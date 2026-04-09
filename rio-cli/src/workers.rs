@@ -142,7 +142,7 @@ struct DiffRow<'a> {
     actor_warm: Option<bool>,
     actor_kind: Option<&'static str>,
     actor_heartbeat_ago_secs: Option<u64>,
-    actor_running_count: Option<u32>,
+    actor_busy: Option<bool>,
 }
 
 impl<'a> DiffRow<'a> {
@@ -166,7 +166,7 @@ impl<'a> DiffRow<'a> {
             actor_warm: actor.map(|a| a.warm),
             actor_kind: actor.map(kind_str),
             actor_heartbeat_ago_secs: actor.map(|a| a.last_heartbeat_ago_secs),
-            actor_running_count: actor.map(|a| a.running_count),
+            actor_busy: actor.map(|a| a.running_build.is_some()),
         }
     }
 
@@ -195,14 +195,14 @@ impl<'a> DiffRow<'a> {
                 // Fresh stream, PG last_seen not updated yet. Benign
                 // and transient — usually clears on next heartbeat.
                 println!(
-                    "{mark} {}  pg=ABSENT  actor=[stream={} reg={} warm={} {} hb={}s run={}]  (PG last_seen stale)",
+                    "{mark} {}  pg=ABSENT  actor=[stream={} reg={} warm={} {} hb={}s busy={}]  (PG last_seen stale)",
                     self.executor_id,
                     yn(self.actor_has_stream.unwrap()),
                     yn(self.actor_is_registered.unwrap()),
                     yn(self.actor_warm.unwrap()),
                     self.actor_kind.unwrap(),
                     self.actor_heartbeat_ago_secs.unwrap(),
-                    self.actor_running_count.unwrap(),
+                    yn(self.actor_busy.unwrap()),
                 );
             }
             "both" => {
@@ -212,7 +212,7 @@ impl<'a> DiffRow<'a> {
                     ""
                 };
                 println!(
-                    "{mark} {}  pg=[{}]  actor=[stream={} reg={} warm={} {} hb={}s run={}]{zombie}",
+                    "{mark} {}  pg=[{}]  actor=[stream={} reg={} warm={} {} hb={}s busy={}]{zombie}",
                     self.executor_id,
                     self.pg_status.unwrap_or("?"),
                     yn(self.actor_has_stream.unwrap()),
@@ -220,7 +220,7 @@ impl<'a> DiffRow<'a> {
                     yn(self.actor_warm.unwrap()),
                     self.actor_kind.unwrap(),
                     self.actor_heartbeat_ago_secs.unwrap(),
-                    self.actor_running_count.unwrap(),
+                    yn(self.actor_busy.unwrap()),
                 );
             }
             _ => unreachable!(),
@@ -267,7 +267,7 @@ fn print_actor_worker(w: &DebugExecutorState) {
             w.systems.join(", ")
         }
     );
-    match w.running_builds.first() {
+    match &w.running_build {
         Some(h) => println!("  running:  {h}"),
         None => println!("  running:  (idle)"),
     }
@@ -340,16 +340,16 @@ pub(crate) async fn run_drain(
         struct DrainJson<'a> {
             executor_id: &'a str,
             accepted: bool,
-            running_builds: u32,
+            busy: bool,
         }
         json(&DrainJson {
             executor_id: &executor_id,
             accepted: resp.accepted,
-            running_builds: resp.running_builds,
+            busy: resp.busy,
         })?;
     } else if resp.accepted {
         let action = if force { "reassigned" } else { "in flight" };
-        if resp.running_builds > 0 {
+        if resp.busy {
             println!("draining {executor_id} (build {action})");
         } else {
             println!("draining {executor_id} (idle)");
@@ -365,10 +365,7 @@ pub(crate) async fn run_drain(
 /// debugging a specific worker's registration or feature advertisement.
 fn print_worker(w: &ExecutorInfo) {
     println!("worker {} [{}]", w.executor_id, w.status);
-    println!(
-        "  state:    {}",
-        if w.running_builds > 0 { "busy" } else { "idle" }
-    );
+    println!("  state:    {}", if w.busy { "busy" } else { "idle" });
     println!(
         "  hb:       {}   up: {}",
         crate::fmt_ts_ago(w.last_heartbeat.as_ref().map(|t| t.seconds)),

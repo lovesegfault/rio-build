@@ -31,9 +31,8 @@
 //!      supply)`. Over-provisioned (supply > demand) → zero spawns.
 //!   5. **Diff DOWN**: per bucket, `surplus = supply.saturating_sub(
 //!      demand)`. A bucket surplus for `scale_down_window` (600s
-//!      default — anti-flap) → delete surplus
-//!      Jobs. Skips Jobs whose pods are mid-build (`running_builds
-//!      > 0` via `ListExecutors`).
+//!      default — anti-flap) → delete surplus Jobs. Skips Jobs
+//!      whose pods are mid-build (`busy` via `ListExecutors`).
 //!   6. **Cold-start floor**: `queued_derivations - manifest.len()`
 //!      derivations have no `build_history` sample → manifest omits
 //!      them (proto doc at `admin_types.proto:249`). Spawn those at
@@ -416,8 +415,8 @@ async fn reap_surplus_manifest_jobs(
         // Background propagation: K8s deletes the Job's pod
         // asynchronously. Pod gets SIGTERM → worker's drain handler
         // (acquire_many on build semaphore) exits cleanly. We've
-        // already verified running_builds == 0, so the semaphore is
-        // immediately acquirable.
+        // already verified !busy, so the semaphore is immediately
+        // acquirable.
         match jobs_api.delete(job_name, &DeleteParams::default()).await {
             Ok(_) => {
                 info!(
@@ -888,16 +887,16 @@ pub(super) fn update_idle_and_reapable(
 // r[impl ctrl.pool.manifest-scaledown]
 /// Select Jobs safe to delete from the reapable buckets.
 ///
-/// "Safe" = pod confirmed idle via `ListExecutors`
-/// (`running_builds == 0`). The `executor_id → Job` match relies on
-/// K8s Job-pod naming: the pod is `{job_name}-{5-char-random}`, and
+/// "Safe" = pod confirmed idle via `ListExecutors` (`busy ==
+/// false`). The `executor_id → Job` match relies on K8s Job-pod
+/// naming: the pod is `{job_name}-{5-char-random}`, and
 /// `executor_id` IS the pod name (`RIO_WORKER_ID=$(POD_NAME)` via
 /// downward API in `build_pod_spec` — see `builderpool/mod.rs`
 /// cleanup-phase comment).
 ///
 /// Three states per Job:
-///   - **Idle** (matching executor, `running_builds == 0`): delete
-///   - **Busy** (matching executor, `running_builds > 0`): skip.
+///   - **Idle** (matching executor, `busy == false`): delete
+///   - **Busy** (matching executor, `busy == true`): skip.
 ///     "Don't delete a Job mid-build." Deleting orphans the build
 ///     (pod SIGTERM'd mid-compilation → scheduler must reassign).
 ///   - **Unknown** (no matching executor): skip. Pod starting up
@@ -1000,7 +999,7 @@ pub(super) fn select_deletable_jobs<'a>(
             .iter()
             .find(|e| e.executor_id.starts_with(&prefix))
         {
-            Some(e) if e.running_builds == 0 => {
+            Some(e) if !e.busy => {
                 // Confirmed idle. Safe to delete.
                 out.push(job);
                 *remaining -= 1;

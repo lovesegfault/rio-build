@@ -66,7 +66,7 @@ fn snapshot_to_proto(s: ExecutorSnapshot) -> ExecutorInfo {
         executor_id: s.executor_id.to_string(),
         systems: s.systems,
         supported_features: s.supported_features,
-        running_builds: u32::from(s.busy),
+        busy: s.busy,
         status,
         resources: s.last_resources,
         last_heartbeat: instant_to_ts(s.last_heartbeat),

@@ -45,8 +45,9 @@ message ResourceUsage {
   uint64 memory_total_bytes = 3;          // Total available memory
   uint64 disk_used_bytes = 4;             // Disk usage (SSD cache)
   uint64 disk_total_bytes = 5;            // Total disk capacity
-  uint32 running_builds = 6;              // Number of active builds
+  reserved 6;                             // was uint32 running_builds (P0537: → bool busy)
   reserved 7;                             // was available_build_slots (P0537: derivable as !busy)
+  bool busy = 8;                          // A build is in flight (P0537: at most one per executor)
 }
 
 // ───────────────────────────────────────────────────────────────────────────

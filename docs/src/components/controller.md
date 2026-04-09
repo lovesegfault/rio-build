@@ -119,7 +119,7 @@ r[ctrl.ephemeral.reap-orphan-running]
 When a Running Job (`JobStatus.ready > 0`) is older than the orphan
 grace (default 5min) AND the scheduler does not consider its executor
 busy --- either the pod's `executor_id` is absent from `ListExecutors`,
-or present with `running_builds == 0` --- the controller MUST delete the
+or present with `busy == false` --- the controller MUST delete the
 Job. This is the controller-side backstop for I-165: a builder process
 stuck in uninterruptible sleep (D-state FUSE wait, OOM-loop) cannot
 self-exit via the 120s `RIO_IDLE_SECS` idle-timeout, never disconnects
@@ -127,7 +127,7 @@ from the scheduler, and would otherwise sit until `activeDeadlineSeconds`
 (default 1h). The grace MUST exceed the builder's idle-timeout so the
 process-level exit is given first chance; the controller reap fires only
 when the process cannot act on its own. A Job whose executor reports
-`running_builds > 0` is NOT reaped --- the scheduler believes a build is
+`busy == true` is NOT reaped --- the scheduler believes a build is
 in progress; `activeDeadlineSeconds` is the backstop for stuck-mid-build.
 The reap is **skipped entirely** when `ListExecutors` fails (scheduler
 unreachable) --- fail-closed, same posture as
@@ -223,7 +223,7 @@ the same labels for its inventory count.
 
 r[ctrl.pool.manifest-scaledown]
 
-Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`running_builds > 0` from `ListExecutors`). Demand returning before the window elapses resets the clock.
+Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`busy` from `ListExecutors`). Demand returning before the window elapses resets the clock.
 
 r[ctrl.pool.manifest-failed-sweep+2]
 The manifest reconciler MUST delete Failed Jobs alongside `ttlSecondsAfterFinished` reaping. With `backoff_limit=0`, a crash-looping pod produces up to `maxConcurrent` Failed Jobs per reconcile tick (the spawn pass fires `headroom` replacements, all of which may fail); the ceiling (`spec.maxConcurrent`) does not cap accumulation because Failed Jobs are not active supply. The sweep is bounded per-tick to `max(20, spec.maxConcurrent)` — the cap tracks the pool's own spawn ceiling so the sweep converges under full crash-loop (net accumulation ≤ 0 per tick). A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.

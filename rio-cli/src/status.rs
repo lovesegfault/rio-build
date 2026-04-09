@@ -72,7 +72,7 @@ pub(crate) async fn run(
             "  worker {} [{}] {}, systems={}",
             w.executor_id,
             w.status,
-            if w.running_builds > 0 { "busy" } else { "idle" },
+            if w.busy { "busy" } else { "idle" },
             w.systems.join(",")
         );
     }

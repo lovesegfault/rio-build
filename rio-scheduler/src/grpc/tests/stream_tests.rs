@@ -7,9 +7,7 @@
 //! completion, empty stream).
 
 use super::*;
-use rio_proto::{
-    ExecutorService, ExecutorServiceClient, ExecutorServiceServer, SchedulerServiceServer,
-};
+use rio_proto::{ExecutorServiceClient, ExecutorServiceServer, SchedulerServiceServer};
 use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
 use tokio_stream::StreamExt;
@@ -62,7 +60,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            running_builds: vec![],
+            running_build: None,
             resources: None,
             size_class: String::new(),
             store_degraded: false,
@@ -280,41 +278,6 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     assert_eq!(buffered[0].1, b"wire-line-0");
 
     Ok(())
-}
-/// Heartbeat with >1 running_builds entry must be rejected at the gRPC
-/// layer. P0537 collapsed executors to one build per pod; the wire field
-/// stays `repeated` for compat but a real builder can only ever send 0
-/// or 1. A multi-entry heartbeat is a protocol invariant violation —
-/// surfacing it here (not silently truncating in the actor) makes a
-/// buggy/hostile builder visible.
-#[tokio::test]
-async fn test_heartbeat_rejects_multiple_running_builds() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let req = Request::new(rio_proto::types::HeartbeatRequest {
-        executor_id: "test-worker".into(),
-        kind: rio_proto::types::ExecutorKind::Builder as i32,
-        systems: vec!["x86_64-linux".into()],
-        supported_features: vec![],
-        running_builds: vec!["/nix/store/a.drv".into(), "/nix/store/b.drv".into()],
-        resources: None,
-        size_class: String::new(),
-        store_degraded: false,
-        draining: false,
-    });
-
-    let result = grpc.heartbeat(req).await;
-    assert!(
-        result.is_err(),
-        "heartbeat with >1 running_builds should be rejected (P0537 invariant)"
-    );
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("running_builds"),
-        "error should mention running_builds: {}",
-        status.message()
-    );
 }
 // ===========================================================================
 // BuildExecution stream: malformed-message handling

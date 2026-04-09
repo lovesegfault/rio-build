@@ -19,7 +19,7 @@ use crate::cgroup::ResourceSnapshotHandle;
 pub(super) const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
-/// Build a heartbeat request, populating `running_builds` from the shared
+/// Build a heartbeat request, populating `running_build` from the shared
 /// tracker.
 ///
 /// Extracted for testability — the heartbeat loop in main.rs calls this.
@@ -40,24 +40,23 @@ pub async fn build_heartbeat_request(
     store_degraded: bool,
     draining: bool,
 ) -> HeartbeatRequest {
-    let current: Vec<String> = slot.running().into_iter().collect();
+    let current = slot.running();
 
     // Read lock held for one struct clone. First heartbeat (before
     // first 10s poll) sends zeros — same as ResourceUsage::default(),
-    // converges after one tick. Override running_builds here: the
-    // cgroup sampler doesn't know the running set. Redundant with the
+    // converges after one tick. Override `busy` here: the cgroup
+    // sampler doesn't know the running slot. Redundant with the
     // top-level HeartbeatRequest field but filling it keeps the
     // ResourceUsage message self-contained for ListExecutors consumers.
-    let running_count = current.len() as u32;
     let resources = {
         let mut ru = *resources.read().unwrap_or_else(|e| e.into_inner());
-        ru.running_builds = running_count;
+        ru.busy = current.is_some();
         ru
     };
 
     HeartbeatRequest {
         executor_id: executor_id.to_string(),
-        running_builds: current,
+        running_build: current,
         resources: Some(resources),
         systems: systems.to_vec(),
         supported_features: features.to_vec(),

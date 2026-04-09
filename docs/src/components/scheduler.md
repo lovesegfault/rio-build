@@ -26,7 +26,7 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 - `SubmitBuild` → DAG merge command
 - `ReportCompletion` → node completion + downstream release command
 - `CancelBuild` → orphan derivations command
-- Heartbeat → executor liveness + running_builds merge + size_class
+- Heartbeat → executor liveness + running_build reconcile + size_class
 - CA early cutoff → edge cutoff + potential cancellation command
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
@@ -143,7 +143,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ```
 
 r[sched.admin.list-executors]
-`AdminService.ListExecutors` returns a point-in-time snapshot of all connected executors via an `ActorCommand::ListExecutors` (O(executors) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `ExecutorInfo` includes `executor_id`, `systems`, `supported_features`, `running_builds` (0 or 1), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
+`AdminService.ListExecutors` returns a point-in-time snapshot of all connected executors via an `ActorCommand::ListExecutors` (O(executors) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `ExecutorInfo` includes `executor_id`, `systems`, `supported_features`, `busy` (a build is in flight), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
 
 r[sched.admin.list-builds]
 `AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the controller polls it every reconcile tick.

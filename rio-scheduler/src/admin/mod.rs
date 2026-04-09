@@ -324,7 +324,7 @@ impl AdminService for AdminServiceImpl {
 
         Ok(Response::new(DrainExecutorResponse {
             accepted: result.accepted,
-            running_builds: u32::from(result.busy),
+            busy: result.busy,
         }))
     }
 
@@ -547,8 +547,7 @@ impl AdminService for AdminServiceImpl {
                 kind: w.kind as i32,
                 systems: w.systems,
                 last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
-                running_count: u32::from(w.running_build.is_some()),
-                running_builds: w.running_build.into_iter().collect(),
+                running_build: w.running_build,
                 draining: w.draining,
                 store_degraded: w.store_degraded,
             })

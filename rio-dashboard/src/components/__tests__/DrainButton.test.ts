@@ -55,7 +55,7 @@ describe('DrainButton', () => {
     });
 
     // Resolve → status stays.
-    resolve({ accepted: true, runningBuilds: 0 });
+    resolve({ accepted: true, busy: false });
     await flushSvelte();
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('draining');
     // Other rows untouched.
@@ -79,7 +79,7 @@ describe('DrainButton', () => {
 
   it('does nothing when confirm() declines', async () => {
     vi.stubGlobal('confirm', vi.fn(() => false));
-    drainExecutor.mockResolvedValue({ accepted: true, runningBuilds: 0 });
+    drainExecutor.mockResolvedValue({ accepted: true, busy: false });
 
     setSeed(executors());
     render(DrainHarness, { props: { executorId: 'w-1' } });

@@ -166,7 +166,7 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
         Some("builder-0")
     );
     assert!(v.get("accepted").is_some_and(|a| a.is_boolean()));
-    assert!(v.get("running_builds").is_some_and(|r| r.is_u64()));
+    assert!(v.get("busy").is_some_and(|b| b.is_boolean()));
 
     // poison-clear --json: inline struct, drv_hash echoed + cleared bool.
     let hash = "/nix/store/deadbeef0000000000000000000000000-test.drv";

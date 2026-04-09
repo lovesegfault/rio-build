@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 ///
 /// `try_claim` is non-blocking by design: with one build per pod, the
 /// scheduler shouldn't dispatch while busy (heartbeat reports
-/// `running_builds`). An assignment arriving while busy is a scheduler
+/// `running_build`). An assignment arriving while busy is a scheduler
 /// bug; the old `acquire_owned().await` would have queued it locally,
 /// silently defeating capacity reporting.
 #[derive(Default)]
@@ -53,7 +53,7 @@ impl BuildSlot {
         Some(BuildSlotGuard(Arc::clone(self)))
     }
 
-    /// Current in-flight drv_path, for heartbeat `running_builds`.
+    /// Current in-flight drv_path, for heartbeat `running_build`.
     pub fn running(&self) -> Option<String> {
         self.running
             .lock()

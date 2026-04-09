@@ -204,7 +204,7 @@ Executors include inventory data in heartbeats so the scheduler can make informe
 ```protobuf
 message HeartbeatRequest {
   string executor_id = 1;
-  repeated string running_builds = 2;
+  reserved 2;                      // was repeated string running_builds (→ optional running_build, field 12)
   ResourceUsage resources = 3;
   reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent executors
   repeated string systems = 5;     // Systems this executor builds for (e.g. ["x86_64-linux", "aarch64-linux"])
@@ -214,6 +214,7 @@ message HeartbeatRequest {
   bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
   ExecutorKind kind = 10;          // builder (airgapped) or fetcher (open egress, FOD-only)
   bool draining = 11;              // executor-authoritative drain flag; scheduler stops dispatching
+  optional string running_build = 12;  // drv path in flight (at most one per executor); unset = idle
 }
 ```
 

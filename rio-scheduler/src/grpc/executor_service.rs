@@ -350,16 +350,6 @@ impl ExecutorService for SchedulerGrpc {
             req.supported_features.len(),
             MAX_HEARTBEAT_FEATURES,
         )?;
-        // P0537: one build per pod, ever. The wire field is still
-        // `repeated` for compat but a real builder populates it from a
-        // single `Option` (rio-builder runtime.rs). >1 entry is a
-        // protocol invariant violation — reject, don't silently drop.
-        if req.running_builds.len() > 1 {
-            return Err(Status::invalid_argument(format!(
-                "running_builds has {} entries (P0537: max 1 build per executor)",
-                req.running_builds.len()
-            )));
-        }
 
         // size_class: empty-string in proto → None. Proto doesn't have
         // Option for strings; empty is the conventional "unset." An
@@ -379,7 +369,7 @@ impl ExecutorService for SchedulerGrpc {
             executor_id: req.executor_id.into(),
             systems: req.systems,
             supported_features: req.supported_features,
-            running_build: req.running_builds.into_iter().next(),
+            running_build: req.running_build,
             size_class,
             resources: req.resources,
             store_degraded: req.store_degraded,

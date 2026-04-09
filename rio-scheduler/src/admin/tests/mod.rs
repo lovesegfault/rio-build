@@ -451,7 +451,7 @@ async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
         .into_inner();
 
     assert!(!resp.accepted, "unknown worker → accepted=false");
-    assert_eq!(resp.running_builds, 0);
+    assert!(!resp.busy);
     Ok(())
 }
 
@@ -482,10 +482,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
         .await?
         .into_inner();
     assert!(resp.accepted);
-    assert_eq!(
-        resp.running_builds, 1,
-        "the first drv is in-flight (Assigned)"
-    );
+    assert!(resp.busy, "the first drv is in-flight (Assigned)");
 
     // Second drv: should NOT dispatch. Worker is busy with first drv
     // AND draining → has_capacity() false.
@@ -512,7 +509,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
         .await?
         .into_inner();
     assert!(resp2.accepted);
-    assert_eq!(resp2.running_builds, 1);
+    assert!(resp2.busy);
     Ok(())
 }
 
@@ -561,9 +558,9 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
         .await?
         .into_inner();
     assert!(resp.accepted);
-    assert_eq!(
-        resp.running_builds, 0,
-        "force=true reassigned → running=0 (caller doesn't wait)"
+    assert!(
+        !resp.busy,
+        "force=true reassigned → idle (caller doesn't wait)"
     );
 
     // reassign_derivations pushes to ready_queue but dispatch_ready

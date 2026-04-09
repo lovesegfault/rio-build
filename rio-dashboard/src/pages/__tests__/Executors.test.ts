@@ -35,7 +35,7 @@ describe('Executors page', () => {
       executorId: id,
       systems: [],
       supportedFeatures: [],
-      runningBuilds: 1,
+      busy: true,
       status,
       lastHeartbeat: timestampFromMs(now - ageSeconds * 1000),
       sizeClass: 'medium',

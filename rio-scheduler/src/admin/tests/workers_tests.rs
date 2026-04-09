@@ -50,7 +50,7 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     assert_eq!(w.executor_id, "alive-worker");
     assert_eq!(w.status, "alive");
     assert_eq!(w.systems, vec!["x86_64-linux".to_string()]);
-    assert_eq!(w.running_builds, 0);
+    assert!(!w.busy);
     assert!(w.connected_since.is_some());
     assert!(w.last_heartbeat.is_some());
     // size_class: connect_executor doesn't set it → empty string.

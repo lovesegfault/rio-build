@@ -141,7 +141,7 @@ pub async fn run(
                 .increment(1);
                 info!(
                     executor_id,
-                    running = r.running_builds,
+                    busy = r.busy,
                     accepted = r.accepted,
                     "DisruptionTarget: DrainExecutor force=true"
                 );

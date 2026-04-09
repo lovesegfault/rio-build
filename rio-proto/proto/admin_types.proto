@@ -54,13 +54,14 @@ message ExecutorInfo {
   repeated string systems = 2;
   repeated string supported_features = 3;
   reserved 4;                            // was max_builds (P0537: always 1)
-  uint32 running_builds = 5;
+  reserved 5;                            // was uint32 running_builds (P0537: → bool busy)
   string status = 6;                     // "alive", "draining", "dead"
   ResourceUsage resources = 7;           // (types.proto)
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;
   string size_class = 10;                // empty = unknown/unclassified (fetchers always empty)
   ExecutorKind kind = 11;                // builder or fetcher (build_types.proto)
+  bool busy = 12;                        // A build is in flight (P0537: at most one per executor)
 }
 
 message ListBuildsRequest {
@@ -122,7 +123,8 @@ message DrainExecutorRequest {
 
 message DrainExecutorResponse {
   bool accepted = 1;
-  uint32 running_builds = 2;             // Builds still running (will complete before drain)
+  reserved 2;                            // was uint32 running_builds (P0537: → bool busy)
+  bool busy = 3;                         // A build is still in flight (will complete before drain)
 }
 
 message ClearPoisonRequest {
@@ -237,14 +239,8 @@ message DebugExecutorState {
   // PG last_seen may be more recent if heartbeats reach PG but the actor's
   // entry was created stale (or vice versa post-failover).
   uint64 last_heartbeat_ago_secs = 7;
-  // running_builds.len(). Count of derivations the actor THINKS this
-  // worker is building. Can drift from worker's own view (TOCTOU,
-  // I-032-style lost completions).
-  uint32 running_count = 8;
-  // The drv hashes themselves. For diffing against InspectBuildDag's
-  // assigned_executor — a derivation Assigned to an executor not in this
-  // list (or one whose has_stream=false) is stuck.
-  repeated string running_builds = 9;
+  reserved 8;                            // was uint32 running_count (P0537: derivable as running_build.is_some())
+  reserved 9;                            // was repeated string running_builds (P0537: → optional running_build)
   // I-056b: has_capacity() checks `!draining && !store_degraded`. Neither
   // was visible here — 45min chasing PG/recovery red herrings when the
   // FOD-stuck-22min root was a stale drain flag surviving reconnect.
@@ -253,6 +249,13 @@ message DebugExecutorState {
   // regardless of stream/registered/warm.
   bool draining = 10;
   bool store_degraded = 11;
+  // The drv hash the actor THINKS this worker is building (P0537: at
+  // most one). Can drift from the worker's own view (TOCTOU,
+  // I-032-style lost completions). For diffing against
+  // InspectBuildDag's assigned_executor — a derivation Assigned to an
+  // executor not listing it here (or one whose has_stream=false) is
+  // stuck.
+  optional string running_build = 12;
 }
 
 message DebugListExecutorsResponse {

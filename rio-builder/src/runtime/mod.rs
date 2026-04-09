@@ -1596,15 +1596,15 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(req.running_builds, vec!["/nix/store/foo.drv".to_string()]);
+        assert_eq!(req.running_build, Some("/nix/store/foo.drv".to_string()));
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
-        // ResourceUsage.running_builds mirrors the top-level field.
-        assert_eq!(req.resources.unwrap().running_builds, 1);
+        // ResourceUsage.busy mirrors the top-level field.
+        assert!(req.resources.unwrap().busy);
     }
 
     #[tokio::test]
-    async fn test_heartbeat_empty_running_builds() {
+    async fn test_heartbeat_idle_running_build() {
         let slot = Arc::new(BuildSlot::default());
         let req = build_heartbeat_request(
             "worker-1",
@@ -1618,7 +1618,7 @@ mod tests {
             false,
         )
         .await;
-        assert!(req.running_builds.is_empty());
+        assert_eq!(req.running_build, None);
     }
 
     /// size_class passes through verbatim (scheduler interprets "" as None).

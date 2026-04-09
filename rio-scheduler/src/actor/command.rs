@@ -29,10 +29,8 @@ pub struct HeartbeatPayload {
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
     /// drv_path the worker reports as in-flight (not a hash). P0537:
-    /// at most one build per pod, so the wire's `repeated string
-    /// running_builds` is collapsed to an `Option` at the gRPC layer
-    /// — a heartbeat with >1 entry is rejected as a protocol
-    /// violation there, not silently truncated here.
+    /// at most one build per pod — the wire field is `optional string
+    /// running_build`, passed through as-is.
     pub running_build: Option<String>,
     /// Size-class from worker config (e.g. "small", "large"). gRPC
     /// maps empty-string → None. Stored on ExecutorState for the
@@ -458,8 +456,6 @@ pub struct DrainResult {
     /// (P0537: at most one). For `force=false`, it will complete
     /// normally. For `force=true`, this is `false` (reassigned). The
     /// worker's preStop hook uses this to decide whether to wait.
-    /// Converted to the proto's legacy `uint32 running_builds` (0/1)
-    /// at the admin gRPC boundary.
     pub busy: bool,
 }
 
@@ -472,8 +468,7 @@ pub struct ExecutorSnapshot {
     pub kind: rio_proto::types::ExecutorKind,
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
-    /// P0537: at most one build per executor. Converted to the proto's
-    /// legacy `uint32 running_builds` (0/1) at the admin gRPC boundary.
+    /// P0537: at most one build per executor.
     pub busy: bool,
     pub draining: bool,
     pub store_degraded: bool,

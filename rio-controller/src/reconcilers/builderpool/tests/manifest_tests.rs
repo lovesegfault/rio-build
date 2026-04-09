@@ -913,16 +913,16 @@ fn vanished_bucket_pruned_from_idle() {
 // ─── select_deletable_jobs ───────────────────────────────────────
 //
 // Tests the executor_id → Job matching + idle check. ExecutorInfo
-// is constructed minimal (only executor_id + running_builds matter).
+// is constructed minimal (only executor_id + busy matter).
 // K8s Job-pod naming: pod is `{job_name}-{random5}`, executor_id
 // IS the pod name (downward API).
 
-/// Minimal ExecutorInfo. Only `executor_id` + `running_builds` are
-/// read by `select_deletable_jobs`; the rest is prost defaults.
-fn executor(id: &str, running: u32) -> ExecutorInfo {
+/// Minimal ExecutorInfo. Only `executor_id` + `busy` are read by
+/// `select_deletable_jobs`; the rest is prost defaults.
+fn executor(id: &str, busy: bool) -> ExecutorInfo {
     ExecutorInfo {
         executor_id: id.into(),
-        running_builds: running,
+        busy,
         ..Default::default()
     }
 }
@@ -949,12 +949,12 @@ fn busy_job_skipped_for_deletion() {
     ];
     let refs: Vec<&Job> = jobs.iter().collect();
 
-    // Executors: aaa idle, bbb BUSY (running_builds=1), ccc idle.
+    // Executors: aaa idle, bbb BUSY, ccc idle.
     // K8s pod naming: `{job}-{5char}` → prefix match.
     let executors = [
-        executor("pool-mf-8g-2000m-aaa-xyzwq", 0),
-        executor("pool-mf-8g-2000m-bbb-pqrst", 1), // mid-build!
-        executor("pool-mf-8g-2000m-ccc-lmnop", 0),
+        executor("pool-mf-8g-2000m-aaa-xyzwq", false),
+        executor("pool-mf-8g-2000m-bbb-pqrst", true), // mid-build!
+        executor("pool-mf-8g-2000m-ccc-lmnop", false),
     ];
 
     // All 3 surplus, all 3 in the reapable budget.
@@ -1002,9 +1002,9 @@ fn surplus_budget_caps_deletions_per_bucket() {
 
     // All idle.
     let executors = [
-        executor("p-mf-8g-2000m-aaa-11111", 0),
-        executor("p-mf-8g-2000m-bbb-22222", 0),
-        executor("p-mf-8g-2000m-ccc-33333", 0),
+        executor("p-mf-8g-2000m-aaa-11111", false),
+        executor("p-mf-8g-2000m-bbb-22222", false),
+        executor("p-mf-8g-2000m-ccc-33333", false),
     ];
 
     // Only 1 surplus (demand=2, supply=3 → surplus=1).
@@ -1032,7 +1032,7 @@ fn unknown_executor_state_skipped() {
     let refs: Vec<&Job> = jobs.iter().collect();
 
     // Only "known" has a registered executor.
-    let executors = [executor("p-mf-8g-2000m-known-abcde", 0)];
+    let executors = [executor("p-mf-8g-2000m-known-abcde", false)];
 
     let reapable = BTreeMap::from([(b8, 2)]);
 
@@ -1065,7 +1065,7 @@ fn prefix_match_requires_trailing_dash() {
     // registered. A naive `starts_with("p-mf-8g-2000m-abc")` (no
     // dash) would falsely match "p-mf-8g-2000m-abcdef-xxxxx" →
     // wrongly conclude Job "abc" is idle.
-    let executors = [executor("p-mf-8g-2000m-abcdef-zzzzz", 0)];
+    let executors = [executor("p-mf-8g-2000m-abcdef-zzzzz", false)];
 
     let reapable = BTreeMap::from([(b8, 2)]);
 
@@ -1095,8 +1095,8 @@ fn non_reapable_bucket_ignored() {
 
     // Both idle.
     let executors = [
-        executor("p-mf-8g-2000m-aaa-11111", 0),
-        executor("p-mf-32g-4000m-bbb-22222", 0),
+        executor("p-mf-8g-2000m-aaa-11111", false),
+        executor("p-mf-32g-4000m-bbb-22222", false),
     ];
 
     // Only b8 reapable (b32's window hasn't elapsed).
@@ -1124,8 +1124,8 @@ fn floor_job_skipped_for_deletion() {
     let refs: Vec<&Job> = jobs.iter().collect();
 
     let executors = [
-        executor("p-mf-floorg-floorm-xxx-11111", 0),
-        executor("p-mf-8g-2000m-yyy-22222", 0),
+        executor("p-mf-floorg-floorm-xxx-11111", false),
+        executor("p-mf-8g-2000m-yyy-22222", false),
     ];
 
     let reapable = BTreeMap::from([(b8, 1)]);
@@ -1156,8 +1156,7 @@ fn failed_job(name: &str) -> Job {
 /// 5 Failed + 3 active → all 5 Failed selected, 3 active untouched.
 /// Failed Jobs need NO idle-check: `status.failed > 0` means the pod
 /// already terminated — nothing to interrupt. Contrast with
-/// `select_deletable_jobs` which requires `running_builds == 0`
-/// from ListExecutors.
+/// `select_deletable_jobs` which requires `!busy` from ListExecutors.
 // r[verify ctrl.pool.manifest-failed-sweep+2]
 #[test]
 fn failed_jobs_swept_without_idle_check() {

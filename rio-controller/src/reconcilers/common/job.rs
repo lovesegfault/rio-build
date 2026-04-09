@@ -328,14 +328,14 @@ fn job_older_than(j: &Job, min_age: Duration) -> bool {
 ///
 /// "Not busy" = no `ExecutorInfo` whose `executor_id` starts with
 /// `{job_name}-` (pod never registered / already disconnected), OR
-/// such an executor exists with `running_builds == 0` (registered but
+/// such an executor exists with `busy == false` (registered but
 /// idle past the builder's own 120s idle-exit — process can't act,
 /// I-165 D-state). The `{job_name}-` prefix match is the same
 /// pod-name convention as `manifest.rs::select_deletable_jobs`
 /// (`RIO_WORKER_ID=$(POD_NAME)` via downward API; Job pod is
 /// `{job_name}-{5char}`).
 ///
-/// A Job whose executor reports `running_builds > 0` is excluded —
+/// A Job whose executor reports `busy == true` is excluded —
 /// the scheduler believes a build is in progress; deleting it would
 /// orphan the build mid-flight. `activeDeadlineSeconds` is the
 /// backstop for stuck-mid-build.
@@ -361,7 +361,7 @@ pub(crate) fn select_orphan_running<'a>(
                 .find(|e| e.executor_id.starts_with(&prefix))
             {
                 // Registered + busy → scheduler owns it. Not orphan.
-                Some(e) if e.running_builds > 0 => false,
+                Some(e) if e.busy => false,
                 // Registered + idle past grace → process can't
                 // self-exit (idle-timeout would have fired by 120s).
                 Some(_) => true,
@@ -967,12 +967,12 @@ mod tests {
         );
     }
 
-    /// Minimal `ExecutorInfo`. Only `executor_id` + `running_builds`
-    /// are read by the orphan selector.
-    fn executor(id: &str, running: u32) -> rio_proto::types::ExecutorInfo {
+    /// Minimal `ExecutorInfo`. Only `executor_id` + `busy` are read
+    /// by the orphan selector.
+    fn executor(id: &str, busy: bool) -> rio_proto::types::ExecutorInfo {
         rio_proto::types::ExecutorInfo {
             executor_id: id.into(),
-            running_builds: running,
+            busy,
             ..Default::default()
         }
     }
@@ -980,14 +980,14 @@ mod tests {
     // r[verify ctrl.ephemeral.reap-orphan-running]
     /// I-165: Running Jobs older than grace, scheduler has no live
     /// assignment for them → reap. Jobs whose executor reports
-    /// `running_builds > 0` are skipped (build in progress per
-    /// scheduler; activeDeadlineSeconds is the backstop there).
+    /// `busy` are skipped (build in progress per scheduler;
+    /// activeDeadlineSeconds is the backstop there).
     #[test]
     fn select_orphan_running_reaps_unassigned() {
         let jobs = vec![
-            // Busy: executor registered, running_builds=1 → skip.
+            // Busy: executor registered, busy=true → skip.
             job_with("rio-builder-x86-busy01", Some(1), Some(0), 600),
-            // Idle-stuck: executor registered, running_builds=0, past
+            // Idle-stuck: executor registered, busy=false, past
             // grace → process can't self-exit (D-state). Reap.
             job_with("rio-builder-x86-idle01", Some(1), Some(0), 600),
             // Ghost: no executor entry at all, past grace → never
@@ -995,8 +995,8 @@ mod tests {
             job_with("rio-builder-x86-ghost1", Some(1), Some(0), 600),
         ];
         let executors = vec![
-            executor("rio-builder-x86-busy01-abcde", 1),
-            executor("rio-builder-x86-idle01-fghij", 0),
+            executor("rio-builder-x86-busy01-abcde", true),
+            executor("rio-builder-x86-idle01-fghij", false),
             // ghost1 has no entry
         ];
         let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
@@ -1045,7 +1045,7 @@ mod tests {
     fn select_orphan_running_prefix_is_dash_anchored() {
         let jobs = vec![job_with("rio-builder-x86-abc", Some(1), Some(0), 600)];
         // Executor for a DIFFERENT Job whose name shares the prefix.
-        let executors = vec![executor("rio-builder-x86-abcdef-qwert", 1)];
+        let executors = vec![executor("rio-builder-x86-abcdef-qwert", true)];
         let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
         assert_eq!(
             orphans.len(),

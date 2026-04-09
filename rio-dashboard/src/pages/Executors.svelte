@@ -71,7 +71,7 @@
   $effect(() => startPoll(refresh));
 
   function isBusy(e: ExecutorInfo): boolean {
-    return e.runningBuilds > 0;
+    return e.busy;
   }
 </script>
 

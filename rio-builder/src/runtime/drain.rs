@@ -103,7 +103,7 @@ pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
                         let r = resp.into_inner();
                         info!(
                             accepted = r.accepted,
-                            running = r.running_builds,
+                            busy = r.busy,
                             "drain acknowledged by scheduler"
                         );
                         break;

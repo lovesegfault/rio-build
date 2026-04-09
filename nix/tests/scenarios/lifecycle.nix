@@ -2107,7 +2107,7 @@ let
       #
       # NOT proven here: scale-down (SCALE_DOWN_WINDOW even at the
       # autoscale fixture's 10s requires pod to heartbeat + report
-      # running_builds=0 via ListExecutors — full round-trip, follow-
+      # busy=false via ListExecutors — full round-trip, follow-
       # on if this times in under ~150s). Failed-Job sweep (P0511) is
       # also follow-on (needs deliberate crash injection).
       with subtest("manifest-pool: sizing=Manifest, cold-start Job, status_patch"):
