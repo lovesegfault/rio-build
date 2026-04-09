@@ -16,9 +16,12 @@
 //! - terminal -> non-terminal: rejected (except poisoned -> created on TTL)
 
 mod build;
+mod db_str;
 mod derivation;
 mod executor;
 mod newtypes;
+
+pub(crate) use db_str::db_str_enum;
 
 pub use build::*;
 pub use derivation::*;
@@ -31,53 +34,30 @@ pub use newtypes::{DrvHash, ExecutorId};
 /// rio-common; scheduler only needs the derived timeout + the divisor.
 pub use rio_common::limits::{HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS};
 
-/// Priority class for scheduling.
-///
-/// Interactive builds get `INTERACTIVE_BOOST` (+1e9) added to their priority
-/// in the `ReadyQueue` BinaryHeap, so they dispatch before any realistic
-/// critical-path value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum PriorityClass {
-    /// CI builds: normal priority, scheduled order.
-    Ci,
-    /// Interactive builds (e.g., IFD during evaluation): +1e9 priority boost.
-    Interactive,
-    /// Scheduled/batch builds: default, lowest priority.
-    #[default]
-    Scheduled,
+db_str_enum! {
+    /// Priority class for scheduling.
+    ///
+    /// Interactive builds get `INTERACTIVE_BOOST` (+1e9) added to their
+    /// priority in the `ReadyQueue` BinaryHeap, so they dispatch before
+    /// any realistic critical-path value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub enum PriorityClass {
+        /// CI builds: normal priority, scheduled order.
+        Ci = "ci",
+        /// Interactive builds (e.g., IFD during evaluation): +1e9 priority boost.
+        Interactive = "interactive",
+        /// Scheduled/batch builds: default, lowest priority.
+        #[default]
+        Scheduled = "scheduled",
+    }
+    parse_err(_s) = &'static str:
+        "invalid priority class (must be 'ci', 'interactive', or 'scheduled')";
 }
 
 impl PriorityClass {
-    /// Database and wire string representation.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ci => "ci",
-            Self::Interactive => "interactive",
-            Self::Scheduled => "scheduled",
-        }
-    }
-
     /// Whether this class gets the INTERACTIVE_BOOST priority bonus.
     pub fn is_interactive(self) -> bool {
         matches!(self, Self::Interactive)
-    }
-}
-
-impl std::str::FromStr for PriorityClass {
-    type Err = &'static str;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ci" => Ok(Self::Ci),
-            "interactive" => Ok(Self::Interactive),
-            "scheduled" => Ok(Self::Scheduled),
-            _ => Err("invalid priority class (must be 'ci', 'interactive', or 'scheduled')"),
-        }
-    }
-}
-
-impl std::fmt::Display for PriorityClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -119,11 +99,7 @@ mod tests {
 
     #[test]
     fn test_priority_class_from_str_roundtrip() {
-        for pc in [
-            PriorityClass::Ci,
-            PriorityClass::Interactive,
-            PriorityClass::Scheduled,
-        ] {
+        for &pc in PriorityClass::ALL {
             let s = pc.as_str();
             let parsed: PriorityClass = s.parse().expect("as_str output must parse");
             assert_eq!(parsed, pc, "roundtrip failed for {pc:?}");

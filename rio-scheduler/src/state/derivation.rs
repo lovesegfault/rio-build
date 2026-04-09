@@ -16,39 +16,49 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use super::{DrvHash, ExecutorId, TransitionError};
+use super::{DrvHash, ExecutorId, TransitionError, db_str_enum};
 
-// r[impl sched.state.machine]
-/// State of a single derivation in the global DAG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DerivationStatus {
-    Created,
-    Queued,
-    Ready,
-    Assigned,
-    Running,
-    Completed,
-    Failed,
-    Poisoned,
-    /// A dependency of this derivation failed/poisoned. This derivation can
-    /// never complete in the current build. Terminal (like Poisoned).
-    /// Maps to Nix BuildStatus::DependencyFailed=10.
-    DependencyFailed,
-    /// Explicitly cancelled via CancelBuild (all interested builds cancelled)
-    /// or DrainExecutor(force). Terminal but distinct from Poisoned: no
-    /// implication of build defect, just scheduler/operator decision.
-    /// No TTL reset — a cancelled build stays cancelled; retry means
-    /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
-    /// cleanup is immediate (no 2h terminationGracePeriodSeconds wait).
-    Cancelled,
-    /// Terminal. CA early-cutoff: a CA dependency completed with
-    /// byte-identical output (content-index match), so this derivation
-    /// would produce the same output as already in the store. Skipped
-    /// without running. Distinct from Completed for metrics
-    /// (`rio_scheduler_ca_cutoff_saves_total`) and audit trail.
-    /// Queued|Ready → Skipped (Ready is order-independent vs
-    /// `find_newly_ready` — matches DependencyFailed precedent).
-    Skipped,
+db_str_enum! {
+    // r[impl sched.state.machine]
+    /// State of a single derivation in the global DAG.
+    ///
+    /// The macro-generated [`ALL`](Self::ALL) const lists variants in
+    /// the order the golden snapshot at
+    /// `rio-test-support/golden/derivation_statuses.json` expects —
+    /// the snapshot test, the exhaustive transition-table test, and the
+    /// dashboard's cross-language cardinality check (vitest reads the
+    /// same golden) all key on it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum DerivationStatus {
+        Created = "created",
+        Queued = "queued",
+        Ready = "ready",
+        Assigned = "assigned",
+        Running = "running",
+        Completed = "completed",
+        Failed = "failed",
+        Poisoned = "poisoned",
+        /// A dependency of this derivation failed/poisoned. This derivation can
+        /// never complete in the current build. Terminal (like Poisoned).
+        /// Maps to Nix BuildStatus::DependencyFailed=10.
+        DependencyFailed = "dependency_failed",
+        /// Explicitly cancelled via CancelBuild (all interested builds cancelled)
+        /// or DrainExecutor(force). Terminal but distinct from Poisoned: no
+        /// implication of build defect, just scheduler/operator decision.
+        /// No TTL reset — a cancelled build stays cancelled; retry means
+        /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
+        /// cleanup is immediate (no 2h terminationGracePeriodSeconds wait).
+        Cancelled = "cancelled",
+        /// Terminal. CA early-cutoff: a CA dependency completed with
+        /// byte-identical output (content-index match), so this derivation
+        /// would produce the same output as already in the store. Skipped
+        /// without running. Distinct from Completed for metrics
+        /// (`rio_scheduler_ca_cutoff_saves_total`) and audit trail.
+        /// Queued|Ready → Skipped (Ready is order-independent vs
+        /// `find_newly_ready` — matches DependencyFailed precedent).
+        Skipped = "skipped",
+    }
+    parse_err(other) = TransitionError: TransitionError::UnknownStatus(other.to_string());
 }
 
 impl DerivationStatus {
@@ -195,72 +205,6 @@ impl DerivationStatus {
                 to,
                 reason: "transition not in state machine",
             })
-        }
-    }
-
-    /// Convert to the wire/database string representation.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Queued => "queued",
-            Self::Ready => "ready",
-            Self::Assigned => "assigned",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Poisoned => "poisoned",
-            Self::DependencyFailed => "dependency_failed",
-            Self::Cancelled => "cancelled",
-            Self::Skipped => "skipped",
-        }
-    }
-
-    /// All variants, in the order the golden snapshot at
-    /// `rio-test-support/golden/derivation_statuses.json` lists them.
-    /// Used by the snapshot test (`status_snapshot` mod below), the
-    /// exhaustive transition-table test, and indirectly by the
-    /// dashboard's cross-language cardinality check (vitest reads the
-    /// same golden). `cfg(test)` because the const itself is only
-    /// useful where exhaustiveness matters — production code matches
-    /// on the enum directly.
-    #[cfg(test)]
-    pub const ALL: [Self; 11] = [
-        Self::Created,
-        Self::Queued,
-        Self::Ready,
-        Self::Assigned,
-        Self::Running,
-        Self::Completed,
-        Self::Failed,
-        Self::Poisoned,
-        Self::DependencyFailed,
-        Self::Cancelled,
-        Self::Skipped,
-    ];
-}
-
-impl std::fmt::Display for DerivationStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for DerivationStatus {
-    type Err = TransitionError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "created" => Ok(Self::Created),
-            "queued" => Ok(Self::Queued),
-            "ready" => Ok(Self::Ready),
-            "assigned" => Ok(Self::Assigned),
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "poisoned" => Ok(Self::Poisoned),
-            "dependency_failed" => Ok(Self::DependencyFailed),
-            "cancelled" => Ok(Self::Cancelled),
-            "skipped" => Ok(Self::Skipped),
-            other => Err(TransitionError::UnknownStatus(other.to_string())),
         }
     }
 }
@@ -1276,8 +1220,8 @@ mod tests {
         .into_iter()
         .collect();
 
-        for from in DerivationStatus::ALL {
-            for to in DerivationStatus::ALL {
+        for &from in DerivationStatus::ALL {
+            for &to in DerivationStatus::ALL {
                 let result = from.validate_transition(to);
                 if valid.contains(&(from, to)) {
                     assert!(

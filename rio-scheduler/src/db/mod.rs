@@ -100,35 +100,26 @@ pub(super) fn encode_pg_text_array(items: &[String]) -> String {
 /// are easy to mix up).
 pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>, i32);
 
-/// Assignment lifecycle status (assignments table).
-///
-/// `Pending` is the insert-time value. Every CompletionReport
-/// transitions it to one of the terminal values — `Completed` on
-/// `Built`, `Failed` on any failure status, `Cancelled` when the
-/// scheduler sent a CancelSignal. I-209: leaving the row at `pending`
-/// after a derivation goes terminal blocks the tick-DELETE pruner
-/// (`NOT EXISTS (SELECT 1 FROM assignments …)`), leaking
-/// `derivations` rows unbounded.
-///
-/// The schema also defines `'acknowledged'` (the phase2c worker-ack
-/// that shipped a different design); SQL paths that reference it use
-/// the literal directly in `insert_assignment`'s ON CONFLICT predicate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssignmentStatus {
-    Pending,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl AssignmentStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
+crate::state::db_str_enum! {
+    /// Assignment lifecycle status (assignments table).
+    ///
+    /// `Pending` is the insert-time value. Every CompletionReport
+    /// transitions it to one of the terminal values — `Completed` on
+    /// `Built`, `Failed` on any failure status, `Cancelled` when the
+    /// scheduler sent a CancelSignal. I-209: leaving the row at `pending`
+    /// after a derivation goes terminal blocks the tick-DELETE pruner
+    /// (`NOT EXISTS (SELECT 1 FROM assignments …)`), leaking
+    /// `derivations` rows unbounded.
+    ///
+    /// The schema also defines `'acknowledged'` (the phase2c worker-ack
+    /// that shipped a different design); SQL paths that reference it use
+    /// the literal directly in `insert_assignment`'s ON CONFLICT predicate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AssignmentStatus {
+        Pending = "pending",
+        Completed = "completed",
+        Failed = "failed",
+        Cancelled = "cancelled",
     }
 }
 /// Database operations for the scheduler.
