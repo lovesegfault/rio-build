@@ -862,14 +862,6 @@ mod tests {
     // any_sig_trusted — cross-tenant sig-visibility gate
     // ------------------------------------------------------------------------
 
-    fn make_trusted_key(name: &str, seed: &[u8; 32]) -> String {
-        let pk = SigningKey::from_bytes(seed).verifying_key();
-        format!(
-            "{name}:{}",
-            base64::engine::general_purpose::STANDARD.encode(pk.as_bytes())
-        )
-    }
-
     // r[verify store.substitute.tenant-sig-visibility]
     #[test]
     fn any_sig_trusted_accepts_matching() {
@@ -877,7 +869,7 @@ mod tests {
         let signer = Signer::from_seed("key-a", &seed);
         let fp = "1;/nix/store/x;sha256:y;1;";
         let sig = signer.sign(fp);
-        let trusted = make_trusted_key("key-a", &seed);
+        let trusted = signer.trusted_key_entry();
 
         assert_eq!(
             any_sig_trusted(&[sig], &[trusted], fp).as_deref(),
@@ -891,7 +883,7 @@ mod tests {
         let fp = "1;/nix/store/x;sha256:y;1;";
         let sig = signer.sign(fp);
         // Different key in trust set — key-b, not key-a.
-        let trusted = make_trusted_key("key-b", &[0x22u8; 32]);
+        let trusted = Signer::from_seed("key-b", &[0x22u8; 32]).trusted_key_entry();
 
         assert_eq!(any_sig_trusted(&[sig], &[trusted], fp), None);
     }
@@ -901,7 +893,7 @@ mod tests {
         let seed = [0x11u8; 32];
         let signer = Signer::from_seed("key-a", &seed);
         let sig = signer.sign("1;/nix/store/REAL;sha256:y;1;");
-        let trusted = make_trusted_key("key-a", &seed);
+        let trusted = signer.trusted_key_entry();
 
         // Sig was over REAL; verify against TAMPERED → None.
         assert_eq!(
@@ -920,8 +912,8 @@ mod tests {
         let sig_c = Signer::from_seed("key-c", &[0x33u8; 32]).sign(fp);
 
         let trusted = vec![
-            make_trusted_key("key-a", &seed_a),
-            make_trusted_key("key-b", &[0x22u8; 32]),
+            Signer::from_seed("key-a", &seed_a).trusted_key_entry(),
+            Signer::from_seed("key-b", &[0x22u8; 32]).trusted_key_entry(),
         ];
 
         assert_eq!(
@@ -942,8 +934,9 @@ mod tests {
     fn any_sig_trusted_skips_malformed() {
         let seed = [0x11u8; 32];
         let fp = "1;/nix/store/x;sha256:y;1;";
-        let good_sig = Signer::from_seed("good", &seed).sign(fp);
-        let good_key = make_trusted_key("good", &seed);
+        let good = Signer::from_seed("good", &seed);
+        let good_sig = good.sign(fp);
+        let good_key = good.trusted_key_entry();
 
         // Garbage entries mixed in — shouldn't break the valid match.
         let sigs = vec!["no-colon".into(), "bad:!!not-base64!!".into(), good_sig];

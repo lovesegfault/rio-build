@@ -32,7 +32,7 @@ struct ChunkSession {
 impl ChunkSession {
     async fn new() -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         // ONE cache, shared across StoreService and ChunkService.
         // A previous convenience constructor (since removed) created
         // a private cache per service — two caches that both missed

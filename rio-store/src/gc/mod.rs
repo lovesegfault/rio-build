@@ -606,9 +606,8 @@ pub(super) async fn decrement_and_enqueue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MemoryChunkBackend;
     use crate::manifest::{Manifest, ManifestEntry};
-    use crate::test_helpers::ChunkSeed;
+    use crate::test_helpers::{ChunkSeed, mem_backend};
     use rio_test_support::TestDb;
     use sqlx::PgPool;
 
@@ -644,7 +643,7 @@ mod tests {
         let h1 = seed_chunk(&db.pool, 1, 2, 1000).await;
         let h2 = seed_chunk(&db.pool, 2, 3, 2000).await;
         let manifest = make_manifest(&[h1, h2]);
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let mut tx = db.pool.begin().await.unwrap();
         let stats = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
@@ -678,7 +677,7 @@ mod tests {
     // r[verify store.gc.pending-deletes]
     async fn enqueue_skips_corrupt_hash() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
         let mut tx = db.pool.begin().await.unwrap();
 
         // One well-formed (32 bytes), one corrupt (7 bytes).
@@ -708,7 +707,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let h = seed_chunk(&db.pool, 1, 1, 5000).await;
         let manifest = make_manifest(&[h]);
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let mut tx = db.pool.begin().await.unwrap();
         let stats = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))

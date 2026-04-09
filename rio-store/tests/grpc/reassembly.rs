@@ -128,7 +128,7 @@ async fn test_chunked_manifest_no_cache_preflight_fails() -> TestResult {
 
     // First: use a CHUNKED store to write a chunked path.
     {
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         let cache = Arc::new(rio_store::cas::ChunkCache::new(
             backend as Arc<dyn ChunkBackend>,
         ));

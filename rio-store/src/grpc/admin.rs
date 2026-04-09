@@ -535,7 +535,7 @@ fn upstream_to_proto(u: metadata::Upstream) -> UpstreamInfo {
 mod tests {
     use super::*;
     use crate::gc::GC_LOCK_ID;
-    use crate::test_helpers::StoreSeed;
+    use crate::test_helpers::{StoreSeed, mem_backend};
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
 
@@ -1049,11 +1049,11 @@ mod tests {
     /// is observable.
     #[tokio::test]
     async fn verify_chunks_reports_missing() {
-        use crate::backend::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::ChunkBackend;
         use crate::test_helpers::ChunkSeed;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Consistent: refcount=1 in PG, present in backend.
         let h_ok = ChunkSeed::new(0x10).with_refcount(1).seed(&db.pool).await;

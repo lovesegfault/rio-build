@@ -20,9 +20,7 @@ const CLUSTER_SIGNING_SEED: [u8; 32] = [0xCC; 32];
 const TENANT_SIGNING_SEED: [u8; 32] = [0xDD; 32];
 
 fn make_test_signer() -> Signer {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(TEST_SIGNING_SEED);
-    Signer::parse(&format!("test.cache.org-1:{b64}")).expect("valid key string")
+    Signer::from_seed("test.cache.org-1", &TEST_SIGNING_SEED)
 }
 
 /// PutPath with a signer: signature lands in narinfo.signatures and is
@@ -258,8 +256,7 @@ async fn put_path_with_tenant_jwt_signs_with_tenant_key() -> TestResult {
         .await?;
 
     // --- 2. Build service with TenantSigner(cluster, pool) ------------
-    let cluster_b64 = base64::engine::general_purpose::STANDARD.encode(CLUSTER_SIGNING_SEED);
-    let cluster = Signer::parse(&format!("cluster-e2e-1:{cluster_b64}"))?;
+    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED);
     let ts = TenantSigner::new(cluster, db.pool.clone());
     let service = StoreServiceImpl::new(db.pool.clone()).with_signer(ts);
 
@@ -340,8 +337,7 @@ async fn put_path_without_jwt_claims_falls_back_to_cluster_key() -> TestResult {
     use base64::Engine;
     use ed25519_dalek::{Signature, SigningKey, Verifier};
 
-    let cluster_b64 = base64::engine::general_purpose::STANDARD.encode(CLUSTER_SIGNING_SEED);
-    let cluster = Signer::parse(&format!("cluster-e2e-1:{cluster_b64}"))?;
+    let cluster = Signer::from_seed("cluster-e2e-1", &CLUSTER_SIGNING_SEED);
     // new_with_signer wraps in TenantSigner internally.
     let mut s = StoreSession::new_with_signer(cluster).await?;
 

@@ -27,7 +27,26 @@ use rio_proto::types::{
 use rio_proto::validated::ValidatedPathInfo;
 use rio_proto::{StoreServiceClient, StoreServiceServer};
 
+use crate::backend::MemoryChunkBackend;
 use crate::grpc::StoreServiceImpl;
+
+// ---------------------------------------------------------------------------
+// In-memory chunk backend
+// ---------------------------------------------------------------------------
+
+/// `Arc::new(MemoryChunkBackend::new())`. Consolidates the ~19 test sites
+/// that hand-roll this. Returns the concrete `Arc<MemoryChunkBackend>` so
+/// callers that need to inspect backend state (e.g. `cas.rs`'s
+/// `make_cache`, `cache_server` blob assertions) keep direct access;
+/// callers that only need the trait object rely on unsized coercion at
+/// the binding site:
+///
+/// ```ignore
+/// let backend: Arc<dyn ChunkBackend> = mem_backend();
+/// ```
+pub fn mem_backend() -> std::sync::Arc<MemoryChunkBackend> {
+    std::sync::Arc::new(MemoryChunkBackend::new())
+}
 
 // ---------------------------------------------------------------------------
 // In-process gRPC server + PutPath stream helpers

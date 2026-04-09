@@ -206,13 +206,13 @@ pub fn spawn_drain_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MemoryChunkBackend;
+    use crate::test_helpers::mem_backend;
     use rio_test_support::TestDb;
 
     #[tokio::test]
     async fn drain_deletes_and_removes_row() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed a chunk + pending row. MemoryBackend's key_for is
         // hex; insert the row with that key.
@@ -250,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn drain_increments_attempts_on_failure() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed a row with a key that CAN'T be deleted (not valid
         // hex → delete_by_key Errs).
@@ -280,7 +280,7 @@ mod tests {
         // path (sharing X) resurrects it (refcount→1, deleted→false).
         // Drain must re-check and SKIP the S3 delete.
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed chunk X in backend + chunks table (resurrected state:
         // refcount=1, deleted=false — as PutPath's upsert would leave it).
@@ -357,7 +357,7 @@ mod tests {
         // Pre-migration-006 rows have NULL blake3_hash → no re-check,
         // proceed unconditionally (old behavior).
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let hash = [0x33u8; 32];
         backend
@@ -384,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn drain_respects_max_attempts() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed a row at max attempts — drain should SKIP it.
         sqlx::query("INSERT INTO pending_s3_deletes (s3_key, attempts) VALUES ('stuck-key', $1)")
@@ -419,7 +419,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_for_update_serializes_with_upsert() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed chunk X: dead state (refcount=0, deleted=true) — sweep
         // already marked it. Pending S3 delete enqueued.
@@ -512,7 +512,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_skip_locked_disjoint_batches() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Seed 5 chunks + pending rows.
         for i in 0..5u8 {

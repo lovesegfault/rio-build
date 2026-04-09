@@ -245,12 +245,7 @@ mod tests {
     /// (The Some-tenant path IS tested by the integration test at
     /// `tests/grpc/signing.rs`, which has a real PG.)
     fn svc_with_signer() -> StoreServiceImpl {
-        // 32-byte seed → Signer::parse accepts `name:base64(seed)` (seed-only
-        // form; ed25519 derives pubkey deterministically).
-        let seed_b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
-        let cluster = crate::signing::Signer::parse(&format!("test-key-1:{seed_b64}"))
-            .expect("valid test signer");
+        let cluster = crate::signing::Signer::from_seed("test-key-1", &[0x42u8; 32]);
         // Pool is lazy — never connects since these tests pass tenant_id=None
         // (the cluster-key path in resolve_once skips the DB entirely).
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");

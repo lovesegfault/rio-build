@@ -690,8 +690,7 @@ pub fn spawn_orphan_chunk_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::TenantSeed;
-    use crate::test_helpers::{ChunkSeed, StoreSeed, path_hash};
+    use crate::test_helpers::{ChunkSeed, StoreSeed, TenantSeed, mem_backend, path_hash};
     use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
 
@@ -1195,7 +1194,7 @@ mod tests {
     /// NO chunk_list — this is the chunked-storage path.
     #[tokio::test]
     async fn sweep_chunked_path_decrements_and_enqueues() {
-        use crate::backend::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::ChunkBackend;
         use crate::manifest::{Manifest, ManifestEntry};
         use std::sync::Arc;
 
@@ -1240,7 +1239,7 @@ mod tests {
             .unwrap();
 
         // Sweep with a backend → decrement + enqueue.
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
         let stats = sweep(
             &db.pool,
             Some(&backend),
@@ -1307,9 +1306,9 @@ mod tests {
     /// so the survivals MEAN something.
     #[tokio::test]
     async fn orphan_chunk_grace_ttl_partitions_correctly() {
-        use crate::backend::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::ChunkBackend;
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Grace = 100s. Young at 10s, old at 200s.
         let grace = 100i64;

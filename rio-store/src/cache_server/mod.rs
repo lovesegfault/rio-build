@@ -437,7 +437,7 @@ mod tests {
     use super::*;
     use crate::backend::{ChunkBackend, MemoryChunkBackend};
     use crate::signing::Signer;
-    use crate::test_helpers::TenantSeed;
+    use crate::test_helpers::{TenantSeed, mem_backend};
     use axum::body::Body;
     use axum::http::Request;
     use rio_test_support::TestDb;
@@ -451,7 +451,7 @@ mod tests {
     /// The `_db` binding in each test keeps it alive.
     async fn setup() -> (Router, TestDb, Arc<MemoryChunkBackend>) {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         let cache = Arc::new(ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
@@ -542,7 +542,7 @@ mod tests {
             .seed(&db.pool)
             .await;
 
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         let cache = Arc::new(ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
@@ -648,10 +648,7 @@ mod tests {
     #[tokio::test]
     async fn narinfo_includes_signature() {
         let (app, db, _backend) = setup().await;
-        use base64::Engine;
-        let seed = [0x55u8; 32];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
-        let signer = Signer::parse(&format!("test-cache:{b64}")).unwrap();
+        let signer = Signer::from_seed("test-cache", &[0x55u8; 32]);
 
         let (store_path, _, _) = seed_path(&db.pool, "narinfo-signed", Some(signer)).await;
         let hash_part = store_path.hash_part();
@@ -724,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn narinfo_tenant_filter_scopes_visibility() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         let cache = Arc::new(ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));

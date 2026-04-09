@@ -737,6 +737,7 @@ impl ChunkCache {
 mod cache_tests {
     use super::*;
     use crate::backend::MemoryChunkBackend;
+    use crate::test_helpers::mem_backend;
 
     /// Real hash/data pair: the BLAKE3 of "hello chunk cache".
     /// `get_verified` hashes the data and compares, so these must match.
@@ -747,7 +748,7 @@ mod cache_tests {
     }
 
     fn make_cache() -> (Arc<MemoryChunkBackend>, ChunkCache) {
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         // Small capacity so eviction tests don't need GB of data.
         let cache =
             ChunkCache::with_capacity(Arc::clone(&backend) as Arc<dyn ChunkBackend>, 1024 * 1024);

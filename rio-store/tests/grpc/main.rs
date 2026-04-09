@@ -23,7 +23,7 @@ use rio_store::grpc::StoreServiceImpl;
 // Re-export the shared helpers under their existing names so the test
 // submodules' `use super::*;` keeps working unchanged.
 pub use rio_store::test_helpers::{
-    put_path, put_path_raw, spawn_store_service as spawn_store_server,
+    mem_backend, put_path, put_path_raw, spawn_store_service as spawn_store_server,
 };
 use rio_test_support::fixtures::{
     make_large_nar, make_nar, make_path_info_for_nar, pseudo_random_bytes, test_store_path,
@@ -89,7 +89,7 @@ impl StoreSession {
     /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
         let db = TestDb::new(&MIGRATOR).await;
-        let backend = Arc::new(MemoryChunkBackend::new());
+        let backend = mem_backend();
         let cache = Arc::new(rio_store::cas::ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
