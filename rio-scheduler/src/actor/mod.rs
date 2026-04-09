@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -21,6 +21,7 @@ use rio_proto::types::FindMissingPathsRequest;
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
 use crate::estimator::Estimator;
+use crate::lease::LeaderState;
 use crate::queue::ReadyQueue;
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
@@ -159,24 +160,21 @@ pub struct DagActor {
     /// so hysteresis (80%/60%) is honored by send() instead of a simple
     /// threshold check. `Arc<AtomicBool>` for lock-free reads on the hot path.
     backpressure_active: Arc<AtomicBool>,
-    /// Leader generation counter (for assignment tokens + stale-work
-    /// detection at workers).
+    /// Leader-election shared state: `generation` (assignment-token /
+    /// stale-work nonce), `is_leader` (dispatch gate), `recovery_complete`
+    /// (dispatch gate). Same Arcs as the lease task and `ActorHandle` —
+    /// the lease task writes `is_leader`/`generation` via
+    /// [`LeaderState::on_acquire`]/[`LeaderState::on_lose`]; the actor
+    /// writes `recovery_complete` via
+    /// [`LeaderState::set_recovery_complete`]; everything else is
+    /// `SeqCst`/`Acquire` reads. See [`LeaderState`] for the
+    /// multi-field ordering rationale.
     ///
-    /// `Arc<AtomicU64>` not `i64`: the lease task (C2, spawned in
-    /// main.rs) is the sole WRITER — it `fetch_add(1, Release)` on
-    /// each leadership acquisition. The actor reads via the same Arc
-    /// for dispatch; `ActorHandle` clones a `GenerationReader` for
-    /// gRPC's `HeartbeatResponse.generation`. Same cross-task sharing
-    /// pattern as `backpressure_active`.
-    ///
-    /// u64 not i64: the proto is `uint64` (WorkAssignment, Heartbeat).
-    /// The prior `i64 as u64` cast at dispatch.rs was a silent sign-
-    /// reinterpret — harmless in practice (Lease transitions can't go
-    /// negative) but a latent footgun. PG's `assignments.generation`
-    /// is BIGINT (signed); cast `u64 as i64` at THAT single boundary
-    /// instead of at every proto-encode site. One cast, edge not hot
-    /// path.
-    generation: Arc<AtomicU64>,
+    /// u64 generation, not i64: the proto is `uint64` (WorkAssignment,
+    /// Heartbeat). PG's `assignments.generation` is BIGINT (signed);
+    /// cast `u64 as i64` at THAT single boundary instead of at every
+    /// proto-encode site.
+    leader: LeaderState,
     /// Weak clone of the actor's own command sender, for scheduling delayed
     /// internal commands (e.g., terminal build cleanup). Weak so the actor
     /// doesn't prevent channel close when all external handles are dropped.
@@ -226,39 +224,6 @@ pub struct DagActor {
     /// sorts by effective cutoff, but configured order is useful for
     /// logging).
     configured_cutoffs: Vec<(String, f64)>,
-    /// Leader flag from the lease task. `dispatch_ready` early-
-    /// returns if false → standby schedulers merge DAGs (state
-    /// stays warm) but don't send assignments. Default `true` for
-    /// non-K8s mode (no lease task = always leader).
-    ///
-    /// Relaxed load: it's a standalone flag with no other state to
-    /// synchronize. A one-pass lag on false→true is harmless (next
-    /// dispatch pass works); true→false means one lame-duck
-    /// dispatch (idempotent — workers reject stale-gen assignments
-    /// after the new leader increments).
-    is_leader: Arc<AtomicBool>,
-    /// Set by handle_leader_acquired AFTER recover_from_pg
-    /// completes (success or failure — see recovery.rs module
-    /// doc). dispatch_ready gates on BOTH is_leader AND this.
-    ///
-    /// Why two flags: the lease loop sets is_leader=true
-    /// IMMEDIATELY on acquire (non-blocking), then fire-and-
-    /// forgets LeaderAcquired. Recovery may take seconds for a
-    /// large DAG. If dispatch gated ONLY on is_leader, it would
-    /// try to dispatch from an incomplete DAG mid-recovery.
-    ///
-    /// Non-K8s mode (always_leader): initialized `true` since
-    /// there's no lease acquisition to trigger recovery. The DAG
-    /// starts empty (as before); no recovery from PG because
-    /// there's no failover.
-    ///
-    /// Relaxed/Release/Acquire: Release on store (handle_leader_
-    /// acquired), Acquire on load (dispatch_ready) so dispatch
-    /// sees all writes from recovery before proceeding. Not
-    /// STRICTLY needed (actor is single-threaded → single-thread
-    /// sequential consistency) but documents the pairing and
-    /// doesn't cost anything.
-    recovery_complete: Arc<AtomicBool>,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -368,15 +333,13 @@ impl DagActor {
             estimator: Estimator::default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
-            generation: plumbing.leader.generation_arc(),
+            leader: plumbing.leader,
             self_tx: None,
             size_classes,
             fetcher_size_classes: cfg.fetcher_size_classes,
             soft_features: cfg.soft_features,
             headroom_mult: cfg.headroom_mult,
             configured_cutoffs,
-            is_leader: plumbing.leader.is_leader_arc(),
-            recovery_complete: plumbing.leader.recovery_complete_arc(),
             hmac_signer: plumbing.hmac_signer,
             shutdown: plumbing.shutdown,
             fod_freeze_since: None,
@@ -695,6 +658,6 @@ impl DagActor {
     /// reader. The reader type has no store/fetch_add methods, so
     /// handle consumers can't accidentally increment.
     pub(crate) fn generation_reader(&self) -> GenerationReader {
-        GenerationReader::new(Arc::clone(&self.generation))
+        GenerationReader::new(self.leader.generation_arc())
     }
 }

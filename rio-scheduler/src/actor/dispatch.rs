@@ -94,9 +94,9 @@ impl DagActor {
         // the three-field transition (generation, is_leader,
         // recovery_complete) is observably ordered even on ARM.
         // A one-pass lag on a single flag is still harmless (see
-        // DagActor.is_leader field doc). In non-K8s mode this is
-        // always true — no-op check.
-        if !self.is_leader.load(std::sync::atomic::Ordering::SeqCst) {
+        // LeaderState struct doc). In non-K8s mode this is always
+        // true — no-op check.
+        if !self.leader.is_leader() {
             return;
         }
         // Also gate on recovery: don't dispatch until recover_from_
@@ -105,10 +105,7 @@ impl DagActor {
         // handle_leader_acquired's SeqCst — sees all recovery
         // writes before proceeding (though actor is single-threaded
         // so this is belt-and-suspenders).
-        if !self
-            .recovery_complete
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !self.leader.recovery_complete() {
             return;
         }
 
@@ -890,7 +887,7 @@ impl DagActor {
         // Acquire pairs with the lease task's Release fetch_add. Sees
         // the generation AND any writes the lease task did before it
         // (is_leader=true, which dispatch_ready checked at loop top).
-        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let generation = self.leader.generation();
 
         // Update DB (non-terminal: log failure, don't block dispatch)
         self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))

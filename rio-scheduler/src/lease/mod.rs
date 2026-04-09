@@ -201,6 +201,43 @@ impl LeaderState {
         Arc::clone(&self.recovery_complete)
     }
 
+    /// Current generation. `Acquire` load — pairs with the `SeqCst`
+    /// `fetch_add` in [`on_acquire`](Self::on_acquire) so a reader
+    /// observing the new generation also sees all prior stores.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Whether we currently hold the lease. `SeqCst` load — see the
+    /// struct doc for the multi-field ordering rationale.
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::SeqCst)
+    }
+
+    /// Whether the actor's `recover_from_pg` has completed since the
+    /// last acquire. `SeqCst` load — pairs with
+    /// [`set_recovery_complete`](Self::set_recovery_complete) and
+    /// [`on_lose`](Self::on_lose).
+    pub fn recovery_complete(&self) -> bool {
+        self.recovery_complete.load(Ordering::SeqCst)
+    }
+
+    /// Mark recovery complete. `SeqCst` store — the actor calls this
+    /// AFTER `recover_from_pg` returns (success or fail-empty); pairs
+    /// with the `SeqCst` load in `dispatch_ready` so dispatch sees all
+    /// recovery writes before proceeding.
+    pub fn set_recovery_complete(&self) {
+        self.recovery_complete.store(true, Ordering::SeqCst);
+    }
+
+    /// Monotonically raise generation to at least `target`. `Release`
+    /// `fetch_max` — defensive against Lease annotation reset
+    /// (`kubectl delete lease` zeros the annotation; PG's high-water
+    /// persists). Returns the previous value.
+    pub fn seed_generation_from(&self, target: u64) -> u64 {
+        self.generation.fetch_max(target, Ordering::Release)
+    }
+
     /// Construct from pre-existing shared Arcs (test fixtures that need
     /// to drive the flags from outside the lease loop).
     #[cfg(test)]

@@ -21,7 +21,7 @@ fn spawn_actor_with_flags(
     let recovery_flag = Arc::new(AtomicBool::new(recovery_complete));
     setup_actor_configured(pool, None, |_, p| {
         p.leader = crate::lease::LeaderState::from_parts(
-            Arc::new(AtomicU64::new(1)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
             leader_flag,
             recovery_flag,
         );

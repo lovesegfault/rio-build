@@ -545,7 +545,7 @@ impl DagActor {
         // returns the PG high-water for us to seed below). So any
         // change between gen_at_entry and gen_now is unambiguously
         // a lease-loop fetch_add — no false positives from PG seeding.
-        let gen_at_entry = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let gen_at_entry = self.leader.generation();
 
         let start = Instant::now();
         let result = self.recover_from_pg().await;
@@ -577,7 +577,7 @@ impl DagActor {
         // so gen_now != gen_at_entry ⇒ lease loop fetch_add'd ⇒ flap.
         // The re-acquire's LeaderAcquired is already queued in our
         // mpsc — discard this recovery, let the next one re-run.
-        let gen_now = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let gen_now = self.leader.generation();
         if gen_now != gen_at_entry {
             warn!(
                 gen_at_entry,
@@ -615,9 +615,7 @@ impl DagActor {
                 // check — this write is deliberate, not a flap.
                 if let Some(max_gen) = pg_max_gen {
                     let target = (max_gen as u64).saturating_add(1);
-                    let prev = self
-                        .generation
-                        .fetch_max(target, std::sync::atomic::Ordering::Release);
+                    let prev = self.leader.seed_generation_from(target);
                     if target > prev {
                         info!(
                             prev_gen = prev,
@@ -646,8 +644,7 @@ impl DagActor {
                         warn!(error = %e, "failed to sweep stale live pins (best-effort)");
                     }
                 }
-                self.recovery_complete
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.leader.set_recovery_complete();
             }
             Err(e) => {
                 // PG failure mid-recovery. Set complete=true
@@ -662,8 +659,7 @@ impl DagActor {
                 // Explicitly re-clear: recovery may have partially
                 // populated before failing.
                 self.clear_persisted_state();
-                self.recovery_complete
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.leader.set_recovery_complete();
             }
         }
     }
