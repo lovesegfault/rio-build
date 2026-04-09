@@ -84,7 +84,17 @@ pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
             host_users: None,
             tls_secret_name: None,
         },
-        classes: vec![],
+        // CEL enforces `size(self.classes) > 0` (I-170); the fixture
+        // ships one default class so unit tests match the apiserver-
+        // admitted shape.
+        classes: vec![
+            rio_crds::common::SizeClassCommon {
+                name: "default".into(),
+                resources: Default::default(),
+                max_concurrent: None,
+            }
+            .into(),
+        ],
     }
 }
 

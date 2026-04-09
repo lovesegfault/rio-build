@@ -54,15 +54,12 @@ pub(super) const FOD_EPHEMERAL_DEADLINE_SECS: i64 = 300;
 /// Reconcile an ephemeral FetcherPool: count active Jobs, poll FOD
 /// queue depth, spawn Jobs if FOD work is waiting.
 ///
-/// Two paths:
-///   - `classes` empty (back-compat): one logical pool, queue signal
-///     is the flat `queued_fod_derivations`.
-///   - `classes` non-empty (P0556, `r[ctrl.fetcherpool.ephemeral-
-///     per-class]`): per-class loop. Queue signal is `GetSizeClass
-///     Status.fod_classes[class.name].queued` (in-flight FOD demand
-///     bucketed by `size_class_floor`); active Jobs counted per class
-///     via `rio.build/pool={class.name}` label; ceiling is `class.
-///     max_replicas` (falling back to `spec.replicas.max`).
+/// Per-class loop (P0556, `r[ctrl.fetcherpool.ephemeral-per-class]`;
+/// CEL enforces `classes` non-empty). Queue signal is `GetSizeClass
+/// Status.fod_classes[class.name].queued` (in-flight FOD demand
+/// bucketed by `size_class_floor`); active Jobs counted per class
+/// via `rio.build/pool={class.name}` label; ceiling is `class.
+/// max_replicas` (falling back to `spec.replicas.max`).
 pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     let JobReconcilePrologue {
         ns,
@@ -74,37 +71,27 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     } = job_reconcile_prologue(fp, ctx)?;
 
     // ── queue signals ───────────────────────────────────────────────
-    // Classed pools need per-class depth from GetSizeClassStatus;
-    // unclassed pools need the flat queued_fod_derivations from
-    // ClusterStatus. Both polled best-effort (scheduler_err recorded
-    // for the SchedulerUnreachable status condition).
+    // Per-class depth from GetSizeClassStatus, with the flat
+    // queued_fod_derivations from ClusterStatus as fallback. Both
+    // polled best-effort (scheduler_err recorded for the
+    // SchedulerUnreachable status condition).
     let (signals, scheduler_err) = fetch_queue_signals(ctx, fp).await;
 
     // ── per-class spawn loop ────────────────────────────────────────
-    // Unclassed → single iteration with class=None.
     let mut total_active = 0i32;
     let mut total_spawned = 0u32;
     let mut total_queued = 0u32;
     let mut total_reaped = 0u32;
-    let class_iter: Vec<Option<&FetcherSizeClass>> = if fp.spec.classes.is_empty() {
-        vec![None]
-    } else {
-        fp.spec.classes.iter().map(Some).collect()
-    };
-    for (idx, class) in class_iter.into_iter().enumerate() {
+    for (idx, class) in fp.spec.classes.iter().enumerate() {
         // r[impl ctrl.fetcherpool.multiarch]
         // pool_name doubles as the `rio.build/pool` label value
         // (executor_labels via executor_params) — per-class active-
         // Job selector. `{fp.name}-{class.name}` so two FetcherPools
         // (per-arch) with the same class don't count each other's
         // Jobs. MUST match executor_params' pool_name derivation.
-        let pool_name = class
-            .map(|c| format!("{name}-{}", c.name))
-            .unwrap_or_else(|| name.clone());
-        let ceiling = class
-            .and_then(|c| c.max_concurrent)
-            .unwrap_or(fp.spec.max_concurrent) as i32;
-        let queued = signals.queued_for(class.map(|c| c.name.as_str()), idx);
+        let pool_name = format!("{name}-{}", class.name);
+        let ceiling = class.max_concurrent.unwrap_or(fp.spec.max_concurrent) as i32;
+        let queued = signals.queued_for(&class.name, idx);
 
         let jobs = jobs_api
             .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool_name}")))
@@ -213,20 +200,16 @@ impl QueueSignals {
         }
     }
 
-    /// Queue depth for one class iteration. `class=None` (unclassed
-    /// pool) → flat. `class=Some(name)` → per-class count; if absent
+    /// Queue depth for one class iteration. Per-class count; if absent
     /// from `by_class` (scheduler doesn't know this class), fall back
     /// to `flat` for the SMALLEST class only (`idx==0`), 0 otherwise —
     /// matches `r[ctrl.fetcherpool.ephemeral-per-class]`'s
     /// over-spawn-smallest posture.
-    fn queued_for(&self, class: Option<&str>, idx: usize) -> u32 {
-        match class {
-            None => self.flat,
-            Some(name) => match self.by_class.get(name) {
-                Some(&q) => q,
-                None if self.by_class.is_empty() && idx == 0 => self.flat,
-                None => 0,
-            },
+    fn queued_for(&self, class: &str, idx: usize) -> u32 {
+        match self.by_class.get(class) {
+            Some(&q) => q,
+            None if self.by_class.is_empty() && idx == 0 => self.flat,
+            None => 0,
         }
     }
 }
@@ -301,15 +284,15 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
 // r[impl ctrl.fetcherpool.ephemeral-per-class]
 pub(super) fn build_job(
     fp: &FetcherPool,
-    class: Option<&FetcherSizeClass>,
+    class: &FetcherSizeClass,
     oref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
     scheduler: &SchedulerAddrs,
     store: &pod::StoreAddrs,
 ) -> Result<Job> {
     let params = executor_params(fp, class)?;
-    // P0556: pool_name (= `rio.build/pool` label) is `class.name` when
-    // classed, `fp.name_any()` when not — set inside executor_params.
-    // Reused for the Job name prefix so logs/metrics group per class.
+    // P0556: pool_name (= `rio.build/pool` label) is `{fp.name}-{class.
+    // name}` — set inside executor_params. Reused for the Job name
+    // prefix so logs/metrics group per class.
     let pool = params.pool_name.clone();
     let labels = pod::executor_labels(&params);
 
@@ -367,6 +350,10 @@ mod tests {
         test_fetcherpool("eph-fp")
     }
 
+    fn cls(fp: &FetcherPool) -> &FetcherSizeClass {
+        &fp.spec.classes[0]
+    }
+
     /// Job carries the fetcher-hardened pod spec (not the builder
     /// one): `RIO_EXECUTOR_KIND=fetcher`, `readOnlyRootFilesystem:
     /// true`, fetcher seccomp.
@@ -374,7 +361,14 @@ mod tests {
     fn build_job_uses_fetcher_params() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(
+            &fp,
+            cls(&fp),
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+        )
+        .unwrap();
         let spec = job.spec.unwrap();
         let pod = spec.template.spec.unwrap();
         let c = &pod.containers[0];
@@ -432,7 +426,14 @@ mod tests {
         let mut fp = test_fp();
         fp.spec.deadline_seconds = Some(900);
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(
+            &fp,
+            cls(&fp),
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+        )
+        .unwrap();
         assert_eq!(job.spec.unwrap().active_deadline_seconds, Some(900));
     }
 
@@ -442,9 +443,19 @@ mod tests {
     fn build_job_labels_include_pool() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(
+            &fp,
+            cls(&fp),
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+        )
+        .unwrap();
         let labels = job.metadata.labels.unwrap();
-        assert_eq!(labels.get(POOL_LABEL).map(String::as_str), Some("eph-fp"));
+        assert_eq!(
+            labels.get(POOL_LABEL).map(String::as_str),
+            Some("eph-fp-default")
+        );
         assert_eq!(
             labels.get("rio.build/role").map(String::as_str),
             Some("fetcher")
@@ -474,14 +485,7 @@ mod tests {
         }
         .into();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(
-            &fp,
-            Some(&class),
-            oref,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-        )
-        .unwrap();
+        let job = build_job(&fp, &class, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         let labels = job.metadata.labels.as_ref().unwrap();
         assert_eq!(
@@ -537,14 +541,7 @@ mod tests {
         }
         .into();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(
-            &fp,
-            Some(&class),
-            oref,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-        )
-        .unwrap();
+        let job = build_job(&fp, &class, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.metadata
                 .labels
@@ -562,7 +559,7 @@ mod tests {
 
     // r[verify ctrl.fetcherpool.ephemeral-per-class]
     /// `QueueSignals::queued_for` routing: per-class count when known;
-    /// flat fallback to smallest only; unclassed → flat.
+    /// flat fallback to smallest only.
     #[test]
     fn queue_signals_routing() {
         // Per-class breakdown known.
@@ -570,11 +567,10 @@ mod tests {
             flat: 5,
             by_class: std::collections::HashMap::from([("tiny".into(), 3), ("small".into(), 2)]),
         };
-        assert_eq!(s.queued_for(Some("tiny"), 0), 3);
-        assert_eq!(s.queued_for(Some("small"), 1), 2);
-        assert_eq!(s.queued_for(None, 0), 5, "unclassed pool → flat");
+        assert_eq!(s.queued_for("tiny", 0), 3);
+        assert_eq!(s.queued_for("small", 1), 2);
         // Class the scheduler doesn't know → 0 (don't double-count).
-        assert_eq!(s.queued_for(Some("huge"), 2), 0);
+        assert_eq!(s.queued_for("huge", 2), 0);
 
         // Breakdown empty (scheduler [[fetcher_size_classes]] off):
         // smallest class falls back to flat, others get 0.
@@ -582,7 +578,7 @@ mod tests {
             flat: 5,
             by_class: std::collections::HashMap::new(),
         };
-        assert_eq!(s.queued_for(Some("tiny"), 0), 5, "smallest gets flat");
-        assert_eq!(s.queued_for(Some("small"), 1), 0, "non-smallest gets 0");
+        assert_eq!(s.queued_for("tiny", 0), 5, "smallest gets flat");
+        assert_eq!(s.queued_for("small", 1), 0, "non-smallest gets 0");
     }
 }

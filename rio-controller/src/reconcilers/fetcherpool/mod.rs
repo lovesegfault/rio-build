@@ -79,17 +79,13 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
 /// Convert `FetcherPool` → `ExecutorPodParams` with fetcher-specific
 /// hardening defaults.
 ///
-/// `class`: overrides `pool_name` suffix, `resources`, and injects
+/// `class`: sets `pool_name` suffix, `resources`, and injects
 /// `RIO_SIZE_CLASS` so the executor reports it in heartbeat
-/// (`r[ctrl.fetcherpool.classes]`). `Option` is vestigial — the CRD
-/// CEL-enforces `size(self.classes) > 0` so callers always pass
-/// `Some`; the `None` arms below are unreachable at runtime.
+/// (`r[ctrl.fetcherpool.classes]`). The CRD CEL-enforces
+/// `size(self.classes) > 0` so every reconcile is per-class.
 /// Security posture (read-only rootfs, seccomp, node placement) is
 /// identical across classes — only resources + size_class env vary.
-fn executor_params(
-    fp: &FetcherPool,
-    class: Option<&FetcherSizeClass>,
-) -> Result<ExecutorPodParams> {
+fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> Result<ExecutorPodParams> {
     // r[impl fetcher.node.dedicated]
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
     // the `rio.build/fetcher=true:NoSchedule` taint + matching
@@ -123,12 +119,8 @@ fn executor_params(
         // RIO_SIZE_CLASS: same env builders use (common/pod.rs reads
         // it from extra_env). The executor copies this into
         // HeartbeatRequest.size_class → ExecutorState.size_class →
-        // hard_filter's size-class match clause. Unclassed pool
-        // (`class=None`) leaves it empty → executor reports
-        // size_class=None → hard_filter passes through (back-compat).
-        extra_env: class
-            .map(|c| vec![pod::env("RIO_SIZE_CLASS", &c.name)])
-            .unwrap_or_default(),
+        // hard_filter's size-class match clause.
+        extra_env: vec![pod::env("RIO_SIZE_CLASS", &class.name)],
         // r[impl ctrl.fetcherpool.multiarch]
         // Per-class pool_name → Job-name prefix
         // `rio-fetcher-{fp}-{class}`.
@@ -140,12 +132,8 @@ fn executor_params(
         // matches builder naming (`rio-builder-x86-64-tiny`).
         // executor_labels reads this for `rio.build/pool` so the
         // per-class headless Service selector and ephemeral
-        // active-Job count stay per-pool. Unclassed (`class=None`)
-        // keeps bare `fp.name_any()` for pre-I-170 back-compat.
-        pool_name: match class {
-            Some(c) => format!("{}-{}", fp.name_any(), c.name),
-            None => fp.name_any(),
-        },
+        // active-Job count stay per-pool.
+        pool_name: format!("{}-{}", fp.name_any(), class.name),
         node_selector,
         tolerations,
         image: fp.spec.image.clone(),
@@ -156,7 +144,7 @@ fn executor_params(
         features: vec![],
         // Per-class resources. CEL enforces classes non-empty, so the
         // legacy single-size `spec.resources` fallback is gone.
-        resources: class.map(|c| c.resources.clone()),
+        resources: Some(class.resources.clone()),
         fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),
         fuse_threads: None,
         // Never privileged — fetchers face the open internet; the
@@ -201,16 +189,20 @@ mod tests {
         fp
     }
 
+    fn cls(fp: &FetcherPool) -> &FetcherSizeClass {
+        &fp.spec.classes[0]
+    }
+
     /// Generated Job pods carry `rio.build/role: fetcher` on the
     /// pod template labels — NetworkPolicies and `kubectl get -l`
     /// target this.
     #[test]
     fn labels_include_fetcher_role() {
         let fp = mk(8);
-        let params = executor_params(&fp, None).unwrap();
+        let params = executor_params(&fp, cls(&fp)).unwrap();
         let labels = pod::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
-        assert_eq!(labels.get("rio.build/pool"), Some(&"test".into()));
+        assert_eq!(labels.get("rio.build/pool"), Some(&"test-default".into()));
     }
 
     /// `readOnlyRootFilesystem: true` + Localhost seccomp =
@@ -218,7 +210,7 @@ mod tests {
     #[test]
     fn security_posture_is_strict() {
         let fp = mk(1);
-        let params = executor_params(&fp, None).unwrap();
+        let params = executor_params(&fp, cls(&fp)).unwrap();
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
         let sp = params.seccomp_profile.as_ref().unwrap();
@@ -234,7 +226,7 @@ mod tests {
     #[test]
     fn node_placement_defaults_to_fetcher_pool() {
         let fp = mk(1);
-        let params = executor_params(&fp, None).unwrap();
+        let params = executor_params(&fp, cls(&fp)).unwrap();
         assert_eq!(
             params
                 .node_selector
@@ -254,7 +246,7 @@ mod tests {
     fn operator_placement_overrides_default() {
         let mut fp = mk(1);
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
-        let params = executor_params(&fp, None).unwrap();
+        let params = executor_params(&fp, cls(&fp)).unwrap();
         assert_eq!(
             params.node_selector.as_ref().unwrap().get("custom"),
             Some(&"yes".into())
@@ -272,7 +264,7 @@ mod tests {
     /// I-170: per-class params carry `RIO_SIZE_CLASS=<name>`, the
     /// per-class resources, and a `{pool}-{class}` pool_name
     /// (→ Job-name prefix `rio-fetcher-{pool}-{class}`). Security
-    /// posture is identical to the unclassed path.
+    /// posture is identical across classes.
     #[test]
     fn per_class_params_set_size_class_and_resources() {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -286,7 +278,7 @@ mod tests {
             max_concurrent: Some(4),
         }
         .into();
-        let params = executor_params(&fp, Some(&class)).unwrap();
+        let params = executor_params(&fp, &class).unwrap();
         // RIO_SIZE_CLASS injected via extra_env (appended after the
         // base env set in the Job pod spec).
         let env: BTreeMap<_, _> = params
@@ -342,7 +334,7 @@ mod tests {
             .spec
             .classes
             .iter()
-            .map(|c| executor_params(&fp, Some(c)).unwrap().pool_name)
+            .map(|c| executor_params(&fp, c).unwrap().pool_name)
             .collect();
         assert_eq!(names, vec!["test-tiny", "test-small"]);
     }
@@ -365,26 +357,13 @@ mod tests {
         let mut arm = mk(8);
         arm.metadata.name = Some("aarch64".into());
 
-        let n = |fp: &FetcherPool| executor_params(fp, Some(&class)).unwrap().pool_name;
+        let n = |fp: &FetcherPool| executor_params(fp, &class).unwrap().pool_name;
         assert_eq!(n(&x86), "x86-64-tiny");
         assert_eq!(n(&arm), "aarch64-tiny");
         assert_ne!(n(&x86), n(&arm), "per-arch pools must not collide");
         // Max length headroom: job_name `rio-fetcher-aarch64-small-abcdef`
         // = 32 chars; RFC 1123 limit is 63.
         assert!(pod::job_name(&n(&arm), ExecutorKind::Fetcher, "abcdef").len() < 63);
-    }
-
-    /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare
-    /// pool_name. Back-compat with pre-I-170 FetcherPools.
-    #[test]
-    fn unclassed_params_no_size_class_env() {
-        let fp = mk(8);
-        let params = executor_params(&fp, None).unwrap();
-        assert!(
-            params.extra_env.is_empty(),
-            "unclassed → executor reports size_class=None → hard_filter passes through"
-        );
-        assert_eq!(params.pool_name, "test");
     }
 
     /// Job name is `rio-{role}-{pool}-{suffix}` (I-104) — pool name
