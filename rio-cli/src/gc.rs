@@ -7,7 +7,7 @@
 //! sweeps (mark phase on a large store can take minutes).
 //!
 //! Separate module (not inline in `main.rs`) — same convention as
-//! `cutoffs.rs`/`wps.rs`: keep `main.rs` deltas to enum variant +
+//! `cutoffs.rs`/`bps.rs`: keep `main.rs` deltas to enum variant +
 //! match arm + mod decl only.
 
 use anyhow::anyhow;

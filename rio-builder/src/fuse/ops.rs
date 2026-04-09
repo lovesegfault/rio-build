@@ -215,9 +215,9 @@ impl Filesystem for NixStoreFs {
             //
             // Hermeticity bonus: builds cannot read store paths outside
             // their declared inputs (ENOENT, same as on a clean machine
-            // — except for paths an earlier build on this STS pod left
-            // in cache_dir, which the local-disk fast path above
-            // returned before reaching here).
+            // — except for paths already present in cache_dir, which
+            // the local-disk fast path above returned before reaching
+            // here).
             match self.cache.jit_classify(name_str) {
                 JitClass::NotInput => {
                     metrics::counter!(

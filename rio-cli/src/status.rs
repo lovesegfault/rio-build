@@ -6,7 +6,7 @@
 //! asserts against (`jq -e '.total_executors'`).
 //!
 //! Separate module (not inline in `main.rs`) — same convention as
-//! `cutoffs.rs`/`wps.rs`: keep `main.rs` deltas to enum variant +
+//! `cutoffs.rs`/`bps.rs`: keep `main.rs` deltas to enum variant +
 //! match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;

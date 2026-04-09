@@ -85,8 +85,8 @@ pub struct BpStatus {
 pub struct FpStatus {
     name: String,
     ready: i32,
-    /// `status.desiredReplicas` — what the autoscaler set on the
-    /// STS (or `spec.replicas.min` before first reconcile).
+    /// `status.desiredReplicas` — what the autoscaler last reconciled
+    /// (or `spec.replicas.min` before first reconcile).
     desired: i32,
     max: i32,
 }
@@ -711,7 +711,8 @@ fn render_human(r: &Report) {
 
     for ns in &r.namespaces {
         // Skip empty namespaces (rio-builders/rio-fetchers only have
-        // STS pods, which show under BuilderPools/FetcherPools below).
+        // ephemeral Job pods, which show under BuilderPools/FetcherPools
+        // below).
         if ns.deployments.is_empty() && ns.daemonsets.is_empty() && ns.problem_pods.is_empty() {
             continue;
         }

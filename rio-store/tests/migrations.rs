@@ -186,3 +186,58 @@ fn migration_checksums_frozen() {
         );
     }
 }
+
+/// Cross-service schema contract: column shapes that rio-store reads
+/// from tables that rio-SCHEDULER owns/writes.
+///
+/// rio-store's GC reads `scheduler_live_pins` directly (`gc/mark.rs`,
+/// `gc/sweep.rs`), and cache-server auth + GC quotas read `tenants`
+/// (`cache_server/auth.rs`, `gc/tenant.rs`). The contract between the
+/// two services is a Postgres table shape with no compile-time
+/// enforcement — a column rename or type change in a scheduler-side
+/// migration breaks store at RUNTIME only. This test asserts the exact
+/// (column, type) tuples rio-store's inline SQL relies on, so a
+/// scheduler-side migration that breaks store fails CI here instead of
+/// in production.
+///
+/// If this test fails after you wrote a migration: either keep the old
+/// column shape (add a view, or rename back), or update BOTH the
+/// rio-store query sites listed above AND this contract table.
+#[tokio::test]
+async fn cross_service_schema_contract() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // (table, column, udt_name) tuples rio-store reads. udt_name is
+    // PG's underlying type name (text/uuid/int4/int8) — more stable
+    // than data_type for assertions.
+    #[rustfmt::skip]
+    const STORE_READS: &[(&str, &str, &str)] = &[
+        // gc/mark.rs ROOTS_SQL (UNION arm), gc/sweep.rs RECHECK_SQL
+        ("scheduler_live_pins", "store_path_hash", "bytea"),
+        // cache_server/auth.rs token lookup
+        ("tenants", "tenant_id",          "uuid"),
+        ("tenants", "tenant_name",        "text"),
+        ("tenants", "cache_token",        "text"),
+        // gc/tenant.rs quota lookup
+        ("tenants", "gc_max_store_bytes", "int8"),
+    ];
+
+    for &(table, col, want_udt) in STORE_READS {
+        let got: Option<String> = sqlx::query_scalar(
+            "SELECT udt_name FROM information_schema.columns \
+             WHERE table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(col)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(want_udt),
+            "cross-service contract broken: rio-store reads {table}.{col} as {want_udt}, \
+             but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, cache_server/auth.rs, \
+             gc/tenant.rs for the dependent queries",
+        );
+    }
+}

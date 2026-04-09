@@ -8,7 +8,7 @@
 //! merge).
 //!
 //! Separate module (not inline in `main.rs`) — same convention as
-//! `gc.rs`/`status.rs`/`wps.rs`: keep `main.rs` deltas to enum
+//! `gc.rs`/`status.rs`/`bps.rs`: keep `main.rs` deltas to enum
 //! variant + match arm + mod decl only.
 
 use clap::Subcommand;

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info};
 
+use rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS;
 use rio_proto::ChunkServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
@@ -177,11 +178,6 @@ impl Default for Config {
 /// drove `acquired_after_secs=16` on QueryPathInfo. The query is a PK
 /// lookup; the bottleneck is connection acquisition.
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
-
-/// Default aws-sdk retry ceiling. aws-sdk's out-of-box default is 3;
-/// 10 gives headroom for S3-compatible backends that close idle
-/// connections aggressively (each reconnect is one attempt).
-const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Parser, Serialize, Default)]
 #[command(

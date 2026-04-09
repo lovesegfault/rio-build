@@ -813,7 +813,8 @@ let
           # exec`. Probe from the VM host instead: the worker's cgroup-ns
           # scopes its OWN /sys/fs/cgroup view, but the HOST sees the full
           # kubepods.slice/... tree. Same leaf dirname, longer path.
-          # Resolve which node the pod is on (STS may schedule to either).
+          # Resolve which node the pod is on (the Job pod may schedule
+          # to either).
           #
           # timeout=120: dispatch-lag variance (flannel subnet race
           # observed 2026-03-16 delaying worker pod start).

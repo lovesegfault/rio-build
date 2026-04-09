@@ -93,15 +93,15 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
     // namespace is wrong / no BPS applied yet (distinguishes "no
     // output = tool failed" from "no output = nothing to show").
     println!("{:<24} {:<8} CHILDREN", "NAME", "CLASSES");
-    for wps in &list.items {
-        let name = wps.name_any();
+    for bps in &list.items {
+        let name = bps.name_any();
         // Child names derived, not fetched from status — status may
         // not exist yet (fresh BPS, reconciler hasn't populated
         // .status.classes[].child_pool). The naming convention
         // (`{bps}-{class.name}`) is canonical (P0233's reconciler
         // uses it; builderpoolset.rs ClassStatus.child_pool just
         // memoizes the same formula).
-        let children: Vec<String> = wps
+        let children: Vec<String> = bps
             .spec
             .classes
             .iter()
@@ -110,7 +110,7 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
         println!(
             "{:<24} {:<8} {}",
             name,
-            wps.spec.classes.len(),
+            bps.spec.classes.len(),
             children.join(",")
         );
     }
@@ -122,10 +122,10 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow::Result<()> {
-    let wps_api: Api<BuilderPoolSet> = Api::namespaced(client.clone(), ns);
+    let bps_api: Api<BuilderPoolSet> = Api::namespaced(client.clone(), ns);
     let wp_api: Api<BuilderPool> = Api::namespaced(client, ns);
 
-    let wps = wps_api
+    let bps = bps_api
         .get(name)
         .await
         .map_err(|e| anyhow::anyhow!("get BuilderPoolSet {ns}/{name}: {e}"))?;
@@ -137,9 +137,9 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     // missing/not-yet-reconciled child (`get_opt` → Ok(None)) degrades
     // that ONE class's row to "-/-" rather than failing the whole
     // describe.
-    let mut rows = Vec::with_capacity(wps.spec.classes.len());
-    for class in &wps.spec.classes {
-        let child_name = format!("{}-{}", wps.name_any(), class.name);
+    let mut rows = Vec::with_capacity(bps.spec.classes.len());
+    for class in &bps.spec.classes {
+        let child_name = format!("{}-{}", bps.name_any(), class.name);
         // `get_opt` — child may not exist yet (Ok(None) → -/-);
         // 403 → warn to stderr but still render the row (RBAC
         // misconfig is per-verb, the BPS get above already worked);
@@ -194,17 +194,17 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
 
     if as_json {
         return crate::json(&DescribeJson {
-            name: &wps.name_any(),
+            name: &bps.name_any(),
             namespace: ns,
             classes: rows.iter().map(ClassJson::from).collect(),
-            status: wps
+            status: bps
                 .status
                 .as_ref()
                 .map(|s| s.classes.iter().map(StatusClassJson::from).collect()),
         });
     }
 
-    println!("Name:      {}", wps.name_any());
+    println!("Name:      {}", bps.name_any());
     println!("Namespace: {ns}");
     println!("Classes:");
     for row in &rows {
@@ -227,7 +227,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     // + child REPLICA counts; Status shows EFFECTIVE cutoffs (post-
     // rebalancer EMA) + queue depth. An operator reading both sees
     // "configured=60s, effective=47.2s" → the rebalancer has drifted.
-    if let Some(st) = &wps.status {
+    if let Some(st) = &bps.status {
         println!("Status:");
         for cs in &st.classes {
             println!(
@@ -274,9 +274,9 @@ struct GetRowJson<'a> {
 }
 
 impl<'a> From<&'a BuilderPoolSet> for GetRowJson<'a> {
-    fn from(wps: &'a BuilderPoolSet) -> Self {
-        let name = wps.name_any();
-        let children = wps
+    fn from(bps: &'a BuilderPoolSet) -> Self {
+        let name = bps.name_any();
+        let children = bps
             .spec
             .classes
             .iter()
@@ -284,7 +284,7 @@ impl<'a> From<&'a BuilderPoolSet> for GetRowJson<'a> {
             .collect();
         Self {
             name,
-            classes: wps.spec.classes.iter().map(|c| c.name.as_str()).collect(),
+            classes: bps.spec.classes.iter().map(|c| c.name.as_str()).collect(),
             children,
         }
     }
@@ -357,7 +357,7 @@ mod tests {
     //!
     //! Unit tests here rather than in `tests/smoke.rs`: smoke.rs
     //! invokes rio-cli as a subprocess via CARGO_BIN_EXE, and the
-    //! `wps` subcommand constructs its kube::Client from kubeconfig/
+    //! `bps` subcommand constructs its kube::Client from kubeconfig/
     //! in-cluster. There's no way to inject a mock apiserver into a
     //! subprocess binary without standing up an actual HTTPS listener
     //! that mimics the K8s API surface. Calling `describe()` directly
@@ -369,10 +369,10 @@ mod tests {
     use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
     /// Minimal BuilderPoolSet JSON with one `small` class. Just enough
-    /// that `describe()`'s `wps_api.get(name)` succeeds and the
+    /// that `describe()`'s `bps_api.get(name)` succeeds and the
     /// per-class loop iterates once (one child WP fetch). `resources:
     /// {}` is fine — `ResourceRequirements` has all-Option fields.
-    fn wps_body() -> String {
+    fn bps_body() -> String {
         serde_json::json!({
             "apiVersion": "rio.build/v1alpha1",
             "kind": "BuilderPoolSet",
@@ -410,10 +410,10 @@ mod tests {
     /// created the child yet" case — the whole point of `get_opt` over
     /// `get` (which would turn 404 into `Err`).
     #[tokio::test]
-    async fn wps_describe_404_renders_ok() {
+    async fn bps_describe_404_renders_ok() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", bps_body()),
             Scenario {
                 method: Method::GET,
                 path_contains: "/builderpools/test-bps-small",
@@ -439,10 +439,10 @@ mod tests {
     /// status is unavailable. Bailing here would hide the half of
     /// the picture that IS visible.
     #[tokio::test]
-    async fn wps_describe_403_warns_not_swallows() {
+    async fn bps_describe_403_warns_not_swallows() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", bps_body()),
             Scenario {
                 method: Method::GET,
                 path_contains: "/builderpools/test-bps-small",
@@ -487,10 +487,10 @@ mod tests {
     /// check apiserver health, not wait for a reconcile that isn't
     /// the problem.
     #[tokio::test]
-    async fn wps_describe_500_bails() {
+    async fn bps_describe_500_bails() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", bps_body()),
             Scenario {
                 method: Method::GET,
                 path_contains: "/builderpools/test-bps-small",
