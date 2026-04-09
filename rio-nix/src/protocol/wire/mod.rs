@@ -33,6 +33,9 @@ pub enum WireError {
     #[error("collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}")]
     CollectionTooLarge(u64),
 
+    #[error("non-zero padding byte after {0}-byte string")]
+    NonZeroPadding(usize),
+
     #[error("invalid UTF-8 in string")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
 
@@ -54,6 +57,10 @@ pub fn padding_len(len: usize) -> usize {
     let rem = len % PADDING;
     if rem == 0 { 0 } else { PADDING - rem }
 }
+
+/// Zero-filled padding source for writers. Slicing `&ZERO_PAD[..n]` yields
+/// `n` zero bytes (n < 8); shared with the sync NAR encoder.
+pub const ZERO_PAD: [u8; 8] = [0u8; 8];
 
 // ---------------------------------------------------------------------------
 // Reading
@@ -85,11 +92,15 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
 
-    // Skip padding bytes. read_exact on a 0-byte slice is a no-op,
-    // so no need to guard on pad > 0.
+    // Consume and VALIDATE padding bytes. Nix C++ `readPadding`
+    // (serialise.cc) throws on non-zero; accepting garbage would let a
+    // malformed encoder go unnoticed until a stricter peer rejects it.
     let pad = padding_len(len);
     let mut pad_buf = [0u8; 8]; // max padding is 7
     r.read_exact(&mut pad_buf[..pad]).await?;
+    if pad_buf[..pad].iter().any(|&b| b != 0) {
+        return Err(WireError::NonZeroPadding(len));
+    }
 
     Ok(buf)
 }
@@ -158,7 +169,7 @@ pub async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Resul
 
         // write_all on a 0-byte slice is a no-op, so no pad > 0 guard.
         let pad = padding_len(data.len());
-        w.write_all(&[0u8; 8][..pad]).await?;
+        w.write_all(&ZERO_PAD[..pad]).await?;
     }
 
     Ok(())
@@ -407,6 +418,25 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let result = read_bytes(&mut reader).await;
         assert!(matches!(result, Err(WireError::StringTooLong(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_bytes_rejects_nonzero_padding() -> anyhow::Result<()> {
+        // len=1, data="x", pad=7 with a non-zero byte.
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 1).await?;
+        buf.push(b'x');
+        buf.extend_from_slice(&[0, 0, 0, 0xff, 0, 0, 0]);
+        let result = read_bytes(&mut Cursor::new(buf)).await;
+        assert!(matches!(result, Err(WireError::NonZeroPadding(1))));
+
+        // All-zero padding still accepted.
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 1).await?;
+        buf.push(b'x');
+        buf.extend_from_slice(&[0; 7]);
+        assert_eq!(read_bytes(&mut Cursor::new(buf)).await?, b"x");
         Ok(())
     }
 
