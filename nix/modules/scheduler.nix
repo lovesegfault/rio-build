@@ -5,6 +5,7 @@
 }:
 let
   cfg = config.services.rio.scheduler;
+  rioLib = import ./_common.nix { inherit lib config; };
 in
 {
   imports = [ ./common.nix ];
@@ -34,11 +35,7 @@ in
       '';
     };
 
-    metricsAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:9091";
-      description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
-    };
+    metricsAddr = rioLib.mkMetricsOption 9091;
 
     tickIntervalSecs = lib.mkOption {
       type = lib.types.ints.positive;
@@ -129,18 +126,15 @@ in
       text = cfg.extraConfig;
     };
 
-    systemd.services.rio-scheduler = {
+    systemd.services.rio-scheduler = rioLib.mkRioService {
+      binary = "rio-scheduler";
       description = "rio-scheduler DAG-aware build scheduler";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "network-online.target"
+      extraAfter = [
         "postgresql.service"
         # Store connection is non-fatal (scheduler warns + disables cache check),
         # but starting after store is still the common-case ordering.
         "rio-store.service"
       ];
-      wants = [ "network-online.target" ];
-
       # Env var naming: figment strips `RIO_` then lowercases to match
       # the Config field. `RIO_LISTEN_ADDR` -> `listen_addr`, etc.
       environment = {
@@ -150,7 +144,6 @@ in
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
         RIO_LOG_S3_PREFIX = cfg.logS3Prefix;
-        RIO_LOG_FORMAT = config.services.rio.logFormat;
       }
       // lib.optionalAttrs (cfg.logS3Bucket != null) {
         RIO_LOG_S3_BUCKET = cfg.logS3Bucket;
@@ -177,12 +170,6 @@ in
           KUBECONFIG = cfg.lease.kubeconfigPath;
         }
       );
-
-      serviceConfig = {
-        ExecStart = "${config.services.rio.package}/bin/rio-scheduler";
-        Restart = "on-failure";
-        RestartSec = "5s";
-      };
     };
   };
 }

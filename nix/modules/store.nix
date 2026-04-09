@@ -5,6 +5,7 @@
 }:
 let
   cfg = config.services.rio.store;
+  rioLib = import ./_common.nix { inherit lib config; };
 in
 {
   imports = [ ./common.nix ];
@@ -26,11 +27,7 @@ in
       '';
     };
 
-    metricsAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:9092";
-      description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
-    };
+    metricsAddr = rioLib.mkMetricsOption 9092;
 
     cacheHttpAddr = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
@@ -90,15 +87,10 @@ in
     environment.etc."rio/store.toml" = lib.mkIf (cfg.extraConfig != "") {
       text = cfg.extraConfig;
     };
-    systemd.services.rio-store = {
+    systemd.services.rio-store = rioLib.mkRioService {
+      binary = "rio-store";
       description = "rio-store NAR content-addressable store";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "network-online.target"
-        "postgresql.service"
-      ];
-      wants = [ "network-online.target" ];
-
+      extraAfter = [ "postgresql.service" ];
       # Env var naming: figment strips `RIO_` prefix then lowercases to
       # match the Config struct field name (e.g. RIO_LISTEN_ADDR ->
       # `listen_addr`). Each rio binary runs as its own process with its
@@ -108,7 +100,6 @@ in
         RIO_LISTEN_ADDR = cfg.listenAddr;
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
-        RIO_LOG_FORMAT = config.services.rio.logFormat;
       }
       // lib.optionalAttrs (cfg.cacheHttpAddr != null) {
         RIO_CACHE_HTTP_ADDR = cfg.cacheHttpAddr;
@@ -121,11 +112,7 @@ in
         # keeps it as the literal runtime path.
         RIO_SIGNING_KEY_PATH = toString cfg.signingKeyFile;
       };
-
       serviceConfig = {
-        ExecStart = "${config.services.rio.package}/bin/rio-store";
-        Restart = "on-failure";
-        RestartSec = "5s";
         # StateDirectory creates /var/lib/rio/store with proper
         # ownership. Filesystem chunk backend base_dir should point
         # under here (or a separate mount). The chunks/ subdir is

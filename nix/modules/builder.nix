@@ -6,6 +6,7 @@
 }:
 let
   cfg = config.services.rio.worker;
+  rioLib = import ./_common.nix { inherit lib config; };
 in
 {
   imports = [ ./common.nix ];
@@ -69,11 +70,7 @@ in
       '';
     };
 
-    metricsAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:9093";
-      description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
-    };
+    metricsAddr = rioLib.mkMetricsOption 9093;
 
     sizeClass = lib.mkOption {
       type = lib.types.str;
@@ -101,100 +98,97 @@ in
     # `user_allow_other`. This option sets that flag.
     programs.fuse.userAllowOther = true;
 
-    systemd.services.rio-builder = {
-      description = "rio-builder build executor with FUSE store";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
-      # The builder is one-shot and exits cleanly per build; systemd
-      # respawns it (Restart=always below). Default StartLimitBurst=5
-      # in 10s trips under fanout (50 builds → ~13 rapid restarts per
-      # worker). Must be at the unit level — `StartLimitIntervalSec`
-      # in [Service] is silently ignored since systemd 230.
-      startLimitIntervalSec = 0;
+    systemd.services.rio-builder =
+      rioLib.mkRioService {
+        binary = "rio-builder";
+        description = "rio-builder build executor with FUSE store";
+        # Env var naming: figment strips `RIO_` then lowercases to match
+        # the Config field; `__` nests. `RIO_STORE__ADDR` -> `store.addr`.
+        environment = {
+          RIO_SCHEDULER__ADDR = cfg.schedulerAddr;
+          RIO_STORE__ADDR = cfg.storeAddr;
+          RIO_FUSE_MOUNT_POINT = cfg.fuseMountPoint;
+          RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
+          RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
+          RIO_METRICS_ADDR = cfg.metricsAddr;
+        }
+        // lib.optionalAttrs (cfg.sizeClass != "") {
+          RIO_SIZE_CLASS = cfg.sizeClass;
+        }
+        // lib.optionalAttrs (cfg.workerId != null) {
+          RIO_EXECUTOR_ID = cfg.workerId;
+        };
+        serviceConfig = {
+          # The worker runs as root (no User=), so CAP_SYS_ADMIN is already
+          # available for FUSE mount, overlayfs, and CLONE_NEWNS in pre_exec.
+          # We do NOT narrow CapabilityBoundingSet: the spawned `nix-daemon
+          # --stdio` child inherits the bounding set, and its sandbox setup
+          # needs CAP_SETUID/SETGID (nixbld users), CAP_CHOWN (output ownership),
+          # CAP_SYS_CHROOT (sandbox chroot), CAP_MKNOD (/dev nodes), etc.
+          # Allow opening /dev/fuse (device cgroup allowlist; DevicePolicy=auto
+          # so pseudo-devices like /dev/null are always allowed).
+          DeviceAllow = [ "/dev/fuse rw" ];
 
-      # nix-daemon --stdio must be on PATH. fuse3 provides fusermount3,
-      # required by the fuser crate's MountOption::AutoUnmount.
-      path = [
-        config.nix.package
-        pkgs.fuse3
-      ];
-
-      # Env var naming: figment strips `RIO_` then lowercases to match
-      # the Config field; `__` nests. `RIO_STORE__ADDR` -> `store.addr`.
-      environment = {
-        RIO_SCHEDULER__ADDR = cfg.schedulerAddr;
-        RIO_STORE__ADDR = cfg.storeAddr;
-        RIO_FUSE_MOUNT_POINT = cfg.fuseMountPoint;
-        RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
-        RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
-        RIO_METRICS_ADDR = cfg.metricsAddr;
-        RIO_LOG_FORMAT = config.services.rio.logFormat;
+          # cgroup v2 per-build resource tracking. The worker creates a
+          # sub-cgroup per build and moves the spawned nix-daemon into
+          # it. memory.peak + polled cpu.stat give tree-wide peak memory
+          # and CPU. Per-PID VmHWM would only capture nix-daemon's own
+          # RSS (~10MB) — the builder is a fork()ed child whose footprint
+          # never appears there.
+          #
+          # Delegate=yes: grants the service ownership of its cgroup
+          # subtree. Without this, cgroup.subtree_control writes fail
+          # EACCES and the worker DIES AT STARTUP (cgroup v2 is a hard
+          # requirement — no broken-metrics fallback).
+          #
+          # DelegateSubgroup=builds: systemd v254+. cgroup v2 forbids a
+          # cgroup having BOTH processes AND sub-cgroups with enabled
+          # controllers (the "no internal processes" rule). This makes
+          # systemd run the worker in a `builds/` SUB-cgroup of the
+          # service cgroup, leaving the service cgroup EMPTY.
+          #
+          # The worker's delegated_root() reads /proc/self/cgroup (which
+          # points to `.../builds/`) and returns the PARENT
+          # (`.../rio-builder.service/`). Per-build cgroups are created
+          # there as SIBLINGS of `builds/` — the service cgroup is
+          # empty, so enabling +memory +cpu on it succeeds; `builds/`
+          # has the worker process but no controller-enabled children
+          # (per-build cgroups are not under it). No rule violation.
+          #
+          # /sys/fs/cgroup/system.slice/rio-builder.service/:
+          #   cgroup.subtree_control  ← worker writes "+memory +cpu" (EMPTY cgroup: no EBUSY)
+          #   builds/                 ← DelegateSubgroup; worker PID lives here
+          #   <drv-hash>/             ← per-build SIBLING (nix-daemon PID → forks builder)
+          #     memory.peak           ← tree-wide peak, read at build end
+          #     cpu.stat              ← tree-wide cumulative, polled 1Hz
+          Delegate = "yes";
+          DelegateSubgroup = "builds";
+          # The builder is one-shot: exits cleanly after completing a
+          # build. systemd respawns it for the next assignment — same
+          # role the k8s controller plays with Jobs. Also covers startup
+          # races (scheduler not ready → connect refused → exit).
+          Restart = "always";
+          RestartSec = "1s";
+          # Unmount FUSE on shutdown (best-effort; the fuser background session
+          # holds it, but the kernel detaches on process exit anyway).
+          ExecStopPost = "-${pkgs.util-linux}/bin/umount -l ${cfg.fuseMountPoint}";
+        };
       }
-      // lib.optionalAttrs (cfg.sizeClass != "") {
-        RIO_SIZE_CLASS = cfg.sizeClass;
-      }
-      // lib.optionalAttrs (cfg.workerId != null) {
-        RIO_EXECUTOR_ID = cfg.workerId;
-      };
+      // {
+        # The builder is one-shot and exits cleanly per build; systemd
+        # respawns it (Restart=always below). Default StartLimitBurst=5
+        # in 10s trips under fanout (50 builds → ~13 rapid restarts per
+        # worker). Must be at the unit level — `StartLimitIntervalSec`
+        # in [Service] is silently ignored since systemd 230.
+        startLimitIntervalSec = 0;
 
-      serviceConfig = {
-        ExecStart = "${config.services.rio.package}/bin/rio-builder";
-        # The worker runs as root (no User=), so CAP_SYS_ADMIN is already
-        # available for FUSE mount, overlayfs, and CLONE_NEWNS in pre_exec.
-        # We do NOT narrow CapabilityBoundingSet: the spawned `nix-daemon
-        # --stdio` child inherits the bounding set, and its sandbox setup
-        # needs CAP_SETUID/SETGID (nixbld users), CAP_CHOWN (output ownership),
-        # CAP_SYS_CHROOT (sandbox chroot), CAP_MKNOD (/dev nodes), etc.
-        # Allow opening /dev/fuse (device cgroup allowlist; DevicePolicy=auto
-        # so pseudo-devices like /dev/null are always allowed).
-        DeviceAllow = [ "/dev/fuse rw" ];
-
-        # cgroup v2 per-build resource tracking. The worker creates a
-        # sub-cgroup per build and moves the spawned nix-daemon into
-        # it. memory.peak + polled cpu.stat give tree-wide peak memory
-        # and CPU. Per-PID VmHWM would only capture nix-daemon's own
-        # RSS (~10MB) — the builder is a fork()ed child whose footprint
-        # never appears there.
-        #
-        # Delegate=yes: grants the service ownership of its cgroup
-        # subtree. Without this, cgroup.subtree_control writes fail
-        # EACCES and the worker DIES AT STARTUP (cgroup v2 is a hard
-        # requirement — no broken-metrics fallback).
-        #
-        # DelegateSubgroup=builds: systemd v254+. cgroup v2 forbids a
-        # cgroup having BOTH processes AND sub-cgroups with enabled
-        # controllers (the "no internal processes" rule). This makes
-        # systemd run the worker in a `builds/` SUB-cgroup of the
-        # service cgroup, leaving the service cgroup EMPTY.
-        #
-        # The worker's delegated_root() reads /proc/self/cgroup (which
-        # points to `.../builds/`) and returns the PARENT
-        # (`.../rio-builder.service/`). Per-build cgroups are created
-        # there as SIBLINGS of `builds/` — the service cgroup is
-        # empty, so enabling +memory +cpu on it succeeds; `builds/`
-        # has the worker process but no controller-enabled children
-        # (per-build cgroups are not under it). No rule violation.
-        #
-        # /sys/fs/cgroup/system.slice/rio-builder.service/:
-        #   cgroup.subtree_control  ← worker writes "+memory +cpu" (EMPTY cgroup: no EBUSY)
-        #   builds/                 ← DelegateSubgroup; worker PID lives here
-        #   <drv-hash>/             ← per-build SIBLING (nix-daemon PID → forks builder)
-        #     memory.peak           ← tree-wide peak, read at build end
-        #     cpu.stat              ← tree-wide cumulative, polled 1Hz
-        Delegate = "yes";
-        DelegateSubgroup = "builds";
-        # The builder is one-shot: exits cleanly after completing a
-        # build. systemd respawns it for the next assignment — same
-        # role the k8s controller plays with Jobs. Also covers startup
-        # races (scheduler not ready → connect refused → exit).
-        Restart = "always";
-        RestartSec = "1s";
-        # Unmount FUSE on shutdown (best-effort; the fuser background session
-        # holds it, but the kernel detaches on process exit anyway).
-        ExecStopPost = "-${pkgs.util-linux}/bin/umount -l ${cfg.fuseMountPoint}";
+        # nix-daemon --stdio must be on PATH. fuse3 provides fusermount3,
+        # required by the fuser crate's MountOption::AutoUnmount.
+        path = [
+          config.nix.package
+          pkgs.fuse3
+        ];
       };
-    };
 
     # Ensure /var/rio/* directories exist (worker creates them too, but this
     # runs earlier and sets correct permissions). Also create the bind-mount
