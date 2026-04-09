@@ -893,8 +893,7 @@ impl DagActor {
     /// failure. The worker may have completed successfully and we just
     /// never heard about it (I-032). Penalizing the executor_id would
     /// recreate the very dead-capacity problem this drain exists to
-    /// fix — `failed_builders` is keyed by executor_id (StatefulSet
-    /// pod name), stable across restarts.
+    /// fix.
     pub(super) async fn drain_phantoms(&mut self, phantoms: Vec<DrvHash>) {
         for phantom in phantoms {
             let Some(state) = self.dag.node_mut(&phantom) else {

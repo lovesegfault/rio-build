@@ -55,8 +55,8 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
    │  cgroup v2 per-build resource tracking       │
    └──────────────────────────────────────────────┘
 
-   rio-controller (K8s operator): BuilderPool/FetcherPool CRDs, StatefulSet
-   reconciliation, autoscaling, drain-aware termination.
+   rio-controller (K8s operator): BuilderPool/FetcherPool CRDs, one-shot Job
+   reconciliation, demand-driven autoscaling, drain-aware termination.
 ```
 
 ## Status

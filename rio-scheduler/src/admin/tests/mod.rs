@@ -487,8 +487,8 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
         "the first drv is in-flight (Assigned)"
     );
 
-    // Second drv: should NOT dispatch. Worker has capacity (1/4 slots
-    // used) but has_capacity() now returns false (draining).
+    // Second drv: should NOT dispatch. Worker is busy with first drv
+    // AND draining → has_capacity() false.
     let _ev2 =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
 

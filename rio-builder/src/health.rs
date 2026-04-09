@@ -58,7 +58,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "before first heartbeat: not ready; StatefulSet rollout waits"
+            "before first heartbeat: not ready; Job pod not yet dispatchable"
         );
 
         // Heartbeat succeeded → READY.

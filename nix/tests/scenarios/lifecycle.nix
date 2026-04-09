@@ -2071,8 +2071,8 @@ let
       #
       # Proves end-to-end what manifest_tests.rs CAN'T (pure-function
       # only — no apiserver):
-      #   - apply() branches on spec.sizing=Manifest (mod.rs:361) — no
-      #     STS, dispatches to reconcile_manifest
+      #   - apply() branches on spec.sizing=Manifest — dispatches to
+      #     reconcile_manifest (no StatefulSet path)
       #   - reconcile_manifest polls GetCapacityManifest + ClusterStatus,
       #     computes cold_start deficit, spawns a Job (manifest.rs:
       #     298 — jobs_api.create succeeds, not the dark error path)
@@ -2137,10 +2137,10 @@ let
               "EOF"
           )
 
-          # ── No StatefulSet (sizing=Manifest branches before STS) ──────
-          # mod.rs:361 checks sizing==Manifest BEFORE the STS/Service/PDB
-          # block. One reconcile tick (~3s with kube-runtime's fast CRD
-          # watch), then assert. STS would be named `manifest-workers`.
+          # ── No StatefulSet ────────────────────────────────────────────
+          # Regression guard: the reconciler creates Jobs only. One
+          # reconcile tick (~3s with kube-runtime's fast CRD watch), then
+          # assert. STS would be named `manifest-workers`.
           import time
           time.sleep(3)
           k3s_server.fail(

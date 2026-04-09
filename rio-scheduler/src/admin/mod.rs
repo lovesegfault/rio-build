@@ -170,12 +170,11 @@ impl AdminService for AdminServiceImpl {
 
     /// Cluster-wide counts for the controller's autoscaling loop.
     ///
-    /// The controller computes `desired_replicas = queued_derivations /
-    /// target_value` (clamped to `[min, max]`) and patches the worker
-    /// StatefulSet. `queued_derivations` is the primary signal — that's
-    /// how many ready-to-build derivations are waiting for worker slots.
-    /// `running_derivations` is secondary (for "scale-down is safe when
-    /// queue=0 AND running is below capacity").
+    /// The controller spawns one-shot Jobs up to `max_concurrent` from
+    /// `queued_derivations`. `queued_derivations` is the primary signal —
+    /// that's how many ready-to-build derivations are waiting for a
+    /// worker. `running_derivations` is secondary (for "scale-down is
+    /// safe when queue=0 AND running is below capacity").
     ///
     /// `store_size_bytes` is a cached value from the 60s background
     /// refresh task — NOT a live PG query (this endpoint is on the
