@@ -5,6 +5,17 @@
 //! directly — every other callsite MUST go through these wrappers so
 //! output is captured/suspended and doesn't land on the spinner line.
 //! Enforced by clippy disallowed-methods.
+//!
+//! Raw `std/tokio::process::Command` is still permitted where these
+//! wrappers can't fit: long-lived children under [`ProcessGuard`]
+//! (port-forward, SSM tunnel), detached spawns with `pre_exec`/setsid
+//! (stress-test builds), piped stdin (`skopeo login --password-stdin`),
+//! and best-effort probes whose error becomes part of the output value
+//! rather than a bail. Those sites carry an inline comment naming the
+//! constraint; one-shot fire-and-read commands should use [`run`] /
+//! [`run_read`] / [`try_read`].
+//!
+//! [`ProcessGuard`]: crate::k8s::shared::ProcessGuard
 #![allow(clippy::disallowed_methods)]
 
 use std::future::Future;
@@ -113,7 +124,8 @@ async fn run_inner(
         .spawn()
         .with_context(|| format!("failed to spawn: {argv}"))?;
 
-    let stdout = child.stdout.take().unwrap();
+    let stdout = child.stdout.take().expect("set via Stdio::piped() above");
+    let stderr = child.stderr.take().expect("set via Stdio::piped() above");
     let (out_buf, err_buf) = if read_stdout {
         tokio::join!(
             async {
@@ -122,13 +134,10 @@ async fn run_inner(
                 let _ = BufReader::new(stdout).read_to_string(&mut s).await;
                 s
             },
-            tail(child.stderr.take().unwrap(), &argv),
+            tail(stderr, &argv),
         )
     } else {
-        tokio::join!(
-            tail(stdout, &argv),
-            tail(child.stderr.take().unwrap(), &argv),
-        )
+        tokio::join!(tail(stdout, &argv), tail(stderr, &argv))
     };
     let status = child.wait().await?;
 

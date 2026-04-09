@@ -18,10 +18,11 @@ use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
 use tracing::{debug, info};
 
+use crate::k8s::client as k;
 use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::{Provider, ProviderKind};
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
-use crate::{helm, kube as k, ui};
+use crate::{helm, ui};
 
 /// Age threshold for "stuck" — 2 minutes. Below this, a pod/NodeClaim
 /// is still plausibly starting; above, it's worth flagging.

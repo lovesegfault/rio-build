@@ -12,10 +12,11 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::client as kube;
 use crate::k8s::provider::{DeployOpts, ProviderKind};
 use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::sh::repo_root;
-use crate::{git, helm, kube, tofu, ui};
+use crate::{git, helm, tofu, ui};
 
 /// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
 /// `builderPoolSetDefaults.classes` in values.yaml. `memLimitBytes` ≈ the
@@ -338,7 +339,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
 /// Idempotent: re-deploys reuse the existing seed so in-flight JWTs
 /// stay valid across `xtask k8s deploy` runs. Rotation = `kubectl
 /// delete secret rio-jwt-signing` then redeploy.
-async fn jwt_keypair(client: &::kube::Client) -> anyhow::Result<(String, String)> {
+async fn jwt_keypair(client: &kube::Client) -> anyhow::Result<(String, String)> {
     use base64::Engine;
     use ed25519_dalek::SigningKey;
     use k8s_openapi::api::core::v1::Secret;

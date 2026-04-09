@@ -5,10 +5,11 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
+use crate::k8s::client as kube;
 use crate::k8s::provider::{BuiltImages, DeployOpts, Provider};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
-use crate::{helm, kube, ui};
+use crate::{helm, ui};
 
 mod push;
 mod rook;

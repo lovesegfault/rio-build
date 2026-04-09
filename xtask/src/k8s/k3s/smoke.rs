@@ -6,9 +6,10 @@ use anyhow::Result;
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
+use crate::k8s::client as kube;
 use crate::k8s::eks::smoke as chaos;
 use crate::k8s::shared::ProcessGuard;
-use crate::{kube, ui};
+use crate::ui;
 
 use crate::k8s::shared::port_forward;
 

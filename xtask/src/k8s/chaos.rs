@@ -45,8 +45,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::k8s::client as k;
 use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
-use crate::kube as k;
 
 /// iptables chain name. Dedicated chain (not bare FORWARD inserts) so
 /// cleanup is `-F <chain>; -D FORWARD -j <chain>; -X <chain>` —

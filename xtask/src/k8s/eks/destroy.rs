@@ -84,8 +84,8 @@ async fn k(args: &[&str]) -> Result<()> {
         buf
     }
     let (stdout, stderr) = tokio::join!(
-        tee(child.stdout.take().unwrap()),
-        tee(child.stderr.take().unwrap()),
+        tee(child.stdout.take().expect("set via Stdio::piped() above")),
+        tee(child.stderr.take().expect("set via Stdio::piped() above")),
     );
     let status = child.wait().await?;
 

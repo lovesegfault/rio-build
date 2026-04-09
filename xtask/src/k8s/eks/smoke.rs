@@ -20,10 +20,11 @@ use tracing::{debug, info};
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::client as kube;
 use crate::k8s::shared::ProcessGuard;
 use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, shell};
-use crate::{kube, ssh, tofu, ui};
+use crate::{ssh, tofu, ui};
 
 const TENANT: &str = "smoke-test";
 

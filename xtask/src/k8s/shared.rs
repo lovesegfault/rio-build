@@ -11,9 +11,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
+use crate::k8s::client as kube;
 use crate::k8s::provider::BuiltImages;
 use crate::sh::{self, cmd, repo_root, shell};
-use crate::{git, kube, ui};
+use crate::{git, ui};
 
 /// `NIX_SSHOPTS` for every nix invocation that talks to the gateway
 /// over an SSM tunnel (rsb/cpt, stress, smoke). Consolidated after

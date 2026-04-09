@@ -11,8 +11,9 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Secret;
 use tracing::info;
 
+use crate::k8s::client as kube;
 use crate::sh::{cmd, shell};
-use crate::{helm, kube, ui};
+use crate::{helm, ui};
 
 pub async fn install() -> Result<()> {
     let sh = shell()?;

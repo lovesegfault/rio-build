@@ -8,9 +8,10 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::config::XtaskConfig;
-use crate::{helm, kube, sh, ui};
+use crate::{helm, sh, ui};
 
 mod chaos;
+pub mod client;
 mod eks;
 mod k3s;
 mod metrics;
@@ -19,6 +20,8 @@ pub mod provider;
 pub mod shared;
 pub(crate) mod status;
 mod stress;
+
+use client as kube;
 
 pub use eks::ami::AmiArch;
 pub use phases::Phase;

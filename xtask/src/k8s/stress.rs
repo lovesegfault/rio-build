@@ -507,7 +507,7 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // and scheduler:9091 prometheus. All tear down when watch exits
     // (ProcessGuard drop fires — watch is a long-lived foreground
     // process, not detached like run).
-    let client = crate::kube::client().await?;
+    let client = crate::k8s::client::client().await?;
     // I-101: ephemeral local ports — no collision with a concurrent
     // `k8s cli` invocation (previously offset to 19101/19102/19091).
     let cli = CliCtx::open(&client, 0, 0).await?;
@@ -519,7 +519,10 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // expose 9091) and TCP-poll like tunnel_grpc does for the gRPC
     // forwards. Second Lease lookup (CliCtx::open did one internally)
     // is one extra apiserver round-trip — negligible vs. a 30s poll loop.
-    let leader = format!("pod/{}", crate::kube::scheduler_leader(&client, NS).await?);
+    let leader = format!(
+        "pod/{}",
+        crate::k8s::client::scheduler_leader(&client, NS).await?
+    );
     let (metrics_port, _metrics_fwd) = port_forward(NS, &leader, 0, 9091).await?;
     crate::ui::poll(
         "scheduler metrics TCP accept",
@@ -553,6 +556,8 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
 
         let metrics = scrape_metrics(metrics_port).await;
 
+        // Raw Command (not sh::try_read): error becomes part of the
+        // jsonl value, not a bail — watch keeps running through blips.
         let top = std::process::Command::new("kubectl")
             .args(["top", "nodes", "--no-headers"])
             .output()

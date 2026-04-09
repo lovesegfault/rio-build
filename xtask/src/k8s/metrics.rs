@@ -16,8 +16,8 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ListParams};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::k8s::client as k;
 use crate::k8s::{NS, NS_STORE};
-use crate::kube as k;
 
 const NS_MONITORING: &str = "monitoring";
 const GRAFANA_SVC: &str = "kube-prometheus-stack-grafana";

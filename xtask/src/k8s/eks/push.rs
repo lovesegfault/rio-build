@@ -308,8 +308,9 @@ async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
         .split_once(':')
         .context("malformed ECR token (expected user:pass)")?;
 
-    // Capture stdio — "Login Succeeded!" on the terminal would land
-    // on the spinner line.
+    // Raw Command (not sh::run): --password-stdin needs piped stdin,
+    // which run_inner nulls. Capture stdio so "Login Succeeded!" doesn't
+    // land on the spinner line.
     let mut child = std::process::Command::new("skopeo")
         .args(["login", "--authfile", authfile])
         .args(["--username", user, "--password-stdin", registry])
@@ -317,7 +318,11 @@ async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    child.stdin.as_mut().unwrap().write_all(pass.as_bytes())?;
+    child
+        .stdin
+        .as_mut()
+        .expect("set via Stdio::piped() above")
+        .write_all(pass.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
         #[allow(clippy::disallowed_methods)]

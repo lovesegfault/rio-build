@@ -18,7 +18,6 @@ mod fuzz;
 mod git;
 mod helm;
 mod k8s;
-mod kube;
 mod migration;
 mod mutants;
 mod regen;

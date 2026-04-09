@@ -1,4 +1,10 @@
-//! kube-rs helpers. Replaces the kubectl invocations in the deploy recipes.
+//! kube-rs client helpers shared by all `k8s::*` modules. Thin wrappers
+//! over `kube::Api` for the operations the deploy/status/chaos paths
+//! need (SSA apply, rollout wait, secret read/write, problem-pod scan).
+//!
+//! Distinct from [`super::shared`]: this module is pure kube-rs (no
+//! shell-outs, no provider awareness); `shared` layers provider-neutral
+//! orchestration on top (port-forward, secrets bootstrap, NIX_SSHOPTS).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,7 +24,8 @@ use tempfile::TempDir;
 use crate::sh::repo_root;
 use crate::ui;
 
-// Re-export so callers that `use crate::kube` can still name the type.
+// Re-export so callers can write `client::Client` / `kube::Client`
+// (most import this module `as kube`).
 pub use kube::Client;
 
 pub async fn client() -> Result<Client> {
