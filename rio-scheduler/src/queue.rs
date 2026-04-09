@@ -8,13 +8,15 @@
 //!
 //! `BinaryHeap` can't do `remove(x)` in O(log n) — only pop. But we
 //! NEED remove (cancellation, re-prioritization). The standard
-//! workaround: keep a `removed` set alongside the heap. `remove(x)`
-//! just marks x in the set; `pop()` skips over marked entries. Same
-//! amortized complexity, way simpler than a hand-rolled indexed heap.
+//! workaround: keep a `members` set alongside the heap. `remove(x)`
+//! takes x out of `members`; `pop()` skips heap entries whose hash is
+//! no longer in `members`. Same amortized complexity, way simpler than
+//! a hand-rolled indexed heap.
 //!
-//! The `removed` set grows until `compact()` rebuilds the heap
-//! without marked entries. Called on Tick when the garbage exceeds
-//! 50% of the heap — bounded memory, amortized O(1) per operation.
+//! Stale heap entries (removed or duplicate-push) accumulate until
+//! `compact()` rebuilds the heap from `members`. Called on Tick when
+//! garbage exceeds 50% of the heap — bounded memory, amortized O(1)
+//! per operation.
 //!
 //! # Priority representation
 //!
@@ -59,20 +61,18 @@ type Entry = (OrderedFloat<f64>, Reverse<u64>, DrvHash);
 /// Priority queue of ready derivations.
 ///
 /// `push(hash, priority)` and `pop()` are O(log n). `remove(hash)`
-/// is O(1) (just marks in a set). `len()` is O(1) and accounts for
-/// the removed markers.
+/// is O(1) (just drops from `members`). `len()` is O(1) and reflects
+/// live entries only.
 #[derive(Debug)]
 pub struct ReadyQueue {
     /// Max-heap: highest priority pops first.
     heap: BinaryHeap<Entry>,
-    /// Hashes marked as removed. `pop()` skips these. Cleared on
-    /// `compact()`.
-    removed: HashSet<DrvHash>,
     /// Monotonic counter for FIFO tiebreak. Wraps at u64::MAX —
     /// after 1.8e19 pushes, the tiebreak order flips once. Don't care.
     seq: u64,
-    /// Members currently in the heap (not removed). For O(1) dedup
-    /// in `push()` — same HashSet-for-dedup pattern as the old FIFO.
+    /// Hashes currently live in the queue. `pop()` skips heap entries
+    /// whose hash is not here (removed or already-popped duplicate).
+    /// Same HashSet-for-dedup pattern as the old FIFO.
     members: HashSet<DrvHash>,
 }
 
@@ -80,7 +80,6 @@ impl ReadyQueue {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
-            removed: HashSet::new(),
             seq: 0,
             members: HashSet::new(),
         }
@@ -98,15 +97,12 @@ impl ReadyQueue {
     /// derivation's priority via the critical-path machinery and the
     /// re-push in `handle_merge_dag`.
     pub fn push(&mut self, hash: DrvHash, priority: f64) {
-        // Already-present case: just push again without touching
-        // `removed`. pop() sees two entries for the same hash; the
-        // FIRST popped (higher priority) wins and removes the hash
-        // from `members`; the SECOND is later skipped because it's
-        // no longer in `members`. The `members` check in pop()
-        // handles dedup — `removed` is only for explicit
-        // cancellation.
-        //
-        // Insert returns true if newly added. Either way we push.
+        // Already-present case: just push again. pop() sees two
+        // entries for the same hash; the FIRST popped (higher
+        // priority) wins and removes the hash from `members`; the
+        // SECOND is later skipped because it's no longer in
+        // `members`. The `members` check in pop() handles both dedup
+        // and cancellation — no separate tombstone set needed.
         self.members.insert(hash.clone());
         self.seq = self.seq.wrapping_add(1);
         self.heap
@@ -116,26 +112,12 @@ impl ReadyQueue {
     /// Pop the highest-priority derivation.
     ///
     /// Skips entries that were removed (lazy invalidation) or that
-    /// are duplicate pushes of a hash already popped.
+    /// are duplicate pushes of a hash already popped. Both reduce to
+    /// "is this hash still in `members`?".
     pub fn pop(&mut self) -> Option<DrvHash> {
         loop {
             let (_, _, hash) = self.heap.pop()?;
-            // Two reasons to skip:
-            // 1. Explicitly removed (cancellation).
-            // 2. Duplicate push — a later push() with the same hash
-            //    went into the heap; an earlier pop already returned
-            //    it. Members was removed then; this stale entry skips.
-            //
-            // Both reduce to: "is this hash still in members?" If
-            // yes, pop it (remove from members, return). If no, skip.
             if self.members.remove(&hash) {
-                // Was in members → valid pop. Also remove from
-                // removed (in case it was there from a remove() call
-                // that was superseded by a re-push... actually no,
-                // remove() takes it out of members too. So if it's
-                // in members, it's not in removed. Still, remove()
-                // on a non-present key is a cheap no-op.)
-                self.removed.remove(&hash);
                 return Some(hash);
             }
             // Not in members: stale entry (removed or duplicate). Skip.
@@ -147,14 +129,7 @@ impl ReadyQueue {
     /// Returns `true` if it was in the queue, `false` otherwise
     /// (same signature as the old remove).
     pub fn remove(&mut self, hash: &str) -> bool {
-        // Take out of members (so pop skips it) + add to removed
-        // (for compact() to know it's garbage).
-        if self.members.remove(hash) {
-            self.removed.insert(hash.into());
-            true
-        } else {
-            false
-        }
+        self.members.remove(hash)
     }
 
     /// Remove all entries. Used by recover_from_pg() to start
@@ -162,7 +137,6 @@ impl ReadyQueue {
     pub fn clear(&mut self) {
         self.heap.clear();
         self.members.clear();
-        self.removed.clear();
         // seq_counter: DON'T reset. Monotonic-forever is fine
         // (it's just a FIFO tiebreak, wraps at u64::MAX after
         // ~500 billion years) and resetting would be a subtle
@@ -185,31 +159,33 @@ impl ReadyQueue {
     /// with lots of cancellations would leak heap memory unboundedly.
     pub fn compact(&mut self) {
         // Threshold: skip if garbage is <50% of heap. Compacting
-        // every Tick when there's 1 stale entry is wasteful.
+        // every Tick when there's 1 stale entry is wasteful. Also
+        // skip when the heap is empty — `0 < 0` is false, so without
+        // this guard an empty queue would drain+rebuild every Tick.
         let garbage = self.heap.len().saturating_sub(self.members.len());
-        if garbage * 2 < self.heap.len() {
+        if self.heap.is_empty() || garbage * 2 < self.heap.len() {
             return;
         }
 
-        // Drain the heap, keep only entries that are in members.
-        // For duplicates (same hash, multiple pushes), keep only
-        // the FIRST occurrence (highest priority — drain is in
-        // arbitrary order but we track seen hashes).
-        //
-        // Actually drain() is arbitrary order, so "first occurrence"
-        // isn't "highest priority". We need to keep the HIGHEST
-        // priority entry for each hash. Collect by hash, max by
-        // priority.
+        // Drain the heap, keep only entries in members. For
+        // duplicates (same hash, multiple pushes), keep the entry
+        // that would have popped first under the FULL Entry ordering
+        // — highest priority, then lowest seq (FIFO), then hash.
+        // `drain()` is arbitrary order so we max-reduce.
         let mut best: std::collections::HashMap<DrvHash, Entry> =
             std::collections::HashMap::with_capacity(self.members.len());
         for entry in self.heap.drain() {
-            let (prio, _, ref hash) = entry;
+            let hash = &entry.2;
             if !self.members.contains(hash) {
                 continue; // removed or stale
             }
             best.entry(hash.clone())
                 .and_modify(|existing| {
-                    if prio > existing.0 {
+                    // Full-tuple compare: equal-priority duplicates
+                    // resolve deterministically on Reverse<seq> (older
+                    // wins), matching pop() semantics. Comparing only
+                    // .0 left the survivor up to drain() order.
+                    if entry > *existing {
                         *existing = entry.clone();
                     }
                 })
@@ -217,7 +193,6 @@ impl ReadyQueue {
         }
 
         self.heap = best.into_values().collect();
-        self.removed.clear();
     }
 }
 
@@ -325,7 +300,18 @@ mod tests {
         }
         q.compact();
         assert_eq!(q.heap.len(), 40, "above threshold → compacted to members");
-        assert!(q.removed.is_empty());
+        assert_eq!(q.heap.len(), q.members.len());
+    }
+
+    #[test]
+    fn compact_empty_is_noop() {
+        // Regression: `garbage * 2 < heap.len()` is `0 < 0 → false`
+        // when empty, so an empty queue used to drain+rebuild every
+        // Tick. The early-return guard makes it a true no-op.
+        let mut q = ReadyQueue::new();
+        q.compact();
+        assert_eq!(q.heap.len(), 0);
+        assert_eq!(q.len(), 0);
     }
 
     #[test]
@@ -365,6 +351,27 @@ mod tests {
         assert_eq!(q.heap.len(), 1);
         assert_eq!(q.pop(), Some("x".into()));
         assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn compact_preserves_fifo_on_equal_priority() {
+        // Regression: with prio-only compare, the survivor among
+        // equal-priority duplicates depended on drain() order, so
+        // post-compact FIFO tiebreak vs OTHER equal-prio hashes was
+        // nondeterministic. Full-Entry compare keeps the older seq.
+        let mut q = ReadyQueue::new();
+        q.push("a".into(), 50.0); // seq=1
+        q.push("b".into(), 50.0); // seq=2
+        q.push("a".into(), 50.0); // seq=3, equal-prio re-push
+        // Garbage to trigger compact.
+        for i in 0..10 {
+            q.push(format!("junk-{i}").into(), 5.0);
+            q.remove(&format!("junk-{i}"));
+        }
+        q.compact();
+        // Surviving "a" must keep seq=1 (older), so "a" pops before "b".
+        assert_eq!(q.pop(), Some("a".into()));
+        assert_eq!(q.pop(), Some("b".into()));
     }
 
     /// Stress: 10k pushes/removes, invariants hold.
