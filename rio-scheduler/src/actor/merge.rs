@@ -1223,9 +1223,97 @@ impl DagActor {
         node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
         jwt_token: Option<&str>,
     ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
+        // Floating-CA lane: PG realisations lookup + store-existence verify.
+        let mut hits = self.check_ca_realisation_hits(probe_set, node_index).await;
+
+        // Path-based lane: batch FindMissingPaths (breaker-gated) +
+        // eager substitute fetch. `None` = no store client or no
+        // path-based candidates → return CA-only hits.
+        // r[impl sched.merge.ca-fod-substitute]
+        let check_paths: Vec<String> = probe_set
+            .iter()
+            .filter_map(|h| node_index.get(h.as_str()))
+            .flat_map(|n| n.expected_output_paths.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+        let Some(resp) = self
+            .find_missing_with_breaker(check_paths.clone(), jwt_token)
+            .await?
+        else {
+            return Ok(hits);
+        };
+
+        // r[impl sched.merge.substitute-probe]
+        // r[impl sched.merge.substitute-fetch]
+        // Substitutable paths count as present after eager-fetch (the
+        // store's HEAD probe is fetch-side-effect-free; QueryPathInfo
+        // with JWT does the actual fetch).
+        let substitutable = Self::eager_substitute_fetch(
+            self.store_client
+                .as_ref()
+                .expect("checked by find_missing_with_breaker"),
+            resp.substitutable_paths,
+            jwt_token,
+            self.grpc_timeout,
+            self.substitute_max_concurrent,
+        )
+        .await;
+        if !substitutable.is_empty() {
+            debug!(
+                count = substitutable.len(),
+                "treating upstream-substitutable paths as cache hits"
+            );
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
+                .increment(substitutable.len() as u64);
+        }
+        let missing: HashSet<String> = resp
+            .missing_paths
+            .into_iter()
+            .filter(|p| !substitutable.contains(p))
+            .collect();
+        let present: HashSet<String> = check_paths
+            .into_iter()
+            .filter(|p| !missing.contains(p))
+            .collect();
+
+        // A derivation is cached if it has at least one non-empty
+        // expected output path AND all of them are present (locally or
+        // upstream-substitutable). Skip nodes the floating-CA lane
+        // already resolved.
+        for h in probe_set {
+            if hits.contains_key(h) {
+                continue; // floating-CA — already resolved above
+            }
+            let Some(n) = node_index.get(h.as_str()) else {
+                continue;
+            };
+            if n.expected_output_paths.iter().any(|p| !p.is_empty())
+                && n.expected_output_paths
+                    .iter()
+                    .all(|p| p.is_empty() || present.contains(p))
+            {
+                hits.insert(h.clone(), n.expected_output_paths.clone());
+            }
+        }
+
+        Ok(hits)
+    }
+
+    /// Floating-CA cache-check lane: query the `realisations` table by
+    /// `(modular_hash, output_name)` for each floating-CA node in
+    /// `probe_set`, then verify the realized paths still exist in the
+    /// store (GC-race defense). Fixed-CA FODs and IA nodes pass
+    /// through (handled by the path-based lane). Best-effort — PG
+    /// blip degrades to cache-miss; store unreachable degrades to
+    /// fail-open (keep realisation hits).
+    async fn check_ca_realisation_hits(
+        &self,
+        probe_set: &HashSet<DrvHash>,
+        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+    ) -> HashMap<DrvHash, Vec<String>> {
         let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
 
-        // --- Floating-CA: realisations-table lookup --------------------
         // Floating-CA nodes have expected_output_paths == [""] (path
         // unknown until built). Query realisations by (modular_hash,
         // output_name) instead — same lookup resolve_ca_inputs uses at
@@ -1339,35 +1427,34 @@ impl DagActor {
                 });
             }
         }
+        hits
+    }
 
-        // --- Path-based: FindMissingPaths by expected path -------------
+    /// Path-based cache-check lane: batch `FindMissingPaths` against
+    /// the store with circuit-breaker accounting. `&mut self` for the
+    /// breaker. Returns:
+    ///
+    ///   - `Ok(None)` — no store client OR no paths to check; breaker
+    ///     untouched. A submission with no path-based candidates is
+    ///     unaffected by store availability — rejecting with
+    ///     `StoreUnavailable` would be a false positive.
+    ///   - `Ok(Some(resp))` — store reachable; breaker closed.
+    ///   - `Err(StoreUnavailable)` — store unreachable AND the breaker
+    ///     tripped (or was already open).
+    ///
+    /// This call is ALSO the half-open probe: when the breaker is open
+    /// the call still fires; success closes it.
+    // r[impl sched.breaker.cache-check+2]
+    async fn find_missing_with_breaker(
+        &mut self,
+        check_paths: Vec<String>,
+        jwt_token: Option<&str>,
+    ) -> Result<Option<rio_proto::types::FindMissingPathsResponse>, ActorError> {
         let Some(store_client) = &self.store_client else {
-            return Ok(hits);
+            return Ok(None);
         };
-
-        // r[impl sched.merge.ca-fod-substitute]
-        // Collect expected output paths for ALL probe-set derivations
-        // with a known path — IA, fixed-CA FODs, or anything else where
-        // the gateway computed expected_output_paths. The is_empty filter
-        // excludes floating-CA (translate.rs sends [""] for those —
-        // handled by the realisations lane above). Newly-inserted +
-        // existing not-done re-probe per I-099.
-        let check_paths: Vec<String> = probe_set
-            .iter()
-            .filter_map(|h| node_index.get(h.as_str()))
-            .flat_map(|n| n.expected_output_paths.iter())
-            .filter(|p| !p.is_empty())
-            .cloned()
-            .collect();
-
         if check_paths.is_empty() {
-            // Didn't probe the store — no signal for the breaker. If it's
-            // open, it stays open; if closed, stays closed. Returning
-            // Ok here (not checking breaker.is_open()) is deliberate: a
-            // submission with no IA expected_output_paths is unaffected by
-            // store availability (there's nothing to path-check), so
-            // rejecting it with StoreUnavailable would be a false positive.
-            return Ok(hits);
+            return Ok(None);
         }
 
         // Wrap in a timeout: this is a synchronous call inside the
@@ -1377,7 +1464,7 @@ impl DagActor {
         // This call is ALSO the half-open probe: if the breaker is open, we
         // still make the call. Success → close; failure → stay open + reject.
         let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: check_paths.clone(),
+            store_paths: check_paths,
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         // r[impl sched.merge.substitute-probe]
@@ -1421,16 +1508,15 @@ impl DagActor {
             Ok(Err(e)) => {
                 warn!(error = %e, "store FindMissingPaths failed");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
-                // r[impl sched.breaker.cache-check+2]
                 // record_failure() returns true if this trips the breaker
                 // open (or it was already open from a prior trip).
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
-                // Under threshold: proceed with CA-only hit set.
+                // Under threshold: caller proceeds with CA-only hits.
                 // IA nodes run with 100% miss — wasteful, but N<5 of
                 // these is tolerable. The breaker catches sustained outages.
-                return Ok(hits);
+                return Ok(None);
             }
             Err(_) => {
                 warn!(
@@ -1441,81 +1527,10 @@ impl DagActor {
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
-                return Ok(hits);
+                return Ok(None);
             }
         };
-
-        // r[impl sched.merge.substitute-probe]
-        // r[impl sched.merge.substitute-fetch]
-        // Substitutable paths count as present: the store's HEAD probe
-        // confirmed the tenant's upstream has them. But the probe is
-        // HEAD-only — the NAR is not yet in the store. The builder's
-        // later FUSE GetPath calls carry no JWT (&[] metadata), so the
-        // store's try_substitute_on_miss short-circuits → ENOENT.
-        //
-        // Fix: fire QueryPathInfo with JWT for each substitutable path
-        // NOW. That RPC's miss-handler (r[store.substitute.upstream])
-        // does the actual fetch. We only care about the side effect;
-        // a path whose fetch fails gets dropped from the substitutable
-        // set so the derivation falls through to normal dispatch.
-        //
-        // Concurrency: buffer_unordered(N). A DAG can have hundreds of
-        // substitutable paths; serial fetch would block the actor for
-        // minutes, but UNBOUNDED concurrency (~1k concurrent QPI →
-        // store → S3 PutObject) saturates the aws-sdk connection pool
-        // (~10-20 default) → "dispatch failure" → ~20% false demotes.
-        // self.substitute_max_concurrent (default 16, configurable via
-        // RIO_SUBSTITUTE_MAX_CONCURRENT) keeps throughput without the
-        // load spike. Each future is independently bounded by
-        // grpc_timeout (same as FindMissingPaths above — still inside
-        // the actor loop).
-        let substitutable = Self::eager_substitute_fetch(
-            store_client,
-            resp.substitutable_paths,
-            jwt_token,
-            grpc_timeout,
-            self.substitute_max_concurrent,
-        )
-        .await;
-        if !substitutable.is_empty() {
-            debug!(
-                count = substitutable.len(),
-                "treating upstream-substitutable paths as cache hits"
-            );
-            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
-                .increment(substitutable.len() as u64);
-        }
-        let missing: HashSet<String> = resp
-            .missing_paths
-            .into_iter()
-            .filter(|p| !substitutable.contains(p))
-            .collect();
-        let present: HashSet<String> = check_paths
-            .into_iter()
-            .filter(|p| !missing.contains(p))
-            .collect();
-
-        // A derivation is cached if it has at least one non-empty
-        // expected output path AND all of them are present (locally or
-        // upstream-substitutable). Skip nodes the floating-CA lane
-        // already resolved.
-        for h in probe_set {
-            if hits.contains_key(h) {
-                continue; // floating-CA — already resolved above
-            }
-            let Some(n) = node_index.get(h.as_str()) else {
-                continue;
-            };
-            if n.expected_output_paths.iter().any(|p| !p.is_empty())
-                && n.expected_output_paths
-                    .iter()
-                    .all(|p| p.is_empty() || present.contains(p))
-            {
-                hits.insert(h.clone(), n.expected_output_paths.clone());
-            }
-        }
-
-        Ok(hits)
+        Ok(Some(resp))
     }
 
     // r[impl sched.merge.substitute-topdown]
