@@ -344,16 +344,15 @@ impl DagActor {
             // get new events from here; events before recovery are
             // served from build_event_log replay (WatchBuild with
             // since_sequence reads from PG).
-            let (tx, _) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
-            self.build_events.insert(row.build_id, tx);
+            let _ = self.events.register(row.build_id);
             self.builds.insert(row.build_id, info);
         }
 
-        // --- Seed build_sequences from event_log high-water marks ---
+        // --- Seed event-bus sequences from event_log high-water marks ---
         let seq_rows = self.db.max_sequence_per_build(build_ids).await?;
         for (build_id, max_seq) in seq_rows {
             // i64 → u64: sequences are always positive.
-            self.build_sequences.insert(build_id, max_seq as u64);
+            self.events.sequences.insert(build_id, max_seq as u64);
         }
 
         Ok(())

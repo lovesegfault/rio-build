@@ -642,7 +642,7 @@ impl DagActor {
                 )),
             });
         for build_id in interested {
-            self.emit_build_event(build_id, event.clone());
+            self.events.emit(build_id, event.clone());
             // I-103: dispatch_fod short-circuit is "completed without
             // assignment" → counts as cached (matches the original
             // LIST_BUILDS_SELECT NOT EXISTS heuristic).
@@ -652,7 +652,7 @@ impl DagActor {
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
             self.update_build_counts_with(build_id, &summary).await;
-            self.emit_progress_with(build_id, &summary);
+            self.events.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
     }
@@ -1041,7 +1041,7 @@ impl DagActor {
         // Emit derivation started event
         let interested_builds = self.get_interested_builds(drv_hash);
         for build_id in &interested_builds {
-            self.emit_build_event(
+            self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {

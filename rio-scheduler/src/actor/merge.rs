@@ -87,7 +87,7 @@ impl DagActor {
         self.update_build_counts(build_id).await;
 
         // Send BuildStarted event
-        self.emit_build_event(
+        self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Started(rio_proto::types::BuildStarted {
                 total_derivations,
@@ -117,7 +117,7 @@ impl DagActor {
         // on the all-cached path — "resolved to zero work" is still
         // resolved. P0294 ripped the Build CRD that originally wanted
         // this as a condition; kept for gateway STDERR_NEXT.
-        self.emit_build_event(
+        self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::InputsResolved(
                 rio_proto::types::BuildInputsResolved {},
@@ -242,9 +242,7 @@ impl DagActor {
         phase!("2-dag-merge-inmem");
 
         // === Step 3: In-memory map inserts ============================
-        let (event_tx, event_rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
-        self.build_events.insert(build_id, event_tx);
-        self.build_sequences.insert(build_id, 0);
+        let event_rx = self.events.register(build_id);
 
         let build_info = BuildInfo::new_pending(
             build_id,
@@ -494,7 +492,7 @@ impl DagActor {
                 reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
             }
 
-            self.emit_build_event(
+            self.events.emit(
                 build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
@@ -1161,9 +1159,7 @@ impl DagActor {
             &merge_result.interest_added,
             build_id,
         );
-        self.build_events.remove(&build_id);
-        self.build_sequences.remove(&build_id);
-        self.build_progress_at.remove(&build_id);
+        self.events.remove(build_id);
         self.builds.remove(&build_id);
         if let Err(db_e) = self.db.delete_build(build_id).await {
             warn!(

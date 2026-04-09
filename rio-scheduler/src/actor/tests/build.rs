@@ -243,7 +243,7 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     let build_id = Uuid::new_v4();
 
     // 1. State event → persisted.
-    actor.emit_build_event(
+    actor.events.emit(
         build_id,
         Event::Cancelled(BuildCancelled {
             reason: "test".into(),
@@ -251,9 +251,11 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     );
     // 2. Log event → FILTERED. Default::default() — only the
     // discriminant matters for the filter.
-    actor.emit_build_event(build_id, Event::Log(BuildLogBatch::default()));
+    actor
+        .events
+        .emit(build_id, Event::Log(BuildLogBatch::default()));
     // 3. State event → persisted. seq=3 (Log consumed seq=2).
-    actor.emit_build_event(
+    actor.events.emit(
         build_id,
         Event::Cancelled(BuildCancelled {
             reason: "again".into(),

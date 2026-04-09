@@ -787,7 +787,7 @@ impl DagActor {
 
         let interested_builds = self.get_interested_builds(drv_hash);
         for build_id in &interested_builds {
-            self.emit_build_event(
+            self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
@@ -1430,7 +1430,7 @@ impl DagActor {
             // remaining is still useful right before that).
             // _with bypasses debounce: completion always carries
             // user-visible state change, and the scan is already paid.
-            self.emit_progress_with(build_id, &summary);
+            self.events.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
     }
@@ -1874,7 +1874,7 @@ impl DagActor {
 
         for build_id in &trigger_builds {
             // Emit failure event
-            self.emit_build_event(
+            self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
@@ -2003,7 +2003,7 @@ impl DagActor {
         self.trigger_log_flush(drv_hash, trigger_builds.clone());
 
         for build_id in &trigger_builds {
-            self.emit_build_event(
+            self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {

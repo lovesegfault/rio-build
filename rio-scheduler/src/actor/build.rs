@@ -213,7 +213,7 @@ impl DagActor {
             .await?;
 
         // Emit cancelled event
-        self.emit_build_event(
+        self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Cancelled(rio_proto::types::BuildCancelled {
                 reason: reason.to_string(),
@@ -266,7 +266,8 @@ impl DagActor {
         build_id: Uuid,
     ) -> Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError> {
         let tx = self
-            .build_events
+            .events
+            .channels
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
 
@@ -279,7 +280,7 @@ impl DagActor {
         // in the broadcast ring → gRPC dedups); everything > last_seq
         // was emitted after (guaranteed on broadcast, not in PG yet).
         let rx = tx.subscribe();
-        let last_seq = self.build_sequences.get(&build_id).copied().unwrap_or(0);
+        let last_seq = self.events.last_seq(build_id);
 
         // If the build is already terminal, the BuildCompleted/Failed/Cancelled
         // event was already sent (possibly to zero receivers). A late subscriber
@@ -326,7 +327,7 @@ impl DagActor {
 
             // Sequence number: reuse the last one (approximate; the subscriber
             // only cares about receiving a terminal event, not exact sequencing).
-            let seq = self.build_sequences.get(&build_id).copied().unwrap_or(0);
+            let seq = self.events.last_seq(build_id);
             let event = rio_proto::types::BuildEvent {
                 build_id: build_id.to_string(),
                 sequence: seq,
@@ -452,7 +453,7 @@ impl DagActor {
             })
             .collect();
 
-        self.emit_build_event(
+        self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Completed(rio_proto::types::BuildCompleted {
                 output_paths,
@@ -487,7 +488,7 @@ impl DagActor {
             return Ok(());
         }
 
-        self.emit_build_event(
+        self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
                 error_message: error_summary,
@@ -601,9 +602,7 @@ impl DagActor {
         }
 
         self.builds.remove(&build_id);
-        self.build_events.remove(&build_id);
-        self.build_sequences.remove(&build_id);
-        self.build_progress_at.remove(&build_id);
+        self.events.remove(build_id);
 
         // Remove build interest from DAG and reap orphaned+terminal nodes.
         let reaped = self.dag.remove_build_interest_and_reap(build_id);
@@ -622,7 +621,7 @@ impl DagActor {
         // anymore (build_sequences just removed above).
         //
         // Skip if no persister configured (tests without PG).
-        if self.event_persist_tx.is_some() {
+        if self.events.has_persister() {
             let pool = self.db.pool().clone();
             rio_common::task::spawn_monitored("event-log-gc", async move {
                 if let Err(e) = sqlx::query("DELETE FROM build_event_log WHERE build_id = $1")

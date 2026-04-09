@@ -47,6 +47,7 @@ mod snapshot;
 pub(super) use breaker::CacheCheckBreaker;
 pub use command::*;
 pub use config::{DagActorConfig, DagActorPlumbing};
+use event::BuildEventBus;
 #[cfg(test)]
 pub(crate) use executor::compute_initial_prefetch_paths;
 pub use handle::ActorHandle;
@@ -107,17 +108,9 @@ pub struct DagActor {
     ready_queue: ReadyQueue,
     /// Active builds indexed by build_id.
     builds: HashMap<Uuid, BuildInfo>,
-    /// Build event broadcast channels.
-    build_events: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
-    /// Per-build sequence counters.
-    build_sequences: HashMap<Uuid, u64>,
-    /// Per-build last-BuildProgress emit time. `emit_progress` debounces
-    /// against this — Progress is dashboard-only and `build_summary` is
-    /// O(dag_nodes), so emitting on every assign/complete/disconnect at
-    /// large-DAG × ephemeral-churn scale head-of-line blocks the actor
-    /// (I-140). Cleared on build terminal/cleanup with the other
-    /// `build_*` maps.
-    build_progress_at: HashMap<Uuid, Instant>,
+    /// Per-build event broadcast channels + sequence/debounce state +
+    /// persister/flusher wires. See [`BuildEventBus`].
+    events: BuildEventBus,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
     /// Retry policy.
@@ -233,17 +226,6 @@ pub struct DagActor {
     /// sorts by effective cutoff, but configured order is useful for
     /// logging).
     configured_cutoffs: Vec<(String, f64)>,
-    /// Channel to the LogFlusher task. Completion handlers `try_send` a
-    /// FlushRequest here so the S3 upload is ordered AFTER the state
-    /// transition (hybrid model: buffer outside actor, flush triggered by
-    /// actor). `None` in tests/environments without S3.
-    ///
-    /// `try_send` (not `send`): if the flusher is backed up, drop the
-    /// request. The 30s periodic tick will still catch the buffer (it
-    /// snapshots, doesn't drain) until CleanupTerminalBuild removes it.
-    /// A dropped final-flush is a downgrade to "periodic snapshot only"
-    /// for that one derivation, not a hang.
-    log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
     /// Leader flag from the lease task. `dispatch_ready` early-
     /// returns if false → standby schedulers merge DAGs (state
     /// stays warm) but don't send assignments. Default `true` for
@@ -277,12 +259,6 @@ pub struct DagActor {
     /// sequential consistency) but documents the pairing and
     /// doesn't cost anything.
     recovery_complete: Arc<AtomicBool>,
-    /// Channel to the event-log persister task. emit_build_event
-    /// try_sends (build_id, seq, prost-encoded BuildEvent) here
-    /// AFTER the broadcast. Event::Log is filtered out — those
-    /// flood PG (~20/sec chatty rustc) and S3 already durables
-    /// them via log_flush_tx. None in tests without PG.
-    event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -380,9 +356,7 @@ impl DagActor {
             dag,
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
-            build_events: HashMap::new(),
-            build_sequences: HashMap::new(),
-            build_progress_at: HashMap::new(),
+            events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
             executors: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -401,10 +375,8 @@ impl DagActor {
             soft_features: cfg.soft_features,
             headroom_mult: cfg.headroom_mult,
             configured_cutoffs,
-            log_flush_tx: plumbing.log_flush_tx,
             is_leader: plumbing.leader.is_leader_arc(),
             recovery_complete: plumbing.leader.recovery_complete_arc(),
-            event_persist_tx: plumbing.event_persist_tx,
             hmac_signer: plumbing.hmac_signer,
             shutdown: plumbing.shutdown,
             fod_freeze_since: None,
@@ -440,8 +412,7 @@ impl DagActor {
             .set_soft_features(self.soft_features.clone(), order);
         self.ready_queue.clear();
         self.builds.clear();
-        self.build_events.clear();
-        self.build_sequences.clear();
+        self.events.clear();
     }
 
     /// Run the actor with a weak clone of its own sender for scheduling

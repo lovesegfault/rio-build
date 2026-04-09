@@ -1331,7 +1331,8 @@ impl DagActor {
                 continue;
             }
             let watched = self
-                .build_events
+                .events
+                .channels
                 .get(build_id)
                 .is_some_and(|tx| tx.receiver_count() > 0);
             if watched {
@@ -1403,8 +1404,7 @@ impl DagActor {
     /// reconnects are within minutes of disconnect).
     fn tick_sweep_event_log(&self) {
         const EVENT_LOG_SWEEP_EVERY: u64 = 360;
-        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
-        {
+        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.events.has_persister() {
             let pool = self.db.pool().clone();
             rio_common::task::spawn_monitored("event-log-sweep", async move {
                 match sqlx::query(

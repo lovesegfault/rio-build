@@ -1,7 +1,10 @@
 //! Build-event emission: per-build broadcast channel + PG persist
-//! sidechannel + log/phase forwarding from worker streams. Everything
-//! here writes to `build_events` / `build_sequences` /
-//! `build_progress_at` / `event_persist_tx` / `log_flush_tx`.
+//! sidechannel + log/phase forwarding from worker streams.
+//!
+//! [`BuildEventBus`] owns the per-build channel/sequence/debounce maps
+//! and the persister/flusher wires. `DagActor` methods that need DAG
+//! lookups (`emit_progress`, `handle_forward_*`, `trigger_log_flush`)
+//! stay on `DagActor` and call into the bus.
 
 use super::*;
 
@@ -14,15 +17,111 @@ use super::*;
 /// `emit_progress_with` directly (bypasses debounce — scan cost paid).
 const PROGRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
-impl DagActor {
-    pub(super) fn emit_build_event(
+/// Per-build event broadcast + sequencing state. Sub-struct of
+/// [`DagActor`] — single-owner actor, so no locking. Fields are
+/// `pub(super)` for the handful of callers that need raw map access
+/// (recovery seq seed, watch_build terminal-resend); everything else
+/// goes through the methods below.
+pub(super) struct BuildEventBus {
+    /// Build event broadcast channels.
+    pub(super) channels: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
+    /// Per-build sequence counters.
+    pub(super) sequences: HashMap<Uuid, u64>,
+    /// Per-build last-BuildProgress emit time. `emit_progress` debounces
+    /// against this — Progress is dashboard-only and `build_summary` is
+    /// O(dag_nodes), so emitting on every assign/complete/disconnect at
+    /// large-DAG × ephemeral-churn scale head-of-line blocks the actor
+    /// (I-140). Cleared on build terminal/cleanup with the other maps.
+    progress_at: HashMap<Uuid, Instant>,
+    /// Channel to the event-log persister task. [`emit`](Self::emit)
+    /// try_sends (build_id, seq, prost-encoded BuildEvent) here AFTER
+    /// the broadcast. Event::Log is filtered out — those flood PG
+    /// (~20/sec chatty rustc) and S3 already durables them via
+    /// `flush_tx`. None in tests without PG.
+    persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
+    /// Channel to the LogFlusher task. Completion handlers `try_send` a
+    /// FlushRequest here so the S3 upload is ordered AFTER the state
+    /// transition (hybrid model: buffer outside actor, flush triggered by
+    /// actor). `None` in tests/environments without S3.
+    ///
+    /// `try_send` (not `send`): if the flusher is backed up, drop the
+    /// request. The 30s periodic tick will still catch the buffer (it
+    /// snapshots, doesn't drain) until CleanupTerminalBuild removes it.
+    /// A dropped final-flush is a downgrade to "periodic snapshot only"
+    /// for that one derivation, not a hang.
+    flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+}
+
+impl BuildEventBus {
+    pub(super) fn new(
+        persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
+        flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+    ) -> Self {
+        Self {
+            channels: HashMap::new(),
+            sequences: HashMap::new(),
+            progress_at: HashMap::new(),
+            persist_tx,
+            flush_tx,
+        }
+    }
+
+    /// Create a fresh broadcast channel for `build_id` and seed
+    /// `sequences[build_id] = 0`. Returns the receiver (merge step 3
+    /// hands it to the SubmitBuild bridge; recovery drops it).
+    pub(super) fn register(
         &mut self,
         build_id: Uuid,
-        event: rio_proto::types::build_event::Event,
-    ) {
+    ) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
+        let (tx, rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
+        self.channels.insert(build_id, tx);
+        self.sequences.insert(build_id, 0);
+        rx
+    }
+
+    /// Drop all per-build state for `build_id` (channels + seq +
+    /// debounce). Called from terminal-cleanup and merge-rollback.
+    pub(super) fn remove(&mut self, build_id: Uuid) {
+        self.channels.remove(&build_id);
+        self.sequences.remove(&build_id);
+        self.progress_at.remove(&build_id);
+    }
+
+    /// Reset to empty. Called from `clear_persisted_state` on leader
+    /// transitions. The `persist_tx`/`flush_tx` wires survive — they're
+    /// task channels, not per-build state.
+    pub(super) fn clear(&mut self) {
+        self.channels.clear();
+        self.sequences.clear();
+        self.progress_at.clear();
+    }
+
+    /// Last-emitted sequence for `build_id`, or 0 if unknown.
+    pub(super) fn last_seq(&self, build_id: Uuid) -> u64 {
+        self.sequences.get(&build_id).copied().unwrap_or(0)
+    }
+
+    /// Whether a PG event-log persister is wired. Gates the
+    /// per-build/periodic event-log GC sweeps (no persister → no rows
+    /// to sweep).
+    pub(super) fn has_persister(&self) -> bool {
+        self.persist_tx.is_some()
+    }
+
+    /// `true` if a Progress event for `build_id` was emitted within
+    /// [`PROGRESS_DEBOUNCE`]. The `mark_progress` half is folded into
+    /// [`emit_progress_with`].
+    pub(super) fn progress_debounced(&self, build_id: Uuid) -> bool {
+        self.progress_at
+            .get(&build_id)
+            .is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
+    }
+
+    /// Core emit: bump sequence, persist (if wired + non-Log), broadcast.
+    pub(super) fn emit(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
         use rio_proto::types::build_event::Event;
 
-        let seq = self.build_sequences.entry(build_id).or_insert(0);
+        let seq = self.sequences.entry(build_id).or_insert(0);
         *seq += 1;
         let seq = *seq;
 
@@ -45,7 +144,7 @@ impl DagActor {
         // LogFlusher, same pattern). Gateway reconnect cares about
         // state-machine events (Started/Completed/Derivation*), not
         // log lines — those it re-fetches from S3.
-        if let Some(tx) = &self.event_persist_tx
+        if let Some(tx) = &self.persist_tx
             && !matches!(build_event.event, Some(Event::Log(_)))
         {
             use prost::Message;
@@ -62,12 +161,52 @@ impl DagActor {
             // metric — spawn_monitored already logged the panic.
         }
 
-        if let Some(tx) = self.build_events.get(&build_id) {
+        if let Some(tx) = self.channels.get(&build_id) {
             // broadcast::send returns Err only if there are no receivers, which is fine
             let _ = tx.send(build_event);
         }
     }
 
+    /// Emit a `BuildProgress` from a precomputed summary, marking the
+    /// debounce timestamp. Bypasses [`progress_debounced`] — the caller
+    /// paid for the O(dag_nodes) scan, so emit unconditionally.
+    pub(super) fn emit_progress_with(
+        &mut self,
+        build_id: Uuid,
+        summary: &crate::dag::BuildSummary,
+    ) {
+        self.progress_at.insert(build_id, Instant::now());
+        self.emit(
+            build_id,
+            rio_proto::types::build_event::Event::Progress(rio_proto::types::BuildProgress {
+                completed: summary.completed,
+                running: summary.running,
+                queued: summary.queued,
+                total: summary.total,
+                critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
+                assigned_executors: summary.assigned_executors.clone(),
+            }),
+        );
+    }
+
+    /// Fire a log-flush request. No-op if the flusher isn't configured
+    /// (tests, or `RIO_LOG_S3_BUCKET` unset).
+    ///
+    /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
+    /// cap and the flusher's S3 PUT latency is sub-second), drop silently.
+    /// The 30s periodic tick will still snapshot until CleanupTerminalBuild.
+    pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) {
+        let Some(tx) = &self.flush_tx else {
+            return;
+        };
+        if tx.try_send(req).is_err() {
+            warn!("log flush channel full, dropped; periodic tick will snapshot");
+            metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
+        }
+    }
+}
+
+impl DagActor {
     /// Emit a BuildProgress snapshot for a build.
     ///
     /// Computes fresh counts + critpath + workers via `build_summary()`
@@ -93,38 +232,11 @@ impl DagActor {
         // 250ms ≈ 4/s max; the dashboard's poll cadence is ~1s anyway.
         // The Tick-driven `tick_publish_gauges` provides the floor for
         // metrics; this is the per-watcher event stream.
-        if self
-            .build_progress_at
-            .get(&build_id)
-            .is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
-        {
+        if self.events.progress_debounced(build_id) {
             return;
         }
         let summary = self.dag.build_summary(build_id);
-        self.emit_progress_with(build_id, &summary);
-    }
-
-    /// [`emit_progress`] with a precomputed summary. Callers that
-    /// already hold a `build_summary` (e.g. `update_build_counts`
-    /// callers) pass it so the O(dag_nodes) scan runs once, not twice.
-    /// Bypasses the debounce — the caller paid for the scan, so emit.
-    pub(super) fn emit_progress_with(
-        &mut self,
-        build_id: Uuid,
-        summary: &crate::dag::BuildSummary,
-    ) {
-        self.build_progress_at.insert(build_id, Instant::now());
-        self.emit_build_event(
-            build_id,
-            rio_proto::types::build_event::Event::Progress(rio_proto::types::BuildProgress {
-                completed: summary.completed,
-                running: summary.running,
-                queued: summary.queued,
-                total: summary.total,
-                critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
-                assigned_executors: summary.assigned_executors.clone(),
-            }),
-        );
+        self.events.emit_progress_with(build_id, &summary);
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
@@ -161,7 +273,7 @@ impl DagActor {
             // interested builds. Typically N=1 (one gateway per build).
             // If profiling ever shows this hot, Arc<BuildLogBatch> in
             // BuildEvent.
-            self.emit_build_event(
+            self.events.emit(
                 build_id,
                 rio_proto::types::build_event::Event::Log(batch.clone()),
             );
@@ -185,7 +297,7 @@ impl DagActor {
             return;
         };
         for build_id in self.get_interested_builds(&hash) {
-            self.emit_build_event(
+            self.events.emit(
                 build_id,
                 rio_proto::types::build_event::Event::Phase(phase.clone()),
             );
@@ -195,10 +307,6 @@ impl DagActor {
     /// Fire a log-flush request for the given derivation. No-op if the
     /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
-    /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
-    /// cap and the flusher's S3 PUT latency is sub-second), drop silently.
-    /// The 30s periodic tick will still snapshot until CleanupTerminalBuild.
-    ///
     /// Called from `handle_completion_success` AND `handle_permanent_failure`
     /// — both paths flush because failed builds still have useful logs.
     /// NOT called from `handle_transient_failure`: the derivation gets
@@ -206,26 +314,16 @@ impl DagActor {
     /// logs replace the partial ones. The ring buffer gets `discard()`ed
     /// by the BuildExecution recv task on worker disconnect.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
-        let Some(tx) = &self.log_flush_tx else {
-            return;
-        };
         let Some(drv_path) = self.drv_hash_to_path(drv_hash) else {
             // Should be impossible at this call site (completion handlers
             // already validated the hash exists in the DAG), but defensive.
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
             return;
         };
-        let req = crate::logs::FlushRequest {
+        self.events.try_log_flush(crate::logs::FlushRequest {
             drv_path,
             drv_hash: drv_hash.clone(),
             interested_builds,
-        };
-        if tx.try_send(req).is_err() {
-            warn!(
-                drv_hash = %drv_hash,
-                "log flush channel full, dropped; periodic tick will snapshot"
-            );
-            metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
-        }
+        });
     }
 }
