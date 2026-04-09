@@ -1,5 +1,11 @@
 //! W3C trace-context propagation across gRPC boundaries.
 //!
+//! **Scope:** observability only. This is the *trace-context*
+//! interceptor — distinct from `rio-common`'s auth interceptor (JWT
+//! tenant-token attachment/verification). The two are orthogonal and
+//! named for what they carry: this module never touches identity; the
+//! auth interceptor never touches spans.
+//!
 //! Per `docs/src/observability.md:164-166`: trace context is propagated via
 //! gRPC metadata using the W3C `traceparent` header. This module provides:
 //!

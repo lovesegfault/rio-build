@@ -81,10 +81,13 @@ const RPC_RETRY: RetryOpts = RetryOpts {
 /// gets the full `RPC_TIMEOUT`; non-`UNAVAILABLE` status and deadline-
 /// exceeded surface immediately.
 ///
-/// NOT used for streaming AdminService RPCs (TriggerGC, GetBuildLogs)
-/// — those need per-message progress, not a whole-call deadline. If
-/// a future subcommand adds one, wrap the stream-drain loop instead.
-pub(crate) async fn rpc<T>(
+/// **Unary only.** The `T: Default` bound rejects `Streaming<_>` at
+/// compile time (prost-generated messages and `()` derive `Default`;
+/// `tonic::Streaming` does not). Server-streaming RPCs (TriggerGC,
+/// GetBuildLogs) need per-message progress, not a whole-call deadline,
+/// and re-issuing the call on retry would silently drop already-
+/// received messages — wrap the stream-drain loop instead.
+pub(crate) async fn rpc<T: Default>(
     what: &'static str,
     mut op: impl AsyncFnMut() -> Result<tonic::Response<T>, tonic::Status>,
 ) -> anyhow::Result<T> {
