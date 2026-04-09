@@ -44,6 +44,7 @@ mod dispatch;
 mod event;
 mod executor;
 mod handle;
+mod housekeeping;
 mod merge;
 mod recovery;
 mod snapshot;
