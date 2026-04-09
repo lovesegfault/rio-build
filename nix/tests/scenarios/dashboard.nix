@@ -31,7 +31,6 @@
 }:
 let
   inherit (fixture) ns;
-  gwSvc = "cilium-gateway-rio-dashboard";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard-curl";
@@ -88,37 +87,11 @@ pkgs.testers.runNixOSTest {
             "| grep -qF 'id=\"app\"'"
         )
 
-    # ── Cilium Gateway Programmed (before gRPC-Web curls) ─────────────
-    # nginx's upstream is `cilium-gateway-rio-dashboard.rio-system.svc.
-    # cluster.local:8080` (baked into the image, docker.nix
-    # dashboardNginxConf). That Service exists only after Cilium
-    # reconciles the Gateway CR → per-Gateway envoy Deployment + Service.
-    #
-    # nginx's `upstream { server <fqdn>; }` resolves DNS at startup —
-    # if the Service doesn't exist, nginx exits with `[emerg] host not
-    # found in upstream` → pod CrashLoopBackOff → kubelet retries with
-    # backoff → eventually the Service exists → nginx starts. The
-    # deploy/rio-dashboard Available check above already proves this
-    # self-heal completed. We wait for the LB IP (from cilium-render's
-    # lbipam pool) — the per-Gateway Service is selectorless, so no
-    # Endpoints object exists; the LB IP being assigned is the
-    # "backend ready" signal.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} get gateway rio-dashboard "
-        "-o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' "
-        "| grep -qx True",
-        timeout=120,
-    )
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} get svc ${gwSvc} "
-        "-o jsonpath='{.status.loadBalancer.ingress[0].ip}' | grep -q .",
-        timeout=60,
-    )
-
     # ── (3) gRPC-Web unary THROUGH nginx ─────────────────────────────
     # curl → nginx:8080 → /rio.admin.AdminService/ClusterStatus matches
     # the `location ~ ^/rio\.(admin|scheduler)\./` block → proxy_pass
-    # to envoy-gateway Service → grpc_web filter → mTLS to scheduler.
+    # straight to rio-scheduler:9001 (D3: scheduler serves gRPC-Web
+    # natively via tonic-web; no Gateway hop in-cluster).
     # The 0x00 byte is the gRPC-Web DATA frame compression flag — if
     # ANY hop mangles the binary framing (e.g., nginx gzip, envoy
     # buffering, wrong content-type pass-through), the first byte
@@ -172,6 +145,18 @@ pkgs.testers.runNixOSTest {
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
             timeout=60,
+        )
+
+    # ── (5) method-gate via nginx: ClearPoison → 404 ─────────────────
+    # nginx's mutating-method location block (docker.nix
+    # dashboardNginxConf) returns 404 BEFORE proxy_pass — proves the
+    # browser-origin can't reach mutating AdminService methods even
+    # though the upstream scheduler would accept them.
+    with subtest("method-gate via nginx: ClearPoison 404"):
+        k3s_server.succeed(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST "
+            "http://localhost:18081/rio.admin.AdminService/ClearPoison -d x "
+            "| grep -qx 404"
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")

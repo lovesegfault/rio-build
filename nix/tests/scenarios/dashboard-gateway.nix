@@ -107,8 +107,15 @@ pkgs.testers.runNixOSTest {
     # Runs FIRST: if tonic-web is broken, the Gateway tests can't pass
     # either — fail here with the simpler reproduction.
     with subtest("gRPC-Web direct: scheduler tonic-web ClusterStatus"):
+        # Port-forward to the LEADER pod, not svc/ (which picks an
+        # arbitrary replica — standby returns trailer-only Unavailable
+        # → first byte 0x80 not 0x00, and retries hit the same pod).
+        leader = k3s_server.succeed(
+            "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            "-o jsonpath='{.spec.holderIdentity}'"
+        ).strip()
         k3s_server.succeed(
-            "k3s kubectl -n ${ns} port-forward svc/rio-scheduler 19001:9001 "
+            f"k3s kubectl -n ${ns} port-forward pod/{leader} 19001:9001 "
             ">/tmp/pf-sched.log 2>&1 & echo $! > /tmp/pf-sched.pid"
         )
         k3s_server.wait_until_succeeds(
@@ -125,22 +132,28 @@ pkgs.testers.runNixOSTest {
             )
         except Exception:
             print("── DIAGNOSTIC: scheduler tonic-web direct ──")
-            print(k3s_server.succeed(
+            k3s_server.execute(
                 "curl -sv -X POST http://localhost:19001/rio.admin.AdminService/ClusterStatus "
                 "-H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' "
-                "--data-raw "" 2>&1 | head -30; "
-                "k3s kubectl -n ${ns} logs deploy/rio-scheduler --tail=40 2>&1"
-            ))
+                "-d x 2>&1 | head -30; "
+                "k3s kubectl -n ${ns} logs pod/" + leader + " --tail=40 2>&1"
+            )
             raise
         finally:
             k3s_server.execute("kill $(cat /tmp/pf-sched.pid) 2>/dev/null || true")
 
-    # ── gRPC-Web through Cilium Gateway (from-pod) ──────────────────────
-    # Cilium's per-Gateway Service is selectorless — the eBPF L7
-    # redirect fires for pod-netns traffic only, not host-netns. So
-    # curl from inside the rio-dashboard pod (image has busybox+curl
-    # in contents, see docker.nix). Same-ns → short-name DNS works.
-    gw_url = "http://cilium-gateway-rio-dashboard:8080"
+    # ── gRPC-Web through Cilium Gateway (from-pod, via LB IP) ───────────
+    # Cilium's per-Gateway Service is selectorless. The eBPF L7
+    # redirect to envoy fires on the LoadBalancer IP (assigned from
+    # the lbipam pool in cilium-render.nix), NOT the ClusterIP — a
+    # pod targeting the Service FQDN (→ ClusterIP) just hangs (no
+    # Endpoints). curl from inside the rio-dashboard pod (image has
+    # busybox+curl, see docker.nix) at the LB IP.
+    gw_ip = k3s_server.succeed(
+        "k3s kubectl -n ${ns} get svc cilium-gateway-rio-dashboard "
+        "-o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
+    ).strip()
+    gw_url = f"http://{gw_ip}:8080"
 
     def pod_sh(script):
         # Heredoc-via-stdin avoids the nested-quote escaping of

@@ -297,11 +297,15 @@ let
       uwsgi_temp_path       /tmp/uwsgi;
       scgi_temp_path        /tmp/scgi;
 
-      # Single upstream: Cilium per-Gateway Service DNS. Port 8080
-      # matches the Gateway listener (dashboard-gateway.yaml). Cilium
-      # names it `cilium-gateway-<gateway-name>` in the Gateway's ns.
-      upstream envoy_gateway {
-        server cilium-gateway-rio-dashboard.rio-system.svc.cluster.local:8080;
+      # Single upstream: rio-scheduler directly. The scheduler serves
+      # gRPC-Web NATIVELY (tonic-web layer, D3) so the in-cluster nginx
+      # → scheduler hop needs no Gateway. The Cilium Gateway is for
+      # north-south (browser → cluster) — Cilium's L7 redirect fires on
+      # the LoadBalancer IP, not the Service ClusterIP, so an in-cluster
+      # client targeting the Gateway Service FQDN would just hang
+      # (selectorless Service, no Endpoints).
+      upstream rio_scheduler {
+        server rio-scheduler.rio-system.svc.cluster.local:9001;
       }
       server {
         # 8080 not 80: runAsNonRoot means no CAP_NET_BIND_SERVICE →
@@ -317,21 +321,29 @@ let
           try_files $uri /index.html;
         }
 
+        # r[dash.auth.method-gate]: mutating AdminService methods are
+        # NOT exposed via the dashboard nginx by default (matches
+        # `dashboard.enableMutatingMethods: false`). The browser SPA
+        # never calls these; rio-cli with mTLS does. 404 here means a
+        # crafted POST from the browser origin can't ClearPoison/
+        # DrainExecutor/etc. even though the upstream would accept it.
+        # This block must be FIRST — nginx evaluates regex locations
+        # in config order, first-match wins.
+        location ~ ^/rio\.admin\.AdminService/(ClearPoison|DrainExecutor|CreateTenant|TriggerGC)$ {
+          return 404;
+        }
+
         # gRPC-Web is plain HTTP/1.1 POST with a length-prefixed
-        # proto body. nginx proxies to the Envoy Gateway Service;
-        # envoy's grpc_web filter (auto-injected when a GRPCRoute
-        # attaches — listener.go:424-425) handles the gRPC-Web →
-        # HTTP/2 gRPC translation and presents the mTLS client cert
-        # (BackendTLSPolicy) to rio-scheduler.
+        # proto body. nginx proxies straight to rio-scheduler:9001
+        # (D3: scheduler's tonic-web layer handles gRPC-Web on the
+        # same port as native gRPC). No translation proxy in between.
         #
         # Pattern matches /rio.admin.AdminService/* and
         # /rio.scheduler.SchedulerService/* — the two services the
-        # dashboard calls (GRPCRoute matches the same). No trailing
-        # / after the second \. — the next token is the ServiceName
-        # (AdminService, SchedulerService), not a path segment. The
-        # / comes AFTER the service name.
+        # dashboard calls. No trailing / after the second \. — the
+        # next token is the ServiceName, not a path segment.
         location ~ ^/rio\.(admin|scheduler)\. {
-          proxy_pass http://envoy_gateway;
+          proxy_pass http://rio_scheduler;
           proxy_http_version 1.1;
 
           # LOAD-BEARING: without proxy_buffering off, nginx buffers
