@@ -184,12 +184,6 @@ let
   ephemeralDrv1 = drvs.mkTrivial { marker = "lifecycle-ephemeral-1"; };
   ephemeralDrv2 = drvs.mkTrivial { marker = "lifecycle-ephemeral-2"; };
 
-  # manifest-pool: one build, distinct marker. Cold-start path: this
-  # derivation has no build_history entry → GetCapacityManifest omits
-  # it → reconcile_manifest's cold_start count = queued_total -
-  # manifest.len() = 1 → spawns ONE floor Job. No seeding needed.
-  manifestDrv = drvs.mkTrivial { marker = "lifecycle-manifest-1"; };
-
   # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
   # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
   # key → tenant_id=None → completion hook's filter_map drops → upsert
@@ -318,7 +312,7 @@ let
         )
 
     # workers_active==0 wait, sized for the heartbeat-timeout FALLBACK
-    # path. The ephemeral-pool→manifest-pool chain has flaked at this
+    # path. The ephemeral-pool drain has flaked at this
     # exact assertion four times (8cf70d94/d82a0046/69fc4ae0/e76c95b6,
     # GHA 24046508263). Each prior fix tightened the producer side; this
     # one bounds the consumer side from first principles.
@@ -555,7 +549,6 @@ let
       gcVictimDrv
       ephemeralDrv1
       ephemeralDrv2
-      manifestDrv
       tenantDrv
       rolloutPreDrv
       rolloutPostDrv

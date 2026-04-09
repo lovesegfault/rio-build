@@ -7,7 +7,7 @@
 use kube::{Resource, ResourceExt};
 
 use crate::error::{Error, Result};
-use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
+use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec};
 use rio_crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use rio_crds::common::PoolSpecCommon;
 
@@ -85,11 +85,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         host_network: template.host_network,
 
         // --- Unset optional (use BuilderPool defaults) ---
-        // WPS is inherently size-class-based (ADR-015) — that IS
-        // Sizing::Static. A Manifest-mode WPS would be a distinct
-        // feature (controller would poll GetCapacityManifest per-WPS).
-        // Until then, WPS children are always Static.
-        sizing: Sizing::Static,
         // I-200: stamp the class cutoff so build_job can derive a
         // per-class activeDeadlineSeconds. The static spec value, NOT
         // `effective_cutoff_secs` (status-side EMA-smoothed) — the

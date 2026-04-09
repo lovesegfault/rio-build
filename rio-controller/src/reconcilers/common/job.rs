@@ -186,19 +186,6 @@ pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
 }
 
-/// `(est_memory_bytes, est_cpu_millicores)` — manifest-mode bucket key.
-/// Shared between the manifest reconciler's internal maps and
-/// `Ctx::manifest_idle`'s per-pool idle state. `pub(crate)` so the
-/// parent `reconcilers::mod` sees the same type alias instead of
-/// re-inlining the tuple literally (no compiler check links two `(u64,
-/// u32)` literals; the alias makes drift a type error).
-///
-/// Scheduler-side bucketing (admin_types.proto:234) rounds memory to
-/// nearest 4GiB, cpu to nearest 2000m, so the keyspace is coarse by
-/// design. A BTreeMap over this is small (typical queue has <10
-/// distinct buckets).
-pub(crate) type Bucket = (u64, u32);
-
 /// Neither Succeeded nor Failed → still active (running or pending).
 /// `None` status treated as active — fresh Job before the Job
 /// controller populates; don't double-spawn on the next tick just
@@ -214,17 +201,6 @@ pub(crate) type Bucket = (u64, u32);
 pub(crate) fn is_active_job(j: &Job) -> bool {
     let s = j.status.as_ref();
     s.and_then(|st| st.succeeded).unwrap_or(0) == 0 && s.and_then(|st| st.failed).unwrap_or(0) == 0
-}
-
-/// `status.failed > 0` — terminal under `backoff_limit=0` (one pod
-/// crash → Job Failed permanently, no retry).
-///
-/// NOT the exact inverse of [`is_active_job`]: a Succeeded Job is
-/// neither active nor failed. The manifest sweep cares only about
-/// the Failed dimension — Succeeded Jobs are reaped by
-/// `ttlSecondsAfterFinished`.
-pub(crate) fn is_failed_job(j: &Job) -> bool {
-    j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0
 }
 
 /// Active AND `status.ready == 0` — the Job's pod is in `Pending`
@@ -295,7 +271,7 @@ pub(crate) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 /// [`REAP_PENDING_GRACE`]. Passing `Duration::ZERO` disables the
 /// grace (tests).
 ///
-/// Oldest-first: same ordering as `manifest::select_failed_jobs`. The oldest
+/// Oldest-first: the oldest
 /// Pending Job has waited longest for a node; if Karpenter hasn't
 /// provisioned one by now it's likely the most stuck. Newest-first
 /// would reap the Job that's closest to scheduling.
@@ -740,8 +716,8 @@ where
 /// scheduler actually went down/recovered.
 // r[impl ctrl.condition.sched-unreachable]
 // TODO(P0304): T505 adds an `rpc_name` param so the message names
-// which RPC failed (ClusterStatus vs GetCapacityManifest vs
-// ListExecutors). Apply here post-extraction.
+// which RPC failed (ClusterStatus vs ListExecutors). Apply here
+// post-extraction.
 pub(crate) fn scheduler_unreachable_condition(
     err: Option<&str>,
     prev: Option<&serde_json::Value>,
@@ -836,9 +812,8 @@ mod tests {
         }
     }
 
-    /// `is_active_job` / `is_failed_job`: verify status→predicate
-    /// mapping for all four Job-status quadrants. Not the exact
-    /// inverse — Succeeded is neither active nor failed.
+    /// `is_active_job`: verify status→predicate mapping for all four
+    /// Job-status quadrants.
     #[test]
     fn job_status_predicates() {
         use k8s_openapi::api::batch::v1::JobStatus;
@@ -854,28 +829,21 @@ mod tests {
             }
         }
 
-        // Fresh Job, no status → active, not failed.
+        // Fresh Job, no status → active.
         let fresh = Job::default();
         assert!(is_active_job(&fresh));
-        assert!(!is_failed_job(&fresh));
 
         // Running: status populated, neither terminal → active.
         let running = job(Some(0), Some(0));
         assert!(is_active_job(&running));
-        assert!(!is_failed_job(&running));
 
-        // Succeeded: NOT active, NOT failed. Manifest pods loop so
-        // this only happens on deliberate scale-down; reapable pass
-        // handles it, sweep does not.
+        // Succeeded: NOT active.
         let succeeded = job(Some(1), Some(0));
         assert!(!is_active_job(&succeeded));
-        assert!(!is_failed_job(&succeeded));
 
-        // Failed under backoff_limit=0: NOT active, IS failed. The
-        // sweep target.
+        // Failed under backoff_limit=0: NOT active.
         let failed = job(Some(0), Some(1));
         assert!(!is_active_job(&failed));
-        assert!(is_failed_job(&failed));
     }
 
     fn job_with(name: &str, ready: Option<i32>, succeeded: Option<i32>, age_s: i64) -> Job {

@@ -28,7 +28,6 @@ spec:
   tolerations:
     - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
   # ---- BuilderPoolSpec-only fields ----
-  sizing: Static                               # Static|Manifest, default Static (ADR-020)
   sizeClass: small                             # string, default "" — maps to RIO_SIZE_CLASS env
   sizeClassCutoffSecs: 60.0                    # f64?, optional — stamped from BuilderPoolSet; drives per-class activeDeadlineSeconds
   features: [big-parallel, kvm]                # list<string>, default [] — maps to requiredSystemFeatures
@@ -91,10 +90,9 @@ Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
 `[get, list, watch, create, delete]`. `delete` is required for the
-excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`) and
-manifest mode's per-bucket scale-down (`r[ctrl.pool.manifest-scaledown]`).
-`ttlSecondsAfterFinished` reaps Completed/Failed Jobs; ownerRef GC
-handles pool-delete cleanup.
+excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`) and the
+orphan-Running reap. `ttlSecondsAfterFinished` reaps Completed/Failed
+Jobs; ownerRef GC handles pool-delete cleanup.
 
 r[ctrl.ephemeral.reap-excess-pending]
 When the per-class queued count drops below the count of Pending-phase
@@ -192,53 +190,6 @@ spawns while the featureless `tiny` pool spawns a builder that
 no-feature derivations (`∅ ⊆ pool_features`); `spawn_count`'s
 active-subtraction and the `r[ctrl.pool.ephemeral-deadline]` backstop
 bound the waste.
-
-r[ctrl.manifest.cold-floor]
-Under `spec.sizing=Manifest`, derivations the manifest omits (no
-`build_history` sample yet) MUST be spawned at `spec.resources` — the
-operator-configured cold-start floor. The floor count is
-`ClusterStatus.queued_derivations - manifest.estimates.len()`; floor
-Jobs are labeled `rio.build/memory-class=floor` so the inventory pass
-counts them separately from manifest buckets (a floor Job already in
-flight claims one cold-start slot, same subtraction as
-`spawn_count`). Cold-start starvation is a livelock — derivations
-that never build never graduate out of cold-start — so the
-`r[ctrl.pool.manifest-fairness]` per-bucket-floor truncation includes
-the cold-start bucket.
-
-r[ctrl.pool.manifest-reconcile]
-Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,
-groups estimates by `(est_memory_bytes, est_cpu_millicores)` buckets,
-diffs against live Job inventory (by label), and spawns Jobs for the
-deficit. Each spawned Job's pod gets `ResourceRequirements` from the
-manifest bucket, not from `spec.resources`. `spec.resources` becomes the
-cold-start floor (used for derivations the manifest omits — no
-`build_history` sample yet).
-
-r[ctrl.pool.manifest-labels]
-Manifest-spawned Jobs carry `rio.build/memory-class={n}Gi` and
-`rio.build/cpu-class={n}m` labels. Operators can `kubectl get job -l
-rio.build/memory-class=48Gi` to see the 48Gi fleet; the reconciler uses
-the same labels for its inventory count.
-
-r[ctrl.pool.manifest-scaledown]
-
-Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`busy` from `ListExecutors`). Demand returning before the window elapses resets the clock.
-
-r[ctrl.pool.manifest-failed-sweep+2]
-The manifest reconciler MUST delete Failed Jobs alongside `ttlSecondsAfterFinished` reaping. With `backoff_limit=0`, a crash-looping pod produces up to `maxConcurrent` Failed Jobs per reconcile tick (the spawn pass fires `headroom` replacements, all of which may fail); the ceiling (`spec.maxConcurrent`) does not cap accumulation because Failed Jobs are not active supply. The sweep is bounded per-tick to `max(20, spec.maxConcurrent)` — the cap tracks the pool's own spawn ceiling so the sweep converges under full crash-loop (net accumulation ≤ 0 per tick). A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.
-
-Manifest-spawned pods are one-shot like static-sizing pods: the executor exits after one build, the Job completes, `ttlSecondsAfterFinished` reaps. The only difference from `sizing: Static` is the per-derivation `ResourceRequirements` taken from the manifest bucket instead of `spec.resources`.
-
-r[ctrl.pool.manifest-fairness]
-When the manifest ceiling (`spec.maxConcurrent - active`) is less than
-total demand, the reconciler MUST apply per-bucket-floor truncation:
-every bucket with nonzero deficit (including cold-start) gets at least
-one spawn before any bucket gets a second. Prevents starvation under
-sustained small-bucket-heavy load where BTreeMap small-first iteration
-would never reach large buckets or cold-start. Cold-start starvation is
-a livelock: derivations that never build never get a `build_history`
-sample, so they never graduate out of cold-start.
 
 r[ctrl.pod.arch-selector]
 When the pool's `spec.systems` resolves to a single CPU architecture,

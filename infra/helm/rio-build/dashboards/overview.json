@@ -84,18 +84,6 @@
       "links": [{"title": "Detail →", "url": "/d/rio-store", "targetBlank": false}]
     },
     {
-      "id": 6,
-      "type": "stat",
-      "title": "Spawn failures",
-      "description": "sum(rate(rio_controller_manifest_spawn_failures_total[5m])). Any red = pods can't be created (quota, image pull, admission).",
-      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [{"expr": "sum(rate(rio_controller_manifest_spawn_failures_total[5m]))", "refId": "A"}],
-      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]}}, "overrides": []},
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
-      "links": [{"title": "Detail →", "url": "/d/rio-builder-lifecycle", "targetBlank": false}]
-    },
-    {
       "id": 7,
       "type": "timeseries",
       "title": "Queue / running / workers",

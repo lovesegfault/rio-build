@@ -199,7 +199,6 @@ async fn main() -> anyhow::Result<()> {
         recorder: recorder.clone(),
         error_counts: Default::default(),
         size_class_cache: Default::default(),
-        manifest: Default::default(),
         scaler: Default::default(),
     });
 

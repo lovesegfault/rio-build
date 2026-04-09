@@ -175,10 +175,7 @@ spec:
                 type: boolean
               resources:
                 description: "K8s resource requests/limits for the executor container.\n\
-                  `Static` sizing applies these directly; `Manifest` sizing uses\n\
-                  them as the cold-start floor when `GetCapacityManifest` has no\n\
-                  sample for a derivation. `any_object` passthrough \u2014 see\n`crate::any_object`\
-                  \ for why."
+                  `any_object` passthrough \u2014 see `crate::any_object` for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
@@ -262,21 +259,6 @@ spec:
                 format: double
                 nullable: true
                 type: number
-              sizing:
-                default: Static
-                description: 'Pod sizing mode (ADR-020). `Static` = operator-set
-
-                  `spec.resources`. `Manifest` = controller polls
-
-                  `GetCapacityManifest`, spawns Jobs with per-derivation resources.
-
-                  `#[serde(default)]` + `#[default] Static` means existing YAMLs
-
-                  without `sizing:` parse unchanged.'
-                enum:
-                - Static
-                - Manifest
-                type: string
               systems:
                 description: 'Target systems (e.g., `["x86_64-linux"]`). Builders
                   AND

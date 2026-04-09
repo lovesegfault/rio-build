@@ -19,7 +19,6 @@ use rio_crds::builderpool::SeccompProfileKind;
 
 mod builders_tests;
 mod disruption_tests;
-mod manifest_tests;
 mod static_sizing_tests;
 
 /// Construct a minimal BuilderPool for builder tests. No K8s
@@ -36,7 +35,7 @@ pub(crate) fn test_wp() -> BuilderPool {
 /// scheduler/store addrs. Tests that need a full Job object
 /// use `build_job` directly.
 pub(crate) fn test_pod_spec(wp: &BuilderPool) -> PodSpec {
-    build_pod_spec(wp, &test_sched_addrs(), &test_store_addrs(), None)
+    build_pod_spec(wp, &test_sched_addrs(), &test_store_addrs())
 }
 
 /// Build a `Ctx` wired to the mock apiserver client. Scheduler/
@@ -68,7 +67,6 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         recorder,
         error_counts: Default::default(),
         size_class_cache: Default::default(),
-        manifest: Default::default(),
         scaler: Default::default(),
     })
 }

@@ -28,11 +28,10 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
-use rio_crds::builderpool::{BuilderPool, Sizing};
+use rio_crds::builderpool::BuilderPool;
 
 mod builders;
 pub mod disruption;
-mod manifest;
 pub(super) mod static_sizing;
 
 #[cfg(test)]
@@ -107,24 +106,13 @@ async fn warn_on_spec_degrades(wp: &BuilderPool, ctx: &Ctx) {
     }
 
     // NEXT constraint lands HERE as another `if` block — that's the
-    // point: one helper, N checks, consistent visibility across both
-    // reconcile modes.
+    // point: one helper, N checks, consistent visibility.
 }
 
 /// Normal reconcile: make the world match spec.
 async fn apply(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    // Surface silent degrades — shared by Static and Manifest
-    // reconcile paths (both use build_pod_spec).
+    // Surface silent degrades before spawn — uses build_pod_spec.
     warn_on_spec_degrades(&wp, &ctx).await;
-
-    // Both reconcile paths spawn one-shot Jobs. The only difference
-    // is sizing: Manifest reads per-derivation resource estimates
-    // from GetCapacityManifest (ADR-020); Static uses fixed pool
-    // resources from spec.
-    // r[impl ctrl.pool.manifest-reconcile]
-    if wp.spec.sizing == Sizing::Manifest {
-        return manifest::reconcile_manifest(&wp, &ctx).await;
-    }
     static_sizing::reconcile_static(&wp, &ctx).await
 }
 
@@ -134,8 +122,7 @@ async fn apply(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
 /// ownerReference GC deletes the Jobs. To interrupt in-flight builds,
 /// `kubectl delete jobs -l rio.build/pool=X`.
 async fn cleanup(wp: Arc<BuilderPool>, _ctx: Arc<Ctx>) -> Result<Action> {
-    info!(builderpool = %wp.name_any(), sizing = ?wp.spec.sizing,
-          "cleanup: ownerRef GC handles Jobs");
+    info!(builderpool = %wp.name_any(), "cleanup: ownerRef GC handles Jobs");
     Ok(Action::await_change())
 }
 /// Requeue policy on error. Transient (Kube, Scheduler) →

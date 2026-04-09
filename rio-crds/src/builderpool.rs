@@ -9,22 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{PoolSpecCommon, PoolStatusCommon, impl_common_deref};
 
-/// Pod sizing mode. ADR-020.
-///
-/// `Static`: operator sets `spec.resources`, controller spawns Jobs
-/// at those resources. ADR-015 behavior. Default.
-///
-/// `Manifest`: controller polls `GetCapacityManifest` and spawns Jobs
-/// with per-derivation resources (P0503). `spec.resources` becomes the
-/// cold-start FLOOR (used when the manifest omits a derivation — no
-/// `build_history` sample yet).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
-pub enum Sizing {
-    #[default]
-    Static,
-    Manifest,
-}
-
 /// Spec for a builder pool. The derive generates a `BuilderPool`
 /// struct with `.metadata`, `.spec` (this), `.status`.
 ///
@@ -107,21 +91,10 @@ pub struct BuilderPoolSpec {
     pub common: PoolSpecCommon,
 
     /// K8s resource requests/limits for the executor container.
-    /// `Static` sizing applies these directly; `Manifest` sizing uses
-    /// them as the cold-start floor when `GetCapacityManifest` has no
-    /// sample for a derivation. `any_object` passthrough — see
-    /// `crate::any_object` for why.
+    /// `any_object` passthrough — see `crate::any_object` for why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
-
-    /// Pod sizing mode (ADR-020). `Static` = operator-set
-    /// `spec.resources`. `Manifest` = controller polls
-    /// `GetCapacityManifest`, spawns Jobs with per-derivation resources.
-    /// `#[serde(default)]` + `#[default] Static` means existing YAMLs
-    /// without `sizing:` parse unchanged.
-    #[serde(default)]
-    pub sizing: Sizing,
 
     // r[impl ctrl.pool.ephemeral-deadline]
     // `deadline_seconds` lives in `PoolSpecCommon`. Builder-side
@@ -419,14 +392,6 @@ mod tests {
             json.contains("hostNetwork:true requires privileged:true"),
             "hostNetwork→privileged CEL rule has no message — \
              Rule::new().message() may have been replaced with bare string"
-        );
-        // The Sizing enum itself is in the schema with both variants.
-        // Guards against a JsonSchema derive dropping an enum variant
-        // (wrong serde attr, etc).
-        assert!(
-            json.contains(r#""enum":["Static","Manifest"]"#)
-                || json.contains(r#""enum":["Manifest","Static"]"#),
-            "Sizing enum variants missing from schema"
         );
     }
 

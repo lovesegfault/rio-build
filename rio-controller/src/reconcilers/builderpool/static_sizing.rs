@@ -396,7 +396,7 @@ pub(super) fn build_job(
         // Wrong-pool-spawn backstop + per-class hung-build detector
         // (I-200). Precedence: explicit override > cutoff×5 > flat 3600.
         ephemeral_deadline(&wp.spec),
-        builders::build_pod_spec(wp, scheduler, store, None),
+        builders::build_pod_spec(wp, scheduler, store),
     ))
 }
 
@@ -632,11 +632,9 @@ mod tests {
     ///
     /// This isn't a controller bug — `build_job → build_pod_spec →
     /// executor_params` reads `wp.spec.tls_secret_name` correctly.
-    /// The `None` at the build_pod_spec call site is `resources_
-    /// override`, not TLS. When the live pod was missing TLS, "is
-    /// build_job dropping it?" was an open question. This pins it
-    /// shut: same volume/mount/env trio, sourced from
-    /// `common/pod.rs::build_executor_pod_spec`.
+    /// When the live pod was missing TLS, "is build_job dropping it?"
+    /// was an open question. This pins it shut: same volume/mount/env
+    /// trio, sourced from `common/pod.rs::build_executor_pod_spec`.
     #[test]
     fn job_tls_secret_mounted_when_set() {
         let mut wp = test_wp();

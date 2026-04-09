@@ -27,7 +27,7 @@
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
 use crate::reconcilers::common::pod::UpstreamAddrs;
-use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
+use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec};
 use rio_crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
@@ -52,7 +52,6 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
             },
         },
         resources: None,
-        sizing: Sizing::Static,
         size_class_cutoff_secs: None,
         fuse_threads: None,
         fuse_passthrough: None,

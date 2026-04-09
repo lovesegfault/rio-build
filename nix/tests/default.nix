@@ -576,18 +576,9 @@ in
       # heartbeat + build + exit). Subtest deletes the default x86-64
       # BuilderPoolSet first so its child pool doesn't steal dispatch.
       "ephemeral-pool"
-      # r[verify ctrl.pool.manifest-reconcile]
-      # r[verify ctrl.pool.manifest-labels]
-      # After ephemeral-pool: workers_active=0 again (ephemeral
-      # cleaned up its own pool via ownerRef GC). Manifest-mode pod
-      # is one-shot like ephemeral; only the per-derivation resource
-      # sizing differs. ~150s: workers_active=0 drain wait +
-      # reconcile tick + Job schedule + pod start + heartbeat +
-      # build + status_patch assertion + ownerRef delete cascade.
-      "manifest-pool"
     ];
-    # ephemeral ~180s + manifest ~150s.
-    globalTimeout = 1600;
+    # ephemeral ~180s.
+    globalTimeout = 1400;
   };
 
   # r[verify ctrl.wps.reconcile]

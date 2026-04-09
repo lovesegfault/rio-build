@@ -100,34 +100,6 @@
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "Manifest spawn failures",
-      "description": "rio_controller_manifest_spawn_failures_total — controller failed to create a worker pod. Non-zero is always actionable (quota, image pull, admission).",
-      "gridPos": {"x": 12, "y": 17, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum by (pool) (rate(rio_controller_manifest_spawn_failures_total[5m]))",
-          "legendFormat": "{{pool}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "color": {"mode": "thresholds"},
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
     }
   ]
 }

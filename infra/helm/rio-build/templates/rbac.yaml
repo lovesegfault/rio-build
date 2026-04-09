@@ -185,9 +185,9 @@ rules:
     verbs: [create, patch]
   # Owned children: one Job per build/FOD. reconcile_* lists Jobs by
   # label for inventory, creates new Jobs for deficit. `delete`:
-  # manifest-mode scale-down explicitly deletes surplus Jobs after
-  # idle grace (r[ctrl.pool.manifest-scaledown]); ownerRef GC handles
-  # BuilderPool-delete cleanup.
+  # excess-Pending reap (r[ctrl.ephemeral.reap-excess-pending]) and
+  # orphan-Running reap; ownerRef GC handles BuilderPool-delete
+  # cleanup.
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]

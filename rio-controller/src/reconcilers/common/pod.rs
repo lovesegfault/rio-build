@@ -223,8 +223,8 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }
 
-/// The Job pod spec — shared by `builderpool::build_job`,
-/// `manifest::build_manifest_job`, and `fetcherpool::build_job`.
+/// The Job pod spec — shared by `builderpool::build_job` and
+/// `fetcherpool::build_job`.
 pub fn build_executor_pod_spec(
     p: &ExecutorPodParams,
     scheduler: &UpstreamAddrs,

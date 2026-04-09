@@ -21,7 +21,7 @@ pub mod componentscaler;
 pub mod fetcherpool;
 pub mod gc_schedule;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,18 +34,6 @@ use crate::error::{Error, Result, error_kind};
 /// Re-export so reconciler modules can `use crate::reconcilers::
 /// KubeErrorExt` without naming rio-crds directly.
 pub use rio_crds::{KubeErrorExt, KubeResultExt};
-
-/// Per-pool manifest idle-tracking state: `common::job::Bucket` →
-/// when it first went surplus. See `builderpool::manifest::
-/// update_idle_and_reapable`. Type alias for `Ctx::manifest_idle`'s
-/// inner map (clippy::type_complexity).
-///
-/// Not an intra-doc link: `Bucket` is `pub(crate)` (visible enough
-/// for the type to resolve, not visible enough for rustdoc's public-
-/// docs link resolver). `ManifestIdleState` is `pub` only because
-/// `Ctx` (also `pub`) names it in a field type — neither is part of
-/// the external API.
-pub type ManifestIdleState = BTreeMap<common::job::Bucket, Instant>;
 
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
@@ -101,41 +89,8 @@ pub struct Ctx {
     /// section spans an await (the gRPC call).
     pub size_class_cache:
         tokio::sync::Mutex<Option<(Instant, rio_proto::types::GetSizeClassStatusResponse)>>,
-    /// In-process state owned by the manifest BuilderPool reconciler.
-    /// Grouped so future per-reconciler state lands here instead of
-    /// accreting onto `Ctx` directly.
-    pub manifest: ManifestState,
     /// In-process state owned by the ComponentScaler reconciler.
     pub scaler: ScalerState,
-}
-
-/// Manifest-mode reconciler state. `Default` = empty idle map +
-/// the production 600s scale-down window; tests that need a different
-/// window override the one field.
-pub struct ManifestState {
-    /// Per-pool per-bucket idle-since timestamp for manifest-mode
-    /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
-    /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
-    /// est_cpu_millicores)` — same as `common::job::Bucket`.
-    /// Value: the Instant the bucket FIRST went surplus
-    /// (`supply > demand`). Cleared when demand returns. A bucket
-    /// idle for `scale_down_window` is eligible for Job deletion.
-    ///
-    /// `parking_lot::Mutex` — same reasoning as `error_counts`.
-    pub idle: Mutex<HashMap<String, ManifestIdleState>>,
-    /// Scale-down stabilization window for the manifest reconciler's
-    /// per-bucket idle grace. 600s default / env-tunable — anti-flap:
-    /// don't reap surplus Jobs right before the next burst.
-    pub scale_down_window: Duration,
-}
-
-impl Default for ManifestState {
-    fn default() -> Self {
-        Self {
-            idle: Mutex::default(),
-            scale_down_window: Duration::from_secs(600),
-        }
-    }
 }
 
 /// ComponentScaler reconciler state.

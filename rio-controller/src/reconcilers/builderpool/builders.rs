@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::PodSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
 
@@ -66,23 +66,13 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
     }
 }
 
-/// The pod spec. Re-exported for `static_sizing::build_job` and
-/// `manifest::build_manifest_job` — the Job pod is the same
-/// executor container with env/resource tweaks.
-///
-/// `resources_override`: `None` reads `wp.spec.resources`
-/// (static-sizing path). `Some(r)` replaces it (manifest path —
-/// per-bucket `ResourceRequirements` from `GetCapacityManifest`,
-/// ADR-020).
+/// The pod spec. Re-exported for `static_sizing::build_job` — the
+/// Job pod is the executor container with `wp.spec.resources` applied.
 pub(super) fn build_pod_spec(
     wp: &BuilderPool,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
-    resources_override: Option<ResourceRequirements>,
 ) -> PodSpec {
-    let mut params = executor_params(wp);
-    if let Some(r) = resources_override {
-        params.resources = Some(r);
-    }
+    let params = executor_params(wp);
     pod::build_executor_pod_spec(&params, scheduler, store)
 }

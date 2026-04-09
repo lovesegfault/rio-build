@@ -28,7 +28,7 @@
 //! │  └─────────────────────────────────┘  │
 //! └──────────────────────────────────────┘
 //!        │
-//!        │ gRPC: AdminService (ClusterStatus, GetCapacityManifest)
+//!        │ gRPC: AdminService (ClusterStatus, GetSizeClassStatus)
 //!        ▼
 //!   rio-scheduler
 //! ```
@@ -131,11 +131,5 @@ pub fn describe_metrics() {
         "Running ephemeral Jobs deleted after orphan grace with no scheduler assignment \
          (labeled by pool, class). Non-zero rate = builders stuck unable to self-exit \
          (D-state FUSE wait, OOM-loop); investigate node/kernel health."
-    );
-    describe_counter!(
-        "rio_controller_manifest_spawn_failures_total",
-        "Manifest Job spawn failures (labeled by pool). Non-zero rate with zero \
-         reconcile_errors_total = warn+continue absorbing errors below threshold; \
-         sustained high rate = threshold bailing every tick (check admission webhooks/RBAC)."
     );
 }
