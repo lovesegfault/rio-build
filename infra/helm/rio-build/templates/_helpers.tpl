@@ -230,79 +230,12 @@ ipFamilies:
 {{- end -}}
 
 {{/*
-NetworkPolicy egress rule fragments. Each renders ONE `egress:` list
-item — include with `| nindent 4` inside a policy's `egress:` block.
-Single edit point for port/selector changes; before extraction these
-three stanzas were copy-pasted verbatim across builder-egress,
-fetcher-egress, rio-controller-egress, store-egress(-upstream) and
-rio-dashboard-egress (a port move on scheduler/store meant editing 6+
-sites in a security-critical file with no compile-time check they
-stayed in sync).
-
-rio.egressDns takes no context (kube-system is a literal). Scheduler
-and Store take the root context to read .Values.namespaces.{system,
-store}.name. TCP/53: DNS falls back to TCP for responses >512 bytes
-(DNSSEC, large SRV records, long CNAME chains) — missing TCP =
-intermittent resolution failures on large responses.
-*/}}
-{{- define "rio.egressDns" -}}
-- to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: kube-system
-  ports:
-    - {protocol: UDP, port: 53}
-    - {protocol: TCP, port: 53}
-{{- end -}}
-
-{{- define "rio.egressScheduler" -}}
-- to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: {{ .Values.namespaces.system.name }}
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: rio-scheduler
-  ports: [{protocol: TCP, port: 9001}]
-{{- end -}}
-
-{{- define "rio.egressStore" -}}
-- to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: {{ .Values.namespaces.store.name }}
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: rio-store
-  ports: [{protocol: TCP, port: 9002}]
-{{- end -}}
-
-{{/*
-Shared leaf-cert spec body (cert-manager.yaml). 90d/30d, ECDSA-P256 PKCS8
-(rustls requirement — see root CA comment), rio-ca-issuer. Everything that
-varies (secretName, dnsNames) stays at the call site.
-*/}}
-{{- define "rio.leafCertSpec" -}}
-duration: 2160h
-renewBefore: 720h
-privateKey:
-  algorithm: ECDSA
-  size: 256
-  encoding: PKCS8
-issuerRef:
-  kind: ClusterIssuer
-  name: rio-ca-issuer
-{{- end -}}
-
-{{/*
 ClusterIP + headless Service pair for a gRPC component. scheduler + store
 both expose this exact pair: ClusterIP for per-call connects (controller
 reconcilers, rio-cli, tests — UNAVAILABLE-then-retry is fine off the hot
 path); headless for BalancedChannel DNS resolution (gateway, workers
 resolve pod IPs and p2c — a sticky single-channel against the ClusterIP
-means scaling replicas doesn't help, I-077). TLS: clients connect to pod
-IPs but the cert SAN is the ClusterIP name; ClientTlsConfig::domain_name()
-overrides verify domain independently of connect URI (balance.rs).
+means scaling replicas doesn't help, I-077).
 
 Usage: {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-store" "ns" .Values.namespaces.store.name "component" "store" "port" 9002) }}
 */}}

@@ -101,15 +101,20 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Cilium WireGuard transparent encryption (encryption.type=
+    # wireguard in addons.tf). cilium-agent loads this on demand,
+    # but having it in initrd avoids a node-Ready delay.
+    boot.kernelModules = [ "wireguard" ];
+
     # ── nix-ld: glibc shim for DaemonSet-delivered host binaries ─────
-    # aws-node DaemonSet hostPath-copies a glibc-linked /opt/cni/bin/
-    # aws-cni; CSI drivers (ebs-csi-node, fsx-csi when added) do the
-    # same. nix-ld provides the /lib64/ld-linux* shim so these run
-    # unmodified. Addons stay EKS-managed (AWS owns CVE/version-compat).
-    # Boot-chain components (nodeadm, kubelet, runc, ecr-credential-
-    # provider) remain nix-packaged. Without this, sandbox creation
-    # fails: `Could not start dynamically linked executable: /opt/cni/
-    # bin/aws-cni` (the nixpkgs stub-ld message).
+    # cilium DaemonSet hostPath-copies a glibc-linked /opt/cni/bin/
+    # cilium-cni; CSI drivers (ebs-csi-node, fsx-csi when added) do
+    # the same. nix-ld provides the /lib64/ld-linux* shim so these run
+    # unmodified. Addons stay helm-managed (upstream owns CVE/version-
+    # compat). Boot-chain components (nodeadm, kubelet, runc, ecr-
+    # credential-provider) remain nix-packaged. Without this, sandbox
+    # creation fails: `Could not start dynamically linked executable:
+    # /opt/cni/bin/cilium-cni` (the nixpkgs stub-ld message).
     programs.nix-ld.enable = true;
 
     # ── containerd ────────────────────────────────────────────────────
@@ -125,10 +130,10 @@ in
       pkgs.runc
     ];
 
-    # CNI: vpc-cni's install initContainer drops the aws-vpc-cni binary
-    # alongside the reference plugins under /opt/cni/bin (tmpfiles below
-    # creates the dir). The .keep file ensures /etc/cni/net.d ships in
-    # the image so the hostPath mount finds a real dir, not a tmpfs.
+    # CNI: cilium's install-cni-binaries initContainer drops the
+    # cilium-cni binary under /opt/cni/bin (tmpfiles below creates
+    # the dir). The .keep file ensures /etc/cni/net.d ships in the
+    # image so the hostPath mount finds a real dir, not a tmpfs.
     environment.etc = {
       "cni/net.d/.keep".text = "";
       # nodeadm's GetKubeletVersion() reads this (regex `v[0-9]+…`) before
@@ -150,20 +155,17 @@ in
     };
 
     # ── networking: systemd-networkd (AL2023 parity), not dhcpcd ──────
-    # nixpkgs amazon-image.nix defaults to dhcpcd. When vpc-cni attaches
-    # a secondary ENI, dhcpcd DHCPs it and rewrites the default route /
-    # drops the IMDS route — symptom: pods schedule for ~1 min, then
-    # ipamd, ecr-credential-provider, ssm-agent all see `dial tcp
-    # 169.254.169.254: i/o timeout`. AL2023 uses networkd with
-    # ManageForeignRoutes=no (templates/al2023/runtime/rootfs/etc/systemd/
-    # networkd.conf.d/80-release.conf): networkd leaves routes/rules it
-    # didn't create alone, so vpc-cni's policy routing survives interface
-    # churn. MACAddressPolicy=none is the vpc-cni #2103 fix (the udev
-    # default `persistent` would rewrite secondary-ENI MACs and break
-    # ip-rule matching). The 80-ec2 .network: DHCP on the PRIMARY ENI
-    # only (PermanentMACAddress matches the boot-time NIC; secondaries
-    # vpc-cni hot-attaches arrive later and don't match) — secondaries
-    # are vpc-cni's to configure.
+    # nixpkgs amazon-image.nix defaults to dhcpcd. dhcpcd would DHCP any
+    # hot-attached interface and rewrite the default route / drop the
+    # IMDS route — symptom: ecr-credential-provider, ssm-agent see `dial
+    # tcp 169.254.169.254: i/o timeout`. AL2023 uses networkd with
+    # ManageForeignRoutes=no: networkd leaves routes/rules it didn't
+    # create alone. Under cilium cluster-pool IPAM there are NO
+    # secondary ENIs (no vpc-cni ipamd), but cilium creates cilium_host
+    # /cilium_net/cilium_wg0 host devices and per-pod lxc* veths —
+    # ManageForeignRoutes=no + MACAddressPolicy=none keep networkd from
+    # touching their routes/MACs. The 80-ec2 .network: DHCP on the
+    # PRIMARY ENI only (cilium devices/veths are excluded by Kind/Name).
     networking = {
       useNetworkd = true;
       useDHCP = false;

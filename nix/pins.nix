@@ -14,9 +14,15 @@
   # k8s-openapi (Cargo.toml) tracks this via the v1_NN feature.
   kubernetes_version = "1.35";
 
-  # cert-manager: chart version == app version since v1.0. Keep the
-  # `v` prefix — jetstack's chart repo publishes as `vX.Y.Z`.
-  cert_manager_version = "v1.20.0";
+  # cilium: chart version == app version. 1.19+ required (IPv6 tunnel
+  # underlay first-class only since PR #40324). Same pin as
+  # nix/cilium-render.nix (k3s VM tests) and infra/eks/addons.tf.
+  cilium_version = "1.19.2";
+
+  # Gateway API CRDs (standard channel). Cilium chart's gatewayAPI.
+  # enabled gates on `.Capabilities.APIVersions.Has` — must be
+  # installed before cilium or the feature silently no-ops.
+  gateway_api_version = "v1.2.1";
 
   # aws-load-balancer-controller: v3.0+ aligns chart with app version.
   aws_lbc_version = "3.1.0";

@@ -22,10 +22,10 @@
 //!      tofu delete `helm_release.karpenter` first, the controller is
 //!      gone before it can terminate its instances → EC2 orphans.
 //!   5. **Delete xtask-managed K8s objects.** rio-* namespaces (xtask
-//!      created them with `namespaces.create=false`), the SSH Secret,
-//!      and Envoy Gateway if it was installed.
+//!      created them with `namespaces.create=false`) and the SSH
+//!      Secret.
 //!   6. **tofu destroy.** Everything else: cluster, VPC, RDS, S3, ECR,
-//!      tofu-managed helm releases (cert-manager, aws-lbc, karpenter,
+//!      tofu-managed helm releases (cilium, aws-lbc, karpenter,
 //!      ESO). RDS `skip_final_snapshot=true`, S3 `force_destroy=true`,
 //!      ECR `force_delete=true` are already set in the `.tf` files.
 //!      Aurora's `deletion_protection` defaults to false in the AWS
@@ -46,7 +46,7 @@ use tracing::{info, warn};
 use super::TF_DIR;
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, repo_root, shell};
-use crate::{helm, tofu, ui};
+use crate::{tofu, ui};
 
 /// Best-effort kubectl. "not found" / NotFound / no-such-resource-type /
 /// unreachable-apiserver are treated as success because we're destroying
@@ -249,21 +249,6 @@ pub async fn run() -> Result<()> {
             "--wait=true",
             "--timeout=600s",
             "--ignore-not-found",
-        ])
-        .await
-    })
-    .await?;
-
-    ui::step("delete envoy-gateway (if installed)", || async {
-        // helm-managed, separate release from `rio`.
-        let _ = helm::uninstall("envoy-gateway", "envoy-gateway-system");
-        k(&[
-            "delete",
-            "ns",
-            "envoy-gateway-system",
-            "--ignore-not-found",
-            "--wait=true",
-            "--timeout=180s",
         ])
         .await
     })

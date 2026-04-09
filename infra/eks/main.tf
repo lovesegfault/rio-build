@@ -32,10 +32,32 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 3.0"
     }
+    # Gateway API CRDs (addons.tf) — kubernetes_manifest validates
+    # against the live cluster at PLAN time which fails on a fresh
+    # apply; kubectl_manifest defers to apply time.
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.19"
+    }
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.0"
+    }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
+  }
+}
+
+provider "kubectl" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  load_config_file       = false
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
   }
 }
 
@@ -148,11 +170,15 @@ module "eks" {
   subnet_ids = module.vpc.private_subnets
 
   # Native IPv6 cluster (P0542): pods and Service ClusterIPs are v6.
-  # vpc-cni hands out v6 from the subnet /64 (no v4 per-pod allocation
-  # → I-073 subnet exhaustion is structurally impossible). The chart's
-  # PreferDualStack Services become v6-primary. IMMUTABLE after create.
-  ip_family                  = "ipv6"
-  create_cni_ipv6_iam_policy = true
+  # Cilium cluster-pool IPAM hands out v6 from a ULA /104 (no v4
+  # per-pod allocation → I-073 subnet exhaustion is structurally
+  # impossible). The chart's PreferDualStack Services become
+  # v6-primary. IMMUTABLE after create.
+  #
+  # Cilium ENI mode is IPv4-ONLY (docs.cilium.io/en/stable/network/
+  # concepts/ipam/eni/) — ip_family=ipv6 forces ipam.mode=cluster-pool
+  # with kernel-level Geneve overlay (not a userspace proxy hop).
+  ip_family = "ipv6"
 
   # IRSA: OIDC provider for pod-to-IAM role assumption. Required
   # for rio-store's S3 access (no static AWS keys in pods).
@@ -177,13 +203,11 @@ module "eks" {
   # the exec provider) would get Forbidden on every API call.
   enable_cluster_creator_admin_permissions = true
 
-  # Core networking addons. Module v21 hardcodes
-  # bootstrap_self_managed_addons=false (and ignore_changes it for
-  # in-place upgrades) — a fresh cluster gets NO vpc-cni/coredns/
-  # kube-proxy unless declared here. Missed on the v20→v21 bump
-  # because the live cluster predated it; first surfaced on full
-  # teardown+recreate (nodes stuck NotReady "cni plugin not
-  # initialized", nodegroup create hung). most_recent tracks the
+  # Core addons. Module v21 hardcodes bootstrap_self_managed_addons=
+  # false — a fresh cluster gets NO vpc-cni/coredns/kube-proxy unless
+  # declared here. CNI + kube-proxy are now Cilium's job
+  # (helm_release.cilium in addons.tf, kubeProxyReplacement=true);
+  # nodes stay NotReady until cilium DS lands. most_recent tracks the
   # cluster k8s version's compatible addon build.
   #
   # eks-pod-identity-agent: required for module.karpenter's Pod
@@ -191,13 +215,6 @@ module "eks" {
   # agent DaemonSet is running before any nodegroup pods start —
   # otherwise the association doesn't take effect until agent restart.
   addons = {
-    vpc-cni = {
-      most_recent    = true
-      before_compute = true
-    }
-    kube-proxy = {
-      most_recent = true
-    }
     coredns = {
       most_recent = true
     }
@@ -210,6 +227,37 @@ module "eks" {
   # EC2NodeClass securityGroupSelectorTerms matches on this.
   node_security_group_tags = {
     "karpenter.sh/discovery" = var.cluster_name
+  }
+
+  # Cilium node-to-node traffic. The module's default node-SG rules cover
+  # apiserver→kubelet and ephemeral pod↔pod, but not the data-plane
+  # ports cilium-agent uses on the node netns: cilium-health probes,
+  # WireGuard (encryption), Geneve (overlay tunnel).
+  node_security_group_additional_rules = {
+    cilium_health = {
+      description = "cilium-health node-to-node"
+      protocol    = "tcp"
+      from_port   = 4240
+      to_port     = 4240
+      type        = "ingress"
+      self        = true
+    }
+    cilium_wireguard = {
+      description = "cilium WireGuard encryption"
+      protocol    = "udp"
+      from_port   = 51871
+      to_port     = 51871
+      type        = "ingress"
+      self        = true
+    }
+    cilium_geneve = {
+      description = "cilium Geneve overlay tunnel"
+      protocol    = "udp"
+      from_port   = 6081
+      to_port     = 6081
+      type        = "ingress"
+      self        = true
+    }
   }
 
   # Managed node groups. System only — worker nodes are

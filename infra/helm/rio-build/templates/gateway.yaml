@@ -136,13 +136,26 @@ metadata:
   namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
-  {{- with $g.service.annotations }}
   annotations:
+    {{- if eq $g.service.type "LoadBalancer" }}
+    # Cilium cluster-pool pod IPs are overlay (ULA fd42::/104), NOT
+    # VPC-routable — NLB target-type:ip can't reach them. instance
+    # mode targets node IPs; Cilium's eBPF kube-proxy-replacement
+    # handles the NodePort→pod hop in-kernel.
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: instance
+    {{- end }}
+    {{- with $g.service.annotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
   {{- include "rio.ipFamily" . | nindent 2 }}
   type: {{ $g.service.type }}
+  {{- if eq $g.service.type "LoadBalancer" }}
+  # Preserve client source IP for SSH audit logging. With Cilium DSR
+  # (loadBalancer.dsrDispatch=geneve in addons.tf), Local works
+  # without the usual "traffic only to nodes with a pod" limitation.
+  externalTrafficPolicy: Local
+  {{- end }}
   selector:
     {{- include "rio.selectorLabels" "rio-gateway" | nindent 4 }}
   ports:

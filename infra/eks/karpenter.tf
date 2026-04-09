@@ -27,17 +27,13 @@ module "karpenter" {
   # SSM access so Karpenter-provisioned nodes show up in Session
   # Manager (same as the bastion). Not required, useful for debugging.
   #
-  # I-088: AmazonEKS_CNI_IPv6_Policy is the customer-managed policy
-  # the eks module creates via create_cni_ipv6_iam_policy=true
-  # (main.tf). The module attaches it to the managed-nodegroup role
-  # but NOT to this karpenter node role — without it, vpc-cni on
-  # karpenter nodes can't AssignIpv6Addresses → pods stuck
-  # `aws-cni failed (add): failed to assign an IP`. The AWS-managed
-  # AmazonEKS_CNI_Policy that this module attaches by default is
-  # v4-only.
+  # Cilium cluster-pool IPAM does NOT call the EC2 API from nodes —
+  # pod IPs come from a Cilium-managed ULA pool, no per-ENI
+  # allocation. (vpc-cni's AmazonEKS_CNI_IPv6_Policy was for ipamd's
+  # AssignIpv6Addresses call; ENI mode would need operator-side IRSA
+  # not node IAM, but ENI mode is IPv4-only so moot here.)
   node_iam_role_additional_policies = {
     AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-    AmazonEKS_CNI_IPv6_Policy    = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/AmazonEKS_CNI_IPv6_Policy"
   }
 
   # Pod Identity — requires the eks-pod-identity-agent addon (main.tf
@@ -57,8 +53,9 @@ resource "helm_release" "karpenter_crd" {
   chart      = "karpenter-crd"
   version    = var.karpenter_version
 
-  # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager.
-  depends_on = [module.eks, helm_release.aws_lbc]
+  # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
+  # cilium dep: CNI must be up or pods Pending → wait=true times out.
+  depends_on = [module.eks, helm_release.aws_lbc, helm_release.cilium]
 }
 
 resource "helm_release" "karpenter" {

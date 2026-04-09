@@ -117,7 +117,8 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
             stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}");
         }
         try_cache_drv(&path, &nar_data, drv_cache);
-        if let Err(e) = grpc_put_path(store_client, jwt_token, service_signer, info, nar_data).await {
+        if let Err(e) = grpc_put_path(store_client, jwt_token, service_signer, info, nar_data).await
+        {
             stderr_err!(stderr, "store error: {e}");
         }
     } else {

@@ -27,8 +27,13 @@ variable "kubernetes_version" {
 # default: if the generated file is missing, `tofu plan` fails loudly
 # instead of silently diverging from the flake's pins.
 
-variable "cert_manager_version" {
-  description = "cert-manager chart version (jetstack repo publishes as vX.Y.Z)."
+variable "cilium_version" {
+  description = "cilium chart version (helm.cilium.io). Same pin as nix/cilium-render.nix."
+  type        = string
+}
+
+variable "gateway_api_version" {
+  description = "Gateway API CRD release tag (kubernetes-sigs/gateway-api)."
   type        = string
 }
 

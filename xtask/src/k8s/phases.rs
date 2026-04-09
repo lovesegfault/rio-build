@@ -23,7 +23,6 @@ pub enum Phase {
     Ami,
     Push,
     Deploy,
-    Envoy,
 }
 
 impl Phase {
@@ -32,14 +31,13 @@ impl Phase {
     /// phase whose dependencies are satisfied concurrently (ami ∥
     /// bootstrap→provision; kubeconfig ∥ push after provision; deploy
     /// waits on the join of all three).
-    pub const ALL: [Phase; 7] = [
+    pub const ALL: [Phase; 6] = [
         Phase::Bootstrap,
         Phase::Provision,
         Phase::Kubeconfig,
         Phase::Ami,
         Phase::Push,
         Phase::Deploy,
-        Phase::Envoy,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -50,7 +48,6 @@ impl Phase {
             Phase::Ami => "ami",
             Phase::Push => "push",
             Phase::Deploy => "deploy",
-            Phase::Envoy => "envoy",
         }
     }
 
@@ -76,7 +73,6 @@ impl Phase {
             // + tags it) + image tag (push) + talks to the cluster
             // (kubeconfig).
             Phase::Deploy => &[Phase::Kubeconfig, Phase::Push, Phase::Ami],
-            Phase::Envoy => &[Phase::Deploy],
         }
     }
 }
@@ -106,7 +102,7 @@ pub(super) struct PhaseParams {
 /// chains continue. Errors are collected and surfaced together after
 /// the graph drains.
 ///
-/// `ami_branch` / `envoy_branch` are injected so tests can mock them
+/// `ami_branch` is injected so tests can mock it
 /// without an EKS account or a live cluster. They are only awaited if
 /// their phase is in `selected`.
 ///
@@ -125,17 +121,15 @@ pub(super) struct PhaseParams {
 ///
 /// `ui::step` wraps each phase in a `tracing::info_span!` so the
 /// per-phase close event (and any error) carries the phase name.
-pub(super) async fn run_up_phases<A, E>(
+pub(super) async fn run_up_phases<A>(
     p: Arc<dyn Provider>,
     cfg: Arc<XtaskConfig>,
     selected: &[Phase],
     pp: PhaseParams,
     ami_branch: A,
-    envoy_branch: E,
 ) -> Result<()>
 where
     A: Future<Output = Result<()>> + Send + 'static,
-    E: Future<Output = Result<()>> + Send + 'static,
 {
     // Per-phase unsatisfied-dep set, restricted to `selected`: a dep
     // the user didn't ask for is treated as already satisfied (so
@@ -157,7 +151,6 @@ where
     let mut running: JoinSet<(Phase, Result<()>)> = JoinSet::new();
     // Injected futures, taken exactly once when their phase dispatches.
     let mut ami = Some(ami_branch);
-    let mut envoy = Some(envoy_branch);
 
     loop {
         // Spawn every selected phase whose pending-dep set is empty.
@@ -212,10 +205,6 @@ where
                     running.spawn(async move {
                         (ph, ui::step("deploy", || p.deploy(&cfg, &pp.deploy)).await)
                     });
-                }
-                Phase::Envoy => {
-                    let e = envoy.take().expect("envoy dispatched once");
-                    running.spawn(async move { (ph, ui::step("envoy", || e).await) });
                 }
             }
         }
@@ -423,13 +412,8 @@ mod tests {
             ami_log.lock().unwrap().push("ami");
             Ok(())
         };
-        let envoy_log = log.clone();
-        let envoy = async move {
-            envoy_log.lock().unwrap().push("envoy");
-            Ok(())
-        };
 
-        run_up_phases(p, cfg(), &Phase::ALL, pp(), ami, envoy)
+        run_up_phases(p, cfg(), &Phase::ALL, pp(), ami)
             .await
             .unwrap();
 
@@ -444,8 +428,6 @@ mod tests {
         // deploy waited for the join: it's after BOTH ami and push
         assert!(pos(&log, "ami") < pos(&log, "deploy"), "log: {log:?}");
         assert!(pos(&log, "push") < pos(&log, "deploy"), "log: {log:?}");
-        // envoy is last
-        assert!(pos(&log, "deploy") < pos(&log, "envoy"));
     }
 
     /// The critical safety property: an AMI build failure does NOT
@@ -464,7 +446,6 @@ mod tests {
         // ami fails immediately — well before provision's 50ms sleep
         // completes. With try_join!, provision would be dropped here.
         let ami = async { Err(anyhow!("ami build failed")) };
-        let envoy = async { Ok(()) };
 
         let r = run_up_phases(
             p,
@@ -472,7 +453,6 @@ mod tests {
             &[Phase::Bootstrap, Phase::Provision, Phase::Ami],
             pp(),
             ami,
-            envoy,
         )
         .await;
 
@@ -495,14 +475,9 @@ mod tests {
         let log: Log = Arc::default();
         let p: Arc<dyn Provider> = Arc::new(MockProvider::new(log.clone()));
 
-        run_up_phases(
-            p,
-            cfg(),
-            &[Phase::Push, Phase::Deploy],
-            pp(),
-            async { Ok(()) },
-            async { Ok(()) },
-        )
+        run_up_phases(p, cfg(), &[Phase::Push, Phase::Deploy], pp(), async {
+            Ok(())
+        })
         .await
         .unwrap();
 
@@ -533,7 +508,6 @@ mod tests {
                 Phase::Push,
             ],
             pp(),
-            async { Ok(()) },
             async { Ok(()) },
         )
         .await
@@ -586,16 +560,9 @@ mod tests {
         let mp = MockProvider::new(log.clone());
         let bootstrap_at = mp.bootstrap_at.clone();
         let p: Arc<dyn Provider> = Arc::new(mp);
-        run_up_phases(
-            p,
-            cfg(),
-            &[Phase::Ami, Phase::Bootstrap],
-            pp(),
-            ami,
-            async { Ok(()) },
-        )
-        .await
-        .unwrap();
+        run_up_phases(p, cfg(), &[Phase::Ami, Phase::Bootstrap], pp(), ami)
+            .await
+            .unwrap();
 
         let log = log.lock().unwrap();
         let b_at = bootstrap_at.lock().unwrap().expect("bootstrap ran");
@@ -635,7 +602,6 @@ mod tests {
                 Phase::Deploy,
             ],
             pp(),
-            async { Ok(()) },
             async { Ok(()) },
         )
         .await;

@@ -80,8 +80,9 @@ resource "helm_release" "external_secrets" {
     }
   ]
 
-  # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager.
-  depends_on = [module.eks, helm_release.aws_lbc]
+  # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
+  # cilium dep: CNI must be up or pods Pending → wait=true times out.
+  depends_on = [module.eks, helm_release.aws_lbc, helm_release.cilium]
 }
 
 # ────────────────────────────────────────────────────────────────────────

@@ -1,9 +1,8 @@
-# Cluster addons installed via Helm: cert-manager + aws-load-balancer-
-# controller. Both are prerequisites for the rio chart — cert-manager
-# issues the mTLS certs (the chart's cert-manager.yaml template has
-# Certificate CRs when tls.enabled=true), and aws-lbc provisions the
-# gateway NLB (service.beta.kubernetes.io/aws-load-balancer-type:
-# external annotation, set via xtask deploy --set-json).
+# Cluster addons installed via Helm: cilium + aws-load-balancer-
+# controller. Both are prerequisites for the rio chart — cilium is the
+# CNI (nodes are NotReady until it lands; v21 bootstrap_self_managed_
+# addons=false means NO vpc-cni fallback), and aws-lbc provisions the
+# gateway NLB.
 #
 # helm_release here (not a separate `helm install` step) keeps
 # everything in one `tofu apply`. The tradeoff: terraform now owns
@@ -12,53 +11,123 @@
 # this is fine.
 
 # ============================================================
-# cert-manager
+# Gateway API CRDs (C1: must exist BEFORE helm_release.cilium)
 # ============================================================
+#
+# Cilium chart's `gatewayAPI.enabled=true` is gated on
+# `.Capabilities.APIVersions.Has "gateway.networking.k8s.io/v1"` —
+# if the CRDs aren't installed first, the feature silently no-ops
+# (no Gateway controller, no GatewayClass). The chart does NOT ship
+# these CRDs itself.
+#
+# Standard-channel install (GatewayClass, Gateway, HTTPRoute,
+# GRPCRoute, ReferenceGrant). Pinned via nix/pins.nix → tfvars.
 
-resource "helm_release" "cert_manager" {
-  name       = "cert-manager"
-  namespace  = "cert-manager"
-  repository = "https://charts.jetstack.io"
-  chart      = "cert-manager"
-  # Pinned via nix/pins.nix → generated.auto.tfvars.json. cert-manager's
-  # chart versioning equals its app version. v1.20 requires k8s ≥1.31
-  # (selectable-field CRDs); UID/GID changed 1000/0 → 65532/65532 —
-  # harmless, no PVs.
-  version = var.cert_manager_version
+data "http" "gateway_api_crds" {
+  url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${var.gateway_api_version}/standard-install.yaml"
+}
 
-  create_namespace = true
+data "kubectl_file_documents" "gateway_api_crds" {
+  content = data.http.gateway_api_crds.response_body
+}
 
-  # CRDs via the chart (not a separate `kubectl apply -f crds.yaml`
-  # step). cert-manager v1.15+ uses `crds.enabled`; the deprecated
-  # `installCRDs` is an ERROR (not ignored) when set alongside it.
-  # helm provider v3: `set` is now a list-of-objects attribute, not
-  # repeated blocks. See hashicorp/terraform-provider-helm
-  # docs/guides/v3-upgrade-guide.md.
-  set = [
-    {
-      name  = "crds.enabled"
-      value = "true"
-    }
+resource "kubectl_manifest" "gateway_api_crds" {
+  for_each  = data.kubectl_file_documents.gateway_api_crds.manifests
+  yaml_body = each.value
+
+  # server_side_apply: CRDs are large; client-side apply hits the
+  # last-applied-configuration annotation size limit.
+  server_side_apply = true
+
+  depends_on = [module.eks]
+}
+
+# ============================================================
+# cilium
+# ============================================================
+#
+# Root of the helm_release depends_on chain. Until cilium's DaemonSet
+# is Ready, system nodes are NotReady → every other helm_release's
+# pods are Pending → their wait=true times out. So this MUST install
+# first. The DaemonSet tolerates node.kubernetes.io/not-ready (it's
+# the thing that makes nodes Ready).
+
+resource "helm_release" "cilium" {
+  name       = "cilium"
+  namespace  = "kube-system"
+  repository = "https://helm.cilium.io"
+  chart      = "cilium"
+  # Pinned via nix/pins.nix → generated.auto.tfvars.json. Same pin as
+  # nix/cilium-render.nix (k3s VM tests). 1.19+ required: IPv6 tunnel
+  # underlay first-class only since PR #40324.
+  version = var.cilium_version
+
+  values = [
+    yamlencode({
+      # Cluster-pool IPAM: Cilium-managed ULA range, NOT VPC IPs. ENI
+      # mode (ipam.mode=eni) is IPv4-ONLY per upstream docs; this
+      # cluster is ip_family=ipv6 (immutable), so ENI mode is not an
+      # option. Overlay encap is kernel-level Geneve — not a userspace
+      # proxy hop. MTU auto-derived from node ENI (9001 → ~8871 pod).
+      ipam = {
+        mode = "cluster-pool"
+        operator = {
+          clusterPoolIPv6PodCIDRList = ["fd42::/104"]
+          clusterPoolIPv6MaskSize    = 120
+        }
+      }
+      ipv6                 = { enabled = true }
+      ipv4                 = { enabled = false }
+      enableIPv6Masquerade = true
+
+      routingMode    = "tunnel"
+      tunnelProtocol = "geneve"
+
+      kubeProxyReplacement = true
+      k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")
+      k8sServicePort       = 443
+
+      encryption = {
+        enabled        = true
+        type           = "wireguard"
+        nodeEncryption = true
+      }
+
+      # C3: dsrDispatch=geneve is the ONLY DSR mode compatible with
+      # tunnel+WireGuard; default `opt` fails. mode=hybrid: SNAT for
+      # ETP:Cluster, DSR for ETP:Local (rio-gateway uses Local for
+      # source-IP preservation).
+      loadBalancer = {
+        mode        = "hybrid"
+        dsrDispatch = "geneve"
+      }
+
+      gatewayAPI = { enabled = true }
+      hubble = {
+        enabled = true
+        relay   = { enabled = true }
+      }
+
+      # Embedded envoy (NOT separate cilium-envoy DaemonSet). Cilium
+      # 1.19's separate-DS cecProcessor→EnvoyResource pipeline never
+      # calls xds.upsertEndpoint — EDS stays at empty v1, Gateway
+      # backends have zero endpoints. NOT IPv6-specific; reproduced
+      # in k3s VM. See ~/tmp/rio-cilium/eds-rootcause.md. Embedded
+      # mode (in-process xDS) works.
+      envoy = { enabled = false }
+
+      # Pin to system nodes — cilium-operator can't schedule on
+      # Karpenter nodes (Karpenter itself depends on CNI being up).
+      operator = {
+        replicas     = 1
+        nodeSelector = { "rio.build/node-role" = "system" }
+      }
+    })
   ]
 
-  # `depends_on` at the resource level makes this wait for the EKS
-  # module. The helm provider itself can't have depends_on, so
-  # without this, terraform might try to install cert-manager
-  # before the cluster exists (rare — usually the plan graph gets
-  # it right via the provider's `host = module.eks.cluster_endpoint`
-  # reference — but explicit is safer).
-  #
-  # aws_lbc dep: not semantic — aws-lbc's mservice.elbv2.k8s.aws
-  # mutating webhook intercepts ALL Service creates cluster-wide
-  # with failurePolicy=Fail (it's the only one of its six webhooks
-  # with an empty namespaceSelector). On a fresh apply, the chart
-  # lands the MutatingWebhookConfiguration before its pod is Ready
-  # → cert-manager's Service create gets "no endpoints available
-  # for service aws-load-balancer-webhook-service". Serializing
-  # behind aws_lbc (wait=true default → Deployment Ready → endpoints
-  # populated) closes the race. Same dep on karpenter_crd and
-  # external_secrets for the same reason.
-  depends_on = [module.eks, helm_release.aws_lbc]
+  # C1: Gateway API CRDs must exist or gatewayAPI.enabled silently
+  # no-ops. for_each set → depend on the whole map.
+  depends_on = [module.eks, kubectl_manifest.gateway_api_crds]
 }
 
 # ============================================================
@@ -153,5 +222,7 @@ resource "helm_release" "aws_lbc" {
   depends_on = [
     module.eks,
     kubernetes_service_account_v1.aws_lbc,
+    # CNI must be up or aws-lbc pods are Pending → wait=true times out.
+    helm_release.cilium,
   ]
 }

@@ -55,10 +55,11 @@ resource "helm_release" "kube_prometheus_stack" {
     },
   ]
 
-  # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager. The
-  # mservice.elbv2.k8s.aws mutating webhook intercepts ALL Service
-  # creates cluster-wide with failurePolicy=Fail; without serializing,
-  # the chart's grafana/alertmanager/prometheus Services race the
-  # webhook's pod-Ready and get "no endpoints available".
-  depends_on = [module.eks, helm_release.aws_lbc]
+  # aws_lbc dep: webhook-ordering only — its mservice.elbv2.k8s.aws
+  # mutating webhook intercepts ALL Service creates cluster-wide with
+  # failurePolicy=Fail; without serializing, the chart's grafana/
+  # alertmanager/prometheus Services race the webhook's pod-Ready and
+  # get "no endpoints available". cilium dep: CNI must be up or pods
+  # Pending → wait=true times out.
+  depends_on = [module.eks, helm_release.aws_lbc, helm_release.cilium]
 }

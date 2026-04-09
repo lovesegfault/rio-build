@@ -2,7 +2,6 @@
 //! k3s (local) vs eks (AWS).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
@@ -90,9 +89,6 @@ pub struct UpOpts {
     /// helm upgrade rio chart.
     #[arg(long)]
     deploy: bool,
-    /// Install Envoy Gateway operator (dashboard gRPC-Web).
-    #[arg(long)]
-    envoy: bool,
 
     // Namespaced per-phase opts. NO clap `requires` attribute —
     // validated at runtime by `validate_phase_opts()` so the
@@ -133,7 +129,6 @@ impl UpOpts {
             Phase::Ami => self.ami,
             Phase::Push => self.push,
             Phase::Deploy => self.deploy,
-            Phase::Envoy => self.envoy,
         }
     }
 
@@ -210,7 +205,7 @@ pub struct K8sArgs {
 #[derive(Subcommand)]
 pub enum K8sCmd {
     /// Bring up the cluster: ami ∥ (bootstrap → provision → kubeconfig
-    /// → push), then deploy → envoy. Phase flags select a subset.
+    /// → push), then deploy. Phase flags select a subset.
     Up(UpOpts),
     /// EKS-unique e2e: NLB health, SSM tunnel, S3-chunked build (IRSA).
     Smoke,
@@ -494,7 +489,7 @@ async fn run_up(
     };
 
     ui::step("k8s up", || async move {
-        run_up_phases(p, cfg, &selected, pp, ami_branch, envoy_install()).await?;
+        run_up_phases(p, cfg, &selected, pp, ami_branch).await?;
         if !explicit {
             info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
         }
@@ -558,36 +553,6 @@ where
     let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
     let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
     f(&sh)
-}
-
-/// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
-/// Provider-agnostic — same helm chart, same namespace.
-async fn envoy_install() -> Result<()> {
-    let client = kube::client().await?;
-
-    // I-198: was sync sh::read — `nix build` can be multi-second and
-    // this runs as a DAG phase. run_read yields. Shell scoped tight
-    // (xshell::Shell is !Sync) so it isn't held across await.
-    let eg = {
-        let shell = sh::shell()?;
-        sh::run_read(sh::cmd!(
-            shell,
-            "nix build --no-link --print-out-paths .#helm-envoy-gateway"
-        ))
-    }
-    .await?;
-
-    helm::Helm::upgrade_install("envoy-gateway", &eg)
-        .namespace("envoy-gateway-system")
-        .create_namespace()
-        .run()?;
-    kube::wait_rollout(
-        &client,
-        "envoy-gateway-system",
-        "envoy-gateway",
-        Duration::from_secs(120),
-    )
-    .await
 }
 
 #[cfg(test)]
