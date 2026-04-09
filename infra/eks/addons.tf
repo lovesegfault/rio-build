@@ -106,12 +106,14 @@ resource "helm_release" "cilium" {
         type    = "wireguard"
       }
 
-      # C3: dsrDispatch=geneve is the ONLY DSR mode compatible with
-      # tunnel+WireGuard; default `opt` fails. mode=hybrid: SNAT for
-      # ETP:Cluster, DSR for ETP:Local (rio-gateway uses Local for
-      # source-IP preservation).
+      # mode=snat: hybrid (DSR for ETP:Local) with dsrDispatch=geneve
+      # SNATs NodePort ingress to cilium_host on IPv6 — TCP handshake
+      # completes but data packets go to-stack and never reach the
+      # NLB client. Plain SNAT mode works; loses source-IP
+      # preservation, but rio-gateway doesn't currently consume it.
+      # C3's dsrDispatch=geneve is moot under snat mode.
       loadBalancer = {
-        mode        = "hybrid"
+        mode        = "snat"
         dsrDispatch = "geneve"
       }
 
