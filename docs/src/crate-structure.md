@@ -520,5 +520,5 @@ src/
 ├── upstream.rs        # `rio upstream list|add|remove` — per-tenant upstream cache CRUD (StoreAdminService)
 ├── verify_chunks.rs   # `rio verify-chunks` — PG↔backend chunk consistency audit (StoreAdminService.VerifyChunks)
 ├── workers.rs         # `rio workers` — ListExecutors table + per-executor drain; --actor/--diff for in-mem state
-└── wps.rs             # `rio bps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
+└── bps.rs             # `rio bps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
 ```

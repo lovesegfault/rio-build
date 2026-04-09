@@ -83,12 +83,12 @@
 #   end-to-end. Subtest deletes the default x86-64 BuilderPoolSet first
 #   so its child pool's reconciler doesn't steal dispatch.
 #
-# ctrl.wps.reconcile — verify marker at default.nix:subtests[wps-lifecycle]
-# ctrl.wps.autoscale — verify marker at default.nix:subtests[wps-lifecycle]
-#   wps-lifecycle: apply a 3-class WPS → BuilderPoolSet reconciler
-#   (builderpoolset/mod.rs:131) creates 3 child WorkerPools named
-#   `{wps}-{class}` with sizeClass=class.name + ownerReferences[0]→WPS
-#   + controller=true. Delete WPS → finalizer cleanup explicitly
+# ctrl.wps.reconcile — verify marker at default.nix:subtests[bps-lifecycle]
+# ctrl.wps.autoscale — verify marker at default.nix:subtests[bps-lifecycle]
+#   bps-lifecycle: apply a 3-class BPS → BuilderPoolSet reconciler
+#   (builderpoolset/mod.rs:131) creates 3 child BuilderPools named
+#   `{bps}-{class}` with sizeClass=class.name + ownerReferences[0]→BPS
+#   + controller=true. Delete BPS → finalizer cleanup explicitly
 #   deletes each child (mod.rs:375), ownerRef GC as fallback.
 {
   pkgs,
@@ -2310,18 +2310,18 @@ let
                 "labels present, status patched, ownerRef cascade cleanup")
     '';
 
-    wps-lifecycle = ''
+    bps-lifecycle = ''
       # ══════════════════════════════════════════════════════════════════
-      # wps-lifecycle — apply WPS → 3 children → delete → children gone
+      # bps-lifecycle — apply BPS → 3 children → delete → children gone
       # ══════════════════════════════════════════════════════════════════
       # Proves the BuilderPoolSet reconciler end-to-end: apply a 3-class
-      # WPS → reconciler's per-class loop (builderpoolset/mod.rs:131)
-      # creates 3 child WorkerPools named `{wps}-{class}` → each child
+      # BPS → reconciler's per-class loop (builderpoolset/mod.rs:131)
+      # creates 3 child BuilderPools named `{bps}-{class}` → each child
       # carries sizeClass=class.name + ownerRef[0]=BuilderPoolSet
-      # (controller=true). Delete WPS → finalizer cleanup() explicitly
+      # (controller=true). Delete BPS → finalizer cleanup() explicitly
       # deletes each child (mod.rs:375); ownerRef GC is the fallback.
-      with subtest("wps-lifecycle: apply WPS → 3 children → delete → children gone"):
-          # ── Apply 3-class WPS ─────────────────────────────────────────
+      with subtest("bps-lifecycle: apply BPS → 3 children → delete → children gone"):
+          # ── Apply 3-class BPS ─────────────────────────────────────────
           # poolTemplate.image=rio-builder + imagePullPolicy not-in-template
           # (builders.rs:137 hardcodes None). systems=[x86_64-linux]
           # (required by child WP CEL). resources are dummy — replicas.
@@ -2337,7 +2337,7 @@ let
               "apiVersion: rio.build/v1alpha1\n"
               "kind: BuilderPoolSet\n"
               "metadata:\n"
-              "  name: test-wps\n"
+              "  name: test-bps\n"
               "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  classes:\n"
@@ -2361,13 +2361,13 @@ let
           )
 
           # ── 3 children appear, correct sizeClass + ownerRef ───────────
-          # child_name = "{wps}-{class.name}" (builders.rs:43). The
+          # child_name = "{bps}-{class.name}" (builders.rs:43). The
           # reconciler's .owns(BuilderPool) watch fires on CR create
           # (<1s); SSA-apply for each child is fast (no pod create
           # at replicas.min=0). 30s absorbs the reconcile tick +
           # 3× apiserver admission.
           for cls in ["small", "medium", "large"]:
-              child = f"test-wps-{cls}"
+              child = f"test-bps-{cls}"
               k3s_server.wait_until_succeeds(
                   f"k3s kubectl -n ${nsBuilders} get builderpool {child} 2>/dev/null",
                   timeout=30,
@@ -2386,30 +2386,30 @@ let
                   f"these diverge, scheduler routing breaks."
               )
               owner = bp["metadata"]["ownerReferences"][0]
-              assert owner["name"] == "test-wps", (
-                  f"expected {child} ownerRef[0].name=test-wps, "
+              assert owner["name"] == "test-bps", (
+                  f"expected {child} ownerRef[0].name=test-bps, "
                   f"got {owner['name']!r}"
               )
               assert owner["kind"] == "BuilderPoolSet", (
                   f"expected {child} ownerRef[0].kind=BuilderPoolSet, "
                   f"got {owner['kind']!r}"
               )
-          print("wps-lifecycle: 3 children created, sizeClass+ownerRef correct")
+          print("bps-lifecycle: 3 children created, sizeClass+ownerRef correct")
 
-          # ── Delete WPS → children GC'd ────────────────────────────────
-          # --wait=false: don't block on the WPS finalizer. cleanup()
+          # ── Delete BPS → children GC'd ────────────────────────────────
+          # --wait=false: don't block on the BPS finalizer. cleanup()
           # (builderpoolset/mod.rs:371) explicitly deletes each child
           # with 404 tolerance. Each child then runs ITS OWN BuilderPool
           # finalizer (DrainWorker — trivially fast at replicas=0)
           # before K8s GC deletes the owned resources.
-          kubectl("delete builderpoolset test-wps --wait=false", ns="${nsBuilders}")
+          kubectl("delete builderpoolset test-bps --wait=false", ns="${nsBuilders}")
 
-          # WPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
+          # BPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
           # iterates 3 children × (delete RPC + child finalizer). At
           # replicas=0, child finalizers complete in <5s each (no pods
           # to drain). 60s absorbs k3s controller lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get builderpoolset test-wps 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpoolset test-bps 2>/dev/null",
               timeout=60,
           )
 
@@ -2418,11 +2418,11 @@ let
           # Checked per-child so a hang names which class stuck.
           for cls in ["small", "medium", "large"]:
               k3s_server.wait_until_succeeds(
-                  f"! k3s kubectl -n ${nsBuilders} get builderpool test-wps-{cls} 2>/dev/null",
+                  f"! k3s kubectl -n ${nsBuilders} get builderpool test-bps-{cls} 2>/dev/null",
                   timeout=30,
               )
 
-          print("wps-lifecycle PASS: 3 children created + GC'd on WPS delete")
+          print("bps-lifecycle PASS: 3 children created + GC'd on BPS delete")
     '';
 
     store-rollout = ''

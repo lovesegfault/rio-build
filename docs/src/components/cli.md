@@ -9,7 +9,7 @@
 
 `--scheduler-addr` (default `localhost:9001`) and `--store-addr` (default
 `rio-store.rio-store:9002`) target the in-pod case. TLS is env-only
-(`RIO_TLS__*`). gRPC connect is **per-subcommand** — `wps` (kube-only) and
+(`RIO_TLS__*`). gRPC connect is **per-subcommand** — `bps` (kube-only) and
 `upstream`/`verify-chunks` (store-only) MUST work when the scheduler is
 unreachable (e.g., to diagnose why).
 
@@ -43,7 +43,7 @@ All unary admin RPCs go through `rpc()` which applies the retry above and a per-
 | `drain-executor` | `AdminService.DrainExecutor` | Mark a worker draining (`--force` reassigns) |
 | `cutoffs` | `AdminService.GetSizeClassStatus` | SITA-E configured vs effective cutoffs |
 | `estimator` | `AdminService.GetEstimatorStats` | build_history EMA dump |
-| `wps` | k8s apiserver (no gRPC) | `BuilderPoolSet` CR get/describe |
+| `bps` | k8s apiserver (no gRPC) | `BuilderPoolSet` CR get/describe |
 | `verify-chunks` | `StoreAdminService.VerifyChunks` | PG↔backend chunk audit |
 | `upstream` | `StoreAdminService.{List,Add,Remove}Upstream` | Per-tenant upstream cache CRUD |
 | `create-tenant` / `list-tenants` | `AdminService.{CreateTenant,ListTenants}` | Tenant CRUD |

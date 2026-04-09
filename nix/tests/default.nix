@@ -591,9 +591,9 @@ in
   };
 
   # r[verify ctrl.wps.reconcile]
-  #   wps-lifecycle: apply 3-class WPS → 3 child WorkerPools named
-  #   `{wps}-{class}` each with sizeClass=class.name + ownerRef[0]=
-  #   BuilderPoolSet (controller=true). Delete WPS → finalizer
+  #   bps-lifecycle: apply 3-class BPS → 3 child BuilderPools named
+  #   `{bps}-{class}` each with sizeClass=class.name + ownerRef[0]=
+  #   BuilderPoolSet (controller=true). Delete BPS → finalizer
   #   cleanup explicitly deletes children; ownerRef GC as fallback.
   #
   # Own split (not folded into autoscale): fresh fixture → clean
@@ -626,10 +626,10 @@ in
     };
   };
 
-  vm-lifecycle-wps-k3s = lifecycleMod.mkTest {
-    name = "wps";
+  vm-lifecycle-bps-k3s = lifecycleMod.mkTest {
+    name = "bps";
     subtests = [
-      "wps-lifecycle"
+      "bps-lifecycle"
     ];
   };
 

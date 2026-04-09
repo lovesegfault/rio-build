@@ -853,7 +853,7 @@ rec {
     # JWT-seed file I/O. Under KVM, pod-Ready → kube-proxy-synced can
     # outrun that gap: nc -z succeeds (iptables rule exists), then ssh
     # gets RST (listener not bound yet, or kube-proxy mid-sync flap
-    # during the scale 0→1 endpoint churn). Observed: vm-lifecycle-wps
+    # during the scale 0→1 endpoint churn). Observed: vm-lifecycle-bps
     # — nc succeeded in 0.11s, immediate `nix copy` got Connection
     # refused.
     #

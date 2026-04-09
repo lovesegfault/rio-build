@@ -672,7 +672,7 @@
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
           #   vm-ca-cutoff-standalone — CA-on-CA cutoff propagation
           #   vm-chaos-standalone — fault injection
-          #   vm-lifecycle-{core,recovery,autoscale,wps}-k3s
+          #   vm-lifecycle-{core,recovery,autoscale,bps}-k3s
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #   vm-security-nonpriv-k3s — privileged-hardening e2e
           #   vm-cli-k3s — rio-cli integration
@@ -761,7 +761,7 @@
                 vm-lifecycle-core-k3s = 8;
                 vm-lifecycle-recovery-k3s = 8;
                 vm-lifecycle-autoscale-k3s = 8;
-                vm-lifecycle-wps-k3s = 8;
+                vm-lifecycle-bps-k3s = 8;
                 vm-le-stability-k3s = 8;
                 vm-le-build-k3s = 8;
                 # k3s + one extra airgap image (squid). Does builds.
