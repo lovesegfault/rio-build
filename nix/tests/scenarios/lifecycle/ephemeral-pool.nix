@@ -257,8 +257,8 @@ scope: with scope; ''
       # (job_count ≤ 2 asserted above) whose pod is mid-connect
       # when SIGTERM lands → builder's `continue 'reconnect` loop
       # (main.rs:388) re-registers → workers_active bounces 0→1
-      # for up to 180s. GHA run 24012511360: manifest-pool's
-      # precondition sched_metric_wait('workers_active 0', 90s)
+      # for up to 180s. GHA run 24012511360: a follow-on subtest's
+      # sched_metric_wait('workers_active 0', 90s) precondition
       # blew with an ephemeral pod still Terminating. Every subtest
       # that deletes a pool MUST wait its own pods gone before the
       # next subtest's workers_active==0 precondition is sound.

@@ -11,7 +11,6 @@
   gc-sweep = import ./gc-sweep.nix;
   refs-end-to-end = import ./refs-end-to-end.nix;
   ephemeral-pool = import ./ephemeral-pool.nix;
-  manifest-pool = import ./manifest-pool.nix;
   bps-lifecycle = import ./bps-lifecycle.nix;
   store-rollout = import ./store-rollout.nix;
   bootstrap-job-ran = import ./bootstrap-job-ran.nix;
