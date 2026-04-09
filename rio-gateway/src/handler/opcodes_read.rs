@@ -150,11 +150,11 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
         Some(info) => {
             wire::write_bool(w, true).await?;
-            pathinfo::write_body(
+            pathinfo::write_valid_path_info(
                 w,
-                &pathinfo::PathInfoBody {
-                    // deriver: Option<StorePath> → empty string if None (wire convention)
-                    deriver: info.deriver.map(|d| d.to_string()).unwrap_or_default(),
+                &pathinfo::ValidPathInfo {
+                    // deriver: Option<StorePath> → Option<String>
+                    deriver: info.deriver.map(|d| d.to_string()),
                     nar_hash: info.nar_hash.to_vec(),
                     // references: Vec<StorePath> — StorePath: AsRef<str>
                     references: info.references.iter().map(|r| r.to_string()).collect(),
@@ -162,8 +162,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
                     nar_size: info.nar_size,
                     ultimate: info.ultimate,
                     signatures: info.signatures,
-                    // content_address: Option<String> → empty string if None
-                    content_address: info.content_address.unwrap_or_default(),
+                    content_address: info.content_address,
                 },
             )
             .await?;

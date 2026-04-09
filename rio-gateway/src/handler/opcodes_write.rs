@@ -181,7 +181,7 @@ struct EntryHead {
 
 /// Read and validate one entry's metadata from the wire.
 ///
-/// Shared by two opcodes that send the same `path` + [`PathInfoBody`]
+/// Shared by two opcodes that send the same `path` + [`ValidPathInfo`]
 /// head:
 ///
 /// - `wopAddToStoreNar` (39): reads from the OUTER stream; the NAR
@@ -193,15 +193,15 @@ struct EntryHead {
 ///
 /// Wire format (`ValidPathInfo::read` in store-api.cc, protocol ≥16):
 ///   path: string
-///   [`PathInfoBody`] (8 fields — see `rio_nix::protocol::pathinfo`)
+///   [`ValidPathInfo`] (8 fields — see `rio_nix::protocol::pathinfo`)
 ///   NAR: see per-opcode note above
 ///
 /// Returns with the NAR bytes still unread — caller decides buffer vs stream.
 ///
-/// [`PathInfoBody`]: rio_nix::protocol::pathinfo::PathInfoBody
+/// [`ValidPathInfo`]: rio_nix::protocol::pathinfo::ValidPathInfo
 async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result<EntryHead> {
     let path_str = wire::read_string(framed).await?;
-    let body = pathinfo::read_body(framed).await?;
+    let body = pathinfo::read_valid_path_info(framed).await?;
 
     debug!(path = %path_str, nar_size = body.nar_size, "read PathInfo wire head");
 
@@ -224,14 +224,14 @@ async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result
     let raw_info = types::PathInfo {
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
-        deriver: body.deriver,
+        deriver: body.deriver.unwrap_or_default(),
         nar_hash: body.nar_hash,
         nar_size: body.nar_size,
         references: body.references,
         registration_time: body.registration_time,
         ultimate: body.ultimate,
         signatures: body.signatures,
-        content_address: body.content_address,
+        content_address: body.content_address.unwrap_or_default(),
     };
     let info =
         ValidatedPathInfo::try_from(raw_info).map_err(|e| GatewayError::InvalidPathInfo {
@@ -378,17 +378,17 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let w = stderr.inner_mut();
 
     wire::write_string(w, path.as_str()).await?;
-    pathinfo::write_body(
+    pathinfo::write_valid_path_info(
         w,
-        &pathinfo::PathInfoBody {
-            deriver: String::new(),
+        &pathinfo::ValidPathInfo {
+            deriver: None,
             nar_hash: nar_hash.digest().to_vec(),
             references,
             registration_time: 0,
             nar_size,
             ultimate: true,
             signatures: Vec::new(),
-            content_address: ca,
+            content_address: Some(ca),
         },
     )
     .await?;
