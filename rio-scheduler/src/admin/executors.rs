@@ -29,10 +29,10 @@ pub(super) async fn list_executors(
     actor: &ActorHandle,
     status_filter: &str,
 ) -> Result<ListExecutorsResponse, Status> {
-    let snapshots = actor
-        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::ListExecutors { reply }))
-        .await
-        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+    let snapshots = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::ListExecutors { reply })
+    })
+    .await?;
 
     let executors: Vec<ExecutorInfo> = snapshots
         .into_iter()

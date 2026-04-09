@@ -72,13 +72,13 @@ pub(super) async fn trigger_gc(
     shutdown: rio_common::signal::Token,
     mut req: GcRequest,
 ) -> Result<ReceiverStream<Result<GcProgress, Status>>, Status> {
-    // Step 1: collect extra_roots from the actor. send_unchecked
-    // bypasses backpressure — GC is operator-initiated, rare,
-    // and should work even when the scheduler is saturated.
-    let mut extra_roots = actor
-        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::GcRoots { reply }))
-        .await
-        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+    // Step 1: collect extra_roots from the actor. Bypasses
+    // backpressure — GC is operator-initiated, rare, and should work
+    // even when the scheduler is saturated.
+    let mut extra_roots = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::GcRoots { reply })
+    })
+    .await?;
 
     // Merge with any client-provided extra_roots (unusual but
     // allowed — maybe the client has additional pins).

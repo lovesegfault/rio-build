@@ -16,13 +16,13 @@ use crate::estimator::BucketedEstimate;
 pub(super) async fn get_capacity_manifest(
     actor: &ActorHandle,
 ) -> Result<GetCapacityManifestResponse, Status> {
-    // send_unchecked: same reasoning as ClusterStatus. The controller
-    // polls this to size the builder fleet — dropping the query under
-    // backpressure would blind it exactly when the queue is deepest.
-    let estimates = actor
-        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::CapacityManifest { reply }))
-        .await
-        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+    // Same reasoning as ClusterStatus: the controller polls this to
+    // size the builder fleet — dropping the query under backpressure
+    // would blind it exactly when the queue is deepest.
+    let estimates = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::CapacityManifest { reply })
+    })
+    .await?;
 
     Ok(GetCapacityManifestResponse {
         estimates: estimates.into_iter().map(to_proto).collect(),

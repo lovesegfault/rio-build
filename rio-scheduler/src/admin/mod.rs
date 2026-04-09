@@ -40,6 +40,21 @@ use uuid::Uuid;
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
 use crate::logs::LogBuffers;
 
+/// `actor.query_unchecked` + `actor_error_to_status`. Every admin
+/// handler that round-trips a oneshot through the actor uses this —
+/// the call bypasses backpressure (diagnostic/operator queries must
+/// land especially under saturation; see I-056) and maps the
+/// `ActorError` into the canonical gRPC `Status`.
+pub(super) async fn query_actor<R>(
+    actor: &ActorHandle,
+    mk: impl FnOnce(tokio::sync::oneshot::Sender<R>) -> ActorCommand,
+) -> Result<R, Status> {
+    actor
+        .query_unchecked(mk)
+        .await
+        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)
+}
+
 mod builds;
 mod estimator;
 mod executors;
@@ -312,15 +327,12 @@ impl AdminService for AdminServiceImpl {
         // loop into MORE load — exactly what we don't want.
         let executor_id = req.executor_id.into();
         let force = req.force;
-        let result = self
-            .actor
-            .query_unchecked(|reply| ActorCommand::DrainExecutor {
-                executor_id,
-                force,
-                reply,
-            })
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        let result = query_actor(&self.actor, |reply| ActorCommand::DrainExecutor {
+            executor_id,
+            force,
+            reply,
+        })
+        .await?;
 
         Ok(Response::new(DrainExecutorResponse {
             accepted: result.accepted,
@@ -341,11 +353,11 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("derivation_hash is required"));
         }
         let drv_hash: crate::state::DrvHash = req.derivation_hash.into();
-        let cleared = self
-            .actor
-            .query_unchecked(|reply| ActorCommand::ClearPoison { drv_hash, reply })
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        let cleared = query_actor(&self.actor, |reply| ActorCommand::ClearPoison {
+            drv_hash,
+            reply,
+        })
+        .await?;
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 
@@ -500,13 +512,10 @@ impl AdminService for AdminServiceImpl {
             .build_id
             .parse()
             .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
-        let (derivations, live_executor_ids) = self
-            .actor
-            .query_unchecked(|reply| {
-                ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
-            })
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        let (derivations, live_executor_ids) = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
+        })
+        .await?;
         Ok(Response::new(InspectBuildDagResponse {
             derivations,
             live_executor_ids,

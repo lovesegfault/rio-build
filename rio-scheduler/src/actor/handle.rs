@@ -186,127 +186,116 @@ impl ActorHandle {
     /// backpressure (`send_unchecked`) — diagnostic queries must
     /// succeed under saturation, that's exactly when you need them.
     pub async fn debug_query_workers(&self) -> Result<Vec<DebugExecutorInfo>, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Admin(AdminQuery::DebugQueryWorkers {
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+        self.query_unchecked(|reply| ActorCommand::Admin(AdminQuery::DebugQueryWorkers { reply }))
+            .await
+    }
+}
+
+/// Test-only `debug_*` actor queries. Thin wrappers over
+/// [`ActorHandle::query_unchecked`] that wrap a [`DebugCmd`] variant
+/// — kept as named methods so test call sites read as intent
+/// (`handle.debug_force_assign(...)`) rather than open-coding the
+/// command enum.
+#[cfg(test)]
+impl ActorHandle {
+    async fn debug<R>(
+        &self,
+        mk: impl FnOnce(oneshot::Sender<R>) -> DebugCmd,
+    ) -> Result<R, ActorError> {
+        self.query_unchecked(|reply| ActorCommand::Debug(mk(reply)))
+            .await
     }
 
-    /// Test-only: query a derivation's state.
-    #[cfg(test)]
+    /// Query a derivation's state.
     pub async fn debug_query_derivation(
         &self,
         drv_hash: &str,
     ) -> Result<Option<DebugDerivationInfo>, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::QueryDerivation {
-            drv_hash: drv_hash.to_string(),
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::QueryDerivation { drv_hash, reply })
+            .await
     }
 
-    /// Test-only: force a derivation to Assigned for a given
-    /// worker, bypassing dispatch's backoff + failed_builders
-    /// exclusion. For retry/poison tests that drive multiple
-    /// completion cycles. Returns `false` if the derivation
-    /// couldn't be forced (terminal state, not found).
-    #[cfg(test)]
+    /// Force a derivation to Assigned for a given worker, bypassing
+    /// dispatch's backoff + failed_builders exclusion. For retry/poison
+    /// tests that drive multiple completion cycles. Returns `false` if
+    /// the derivation couldn't be forced (terminal state, not found).
     pub async fn debug_force_assign(
         &self,
         drv_hash: &str,
         executor_id: &str,
     ) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::ForceAssign {
-            drv_hash: drv_hash.to_string(),
-            executor_id: executor_id.into(),
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+        let drv_hash = drv_hash.to_string();
+        let executor_id = executor_id.into();
+        self.debug(|reply| DebugCmd::ForceAssign {
+            drv_hash,
+            executor_id,
+            reply,
+        })
+        .await
     }
 
-    /// Test-only: backdate `running_since` and force Running status.
-    /// For backstop-timeout tests. Returns `false` if not found or
-    /// not in Assigned/Running.
-    #[cfg(test)]
+    /// Backdate `running_since` and force Running status. For
+    /// backstop-timeout tests. Returns `false` if not found or not in
+    /// Assigned/Running.
     pub async fn debug_backdate_running(
         &self,
         drv_hash: &str,
         secs_ago: u64,
     ) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::BackdateRunning {
-            drv_hash: drv_hash.to_string(),
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::BackdateRunning {
+            drv_hash,
             secs_ago,
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+            reply,
+        })
+        .await
     }
 
-    /// Test-only: backdate a build's `submitted_at`. For per-build-
-    /// timeout tests. Returns `false` if build not found.
-    #[cfg(test)]
+    /// Backdate a build's `submitted_at`. For per-build-timeout tests.
+    /// Returns `false` if build not found.
     pub async fn debug_backdate_submitted(
         &self,
         build_id: Uuid,
         secs_ago: u64,
     ) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::BackdateSubmitted {
+        self.debug(|reply| DebugCmd::BackdateSubmitted {
             build_id,
             secs_ago,
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+            reply,
+        })
+        .await
     }
 
-    /// Test-only: force a derivation into `Poisoned` with the given
-    /// `retry_count`. Returns `false` if not found.
-    #[cfg(test)]
+    /// Force a derivation into `Poisoned` with the given `retry_count`.
+    /// Returns `false` if not found.
     pub async fn debug_force_poisoned(
         &self,
         drv_hash: &str,
         retry_count: u32,
     ) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::ForcePoisoned {
-            drv_hash: drv_hash.to_string(),
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::ForcePoisoned {
+            drv_hash,
             retry_count,
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+            reply,
+        })
+        .await
     }
 
-    /// Test-only: clear a derivation's `drv_content` to simulate
-    /// post-recovery state. Returns `false` if not found.
-    #[cfg(test)]
+    /// Clear a derivation's `drv_content` to simulate post-recovery
+    /// state. Returns `false` if not found.
     pub async fn debug_clear_drv_content(&self, drv_hash: &str) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::ClearDrvContent {
-            drv_hash: drv_hash.to_string(),
-            reply: tx,
-        }))
-        .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::ClearDrvContent { drv_hash, reply })
+            .await
     }
 
-    /// Test-only: call `cache_breaker.record_failure()` `n` times.
-    /// Returns `is_open()` after. For breaker-gate tests that need
-    /// the breaker open WITHOUT driving N failing RPCs through the
-    /// full merge/completion path.
-    #[cfg(test)]
+    /// Call `cache_breaker.record_failure()` `n` times. Returns
+    /// `is_open()` after. For breaker-gate tests that need the breaker
+    /// open WITHOUT driving N failing RPCs through the full
+    /// merge/completion path.
     pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
-        let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::Debug(DebugCmd::TripBreaker { n, reply: tx }))
-            .await?;
-        rx.await.map_err(|_| ActorError::ChannelSend)
+        self.debug(|reply| DebugCmd::TripBreaker { n, reply }).await
     }
 }

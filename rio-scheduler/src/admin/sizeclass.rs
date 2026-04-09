@@ -33,19 +33,17 @@ pub(super) async fn get_size_class_status(
     db: &SchedulerDb,
     pool_features: Option<Vec<String>>,
 ) -> Result<GetSizeClassStatusResponse, Status> {
-    // send_unchecked: the WPS autoscaler (P0234) reads this to set
-    // per-class replica targets. Dropping under backpressure blinds
-    // the autoscaler exactly when it should scale up — same
-    // reasoning as ClusterStatus.
-    let (snapshots, fod_snapshots) = actor
-        .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
-                pool_features,
-                reply,
-            })
+    // The WPS autoscaler (P0234) reads this to set per-class replica
+    // targets. Dropping under backpressure blinds the autoscaler
+    // exactly when it should scale up — same reasoning as
+    // ClusterStatus.
+    let (snapshots, fod_snapshots) = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+            pool_features,
+            reply,
         })
-        .await
-        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+    })
+    .await?;
 
     // P0556: FOD classes are independent of builder classes — populate
     // even if `size_classes` is off. cutoffs/sample_count are zero

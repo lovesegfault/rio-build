@@ -21,14 +21,14 @@ pub(super) async fn get_estimator_stats(
     actor: &ActorHandle,
     drv_name_filter: Option<&str>,
 ) -> Result<GetEstimatorStatsResponse, Status> {
-    // send_unchecked: read-only diagnostic, but the operator reaches
-    // for this when something is misrouting under load — same
-    // "don't drop the diagnostic exactly when it's needed" reasoning
-    // as ClusterStatus / GetSizeClassStatus.
-    let mut entries = actor
-        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::EstimatorStats { reply }))
-        .await
-        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+    // Read-only diagnostic, but the operator reaches for this when
+    // something is misrouting under load — same "don't drop the
+    // diagnostic exactly when it's needed" reasoning as ClusterStatus
+    // / GetSizeClassStatus.
+    let mut entries = super::query_actor(actor, |reply| {
+        ActorCommand::Admin(AdminQuery::EstimatorStats { reply })
+    })
+    .await?;
 
     // Substring filter on pname. Empty filter = keep all (proto
     // optional-string-unset and explicit "" both land here).
