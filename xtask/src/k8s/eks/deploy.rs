@@ -187,10 +187,12 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": "internal",
-        // P0542: dualstack NLB so the gateway has both A and AAAA.
-        // v6-only pods inside the cluster reach it via the Service
-        // ClusterIP anyway; this is for the SSM-tunnel client side.
-        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
+        // ipv4: target-type=instance + dualstack creates an IPv6 target
+        // group that requires instances to have a PRIMARY IPv6 address.
+        // AL2023 system nodes (where rio-gateway runs) have secondary
+        // IPv6 only → InvalidTarget. NLB→node v4 NodePort→Cilium eBPF→
+        // pod works regardless of pod IP family.
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "ipv4",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
