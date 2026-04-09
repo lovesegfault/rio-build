@@ -55,7 +55,7 @@ resource "helm_release" "karpenter_crd" {
 
   # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
   # cilium dep: CNI must be up or pods Pending → wait=true times out.
-  depends_on = [module.eks, helm_release.aws_lbc, helm_release.cilium]
+  depends_on = [helm_release.aws_lbc, helm_release.cilium]
 }
 
 resource "helm_release" "karpenter" {
@@ -97,5 +97,5 @@ resource "helm_release" "karpenter" {
     })
   ]
 
-  depends_on = [module.eks, module.karpenter, helm_release.karpenter_crd]
+  depends_on = [module.karpenter, helm_release.karpenter_crd]
 }

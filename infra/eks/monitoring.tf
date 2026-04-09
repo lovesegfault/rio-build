@@ -77,5 +77,5 @@ resource "helm_release" "kube_prometheus_stack" {
   # alertmanager/prometheus Services race the webhook's pod-Ready and
   # get "no endpoints available". cilium dep: CNI must be up or pods
   # Pending → wait=true times out.
-  depends_on = [module.eks, helm_release.aws_lbc, helm_release.cilium]
+  depends_on = [helm_release.aws_lbc, helm_release.cilium]
 }

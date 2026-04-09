@@ -39,7 +39,7 @@ resource "kubectl_manifest" "gateway_api_crds" {
   # last-applied-configuration annotation size limit.
   server_side_apply = true
 
-  # No explicit depends_on = [module.eks] — that waits for the
+  # No explicit depends_on = [helm_release.cilium] — that waits for the
   # nodegroup too, which deadlocks (nodegroup needs CNI to go Ready).
   # The kubectl provider is configured with module.eks.cluster_endpoint
   # which gives the implicit dep on the control plane only.
@@ -140,7 +140,7 @@ resource "helm_release" "cilium" {
 
   # C1: Gateway API CRDs must exist or gatewayAPI.enabled silently
   # no-ops. for_each set → depend on the whole map. Do NOT
-  # depends_on = [module.eks] — that waits for the nodegroup, which
+  # depends_on = [helm_release.cilium] — that waits for the nodegroup, which
   # deadlocks (nodegroup health requires nodes Ready, which requires
   # this CNI). The helm provider config + k8sServiceHost value both
   # reference module.eks.cluster_endpoint, giving the implicit dep on
@@ -171,7 +171,7 @@ resource "kubernetes_service_account_v1" "aws_lbc" {
       "eks.amazonaws.com/role-arn" = module.aws_lbc_irsa.arn
     }
   }
-  depends_on = [module.eks]
+  depends_on = [helm_release.cilium]
 }
 
 module "aws_lbc_irsa" {
