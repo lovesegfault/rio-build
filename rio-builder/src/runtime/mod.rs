@@ -1737,11 +1737,7 @@ mod tests {
         use rio_test_support::grpc::spawn_mock_store;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
+        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
         let (store, addr, _srv) = spawn_mock_store().await.unwrap();
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
@@ -1805,11 +1801,7 @@ mod tests {
         use rio_test_support::grpc::spawn_mock_store;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
+        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
         let (store, addr, _srv) = spawn_mock_store().await.unwrap();
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
@@ -1861,11 +1853,7 @@ mod tests {
         use rio_test_support::grpc::spawn_mock_store;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
+        let cache = Arc::new(crate::fuse::cache::Cache::new(dir.path().to_path_buf()).unwrap());
         let (store, addr, _srv) = spawn_mock_store().await.unwrap();
         let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await

@@ -211,50 +211,43 @@ impl NixStoreFs {
         store_basename: &str,
         fetch_timeout: Duration,
     ) -> Result<PathBuf, Errno> {
-        match self.cache.get_path(store_basename) {
-            Ok(Some(local_path)) => {
-                // Self-healing fast path: the index says present — verify
-                // disk agrees. If an external rm (debugging, interrupted
-                // eviction) deleted the file but left the SQLite row,
-                // trusting the index here makes the path PERMANENTLY
-                // unfetchable (every call returns a path that doesn't exist;
-                // we never fall through to fetch). Stat is one extra syscall
-                // per store-path-root lookup — cheap, and ensure_cached only
-                // runs when ops.rs already missed.
-                match local_path.symlink_metadata() {
-                    Ok(_) => {
-                        // I-110c: drop any primed hint — we won't fetch.
-                        // Keeps the hint map from accumulating entries
-                        // for already-cached inputs across builds.
-                        let _ = self.cache.take_manifest_hint(store_basename);
-                        return Ok(local_path);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        tracing::warn!(
-                            store_path = store_basename,
-                            local_path = %local_path.display(),
-                            "cache index says present but disk disagrees; purging stale row and re-fetching"
-                        );
-                        metrics::counter!("rio_builder_fuse_index_divergence_total").increment(1);
-                        self.cache.remove_stale(store_basename);
-                        // fall through to try_start_fetch below
-                    }
-                    Err(e) => {
-                        // EACCES/EIO on the stat — something else is wrong.
-                        // Don't silently re-fetch (would mask disk failure).
-                        tracing::error!(
-                            store_path = store_basename,
-                            error = %e,
-                            "cache stat failed (not ENOENT)"
-                        );
-                        return Err(Errno::EIO);
-                    }
+        if let Some(local_path) = self.cache.get_path(store_basename) {
+            // Self-healing fast path: the index says present — verify
+            // disk agrees. If an external rm (debugging, interrupted
+            // eviction) deleted the file but left the index entry,
+            // trusting the index here makes the path PERMANENTLY
+            // unfetchable (every call returns a path that doesn't exist;
+            // we never fall through to fetch). Stat is one extra syscall
+            // per store-path-root lookup — cheap, and ensure_cached only
+            // runs when ops.rs already missed.
+            match local_path.symlink_metadata() {
+                Ok(_) => {
+                    // I-110c: drop any primed hint — we won't fetch.
+                    // Keeps the hint map from accumulating entries
+                    // for already-cached inputs across builds.
+                    let _ = self.cache.take_manifest_hint(store_basename);
+                    return Ok(local_path);
                 }
-            }
-            Ok(None) => {} // not cached, fetch below
-            Err(e) => {
-                tracing::error!(store_path = store_basename, error = %e, "FUSE cache index query failed");
-                return Err(Errno::EIO);
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        store_path = store_basename,
+                        local_path = %local_path.display(),
+                        "cache index says present but disk disagrees; purging stale entry and re-fetching"
+                    );
+                    metrics::counter!("rio_builder_fuse_index_divergence_total").increment(1);
+                    self.cache.remove_stale(store_basename);
+                    // fall through to try_start_fetch below
+                }
+                Err(e) => {
+                    // EACCES/EIO on the stat — something else is wrong.
+                    // Don't silently re-fetch (would mask disk failure).
+                    tracing::error!(
+                        store_path = store_basename,
+                        error = %e,
+                        "cache stat failed (not ENOENT)"
+                    );
+                    return Err(Errno::EIO);
+                }
             }
         }
 
@@ -366,24 +359,16 @@ impl NixStoreFs {
         // "input does not exist" until remount. A non-ENOENT error is
         // propagated to the caller WITHOUT a negative dentry. EIO matches
         // the Fetch arm's own failure errno and the spec's "fetch failure
-        // is EIO, never ENOENT" rule. Index error ⇒ also EIO.
+        // is EIO, never ENOENT" rule.
         // r[impl builder.fuse.jit-lookup]
         match self.cache.get_path(store_basename) {
-            Ok(Some(p)) => Ok(p),
-            Ok(None) => {
+            Some(p) => Ok(p),
+            None => {
                 tracing::warn!(
                     store_path = store_basename,
                     "fetcher guard dropped with cache empty (fetcher \
                      errored or panicked); returning EIO so overlayfs \
                      does not negative-cache (I-179)"
-                );
-                Err(Errno::EIO)
-            }
-            Err(e) => {
-                tracing::error!(
-                    store_path = store_basename,
-                    error = %e,
-                    "cache index query failed after wait"
                 );
                 Err(Errno::EIO)
             }
@@ -438,17 +423,10 @@ pub fn prefetch_path_blocking(
     store_basename: &str,
 ) -> Result<Option<PrefetchSkip>, Errno> {
     // Fast-path: already cached (concurrent prefetch or earlier hint).
-    match cache.get_path(store_basename) {
-        Ok(Some(_)) => {
-            // I-110c: drop any primed hint — we won't fetch.
-            let _ = cache.take_manifest_hint(store_basename);
-            return Ok(Some(PrefetchSkip::AlreadyCached));
-        }
-        Ok(None) => {} // not cached, proceed
-        Err(e) => {
-            tracing::debug!(store_path = store_basename, error = %e, "prefetch: cache query failed");
-            return Err(Errno::EIO);
-        }
+    if cache.get_path(store_basename).is_some() {
+        // I-110c: drop any primed hint — we won't fetch.
+        let _ = cache.take_manifest_hint(store_basename);
+        return Ok(Some(PrefetchSkip::AlreadyCached));
     }
 
     match cache.try_start_fetch(store_basename) {
@@ -779,20 +757,8 @@ fn commit_to_cache(
         Errno::EIO
     })?;
 
-    // Record in cache index. If this fails, the path is on disk but
-    // invisible to contains() — every subsequent access would re-fetch
-    // the NAR, creating an infinite re-fetch loop under DB failure.
-    // Fail loudly (EIO) so the build surfaces the real problem instead
-    // of silently amplifying network traffic.
-    if let Err(e) = cache.insert(store_basename) {
-        tracing::error!(
-            store_path = %store_basename,
-            local_path = %local_path.display(),
-            error = %e,
-            "failed to record in cache index; path on disk but untracked"
-        );
-        return Err(Errno::EIO);
-    }
+    // Record in the in-memory cache index (infallible HashSet insert).
+    cache.insert(store_basename);
 
     Ok(())
 }

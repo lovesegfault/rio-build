@@ -14,16 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-/// Errors from cache operations. Only [`Cache::new`] is fallible (directory
-/// creation); index ops (`get_path`/`insert`/`remove_stale`/`contains`) are
-/// pure `HashSet` accesses and cannot fail — they keep `Result` return types
-/// for caller compatibility only.
-#[derive(Debug, thiserror::Error)]
-pub enum CacheError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
 /// Per-path coordination for in-flight fetches.
 ///
 /// Waiters block on `cv` until `done` flips to true.
@@ -211,10 +201,7 @@ impl Cache {
     /// process-local `HashSet` — builders are ephemeral (one build per
     /// pod), so persisting it would only add I/O for a file nobody reads
     /// (I-141: the previous on-disk index cost ~10s/build under load).
-    ///
-    /// `async` for caller compatibility only (no awaits inside).
-    #[allow(clippy::unused_async)]
-    pub async fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {
+    pub fn new(cache_dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             cache_dir,
@@ -299,27 +286,22 @@ impl Cache {
 
     /// Check if a store path is cached.
     #[cfg(test)]
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn contains(&self, store_path: &str) -> Result<bool, CacheError> {
-        Ok(self
-            .cached
+    pub fn contains(&self, store_path: &str) -> bool {
+        self.cached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(store_path))
+            .contains(store_path)
     }
 
-    /// Get the full filesystem path for a cached store path.
-    ///
-    /// Returns `Ok(None)` if the path is not cached. Infallible — `Result`
-    /// kept for caller compatibility.
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn get_path(&self, store_path: &str) -> Result<Option<PathBuf>, CacheError> {
+    /// Get the full filesystem path for a cached store path, or `None` if
+    /// not cached.
+    pub fn get_path(&self, store_path: &str) -> Option<PathBuf> {
         let present = self
             .cached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(store_path);
-        Ok(present.then(|| self.cache_dir.join(store_path)))
+        present.then(|| self.cache_dir.join(store_path))
     }
 
     /// Remove a stale index entry. Called when the index says "present"
@@ -331,15 +313,12 @@ impl Cache {
             .remove(store_path);
     }
 
-    /// Record a store path as cached after extraction. Infallible —
-    /// `Result` kept for caller compatibility.
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn insert(&self, store_path: &str) -> Result<(), CacheError> {
+    /// Record a store path as cached after extraction.
+    pub fn insert(&self, store_path: &str) {
         self.cached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(store_path.to_owned());
-        Ok(())
     }
 
     /// Try to claim responsibility for fetching a path.
@@ -377,16 +356,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    async fn make_cache(cache_dir: PathBuf) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::new(cache_dir).await?))
+    fn make_cache(cache_dir: PathBuf) -> Arc<Cache> {
+        Arc::new(Cache::new(cache_dir).expect("Cache::new"))
     }
 
-    #[tokio::test]
-    async fn test_cache_new_creates_dir_memory_index() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+    #[test]
+    fn test_cache_new_creates_dir_memory_index() {
+        let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
 
-        let cache = make_cache(cache_dir.clone()).await?;
+        let cache = make_cache(cache_dir.clone());
         // cache_dir is created (NAR trees land here); the index is a
         // process-local HashSet, never persisted.
         assert!(cache_dir.exists());
@@ -394,17 +373,16 @@ mod tests {
             !cache_dir.join("cache_index.sqlite").exists(),
             "index must be in-memory, not on disk"
         );
-        assert!(!cache.contains("nope")?);
-        Ok(())
+        assert!(!cache.contains("nope"));
     }
 
     /// JIT allowlist: unarmed → NotArmed; register → KnownInput /
     /// NotInput. Second register EXTENDS, not replaces.
     // r[verify builder.fuse.jit-register]
-    #[tokio::test]
-    async fn test_jit_classify_roundtrip() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+    #[test]
+    fn test_jit_classify_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
 
         let hello = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello";
         let world = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world";
@@ -438,51 +416,47 @@ mod tests {
             }
         );
         assert_eq!(cache.known_inputs_len(), 2);
-        Ok(())
     }
 
     /// Index round-trip: insert is observed by contains/get_path.
     // r[verify builder.fuse.cache-ephemeral-memory]
-    #[tokio::test]
-    async fn test_cache_insert_and_contains() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+    #[test]
+    fn test_cache_insert_and_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
 
-        assert!(!cache.contains("abc-hello-1.0")?);
-        cache.insert("abc-hello-1.0")?;
-        assert!(cache.contains("abc-hello-1.0")?);
-        Ok(())
+        assert!(!cache.contains("abc-hello-1.0"));
+        cache.insert("abc-hello-1.0");
+        assert!(cache.contains("abc-hello-1.0"));
     }
 
-    #[tokio::test]
-    async fn test_cache_get_path() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+    #[test]
+    fn test_cache_get_path() {
+        let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let cache = make_cache(cache_dir.clone()).await?;
+        let cache = make_cache(cache_dir.clone());
 
-        assert!(cache.get_path("abc-hello-1.0")?.is_none());
-        cache.insert("abc-hello-1.0")?;
-        let path = cache.get_path("abc-hello-1.0")?.expect("just inserted");
+        assert!(cache.get_path("abc-hello-1.0").is_none());
+        cache.insert("abc-hello-1.0");
+        let path = cache.get_path("abc-hello-1.0").expect("just inserted");
         assert_eq!(path, cache_dir.join("abc-hello-1.0"));
-        Ok(())
     }
 
     /// remove_stale drops the index entry so the next get_path is a miss.
-    #[tokio::test]
-    async fn test_cache_remove_stale() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
-        cache.insert("abc-hello-1.0")?;
-        assert!(cache.get_path("abc-hello-1.0")?.is_some());
+    #[test]
+    fn test_cache_remove_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
+        cache.insert("abc-hello-1.0");
+        assert!(cache.get_path("abc-hello-1.0").is_some());
         cache.remove_stale("abc-hello-1.0");
-        assert!(cache.get_path("abc-hello-1.0")?.is_none());
-        Ok(())
+        assert!(cache.get_path("abc-hello-1.0").is_none());
     }
 
-    #[tokio::test]
-    async fn test_inflight_claim_and_notify() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+    #[test]
+    fn test_inflight_claim_and_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
 
         // First claim should succeed.
         let FetchClaim::Fetch(guard) = cache.try_start_fetch("abc-path") else {
@@ -501,16 +475,15 @@ mod tests {
         let FetchClaim::Fetch(_) = cache.try_start_fetch("abc-path") else {
             panic!("should be able to re-claim after guard drop");
         };
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_inflight_concurrent_wait() -> anyhow::Result<()> {
+    #[test]
+    fn test_inflight_concurrent_wait() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Instant;
 
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
         let fetch_count = Arc::new(AtomicU32::new(0));
 
         // Two threads race to fetch the same path. Exactly one should get
@@ -549,13 +522,12 @@ mod tests {
             }
             start.elapsed()
         }
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_inflight_wait_timeout() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+    #[test]
+    fn test_inflight_wait_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
 
         // Claim the fetch but never drop the guard.
         let FetchClaim::Fetch(guard) = cache.try_start_fetch("stuck-path") else {
@@ -571,15 +543,14 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(100));
 
         drop(guard);
-        Ok(())
     }
 
     /// `is_done()` reflects guard-drop state without waiting on the condvar.
     /// Before guard drop: `false`. After guard drop: `true`.
-    #[tokio::test]
-    async fn test_inflight_is_done_tracks_guard_drop() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache = make_cache(dir.path().join("cache")).await?;
+    #[test]
+    fn test_inflight_is_done_tracks_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
 
         let FetchClaim::Fetch(guard) = cache.try_start_fetch("done-path") else {
             panic!("first claim should return Fetch");
@@ -601,7 +572,6 @@ mod tests {
 
         // And wait() now returns immediately true.
         assert!(entry.wait(Duration::from_secs(1)));
-        Ok(())
     }
 
     /// FetchSemaphore: permits are consumed by acquire, restored on permit drop.

@@ -823,7 +823,7 @@ mod tests {
         seed_with_refs(&store, &p_b, &[]);
 
         let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c")).await?;
+        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"))?;
 
         prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
 

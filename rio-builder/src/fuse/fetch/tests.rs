@@ -91,11 +91,7 @@ async fn setup_fetch_harness() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cache = Arc::new(
-        Cache::new(dir.path().to_path_buf())
-            .await
-            .expect("Cache::new"),
-    );
+    let cache = Arc::new(Cache::new(dir.path().to_path_buf()).expect("Cache::new"));
     let (store, addr, server_handle) = spawn_mock_store().await.expect("spawn mock store");
     let ch = rio_proto::client::connect_channel(&addr.to_string())
         .await
@@ -107,7 +103,7 @@ async fn setup_fetch_harness() -> (
 
 /// Seed MockStore with a valid single-file NAR → prefetch fetches,
 /// spools to a `.nar-*` tempfile, `restore_path_streaming`s to cache_dir,
-/// inserts into SQLite index → Ok(None) ("fetched"). Verify the extracted
+/// inserts into the in-memory index → Ok(None) ("fetched"). Verify the extracted
 /// file exists on disk with the right contents and the spool is gone.
 // r[verify builder.fuse.fetch-bounded-memory]
 #[tokio::test(flavor = "multi_thread")]
@@ -152,14 +148,10 @@ async fn test_prefetch_success_roundtrip() {
     assert_eq!(content, b"hello");
 
     // And the cache index should know about it.
-    // (Use spawn_blocking — cache.contains also uses block_on.)
-    let cache_cl = Arc::clone(&cache);
-    let basename_cl = basename.clone();
-    let contains = tokio::task::spawn_blocking(move || cache_cl.contains(&basename_cl))
-        .await
-        .expect("join")
-        .expect("contains query");
-    assert!(contains, "cache index should record the path");
+    assert!(
+        cache.contains(&basename),
+        "cache index should record the path"
+    );
 
     // I-180: the `.nar-*` spool tempfile must be removed post-extract
     // (scopeguard) — only the extracted tree remains in cache_dir.
@@ -695,11 +687,7 @@ async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
     assert_ne!(err.code(), Errno::ENOENT.code());
 
     // Sanity: cache really is empty for this basename.
-    let bn = basename.clone();
-    let cached = tokio::task::spawn_blocking(move || cache.get_path(&bn))
-        .await
-        .expect("join")
-        .expect("get_path");
+    let cached = cache.get_path(&basename);
     assert!(cached.is_none(), "cache must be empty: {cached:?}");
     drop(dir);
 }
@@ -736,18 +724,10 @@ async fn test_ensure_cached_self_heals_index_disk_divergence() {
     std::fs::remove_file(&p1).expect("rm cache file");
     assert!(!p1.exists(), "precondition: file gone from disk");
 
-    // Index still says present (contains() uses block_on internally).
-    let still_indexed = {
-        let cache = Arc::clone(&cache);
-        let bn = basename.clone();
-        tokio::task::spawn_blocking(move || cache.contains(&bn))
-            .await
-            .expect("join")
-            .expect("contains query")
-    };
+    // Index still says present.
     assert!(
-        still_indexed,
-        "precondition: index row survives external rm"
+        cache.contains(&basename),
+        "precondition: index entry survives external rm"
     );
 
     // Second ensure_cached: should stat the fast-path return, detect
@@ -763,16 +743,11 @@ async fn test_ensure_cached_self_heals_index_disk_divergence() {
     assert!(p2.exists(), "self-healed path exists: {p2:?}");
     assert_eq!(std::fs::read(&p2).expect("read"), b"heal-me");
 
-    // The index row was re-inserted by fetch_extract_insert (so the
+    // The index entry was re-inserted by fetch_extract_insert (so the
     // self-heal's remove_stale was followed by a fresh insert).
-    let reindexed = {
-        let cache = Arc::clone(&cache);
-        let bn = basename.clone();
-        tokio::task::spawn_blocking(move || cache.contains(&bn))
-            .await
-            .expect("join")
-            .expect("contains query")
-    };
-    assert!(reindexed, "index row re-inserted after self-heal fetch");
+    assert!(
+        cache.contains(&basename),
+        "index entry re-inserted after self-heal fetch"
+    );
     drop(dir);
 }

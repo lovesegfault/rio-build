@@ -78,7 +78,7 @@ pub async fn setup(
 
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
-    let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir).await?);
+    let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
     // Clone for prefetch. Cache methods use runtime.block_on
     // internally (sync, designed for FUSE callbacks on dedicated
     // threads). The prefetch handler will call them via
