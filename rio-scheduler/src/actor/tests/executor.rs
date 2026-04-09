@@ -372,21 +372,21 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
 
 /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
 /// derivation) must not clobber the scheduler's fresh assignment in
-/// worker.running_builds. The scheduler is authoritative.
+/// worker.running_build. The scheduler is authoritative.
 #[tokio::test]
 async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
-    // Register worker (initial heartbeat has empty running_builds).
+    // Register worker (initial heartbeat has empty running_build).
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("toctou-worker", "x86_64-linux").await?;
 
     // Merge a derivation. Scheduler will assign it to the worker and
-    // insert it into worker.running_builds.
+    // insert it into worker.running_build.
     let build_id = Uuid::new_v4();
     let drv_hash = "toctou-drv-hash";
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Verify: derivation is Assigned, worker.running_builds contains it.
+    // Verify: derivation is Assigned, worker.running_build contains it.
     let info = handle
         .debug_query_derivation(drv_hash)
         .await?
@@ -400,15 +400,15 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
         .expect("toctou-worker registered");
     assert!(
         w.running_build == Some(drv_hash.to_string()),
-        "scheduler should have tracked the assignment in worker.running_builds"
+        "scheduler should have tracked the assignment in worker.running_build"
     );
 
-    // Send a STALE heartbeat with empty running_builds. This mimics the
+    // Send a STALE heartbeat with empty running_build. This mimics the
     // race: worker sent heartbeat before receiving/acking the assignment.
-    // send_heartbeat's running_builds=[] is the stale value under test.
+    // send_heartbeat's running_build=[] is the stale value under test.
     send_heartbeat(&handle, "toctou-worker", "x86_64-linux").await?;
 
-    // Assignment must still be tracked. Before the fix, running_builds
+    // Assignment must still be tracked. Before the fix, running_build
     // would be wholesale replaced with the empty set, orphaning the
     // assignment (completion would later warn "unknown derivation").
     let workers = handle.debug_query_workers().await?;
@@ -423,7 +423,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     Ok(())
 }
 
-/// I-035: a SECOND consecutive heartbeat with empty running_builds drains
+/// I-035: a SECOND consecutive heartbeat with empty running_build drains
 /// the phantom. The TOCTOU window is one heartbeat interval (~10s) — one
 /// miss is the race the test above protects; two misses means the worker
 /// genuinely doesn't have the assignment (lost completion, dead stream
@@ -510,20 +510,20 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 
 /// I-042: completion arriving for a derivation that's already terminal
 /// (e.g., poisoned by a parallel-retry race) must still free the
-/// executor's `running_builds` slot. Before the fix, the line-419
+/// executor's `running_build` slot. Before the fix, the line-419
 /// early-return (`"not in assigned/running state"`) returned BEFORE
-/// `running_builds.remove`, leaking the slot.
+/// `running_build.remove`, leaking the slot.
 ///
 /// EKS reproduction (build 019d4681): stage0-posix retried across
 /// fetchers 0, 1, 3. fetcher-3's TransientFailure was the 6th — by
 /// then the derivation was already Poisoned (threshold 3, hit by an
-/// earlier completion). The 6th completion's running_builds.remove was
+/// earlier completion). The 6th completion's running_build.remove was
 /// inside an if-chain that the early-return skipped. fetcher-3's slot
 /// stayed 1/1 across 30+ heartbeats.
 ///
 /// Why the I-035 phantom-drain didn't catch it: the heartbeat reconcile
 /// (executor.rs:531-541) DOES drop entries whose DAG status is
-/// terminal — but only by overwriting `running_builds = reconciled` at
+/// terminal — but only by overwriting `running_build = reconciled` at
 /// line 608. The phantom-drain (which WARNs) checks `reconciled
 /// .difference(&heartbeat_set)`; a Poisoned entry is already filtered
 /// OUT of `reconciled` by `still_inflight=false`, so it's not a
@@ -531,7 +531,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 /// via the line-608 overwrite — this test confirms that safety net
 /// works, while the fix makes the completion path free immediately.
 #[tokio::test]
-async fn test_completion_after_poison_frees_running_builds() -> TestResult {
+async fn test_completion_after_poison_frees_running_build() -> TestResult {
     // Two workers so dispatch can re-assign after worker-1's failure.
     let (_db, handle, _task, _rx1) = setup_with_worker("i042-w1", "x86_64-linux").await?;
     let _rx2 = connect_executor(&handle, "i042-w2", "x86_64-linux").await?;
@@ -543,9 +543,9 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     let _evt = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Whichever worker got it, force-assign to BOTH so each has the
-    // entry in running_builds. This simulates the live race where an
+    // entry in running_build. This simulates the live race where an
     // earlier retry left a stale entry: dispatch added → completion
-    // ran → completion's early-return left running_builds untouched.
+    // ran → completion's early-return left running_build untouched.
     // debug_force_assign is idempotent for the worker that already
     // owns it; for the other, it sets assigned_executor + inserts.
     // After both calls, assigned_executor = i042-w2 (last-writer wins).
@@ -588,7 +588,7 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     // THE RACE: w1's completion arrives. drv is already Poisoned.
     // handle_completion's status check (line 412) fires the
     // not-Assigned/Running early-return. Before I-042: this returned
-    // BEFORE running_builds.remove → w1's slot leaked. After: the
+    // BEFORE running_build.remove → w1's slot leaked. After: the
     // remove is hoisted before the early-return paths.
     complete_failure(
         &handle,
@@ -604,24 +604,24 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     assert!(
         w1.running_build != Some(drv_hash.to_string()),
         "I-042: completion for already-terminal derivation must free \
-         the executor's running_builds slot — pre-fix this leaked"
+         the executor's running_build slot — pre-fix this leaked"
     );
     Ok(())
 }
 
 /// I-042 safety-net assertion: even WITHOUT the completion-side fix,
-/// the heartbeat reconcile drops running_builds entries whose DAG
+/// the heartbeat reconcile drops running_build entries whose DAG
 /// status is terminal. This is the i035 reconcile loop's
 /// `still_inflight = matches!(status, Assigned|Running)` filter — a
 /// Poisoned entry doesn't match, doesn't go into `reconciled`,
-/// `running_builds = reconciled` overwrites it away.
+/// `running_build = reconciled` overwrites it away.
 ///
 /// The phantom-drain WARN doesn't fire (the entry is filtered out
 /// before suspect detection), but the slot is freed. This test
 /// pins that behavior so the safety net stays even if completion-
 /// side cleanup regresses.
 #[tokio::test]
-async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestResult {
+async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("i042-hb-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
@@ -639,7 +639,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
     // Poison via PermanentFailure. The completion-side fix frees the
     // slot here (proven by the test above). To probe the heartbeat
     // safety net independently, re-insert via debug_force_assign —
-    // it adds to running_builds without checking DAG terminality.
+    // it adds to running_build without checking DAG terminality.
     complete_failure(
         &handle,
         "i042-hb-w",
@@ -653,7 +653,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
 
     // Re-seed the leak: force_assign on a Poisoned drv fails the
     // status transition (Poisoned → Assigned is invalid) so it
-    // returns false WITHOUT inserting into running_builds. We need
+    // returns false WITHOUT inserting into running_build. We need
     // a different re-seed: the test below covers this scenario via
     // the two-worker race; here we just assert the reconcile filter
     // logic by checking the slot stays clear after a heartbeat (it
@@ -667,7 +667,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
     assert!(
         w.running_build != Some(drv_hash.to_string()),
         "Poisoned derivation must not survive heartbeat reconcile in \
-         running_builds (still_inflight = matches!(Poisoned, Assigned|Running) = false)"
+         running_build (still_inflight = matches!(Poisoned, Assigned|Running) = false)"
     );
     Ok(())
 }
@@ -1440,7 +1440,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     let _ev = merge_single_node(&handle, build_id, "hb-drv", PriorityClass::Scheduled).await?;
 
     // Connect worker via ExecutorConnected only (no initial heartbeat)
-    // so we control the first heartbeat's running_builds precisely.
+    // so we control the first heartbeat's running_build precisely.
     let (stream_tx, _stream_rx) = mpsc::channel(256);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
@@ -1449,7 +1449,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
         })
         .await?;
 
-    // Heartbeat with running_builds claiming the drv we merged but
+    // Heartbeat with running_build claiming the drv we merged but
     // never assigned to this worker. The reconcile adopts it (worker
     // is authoritative about what it's running) which sets
     // running_build → has_capacity()=false → the post-heartbeat
@@ -1542,13 +1542,13 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
 async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("busy-worker", "x86_64-linux").await?;
 
-    // Merge + dispatch → Assigned to busy-worker. running_builds={drv}.
+    // Merge + dispatch → Assigned to busy-worker. running_build={drv}.
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "drain-drv", PriorityClass::Scheduled).await?;
     // recv_assignment on busy-worker's rx proves it was dispatched here.
     let _assignment = recv_assignment(&mut rx).await;
 
-    // Force-drain. to_reassign drains running_builds → 1 entry.
+    // Force-drain. to_reassign drains running_build → 1 entry.
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::DrainExecutor {
@@ -1560,7 +1560,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     let result = reply_rx.await?;
 
     assert!(result.accepted, "known worker → accepted");
-    // force=true → running_builds: 0 (worker.rs:277 "reassigned:
+    // force=true → running_build: 0 (worker.rs:277 "reassigned:
     // caller doesn't wait"). The count is only nonzero for
     // force=false (caller polls until it drains naturally).
     assert!(

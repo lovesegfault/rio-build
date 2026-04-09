@@ -187,7 +187,7 @@ pub(super) mod tests {
                 tls_secret_name: None,
             },
         };
-        let mut wps = BuilderPoolSet::new("test-wps", spec);
+        let mut wps = BuilderPoolSet::new("test-bps", spec);
         // controller_owner_ref needs uid + name. Apiserver sets
         // these; tests fake them (same pattern as builderpool/tests.rs
         // test_wp()).
@@ -214,7 +214,7 @@ pub(super) mod tests {
             // Name = {wps}-{class.name}.
             assert_eq!(
                 child.name_any(),
-                format!("test-wps-{}", class.name),
+                format!("test-bps-{}", class.name),
                 "child name convention: {{wps}}-{{class}}"
             );
             // ownerRef → WPS UID, controller=true. K8s GC deletes

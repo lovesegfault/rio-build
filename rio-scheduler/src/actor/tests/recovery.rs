@@ -661,11 +661,11 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
 /// Scenario: scheduler persists PG=Assigned+worker, crashes BEFORE
 /// try_send (the actual channel send to the worker). On restart,
 /// worker reconnects (heartbeat → in self.executors). Without the
-/// running_builds cross-check, reconcile_assignments sees "worker
+/// running_build cross-check, reconcile_assignments sees "worker
 /// present, leave it" → drv stuck forever (worker never got it,
 /// no running_since → backstop timeout won't fire).
 ///
-/// The fix: cross-check worker.running_builds even when worker is
+/// The fix: cross-check worker.running_build even when worker is
 /// present. If drv NOT in the worker's heartbeat, reconcile it
 /// (store-check → Completed, or reset → Ready).
 #[tokio::test]
@@ -697,7 +697,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     let (handle, _task) = setup_actor(sched_db.pool.clone());
 
     // Worker reconnects: BuildExecution stream + heartbeat with
-    // EMPTY running_builds (because it never actually got the
+    // EMPTY running_build (because it never actually got the
     // assignment — the try_send never happened).
     let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux").await?;
     // Second worker so the post-reconcile dispatch has somewhere to go.
@@ -715,7 +715,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     barrier(&handle).await;
 
     // Verify: drv is Assigned, worker is in self.executors, but
-    // running_builds does NOT contain the drv (phantom!).
+    // running_build does NOT contain the drv (phantom!).
     let pre = handle
         .debug_query_derivation("phantom-drv")
         .await?
@@ -727,7 +727,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     );
 
     // ReconcileAssignments: worker present BUT drv not in
-    // running_builds → reconcile. No store client here, so
+    // running_build → reconcile. No store client here, so
     // store-check fails → reset to Ready (not Completed).
     handle
         .send_unchecked(ActorCommand::ReconcileAssignments)
@@ -735,7 +735,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     barrier(&handle).await;
 
     // THE KEY ASSERTION: drv should be Ready (or re-dispatched).
-    // Without the running_builds cross-check, it would stay Assigned
+    // Without the running_build cross-check, it would stay Assigned
     // forever — worker present meant "leave it, completion will
     // arrive", but the worker never had it so no completion comes.
     let post = handle

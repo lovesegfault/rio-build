@@ -374,12 +374,12 @@ impl DagActor {
         let mut promoted_to: Option<String> = None;
         if let Some(state) = self.dag.node_mut(drv_hash) {
             let (to, kind) = if state.is_fixed_output {
-                let to = crate::assignment::next_fetcher_class(from, &self.fetcher_size_classes);
+                let to = crate::assignment::next_fetcher_class(from, &self.sizing.fetcher_classes);
                 (to, "fod")
             } else {
                 // parking_lot guard scope: ends here, before the
                 // persist `.await` below (guard is !Send).
-                let classes = self.size_classes.read();
+                let classes = self.sizing.size_classes.read();
                 let to = crate::assignment::next_builder_class(from, &classes);
                 (to, "builder")
             };
@@ -532,7 +532,7 @@ impl DagActor {
             h
         } else {
             // Drv not in DAG (reaped after build-terminal, or truly
-            // unknown). running_builds is keyed by drv_hash which we
+            // unknown). running_build holds the drv_hash which we
             // can't recover from drv_key here — but the heartbeat
             // reconcile drops entries whose DAG node is gone (executor.rs
             // still_inflight check). The next heartbeat (~10s) frees
@@ -630,7 +630,7 @@ impl DagActor {
         // Stale-report guard: if this completion is from a worker that no
         // longer owns the derivation (reassigned after disconnect/timeout),
         // drop it. The current assigned_executor's report is authoritative.
-        // running_builds was already freed above — for the stale executor
+        // running_build was already freed above — for the stale executor
         // that's correct (it doesn't own the drv); for the current owner
         // this branch doesn't fire.
         if let Some(assigned) = &state.assigned_executor
@@ -1344,7 +1344,7 @@ impl DagActor {
                     // classify() saw (which also reads from the EMA's
                     // 0→None filtered history).
                     let cutoff_opt = {
-                        let classes = self.size_classes.read();
+                        let classes = self.sizing.size_classes.read();
                         if let Some(actual_class) = crate::assignment::classify(
                             duration_secs,
                             peak_mem.map(|m| m as f64),

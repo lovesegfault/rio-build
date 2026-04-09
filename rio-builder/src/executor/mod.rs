@@ -56,7 +56,7 @@ const MAX_PARALLEL_FETCHES: usize = 16;
 /// (the alternative was `#[allow]`, which we don't use in prod code).
 ///
 /// Distinct from `BuildSpawnContext` (lib.rs): that holds Arc-shared
-/// state (stream_tx, running_builds) that needs per-call cloning; this
+/// state (stream_tx, running_build) that needs per-call cloning; this
 /// holds `Copy`/cheap-to-copy config that can just be passed by value.
 #[derive(Clone)]
 pub struct ExecutorEnv {

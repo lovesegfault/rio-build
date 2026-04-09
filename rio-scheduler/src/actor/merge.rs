@@ -1123,7 +1123,7 @@ impl DagActor {
         // memory have a floor ≥ DB (recovery loaded it; any promotion
         // since then wrote both in-mem and DB), so overwriting would
         // downgrade.
-        let order = crate::assignment::builder_class_order(&self.size_classes.read());
+        let order = crate::assignment::builder_class_order(&self.sizing.size_classes.read());
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);

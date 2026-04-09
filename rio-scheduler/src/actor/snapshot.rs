@@ -185,7 +185,7 @@ impl DagActor {
         // Take a read lock for the whole computation. Rebalancer
         // writes hourly; contention is near-zero. Dropped at end of
         // scope (no await in this fn).
-        let classes = self.size_classes.read();
+        let classes = self.sizing.size_classes.read();
         if classes.is_empty() {
             // Feature off — return empty. Handler maps to empty
             // response which the CLI can render as "size-class
@@ -221,6 +221,7 @@ impl DagActor {
                 // config in DagActor::new, but defensive against a
                 // future config-reload path that forgets one).
                 let configured = self
+                    .sizing
                     .configured_cutoffs
                     .iter()
                     .find(|(n, _)| n == &c.name)
@@ -394,13 +395,14 @@ impl DagActor {
     /// [`compute_size_class_snapshot`]: Self::compute_size_class_snapshot
     // r[impl sched.fod.size-class-reactive]
     pub(crate) fn compute_fod_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
-        if self.fetcher_size_classes.is_empty() {
+        if self.sizing.fetcher_classes.is_empty() {
             return Vec::new();
         }
         let mut index: HashMap<String, usize> =
-            HashMap::with_capacity(self.fetcher_size_classes.len());
+            HashMap::with_capacity(self.sizing.fetcher_classes.len());
         let mut snapshots: Vec<SizeClassSnapshot> = self
-            .fetcher_size_classes
+            .sizing
+            .fetcher_classes
             .iter()
             .enumerate()
             .map(|(i, name)| {
@@ -482,7 +484,7 @@ impl DagActor {
             let Some(entry) = self.estimator.lookup_entry(pname, &state.system) else {
                 continue;
             };
-            if let Some(b) = Estimator::bucketed_estimate(&entry, self.headroom_mult) {
+            if let Some(b) = Estimator::bucketed_estimate(&entry, self.sizing.headroom_mult) {
                 out.push(b);
             }
         }
@@ -493,11 +495,11 @@ impl DagActor {
     /// Per-`(pname, system)` estimator dump for `GetEstimatorStats`
     /// (I-124). Walks the in-memory `build_history` snapshot and
     /// classifies each entry under the CURRENT effective cutoffs —
-    /// the same `self.size_classes.read()` dispatch uses, post-
+    /// the same `self.sizing.size_classes.read()` dispatch uses, post-
     /// rebalancer drift. Filtering + sorting happen handler-side
     /// (admin/estimator.rs); this returns the full set.
     pub(crate) fn compute_estimator_stats(&self) -> Vec<EstimatorStatsEntry> {
-        let classes = self.size_classes.read();
+        let classes = self.sizing.size_classes.read();
         self.estimator
             .iter_history()
             .map(|((pname, system), entry)| EstimatorStatsEntry {

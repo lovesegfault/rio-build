@@ -28,10 +28,13 @@ use crate::state::{
     HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
-// `impl DagActor` is sharded across these submodules by concern; each
-// file's impl block reaches into the same struct fields (single-owner
-// actor — no encapsulation boundary). Keep ALL `mod` decls here so the
-// submodule list is discoverable in one place.
+// `impl DagActor` is sharded across these submodules by concern.
+// Cohesive field clusters live in sub-structs (`events: BuildEventBus`,
+// `leader: LeaderState`, `sizing: SizingConfig`); the genuinely
+// cross-cutting fields (`dag`, `executors`, `builds`, `db`,
+// `ready_queue`) remain flat — every handler reads/writes them. Keep
+// ALL `mod` decls here so the submodule list is discoverable in one
+// place.
 mod breaker;
 mod build;
 mod command;
@@ -47,6 +50,7 @@ mod snapshot;
 
 pub(super) use breaker::CacheCheckBreaker;
 pub use command::*;
+pub(crate) use config::SizingConfig;
 pub use config::{DagActorConfig, DagActorPlumbing};
 use event::BuildEventBus;
 #[cfg(test)]
@@ -180,50 +184,10 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
-    /// Size-class cutoff config. Empty = feature off (no classification).
-    /// dispatch.rs calls classify() with a read guard; completion.rs
-    /// reads cutoff_for() for misclassification detection.
-    ///
-    /// `Arc<parking_lot::RwLock<...>>` — shared with the rebalancer
-    /// task (spawned in `run_inner`) which writes new cutoffs hourly.
-    /// parking_lot not tokio::sync: writes are rare (1/hour) so
-    /// contention is near-zero, and a sync lock keeps `classify()`
-    /// sync — no `.await` inside dispatch's hot read path.
-    ///
-    /// R10 CHECK: callers MUST NOT hold a read/write guard across
-    /// `.await`. parking_lot guards are not `Send` so the borrow
-    /// checker catches some misuse, but a `.read()` followed by
-    /// `.await` on the same task blocks the executor thread. See
-    /// dispatch.rs: guards are dropped before any await boundary.
-    size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
-    /// Fetcher size-class config (I-170). Empty = feature off (single
-    /// fetcher pool, no class filter — original behavior). Ordered
-    /// smallest→largest; `find_executor_with_overflow`'s FOD branch
-    /// walks from `DerivationState.sched.size_class_floor` upward. Plain
-    /// `Vec` (not `Arc<RwLock>`): no rebalancer mutates this — it's
-    /// just an ordered name list, config-static after construction.
-    fetcher_size_classes: Vec<String>,
-    /// I-204: capability-hint features stripped at DAG insertion.
-    /// Mirrored onto `self.dag` by `with_soft_features` and re-applied
-    /// in `clear_persisted_state` (recovery replaces the DAG).
-    soft_features: Vec<crate::assignment::SoftFeature>,
-    /// ADR-020 capacity manifest headroom. Applied by both
-    /// `compute_capacity_manifest` (manifest RPC) and the dispatch-time
-    /// resource-fit filter. Config-global; per-pool later if needed.
-    /// Validated finite + positive at startup (main.rs).
-    ///
-    /// f64 not Arc: config-static, never mutated after
-    /// `with_headroom_mult()`. No runtime override.
-    headroom_mult: f64,
-    /// Static TOML cutoffs, captured once in `with_size_classes()`
-    /// BEFORE the rebalancer's first write. The rebalancer mutates
-    /// `size_classes[i].cutoff_secs` in-place hourly; without this
-    /// snapshot, there's no way to report drift to operators.
-    /// `(name, cutoff_secs)` pairs — HashMap would be idiomatic but
-    /// Vec preserves config order (matters for the RPC response which
-    /// sorts by effective cutoff, but configured order is useful for
-    /// logging).
-    configured_cutoffs: Vec<(String, f64)>,
+    /// Size-class routing + soft-feature config. See [`SizingConfig`].
+    /// `pub(crate)` for tests that simulate a rebalancer pass by
+    /// writing `sizing.size_classes` directly.
+    pub(crate) sizing: SizingConfig,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -298,24 +262,13 @@ impl DagActor {
     /// are `Default`-able — tests / non-K8s spawns can
     /// `..Default::default()` and override one or two fields.
     pub fn new(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
-        // Snapshot the as-loaded cutoffs BEFORE the rebalancer sees
-        // them. GetSizeClassSnapshot reports both: effective (mutated
-        // hourly) vs configured (this snapshot) for drift visibility.
-        let configured_cutoffs = cfg
-            .size_classes
-            .iter()
-            .map(|c| (c.name.clone(), c.cutoff_secs))
-            .collect();
-        let size_classes = Arc::new(parking_lot::RwLock::new(cfg.size_classes));
+        let sizing = SizingConfig::new(&cfg);
         // I-204: soft-feature stripping is configured on the DAG. Stored
         // on the actor (not just the DAG) because `clear_persisted_state`
-        // replaces `self.dag` on every leader transition — the actor copy
-        // is what survives. The class-order snapshot (for I-213 floor-hint
-        // comparison) is derived from the SAME size_classes the rebalancer
-        // shares, so soft_features always sees the right order.
+        // replaces `self.dag` on every leader transition — the
+        // `SizingConfig` copy is what survives.
         let mut dag = DerivationDag::new();
-        let order = crate::assignment::builder_class_order(&size_classes.read());
-        dag.set_soft_features(cfg.soft_features.clone(), order);
+        sizing.apply_to_dag(&mut dag);
 
         Self {
             dag,
@@ -335,11 +288,7 @@ impl DagActor {
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
             self_tx: None,
-            size_classes,
-            fetcher_size_classes: cfg.fetcher_size_classes,
-            soft_features: cfg.soft_features,
-            headroom_mult: cfg.headroom_mult,
-            configured_cutoffs,
+            sizing,
             hmac_signer: plumbing.hmac_signer,
             shutdown: plumbing.shutdown,
             fod_freeze_since: None,
@@ -370,9 +319,7 @@ impl DagActor {
     /// `self.executors` — those are live connections, not persisted.
     pub(super) fn clear_persisted_state(&mut self) {
         self.dag = DerivationDag::new();
-        let order = crate::assignment::builder_class_order(&self.size_classes.read());
-        self.dag
-            .set_soft_features(self.soft_features.clone(), order);
+        self.sizing.apply_to_dag(&mut self.dag);
         self.ready_queue.clear();
         self.builds.clear();
         self.events.clear();
@@ -399,7 +346,7 @@ impl DagActor {
         // No-op if size_classes empty (feature off).
         crate::rebalancer::spawn_task(
             self.db.clone(),
-            Arc::clone(&self.size_classes),
+            Arc::clone(&self.sizing.size_classes),
             self.shutdown.clone(),
         );
 

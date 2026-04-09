@@ -238,7 +238,7 @@ impl DagActor {
         // Also compute the ADR-020 bucketed memory estimate for
         // the resource-fit filter. Same estimator lookup path
         // as compute_capacity_manifest (lookup_entry +
-        // bucketed_estimate + self.headroom_mult) so the
+        // bucketed_estimate + self.sizing.headroom_mult) so the
         // placement filter and the manifest RPC agree.
         //
         // `is_fixed_output` is captured into a local so the
@@ -253,7 +253,7 @@ impl DagActor {
         let (target_class, est_memory_bytes, is_fixed_output) = {
             let pname = state.pname.as_deref();
             let system = &state.system;
-            let classes = self.size_classes.read();
+            let classes = self.sizing.size_classes.read();
             let target_class = crate::assignment::classify(
                 state.sched.est_duration,
                 self.estimator.peak_memory(pname, system),
@@ -277,7 +277,7 @@ impl DagActor {
             } else {
                 pname
                     .and_then(|p| self.estimator.lookup_entry(p, system))
-                    .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
+                    .and_then(|e| Estimator::bucketed_estimate(&e, self.sizing.headroom_mult))
                     .map(|b| b.memory_bytes)
             };
             (target_class, est_memory_bytes, state.is_fixed_output)
@@ -400,7 +400,7 @@ impl DagActor {
     /// 50 forever otherwise.
     // r[impl sched.freeze-detector]
     fn publish_dispatch_gauges(&mut self, class_deferred: HashMap<String, u64>, fod_deferred: u64) {
-        for sc in self.size_classes.read().iter() {
+        for sc in self.sizing.size_classes.read().iter() {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
         // Sum before class_deferred is consumed by the gauge loop below.
@@ -743,7 +743,7 @@ impl DagActor {
         // on prior failure) or `fetcher_size_classes[0]` if never
         // failed. Empty config = no class filter (original behavior).
         if drv_state.is_fixed_output {
-            if self.fetcher_size_classes.is_empty() {
+            if self.sizing.fetcher_classes.is_empty() {
                 let w = crate::assignment::best_executor(&self.executors, drv_state, None);
                 return (w, None);
             }
@@ -755,9 +755,9 @@ impl DagActor {
                 .sched
                 .size_class_floor
                 .as_deref()
-                .and_then(|f| self.fetcher_size_classes.iter().position(|c| c == f))
+                .and_then(|f| self.sizing.fetcher_classes.iter().position(|c| c == f))
                 .unwrap_or(0);
-            for class in &self.fetcher_size_classes[floor_idx..] {
+            for class in &self.sizing.fetcher_classes[floor_idx..] {
                 if let Some(w) =
                     crate::assignment::best_executor(&self.executors, drv_state, Some(class))
                 {
@@ -784,7 +784,7 @@ impl DagActor {
         //
         // Read guard lives through the chain walk — no `.await` in
         // this fn, so it's safe. best_executor is sync.
-        let classes = self.size_classes.read();
+        let classes = self.sizing.size_classes.read();
         let target_cutoff = crate::assignment::cutoff_for(target, &classes);
         // r[impl sched.builder.size-class-reactive]
         // I-177: clamp the chain start at `size_class_floor`. A
@@ -992,7 +992,7 @@ impl DagActor {
                 if let Some(state) = self.dag.node_mut(drv_hash)
                     && let Err(e) = state.reset_to_ready()
                 {
-                    // We already transitioned to Assigned, cleared running_builds,
+                    // We already transitioned to Assigned, cleared running_build,
                     // and now can't reset. Derivation is orphaned in Assigned
                     // with no worker actually building. Heartbeat reconciliation
                     // may eventually catch this, but it's a visible hang until then.

@@ -229,16 +229,6 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
             return (QueueSignals::zero(), Some(e.to_string()));
         }
     };
-    if fp.spec.classes.is_empty() {
-        // Unclassed pool: per-class breakdown not needed.
-        return (
-            QueueSignals {
-                flat,
-                by_class: std::collections::HashMap::new(),
-            },
-            None,
-        );
-    }
     // r[impl ctrl.fetcherpool.ephemeral-per-class]
     let by_class = match ctx
         .admin

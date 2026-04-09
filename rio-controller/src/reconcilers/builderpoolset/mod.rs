@@ -529,8 +529,8 @@ mod tests {
         // (the I-119 bug class) would either skip the second PATCH
         // (verifier panics on unconsumed scenario) or send a stale
         // body — both fail here.
-        let mut scenarios = apply_scenarios(&["test-wps-tiny"], r#""memory":"1Gi""#);
-        scenarios.extend(apply_scenarios(&["test-wps-tiny"], r#""memory":"2Gi""#));
+        let mut scenarios = apply_scenarios(&["test-bps-tiny"], r#""memory":"1Gi""#);
+        scenarios.extend(apply_scenarios(&["test-bps-tiny"], r#""memory":"2Gi""#));
         let guard = verifier.run(scenarios);
 
         // ---- First reconcile: 1Gi ----
@@ -559,7 +559,7 @@ mod tests {
         let ctx = test_ctx(client);
         let wps = test_wps_with_classes(&["tiny"]);
 
-        let mut scenarios = apply_scenarios(&["test-wps-tiny"], r#""kind":"BuilderPool""#);
+        let mut scenarios = apply_scenarios(&["test-bps-tiny"], r#""kind":"BuilderPool""#);
         // Override path_contains on the child PATCH to assert the
         // SSA query param. Substring match (Scenario semantics) so
         // param order doesn't matter.
@@ -575,7 +575,7 @@ mod tests {
             name: name.into(),
             effective_cutoff_secs: cutoff,
             queued,
-            child_pool: format!("test-wps-{name}"),
+            child_pool: format!("test-bps-{name}"),
             replicas: 0,
             ready_replicas: 0,
         }
@@ -637,7 +637,7 @@ mod tests {
         );
         assert_eq!(
             status_classes[1].get("childPool").and_then(|v| v.as_str()),
-            Some("test-wps-large")
+            Some("test-bps-large")
         );
 
         // --- spec ABSENT (we own status, reconciler owns spec) ---

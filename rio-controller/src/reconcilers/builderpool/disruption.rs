@@ -3,8 +3,8 @@
 //! K8s sets `status.conditions[type=DisruptionTarget, status=True]`
 //! when eviction is imminent (node drain, spot interrupt, PDB-
 //! mediated disruption). We fire `DrainExecutor{force:true}` → the
-//! scheduler iterates `running_builds`, sends `CancelSignal` per
-//! build → worker `cgroup.kill()`s → builds reassign in seconds
+//! scheduler reads `running_build`, sends `CancelSignal` → worker
+//! `cgroup.kill()`s → the build reassigns in seconds
 //! instead of burning the 2h `terminationGracePeriodSeconds`.
 //!
 //! This is what the four pre-existing comments at
@@ -29,7 +29,7 @@
 //! event for that pod fires another `DrainExecutor{force:true}`. The
 //! scheduler's `handle_drain_executor` is idempotent: `force=true`
 //! with `draining=true` re-preempts, which is a no-op on an
-//! already-empty `running_builds`. No client-side dedup needed.
+//! already-cleared `running_build`. No client-side dedup needed.
 
 // r[impl ctrl.drain.disruption-target]
 
@@ -112,8 +112,8 @@ pub async fn run(
         };
 
         // Best-effort. `force=true` triggers the preemption block
-        // at `rio-scheduler/src/actor/worker.rs:211-258`: drain
-        // running_builds → CancelSignal each → reassign.
+        // at `rio-scheduler/src/actor/worker.rs:211-258`: take
+        // running_build → CancelSignal → reassign.
         //
         // Failure modes:
         //   - Scheduler down → tonic ConnectError. Worker's own

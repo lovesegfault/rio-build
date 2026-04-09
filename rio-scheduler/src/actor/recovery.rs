@@ -72,7 +72,7 @@ impl DagActor {
     /// Returns the PG high-water generation on success (for the
     /// caller's monotonicity seed). The caller does `fetch_max`
     /// AFTER the TOCTOU check — keeping this function free of
-    /// writes to `self.generation` is load-bearing for the
+    /// writes to `self.leader`'s generation is load-bearing for the
     /// gen-snapshot check in `handle_leader_acquired` (any change
     /// to `generation` during recovery then unambiguously means
     /// the lease loop fetch_add'd, i.e. a flap).
@@ -107,7 +107,7 @@ impl DagActor {
         // --- Fetch PG generation high-water mark (caller seeds) ---
         // NOT applied here: the caller (handle_leader_acquired) does
         // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
-        // self.generation here would false-positive that check.
+        // self.leader's generation here would false-positive that check.
         let pg_max_gen = self.db.max_assignment_generation().await?;
 
         self.seed_ready_queue();
@@ -541,7 +541,7 @@ impl DagActor {
         // OLD generation but stamped with the NEW one — worker-side
         // gen fence can't catch that.
         //
-        // recover_from_pg() does NOT write to self.generation (it
+        // recover_from_pg() does NOT write to self.leader's generation (it
         // returns the PG high-water for us to seed below). So any
         // change between gen_at_entry and gen_now is unambiguously
         // a lease-loop fetch_add — no false positives from PG seeding.
@@ -573,8 +573,8 @@ impl DagActor {
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
         // TOCTOU re-check: did the lease task fetch_add during
-        // recovery? recover_from_pg doesn't touch self.generation,
-        // so gen_now != gen_at_entry ⇒ lease loop fetch_add'd ⇒ flap.
+        // recovery? recover_from_pg doesn't touch self.leader's
+        // generation, so gen_now != gen_at_entry ⇒ lease flap.
         // The re-acquire's LeaderAcquired is already queued in our
         // mpsc — discard this recovery, let the next one re-run.
         let gen_now = self.leader.generation();
@@ -733,7 +733,7 @@ impl DagActor {
             })
             .filter_map(|(h, s)| match s.assigned_executor.as_ref() {
                 Some(w) if self.executors.contains_key(w) => {
-                    // Worker reconnected. Cross-check running_builds:
+                    // Worker reconnected. Cross-check running_build:
                     // if the worker's heartbeat doesn't include this
                     // drv_hash, the assignment is phantom — PG says
                     // Assigned+worker but the worker never got the

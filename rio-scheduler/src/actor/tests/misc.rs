@@ -506,7 +506,7 @@ async fn size_class_snapshot_preserves_configured_after_rebalance() {
 
     // Simulate a rebalancer pass: mutate effective cutoffs in-place.
     {
-        let mut g = actor.size_classes.write();
+        let mut g = actor.sizing.size_classes.write();
         g[0].cutoff_secs = 75.3;
         g[1].cutoff_secs = 2100.0;
     }
@@ -1311,13 +1311,13 @@ async fn capacity_manifest_ready_only() {
 }
 
 /// P0510 regression guard: manifest and dispatch read the same
-/// `self.headroom_mult`.
+/// `self.sizing.headroom_mult`.
 ///
 /// Before P0510, headroom was plumbed via ActorCommand param
 /// (manifest) AND DagActor field (dispatch) — two copies of one
 /// config-static value. A future per-request knob could bypass one
 /// path. Now both call `Estimator::bucketed_estimate(&e,
-/// self.headroom_mult)`. This test picks a non-default headroom (1.5
+/// self.sizing.headroom_mult)`. This test picks a non-default headroom (1.5
 /// vs default 1.25) where the bucket boundary differs: 6GiB×1.25 →
 /// 8GiB bucket; 6GiB×1.5 → 12GiB bucket.
 #[tokio::test]
@@ -1344,17 +1344,17 @@ async fn dispatch_and_manifest_use_same_headroom() {
         1,
     )]);
 
-    // Manifest path: compute_capacity_manifest → self.headroom_mult.
+    // Manifest path: compute_capacity_manifest → self.sizing.headroom_mult.
     let manifest = actor.compute_capacity_manifest();
     assert_eq!(manifest.len(), 1);
     let manifest_mem = manifest[0].memory_bytes;
 
     // Dispatch path: dispatch.rs:115 does lookup_entry +
-    // bucketed_estimate(&e, self.headroom_mult). Replicate with the
+    // bucketed_estimate(&e, self.sizing.headroom_mult). Replicate with the
     // actor's field directly — proves the manifest read the same
     // field, not a stale copy.
     let entry = actor.estimator.lookup_entry("pkg", "x86_64-linux").unwrap();
-    let dispatch_mem = Estimator::bucketed_estimate(&entry, actor.headroom_mult)
+    let dispatch_mem = Estimator::bucketed_estimate(&entry, actor.sizing.headroom_mult)
         .unwrap()
         .memory_bytes;
 

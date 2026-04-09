@@ -552,9 +552,9 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // the new leader). Running builds continue — their completions
     // land in the permanent sink, the relay buffers until the new
     // gRPC channel is swapped in. Heartbeat (separate unary RPC,
-    // same balanced channel) reports running_builds to the new
+    // same balanced channel) reports running_build to the new
     // leader within one tick; reconcile at T+45s sees the worker
-    // connected + running_builds populated → no reassignment.
+    // connected + running_build populated → no reassignment.
     // See rio-scheduler/src/actor/recovery.rs handle_reconcile_assignments.
     'reconnect: loop {
         // I-063 drain transition + I-195 idle fast-path. Hoisted to the
@@ -902,7 +902,7 @@ async fn handle_assignment(
     // start. P0537: one build per pod —
     // try_claim is non-blocking. If busy,
     // the scheduler dispatched while heartbeat
-    // shows running_builds nonempty.
+    // shows running_build set.
     //
     // Known harmless trigger (observed in KVM
     // test, ~300ms double-dispatch of SAME
@@ -1194,7 +1194,7 @@ mod tests {
     /// zombie. Before the fix, relay only broke the pump loop on
     /// SendError — completions pumped into the dead stream after
     /// scheduler failover. Observed on EKS: 4 fetchers each did ONE
-    /// build then stalled forever (`running_builds` never freed).
+    /// build then stalled forever (`running_build` never freed).
     ///
     /// Key difference from `relay_survives_target_swap`: grpc1_rx
     /// is NOT dropped before the swap. The relay must notice via

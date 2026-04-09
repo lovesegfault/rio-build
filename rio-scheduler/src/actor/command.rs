@@ -298,7 +298,7 @@ pub enum AdminQuery {
     },
     /// Bucketed resource estimates for ready-queue derivations
     /// (ADR-020 capacity manifest). Headroom applied from
-    /// `self.headroom_mult` (config-static, same value the dispatch
+    /// `self.sizing.headroom_mult` (config-static, same value the dispatch
     /// filter uses). Cold-start derivations (no `build_history`
     /// sample) are omitted — controller uses its operator floor.
     CapacityManifest {

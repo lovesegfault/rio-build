@@ -298,7 +298,7 @@ async fn test_handle_uses_shared_backpressure_flag() {
 }
 
 /// When try_send to a worker's stream fails (channel full/disconnected),
-/// assign_to_worker must remove drv_hash from worker.running_builds.
+/// assign_to_worker must remove drv_hash from worker.running_build.
 /// Without cleanup: phantom capacity leak (worker appears busy forever).
 ///
 /// P0537: with single-build, channel-FULL during one dispatch pass is
@@ -306,7 +306,7 @@ async fn test_handle_uses_shared_backpressure_flag() {
 /// channel-CLOSED case exercises the same cleanup path: drop the
 /// receiver before dispatch so try_send fails.
 #[tokio::test]
-async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
+async fn test_assign_send_failure_cleans_running_build() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Connect worker, then drop the receiver so try_send sees Closed.
@@ -333,7 +333,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     .await?;
 
     // Worker should have ZERO running builds — the failed send must
-    // have cleaned up running_builds, not leaked the phantom entry.
+    // have cleaned up running_build, not leaked the phantom entry.
     let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
