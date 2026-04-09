@@ -78,9 +78,11 @@ let
   # Cilium creates per-Gateway Services as type:LoadBalancer. With k3s
   # --disable=servicelb and no LB-IPAM pool, the Service stays Pending
   # for an external IP → Gateway never Programmed:True. This pool lets
-  # Cilium's lbipam assign an address from a test-only range. The
-  # fixture port-forwards to the Service anyway, so the LB IP is never
-  # actually routed — it just satisfies the Programmed gate.
+  # Cilium's lbipam assign an address from the eth1 vlan subnet
+  # (192.168.1.0/24, .240-.255 reserved for LB IPs — node IPs are
+  # .3/.4). l2announcements makes a Cilium node ARP-reply for the IP
+  # on eth1 so it's actually reachable (without it the IP only exists
+  # in Service.status, no node claims it → curl times out).
   lbIpamPool = pkgs.writeText "lbipam-pool.yaml" ''
     apiVersion: cilium.io/v2
     kind: CiliumLoadBalancerIPPool
@@ -88,7 +90,20 @@ let
       name: vm-test-pool
     spec:
       blocks:
-        - cidr: "192.168.100.0/24"
+        - cidr: "192.168.1.240/28"
+    ---
+    apiVersion: cilium.io/v2alpha1
+    kind: CiliumL2AnnouncementPolicy
+    metadata:
+      name: rio-gateway-l2
+    spec:
+      serviceSelector:
+        matchLabels:
+          gateway.networking.k8s.io/gateway-name: rio-dashboard
+      interfaces:
+        - eth1
+      externalIPs: false
+      loadBalancerIPs: true
   '';
 in
 pkgs.runCommand "cilium-rendered"
@@ -122,6 +137,7 @@ pkgs.runCommand "cilium-rendered"
       --set operator.replicas=1 \
       --set encryption.enabled=true \
       --set encryption.type=wireguard \
+      --set l2announcements.enabled=${if gatewayEnabled then "true" else "false"} \
       --set envoy.enabled=false \
       --set gatewayAPI.enabled=${if gatewayEnabled then "true" else "false"} \
       ${pkgs.lib.optionalString gatewayEnabled ''
