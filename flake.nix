@@ -246,10 +246,6 @@
           workspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
-            # tests/metrics_registered.rs greps the obs.md table at
-            # runtime via CARGO_MANIFEST_DIR/../docs/. nextest sets
-            # CARGO_MANIFEST_DIR to <this fileset>/<crate>/.
-            ./docs/src/observability.md
             ./rio-auth
             ./rio-bench
             ./rio-cli
@@ -282,11 +278,13 @@
             # rio-controller tests — build-time presence check so a
             # missing profile fails compile, not silently at deploy).
             ./nix/nixos-node/seccomp
-            # observability.md — build.rs greps the per-component
-            # metrics tables to derive SPEC_METRICS for the
+            # observability.md — metrics_registered tests grep the
+            # per-component metrics tables at runtime for the
             # spec→describe check (see rio-test-support
-            # emit_spec_metrics_grep). Adding a row must break
-            # the nextest drv hash so drift is caught.
+            # grep_spec_names). nextest sets CARGO_MANIFEST_DIR to
+            # <this fileset>/<crate>/, so ../docs/ must resolve.
+            # Adding a row must break the nextest drv hash so drift
+            # is caught.
             ./docs/src/observability.md
           ];
           workspaceSrc = pkgs.lib.fileset.toSource {

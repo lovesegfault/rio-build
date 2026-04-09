@@ -456,8 +456,8 @@ pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), c
 }
 
 /// Assert that every name in `emitted_metrics` (one per line — the
-/// `include_str!(OUT_DIR/emitted_metrics.txt)` output) appears in the
-/// set of `describe_*!` calls fired by `describe_fn`.
+/// joined output of [`grep_emitted_names`]) appears in the set of
+/// `describe_*!` calls fired by `describe_fn`.
 ///
 /// Emit→describe direction: catches "someone added
 /// `metrics::counter!("new_thing")` deep in a handler but forgot both
@@ -466,7 +466,7 @@ pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), c
 /// through the spec→describe check (which only knows what's IN the
 /// spec list).
 ///
-/// `min_emitted` is a precondition self-check: if the build-script
+/// `min_emitted` is a precondition self-check: if the source-text
 /// grep returns near-zero, either the crate genuinely has no metrics
 /// (implausible for any crate large enough to need this check) or the
 /// regex broke (e.g., someone imported the macros unqualified). Fail
