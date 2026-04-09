@@ -66,7 +66,7 @@ pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 ///
 /// Scheduler signs at dispatch (executor_id + drv_hash + expiry);
 /// store verifies on PutPath to gate which executor can upload which
-/// path. See [`crate::hmac`] for the token format. Value is
+/// path. See `rio_auth::hmac` for the token format. Value is
 /// base64-encoded bytes (always ASCII).
 pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 
@@ -75,7 +75,7 @@ pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 /// Lowercase: tonic normalizes metadata keys (HTTP/2 header rules).
 /// Matches `rio-gateway/src/handler/build.rs` — if the gateway ever
 /// renames this, `header_name_matches_gateway_literal` in
-/// [`crate::jwt_interceptor`] tests fails.
+/// `rio_auth::jwt_interceptor` tests fails.
 pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
@@ -359,6 +359,76 @@ pub fn is_transient(code: tonic::Code) -> bool {
     )
 }
 
+/// `should_retry` predicate for [`retry_status`]: `UNAVAILABLE` only.
+///
+/// Narrower than [`is_transient`] — used where the only legitimate
+/// transient is "wrong replica" (standby scheduler, leader mid-recovery).
+/// `Unknown`/`Aborted` from those callers indicate a real fault, not a
+/// retry signal.
+pub fn is_unavailable(s: &Status) -> bool {
+    s.code() == tonic::Code::Unavailable
+}
+
+/// Policy for [`retry_status`]. `Copy` so call sites can declare a
+/// `const` inline (same pattern as [`crate::backoff::Backoff`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryOpts {
+    /// Backoff curve between attempts. First sleep is
+    /// `backoff.duration(0)`.
+    pub backoff: crate::backoff::Backoff,
+    /// Total attempts (NOT retries): `1` = no retry, `u32::MAX` =
+    /// effectively infinite. `0` is treated as `1`.
+    pub max_attempts: u32,
+}
+
+/// Retry a `Status`-returning op while `should_retry(&status)` holds.
+///
+/// The single retry-on-transient-status loop for unary gRPC calls.
+/// Replaces the three hand-rolled variants that drifted in
+/// `rio-cli::rpc`, `rio-builder::run_drain`, and ad-hoc call sites:
+/// each had its own attempt-counting, backoff indexing, and
+/// retryable-vs-terminal classification.
+///
+/// `on_retry(attempt, &status)` fires BEFORE each backoff sleep
+/// (`attempt` is 1-indexed: 1 = first retry). Use it for
+/// `eprintln!`/`tracing` retry feedback; pass `|_, _| {}` to silence.
+///
+/// On exhaustion or non-retryable status, returns the final `Status`
+/// unchanged — callers can still match on `.code()`. No shutdown token:
+/// callers that need cancellation use [`crate::backoff::retry`]
+/// directly (it has the `select!` race built in).
+///
+/// ```ignore
+/// let resp = retry_status(
+///     &OPTS,
+///     is_unavailable,
+///     |n, s| tracing::debug!(%s, "retry {n}"),
+///     async || client.drain_executor(req.clone()).await,
+/// ).await?;
+/// ```
+pub async fn retry_status<T>(
+    opts: &RetryOpts,
+    should_retry: impl Fn(&Status) -> bool,
+    mut on_retry: impl FnMut(u32, &Status),
+    mut op: impl AsyncFnMut() -> Result<T, Status>,
+) -> Result<T, Status> {
+    let max = opts.max_attempts.max(1);
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(s) => {
+                attempt += 1;
+                if attempt >= max || !should_retry(&s) {
+                    return Err(s);
+                }
+                on_retry(attempt, &s);
+                tokio::time::sleep(opts.backoff.duration(attempt - 1)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +520,73 @@ mod tests {
         assert!(!is_transient(tonic::Code::DeadlineExceeded));
         assert!(!is_transient(tonic::Code::DataLoss));
         assert!(!is_transient(tonic::Code::NotFound));
+    }
+
+    const TEST_OPTS: RetryOpts = RetryOpts {
+        backoff: crate::backoff::Backoff {
+            base: Duration::from_millis(1),
+            mult: 2.0,
+            cap: Duration::from_millis(8),
+            jitter: crate::backoff::Jitter::None,
+        },
+        max_attempts: 3,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_status_retries_then_succeeds() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let r = retry_status(
+            &TEST_OPTS,
+            is_unavailable,
+            |_, _| {},
+            async || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    Err(Status::unavailable("standby"))
+                } else {
+                    Ok(42u32)
+                }
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), 42);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_status_non_retryable_surfaces_immediately() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let r: Result<(), _> = retry_status(
+            &TEST_OPTS,
+            is_unavailable,
+            |_, _| panic!("on_retry must not fire for non-retryable"),
+            async || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Status::not_found("nope"))
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap_err().code(), tonic::Code::NotFound);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_status_exhausts_and_calls_on_retry() {
+        let retries = std::sync::atomic::AtomicU32::new(0);
+        let r: Result<(), _> = retry_status(
+            &TEST_OPTS,
+            is_unavailable,
+            |n, s| {
+                assert_eq!(s.code(), tonic::Code::Unavailable);
+                retries.store(n, std::sync::atomic::Ordering::SeqCst);
+            },
+            async || Err(Status::unavailable("down")),
+        )
+        .await;
+        assert_eq!(r.unwrap_err().code(), tonic::Code::Unavailable);
+        // 3 attempts → 2 retries (on_retry fires before sleeps 1 and 2;
+        // attempt 3 returns the error without sleeping).
+        assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
