@@ -7,7 +7,11 @@ publish = false
 
 [dependencies]
 # Internal
-rio-test-support.workspace = true
+# default-features = false: only pg::PgServer (for `regen sqlx`); skips
+# rio-nix/rio-proto/tonic/kube/tower-test which `full` would pull. Direct
+# path (not workspace = true) because workspace-inherited deps can't
+# override default-features.
+rio-test-support = { path = "../rio-test-support", default-features = false }
 rio-crds.workspace = true
 
 # CLI + config

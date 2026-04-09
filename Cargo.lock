@@ -9628,6 +9628,7 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "typenum",
+ "unicode-normalization",
  "uuid",
  "winnow 0.7.15",
  "winnow 1.0.1",

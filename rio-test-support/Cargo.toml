@@ -8,52 +8,86 @@ repository.workspace = true
 publish = false
 description = "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services"
 
+[features]
+# `full` gates everything except pg::PgServer (the ephemeral-postgres
+# bootstrap). xtask uses `default-features = false` so `regen sqlx`
+# can reuse the bootstrap without pulling rio-nix/rio-proto/tonic/kube
+# into its build graph. Every other consumer is a dev-dependency and
+# takes the default.
+default = ["full"]
+full = [
+  "dep:sqlx",
+  "dep:tracing-subscriber",
+  "dep:rio-nix",
+  "dep:rio-proto",
+  "dep:tonic",
+  "dep:tokio-stream",
+  "dep:sha2",
+  "dep:hex",
+  "dep:blake3",
+  "dep:tower",
+  "dep:hyper-util",
+  "dep:tower-test",
+  "dep:http",
+  "dep:http-body-util",
+  "dep:kube",
+  "dep:serde_json",
+  "dep:metrics",
+  "dep:rand",
+  "dep:prost",
+  "dep:prost-types",
+  "dep:heck",
+]
+
 [dependencies]
+# ─── Unconditional: pg::PgServer bootstrap ──────────────────────────
 anyhow = { workspace = true }
-sqlx = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
+scopeguard = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# ─── feature = "full" ───────────────────────────────────────────────
+sqlx = { workspace = true, optional = true }
 # init_test_logging(): with_test_writer()+EnvFilter so per-test
 # tracing output is captured by libtest and shown only on failure.
-tracing-subscriber = { workspace = true }
-rio-nix = { workspace = true }
-rio-proto = { workspace = true }
-tonic = { workspace = true }
-tokio-stream = { workspace = true, features = ["net"] }
-sha2 = { workspace = true }
-hex = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+rio-nix = { workspace = true, optional = true }
+rio-proto = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 # MockStore::seed_chunked: fixed-size chunk content addressing for the
 # in-memory ChunkService.GetChunk impl (dataplane2).
-blake3 = { workspace = true }
+blake3 = { workspace = true, optional = true }
 # spawn_mock_store_inproc: in-process duplex transport so
 # `#[tokio::test(start_paused = true)]` doesn't auto-advance timeouts
 # while real TCP is pending.
-tower = { workspace = true }
-hyper-util = { workspace = true }
+tower = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 # kube_mock: scenario-driven mock apiserver via tower-test
 # mock::pair() wrapped as kube::Client. Shared by rio-controller
 # reconciler tests and rio-scheduler lease election tests.
-tower-test = { workspace = true }
-http = { workspace = true }
+tower-test = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 # http-body-util: BodyExt::collect for draining the request body
 # in kube_mock's body_contains assertion. kube::client::Body is
 # a hyper-style stream; .collect().to_bytes() flattens it.
-http-body-util = { workspace = true }
-kube = { workspace = true }
+http-body-util = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
 # serde_json: Scenario::k8s_error builds the metav1.Status envelope
 # via json!(). Already transitively pulled by kube; direct dep so
 # the macro is in scope.
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 # metrics: DescribedNames + CountingRecorder test recorders.
 # Extracted from 5× + 3× per-crate copies (P0330).
-metrics = { workspace = true }
+metrics = { workspace = true, optional = true }
 # rand_store_hash(): fresh nixbase32 hash per call. Criterion-driven
 # benches need unique drv_hash across iterations (scheduler DAG
 # dedupes, collisions skew latency low).
-rand = { workspace = true }
-scopeguard = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+rand = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }
@@ -69,9 +103,10 @@ regex = { workspace = true }
 [build-dependencies]
 # build.rs runs protoc --descriptor_set_out on admin.proto and
 # decodes the FileDescriptorSet to iterate service methods (same
-# parser rio-proto uses — single source of truth).
-prost = { workspace = true }
-prost-types = { workspace = true }
+# parser rio-proto uses — single source of truth). Gated on `full`:
+# the generated MockAdmin macro is only consumed by grpc/admin.rs.
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
 # heck: prost's ident normalization (GCRequest → GcRequest) +
 # trait-method snake_case (ClusterStatus → cluster_status).
-heck = { workspace = true }
+heck = { workspace = true, optional = true }

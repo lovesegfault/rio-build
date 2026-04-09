@@ -29,11 +29,22 @@
 //! changes; new streaming/recording RPCs need MANUAL_METHODS growth +
 //! a hand-written body (still less work than before).
 
+// MockAdmin codegen is only consumed by grpc/admin.rs (feature = "full").
+// When `full` is off (xtask's default-features = false), skip everything
+// — no protoc invocation, no prost/heck build-deps.
+#[cfg(not(feature = "full"))]
+fn main() {}
+
+#[cfg(feature = "full")]
 use std::fmt::Write as _;
+#[cfg(feature = "full")]
 use std::process::Command;
 
+#[cfg(feature = "full")]
 use heck::{ToSnakeCase, ToUpperCamelCase};
+#[cfg(feature = "full")]
 use prost::Message;
+#[cfg(feature = "full")]
 use prost_types::FileDescriptorSet;
 
 /// Proto method names (PascalCase) whose MockAdmin impls are NOT
@@ -42,6 +53,7 @@ use prost_types::FileDescriptorSet;
 /// loop expects an `is_complete=true` frame); the two custom unaries
 /// record calls / echo request fields so smoke tests can assert on
 /// pass-through.
+#[cfg(feature = "full")]
 const MANUAL_METHODS: &[&str] = &[
     "GetBuildLogs", // streaming — sends one is_complete=true chunk
     "TriggerGC",    // streaming — sends one is_complete=true frame
@@ -49,6 +61,7 @@ const MANUAL_METHODS: &[&str] = &[
     "CreateTenant", // echoes tenant_name back in TenantInfo
 ];
 
+#[cfg(feature = "full")]
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let proto_dir = format!("{manifest}/../rio-proto/proto");
@@ -92,6 +105,22 @@ fn main() {
         .flat_map(|f| &f.service)
         .find(|s| s.name() == "AdminService")
         .expect("AdminService in descriptor set");
+
+    // Validate MANUAL_METHODS against the descriptor: every name listed
+    // here must exist on AdminService. Without this, a proto rename
+    // leaves a stale MANUAL_METHODS entry that silently no-ops, and the
+    // failure surfaces as an unrelated trait-impl error in grpc/admin.rs
+    // ("method `old_name` is not a member of trait"). Failing here puts
+    // the diagnostic at the edit site.
+    let proto_names: std::collections::HashSet<&str> =
+        service.method.iter().map(|m| m.name()).collect();
+    for &m in MANUAL_METHODS {
+        assert!(
+            proto_names.contains(m),
+            "MANUAL_METHODS entry {m:?} not found in admin.proto AdminService — \
+             rename it to match the proto, or remove it if the RPC was deleted"
+        );
+    }
 
     let mut generated_body = String::new();
 
@@ -192,6 +221,7 @@ fn main() {
 /// UpperCamelCase, which lowercases consecutive caps: `GCRequest` →
 /// `GcRequest`, `GCProgress` → `GcProgress`. Already-normalized names
 /// (`ClusterStatusResponse`) are idempotent under the transform.
+#[cfg(feature = "full")]
 fn proto_type_to_rust(proto_type: &str) -> String {
     // Descriptor form has leading dot: ".rio.types.Foo".
     let proto_type = proto_type.strip_prefix('.').unwrap_or(proto_type);

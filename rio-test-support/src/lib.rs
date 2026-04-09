@@ -8,23 +8,35 @@
 //! - [`metrics`]: test-only `metrics::Recorder` impls (DescribedNames, CountingRecorder)
 //! - [`config`]: figment::Jail standing-guard test macros (jail_roundtrip!, jail_defaults!)
 
-pub mod config;
-pub mod fixtures;
-pub mod grpc;
-pub mod kube_mock;
-pub mod metrics;
+// `pg` is unconditional so xtask (default-features = false) can reuse
+// PgServer::get() without pulling rio-nix/rio-proto/tonic/kube. Every
+// other module is gated on `full` (the default).
 pub mod pg;
+
+#[cfg(feature = "full")]
+pub mod config;
+#[cfg(feature = "full")]
+pub mod fixtures;
+#[cfg(feature = "full")]
+pub mod grpc;
+#[cfg(feature = "full")]
+pub mod kube_mock;
+#[cfg(feature = "full")]
+pub mod metrics;
+#[cfg(feature = "full")]
 pub mod wire;
 
-// metrics_grep.rs is include!()-ed by crate build.rs files, not a
-// public module of this crate. Compile it at test time ONLY so the
-// grep_spec_names self-test runs via `cargo test -p rio-test-support`.
-// The #[allow(dead_code)] attributes inside handle the unused-fn
-// warnings (emit_metrics_grep isn't called from tests).
+// build-support/metrics_grep.rs is include!()-ed by crate build.rs
+// files, not a public module of this crate. Compile it at test time
+// ONLY so the grep_spec_names self-test runs via `cargo test -p
+// rio-test-support`. The #[allow(dead_code)] attributes inside handle
+// the unused-fn warnings (emit_metrics_grep isn't called from tests).
 #[cfg(test)]
+#[path = "../../build-support/metrics_grep.rs"]
 mod metrics_grep;
 
 // Re-export at crate root — TestDb is the most-used type.
+#[cfg(feature = "full")]
 pub use pg::TestDb;
 
 /// Standard return type for `#[test]` / `#[tokio::test]` bodies.
@@ -39,6 +51,7 @@ pub type TestResult = anyhow::Result<()>;
 /// `filter` is an `EnvFilter` directive string (e.g.,
 /// `"rio_gateway=debug,rio_nix=debug"`). Without this, `tracing::debug!`
 /// in error paths is void and failure logs are useless.
+#[cfg(feature = "full")]
 pub fn init_test_logging(filter: &str) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -15,11 +15,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use sqlx::PgPool;
-use sqlx::migrate::Migrator;
-use sqlx::postgres::PgPoolOptions;
 use tempfile::TempDir;
 
 /// Process-global postgres server. Lazily initialized on first [`TestDb::new`].
@@ -27,6 +24,7 @@ static PG: OnceLock<PgServer> = OnceLock::new();
 
 /// Process-global ephemeral postgres. Public so xtask's `regen sqlx`
 /// can reuse the same bootstrap instead of duplicating it in bash.
+/// Available without `feature = "full"` (no sqlx dependency).
 // r[impl ts.pg.server]
 pub enum PgServer {
     /// Ephemeral server we bootstrapped ourselves. The child process dies
@@ -307,10 +305,22 @@ fn pid_alive(_pid: i32) -> bool {
     true
 }
 
+// ─── TestDb: per-test isolated database (feature = "full") ──────────
+//
+// Everything below uses sqlx and is gated on `full`. PgServer above is
+// the only piece xtask needs; gating TestDb keeps sqlx out of xtask's
+// build graph.
+
+#[cfg(feature = "full")]
+use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
+#[cfg(feature = "full")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// Build a URL for the given database name from an admin URL.
 ///
 /// Handles both TCP URLs (`postgres://host:port/old` → `.../new`) and
 /// Unix-socket URLs (`postgres:///old?host=/sock` → `postgres:///new?host=/sock`).
+#[cfg(any(feature = "full", test))]
 fn replace_db_name(url: &str, new_db: &str) -> String {
     // Split off query string first so we don't mangle ?host=... paths.
     let (base, query) = match url.split_once('?') {
@@ -343,12 +353,14 @@ fn replace_db_name(url: &str, new_db: &str) -> String {
 /// tests that close `pool` to simulate DB unavailability will still have their
 /// database cleaned up. See `test_db_failure_during_completion_logged` in
 /// rio-scheduler for an example.
+#[cfg(feature = "full")]
 pub struct TestDb {
     pub pool: PgPool,
     db_name: String,
     admin_url: String,
 }
 
+#[cfg(feature = "full")]
 impl TestDb {
     /// Create an isolated test database and run migrations on it.
     pub async fn new(migrator: &Migrator) -> Self {
@@ -416,6 +428,7 @@ impl TestDb {
     }
 }
 
+#[cfg(feature = "full")]
 impl Drop for TestDb {
     fn drop(&mut self) {
         // Drop the database via a fresh admin connection. Runs on a separate

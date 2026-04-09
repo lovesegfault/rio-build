@@ -21869,6 +21869,10 @@
           "packageId": "regex"
         }
       ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "full"
+      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -30819,6 +30823,10 @@
           "packageId": "typenum"
         },
         {
+          "name": "unicode-normalization",
+          "packageId": "unicode-normalization"
+        },
+        {
           "name": "uuid",
           "packageId": "uuid"
         },
@@ -31105,6 +31113,10 @@
         {
           "name": "typenum",
           "packageId": "typenum"
+        },
+        {
+          "name": "unicode-normalization",
+          "packageId": "unicode-normalization"
         },
         {
           "name": "uuid",
