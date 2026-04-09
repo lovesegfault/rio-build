@@ -1,114 +1,43 @@
 use std::io::{Cursor, Read};
 
+use rstest::rstest;
+
 use super::sync_wire::{write_bytes, write_str, write_u64};
 use super::*;
 
-#[test]
-fn roundtrip_regular_file() -> anyhow::Result<()> {
-    let node = NarNode::Regular {
-        executable: false,
-        contents: b"hello world\n".to_vec(),
-    };
-
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node)?;
-
-    let parsed = parse(&mut Cursor::new(&buf))?;
-    assert_eq!(parsed, node);
-    Ok(())
+fn reg(executable: bool, contents: &[u8]) -> NarNode {
+    NarNode::Regular {
+        executable,
+        contents: contents.to_vec(),
+    }
 }
 
-#[test]
-fn roundtrip_executable_file() -> anyhow::Result<()> {
-    let node = NarNode::Regular {
-        executable: true,
-        contents: b"#!/bin/sh\necho hello\n".to_vec(),
-    };
-
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node)?;
-
-    let parsed = parse(&mut Cursor::new(&buf))?;
-    assert_eq!(parsed, node);
-    Ok(())
+fn entry(name: &str, node: NarNode) -> NarEntry {
+    NarEntry {
+        name: name.to_string(),
+        node,
+    }
 }
 
-#[test]
-fn roundtrip_symlink() -> anyhow::Result<()> {
-    let node = NarNode::Symlink {
-        target: "file.txt".to_string(),
-    };
-
+/// serialize → parse is identity for every NarNode shape.
+#[rstest]
+#[case::regular_file(reg(false, b"hello world\n"))]
+#[case::executable_file(reg(true, b"#!/bin/sh\necho hello\n"))]
+#[case::symlink(NarNode::Symlink { target: "file.txt".to_string() })]
+#[case::empty_directory(NarNode::Directory { entries: vec![] })]
+#[case::empty_file(reg(false, b""))]
+#[case::directory_with_entries(NarNode::Directory {
+    entries: vec![
+        entry("a_file.txt", reg(false, b"content a")),
+        entry("b_link", NarNode::Symlink { target: "a_file.txt".to_string() }),
+        entry("c_dir", NarNode::Directory {
+            entries: vec![entry("nested.txt", reg(false, b"nested content"))],
+        }),
+    ],
+})]
+fn roundtrip(#[case] node: NarNode) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     serialize(&mut buf, &node)?;
-
-    let parsed = parse(&mut Cursor::new(&buf))?;
-    assert_eq!(parsed, node);
-    Ok(())
-}
-
-#[test]
-fn roundtrip_empty_directory() -> anyhow::Result<()> {
-    let node = NarNode::Directory { entries: vec![] };
-
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node)?;
-
-    let parsed = parse(&mut Cursor::new(&buf))?;
-    assert_eq!(parsed, node);
-    Ok(())
-}
-
-#[test]
-fn roundtrip_directory_with_entries() -> anyhow::Result<()> {
-    let node = NarNode::Directory {
-        entries: vec![
-            NarEntry {
-                name: "a_file.txt".to_string(),
-                node: NarNode::Regular {
-                    executable: false,
-                    contents: b"content a".to_vec(),
-                },
-            },
-            NarEntry {
-                name: "b_link".to_string(),
-                node: NarNode::Symlink {
-                    target: "a_file.txt".to_string(),
-                },
-            },
-            NarEntry {
-                name: "c_dir".to_string(),
-                node: NarNode::Directory {
-                    entries: vec![NarEntry {
-                        name: "nested.txt".to_string(),
-                        node: NarNode::Regular {
-                            executable: false,
-                            contents: b"nested content".to_vec(),
-                        },
-                    }],
-                },
-            },
-        ],
-    };
-
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node)?;
-
-    let parsed = parse(&mut Cursor::new(&buf))?;
-    assert_eq!(parsed, node);
-    Ok(())
-}
-
-#[test]
-fn roundtrip_empty_file() -> anyhow::Result<()> {
-    let node = NarNode::Regular {
-        executable: false,
-        contents: vec![],
-    };
-
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node)?;
-
     let parsed = parse(&mut Cursor::new(&buf))?;
     assert_eq!(parsed, node);
     Ok(())
@@ -884,63 +813,22 @@ fn nar_with_entry_name(name: &[u8]) -> Vec<u8> {
     buf
 }
 
-#[test]
-fn test_parse_rejects_dotdot_entry() {
-    let buf = nar_with_entry_name(b"..");
+#[rstest]
+#[case::dotdot(b"..")]
+#[case::slash(b"etc/passwd")]
+#[case::absolute(b"/etc/passwd")]
+#[case::nul(b"foo\0bar")]
+#[case::empty(b"")]
+#[case::dot(b".")]
+fn test_parse_rejects_unsafe_entry_name(#[case] name: &[u8]) {
+    let buf = nar_with_entry_name(name);
     let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+    // All test names here are valid UTF-8 (including NUL); the
+    // separate non-UTF-8 case asserts InvalidUtf8, not InvalidEntryName.
+    let expected = std::str::from_utf8(name).unwrap();
     assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name == ".."),
-        "expected InvalidEntryName for '..', got {err:?}"
-    );
-}
-
-#[test]
-fn test_parse_rejects_slash_entry() {
-    let buf = nar_with_entry_name(b"etc/passwd");
-    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
-    assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name == "etc/passwd"),
-        "expected InvalidEntryName for slash name, got {err:?}"
-    );
-}
-
-#[test]
-fn test_parse_rejects_absolute_entry() {
-    let buf = nar_with_entry_name(b"/etc/passwd");
-    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
-    assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name == "/etc/passwd"),
-        "expected InvalidEntryName for absolute name, got {err:?}"
-    );
-}
-
-#[test]
-fn test_parse_rejects_nul_entry() {
-    let buf = nar_with_entry_name(b"foo\0bar");
-    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
-    assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name == "foo\0bar"),
-        "expected InvalidEntryName for NUL name, got {err:?}"
-    );
-}
-
-#[test]
-fn test_parse_rejects_empty_entry() {
-    let buf = nar_with_entry_name(b"");
-    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
-    assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name.is_empty()),
-        "expected InvalidEntryName for empty name, got {err:?}"
-    );
-}
-
-#[test]
-fn test_parse_rejects_dot_entry() {
-    let buf = nar_with_entry_name(b".");
-    let err = parse(&mut Cursor::new(&buf)).unwrap_err();
-    assert!(
-        matches!(&err, NarError::InvalidEntryName { name } if name == "."),
-        "expected InvalidEntryName for '.', got {err:?}"
+        matches!(&err, NarError::InvalidEntryName { name: n } if n == expected),
+        "expected InvalidEntryName for {expected:?}, got {err:?}"
     );
 }
 
