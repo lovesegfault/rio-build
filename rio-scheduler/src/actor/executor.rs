@@ -143,15 +143,19 @@ impl DagActor {
     /// Flip `warm=true` on PrefetchComplete ACK. See
     /// `r[sched.assign.warm-gate]`. No-op if the worker is unknown
     /// (disconnected between hint and ACK — rare race).
+    ///
+    /// Returns `true` on a cold→warm transition (the caller dispatches
+    /// inline, capped per Tick); `false` for already-warm re-ACKs
+    /// (per-assignment hints) and unknown workers.
     pub(super) fn handle_prefetch_complete(
         &mut self,
         executor_id: &ExecutorId,
         paths_fetched: u32,
-    ) {
+    ) -> bool {
         let Some(w) = self.executors.get_mut(executor_id) else {
             debug!(executor_id = %executor_id,
                    "PrefetchComplete for unknown worker (disconnected?)");
-            return;
+            return false;
         };
         // Idempotent: a worker sending two ACKs (e.g., pre-dispatch
         // hint + first per-assignment hint both getting ACKed) just
@@ -169,6 +173,7 @@ impl DagActor {
         // histogram serves observability, not gating — the gate is
         // the warm flag flip above, which is idempotent.
         metrics::histogram!("rio_scheduler_warm_prefetch_paths").record(f64::from(paths_fetched));
+        !was_warm
     }
 
     /// Hook fired exactly once per worker when it transitions

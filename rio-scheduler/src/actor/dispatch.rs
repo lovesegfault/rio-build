@@ -111,8 +111,9 @@ impl DagActor {
         }
 
         // I-163: any caller reaching here (Tick, MergeDag,
-        // PrefetchComplete, ProcessCompletion) is about to do the work
-        // the dirty flag represents. Clear it so the NEXT Tick doesn't
+        // ProcessCompletion, became_idle/PrefetchComplete carve-out)
+        // is about to do the work the dirty flag represents. Clear it
+        // so the NEXT Tick doesn't
         // redundantly re-dispatch when an inline caller already ran.
         // Cleared after the leader/recovery gates — a not-yet-leader
         // standby keeps the flag so the first post-recovery Tick

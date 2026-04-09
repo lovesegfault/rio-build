@@ -99,10 +99,11 @@ impl DagActor {
     }
 
     pub(super) async fn handle_tick(&mut self) {
-        // Reset the became_idle inline-dispatch budget. See
-        // `BECAME_IDLE_INLINE_CAP` — past the cap, 0→1 heartbeats
-        // since the previous Tick set dispatch_dirty instead; the
-        // dispatch below drains it.
+        // Reset the "worker newly available" inline-dispatch budget.
+        // See `BECAME_IDLE_INLINE_CAP` — past the cap, became_idle
+        // heartbeats and PrefetchComplete cold→warm edges since the
+        // previous Tick set dispatch_dirty instead; the dispatch
+        // below drains it.
         self.became_idle_inline_this_tick = 0;
 
         self.maybe_refresh_estimator().await;
@@ -132,7 +133,8 @@ impl DagActor {
         // it at Tick cadence (≤1/s) instead of per-heartbeat (29/s at
         // 290 workers). dispatch_ready clears the flag itself (after
         // its leader/recovery gates) so inline callers (MergeDag,
-        // PrefetchComplete, ProcessCompletion) also satisfy it.
+        // ProcessCompletion, the capped became_idle/PrefetchComplete
+        // carve-out) also satisfy it.
         if self.dispatch_dirty {
             self.dispatch_ready().await;
         }

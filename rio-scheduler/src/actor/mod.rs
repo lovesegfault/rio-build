@@ -106,15 +106,17 @@ pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 16;
 /// is dropped.
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Max inline `dispatch_ready` calls from the `became_idle` heartbeat
-/// carve-out per Tick. Past this, `became_idle` only sets
-/// `dispatch_dirty` (deferred ≤1 Tick). Prevents leader-failover from
-/// reintroducing the I-163 storm: with 290 executors all reconnecting,
-/// 290 first-heartbeats are all 0→1 transitions → 290 sequential
-/// `dispatch_ready` passes (each does the ~150ms batch-FOD precheck).
-/// 4 inline + remainder coalesced bounds the burst at ~600ms regardless
-/// of fleet size while keeping the steady-state "fresh ephemeral
-/// dispatches immediately" win.
+/// Max inline `dispatch_ready` calls from the "worker newly available"
+/// carve-out per Tick — Heartbeat `became_idle` (capacity 0→1) and
+/// `PrefetchComplete` (cold→warm) share this budget. Past it, both
+/// only set `dispatch_dirty` (deferred ≤1 Tick). Prevents
+/// leader-failover from reintroducing the I-163 storm: with 290
+/// executors all reconnecting, 290 first-heartbeats are 0→1
+/// transitions and 290 PrefetchComplete ACKs follow → 580 sequential
+/// `dispatch_ready` passes uncapped (each does the ~150ms batch-FOD
+/// precheck). 4 inline + remainder coalesced bounds the burst at
+/// ~600ms regardless of fleet size while keeping the steady-state
+/// "fresh ephemeral dispatches immediately" win.
 pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
 
 /// The DAG actor state.
@@ -242,21 +244,24 @@ pub struct DagActor {
     /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
     /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
     /// workers / 10s × 169ms each that's ~5× actor capacity. Coalescing
-    /// to once-per-Tick drops it to ≤1/s; state-change events
-    /// (PrefetchComplete, ProcessCompletion, MergeDag) still dispatch
-    /// inline because those genuinely unlock new work.
+    /// to once-per-Tick drops it to ≤1/s; ProcessCompletion / MergeDag
+    /// still dispatch inline (those genuinely unlock new derivations);
+    /// Heartbeat became_idle and PrefetchComplete share the
+    /// [`BECAME_IDLE_INLINE_CAP`] budget (those only change placement
+    /// candidacy).
     // r[impl sched.actor.dispatch-decoupled]
     dispatch_dirty: bool,
-    /// Inline `dispatch_ready` calls fired from the `became_idle`
-    /// carve-out since the last Tick. Capped at
-    /// [`BECAME_IDLE_INLINE_CAP`]; once hit, further `became_idle`
-    /// heartbeats only set `dispatch_dirty`. Reset to 0 in
-    /// `handle_tick`. Guards the failover/mass-reconnect case where
-    /// every executor's first heartbeat is a 0→1 transition — the
-    /// `r[sched.dispatch.became-idle-immediate]` carve-out assumed "≤1
-    /// per executor per spawn cycle", which is true steady-state but
-    /// becomes N-at-once after leader failover (the I-163 storm via
-    /// the back door).
+    /// Inline `dispatch_ready` calls fired from the "worker newly
+    /// available" carve-out (Heartbeat `became_idle` + `PrefetchComplete`
+    /// cold→warm) since the last Tick. Capped at
+    /// [`BECAME_IDLE_INLINE_CAP`]; once hit, further such edges only
+    /// set `dispatch_dirty`. Reset to 0 in `handle_tick`. Guards the
+    /// failover/mass-reconnect case where every executor's first
+    /// heartbeat is a 0→1 transition AND its PrefetchComplete is a
+    /// cold→warm edge — the `r[sched.dispatch.became-idle-immediate]`
+    /// carve-out assumed "≤1 per executor per spawn cycle", which is
+    /// true steady-state but becomes 2N-at-once after leader failover
+    /// (the I-163 storm via the back door).
     became_idle_inline_this_tick: u32,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
@@ -474,12 +479,24 @@ impl DagActor {
                     executor_id,
                     paths_fetched,
                 } => {
-                    self.handle_prefetch_complete(&executor_id, paths_fetched);
-                    // Dispatch: a newly-warm worker may now be the
-                    // best candidate for queued derivations that were
-                    // previously deferred (no warm worker passed the
-                    // hard filter).
-                    self.dispatch_ready().await;
+                    // r[impl sched.dispatch.became-idle-immediate]
+                    // Cold→warm is the same "worker newly available"
+                    // edge as Heartbeat became_idle — it changes
+                    // placement candidacy, not derivation readiness.
+                    // Share the inline budget so leader-failover (N
+                    // reconnects → N near-simultaneous PrefetchComplete
+                    // ACKs) coalesces to dispatch_dirty instead of N
+                    // sequential dispatch_ready passes. Already-warm
+                    // re-ACKs (per-assignment hints) change no
+                    // eligibility → skip dispatch entirely.
+                    if self.handle_prefetch_complete(&executor_id, paths_fetched) {
+                        if self.became_idle_inline_this_tick < BECAME_IDLE_INLINE_CAP {
+                            self.became_idle_inline_this_tick += 1;
+                            self.dispatch_ready().await;
+                        } else {
+                            self.dispatch_dirty = true;
+                        }
+                    }
                 }
                 ActorCommand::Heartbeat(hb) => {
                     let (phantoms, became_idle) = self.handle_heartbeat(hb);
@@ -493,8 +510,8 @@ impl DagActor {
                     // 290 workers × 10s heartbeat × 169ms dispatch_ready
                     // = ~5× actor capacity → mailbox_depth=9.5k → admin
                     // RPC timeouts. handle_tick drains the flag at ≤1/s;
-                    // ProcessCompletion / PrefetchComplete / MergeDag
-                    // still dispatch inline (those unlock new work).
+                    // ProcessCompletion / MergeDag still dispatch inline
+                    // (those unlock new derivations).
                     // r[impl sched.actor.dispatch-decoupled]
                     //
                     // r[impl sched.dispatch.became-idle-immediate]

@@ -1797,6 +1797,10 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     for w in 0..W {
         rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux").await?);
     }
+    // Connects past BECAME_IDLE_INLINE_CAP coalesce to dispatch_dirty
+    // — drain via one Tick (one dispatch_ready instead of W; tighter
+    // than the pre-cap behavior this test bounded).
+    handle.send_unchecked(ActorCommand::Tick).await?;
     let mut assigned = Vec::with_capacity(W);
     for rx in &mut rxs {
         assigned.push(recv_assignment(rx).await.drv_path);

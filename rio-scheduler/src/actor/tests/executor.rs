@@ -857,7 +857,10 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
                 executor_id: id.into(),
             })
             .await?;
-        barrier(&handle).await;
+        // Tick: each connect's first-heartbeat consumes the
+        // BECAME_IDLE_INLINE_CAP budget; reset between iterations
+        // (production disconnect→reconnect spans multiple Ticks).
+        tick(&handle).await?;
         drop(rx);
 
         let s = handle
@@ -894,7 +897,7 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
                 executor_id: id.into(),
             })
             .await?;
-        barrier(&handle).await;
+        tick(&handle).await?;
         drop(rx);
     }
     let s = handle
@@ -2494,8 +2497,8 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
 /// per Tick; the remainder coalesce to `dispatch_dirty`.
 ///
 /// Setup uses degrade→undegrade on ALREADY-warm workers to isolate the
-/// `became_idle` heartbeat path from `PrefetchComplete` (which has its
-/// own inline dispatch, naturally spread by fetch latency in prod).
+/// `became_idle` heartbeat path from `PrefetchComplete` (which now
+/// shares the same cap — see [`test_prefetch_complete_burst_capped`]).
 ///
 /// Asserts BOTH halves of the cap:
 ///   - exactly CAP assignments land from heartbeats alone (no Tick) —
@@ -2581,6 +2584,117 @@ async fn test_became_idle_burst_capped_per_tick() -> TestResult {
     assert_eq!(
         assigned_total, n,
         "all {n} derivations should be assigned after one Tick drains dispatch_dirty"
+    );
+    Ok(())
+}
+
+/// r[verify sched.dispatch.became-idle-immediate]
+///
+/// `PrefetchComplete` is the OTHER mass-reconnect inline-dispatch
+/// vector: leader-failover → N reconnects → N first-Heartbeats (capped
+/// above) → N PrefetchComplete ACKs. Uncapped, each ACK ran
+/// `dispatch_ready` inline — the I-163 storm via the back door even
+/// after Heartbeat was gated. The fix routes cold→warm through the
+/// same `BECAME_IDLE_INLINE_CAP` budget as `became_idle`.
+///
+/// Asserts the shared-budget contract directly: exhaust the budget via
+/// `became_idle` (CAP cold-fallback assignments), then prove a single
+/// PrefetchComplete cold→warm DEFERS to `dispatch_dirty` instead of
+/// dispatching inline. Without the fix, the PFC dispatches inline and
+/// the (CAP+1)th root is assigned before Tick.
+///
+/// Setup uses a (child + N roots) DAG with the child completed first
+/// — the only way to get cold-registered workers (on_worker_registered
+/// flips warm immediately when the Ready set's input closure is empty,
+/// which it is for childless test nodes).
+#[tokio::test]
+async fn test_prefetch_complete_burst_capped() -> TestResult {
+    use crate::actor::BECAME_IDLE_INLINE_CAP;
+    use rio_proto::types::scheduler_message::Msg;
+    let (_db, handle, _task) = setup().await;
+
+    let cap = BECAME_IDLE_INLINE_CAP as usize;
+    let n_roots = cap + 1;
+
+    // (1) child C + (CAP+1) roots all depending on C. C has an
+    // expected_output_path so each root's input closure is non-empty
+    // once C completes.
+    let mut child = make_test_node("pfc-child", "x86_64-linux");
+    child.expected_output_paths = vec![test_store_path("pfc-child-out")];
+    let mut nodes = vec![child];
+    let mut edges = Vec::new();
+    for i in 0..n_roots {
+        nodes.push(make_test_node(&format!("pfc-root-{i}"), "x86_64-linux"));
+        edges.push(make_test_edge(&format!("pfc-root-{i}"), "pfc-child"));
+    }
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, false).await?;
+
+    // (2) Bootstrap: complete C via a throwaway worker so all roots
+    // become Ready with C as a completed child. Then disconnect to
+    // reset whatever root boot-w grabbed on completion-dispatch.
+    let mut boot_rx = connect_executor(&handle, "pfc-boot", "x86_64-linux").await?;
+    let asgn = recv_assignment(&mut boot_rx).await;
+    assert_eq!(asgn.drv_path, test_drv_path("pfc-child"));
+    complete_success_empty(&handle, "pfc-boot", &test_drv_path("pfc-child")).await?;
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "pfc-boot".into(),
+        })
+        .await?;
+    drop(boot_rx);
+    // Reset the inline budget consumed by boot-w's connect/dispatch.
+    handle.send(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    // (3) Exhaust the budget: connect CAP workers without ACK. Each
+    // first-heartbeat is became_idle (b=1..CAP); on_worker_registered
+    // sees non-empty closure → sends hint, workers stay COLD.
+    // cold-fallback assigns CAP roots inline.
+    let mut _rxs = Vec::new();
+    for i in 0..cap {
+        _rxs.push(connect_executor_no_ack(&handle, &format!("pfc-w{i}"), "x86_64-linux").await?);
+    }
+    // (4) One more worker — became_idle at b≥CAP sets dirty. Still
+    // cold. Exactly one root remains Ready.
+    let mut rx_last =
+        connect_executor_no_ack(&handle, &format!("pfc-w{cap}"), "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    // (5) PrefetchComplete for the last worker (cold→warm). With the
+    // fix this consumes from the shared budget (already at CAP) →
+    // dispatch_dirty. WITHOUT the fix it dispatched inline → the
+    // last root would land on rx_last now.
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: format!("pfc-w{cap}").into(),
+            paths_fetched: 1,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let count_assignments = |rx: &mut mpsc::Receiver<_>| {
+        let mut n = 0usize;
+        while let Ok(rio_proto::types::SchedulerMessage { msg }) = rx.try_recv() {
+            if matches!(msg, Some(Msg::Assignment(_))) {
+                n += 1;
+            }
+        }
+        n
+    };
+    assert_eq!(
+        count_assignments(&mut rx_last),
+        0,
+        "PrefetchComplete cold→warm at budget=CAP must defer to dispatch_dirty, \
+         not dispatch inline (I-163 storm via the back door)"
+    );
+
+    // (6) One Tick drains dispatch_dirty → last root assigned.
+    handle.send(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        count_assignments(&mut rx_last),
+        1,
+        "deferred PrefetchComplete dispatch should land after one Tick"
     );
     Ok(())
 }
