@@ -205,15 +205,16 @@ let
     exit 1
   '';
 
-  # Cross-crate compile-time reads from rio-test-support: build.rs
-  # include!("../rio-test-support/src/metrics_grep.rs") in 5 crates, and
+  # Cross-crate compile-time reads: build.rs include!()s
+  # build-support/metrics_grep.rs in 5 crates (anchored via
+  # CARGO_MANIFEST_DIR/../build-support), and
   # include_str!("../../../rio-test-support/golden/...") in rio-scheduler
   # src/state/derivation.rs. buildRustCrate's src is just the crate dir,
-  # so ../rio-test-support resolves outside. Narrow filesets per-file so
+  # so the sibling paths resolve outside. Narrow filesets per-file so
   # editing golden/ doesn't invalidate metrics_grep-only crates.
   metricsGrepFileset = pkgs.lib.fileset.toSource {
-    root = ../rio-test-support;
-    fileset = ../rio-test-support/src/metrics_grep.rs;
+    root = ../build-support;
+    fileset = ../build-support/metrics_grep.rs;
   };
   goldenFileset = pkgs.lib.fileset.toSource {
     root = ../rio-test-support;
@@ -245,8 +246,9 @@ let
   # withMetricsGrep, withSeccompProfiles) — the golden/ symlink is only USED
   # by rio-scheduler but costs nothing in crates that don't reference it.
   linkMetricsGrep = ''
-    mkdir -p $NIX_BUILD_TOP/rio-test-support/src
-    ln -sf ${metricsGrepFileset}/src/metrics_grep.rs $NIX_BUILD_TOP/rio-test-support/src/metrics_grep.rs
+    mkdir -p $NIX_BUILD_TOP/build-support
+    ln -sf ${metricsGrepFileset}/metrics_grep.rs $NIX_BUILD_TOP/build-support/metrics_grep.rs
+    mkdir -p $NIX_BUILD_TOP/rio-test-support
     ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
     mkdir -p $NIX_BUILD_TOP/docs/src
     ln -sf ${obsMdFileset}/src/observability.md $NIX_BUILD_TOP/docs/src/observability.md
@@ -258,7 +260,7 @@ let
     # $NIX_BUILD_TOP — writable. sqlx::migrate!("../migrations")
     # resolves $CARGO_MANIFEST_DIR/../migrations at compile time; this
     # symlink makes that path resolve to the fileset'd store path.
-    # Same for rio-test-support/src/metrics_grep.rs (build.rs include!()).
+    # Same for build-support/metrics_grep.rs (build.rs include!()).
     postUnpack = ''
       ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
       ${linkMetricsGrep}
@@ -393,6 +395,9 @@ let
       postUnpack = ''
         mkdir -p $NIX_BUILD_TOP/rio-proto
         ln -sf ${protoFileset}/proto $NIX_BUILD_TOP/rio-proto/proto
+        # cfg(test) #[path = "../../build-support/metrics_grep.rs"] in lib.rs
+        mkdir -p $NIX_BUILD_TOP/build-support
+        ln -sf ${metricsGrepFileset}/metrics_grep.rs $NIX_BUILD_TOP/build-support/metrics_grep.rs
       '';
     };
 
@@ -405,8 +410,8 @@ let
     rio-store = withMigrations;
     rio-gateway = withMigrations;
 
-    # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
-    # compile-time file read crossing crate boundary.
+    # build.rs include!() of build-support/metrics_grep.rs — compile-time
+    # file read crossing crate boundary.
     rio-builder = withMetricsGrep;
 
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in

@@ -15,10 +15,15 @@
 //! — textual by nature, so a source grep is the right tool.
 //!
 //! The grep implementation is shared via `include!()` from
-//! rio-test-support (not a build-dependency — include!() sidesteps
-//! the workspace publish=false build-dep constraint).
+//! `build-support/` (not a build-dependency — include!() sidesteps
+//! the workspace publish=false build-dep constraint). Anchored via
+//! `CARGO_MANIFEST_DIR` so the path resolves regardless of where
+//! cargo invokes rustc from.
 
-include!("../rio-test-support/src/metrics_grep.rs");
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build-support/metrics_grep.rs"
+));
 
 fn main() {
     metrics_build_main("rio_scheduler_");

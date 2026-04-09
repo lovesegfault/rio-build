@@ -1,6 +1,9 @@
-//! See rio-scheduler/build.rs for rationale + rio-test-support/src/metrics_grep.rs for impl.
+//! See rio-scheduler/build.rs for rationale + build-support/metrics_grep.rs for impl.
 
-include!("../rio-test-support/src/metrics_grep.rs");
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../build-support/metrics_grep.rs"
+));
 
 fn main() {
     metrics_build_main("rio_store_");

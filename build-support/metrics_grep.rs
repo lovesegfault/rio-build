@@ -1,14 +1,13 @@
-// This file is `include!()`-ed by crate-level build.rs files, NOT
-// compiled as a rio-test-support module. See rio-scheduler/build.rs
-// for the full rationale on why this is a build-time source grep
-// rather than a runtime recorder hook.
+// This file is `include!()`-ed by crate-level build.rs files via
+// `concat!(env!("CARGO_MANIFEST_DIR"), "/../build-support/metrics_grep.rs")`.
+// See rio-scheduler/build.rs for the full rationale on why this is a
+// build-time source grep rather than a runtime recorder hook.
 //
-// The `#[allow(dead_code)]` below is defensive — consumers call
-// `emit_metrics_grep` from build.rs `main()`, so it is not dead at
-// the `include!` expansion site. The attribute guards against a
-// future accidental `mod metrics_grep;` in rio-test-support's lib.rs
-// (where it WOULD be dead, and clippy --deny warnings would break
-// the build).
+// rio-test-support compiles it as a `#[cfg(test)]` module (via
+// `#[path = "..."]`) so the grep_spec_names self-test runs under
+// `cargo test -p rio-test-support`. The `#[allow(dead_code)]` below
+// silences unused-fn warnings in that context (emit_metrics_grep
+// isn't called from tests).
 
 /// Standard `build.rs` body for crates with a `tests/metrics_registered.rs`.
 ///
@@ -18,7 +17,7 @@
 /// Crate `build.rs` becomes:
 ///
 /// ```ignore
-/// include!("../rio-test-support/src/metrics_grep.rs");
+/// include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../build-support/metrics_grep.rs"));
 /// fn main() { metrics_build_main("rio_X_"); }
 /// ```
 // r[impl ts.metrics.grep]
