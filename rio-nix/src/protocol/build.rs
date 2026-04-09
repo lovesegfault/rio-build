@@ -370,6 +370,15 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         let out_path = match serde_json::from_str::<serde_json::Value>(&json_str) {
             Ok(v) => match v.get("outPath").and_then(|p| p.as_str()) {
                 Some(p) if p.starts_with(crate::store_path::STORE_PREFIX) => p.to_string(),
+                // Guard empty BEFORE prefixing — `format!("/nix/store/{}")`
+                // on `""` yields a bare `/nix/store/`, which downstream
+                // StorePath::parse would later reject with a confusing
+                // "missing hash" instead of pointing at the wire payload.
+                Some("") => {
+                    return Err(wire::WireError::Io(std::io::Error::other(format!(
+                        "Realisation JSON has empty 'outPath': {json_str}"
+                    ))));
+                }
                 Some(p) => format!("{}{p}", crate::store_path::STORE_PREFIX),
                 None => {
                     tracing::warn!(json = %json_str, "Realisation JSON missing 'outPath' field");

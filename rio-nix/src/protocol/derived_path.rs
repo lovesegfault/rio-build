@@ -18,6 +18,9 @@ pub enum DerivedPathError {
     #[error(transparent)]
     StorePath(#[from] StorePathError),
 
+    #[error("built path base must be a derivation (.drv): {0}")]
+    NotDerivation(String),
+
     #[error("output name must not be empty")]
     EmptyOutputName,
 
@@ -75,6 +78,13 @@ impl DerivedPath {
     pub fn parse(s: &str) -> Result<Self, DerivedPathError> {
         if let Some((drv_part, output_part)) = s.split_once('!') {
             let drv = StorePath::parse(drv_part)?;
+            // Nix `DerivedPath::Built` carries a `StorePathDescriptor` whose
+            // `name` always ends in `.drv`; `parseDerivedPath` enforces this.
+            // Without it, `<non-drv>!out` would round-trip as a Built path
+            // referencing something the scheduler can't dispatch.
+            if !drv.is_derivation() {
+                return Err(DerivedPathError::NotDerivation(drv_part.to_string()));
+            }
             let outputs = if output_part == "*" {
                 OutputSpec::All
             } else {
@@ -201,6 +211,21 @@ mod tests {
     fn parse_invalid_base_path() {
         assert!(DerivedPath::parse("not-a-path!*").is_err());
         assert!(DerivedPath::parse("not-a-path").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_built_without_drv_suffix() {
+        // `!` present but base path is not a .drv — not a valid Built path.
+        let path_str = format!("{}!out", make_path("hello-2.12.1"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::NotDerivation(_))
+        ));
+        let path_str = format!("{}!*", make_path("hello-2.12.1"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::NotDerivation(_))
+        ));
     }
 
     #[test]

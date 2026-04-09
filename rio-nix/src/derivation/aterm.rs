@@ -244,6 +244,12 @@ impl<'a> ATermParser<'a> {
         self.expect("Derive(")?;
 
         let outputs = self.parse_outputs()?;
+        // Nix C++ `parseDerivation` rejects this implicitly (the output map
+        // is keyed and at least `out` is required); we enforce it explicitly
+        // so `to_basic()`'s "Derivation always has outputs" expect is sound.
+        if outputs.is_empty() {
+            return Err(DerivationError::NoOutputs);
+        }
         self.expect(",")?;
 
         let input_drvs = self.parse_input_drvs()?;
@@ -719,6 +725,15 @@ mod tests {
         assert!(matches!(
             Derivation::parse(aterm),
             Err(DerivationError::EmptyOutputName(0))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_zero_outputs() {
+        let aterm = r#"Derive([],[],[],"x86_64-linux","/bin/sh",[],[("name","test")])"#;
+        assert!(matches!(
+            Derivation::parse(aterm),
+            Err(DerivationError::NoOutputs)
         ));
     }
 

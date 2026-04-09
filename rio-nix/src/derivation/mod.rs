@@ -35,6 +35,9 @@ pub enum DerivationError {
     #[error("empty output name at index {0}")]
     EmptyOutputName(usize),
 
+    #[error("derivation must have at least one output")]
+    NoOutputs,
+
     #[error("collection too large: {0} items (max {MAX_ATERM_LIST_ITEMS})")]
     CollectionTooLarge(usize),
 
@@ -222,7 +225,8 @@ pub struct Derivation {
 impl Derivation {
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
     ///
-    /// Cannot fail since a valid `Derivation` always has at least one output.
+    /// Infallible: [`Derivation::parse`] rejects zero-output derivations
+    /// (`DerivationError::NoOutputs`), so the inner `expect` is unreachable.
     pub fn to_basic(&self) -> BasicDerivation {
         BasicDerivation::new(
             self.outputs.clone(),
