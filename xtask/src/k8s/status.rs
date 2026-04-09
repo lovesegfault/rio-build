@@ -5,12 +5,13 @@
 //! error. The command should be useful precisely when things are
 //! broken.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use console::style;
-use k8s_openapi::api::core::v1::{Event, Node, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret};
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use rio_crds::builderpool::BuilderPool;
@@ -21,8 +22,15 @@ use tracing::{debug, info};
 use crate::k8s::client as k;
 use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::{Provider, ProviderKind};
-use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
+use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
 use crate::{helm, ui};
+
+/// Scheduler metrics container port (scheduler.yaml `name: metrics`).
+/// The Service spec only exposes 9001 (gRPC) — must target the pod.
+const SCHED_METRICS_PORT: u16 = 9091;
+const STORE_METRICS_PORT: u16 = 9092;
+/// Per-scrape timeout. Anything slower means bigger problems.
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Age threshold for "stuck" — 2 minutes. Below this, a pod/NodeClaim
 /// is still plausibly starting; above, it's worth flagging.
@@ -146,6 +154,7 @@ pub async fn run(
     cfg: &crate::config::XtaskConfig,
     json: bool,
     reap_stuck_nodes: bool,
+    metrics: bool,
 ) -> Result<()> {
     // `-p k3s` means "show me k3s" — if kubeconfig points elsewhere,
     // switch it. Only error if the switch itself fails (e.g. k3s
@@ -185,6 +194,10 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         ui::suspend(|| render_human(&report));
+    }
+    if metrics {
+        eprintln!();
+        print_metrics_detail(&client).await;
     }
     Ok(())
 }
@@ -400,48 +413,265 @@ async fn gather_stuck_nodeclaims(client: &k::Client) -> Vec<StuckNodeClaim> {
 }
 
 /// Port-forward to the scheduler leader's :9091, GET /metrics once,
-/// parse three gauges. Reuses the minimal HTTP/1.0-over-portforward
-/// approach from smoke.rs::sched_metric — one scrape, three parses.
+/// parse the three I-025 freeze-signal gauges.
 async fn gather_scheduler_metrics(client: &k::Client) -> Option<SchedulerMetrics> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let leader = k::scheduler_leader(client, NS)
         .await
         .inspect_err(|e| debug!("scheduler leader: {e:#}"))
         .ok()?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
-    let mut pf = pods
-        .portforward(&leader, &[9091])
-        .await
-        .inspect_err(|e| debug!("portforward: {e:#}"))
-        .ok()?;
-    let mut stream = pf.take_stream(9091)?;
-    stream
-        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        .await
-        .ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).await.ok()?;
-
-    let parse = |name: &str| -> f64 {
-        for line in body.lines() {
-            if let Some(rest) = line.strip_prefix(name)
-                && let Some(v) = rest.split_whitespace().last()
-            {
-                return v.parse().unwrap_or(0.0);
-            }
-        }
-        0.0
-    };
-    let fod_queue_depth = parse("rio_scheduler_fod_queue_depth");
-    let fetcher_utilization = parse("rio_scheduler_fetcher_utilization");
-    let derivations_queued = parse("rio_scheduler_derivations_queued");
+    let s = Scrape::parse(
+        &scrape_pod(client, NS, &leader, SCHED_METRICS_PORT)
+            .await
+            .inspect_err(|e| debug!("scrape: {e:#}"))
+            .ok()?,
+    );
+    let fod_queue_depth = s.first("rio_scheduler_fod_queue_depth").unwrap_or(0.0);
+    let fetcher_utilization = s.first("rio_scheduler_fetcher_utilization").unwrap_or(0.0);
     Some(SchedulerMetrics {
         fod_queue_depth,
         fetcher_utilization,
-        derivations_queued,
+        derivations_queued: s.first("rio_scheduler_derivations_queued").unwrap_or(0.0),
         possible_freeze: fod_queue_depth > 0.0 && fetcher_utilization == 0.0,
     })
+}
+
+// -- prometheus scrape (shared by gather + --metrics) -------------------
+
+/// In-process port-forward + minimal HTTP/1.0 GET /metrics. kube's
+/// portforward hands back a duplex stream; pulling hyper for one
+/// request is heavier than 10 lines.
+async fn scrape_pod(client: &k::Client, ns: &str, pod: &str, port: u16) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let fut = async {
+        let mut pf = pods.portforward(pod, &[port]).await?;
+        let mut stream = pf.take_stream(port).context("no portforward stream")?;
+        stream
+            .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await?;
+        let mut body = String::new();
+        stream.read_to_string(&mut body).await?;
+        anyhow::Ok(body)
+    };
+    tokio::time::timeout(SCRAPE_TIMEOUT, fut)
+        .await
+        .context("scrape timed out")?
+}
+
+/// Parsed prometheus text exposition. Keyed by metric name → list of
+/// `(label-set, value)`. Label set is the raw `{…}` string (empty for
+/// unlabelled scalars) — good enough for display and for matching
+/// `_sum` against `_count` of the same series.
+struct Scrape {
+    by_name: BTreeMap<String, Vec<(String, f64)>>,
+}
+
+impl Scrape {
+    fn parse(body: &str) -> Self {
+        let mut by_name: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // `name{labels} value` or `name value`. Split on the LAST
+            // whitespace — robust to a HTTP status line sneaking
+            // through (body includes the response headers; harmlessly
+            // parsed-and-ignored).
+            let Some((head, val)) = line.rsplit_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(val) = val.parse::<f64>() else {
+                continue;
+            };
+            let (name, labels) = match head.find('{') {
+                Some(i) => (&head[..i], head[i..].to_string()),
+                None => (head, String::new()),
+            };
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .push((labels, val));
+        }
+        Self { by_name }
+    }
+
+    fn series(&self, name: &str) -> &[(String, f64)] {
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn first(&self, name: &str) -> Option<f64> {
+        self.series(name).first().map(|(_, v)| *v)
+    }
+}
+
+/// `--metrics` section: the gauges that answer "is the actor wedged?"
+/// (mailbox depth, queued/running, workers, mean actor-cmd latency)
+/// for the scheduler leader, plus a per-replica store summary.
+/// Best-effort like every other status section.
+#[allow(clippy::print_stderr)]
+async fn print_metrics_detail(client: &k::Client) {
+    const SCHED_GAUGES: &[(&str, &str)] = &[
+        ("rio_scheduler_actor_mailbox_depth", "mailbox_depth"),
+        ("rio_scheduler_derivations_queued", "derivations_queued"),
+        ("rio_scheduler_derivations_running", "derivations_running"),
+        ("rio_scheduler_workers_active", "workers_active"),
+        ("rio_scheduler_builds_active", "builds_active"),
+        ("rio_scheduler_fod_queue_depth", "fod_queue_depth"),
+        ("rio_scheduler_class_queue_depth", "class_queue_depth"),
+    ];
+    const STORE_GAUGES: &[(&str, &str)] = &[
+        ("rio_store_pg_pool_utilization", "pg_pool_util"),
+        ("rio_store_s3_deletes_pending", "s3_del_pending"),
+        ("rio_store_chunk_dedup_ratio", "dedup_ratio"),
+    ];
+    let fmt_val = |v: f64| {
+        if v.fract() == 0.0 && v.abs() < 1e15 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.3}")
+        }
+    };
+
+    header("Scheduler metrics");
+    match async {
+        let leader = k::scheduler_leader(client, NS).await?;
+        scrape_pod(client, NS, &leader, SCHED_METRICS_PORT).await
+    }
+    .await
+    {
+        Ok(body) => {
+            let s = Scrape::parse(&body);
+            for &(metric, label) in SCHED_GAUGES {
+                match s.series(metric) {
+                    [] => eprintln!("  {label:<24} {}", style("-").dim()),
+                    [(l, v)] if l.is_empty() => {
+                        eprintln!("  {label:<24} {}", style(fmt_val(*v)).cyan())
+                    }
+                    many => {
+                        let parts: Vec<String> = many
+                            .iter()
+                            .map(|(l, v)| format!("{l}={}", fmt_val(*v)))
+                            .collect();
+                        eprintln!("  {label:<24} {}", parts.join("  "));
+                    }
+                }
+            }
+            // actor_cmd_seconds is a histogram; sum/count per cmd is a
+            // cheap mean — good enough to spot the one cmd that's 100×
+            // the rest (the I-139 signature). For real p99, use Grafana.
+            let sums = s.series("rio_scheduler_actor_cmd_seconds_sum");
+            let counts: BTreeMap<_, _> = s
+                .series("rio_scheduler_actor_cmd_seconds_count")
+                .iter()
+                .cloned()
+                .collect();
+            let mut rows: Vec<_> = sums
+                .iter()
+                .filter_map(|(labels, sum)| {
+                    let cmd = labels
+                        .strip_prefix("{cmd=\"")?
+                        .strip_suffix("\"}")?
+                        .to_string();
+                    let count = *counts.get(labels)?;
+                    (count > 0.0).then(|| (cmd, sum / count, count))
+                })
+                .collect();
+            rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+            if !rows.is_empty() {
+                eprintln!(
+                    "  {:<24} {}",
+                    "actor_cmd_mean",
+                    style("(sum/count by cmd, slowest first)").dim()
+                );
+                for (cmd, mean, count) in rows.iter().take(8) {
+                    eprintln!(
+                        "    {cmd:<22} {:>10}  {}",
+                        style(format!("{mean:.3}s")).cyan(),
+                        style(format!("n={count:.0}")).dim()
+                    );
+                }
+            }
+        }
+        Err(e) => eprintln!("  {} scrape failed: {e:#}", style("✗").red()),
+    }
+
+    eprintln!();
+    header("Store metrics");
+    let api: Api<Pod> = Api::namespaced(client.clone(), NS_STORE);
+    let store_pods: Vec<String> = api
+        .list(&ListParams::default().labels("app.kubernetes.io/name=rio-store"))
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+        .filter_map(|p| p.metadata.name)
+        .collect();
+    if store_pods.is_empty() {
+        eprintln!("  {} no rio-store pods", style("·").dim());
+    }
+    for pod in &store_pods {
+        match scrape_pod(client, NS_STORE, pod, STORE_METRICS_PORT).await {
+            Ok(body) => {
+                let s = Scrape::parse(&body);
+                let line: Vec<String> = STORE_GAUGES
+                    .iter()
+                    .map(|&(metric, label)| {
+                        let v = s.first(metric).map(&fmt_val).unwrap_or_else(|| "-".into());
+                        format!("{label}={v}")
+                    })
+                    .collect();
+                eprintln!("  {} {pod:<28} {}", style("·").dim(), line.join("  "));
+            }
+            Err(e) => eprintln!("  {} {pod:<28} scrape failed: {e:#}", style("✗").red()),
+        }
+    }
+}
+
+/// `xtask k8s grafana` — port-forward to Grafana (kube-prometheus-
+/// stack), print URL + credentials, hold until Ctrl-C.
+#[allow(clippy::print_stderr)]
+pub async fn grafana(port: u16) -> Result<()> {
+    const NS_MON: &str = "monitoring";
+    const SVC: &str = "kube-prometheus-stack-grafana";
+
+    let client = k::client().await?;
+    let secrets: Api<Secret> = Api::namespaced(client, NS_MON);
+    let secret = secrets.get(SVC).await.with_context(|| {
+        format!(
+            "Secret {NS_MON}/{SVC} not found — has \
+             `tofu apply -target=helm_release.kube_prometheus_stack` run?"
+        )
+    })?;
+    let pw = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get("admin-password"))
+        .and_then(|b| String::from_utf8(b.0.clone()).ok())
+        .or_else(|| {
+            secret
+                .string_data
+                .as_ref()
+                .and_then(|d| d.get("admin-password").cloned())
+        })
+        .context("admin-password key missing in Grafana secret")?;
+
+    crate::k8s::shared::kill_port_listeners(port);
+    let (bound, _guard) =
+        crate::k8s::shared::port_forward(NS_MON, &format!("svc/{SVC}"), port, 80).await?;
+
+    eprintln!();
+    eprintln!(
+        "  {} http://localhost:{bound}",
+        style("Grafana:").bold().green()
+    );
+    eprintln!("  {}   admin / {pw}", style("login:").bold());
+    eprintln!("  (port-forward held; Ctrl-C to stop)");
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 /// Events with reason=FailedCreatePodSandBox across all rio
@@ -889,6 +1119,22 @@ fn render_human(r: &Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrape_parse() {
+        let s = Scrape::parse(
+            "HTTP/1.0 200 OK\n\
+             # HELP rio_scheduler_derivations_queued queued\n\
+             rio_scheduler_derivations_queued 42\n\
+             rio_scheduler_workers_active{pool=\"x86-64-tiny\"} 3\n\
+             rio_scheduler_workers_active{pool=\"x86-64-small\"} 1\n",
+        );
+        assert_eq!(s.first("rio_scheduler_derivations_queued"), Some(42.0));
+        assert_eq!(s.first("rio_scheduler_absent"), None);
+        assert_eq!(s.series("rio_scheduler_workers_active").len(), 2);
+        // HTTP status line + # HELP harmlessly skipped (rsplit "OK" not f64).
+        assert!(!s.by_name.contains_key("HTTP/1.0"));
+    }
 
     #[test]
     fn cidr_contains_basics() {

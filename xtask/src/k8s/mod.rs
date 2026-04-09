@@ -14,7 +14,6 @@ mod chaos;
 pub mod client;
 mod eks;
 mod k3s;
-mod metrics;
 mod phases;
 pub mod provider;
 pub mod shared;
@@ -233,16 +232,12 @@ pub enum K8sCmd {
         /// Karpenter reprovisions healthy replacements.
         #[arg(long)]
         reap_stuck_nodes: bool,
-    },
-    /// One-shot Prometheus scrape of scheduler-leader + store
-    /// replicas. Prints the gauges that answer "is the actor
-    /// wedged?" — mailbox depth, queued/running, workers, mean
-    /// actor-cmd latency. <5s; no Prometheus install required.
-    #[command(visible_alias = "m")]
-    Metrics {
-        /// List what would be scraped instead of scraping.
-        #[arg(long)]
-        dry_run: bool,
+        /// Append a one-shot Prometheus scrape of scheduler-leader +
+        /// store replicas: mailbox depth, queued/running, workers,
+        /// mean actor-cmd latency. The "is the actor wedged?" gauges.
+        /// <5s; no Prometheus install required.
+        #[arg(long, short = 'm')]
+        metrics: bool,
     },
     /// Port-forward to Grafana (kube-prometheus-stack), print
     /// URL + credentials, hold until Ctrl-C. The 6 rio-* dashboards
@@ -364,9 +359,9 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         K8sCmd::Status {
             json,
             reap_stuck_nodes,
-        } => status::run(&*p, kind, cfg, json, reap_stuck_nodes).await,
-        K8sCmd::Metrics { dry_run } => metrics::run(dry_run).await,
-        K8sCmd::Grafana { port } => metrics::grafana(port).await,
+            metrics,
+        } => status::run(&*p, kind, cfg, json, reap_stuck_nodes, metrics).await,
+        K8sCmd::Grafana { port } => status::grafana(port).await,
         K8sCmd::Destroy { yes } => {
             let what = match kind {
                 ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
