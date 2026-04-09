@@ -37,14 +37,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap { inherit fixture; }}
 
-    # ── cilium-envoy DaemonSet rollout ──────────────────────────────────
-    # gatewayAPI.enabled=true → cilium-envoy DS deploys alongside
-    # cilium-agent. Must be Ready before any Gateway reconciles.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n kube-system rollout status ds/cilium-envoy "
-        "--timeout=120s",
-        timeout=150,
-    )
+    # ── (no cilium-envoy DS — embedded mode, see cilium-render.nix) ─────
 
     # ── Gateway Programmed ──────────────────────────────────────────────
     # cilium-operator reconciles GatewayClass → Gateway → per-Gateway
@@ -87,6 +80,24 @@ pkgs.testers.runNixOSTest {
             "-o name | grep -q .",
             timeout=60,
         )
+
+    # ── EDS endpoint diagnostic (embedded envoy admin) ──────────────────
+    # Dump cluster/endpoint state from cilium-agent's embedded envoy
+    # admin interface. The separate-DaemonSet mode timed out on
+    # ClusterLoadAssignment fetch — this proves embedded mode pushes
+    # endpoints (or shows the same gap if the EDS issue is elsewhere).
+    print("── DIAGNOSTIC: embedded envoy admin clusters ──")
+    print(k3s_server.succeed(
+        "k3s kubectl -n kube-system exec ds/cilium -- "
+        "cilium-dbg envoy admin clusters 2>&1 "
+        "| grep -E 'rio-scheduler|rio-system' || echo NO-SCHEDULER-CLUSTER"
+    ))
+    print(k3s_server.succeed(
+        "k3s kubectl -n kube-system exec ds/cilium -- "
+        "cilium-dbg envoy admin config_dump 2>&1 "
+        "| grep -A3 -E 'cluster_name.*rio-scheduler|endpoint.*9001' "
+        "| head -30 || true"
+    ))
 
     # ── D3: gRPC-Web direct to scheduler (no Gateway) ───────────────────
     # Proves the scheduler serves gRPC-Web NATIVELY (tonic-web layer),

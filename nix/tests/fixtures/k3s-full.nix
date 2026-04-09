@@ -216,11 +216,7 @@ let
     dockerImages.vmTestSeed
     pulled.bitnami-postgresql
   ]
-  ++ pkgs.lib.optionals gatewayEnabled [
-    # Cilium L7 proxy DaemonSet (envoy.enabled=true in cilium-render.nix
-    # when gatewayEnabled). ~400MB compressed.
-    pulled.cilium-envoy
-  ]
+  # (cilium-envoy preload removed — embedded mode, see cilium-render.nix)
   # nginx + SPA bundle (rio-dashboard:dev). dashboard.enabled=true
   # (set when gatewayEnabled) renders the nginx Deployment;
   # without this preload the pod goes ImagePullBackOff. The `?`

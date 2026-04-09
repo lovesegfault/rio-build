@@ -47,10 +47,13 @@
 # provisioner: `dial tcp 10.43.0.1:443: i/o timeout` → CrashLoopBackOff
 # → PVC never binds → PG never Ready).
 #
-# gatewayEnabled flips on Cilium's Gateway API + the standalone
-# cilium-envoy DaemonSet (L7 proxy for the per-Gateway envoy). Adds
-# ~400M of preload (cilium-envoy image) so only enabled for dashboard
-# scenarios; L4-only tests (the default) keep envoy.enabled=false.
+# gatewayEnabled flips on Cilium's Gateway API. envoy.enabled is
+# pinned FALSE (embedded mode — envoy runs inside cilium-agent, xDS is
+# in-process) because the standalone cilium-envoy DaemonSet's EDS fetch
+# times out in this fixture: cilium-agent never pushes
+# ClusterLoadAssignment to the separate DS (`gRPC config: initial fetch
+# timed out for ...endpoint.v3.ClusterLoadAssignment`). Embedded mode
+# bypasses the agent→envoy network xDS hop entirely.
 {
   pkgs,
   nixhelm,
@@ -119,8 +122,7 @@ pkgs.runCommand "cilium-rendered"
       --set operator.replicas=1 \
       --set encryption.enabled=true \
       --set encryption.type=wireguard \
-      --set envoy.enabled=${if gatewayEnabled then "true" else "false"} \
-      --set envoy.image.useDigest=false \
+      --set envoy.enabled=false \
       --set gatewayAPI.enabled=${if gatewayEnabled then "true" else "false"} \
       ${pkgs.lib.optionalString gatewayEnabled ''
         --api-versions gateway.networking.k8s.io/v1 \

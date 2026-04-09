@@ -46,16 +46,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap { inherit fixture; }}
 
-    # ── cilium-envoy DaemonSet rollout ────────────────────────────────
-    # Same gate as dashboard-gateway.nix — nginx proxies to the Cilium
-    # per-Gateway Service, so cilium-envoy must be Ready before the
-    # curls hit /rio.*. SPA curls (1+2) don't need this; placed here so
-    # the gateway reconcile has time to settle while we test SPA.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n kube-system rollout status ds/cilium-envoy "
-        "--timeout=120s",
-        timeout=150,
-    )
+    # ── (no cilium-envoy DS — embedded mode, see cilium-render.nix) ───
 
     # ── nginx Deployment Available ────────────────────────────────────
     # dashboard.yaml renders when dashboard.enabled=true (set by the
