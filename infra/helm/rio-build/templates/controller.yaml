@@ -44,7 +44,7 @@ spec:
               containerPort: 9194
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.covEnv" . | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "tls")) | nindent 12 }}
             - name: RIO_SCHEDULER__ADDR
               value: {{ $c.schedulerAddr | quote }}
             - name: RIO_STORE__ADDR
@@ -66,15 +66,11 @@ spec:
             - name: RIO_STORE__BALANCE_PORT
               value: {{ $c.storeBalancePort | quote }}
             {{- end }}
-            {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if or .Values.tls.enabled .Values.coverage.enabled }}
           volumeMounts:
-            {{- include "rio.tlsVolumeMount" . | nindent 12 }}
-            {{- include "rio.covVolumeMount" . | nindent 12 }}
-          {{- end }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "tls" "cov")) | nindent 12 }}
           # /healthz serves 200 once kube client + scheduler admin client
           # connected. Controller that can't watch CRDs is useless → NotReady
           # is correct. Already plaintext HTTP — no TLS retarget needed.
@@ -87,9 +83,6 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml $c.resources | nindent 12 }}
-      {{- if or .Values.tls.enabled .Values.coverage.enabled }}
       volumes:
-        {{- include "rio.tlsVolume" (dict "root" . "name" "rio-controller-tls") | nindent 8 }}
-        {{- include "rio.covVolume" . | nindent 8 }}
-      {{- end }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov") "tlsSecret" "rio-controller-tls") | nindent 8 }}
 {{- end }}

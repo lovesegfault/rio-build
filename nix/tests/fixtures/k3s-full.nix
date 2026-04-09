@@ -134,7 +134,7 @@ let
     })
     // (pkgs.lib.optionalAttrs coverage {
       # PSA restricted (ADR-019 default for control-plane) blocks the
-      # hostPath "cov" volume (_helpers.tpl rio.covVolume) that
+      # hostPath "cov" volume (_helpers.tpl rio.mounts cov family) that
       # collects LLVM profraws to the node filesystem. Coverage is a
       # test-only mode; bumping to privileged here keeps production
       # values.yaml at restricted (r[sec.psa.control-plane-restricted]).

@@ -38,110 +38,96 @@ helm.sh/chart: {{ .root.Chart.Name }}-{{ .root.Chart.Version }}
 {{- end -}}
 
 {{/*
-TLS mount block — volume + volumeMount + RIO_TLS__* env. Same for every
-component; only the secret name varies. Self-guarded on
-.Values.tls.enabled (renders nothing when disabled, so callers include
-unconditionally with `| nindent N`) — same pattern as rio.jwt* and
-rio.cov* below.
+Guarded mount families — one parameterized template for the four
+env+mount+volume triples that every control-plane pod conditionally
+carries (tls / jwtVerify / jwtSign / cov). Replaces the previous 12
+near-identical `rio.{tls,jwtVerify,jwtSign,cov}{Env,VolumeMount,Volume}`
+defines: same self-guard pattern (renders nothing when the family's
+.Values.*.enabled flag is false), same output, single edit point.
 
-rio.tlsVolume takes (dict "root" . "name" "rio-<component>-tls") because
-it needs BOTH the root context (for .Values.tls.enabled) AND the
-per-component secret name.
+Usage:
+  {{- include "rio.mounts" (dict "root" . "form" "env"    "want" (list "cov" "jwtSign")) | nindent 12 }}
+  {{- include "rio.mounts" (dict "root" . "form" "mount"  "want" (list "tls" "cov" "jwtVerify")) | nindent 12 }}
+  {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov") "tlsSecret" "rio-gateway-tls") | nindent 8 }}
+
+`want` is the ordered list of families to emit; each entry self-guards
+on its `.on` flag so callers include unconditionally and drop the
+hand-rolled `{{ if or .Values.tls.enabled .Values.coverage.enabled ... }}`
+wrapper around `volumes:` / `volumeMounts:` (a null list-key is valid
+PodSpec — k8s treats it as empty).
+
+Families:
+  tls        .Values.tls.enabled. Per-component secret (cert-manager
+             Certificate per pod CN) — caller passes `tlsSecret`.
+  jwtVerify  .Values.jwt.enabled. SCHEDULER + STORE. ConfigMap
+             rio-jwt-pubkey (PUBLIC ed25519 verifying key). Without
+             the mount, cfg.jwt.key_path stays None → interceptor is
+             inert → silent fail-open. See r[sec.jwt.pubkey-mount].
+  jwtSign    .Values.jwt.enabled. GATEWAY ONLY. Secret rio-jwt-signing
+             (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
+             jwtVerify — JwtConfig is a shared type; gateway loads it
+             as SigningKey seed, scheduler/store as VerifyingKey.
+  cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
+             LLVM profraw atexit flush. POD_NAME in the filename: pods
+             share the hostPath and all run PID 1, so %p alone does NOT
+             disambiguate a replacement pod on the same node (leader-
+             election failover, rollout) — its PID-1 profraw would
+             OVERWRITE the predecessor's. Kubelet's dependent-env-var
+             expansion substitutes $(POD_NAME) at container start. %p
+             still covers in-container CrashLoop restarts, %m covers
+             same-PID-different-binary.
 */}}
-{{- define "rio.tlsEnv" -}}
-{{- if .Values.tls.enabled }}
-- name: RIO_TLS__CERT_PATH
-  value: /etc/rio/tls/tls.crt
-- name: RIO_TLS__KEY_PATH
-  value: /etc/rio/tls/tls.key
-- name: RIO_TLS__CA_PATH
-  value: /etc/rio/tls/ca.crt
+{{- define "rio.mounts" -}}
+{{- $root := .root -}}
+{{- $form := .form -}}
+{{- $tlsSecret := .tlsSecret | default "" -}}
+{{- $fams := dict
+      "tls" (dict
+        "on"   $root.Values.tls.enabled
+        "vol"  "tls" "path" "/etc/rio/tls" "ro" true
+        "src"  (dict "secret" (dict "secretName" $tlsSecret))
+        "env"  (list
+          (dict "name" "RIO_TLS__CERT_PATH" "value" "/etc/rio/tls/tls.crt")
+          (dict "name" "RIO_TLS__KEY_PATH"  "value" "/etc/rio/tls/tls.key")
+          (dict "name" "RIO_TLS__CA_PATH"   "value" "/etc/rio/tls/ca.crt")))
+      "jwtVerify" (dict
+        "on"   $root.Values.jwt.enabled
+        "vol"  "jwt-pubkey" "path" "/etc/rio/jwt" "ro" true
+        "src"  (dict "configMap" (dict "name" "rio-jwt-pubkey"))
+        "env"  (list
+          (dict "name" "RIO_JWT__KEY_PATH" "value" "/etc/rio/jwt/ed25519_pubkey")))
+      "jwtSign" (dict
+        "on"   $root.Values.jwt.enabled
+        "vol"  "jwt-signing" "path" "/etc/rio/jwt" "ro" true
+        "src"  (dict "secret" (dict "secretName" "rio-jwt-signing"))
+        "env"  (list
+          (dict "name" "RIO_JWT__KEY_PATH" "value" "/etc/rio/jwt/ed25519_seed")))
+      "cov" (dict
+        "on"   $root.Values.coverage.enabled
+        "vol"  "cov" "path" "/var/lib/rio/cov" "ro" false
+        "src"  (dict "hostPath" (dict "path" "/var/lib/rio/cov" "type" "DirectoryOrCreate"))
+        "env"  (list
+          (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
+          (dict "name" "LLVM_PROFILE_FILE" "value" "/var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw")))
+-}}
+{{- range .want }}
+{{- $f := get $fams . }}
+{{- if $f.on }}
+{{- if eq $form "env" }}
+{{- range $f.env }}
+- {{ toYaml . | nindent 2 | trim }}
 {{- end }}
-{{- end -}}
-
-{{- define "rio.tlsVolumeMount" -}}
-{{- if .Values.tls.enabled }}
-- name: tls
-  mountPath: /etc/rio/tls
+{{- else if eq $form "mount" }}
+- name: {{ $f.vol }}
+  mountPath: {{ $f.path }}
+{{- if $f.ro }}
   readOnly: true
 {{- end }}
-{{- end -}}
-
-{{- define "rio.tlsVolume" -}}
-{{- if .root.Values.tls.enabled }}
-- name: tls
-  secret:
-    secretName: {{ .name }}
+{{- else if eq $form "volume" }}
+- name: {{ $f.vol }}
+{{ toYaml $f.src | indent 2 }}
 {{- end }}
-{{- end -}}
-
-{{/*
-JWT pubkey mount — SCHEDULER + STORE. Self-guarded on .Values.jwt.enabled
-(renders nothing when disabled, so callers include unconditionally with
-`| nindent 12`). ConfigMap is PUBLIC (ed25519 verifying key) — mounted
-read-only, no Secret perms needed. key_path matches what the main.rs
-wiring reads (rio-common JwtConfig.key_path → RIO_JWT__KEY_PATH env).
-
-File-key-mapping: ConfigMap data key `ed25519_pubkey` → file
-`/etc/rio/jwt/ed25519_pubkey`. scheduler/main.rs doc-comment already
-references this path — this mount makes it real.
-
-Without the mount, cfg.jwt.key_path stays None and the interceptor
-falls through to inert mode (every RPC passes, no Claims attached) —
-a silent fail-open when the operator thought jwt.enabled=true meant
-enforcement. See r[sec.jwt.pubkey-mount].
-*/}}
-{{- define "rio.jwtVerifyEnv" -}}
-{{- if .Values.jwt.enabled }}
-- name: RIO_JWT__KEY_PATH
-  value: /etc/rio/jwt/ed25519_pubkey
 {{- end }}
-{{- end -}}
-
-{{- define "rio.jwtVerifyVolumeMount" -}}
-{{- if .Values.jwt.enabled }}
-- name: jwt-pubkey
-  mountPath: /etc/rio/jwt
-  readOnly: true
-{{- end }}
-{{- end -}}
-
-{{- define "rio.jwtVerifyVolume" -}}
-{{- if .Values.jwt.enabled }}
-- name: jwt-pubkey
-  configMap:
-    name: rio-jwt-pubkey
-{{- end }}
-{{- end -}}
-
-{{/*
-JWT signing seed mount — GATEWAY ONLY. Secret (private ed25519 seed).
-Same self-guard pattern; gateway main.rs reads RIO_JWT__KEY_PATH for
-the SIGNING seed path (JwtConfig is shared type, both sides use
-key_path — gateway loads it as a SigningKey seed, scheduler/store
-load it as a VerifyingKey). Gateway decodes the Secret's base64 layer
-→ 32 raw bytes → SigningKey::from_bytes.
-*/}}
-{{- define "rio.jwtSignEnv" -}}
-{{- if .Values.jwt.enabled }}
-- name: RIO_JWT__KEY_PATH
-  value: /etc/rio/jwt/ed25519_seed
-{{- end }}
-{{- end -}}
-
-{{- define "rio.jwtSignVolumeMount" -}}
-{{- if .Values.jwt.enabled }}
-- name: jwt-signing
-  mountPath: /etc/rio/jwt
-  readOnly: true
-{{- end }}
-{{- end -}}
-
-{{- define "rio.jwtSignVolume" -}}
-{{- if .Values.jwt.enabled }}
-- name: jwt-signing
-  secret:
-    secretName: rio-jwt-signing
 {{- end }}
 {{- end -}}
 
@@ -153,54 +139,6 @@ RUST_LOG env var. Self-guarded — empty global.logLevel renders nothing
 {{- with .Values.global.logLevel }}
 - name: RUST_LOG
   value: {{ . | quote }}
-{{- end }}
-{{- end -}}
-
-{{/*
-Coverage profraw collection. Self-guarded on .Values.coverage.enabled
-— renders nothing when disabled. Include unconditionally in each pod
-template alongside rustLogEnv/tlsVolumeMount.
-
-LLVM writes profraws via an atexit handler. Graceful shutdown
-(SIGTERM → main returns) flushes them. hostPath lands the files
-on the NODE filesystem so collectCoverage can tar them after pod
-deletion.
-
-POD_NAME in the filename: all pods on a node share the hostPath.
-In containers, the main process is PID 1 — %p alone does NOT
-disambiguate two pods of the same binary on the same node. When
-a Deployment replaces a killed pod (leader-election failover,
-controller restart, gateway rollout), the replacement lands on
-the SAME node and its PID-1 profraw OVERWRITES the predecessor's.
-Kubelet's dependent-env-var expansion substitutes $(POD_NAME)
-with metadata.name at container start, before LLVM sees the
-string. %p still covers in-container restarts (CrashLoop within
-the same pod), %m covers same-PID-different-binary.
-*/}}
-{{- define "rio.covEnv" -}}
-{{- if .Values.coverage.enabled }}
-- name: POD_NAME
-  valueFrom:
-    fieldRef:
-      fieldPath: metadata.name
-- name: LLVM_PROFILE_FILE
-  value: /var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw
-{{- end }}
-{{- end -}}
-
-{{- define "rio.covVolumeMount" -}}
-{{- if .Values.coverage.enabled }}
-- name: cov
-  mountPath: /var/lib/rio/cov
-{{- end }}
-{{- end -}}
-
-{{- define "rio.covVolume" -}}
-{{- if .Values.coverage.enabled }}
-- name: cov
-  hostPath:
-    path: /var/lib/rio/cov
-    type: DirectoryOrCreate
 {{- end }}
 {{- end -}}
 

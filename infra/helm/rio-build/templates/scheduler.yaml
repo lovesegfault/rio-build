@@ -81,8 +81,7 @@ spec:
               containerPort: 9101
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.covEnv" . | nindent 12 }}
-            {{- include "rio.jwtVerifyEnv" . | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "tls")) | nindent 12 }}
             # All replicas contend for SAME Lease. Presence ENABLES lease mode
             # (LeaseConfig::from_env returns None without it → always-leader,
             # WRONG with replicas>1).
@@ -115,12 +114,8 @@ spec:
             {{- end }}
             - name: RIO_SUBSTITUTE_MAX_CONCURRENT
               value: {{ $s.substituteMaxConcurrent | quote }}
-            {{- include "rio.tlsEnv" . | nindent 12 }}
-          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $hasClasses }}
           volumeMounts:
-            {{- include "rio.tlsVolumeMount" . | nindent 12 }}
-            {{- include "rio.covVolumeMount" . | nindent 12 }}
-            {{- include "rio.jwtVerifyVolumeMount" . | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "tls" "cov" "jwtVerify")) | nindent 12 }}
             {{- if $hasClasses }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries [[size_classes]] entries; everything else
@@ -135,7 +130,6 @@ spec:
               subPath: scheduler.toml
               readOnly: true
             {{- end }}
-          {{- end }}
           # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
           # — that's the whole design point. Both pods Ready; clients route
           # via health-aware balancer which DOES check is_leader (via
@@ -164,17 +158,13 @@ spec:
             failureThreshold: 12
           resources:
             {{- toYaml $s.resources | nindent 12 }}
-      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $hasClasses }}
       volumes:
-        {{- include "rio.tlsVolume" (dict "root" . "name" "rio-scheduler-tls") | nindent 8 }}
-        {{- include "rio.covVolume" . | nindent 8 }}
-        {{- include "rio.jwtVerifyVolume" . | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov" "jwtVerify") "tlsSecret" "rio-scheduler-tls") | nindent 8 }}
         {{- if $hasClasses }}
         - name: config
           configMap:
             name: rio-scheduler-config
         {{- end }}
-      {{- end }}
 ---
 # Kept for per-call connects (controller reconcilers, rio-cli, tests). Those
 # get UNAVAILABLE ~50% of the time and retry — fine for non-hot-path.
