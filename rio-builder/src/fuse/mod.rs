@@ -13,9 +13,9 @@
 //! - Multi-threaded dispatch (`n_threads > 1`) to mitigate lookup/open bottleneck
 //! - Async backing: `tokio::runtime::Handle::block_on` bridges sync FUSE callbacks
 
+mod attr;
 pub mod cache;
 pub mod circuit;
-mod lookup;
 mod read;
 
 pub(crate) mod fetch;
@@ -195,10 +195,7 @@ impl NixStoreFs {
     /// lookup path. readdir should use get_or_ephemeral_inode (no persistent
     /// allocation; the kernel does not forget readdir-returned inodes).
     fn get_or_create_inode_for_lookup(&self, path: PathBuf) -> u64 {
-        let mut map = self.inodes_write();
-        let ino = map.get_or_create(path);
-        map.increment_lookup(ino);
-        ino
+        self.inodes_write().get_or_create(path)
     }
 
     fn real_path(&self, ino: u64) -> Option<PathBuf> {

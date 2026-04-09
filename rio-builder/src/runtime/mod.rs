@@ -112,6 +112,31 @@ pub struct BuildSpawnContext {
     pub fuse_fetch_timeout: Duration,
 }
 
+impl BuildSpawnContext {
+    /// Project the per-worker config fields into an [`executor::ExecutorEnv`].
+    ///
+    /// `BuildSpawnContext` is the runtime-layer bundle (Arc-shared
+    /// stream/slot handles + config); `ExecutorEnv` is the executor-layer
+    /// view (config + per-build cancel flag, no stream/slot). Keeping the
+    /// field copy in one place means a new config field only needs wiring
+    /// here, not at every `execute_build` call site.
+    pub fn executor_env(&self, cancelled: Arc<AtomicBool>) -> executor::ExecutorEnv {
+        executor::ExecutorEnv {
+            fuse_mount_point: self.fuse_mount_point.clone(),
+            overlay_base_dir: self.overlay_base_dir.clone(),
+            executor_id: self.executor_id.clone(),
+            log_limits: self.log_limits,
+            daemon_timeout: self.daemon_timeout,
+            max_silent_time: self.max_silent_time,
+            cgroup_parent: self.cgroup_parent.clone(),
+            executor_kind: self.executor_kind,
+            fuse_cache: Some(Arc::clone(&self.fuse_cache)),
+            fuse_fetch_timeout: self.fuse_fetch_timeout,
+            cancelled,
+        }
+    }
+}
+
 /// Proactive-ema resource tick interval. 10s matches HEARTBEAT_INTERVAL
 /// — frequent enough that a build trending toward OOM is noticed within
 /// one tick, coarse enough that the ExecutorMessage stream isn't flooded
@@ -241,24 +266,22 @@ pub async fn spawn_build_task(
         return; // Guard drops, no build spawned.
     }
 
-    // Record the cancel target on the slot. We know the cgroup path
-    // deterministically: cgroup_parent/sanitize_build_id(drv_path).
-    // execute_build creates this AFTER spawning the daemon (needs
-    // PID); we record PREDICTIVELY here so a Cancel arriving early
-    // still finds it. If Cancel arrives BEFORE the cgroup exists,
-    // cgroup.kill → ENOENT → try_cancel_build leaves the flag SET;
-    // execute_build polls it during prefetch+warm and aborts
-    // pre-daemon-spawn (I-166).
+    // Record the cgroup path on the slot. We know it deterministically:
+    // cgroup_parent/sanitize_build_id(drv_path). execute_build creates
+    // it AFTER spawning the daemon (needs PID); we record PREDICTIVELY
+    // here so a Cancel arriving early still finds it. If Cancel arrives
+    // BEFORE the cgroup exists, cgroup.kill → ENOENT → try_cancel_build
+    // leaves the flag SET; execute_build polls it during prefetch+warm
+    // and aborts pre-daemon-spawn (I-166).
     //
-    // The cancelled flag: set by try_cancel_build BEFORE killing.
-    // Read below in the Err arm to distinguish "cancelled" (user
-    // intent, Cancelled status) from "executor failed" (infra issue,
-    // InfrastructureFailure status).
+    // The cancelled flag itself was created at try_claim time (lives in
+    // the slot AND the guard); read below in the Err arm to distinguish
+    // "cancelled" (user intent, Cancelled status) from "executor failed"
+    // (infra issue, InfrastructureFailure status).
     let build_id = executor::sanitize_build_id(&drv_path);
     let build_cgroup_path = ctx.cgroup_parent.join(&build_id);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    ctx.slot
-        .set_cancel_target(build_cgroup_path.clone(), Arc::clone(&cancelled));
+    let cancelled = guard.cancelled();
+    ctx.slot.set_cgroup_path(build_cgroup_path.clone());
 
     // Clone for the panic handler before moving ctx into the task.
     let panic_tx = ctx.stream_tx.clone();
@@ -282,21 +305,9 @@ pub async fn spawn_build_task(
         let _slot_guard = guard;
 
         let mut store_client = ctx.store_clients.store.clone();
-        let build_env = executor::ExecutorEnv {
-            fuse_mount_point: ctx.fuse_mount_point,
-            overlay_base_dir: ctx.overlay_base_dir,
-            executor_id: ctx.executor_id,
-            log_limits: ctx.log_limits,
-            daemon_timeout: ctx.daemon_timeout,
-            max_silent_time: ctx.max_silent_time,
-            cgroup_parent: ctx.cgroup_parent,
-            executor_kind: ctx.executor_kind,
-            fuse_cache: Some(ctx.fuse_cache),
-            fuse_fetch_timeout: ctx.fuse_fetch_timeout,
-            // Same Arc as the slot's cancel target. execute_build polls
-            // it during the pre-cgroup phase (I-166).
-            cancelled: Arc::clone(&cancelled),
-        };
+        // Same Arc as the slot's cancel flag. execute_build polls it
+        // during the pre-cgroup phase (I-166).
+        let build_env = ctx.executor_env(Arc::clone(&cancelled));
 
         // Proactive-ema wrap: 10s memory.peak samples flow to the
         // scheduler while the build runs. execute_build is the polled
@@ -1501,11 +1512,11 @@ mod tests {
         // VM-tested in vm-phase3b).
         let tmpdir = tempfile::tempdir().unwrap();
         let cgroup_path = tmpdir.path().to_path_buf();
-        let cancelled = Arc::new(AtomicBool::new(false));
 
         let slot = Arc::new(BuildSlot::default());
-        let _g = slot.try_claim("/nix/store/test.drv").unwrap();
-        slot.set_cancel_target(cgroup_path.clone(), Arc::clone(&cancelled));
+        let g = slot.try_claim("/nix/store/test.drv").unwrap();
+        let cancelled = g.cancelled();
+        slot.set_cgroup_path(cgroup_path.clone());
 
         let found = try_cancel_build(&slot, "/nix/store/test.drv");
         assert!(found, "running drv in slot → true");
@@ -1530,10 +1541,33 @@ mod tests {
         );
 
         let _g = slot.try_claim("/nix/store/other.drv").unwrap();
-        slot.set_cancel_target(PathBuf::from("/nope"), Arc::new(AtomicBool::new(false)));
+        slot.set_cgroup_path(PathBuf::from("/nope"));
         assert!(
             !try_cancel_build(&slot, "/nix/store/absent.drv"),
             "drv mismatch → false (stale CancelSignal guard)"
+        );
+    }
+
+    /// Corr#3 regression: cancel arrives between `try_claim` and
+    /// `set_cgroup_path`. Previously the cancel target lived under a
+    /// separate mutex and was `None` here → `try_cancel_build` returned
+    /// `false` and the cancel was lost. Now the flag is created at claim
+    /// time, so the cancel lands.
+    #[test]
+    fn cancel_build_before_cgroup_path_recorded() {
+        let slot = Arc::new(BuildSlot::default());
+        let g = slot.try_claim("/nix/store/test.drv").unwrap();
+        let cancelled = g.cancelled();
+        // No set_cgroup_path call — spawn_build_task hasn't reached it yet.
+
+        let got = try_cancel_build(&slot, "/nix/store/test.drv");
+        assert!(
+            got,
+            "claimed slot → cancel must land even without cgroup path"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "flag set so execute_build's pre-cgroup poll aborts"
         );
     }
 
@@ -1553,7 +1587,6 @@ mod tests {
     // r[verify builder.cancel.pre-cgroup-deferred]
     #[test]
     fn cancel_build_cgroup_missing_keeps_flag() {
-        let cancelled = Arc::new(AtomicBool::new(false));
         // Path that definitely doesn't exist. tmpdir/nonexistent so
         // the test doesn't depend on /sys/fs/cgroup being mounted (CI
         // sandbox may not have cgroup v2).
@@ -1561,8 +1594,9 @@ mod tests {
         let fake_cgroup = tmp.path().join("not-created-yet");
 
         let slot = Arc::new(BuildSlot::default());
-        let _g = slot.try_claim("/nix/store/test.drv").unwrap();
-        slot.set_cancel_target(fake_cgroup, Arc::clone(&cancelled));
+        let g = slot.try_claim("/nix/store/test.drv").unwrap();
+        let cancelled = g.cancelled();
+        slot.set_cgroup_path(fake_cgroup);
 
         let got = try_cancel_build(&slot, "/nix/store/test.drv");
 

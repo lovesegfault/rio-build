@@ -10,6 +10,26 @@ use std::sync::atomic::AtomicBool;
 
 use tokio::sync::Notify;
 
+/// Per-claim state. Created atomically by [`BuildSlot::try_claim`] and
+/// torn down by [`BuildSlotGuard::drop`]. The `cancelled` flag exists
+/// from the instant the slot is claimed, so a `Cancel` racing the
+/// `try_claim` → `set_cgroup_path` window still has a flag to set
+/// (Corr#3: previously `running` and the cancel target lived under
+/// separate mutexes, and a cancel in that window returned `false` and
+/// was lost).
+struct SlotInner {
+    drv_path: String,
+    /// Same `Arc` handed to the spawned build task via
+    /// [`BuildSlotGuard::cancelled`] and threaded into
+    /// `ExecutorEnv.cancelled`.
+    cancelled: Arc<AtomicBool>,
+    /// Populated by [`BuildSlot::set_cgroup_path`] once
+    /// `spawn_build_task` has computed it. `None` until then —
+    /// `try_cancel_build` treats `None` like ENOENT (flag set, kill
+    /// deferred to the executor's pre-cgroup poll).
+    cgroup_path: Option<PathBuf>,
+}
+
 /// Single-build occupancy. P0537: one build per pod, no concurrency
 /// knob. Replaces the old `Semaphore::new(1)` + `RwLock<HashSet<String>>`
 /// pair — both "is a build running?" and "which drv_path?" live here.
@@ -21,53 +41,69 @@ use tokio::sync::Notify;
 /// silently defeating capacity reporting.
 #[derive(Default)]
 pub struct BuildSlot {
-    /// `Some(drv_path)` while a build is in-flight. `Mutex` not
-    /// `RwLock`: with one build, contention is impossible (claim/release
-    /// are serial; heartbeat reads every 10s).
-    running: std::sync::Mutex<Option<String>>,
+    /// `Some` while a build is in-flight. Single mutex over all
+    /// per-build state (drv_path, cancel flag, cgroup path) so
+    /// `try_cancel_build` reads a consistent snapshot — no TOCTOU
+    /// between "is this drv running?" and "set its cancel flag".
+    inner: std::sync::Mutex<Option<SlotInner>>,
     /// Notified on release. `notify_waiters` (not `_one`): the drain
     /// watcher and the build-done watcher may both be parked at once
     /// (SIGTERM during the build).
     idle: Notify,
-    /// Cancel target for the running build: (cgroup path for
-    /// `cgroup.kill`, cancelled flag). Populated by `spawn_build_task`
-    /// PREDICTIVELY (before the cgroup is created); read by
-    /// [`try_cancel_build`]. The flag is the same `Arc` threaded into
-    /// `ExecutorEnv.cancelled` and the spawned task's Err-classifier.
-    ///
-    /// `Mutex` like `running`: the Cancel handler reads once;
-    /// `spawn_build_task` writes once. Cleared by `BuildSlotGuard::drop`
-    /// (same lifetime as `running`).
-    cancel: std::sync::Mutex<Option<(PathBuf, Arc<AtomicBool>)>>,
 }
 
 impl BuildSlot {
     /// Claim the slot for `drv_path`. Returns `None` if already busy
     /// (caller logs and rejects the assignment — see struct doc).
+    ///
+    /// The returned guard owns the cancel flag for this build; callers
+    /// reach it via [`BuildSlotGuard::cancelled`].
     pub fn try_claim(self: &Arc<Self>, drv_path: &str) -> Option<BuildSlotGuard> {
-        let mut slot = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_some() {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.is_some() {
             return None;
         }
-        *slot = Some(drv_path.to_string());
-        Some(BuildSlotGuard(Arc::clone(self)))
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *inner = Some(SlotInner {
+            drv_path: drv_path.to_string(),
+            cancelled: Arc::clone(&cancelled),
+            cgroup_path: None,
+        });
+        Some(BuildSlotGuard {
+            slot: Arc::clone(self),
+            cancelled,
+        })
     }
 
     /// Current in-flight drv_path, for heartbeat `running_build`.
     pub fn running(&self) -> Option<String> {
-        self.running
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .as_ref()
+            .map(|s| s.drv_path.clone())
     }
 
     pub fn is_busy(&self) -> bool {
-        self.running().is_some()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
-    /// Record the cancel target for the running build. See field doc.
-    pub fn set_cancel_target(&self, cgroup_path: PathBuf, cancelled: Arc<AtomicBool>) {
-        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some((cgroup_path, cancelled));
+    /// Record the cgroup path for the running build. Called by
+    /// `spawn_build_task` after computing it from `cgroup_parent` +
+    /// `sanitize_build_id(drv_path)` — predictively, before the cgroup
+    /// is actually created. See [`try_cancel_build`].
+    pub fn set_cgroup_path(&self, cgroup_path: PathBuf) {
+        if let Some(s) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            s.cgroup_path = Some(cgroup_path);
+        }
     }
 
     /// Park until the slot is idle. Missed-notification-safe: the
@@ -92,22 +128,32 @@ impl BuildSlot {
 /// RAII release: `Drop` clears the slot and wakes any `wait_idle()`
 /// callers. Held inside `spawn_build_task`'s spawned future (same
 /// lifetime the old `OwnedSemaphorePermit` had).
-pub struct BuildSlotGuard(Arc<BuildSlot>);
+pub struct BuildSlotGuard {
+    slot: Arc<BuildSlot>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl BuildSlotGuard {
+    /// The cancel flag for this build. Same `Arc` stored in the slot
+    /// and set by [`try_cancel_build`]; thread it into `ExecutorEnv`
+    /// and the post-build Err classifier.
+    pub fn cancelled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+}
 
 impl Drop for BuildSlotGuard {
     fn drop(&mut self) {
-        *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.0.cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.0.idle.notify_waiters();
+        *self.slot.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.slot.idle.notify_waiters();
     }
 }
 
 /// Attempt to cancel the running build. Checks the slot's running
 /// drv_path matches, sets the cancel flag, writes cgroup.kill.
 ///
-/// Returns `true` if the build was found and kill was attempted
-/// (kill may still fail if the cgroup was already removed — we
-/// log and consider it "cancelled anyway"). `false` if not found
+/// Returns `true` if the build was found and the flag was set (kill
+/// may still be deferred — see ENOENT handling). `false` if not found
 /// (build already finished, or the cancel is for a different drv —
 /// stale CancelSignal from a previous scheduler generation).
 ///
@@ -116,27 +162,27 @@ impl Drop for BuildSlotGuard {
 /// transitioned the derivation to Cancelled on its side — this
 /// is just cleanup).
 pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
-    // drv_path match: with one build per pod the slot holds 0-or-1
-    // entry; the drv_path check guards against a stale CancelSignal
-    // (scheduler restarted and re-sent for a build this pod never had).
-    if slot.running().as_deref() != Some(drv_path) {
+    // Single lock for the whole operation: drv_path match + flag set +
+    // cgroup path read happen atomically. With one build per pod the
+    // slot holds 0-or-1 entry; the drv_path check guards against a
+    // stale CancelSignal (scheduler restarted and re-sent for a build
+    // this pod never had).
+    let guard = slot.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(inner) = guard.as_ref() else {
         tracing::debug!(
             drv_path,
-            "cancel: build not in slot (finished or never started)"
-        );
-        return false;
-    }
-    let guard = slot.cancel.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((cgroup_path, cancelled)) = guard.as_ref() else {
-        // Slot claimed but cancel target not yet set — spawn_build_task
-        // hasn't reached set_cancel_target. Same as ENOENT below: return
-        // false; the scheduler will re-send.
-        tracing::debug!(
-            drv_path,
-            "cancel: slot claimed but cancel target not yet set"
+            "cancel: slot idle (build finished or never started)"
         );
         return false;
     };
+    if inner.drv_path != drv_path {
+        tracing::debug!(
+            drv_path,
+            running = %inner.drv_path,
+            "cancel: drv mismatch (stale CancelSignal)"
+        );
+        return false;
+    }
 
     // Set flag BEFORE kill: if there's a race where execute_build
     // is reading the flag right now, we want "cancelled=true" to
@@ -144,7 +190,23 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
     // The kill → stdout EOF → Err path has some latency (kernel
     // delivers SIGKILL, process dies, pipe closes, tokio wakes);
     // setting the flag first gives us a wider window.
-    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    inner
+        .cancelled
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let Some(cgroup_path) = inner.cgroup_path.as_deref() else {
+        // Slot claimed but cgroup path not yet recorded —
+        // spawn_build_task hasn't reached set_cgroup_path. The flag IS
+        // set (lives in the slot from claim time), so execute_build's
+        // pre-cgroup poll will abort. Same outcome as ENOENT below.
+        //
+        // r[impl builder.cancel.pre-cgroup-deferred]
+        tracing::info!(
+            drv_path,
+            "cancel: cgroup path not yet recorded; flag set for pre-cgroup poll"
+        );
+        return true;
+    };
 
     match crate::cgroup::kill_cgroup(cgroup_path) {
         Ok(()) => {

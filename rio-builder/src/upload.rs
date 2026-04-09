@@ -6,6 +6,7 @@
 // r[impl builder.upload.multi-output]
 
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,32 +78,37 @@ const STREAM_CHANNEL_BUF: usize = 4;
 /// `references` are full `/nix/store/...` paths from the ref-scan
 /// candidate set, which was built from already-validated input-closure
 /// paths plus declared output paths — `StorePath::parse` cannot fail on
-/// them (defensively dropped if it somehow does). `deriver` may be empty
-/// (dev mode), which maps to `None`. Fields not known at upload time
-/// (`registration_time`, `signatures`, `content_address`, …) are left
-/// default; the store fills them server-side.
+/// them. A parse failure here is an invariant violation (CandidateSet
+/// returned a path it didn't validate) and is surfaced as
+/// [`UploadError::InvalidReference`] rather than silently dropped:
+/// dropping would corrupt the output's reference graph and break GC
+/// reachability. `deriver` may be empty (dev mode), which maps to
+/// `None`. Fields not known at upload time (`registration_time`,
+/// `signatures`, `content_address`, …) are left default; the store
+/// fills them server-side.
 fn uploaded_info(
     store_path: StorePath,
     nar_hash: [u8; 32],
     nar_size: u64,
     references: Vec<String>,
     deriver: &str,
-) -> ValidatedPathInfo {
-    ValidatedPathInfo {
+) -> Result<ValidatedPathInfo, UploadError> {
+    let references = references
+        .into_iter()
+        .map(|r| StorePath::parse(&r).map_err(|_| UploadError::InvalidReference { path: r }))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ValidatedPathInfo {
         store_path,
         store_path_hash: Vec::new(),
         deriver: StorePath::parse(deriver).ok(),
         nar_hash,
         nar_size,
-        references: references
-            .into_iter()
-            .filter_map(|r| StorePath::parse(&r).ok())
-            .collect(),
+        references,
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
         content_address: None,
-    }
+    })
 }
 
 /// Errors from upload operations.
@@ -116,6 +122,13 @@ pub enum UploadError {
     UploadExhausted { path: String, source: tonic::Status },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Ref-scan returned a path that fails `StorePath::parse`. The
+    /// candidate set is built from validated input-closure paths, so
+    /// this indicates a bug in `CandidateSet::resolve` (or a mismatched
+    /// store-prefix). Surfaced as an error — silently dropping the ref
+    /// would publish a path with a broken reference graph.
+    #[error("ref-scan returned unparseable store path {path:?}")]
+    InvalidReference { path: String },
 }
 
 /// Scan the overlay upper layer for new store paths.
@@ -144,10 +157,19 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
                 "non-UTF-8 filename in upper store",
             )
         })?;
-        // Skip hidden files and the .links directory
-        if !name.starts_with('.') {
-            outputs.push(name);
+        // Skip hidden files and the .links directory.
+        if name.starts_with('.') {
+            continue;
         }
+        // Skip overlayfs whiteouts: a build that `rm`s a lower-layer
+        // store path (read-only input) leaves a 0/0 chardev in the
+        // upper. NAR-dumping a chardev would fail with EACCES/ENXIO and
+        // poison the whole upload; the whiteout is not an output.
+        if entry.file_type()?.is_char_device() {
+            tracing::debug!(name, "skipping overlay whiteout in upper store");
+            continue;
+        }
+        outputs.push(name);
     }
 
     // read_dir order is filesystem-dependent; sort for deterministic behavior.
@@ -172,8 +194,8 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
 /// ## Retry cost
 ///
 /// Each retry re-reads the file from disk (`spawn_blocking` + channel are
-/// consumed on each attempt; can't rewind them). At `MAX_UPLOAD_RETRIES=3`
-/// that's worst-case 3× disk reads. Retries are rare (transient S3/gRPC
+/// consumed on each attempt; can't rewind them). At [`MAX_UPLOAD_RETRIES`]
+/// that's worst-case 8× disk reads. Retries are rare (transient S3/gRPC
 /// blips); the extra reads cost seconds on NVMe for a 4GiB file — trivial
 /// vs. the 32GiB memory saving.
 #[instrument(skip_all, fields(store_path = %format!("/nix/store/{output_basename}")))]
@@ -281,13 +303,7 @@ async fn upload_output(
                     nar_hash = %hex::encode(nar_hash),
                     "upload complete"
                 );
-                return Ok(uploaded_info(
-                    parsed_path,
-                    nar_hash,
-                    nar_size,
-                    references,
-                    deriver,
-                ));
+                return uploaded_info(parsed_path, nar_hash, nar_size, references, deriver);
             }
             // r[impl builder.upload.aborted-poll]
             Err(e) if is_concurrent_put_path(&e) => {
@@ -972,13 +988,10 @@ async fn upload_outputs_batch(
                 .await
                 .map_err(|e| tonic::Status::internal(format!("dump task panicked: {e}")))??;
 
-            results.push(uploaded_info(
-                parsed_path,
-                nar_hash,
-                nar_size,
-                references,
-                &deriver_owned,
-            ));
+            results.push(
+                uploaded_info(parsed_path, nar_hash, nar_size, references, &deriver_owned)
+                    .map_err(|e| tonic::Status::internal(e.to_string()))?,
+            );
         }
         // tx drops here → batch stream closes → server enters commit phase.
         Ok::<_, tonic::Status>(results)

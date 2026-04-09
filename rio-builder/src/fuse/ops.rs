@@ -68,9 +68,9 @@ use fuser::{
 };
 
 use super::NixStoreFs;
+use super::attr::{ATTR_TTL, BLOCK_SIZE, stat_to_attr};
 use super::cache::JitClass;
 use super::fetch::jit_fetch_timeout;
-use super::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr};
 use super::read::{io_error_to_errno, read_file_range};
 
 impl Filesystem for NixStoreFs {

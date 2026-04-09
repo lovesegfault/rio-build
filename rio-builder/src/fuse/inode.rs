@@ -36,26 +36,29 @@ impl InodeMap {
         }
     }
 
+    /// Allocate (or reuse) an inode for `path` AND bump its kernel
+    /// lookup refcount. Call exactly once per successful `reply.entry()`.
+    ///
+    /// The refcount bump is folded in so a caller cannot allocate an
+    /// entry without an `nlookup` — an entry with `nlookup == 0` is
+    /// unreachable by `forget()` and would leak for the mount lifetime.
     pub(super) fn get_or_create(&mut self, path: PathBuf) -> u64 {
-        if let Some(&ino) = self.path_to_inode.get(&path) {
-            return ino;
-        }
-        let ino = self.next_inode;
-        self.next_inode += 1;
-        self.inode_to_path.insert(ino, path.clone());
-        self.path_to_inode.insert(path, ino);
+        let ino = if let Some(&ino) = self.path_to_inode.get(&path) {
+            ino
+        } else {
+            let ino = self.next_inode;
+            self.next_inode += 1;
+            self.inode_to_path.insert(ino, path.clone());
+            self.path_to_inode.insert(path, ino);
+            ino
+        };
+        *self.nlookup.entry(ino).or_insert(0) += 1;
         ino
     }
 
     /// Read-only lookup: returns the inode if path is already tracked.
     pub(super) fn get_existing(&self, path: &Path) -> Option<u64> {
         self.path_to_inode.get(path).copied()
-    }
-
-    /// Increment the kernel lookup refcount for an inode. Call this exactly
-    /// once per successful reply.entry().
-    pub(super) fn increment_lookup(&mut self, ino: u64) {
-        *self.nlookup.entry(ino).or_insert(0) += 1;
     }
 
     /// Decrement the kernel lookup refcount by `n`. If it reaches zero (and
@@ -165,9 +168,8 @@ mod tests {
         let root = PathBuf::from("/nix/store");
         let mut map = InodeMap::new(root);
         let p = PathBuf::from("/nix/store/abc-hello");
-        let ino = map.get_or_create(p);
-        map.increment_lookup(ino);
-        map.increment_lookup(ino);
+        let ino = map.get_or_create(p.clone());
+        assert_eq!(map.get_or_create(p), ino);
         // nlookup = 2; forget(1) -> nlookup = 1, not removed
         assert!(!map.forget(ino, 1));
         assert!(map.real_path(ino).is_some());
@@ -181,10 +183,10 @@ mod tests {
     fn test_inode_map_forget_keeps_when_nonzero() {
         let root = PathBuf::from("/nix/store");
         let mut map = InodeMap::new(root);
-        let ino = map.get_or_create(PathBuf::from("/nix/store/abc"));
-        map.increment_lookup(ino);
-        map.increment_lookup(ino);
-        map.increment_lookup(ino);
+        let p = PathBuf::from("/nix/store/abc");
+        let ino = map.get_or_create(p.clone());
+        map.get_or_create(p.clone());
+        map.get_or_create(p);
         // nlookup = 3; forget(2) -> nlookup = 1, not removed
         assert!(!map.forget(ino, 2));
         assert!(map.real_path(ino).is_some());
@@ -195,7 +197,8 @@ mod tests {
     fn test_inode_map_forget_never_removes_root() {
         let root = PathBuf::from("/nix/store");
         let mut map = InodeMap::new(root.clone());
-        map.increment_lookup(INodeNo::ROOT.0);
+        // Bump ROOT's nlookup via the public path (re-lookup root).
+        assert_eq!(map.get_or_create(root.clone()), INodeNo::ROOT.0);
         // Even if nlookup hits zero, ROOT is never removed.
         assert!(!map.forget(INodeNo::ROOT.0, 100));
         assert_eq!(map.real_path(INodeNo::ROOT.0), Some(root));
