@@ -1,6 +1,6 @@
 //! FetcherPool Job-per-FOD reconciler.
 //!
-//! Same Job lifecycle as `builderpool/ephemeral.rs` (see that
+//! Same Job lifecycle as `builderpool/static_sizing.rs` (see that
 //! module's header for the full design rationale — push-vs-poll,
 //! Job naming, zero cross-build state). Differences here:
 //!
@@ -14,32 +14,31 @@
 //!     are network-bound and short; the failure mode is a stuck
 //!     download, not a 90min compile.
 //!
-//! The pure helpers (`is_active_job`, `try_spawn_job`,
-//! `random_suffix`, `scheduler_unreachable_condition`,
-//! `spawn_count`, `EPHEMERAL_REQUEUE`, `JOB_TTL_SECS`) are reused
-//! from `common::job`. The CR-typed glue (status patch, Job build)
-//! is reproduced — the two `*PoolStatus` shapes and `executor_params`
-//! signatures differ nominally but a trait would be more code than
-//! the ~40 lines duplicated.
+//! The Job-lifecycle plumbing (`is_active_job`, `try_spawn_job`,
+//! `random_suffix`, `spawn_count`, `JOB_REQUEUE`, `JOB_TTL_SECS`,
+//! `JobReconcilePrologue`, `patch_job_pool_status`, both reap
+//! helpers) is shared with the builder reconcilers via
+//! `common::job`. Only `build_job` (the per-role pod spec) and the
+//! per-class spawn loop remain FetcherPool-specific.
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
-use kube::api::{Api, ListParams, ObjectMeta, Patch, PatchParams};
+use kube::ResourceExt;
+use kube::api::{ListParams, ObjectMeta};
 use kube::runtime::controller::Action;
-use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::common::job::{
-    EPHEMERAL_REQUEUE, JOB_TTL_SECS, SpawnOutcome, is_active_job, random_suffix,
-    reap_excess_pending, reap_orphan_running, scheduler_unreachable_condition, spawn_count,
-    try_spawn_job,
+    JOB_REQUEUE, JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job,
+    job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
+    reap_orphan_running, spawn_count, try_spawn_job,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, SchedulerAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
-use super::{MANAGER, executor_params};
+use super::executor_params;
 
 /// Default `activeDeadlineSeconds` when `FetcherPoolSpec.ephemeral_
 /// deadline_seconds` is unset. 300 (5min): a fetch that hasn't
@@ -64,18 +63,15 @@ pub(super) const FOD_EPHEMERAL_DEADLINE_SECS: i64 = 300;
 ///     bucketed by `size_class_floor`); active Jobs counted per class
 ///     via `rio.build/pool={class.name}` label; ceiling is `class.
 ///     max_replicas` (falling back to `spec.replicas.max`).
-pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
-    let ns = fp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?;
-    let name = fp.name_any();
-    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
-
-    let oref = fp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
-    })?;
-    let scheduler = ctx.scheduler_addrs();
-    let store = ctx.store_addrs();
+pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
+    let JobReconcilePrologue {
+        ns,
+        name,
+        jobs_api,
+        oref,
+        scheduler,
+        store,
+    } = job_reconcile_prologue(fp, ctx)?;
 
     // ── queue signals ───────────────────────────────────────────────
     // Classed pools need per-class depth from GetSizeClassStatus;
@@ -155,7 +151,7 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
             }
         }
 
-        // I-183: same reap as builderpool/ephemeral.rs — when per-class
+        // I-183: same reap as builderpool/static_sizing.rs — when per-class
         // queued drops below per-class Pending, delete the excess.
         // FetcherPool's 300s deadline makes this less acute than
         // BuilderPool's 1h, but the Karpenter node-churn cost is the
@@ -164,18 +160,19 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         total_reaped +=
             reap_excess_pending(&jobs_api, &jobs.items, queued_known, &name, &pool_name).await;
 
-        // I-165: same orphan-reap as builderpool/ephemeral.rs. Less
+        // I-165: same orphan-reap as builderpool/static_sizing.rs. Less
         // acute here (FOD_EPHEMERAL_DEADLINE_SECS=300s ≈ the grace
         // itself) but a stuck fetcher still holds a node for 5min of
         // nothing. Lazy RPC; fail-closed.
         total_reaped += reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &pool_name).await;
     }
 
-    patch_status(
+    patch_job_pool_status::<FetcherPool, _>(
         ctx,
-        fp,
+        fp.status.as_ref(),
         &ns,
         &name,
+        None,
         total_active,
         fp.spec.max_concurrent as i32,
         scheduler_err.as_deref(),
@@ -191,12 +188,12 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         "reconciled FetcherPool (ephemeral)"
     );
 
-    Ok(Action::requeue(EPHEMERAL_REQUEUE))
+    Ok(Action::requeue(JOB_REQUEUE))
 }
 
 /// Queue signals for one ephemeral reconcile tick. Carries both the
 /// flat count (unclassed fallback) and the per-class breakdown so
-/// `reconcile_ephemeral` can serve either path from one fetch.
+/// `reconcile` can serve either path from one fetch.
 struct QueueSignals {
     /// Flat in-flight FOD demand (`queued_fod_derivations`). Fallback
     /// when `fod_classes` is empty (scheduler `[[fetcher_size_classes]]`
@@ -297,42 +294,8 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
     (QueueSignals { flat, by_class }, None)
 }
 
-/// SSA-patch `.status` for a Job-mode FetcherPool. Same shape as
-/// `common::job::patch_job_pool_status` but FetcherPool-
-/// typed (no `replicas` field on FetcherPoolStatus — only
-/// ready/desired).
-async fn patch_status(
-    ctx: &Ctx,
-    fp: &FetcherPool,
-    ns: &str,
-    name: &str,
-    active: i32,
-    desired: i32,
-    scheduler_err: Option<&str>,
-) -> Result<()> {
-    let api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), ns);
-    let ar = FetcherPool::api_resource();
-    let prev = crate::scaling::find_condition(fp.status.as_ref(), "SchedulerUnreachable");
-    let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
-    api.patch_status(
-        name,
-        &PatchParams::apply(MANAGER).force(),
-        &Patch::Apply(serde_json::json!({
-            "apiVersion": ar.api_version,
-            "kind": ar.kind,
-            "status": {
-                "readyReplicas": active,
-                "desiredReplicas": desired,
-                "conditions": [cond],
-            },
-        })),
-    )
-    .await?;
-    Ok(())
-}
-
 /// Build a K8s Job for one ephemeral fetcher pod. Same Job-level
-/// settings as `builderpool/ephemeral::build_job` (`backoffLimit: 0`,
+/// settings as `builderpool/static_sizing::build_job` (`backoffLimit: 0`,
 /// `restartPolicy: Never`, `ttlSecondsAfterFinished`); the pod spec
 /// comes from the fetcher-hardened `executor_params`.
 // r[impl ctrl.fetcherpool.ephemeral-per-class]
@@ -474,7 +437,7 @@ mod tests {
     }
 
     /// Labels include `rio.build/pool=<name>` so the active-Job list
-    /// in `reconcile_ephemeral` finds them.
+    /// in `reconcile` finds them.
     #[test]
     fn build_job_labels_include_pool() {
         let fp = test_fp();

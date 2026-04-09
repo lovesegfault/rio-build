@@ -50,7 +50,26 @@ use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt, standard_error_policy, timed};
-use crate::scaling::is_wps_owned_by;
+/// Is this BuilderPool owned by a SPECIFIC BuilderPoolSet? Checks
+/// `ownerReferences` for a controller entry whose UID matches
+/// `wps.metadata.uid`. Used by the prune path, where we must not
+/// prune a DIFFERENT WPS's children that happen to share the
+/// namespace.
+///
+/// Returns false if `wps` has no UID (not from apiserver — should
+/// not happen on a real reconcile; treated as "can't prove
+/// ownership, don't prune").
+pub(crate) fn is_wps_owned_by(pool: &BuilderPool, wps: &BuilderPoolSet) -> bool {
+    let Some(wps_uid) = wps.metadata.uid.as_deref() else {
+        return false;
+    };
+    pool.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|or| or.kind == "BuilderPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
+}
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus};
 

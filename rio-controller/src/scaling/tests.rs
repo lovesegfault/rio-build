@@ -1,7 +1,12 @@
-//! Unit tests for the shared scaling surface: queue-depth lookups
-//! and the `is_wps_owned_by` ownership predicate.
+//! Unit tests for the shared scaling surface: queue-depth lookups.
+//!
+//! `is_wps_owned_by` tests stay here for now (the fn moved to
+//! `reconcilers::builderpoolset`); moving the tests alongside it
+//! is a TODO — they exercise the same fixture set as the queue
+//! tests below.
 
 use super::*;
+use crate::reconcilers::builderpoolset::is_wps_owned_by;
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::BuilderPoolSet;
 

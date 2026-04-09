@@ -61,9 +61,9 @@ use tracing::{debug, info, warn};
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::common::job::{
-    EPHEMERAL_REQUEUE, JOB_TTL_SECS, SpawnOutcome, is_active_job, job_reconcile_prologue,
-    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running, spawn_count,
-    spawn_prerequisites, try_spawn_job,
+    JOB_REQUEUE, JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job,
+    job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
+    reap_orphan_running, spawn_count, try_spawn_job,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
@@ -124,8 +124,15 @@ fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
 /// Status: `replicas` / `readyReplicas` / `desiredReplicas` mean
 /// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
 /// (`spec.maxConcurrent`).
-pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
-    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
+pub(super) async fn reconcile_static(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
+    let JobReconcilePrologue {
+        ns,
+        name,
+        jobs_api,
+        oref,
+        scheduler,
+        store,
+    } = job_reconcile_prologue(wp, ctx)?;
     let ceiling = wp.spec.max_concurrent as i32;
 
     // ---- Poll queue depth ----
@@ -195,8 +202,6 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
-        let (oref, scheduler, store) = spawn_prerequisites(wp, ctx)?;
-
         for _ in 0..to_spawn {
             let job = build_job(wp, oref.clone(), &scheduler, &store)?;
             // build_job() always sets metadata.name, so this can't
@@ -272,19 +277,19 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     // "ready" when it's running; we don't probe individual Job pods
     // from here). `desiredReplicas` = ceiling. SchedulerUnreachable
     // condition reflects the poll above.
-    patch_job_pool_status(
+    patch_job_pool_status::<BuilderPool, _>(
         ctx,
-        wp,
+        wp.status.as_ref(),
         &ns,
         &name,
-        active,
+        Some(active),
         active,
         ceiling,
         scheduler_err.as_deref(),
     )
     .await?;
 
-    Ok(Action::requeue(EPHEMERAL_REQUEUE))
+    Ok(Action::requeue(JOB_REQUEUE))
 }
 
 /// Queue depth relevant to THIS ephemeral pool.
@@ -354,7 +359,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///   - `backoffLimit: 0` — same reasoning. One attempt.
 ///   - `ttlSecondsAfterFinished: 600` — K8s TTL controller reaps.
 ///   - `activeDeadlineSeconds` — backstop for wrong-pool spawns.
-///     `reconcile_ephemeral` spawns from the CLUSTER-WIDE
+///     `reconcile_static` spawns from the CLUSTER-WIDE
 ///     `queued_derivations` count, not pool-matching depth. A
 ///     queue full of x86 work on an arm64 ephemeral pool
 ///     triggers a spawn; the worker heartbeats, never matches
@@ -454,7 +459,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{test_sched_addrs, test_store_addrs};
     // `controller_owner_ref` comes from `kube::Resource`. Module-
-    // level import moved to common::job with spawn_prerequisites;
+    // level import moved to common::job with the prologue helper;
     // tests still build Jobs directly, so import here.
     use kube::Resource;
 
@@ -495,7 +500,7 @@ mod tests {
         assert_eq!(orefs[0].kind, "BuilderPool");
         assert_eq!(orefs[0].controller, Some(true));
 
-        // rio.build/pool label → reconcile_ephemeral's active-count
+        // rio.build/pool label → reconcile_static's active-count
         // query finds this Job. Without it, every reconcile thinks
         // active=0 and spawns more Jobs → runaway.
         let labels = job.metadata.labels.as_ref().unwrap();

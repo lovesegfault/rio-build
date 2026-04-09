@@ -1,16 +1,15 @@
 //! Shared plumbing for the Job-mode reconcilers (`builderpool::
-//! {ephemeral,manifest}` and `fetcherpool::ephemeral`). All follow the
+//! {static_sizing,manifest}` and `fetcherpool::jobs`). All follow the
 //! same skeleton: list Jobs by label, filter active, diff against
 //! demand, spawn deficit, reap excess, patch status. The diff is
 //! different (per-bucket vs flat-ceiling); the plumbing around it is
 //! the same.
 //!
 //! Extracted (P0513) after the mc=60 consolidator pass found 4
-//! byte-identical-or-near segments (~50L) plus two `super::ephemeral::`
-//! cross-refs from `manifest.rs` reaching into a sibling for helpers
-//! that belong in neither. Moved from `builderpool/` to `common/` once
-//! `fetcherpool::ephemeral` started importing through the sibling
-//! reconciler.
+//! byte-identical-or-near segments (~50L) plus two cross-refs from
+//! `manifest.rs` reaching into a sibling for helpers that belong in
+//! neither. Moved from `builderpool/` to `common/` once the fetcher
+//! reconciler started importing through the sibling reconciler.
 
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt};
-use rio_crds::builderpool::BuilderPool;
+use rio_crds::common::PoolStatusCommon;
 
 use super::pod::{SchedulerAddrs, StoreAddrs};
 
@@ -42,7 +41,7 @@ pub(crate) const MANAGER: &str = "rio-controller";
 /// load). Longer lengthens dispatch latency: a worker needs one
 /// requeue interval + pod scheduling + container pull + FUSE mount +
 /// heartbeat (~10s + 10-30s) before the scheduler sees it.
-pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
+pub(crate) const JOB_REQUEUE: Duration = Duration::from_secs(10);
 
 /// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
 /// deletes the Job (and its pod, via ownerRef) this many seconds
@@ -462,36 +461,52 @@ pub(crate) async fn reap_orphan_running(
     reaped
 }
 
-/// ns/name/jobs_api prelude. Both Job-mode reconcilers start here:
-/// extract the namespaced identity and build the Job API handle. The
-/// namespace-missing case is `InvalidSpec` not `NotFound` — a
-/// BuilderPool without `.metadata.namespace` is a cluster-scoped
-/// apply error (the CRD is `Namespaced`), not a transient condition.
-pub(crate) fn job_reconcile_prologue(
-    wp: &BuilderPool,
-    ctx: &Ctx,
-) -> Result<(String, String, Api<Job>)> {
-    let ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let name = wp.name_any();
-    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
-    Ok((ns, name, jobs_api))
+/// Per-reconcile derived state every Job-mode reconciler needs up
+/// front. Replaces the previous split into `job_reconcile_prologue`
+/// (ns/name/api) + `spawn_prerequisites` (oref/addrs) — both took
+/// the same two args and every caller used both within a few dozen
+/// lines of each other; the split was indirection without dedup.
+pub(crate) struct JobReconcilePrologue {
+    pub ns: String,
+    pub name: String,
+    pub jobs_api: Api<Job>,
+    /// `controller_owner_ref` for the pool CR. The no-`.metadata.uid`
+    /// error only happens on a CR not read from the apiserver — tests
+    /// that construct one in memory forget this; production reconcile
+    /// always has it.
+    pub oref: OwnerReference,
+    pub scheduler: SchedulerAddrs,
+    pub store: StoreAddrs,
 }
 
-/// OwnerReference + SchedulerAddrs — both spawn paths need both
-/// before entering their per-Job create loop. The `controller_
-/// owner_ref` error (no `.metadata.uid`) only happens on a
-/// BuilderPool not read from the apiserver — tests that construct
-/// one in memory forget this; production reconcile always has it.
-pub(crate) fn spawn_prerequisites(
-    wp: &BuilderPool,
-    ctx: &Ctx,
-) -> Result<(OwnerReference, SchedulerAddrs, StoreAddrs)> {
+/// Extract namespaced identity, Job API handle, ownerRef and
+/// upstream addresses. The namespace-missing case is `InvalidSpec`
+/// not `NotFound` — a pool CR without `.metadata.namespace` is a
+/// cluster-scoped apply error (the CRD is `Namespaced`), not a
+/// transient condition.
+pub(crate) fn job_reconcile_prologue<K>(wp: &K, ctx: &Ctx) -> Result<JobReconcilePrologue>
+where
+    K: Resource<DynamicType = ()>,
+{
+    let ns = wp
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))?;
+    let name = wp.name_any();
+    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
     let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
+        Error::InvalidSpec(format!(
+            "{} has no metadata.uid (not from apiserver?)",
+            K::kind(&())
+        ))
     })?;
-    Ok((oref, ctx.scheduler_addrs(), ctx.store_addrs()))
+    Ok(JobReconcilePrologue {
+        ns,
+        name,
+        jobs_api,
+        oref,
+        scheduler: ctx.scheduler.clone(),
+        store: ctx.store.clone(),
+    })
 }
 
 /// Outcome of a single `jobs_api.create` attempt. Caller decides
@@ -540,11 +555,13 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
     }
 }
 
-/// SSA-patch `.status.{replicas,readyReplicas,desiredReplicas,
-/// conditions}` for a Job-mode BuilderPool.
+/// SSA-patch `.status.{replicas?,readyReplicas,desiredReplicas,
+/// conditions}` for a Job-mode pool CR (BuilderPool / FetcherPool).
 ///
-/// "Replicas" means "active Jobs" — `kubectl get wp` columns are
-/// filled here from the Job inventory.
+/// "Replicas" means "active Jobs" — `kubectl get` columns are
+/// filled here from the Job inventory. `replicas: None` for CRs
+/// whose status doesn't carry that field (FetcherPool); the SSA
+/// body omits it so the apiserver doesn't reject an unknown field.
 ///
 /// `conditions`: `SchedulerUnreachable` reflects the reconciler's
 /// poll-phase RPC result. `scheduler_err = Some` → status="True"
@@ -554,38 +571,53 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// condition, so we write it every reconcile or a stale True would
 /// persist. The autoscaler's `Scaling` condition lives under a
 /// different field manager; SSA keeps them separate.
+///
+/// `prev_status`: the CR's `.status` (for `lastTransitionTime`
+/// preservation). Generic over `S: AsRef<PoolStatusCommon>` so both
+/// `*PoolStatus` structs feed in directly. `K` must be turbofished
+/// at the call site (`patch_job_pool_status::<BuilderPool, _>(…)`)
+/// — there's no value param it could infer from.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn patch_job_pool_status(
+pub(crate) async fn patch_job_pool_status<K, S>(
     ctx: &Ctx,
-    wp: &BuilderPool,
+    prev_status: Option<&S>,
     ns: &str,
     name: &str,
-    active: i32,
+    replicas: Option<i32>,
     ready: i32,
     desired: i32,
     scheduler_err: Option<&str>,
-) -> Result<()> {
-    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), ns);
-    let ar = BuilderPool::api_resource();
-    let prev = crate::scaling::find_condition(wp.status.as_ref(), "SchedulerUnreachable");
+) -> Result<()>
+where
+    K: Resource<DynamicType = (), Scope = kube::core::NamespaceResourceScope>
+        + CustomResourceExt
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+    S: AsRef<PoolStatusCommon>,
+{
+    let api: Api<K> = Api::namespaced(ctx.client.clone(), ns);
+    let ar = K::api_resource();
+    let prev = super::conditions::find_condition(prev_status, "SchedulerUnreachable");
     let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
-    let status_patch = serde_json::json!({
-        "apiVersion": ar.api_version,
-        "kind": ar.kind,
-        "status": {
-            "replicas": active,
-            "readyReplicas": ready,
-            "desiredReplicas": desired,
-            "conditions": [cond],
-        },
+    let mut status = serde_json::json!({
+        "readyReplicas": ready,
+        "desiredReplicas": desired,
+        "conditions": [cond],
     });
-    wp_api
-        .patch_status(
-            name,
-            &kube::api::PatchParams::apply(MANAGER).force(),
-            &kube::api::Patch::Apply(&status_patch),
-        )
-        .await?;
+    if let Some(r) = replicas {
+        status["replicas"] = r.into();
+    }
+    api.patch_status(
+        name,
+        &kube::api::PatchParams::apply(MANAGER).force(),
+        &kube::api::Patch::Apply(serde_json::json!({
+            "apiVersion": ar.api_version,
+            "kind": ar.kind,
+            "status": status,
+        })),
+    )
+    .await?;
     Ok(())
 }
 
@@ -636,7 +668,7 @@ pub(crate) fn scheduler_unreachable_condition(
         "status": status,
         "reason": reason,
         "message": message,
-        "lastTransitionTime": crate::scaling::transition_time(status, prev),
+        "lastTransitionTime": super::conditions::transition_time(status, prev),
     })
 }
 

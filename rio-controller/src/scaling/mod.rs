@@ -1,60 +1,12 @@
-//! Scaling helpers — queue-depth lookups, condition utilities,
-//! BPS ownership predicates, and the [`component`] scaler.
+//! Scaling helpers — queue-depth lookups and the [`component`]
+//! scaler.
 //!
 //! Shared surface the Job reconcilers and the ComponentScaler
-//! both consume.
+//! both consume. Condition helpers live in
+//! `reconcilers::common::conditions`; the BPS ownership predicate
+//! lives with its sole caller in `reconcilers::builderpoolset`.
 
 pub mod component;
-
-use rio_crds::builderpool::BuilderPool;
-use rio_crds::builderpoolset::BuilderPoolSet;
-use rio_crds::common::PoolStatusCommon;
-
-/// Compute `lastTransitionTime` per K8s convention: preserve the
-/// existing timestamp if `status` is unchanged, stamp now() on
-/// an actual transition (or first write).
-///
-/// Without this, a reconciler that writes the same condition
-/// every tick (ephemeral.rs's 10s requeue) makes
-/// `lastTransitionTime` always read "~10s ago" — useless for
-/// "when did the scheduler become unreachable."
-pub(crate) fn transition_time(new_status: &str, prev: Option<&serde_json::Value>) -> String {
-    // k8s_openapi re-exports jiff (kube 3.0's chrono replacement).
-    // Timestamp::now() → Display is RFC3339 with offset (UTC Z).
-    // K8s Condition.lastTransitionTime expects this format.
-    if let Some(p) = prev
-        && p.get("status").and_then(|s| s.as_str()) == Some(new_status)
-        && let Some(ts) = p.get("lastTransitionTime").and_then(|t| t.as_str())
-    {
-        return ts.to_string();
-    }
-    k8s_openapi::jiff::Timestamp::now().to_string()
-}
-
-/// Find a condition by `type` in a pool's `status.conditions` array.
-/// Used to read the existing condition before a rewrite so
-/// `lastTransitionTime` can be preserved on non-transitions.
-///
-/// Generic over the embedding status struct via `AsRef` so both
-/// `BuilderPoolStatus` and `FetcherPoolStatus` (which flatten
-/// [`PoolStatusCommon`]) feed into one function — previously two
-/// near-identical 6-line copies.
-///
-/// Returns `None` if the pool has no status, no conditions, or no
-/// condition of the given type. Serializes via serde_json (the
-/// k8s_openapi Condition struct → json::Value) so the output
-/// plugs directly into `transition_time`.
-pub(crate) fn find_condition<S: AsRef<PoolStatusCommon>>(
-    status: Option<&S>,
-    cond_type: &str,
-) -> Option<serde_json::Value> {
-    status?
-        .as_ref()
-        .conditions
-        .iter()
-        .find(|c| c.type_ == cond_type)
-        .and_then(|c| serde_json::to_value(c).ok())
-}
 
 /// Queue depth relevant to a pool, given its `spec.systems`.
 ///
@@ -168,27 +120,6 @@ pub(crate) fn class_queued_for_pool(
         .iter()
         .find(|c| c.name == size_class)
         .map(|c| class_queued_for_systems(c, systems))
-}
-
-/// Is this BuilderPool owned by a SPECIFIC BuilderPoolSet? Checks
-/// `ownerReferences` for a controller entry whose UID matches
-/// `wps.metadata.uid`. Used by the prune path, where we must not
-/// prune a DIFFERENT WPS's children that happen to share the
-/// namespace.
-///
-/// Returns false if `wps` has no UID (not from apiserver — should
-/// not happen on a real reconcile; treated as "can't prove
-/// ownership, don't prune").
-pub(crate) fn is_wps_owned_by(pool: &BuilderPool, wps: &BuilderPoolSet) -> bool {
-    let Some(wps_uid) = wps.metadata.uid.as_deref() else {
-        return false;
-    };
-    pool.metadata
-        .owner_references
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|or| or.kind == "BuilderPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
     }
 }
 
-/// The pod spec. Re-exported for `ephemeral::build_job` and
+/// The pod spec. Re-exported for `static_sizing::build_job` and
 /// `manifest::build_manifest_job` — the Job pod is the same
 /// executor container with env/resource tweaks.
 ///

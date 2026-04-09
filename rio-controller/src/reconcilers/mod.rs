@@ -98,7 +98,7 @@ pub struct Ctx {
     ///
     /// `parking_lot::Mutex` — same reasoning as `error_counts`.
     pub manifest_idle: Mutex<HashMap<String, ManifestIdleState>>,
-    /// TTL-cached `GetSizeClassStatus` response. The ephemeral
+    /// TTL-cached `GetSizeClassStatus` response. The static-sizing
     /// builderpool reconciler and the ComponentScaler reconciler
     /// both poll this on ~10s ticks; without the cache they'd
     /// double-poll the scheduler. 5s TTL: short enough that a
@@ -127,17 +127,6 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Clone the scheduler address bundle for pod-spec injection.
-    /// Every reconciler that builds an executor pod-spec calls this.
-    pub fn scheduler_addrs(&self) -> common::pod::SchedulerAddrs {
-        self.scheduler.clone()
-    }
-
-    /// Clone the store address bundle for pod-spec injection.
-    pub fn store_addrs(&self) -> common::pod::StoreAddrs {
-        self.store.clone()
-    }
-
     /// Publish an event scoped to a K8s object. Best-effort —
     /// event-publish failure is logged, not propagated (events
     /// are observability, not correctness; a reconcile that

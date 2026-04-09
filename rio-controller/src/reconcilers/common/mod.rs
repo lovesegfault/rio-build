@@ -10,5 +10,6 @@
 //! of copy-pasting 1100 + reaching through `builderpool::` for
 //! helpers.
 
+pub mod conditions;
 pub mod job;
 pub mod pod;

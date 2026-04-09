@@ -8,7 +8,7 @@
 //! manifest bucket instead of FROM `spec.resources`.
 //!
 //! Versus [`ephemeral`](super::ephemeral): same Job-spawn machinery,
-//! different pod-spec source. `reconcile_ephemeral` reads the scalar
+//! different pod-spec source. `reconcile_static` reads the scalar
 //! `queued_derivations` and spawns N identical Jobs sized by
 //! `spec.resources`. `reconcile_manifest` reads the per-derivation
 //! breakdown and spawns heterogeneous Jobs — a queue with one 4Gi
@@ -75,14 +75,14 @@ use super::builders::{self, SchedulerAddrs, StoreAddrs};
 /// `manifest_tests.rs`'s `use ...::manifest::Bucket` stays intact.
 pub(super) use crate::reconcilers::common::job::Bucket;
 use crate::reconcilers::common::job::{
-    JOB_TTL_SECS, SpawnOutcome, is_active_job, is_failed_job, job_reconcile_prologue,
-    patch_job_pool_status, random_suffix, spawn_prerequisites, try_spawn_job,
+    JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job, is_failed_job,
+    job_reconcile_prologue, patch_job_pool_status, random_suffix, try_spawn_job,
 };
 
 /// Requeue interval. Same as ephemeral (~10s) — manifest is demand-
 /// driven, not drift-driven. A derivation queued between ticks waits
 /// one interval before a pod is spawned for it. See ephemeral.rs's
-/// `EPHEMERAL_REQUEUE` doc for the latency-vs-apiserver-load tradeoff.
+/// `JOB_REQUEUE` doc for the latency-vs-apiserver-load tradeoff.
 const MANIFEST_REQUEUE: Duration = Duration::from_secs(10);
 
 /// Manifest sizing mode label. Distinguishes manifest Jobs from
@@ -452,7 +452,14 @@ async fn reap_surplus_manifest_jobs(
 /// difference is per-bucket `ResourceRequirements` instead of
 /// one-size from `spec.resources`.
 pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
-    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
+    let JobReconcilePrologue {
+        ns,
+        name,
+        jobs_api,
+        oref,
+        scheduler,
+        store,
+    } = job_reconcile_prologue(wp, ctx)?;
 
     // ---- Poll: manifest + ClusterStatus ----
     let (estimates, queued_total, scheduler_err) = poll_manifest_demand(ctx, &name).await;
@@ -527,7 +534,6 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let truncated = truncate_plan(&plan, budget);
 
     if !truncated.is_empty() {
-        let (oref, scheduler, store) = spawn_prerequisites(wp, ctx)?;
         // Pre-build all Jobs, then spawn via the threshold-aware
         // helper. Batch size is bounded by `headroom` (≤ max_concurrent)
         // so the Vec is small. spawn_manifest_jobs bails with
@@ -557,12 +563,12 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // ---- Status patch ----
     // `replicas` = active Jobs, `desired` = ceiling. SchedulerUnreachable
     // condition reflects BOTH RPCs (either down → True).
-    patch_job_pool_status(
+    patch_job_pool_status::<BuilderPool, _>(
         ctx,
-        wp,
+        wp.status.as_ref(),
         &ns,
         &name,
-        active_total,
+        Some(active_total),
         active_total,
         ceiling,
         scheduler_err.as_deref(),
@@ -1045,7 +1051,7 @@ fn bucket_to_resources(bucket: Bucket) -> ResourceRequirements {
 /// `bucket` is Some; `None` when cold-start (→ `spec.resources`
 /// floor).
 ///
-/// Differences from `ephemeral::build_job`:
+/// Differences from `static_sizing::build_job`:
 ///   - Per-bucket `ResourceRequirements` override
 ///   - Labels: `rio.build/sizing=manifest` + class labels
 ///   - Name: `{pool}-mf-{mem}g-{cpu}m-{random6}`

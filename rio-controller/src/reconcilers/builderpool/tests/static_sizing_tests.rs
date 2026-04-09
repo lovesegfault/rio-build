@@ -37,7 +37,7 @@ fn ephemeral_spawn_fail_still_patches_status() {
     // (P0516). Same brittleness-is-the-point: anyone reintroducing a
     // bail in this block trips this and must consciously decide the
     // status patch can be skipped.
-    let src = include_str!("../ephemeral.rs");
+    let src = include_str!("../static_sizing.rs");
     let spawn_start = src
         .find("---- Spawn decision ----")
         .expect("spawn section marker present");

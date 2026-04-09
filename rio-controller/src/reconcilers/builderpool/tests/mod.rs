@@ -20,8 +20,8 @@ use rio_crds::builderpool::SeccompProfileKind;
 
 mod builders_tests;
 mod disruption_tests;
-mod ephemeral_tests;
 mod manifest_tests;
+mod static_sizing_tests;
 
 /// Construct a minimal BuilderPool for builder tests. No K8s
 /// interaction — pure struct-to-struct.

@@ -27,15 +27,10 @@ use crate::reconcilers::{Ctx, standard_error_policy, timed};
 use rio_crds::builderpool::SeccompProfileKind;
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
-mod ephemeral;
+mod jobs;
 
 /// Finalizer name. Kubebuilder convention: `{kind}.{group}/{suffix}`.
 const FINALIZER: &str = "fetcherpool.rio.build/drain";
-
-/// Field manager for server-side apply. Shared with the builderpool
-/// reconciler — re-exported from `common::job` so both pool
-/// reconcilers stamp the same SSA manager.
-pub(super) use crate::reconcilers::common::job::MANAGER;
 
 /// Default FUSE cache size for fetchers. FODs are typically small
 /// (source tarballs, git clones) — 10Gi is plenty. BuilderPool
@@ -70,7 +65,7 @@ async fn reconcile_inner(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> 
 
 /// Normal reconcile: make the world match spec.
 async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
-    ephemeral::reconcile_ephemeral(&fp, ctx).await
+    jobs::reconcile(&fp, ctx).await
 }
 
 /// Cleanup: ownerRef GC handles the Jobs. Fetches are short-lived

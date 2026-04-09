@@ -39,7 +39,7 @@ fn event_post_scenario(reason: &'static str) -> Scenario {
 }
 
 /// Scenarios for the ephemeral-mode path AFTER `warn_on_spec_degrades`:
-/// `reconcile_ephemeral` lists Jobs → polls ClusterStatus (dead
+/// `reconcile_static` lists Jobs → polls ClusterStatus (dead
 /// admin → queued=0, no HTTP) → patches status. Only the two
 /// apiserver calls appear in scenarios; the failed gRPC is just
 /// a logged warn.
@@ -56,7 +56,7 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
             })
             .to_string(),
         ),
-        // Status patch — reconcile_ephemeral reports active/ceiling.
+        // Status patch — reconcile_static reports active/ceiling.
         Scenario::ok(
             http::Method::PATCH,
             "/builderpools/test-pool/status",
@@ -253,7 +253,7 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 
     apply(Arc::new(wp), &ctx)
         .await
-        .expect("apply completes (reconcile_ephemeral path)");
+        .expect("apply completes (reconcile_static path)");
 
     guard.verified().await;
 }
