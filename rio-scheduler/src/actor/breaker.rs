@@ -13,7 +13,9 @@
 //! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
 //! only if a third breaker appears.
 
-use super::*;
+use std::time::Instant;
+
+use tracing::{info, warn};
 
 /// Circuit breaker for the scheduler's cache-check FindMissingPaths call.
 ///

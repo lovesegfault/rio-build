@@ -2,7 +2,15 @@
 // r[impl sched.completion.idempotent]
 // r[impl sched.critical-path.incremental]
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+
+use super::DagActor;
 
 /// Timeout for the CA cutoff-compare realisation lookup.
 ///

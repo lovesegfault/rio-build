@@ -4,14 +4,22 @@
 // r[impl sched.executor.dual-register]
 // r[impl sched.executor.deregister-reassign]
 
-use super::*;
+use std::collections::HashMap;
+use std::time::Instant;
+
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::dag::DerivationDag;
+use crate::state::{DerivationStatus, DrvHash, ExecutorId, ExecutorState};
 
 /// Initial-hint budget: max store paths to send in the registration-
 /// time `PrefetchHint`. A broad common-set (glibc, stdenv, etc.) is the
 /// intent, not the entire queue's closure. See [`on_worker_registered`].
 ///
 /// [`on_worker_registered`]: DagActor::on_worker_registered
-use super::MAX_PREFETCH_PATHS;
+use super::{DagActor, DrainResult, HeartbeatPayload, MAX_PREFETCH_PATHS};
 
 /// Initial-hint scan budget: max Ready derivations to consider. Don't
 /// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40

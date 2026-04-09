@@ -1,7 +1,19 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
 // r[impl sched.overflow.up-only]
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use tracing::{debug, error, info, warn};
+
+use rio_proto::types::FindMissingPathsRequest;
+
+use crate::estimator::Estimator;
+use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+
+use super::DagActor;
+#[cfg(test)]
+use super::backdate;
 
 /// Per-dispatch-pass accumulators threaded through
 /// [`DagActor::try_dispatch_one`]. The drain loop in

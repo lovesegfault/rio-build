@@ -3,7 +3,20 @@
 // r[impl sched.merge.shared-priority-max]
 // r[impl sched.merge.toctou-serial]
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use tokio::sync::broadcast;
+use tonic::transport::Channel;
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+use rio_proto::StoreServiceClient;
+use rio_proto::types::FindMissingPathsRequest;
+
+use crate::state::{BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash};
+
+use super::{ActorError, DagActor, MergeDagRequest};
 
 /// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
 /// [`DagActor::reconcile_merged_state`].

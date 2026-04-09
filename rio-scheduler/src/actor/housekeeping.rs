@@ -8,7 +8,18 @@
 //! Keeping them separate makes "what runs every Tick" discoverable
 //! without scrolling past 1000 lines of heartbeat-reconcile.
 
-use super::*;
+use std::sync::Arc;
+use std::time::Instant;
+
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::state::{
+    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS,
+    MAX_MISSED_HEARTBEATS, POISON_TTL,
+};
+
+use super::DagActor;
 
 /// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the

@@ -10,6 +10,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+// `broadcast` and the `crate::state` heartbeat/poison constants below
+// are not used by mod.rs directly — they're pulled through `use
+// super::*` by `recovery.rs` / `tests/` (b03 scope, glob-import
+// retained). Once those modules switch to explicit imports, drop
+// these.
+#[allow(unused_imports)]
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
@@ -23,6 +29,7 @@ use crate::db::SchedulerDb;
 use crate::estimator::Estimator;
 use crate::lease::LeaderState;
 use crate::queue::ReadyQueue;
+#[allow(unused_imports)]
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
     HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, RetryPolicy,

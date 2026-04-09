@@ -6,7 +6,16 @@
 //! lookups (`emit_progress`, `handle_forward_*`, `trigger_log_flush`)
 //! stay on `DagActor` and call into the bus.
 
-use super::*;
+use std::collections::HashMap;
+use std::time::Instant;
+
+use tokio::sync::{broadcast, mpsc};
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::state::DrvHash;
+
+use super::{BUILD_EVENT_BUFFER_SIZE, DagActor};
 
 /// Minimum interval between `BuildProgress` emits for one build (I-140).
 /// `emit_progress` → `build_summary` is O(dag_nodes); on a 153k-node DAG
