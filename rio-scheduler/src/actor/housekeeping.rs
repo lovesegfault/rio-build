@@ -57,6 +57,11 @@ const BACKSTOP_SLACK_SECS: u64 = 0;
 /// waiting 5 minutes.
 #[cfg(not(test))]
 const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+// CAUTION: with zero grace, the orphan sweep cancels ANY Active build whose
+// `build_events` receiver count is 0 on the SECOND Tick after the drop. A
+// test that drops/ignores the `event_rx` returned from MergeDag and then
+// sends `Tick` ≥2× will silently lose its derivations to auto-cancel. If a
+// test's build vanishes mid-sequence, check whether `event_rx` is held.
 #[cfg(test)]
 const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
