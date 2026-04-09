@@ -192,9 +192,13 @@ pub struct ActorHarness {
 }
 
 impl ActorHarness {
-    /// Spawn ephemeral PG + actor. Mirrors what `setup_actor` does
-    /// inside rio-scheduler's `#[cfg(test)]` modules, but built from
-    /// the public API so an external crate can drive it.
+    /// Spawn ephemeral PG + actor via the public
+    /// [`ActorHandle::spawn`] API. Conceptually mirrors the
+    /// `#[cfg(test)] setup_actor` helper in rio-scheduler, but does
+    /// NOT depend on it — when `DagActorConfig`/`DagActorPlumbing`
+    /// grow fields, both update independently (the bench wants
+    /// `Default::default()` for everything; tests often want a custom
+    /// closure).
     // r[impl bench.harness-scope]
     pub async fn spawn() -> anyhow::Result<Self> {
         let db = TestDb::new(&rio_scheduler::MIGRATOR).await;
@@ -238,8 +242,9 @@ pub struct BenchHarness {
 
 impl BenchHarness {
     /// Spawn the full stack: [`ActorHarness::spawn`] + gRPC server +
-    /// connected client. Mirrors what `SchedulerGrpc::new_for_tests`
-    /// does inside rio-scheduler's `#[cfg(test)]` modules.
+    /// connected client. Uses the public
+    /// [`SchedulerGrpc::with_log_buffers`] constructor (the same one
+    /// `main.rs` wires) — no `#[cfg(test)]` surface needed.
     pub async fn spawn() -> anyhow::Result<Self> {
         let inner = ActorHarness::spawn().await?;
         let actor = inner.actor.clone();

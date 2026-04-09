@@ -343,8 +343,12 @@ impl DagActor {
             // Fresh broadcast channel. Late WatchBuild subscribers
             // get new events from here; events before recovery are
             // served from build_event_log replay (WatchBuild with
-            // since_sequence reads from PG).
-            let _ = self.events.register(row.build_id);
+            // since_sequence reads from PG). The returned
+            // `broadcast::Receiver` is intentionally dropped:
+            // recovery itself doesn't subscribe, it only needs the
+            // channel to EXIST so emit_build_event has a sender and
+            // late WatchBuild calls can `events.subscribe(id)`.
+            drop(self.events.register(row.build_id));
             self.builds.insert(row.build_id, info);
         }
 

@@ -66,6 +66,23 @@ impl LogBuffers {
     }
 
     /// Push a batch. Evicts oldest lines if the buffer exceeds `RING_CAPACITY`.
+    ///
+    /// # Late-push leak (known, bounded by builds-per-process)
+    ///
+    /// `.entry().or_default()` will RECREATE a buffer for `drv_path` if
+    /// it was already removed by [`Self::drain`]. The race: completion
+    /// fires `FlushRequest::Completion` → flusher drains → entry gone →
+    /// a late `LogBatch` (still in flight on the same BuildExecution
+    /// stream, batched before the worker sent CompletionReport) lands
+    /// here and recreates an entry that nothing will drain again. The
+    /// per-buffer ring cap bounds memory; entry COUNT is unbounded
+    /// over scheduler lifetime.
+    ///
+    /// TODO: close by having the actor call a `seal(drv_path)` on
+    /// dispatch-end (so push() becomes `get_mut`-only), or by sweeping
+    /// keys not in the actor's live drv set on Tick. Both require
+    /// touching `actor/{dispatch,completion}.rs`; deferred until that
+    /// surface is stable.
     pub fn push(&self, batch: &BuildLogBatch) {
         // `entry()` locks the shard's write lock for the duration of the
         // closure. For the same-key case (one worker per drv_path), this is
