@@ -21375,6 +21375,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "rio-store",
+          "packageId": "rio-store"
+        },
+        {
           "name": "serde",
           "packageId": "serde"
         },

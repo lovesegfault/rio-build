@@ -16,6 +16,12 @@ path = "src/main.rs"
 rio-common = { workspace = true, features = ["postgres", "aws"] }
 rio-auth = { workspace = true }
 rio-proto = { workspace = true }
+# `schema`-only: just `realisations` + `error` (sqlx + thiserror), no
+# aws-sdk-s3/axum/moka/reqwest. Lets ca/resolve.rs delegate to
+# `rio_store::realisations::query` instead of carrying a raw-SQL copy
+# — single owner for the realisations table SQL. The dev-dep below
+# adds `test-utils` (→ `server`) for test fixtures.
+rio-store = { workspace = true, features = ["schema"] }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

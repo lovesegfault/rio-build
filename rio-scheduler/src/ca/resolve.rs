@@ -68,6 +68,14 @@ pub enum ResolveError {
     #[error("database error during resolution: {0}")]
     Db(#[from] sqlx::Error),
 
+    /// DB error from `rio_store::realisations::query`. Same
+    /// retry-ability as [`Db`](Self::Db); separate variant only
+    /// because rio-store's accessors return the SQLSTATE-classified
+    /// [`MetadataError`](rio_store::error::MetadataError) rather than
+    /// raw `sqlx::Error`.
+    #[error("realisations lookup: {0}")]
+    Store(#[from] rio_store::error::MetadataError),
+
     /// No `drv_content` available. Resolution requires the full
     /// ATerm to parse `inputDrvs` and perform placeholder replacement.
     /// Caller should fetch from store or defer.
@@ -489,33 +497,20 @@ pub async fn insert_realisation_deps(
 /// the PG pool and migrations), not via the store gRPC. ADR-018 §3:
 /// "resolution logic belongs in the scheduler."
 ///
-/// TODO: replace this raw-SQL copy with
-/// `rio_store::realisations::query` (now `pub`). Blocked: a
-/// `schema`-only feature on rio-store cascades — `realisations::query`
-/// returns `metadata::MetadataError`, and `metadata/mod.rs` interleaves
-/// the error enum with `ManifestKind`/`NarinfoRow`/queries across ~500
-/// lines + 6 submodules, pulling `bytes` + `rio_proto::validated` even
-/// for the bare enum. Making `default-features = false` actually drop
-/// aws-sdk-s3/axum/moka/reqwest requires (a) extracting
-/// `MetadataError` + `From<sqlx::Error>` into an always-on module,
-/// (b) marking ~15 deps `optional`, (c) `required-features` on the
-/// bin, (d) gating `describe_metrics()` + `build.rs`. That's a
-/// rio-store structural refactor, not a flag add. Alternative: move
-/// the `realisations` table accessors to `rio_common::schema` (already
-/// a shared dep, already has `postgres` feature).
+/// Thin wrapper over [`rio_store::realisations::query`] that drops the
+/// fields resolve doesn't need (only `output_path` matters here). The
+/// `schema` feature on rio-store keeps that dep lean — just sqlx +
+/// thiserror, none of the aws-sdk-s3/axum/moka server tree.
 pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],
     output_name: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = $2",
+) -> Result<Option<String>, rio_store::error::MetadataError> {
+    Ok(
+        rio_store::realisations::query(pool, modular_hash, output_name)
+            .await?
+            .map(|r| r.output_path),
     )
-    .bind(modular_hash.as_slice())
-    .bind(output_name)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(p,)| p))
 }
 
 /// A prior realisation: some OTHER derivation that produced the same
