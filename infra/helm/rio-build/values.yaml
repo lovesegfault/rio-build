@@ -145,13 +145,9 @@ dualStack:
 
 networkPolicy:
   enabled: true
-  # S3 VPC endpoint CIDR for builder direct-S3 reads (presigned URLs
-  # from store). AWS-specific; varies by VPC. Unset → no S3 egress rule
-  # rendered (builder fetches chunks via store gRPC only).
-  builderS3Cidr: ""
   # S3 VPC endpoint CIDR for store direct-S3 writes (chunk upload).
-  # Same operator-set pattern as builderS3Cidr. Unset → no S3 egress
-  # rule in store-egress (store uses local filesystem backend only).
+  # AWS-specific; varies by VPC. Unset → no S3 egress rule in
+  # store-egress (store uses local filesystem backend only).
   storeS3Cidr: ""
 
 # Prometheus-operator scrape wiring. Renders ServiceMonitor + PodMonitor +

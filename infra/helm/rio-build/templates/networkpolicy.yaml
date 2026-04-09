@@ -41,16 +41,6 @@ spec:
     {{- include "rio.egressScheduler" . | nindent 4 }}
     # Store: GetPath inputs, PutPath outputs. Cross-ns to rio-store.
     {{- include "rio.egressStore" . | nindent 4 }}
-    {{- with .Values.networkPolicy.builderS3Cidr }}
-    # S3 VPC endpoint CIDR — builder reads chunks directly from S3 when
-    # the store hands back a presigned URL. Only rendered when the
-    # operator sets the endpoint CIDR (AWS-specific; varies by VPC).
-    # AWS VPC endpoints are IPv4-only (no AAAA); the value here is a v4
-    # CIDR even on dual-stack clusters.
-    - to:
-        - ipBlock: {cidr: {{ . }}}
-      ports: [{protocol: TCP, port: 443}]
-    {{- end }}
 ---
 # r[impl fetcher.netpol.egress-open]
 #
@@ -249,8 +239,10 @@ spec:
         - ipBlock: {cidr: fc00::/7}
       ports: [{protocol: TCP, port: 5432}]
     {{- with .Values.networkPolicy.storeS3Cidr }}
-    # S3 VPC endpoint CIDR — store writes chunks directly. Same
-    # operator-set pattern as builderS3Cidr.
+    # S3 VPC endpoint CIDR — store writes chunks directly. Only
+    # rendered when the operator sets the endpoint CIDR (AWS-specific;
+    # varies by VPC). VPC endpoints are IPv4-only (no AAAA); the value
+    # here is a v4 CIDR even on dual-stack clusters.
     - to:
         - ipBlock: {cidr: {{ . }}}
       ports: [{protocol: TCP, port: 443}]
