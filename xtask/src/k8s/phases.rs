@@ -123,10 +123,8 @@ pub(super) struct PhaseParams {
 /// each blocked phase ties up a runtime worker — but a slip is now a
 /// throughput cost, not a wall-clock-doubling stall.
 ///
-/// `ui::step` is concurrency-aware (span-scoped depth, see ui.rs
-/// `DepthLayer`); interleaved ✓/✗ lines from concurrent phases render
-/// with correct indentation. The transient spinner is best-effort
-/// (last-enter-wins) — acceptable, the persistent tree is the record.
+/// `ui::step` wraps each phase in a `tracing::info_span!` so the
+/// per-phase close event (and any error) carries the phase name.
 pub(super) async fn run_up_phases<A, E>(
     p: Arc<dyn Provider>,
     cfg: Arc<XtaskConfig>,

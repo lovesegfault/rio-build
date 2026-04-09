@@ -2,11 +2,6 @@
 //!
 //! Invoke via the workspace alias: `cargo xtask <cmd>`.
 
-// Raw println!/eprintln! land on top of the bottom-line spinner.
-// Use tracing::info!() or ui::suspend(|| println!(...)) instead.
-// Allowed where no spinner is active (e.g. --list output, pre-init).
-#![deny(clippy::print_stdout, clippy::print_stderr)]
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
