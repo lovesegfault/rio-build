@@ -1,18 +1,18 @@
 //! End-to-end smoke test via SSM-tunneled gateway.
 //!
-//! Replaces `infra/eks/smoke-test.sh`:
-//!   1. bootstrap tenant via rio-cli in scheduler leader pod
-//!   2. generate SSH key, install as authorized_keys Secret, restart gateway
-//!   3. wait NLB target health, start SSM tunnel, read SSH banner
-//!   4. build a trivial derivation through ssh-ng:// (tiny output, inline-in-PG path)
-//!   5. build a large-output derivation (NAR > 256 KiB → chunked S3 path → IRSA)
-//!   6. worker-kill chaos: kill a pod mid-build, assert reassign + metric bump
+//! EKS-unique surface only — VM tests (`nix/tests/`) cover the
+//! trivial-build path and worker-kill chaos. This validates:
+//!   1. bootstrap tenant via rio-cli (port-forwarded scheduler+store)
+//!   2. install SSH key, restart gateway
+//!   3. NLB target registration + health (aws-lbc reconcile)
+//!   4. SSM tunnel through bastion → NLB → gateway
+//!   5. large-output build (NAR > 256 KiB → chunked S3 path → IRSA)
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use ::kube::api::{Api, DeleteParams, ListParams};
+use ::kube::api::{Api, ListParams};
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
@@ -167,21 +167,14 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             step_fetcherpool_reconciled(&client)
         })
         .await?;
-        ui::step("trivial build (cold-start ~2-3min)", || {
-            smoke_build("fast", 5, 1, &store_url)
-        })
-        .await?;
         // 1 MiB NAR — well over cas::INLINE_THRESHOLD (256 KiB) —
         // forces PutPath down the chunked-S3 path. Catches store-side
         // S3-credential faults (IRSA drift, bucket policy, endpoint
-        // misconfig) that the inline path silently skips.
+        // misconfig) that the inline path silently skips. Trivial-
+        // build (inline-PG path) and worker-kill chaos are covered by
+        // the VM test suite; here we exercise only EKS-unique infra.
         ui::step("large-NAR build (S3 chunked path)", || {
             smoke_build("large", 5, 1024, &store_url)
-        })
-        .await?;
-        ui::step("rio-cli status", || step_status(&cli)).await?;
-        ui::step("worker-kill chaos", || {
-            step_worker_kill(&client, &store_url)
         })
         .await
     })
@@ -574,144 +567,6 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
     wait_cr_status::<FetcherPool>(client, NS_FETCHERS, FETCHER_POOL).await
-}
-
-pub async fn step_status(cli: &CliCtx) -> Result<()> {
-    info!("checking cluster status");
-    // CliCtx::run ? is correct here: rio-cli status exits 0 on any
-    // reachable state (empty cluster → empty lists, still exit 0).
-    // Non-zero means an RPC failed (tunnel broke, TLS, timeout) —
-    // unrecoverable for a smoke step. No match-on-Err needed; contrast
-    // step_tenant where create-tenant exits non-zero on AlreadyExists.
-    let out = cli.run(&["status"])?;
-    // suspend the spinner before dumping multi-line output.
-    #[allow(clippy::print_stdout)]
-    crate::ui::suspend(|| println!("{out}"));
-    // Ephemeral single-build-per-pod: workers exit after the trivial +
-    // large builds complete, so "worker " is legitimately absent here.
-    // The pre-ephemeral check asserted standing STS replicas (I-153).
-    // The status RPC working + builds appearing is the real assertion.
-    if !out.contains("build ") {
-        bail!("no builds in status output");
-    }
-    Ok(())
-}
-
-/// baseline + bg-build(+its inner) + >=2-poll + kill + await + verify
-pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
-    let before = ui::step("capture disconnect baseline", || async {
-        let b = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
-        info!("baseline: {b}");
-        Ok::<_, anyhow::Error>(b)
-    })
-    .await?;
-
-    // I-155: kill ALL running builders (mass-disconnect resilience —
-    // models a node failure). The wait condition is the load-bearing
-    // part: snapshot pre-spawn pods and poll until a NEW pod is
-    // Running. The previous build's pod lingers Running for a few
-    // seconds (graceful exit + upload); polling for "any Running"
-    // matched it and killed before the chaos build's pod even existed.
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
-    let running_builders = || {
-        let pods = pods.clone();
-        async move {
-            Ok::<_, anyhow::Error>(
-                pods.list(&ListParams::default().labels("rio.build/role=builder"))
-                    .await?
-                    .items
-                    .into_iter()
-                    .filter(|p| {
-                        p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
-                    })
-                    .filter_map(|p| p.metadata.name)
-                    .collect::<Vec<_>>(),
-            )
-        }
-    };
-    let pre_spawn: std::collections::HashSet<String> =
-        running_builders().await?.into_iter().collect();
-
-    info!("starting background build (180s)");
-    let store_url = store_url.to_string();
-    // step_owned (not step) so the span is created synchronously here
-    // — inside the phase — before spawn moves the future to a worker
-    // with no span context.
-    let build = tokio::spawn(ui::step_owned("background build".into(), async move {
-        smoke_build("slow", 180, 1, &store_url).await
-    }));
-
-    ui::poll(
-        "chaos build's pod Running",
-        Duration::from_secs(10),
-        18,
-        || {
-            let f = running_builders();
-            let pre = pre_spawn.clone();
-            async move { Ok(f.await?.into_iter().find(|p| !pre.contains(p))) }
-        },
-    )
-    .await?;
-
-    ui::step("kill all builder pods", || async {
-        let victims = running_builders().await?;
-        info!("victims ({}): {}", victims.len(), victims.join(", "));
-        for victim in &victims {
-            pods.delete(victim, &DeleteParams::default()).await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?;
-
-    ui::step("await build (should survive reassign)", || async {
-        build.await??;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?;
-
-    // The build reassigns fast (seconds) but the killed pod's graceful
-    // SIGTERM shutdown takes up to terminationGracePeriodSeconds (~30s
-    // default) before the gRPC stream actually closes. Poll until the
-    // counter moves or give up.
-    ui::poll(
-        "disconnect counter increased",
-        Duration::from_secs(5),
-        12,
-        || async {
-            let after = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
-            info!("before={before} after={after}");
-            Ok((after > before).then_some(()))
-        },
-    )
-    .await
-}
-
-/// Scrape a metric from the scheduler leader via port-forward.
-async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
-    let leader = kube::scheduler_leader(client, NS).await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
-    let mut pf = pods.portforward(&leader, &[9091]).await?;
-    let stream = pf.take_stream(9091).context("no portforward stream")?;
-
-    // kube's portforward returns a duplex stream; hand-roll a minimal
-    // HTTP GET over it (pulling hyper just for one metrics scrape is
-    // heavier than 10 lines of HTTP/1.0).
-    use tokio::io::AsyncWriteExt;
-    let mut stream = stream;
-    stream
-        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        .await?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).await?;
-
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix(name)
-            && let Some(v) = rest.split_whitespace().last()
-        {
-            return Ok(v.parse().unwrap_or(0.0));
-        }
-    }
-    Ok(0.0)
 }
 
 /// nix-instantiate + nix copy + nix build

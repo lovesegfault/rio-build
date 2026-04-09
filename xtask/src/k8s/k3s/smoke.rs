@@ -43,21 +43,13 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             chaos::step_fetcherpool_reconciled(&client)
         })
         .await?;
-        ui::step("trivial build", || {
-            chaos::smoke_build("fast", 5, 1, &store_url)
-        })
-        .await?;
         // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces
-        // the chunked object-store path. On k3s the backend is
-        // rook, not S3 — but a misconfigured bucket endpoint
-        // or credential fails the same way. See I-006.
+        // the chunked object-store path. On k3s the backend is rook,
+        // not S3 — but a misconfigured bucket endpoint or credential
+        // fails the same way (I-006). Trivial-build + worker-kill
+        // chaos are covered by the VM test suite.
         ui::step("large-NAR build", || {
             chaos::smoke_build("large", 5, 1024, &store_url)
-        })
-        .await?;
-        ui::step("rio-cli status", || chaos::step_status(&cli)).await?;
-        ui::step("worker-kill chaos", || {
-            chaos::step_worker_kill(&client, &store_url)
         })
         .await
     })
