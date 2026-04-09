@@ -3,7 +3,25 @@
 //! [`StoreServiceImpl`]; the `StoreService` trait impl in `mod.rs`
 //! delegates here so the trait body stays a flat list of one-liners.
 
-use super::*;
+use tonic::{Request, Response, Status};
+use tracing::warn;
+
+use rio_proto::types::{
+    AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
+    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, FindMissingPathsRequest,
+    FindMissingPathsResponse, ManifestEntry, ManifestHint, PathInfo, PathInfoEntry,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
+    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
+    TenantQuotaResponse,
+};
+
+use rio_common::grpc::StatusExt;
+use rio_common::tenant::NormalizedName;
+
+use crate::metadata::{self, ManifestKind};
+use crate::realisations;
+
+use super::{StoreServiceImpl, metadata_status, validate_store_path};
 
 impl StoreServiceImpl {
     /// DoS bound + per-path format check shared by the batch read RPCs.

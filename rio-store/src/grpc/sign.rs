@@ -4,7 +4,16 @@
 //! (sign-on-upload), PutPathBatch (resolve-once-sign-N), and the
 //! read RPCs (sig-gate on QueryPathInfo/GetPath).
 
-use super::*;
+use tonic::Status;
+use tracing::{debug, warn};
+
+use rio_proto::validated::ValidatedPathInfo;
+
+use rio_common::grpc::StatusExt;
+
+use crate::metadata::{self};
+
+use super::{StoreServiceImpl, metadata_status};
 
 impl StoreServiceImpl {
     // r[impl store.substitute.tenant-sig-visibility]
@@ -218,9 +227,17 @@ impl StoreServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
+    use sqlx::PgPool;
+
     use rio_test_support::fixtures::{make_path_info, test_store_path};
     use tracing_test::traced_test;
+
+    use crate::signing::TenantSigner;
+    use crate::substitute::Substituter;
+
+    use super::*;
 
     /// Build a StoreServiceImpl with a test signer but no DB/backend.
     /// These tests pass `tenant_id: None` to `maybe_sign`, so the pool

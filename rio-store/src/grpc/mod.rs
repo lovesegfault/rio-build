@@ -18,39 +18,29 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument};
 
-use rio_proto::ChunkService;
 use rio_proto::StoreService;
-use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
-    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, FindMissingPathsRequest,
-    FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
-    ManifestEntry, ManifestHint, PathInfo, PathInfoEntry, PutPathBatchRequest,
-    PutPathBatchResponse, PutPathRequest, PutPathResponse, PutPathTrailer,
-    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
-    TenantQuotaResponse, get_path_response, put_path_request,
+    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, FindMissingPathsRequest,
+    FindMissingPathsResponse, GetPathRequest, PathInfo, PutPathBatchRequest, PutPathBatchResponse,
+    PutPathRequest, PutPathResponse, QueryPathFromHashPartRequest, QueryPathInfoRequest,
+    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
+    TenantQuotaRequest, TenantQuotaResponse,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::grpc::StatusExt;
 use rio_common::limits::MAX_NAR_SIZE;
-use rio_common::tenant::NormalizedName;
 
 use crate::backend::ChunkBackend;
 use crate::cas::{self, ChunkCache};
-use crate::metadata::{self, ManifestKind};
-use crate::realisations;
+use crate::metadata;
 use crate::signing::TenantSigner;
 use crate::substitute::{SubstituteError, Substituter};
-use crate::validate::validate_nar_digest;
 
 mod admin;
 mod chunk;
@@ -184,12 +174,6 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
     }
     metadata_status(context, e)
 }
-
-// `validate_put_metadata` + `apply_trailer` live in
-// `put_path::common` now (the fault-line NOTE that was here said to
-// extract them once mod.rs crossed 1000L — it did). Re-exported via
-// `put_path` so `put_path_batch`'s `use super::*` still resolves.
-use put_path::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
 
 /// The StoreService gRPC server.
 ///

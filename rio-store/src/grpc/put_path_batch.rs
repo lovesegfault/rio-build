@@ -26,9 +26,20 @@
 use std::collections::BTreeMap;
 
 use super::put_path::common::NarPersist;
-use super::*;
+
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{error, warn};
+
+use rio_proto::types::{
+    PutPathBatchRequest, PutPathBatchResponse, PutPathTrailer, put_path_request,
+};
+use rio_proto::validated::ValidatedPathInfo;
+
+use crate::metadata::{self};
+
+use super::put_path::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
+use super::{StoreServiceImpl, putpath_metadata_status};
 use rio_common::limits::MAX_BATCH_OUTPUTS;
-use rio_proto::types::{PutPathBatchRequest, PutPathBatchResponse, PutPathTrailer};
 
 /// Per-output accumulation state. One of these per `output_index` seen
 /// on the stream.

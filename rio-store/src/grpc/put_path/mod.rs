@@ -15,7 +15,14 @@
 //! PutPathTrailer after all chunks (stream-and-hash — the client doesn't
 //! know the hash until after transmitting all bytes).
 
-use super::*;
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{debug, warn};
+
+use rio_proto::types::{PutPathRequest, PutPathResponse};
+
+use crate::metadata;
+
+use super::{StoreServiceImpl, putpath_metadata_status};
 
 pub(super) mod common;
 pub(super) use common::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};

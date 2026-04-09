@@ -13,7 +13,24 @@
 //! via `buffered()` (NOT `buffer_unordered` — chunk order matters for
 //! correct NAR reconstruction).
 
-use super::*;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+use tracing::{error, warn};
+
+use rio_proto::client::NAR_CHUNK_SIZE;
+use rio_proto::types::{
+    GetPathRequest, GetPathResponse, ManifestHint, PathInfo, get_path_response,
+};
+
+use rio_common::grpc::StatusExt;
+
+use crate::metadata::{self, ManifestKind};
+
+use super::{StoreServiceImpl, metadata_status, validate_store_path};
 
 pub(super) type GetPathStream = ReceiverStream<Result<GetPathResponse, Status>>;
 

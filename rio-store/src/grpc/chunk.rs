@@ -8,7 +8,16 @@
 //! GetChunk is unscoped: knowing a BLAKE3 hash already proves you have
 //! (or had) the bytes.
 
-use super::*;
+use std::sync::Arc;
+
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+use tracing::instrument;
+
+use rio_proto::ChunkService;
+use rio_proto::types::{GetChunkRequest, GetChunkResponse};
+
+use crate::cas::{self, ChunkCache};
 
 /// ChunkService implementation.
 ///
