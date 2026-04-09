@@ -484,6 +484,18 @@ rec {
             --secret-binary fileb:///tmp/hmac
         fi
 
+        if aws secretsmanager describe-secret --secret-id rio/service-hmac >/dev/null 2>&1; then
+          echo "[bootstrap] rio/service-hmac already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/service-hmac"
+          # SEPARATE key from rio/hmac — gateway signs ServiceClaims with
+          # this; store verifies. A leaked assignment key cannot mint
+          # service tokens (different secret, different claims shape).
+          openssl rand 32 > /tmp/service-hmac
+          aws secretsmanager create-secret --name rio/service-hmac \
+            --secret-binary fileb:///tmp/service-hmac
+        fi
+
         if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1; then
           echo "[bootstrap] rio/signing-key already exists, skipping"
         else
