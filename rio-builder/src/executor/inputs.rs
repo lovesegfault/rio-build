@@ -454,112 +454,78 @@ mod tests {
     }
 
     use rio_test_support::fixtures::seed_store_output as seed_output;
+    use rstest::rstest;
 
-    #[test]
-    fn test_verify_fod_recursive_sha256_ok() -> anyhow::Result<()> {
-        // Recursive mode computes the LOCAL NAR hash. Seed a real
-        // file, compute its NAR hash, use that as the expected hash.
-        let content = b"recursive fod sha256 test content";
-        let (_tmp, store_dir) = seed_output("test-fod", content)?;
-
-        // Compute the NAR hash of the seeded file.
-        let actual_hash = compute_local_nar_hash(&store_dir.join("test-fod"), FodHashAlgo::Sha256)?;
-        let drv = make_fod_drv(
-            "/nix/store/test-fod",
-            "r:sha256",
-            &hex::encode(&actual_hash),
-        );
-
-        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
-        Ok(())
+    /// Compute the *correct* declared-hash hex for `content` seeded at
+    /// `basename` under `store_dir`, given the ATerm hash_algo string.
+    /// Recursive ("r:" prefix) → NAR hash; flat → raw-content digest.
+    fn correct_fod_hash(
+        store_dir: &std::path::Path,
+        basename: &str,
+        content: &[u8],
+        algo: &str,
+    ) -> anyhow::Result<String> {
+        use sha2::Digest;
+        Ok(match algo {
+            "r:sha256" => hex::encode(compute_local_nar_hash(
+                &store_dir.join(basename),
+                FodHashAlgo::Sha256,
+            )?),
+            "r:sha1" => hex::encode(compute_local_nar_hash(
+                &store_dir.join(basename),
+                FodHashAlgo::Sha1,
+            )?),
+            "sha256" => hex::encode(sha2::Sha256::digest(content)),
+            "sha512" => hex::encode(sha2::Sha512::digest(content)),
+            "sha1" => hex::encode(<sha1::Sha1 as sha1::Digest>::digest(content)),
+            other => panic!("test helper: unhandled algo {other}"),
+        })
     }
 
-    #[test]
-    fn test_verify_fod_recursive_sha256_mismatch() -> anyhow::Result<()> {
-        let (_tmp, store_dir) = seed_output("test-fod", b"actual content")?;
-        // Declare a WRONG hash (all-zero digest).
-        let wrong_hash = hex::encode([0u8; 32]);
-        let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", &wrong_hash);
+    /// FOD hash verification across {flat, recursive} × {sha1, sha256, sha512}
+    /// with both matching and mismatching declared hashes. `declare_correct`
+    /// = false means we declare an all-zero digest of the right length and
+    /// expect the verifier to reject with "mismatch".
+    ///
+    /// Covers algo dispatch (a hardcoded-sha256 verifier would false-reject
+    /// the sha1/sha512 ok cases).
+    #[rstest]
+    #[case::recursive_sha256_ok("test-fod", "r:sha256", true)]
+    #[case::recursive_sha256_mismatch("test-fod", "r:sha256", false)]
+    #[case::flat_sha256_ok("test-flat-fod", "sha256", true)]
+    #[case::flat_sha256_mismatch("test-flat-fod", "sha256", false)]
+    #[case::flat_sha1_ok("test-sha1-fod", "sha1", true)]
+    #[case::flat_sha512_ok("test-sha512-fod", "sha512", true)]
+    #[case::recursive_sha1_ok("test-rsha1", "r:sha1", true)]
+    fn test_verify_fod(
+        #[case] basename: &str,
+        #[case] algo: &str,
+        #[case] declare_correct: bool,
+    ) -> anyhow::Result<()> {
+        let content = format!("fod test content for {algo}").into_bytes();
+        let (_tmp, store_dir) = seed_output(basename, &content)?;
+
+        let declared = if declare_correct {
+            correct_fod_hash(&store_dir, basename, &content, algo)?
+        } else {
+            // Wrong hash: all-zero digest of the correct width.
+            let width = correct_fod_hash(&store_dir, basename, &content, algo)?.len();
+            "0".repeat(width)
+        };
+        let drv = make_fod_drv(&format!("/nix/store/{basename}"), algo, &declared);
 
         let result = verify_fod_hashes(&drv, &store_dir);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("mismatch"),
-            "error should mention hash mismatch"
+        assert_eq!(
+            result.is_ok(),
+            declare_correct,
+            "algo={algo} declare_correct={declare_correct}: got {result:?}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_fod_flat_sha256_ok() -> anyhow::Result<()> {
-        use sha2::{Digest, Sha256};
-        let content = b"hello world flat fod content";
-        let expected: [u8; 32] = Sha256::digest(content).into();
-
-        let (_tmp, store_dir) = seed_output("test-flat-fod", content)?;
-        let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &hex::encode(expected));
-
-        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_fod_flat_sha256_mismatch() -> anyhow::Result<()> {
-        use sha2::{Digest, Sha256};
-        let wrong: [u8; 32] = Sha256::digest(b"different content").into();
-
-        let (_tmp, store_dir) = seed_output("test-flat-fod", b"actual content")?;
-        let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &hex::encode(wrong));
-
-        assert!(verify_fod_hashes(&drv, &store_dir).is_err());
-        Ok(())
-    }
-
-    /// sha1 FODs verify correctly (algo dispatch, not hardcoded sha256).
-    #[test]
-    fn test_verify_fod_flat_sha1_ok() -> anyhow::Result<()> {
-        use sha1::Digest;
-        let content = b"sha1 flat fod content";
-        let expected = sha1::Sha1::digest(content);
-
-        let (_tmp, store_dir) = seed_output("test-sha1-fod", content)?;
-        let drv = make_fod_drv("/nix/store/test-sha1-fod", "sha1", &hex::encode(expected));
-
-        assert!(
-            verify_fod_hashes(&drv, &store_dir).is_ok(),
-            "sha1 FOD should verify (algo dispatch; hardcoded sha256 would false-reject)"
-        );
-        Ok(())
-    }
-
-    /// sha512 FODs verify correctly.
-    #[test]
-    fn test_verify_fod_flat_sha512_ok() -> anyhow::Result<()> {
-        use sha2::{Digest, Sha512};
-        let content = b"sha512 flat fod content";
-        let expected = Sha512::digest(content);
-
-        let (_tmp, store_dir) = seed_output("test-sha512-fod", content)?;
-        let drv = make_fod_drv(
-            "/nix/store/test-sha512-fod",
-            "sha512",
-            &hex::encode(expected),
-        );
-
-        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
-        Ok(())
-    }
-
-    /// Recursive sha1 (NAR hash computed via sha1).
-    #[test]
-    fn test_verify_fod_recursive_sha1_ok() -> anyhow::Result<()> {
-        let content = b"r:sha1 nar content";
-        let (_tmp, store_dir) = seed_output("test-rsha1", content)?;
-
-        let actual = compute_local_nar_hash(&store_dir.join("test-rsha1"), FodHashAlgo::Sha1)?;
-        let drv = make_fod_drv("/nix/store/test-rsha1", "r:sha1", &hex::encode(&actual));
-
-        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
+        if !declare_correct {
+            assert!(
+                result.unwrap_err().to_string().contains("mismatch"),
+                "error should mention hash mismatch"
+            );
+        }
         Ok(())
     }
 
