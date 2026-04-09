@@ -30,6 +30,7 @@
 rio_test_support::metrics_suite! {
     describe_fn: rio_scheduler::describe_metrics,
     crate_name: "rio-scheduler",
+    prefix: "rio_scheduler_",
     histogram_buckets: rio_scheduler::HISTOGRAM_BUCKETS,
     spec_floor: 20,
     emit_floor: 30,

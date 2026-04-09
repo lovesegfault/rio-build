@@ -26,15 +26,6 @@ pub mod metrics;
 #[cfg(feature = "full")]
 pub mod wire;
 
-// build-support/metrics_grep.rs is include!()-ed by crate build.rs
-// files, not a public module of this crate. Compile it at test time
-// ONLY so the grep_spec_names self-test runs via `cargo test -p
-// rio-test-support`. The #[allow(dead_code)] attributes inside handle
-// the unused-fn warnings (emit_metrics_grep isn't called from tests).
-#[cfg(test)]
-#[path = "../../build-support/metrics_grep.rs"]
-mod metrics_grep;
-
 // Re-export at crate root — TestDb is the most-used type.
 #[cfg(feature = "full")]
 pub use pg::TestDb;

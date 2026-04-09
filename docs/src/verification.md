@@ -166,7 +166,7 @@ r[ts.wire.helpers]
 `do_handshake` sends the client side of the worker-protocol handshake against a `DuplexStream` (not `client_handshake` — that's the production driver in `rio-nix::protocol::client`). `read_path_info` reads the 8-field `wopQueryPathInfo` body so callsites don't repeat the discard sequence. `drain_stderr_until_last` panics on `STDERR_ERROR`; `drain_stderr_expecting_error` is the inverse for error-path tests.
 
 r[ts.metrics.grep]
-`metrics_grep.rs` is `include!()`-ed by per-crate `build.rs` files (NOT compiled as a test-support module). `metrics_build_main(prefix)` greps the calling crate's `src/` for `metrics::{counter,gauge,histogram}!("...")` literals → `OUT_DIR/emitted_metrics.txt`, and greps `docs/src/observability.md` table rows for `prefix` → `OUT_DIR/spec_metrics.txt`. The grep operates on **source text**, not on a Prometheus scrape — it catches an undescribed metric at build time without running the binary.
+`grep_emitted_names(manifest_dir)` greps the crate's `src/` for `metrics::{counter,gauge,histogram}!("...")` literals; `grep_spec_names(obs_md, prefix)` greps `docs/src/observability.md` table rows. Both run at **test time** from `metrics_suite!` (no per-crate build.rs). The grep operates on **source text**, not on a Prometheus scrape — it catches an undescribed metric without running the binary.
 
 ## Benchmarks
 

@@ -20467,12 +20467,6 @@
           "packageId": "workspace-hack"
         }
       ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
-        }
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -20847,12 +20841,6 @@
           "packageId": "workspace-hack"
         }
       ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
-        }
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -21047,12 +21035,6 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
         }
       ],
       "devDependencies": [
@@ -21423,12 +21405,6 @@
           "packageId": "workspace-hack"
         }
       ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
-        }
-      ],
       "devDependencies": [
         {
           "name": "aws-sdk-s3",
@@ -21646,12 +21622,6 @@
           "packageId": "x509-parser"
         }
       ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
-        }
-      ],
       "devDependencies": [
         {
           "name": "aws-sdk-s3",
@@ -21776,6 +21746,10 @@
           "packageId": "rand 0.10.0"
         },
         {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -21854,10 +21828,6 @@
         {
           "name": "k8s-openapi",
           "packageId": "k8s-openapi"
-        },
-        {
-          "name": "regex",
-          "packageId": "regex"
         }
       ],
       "resolvedDefaultFeatures": [

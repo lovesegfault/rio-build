@@ -40,12 +40,14 @@ full = [
 ]
 
 [dependencies]
-# ─── Unconditional: pg::PgServer bootstrap ──────────────────────────
+# ─── Unconditional: pg::PgServer bootstrap + metrics grep ───────────
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
 scopeguard = { workspace = true }
+# metrics::grep_emitted_names — already transitive in Cargo.lock.
+regex = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # ─── feature = "full" ───────────────────────────────────────────────
@@ -95,10 +97,6 @@ nix = { workspace = true, features = ["process", "signal"] }
 [dev-dependencies]
 # kube_mock's verifier_roundtrip test needs a concrete k8s type (Pod).
 k8s-openapi = { workspace = true }
-# metrics_grep self-test compiles the include!()-ed helper as a
-# cfg(test) module to unit-test grep_spec_names. emit_metrics_grep
-# (unused in the test, but compiled) references regex::Regex.
-regex = { workspace = true }
 
 [build-dependencies]
 # build.rs runs protoc --descriptor_set_out on admin.proto and

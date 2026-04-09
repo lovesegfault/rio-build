@@ -15,6 +15,7 @@
 rio_test_support::metrics_suite! {
     describe_fn: rio_store::describe_metrics,
     crate_name: "rio-store",
+    prefix: "rio_store_",
     histogram_buckets: rio_store::HISTOGRAM_BUCKETS,
     spec_floor: 12,
     emit_floor: 15,

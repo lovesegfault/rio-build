@@ -71,7 +71,6 @@ specs (
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
           rio-auth/src/**/*.rs
-          build-support/**/*.rs
           rio-cli/src/**/*.rs
           rio-test-support/src/**/*.rs
           rio-bench/src/**/*.rs

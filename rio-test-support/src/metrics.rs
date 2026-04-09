@@ -24,7 +24,8 @@
 //! canonical; controller/src/reconcilers/gc_schedule.rs + gateway/tests/ssh_hardening.rs
 //! stripped subsets). P0212 left the breadcrumb at gc_schedule.rs:229.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -276,63 +277,129 @@ impl Recorder for GaugeValues {
 }
 
 // ===========================================================================
+// source-text grep — runs at TEST time (was: per-crate build.rs at BUILD time)
+// ===========================================================================
+
+/// Grep `<manifest_dir>/src/**.rs` for `metrics::{counter,gauge,histogram}!("…")`
+/// macro literals.
+///
+/// Source-text, not a Prometheus scrape: most `metrics::counter!()`
+/// calls are deep in handlers gated on actor state you can't trigger
+/// from a unit test. The failure mode is "developer wrote a literal
+/// string in a macro call" — textual by nature.
+///
+/// `\bmetrics::` prefix is REQUIRED (matches this codebase's
+/// convention — no one imports the macros unqualified) and avoids
+/// false-matching `describe_counter!("…")`. `\s*` handles rustfmt's
+/// multi-line break after the paren.
+// r[impl ts.metrics.grep]
+pub fn grep_emitted_names(manifest_dir: &str) -> Vec<String> {
+    let re = regex::Regex::new(r#"\bmetrics::(?:counter|gauge|histogram)!\s*\(\s*"([a-z0-9_]+)""#)
+        .unwrap();
+    let mut names = BTreeSet::new();
+    fn walk(dir: &Path, re: &regex::Regex, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, re, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for cap in re.captures_iter(&text) {
+                    out.insert(cap[1].to_string());
+                }
+            }
+        }
+    }
+    walk(&Path::new(manifest_dir).join("src"), &re, &mut names);
+    names.into_iter().collect()
+}
+
+/// Grep the observability.md table for metric names with `prefix`.
+///
+/// Table rows look like `` | `rio_component_metric_name` | Type | Desc | ``.
+/// First `|` stripped, cell trimmed of backticks, result must be
+/// purely `[a-z0-9_]+` (rejects prose mentions, comma-separated
+/// cells like the Histogram Buckets table, `{label}` examples,
+/// `|---|---|` separator).
+pub fn grep_spec_names(obs_md_src: &str, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = obs_md_src
+        .lines()
+        .filter_map(|l| {
+            let first = l
+                .strip_prefix('|')?
+                .split('|')
+                .next()?
+                .trim()
+                .trim_matches('`');
+            (first.starts_with(prefix)
+                && !first.is_empty()
+                && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .then(|| first.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+// ===========================================================================
 // metrics_suite! — generates the 3-test metrics_registered.rs body
 // ===========================================================================
 
 /// Expand to the three `metrics_registered.rs` tests
-/// (spec→describe, emit→describe, describe→buckets) plus the two
-/// `include_str!(OUT_DIR/…)` consts they consume.
+/// (spec→describe, emit→describe, describe→buckets).
 ///
 /// Invoked once per crate at `tests/metrics_registered.rs`. The
 /// `// r[verify obs.metric.X]` tracey marker goes ABOVE the macro
-/// invocation in the source file (tracey reads source text, not
-/// macro expansions).
+/// invocation (tracey reads source text, not macro expansions).
+///
+/// The grep runs at test time against `env!("CARGO_MANIFEST_DIR")` —
+/// no build.rs, no `OUT_DIR` artifacts, no per-crate build-script
+/// invocation on every `cargo build`.
 ///
 /// Parameters:
 /// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
 /// - `crate_name`: human-readable name for error messages
+/// - `prefix`: `"rio_X_"` — selects this crate's rows from observability.md
 /// - `histogram_buckets`: the crate's `pub const HISTOGRAM_BUCKETS` table
 /// - `spec_floor`: min rows expected in the obs.md table (vacuity guard)
 /// - `emit_floor`: min `metrics::*!` literals expected in src/ (regex-health guard)
 /// - `default_buckets_ok`: histograms deliberately on `[0.005..10.0]` defaults
-///
-/// The per-crate `HISTOGRAM_BUCKETS` table is passed at
-/// the call site — every caller already depends on `rio-common`.
 #[macro_export]
 macro_rules! metrics_suite {
     (
         describe_fn: $describe_fn:path,
         crate_name: $crate_name:literal,
+        prefix: $prefix:literal,
         histogram_buckets: $histogram_buckets:expr,
         spec_floor: $spec_floor:literal,
         emit_floor: $emit_floor:literal,
         default_buckets_ok: [$($ok:literal),* $(,)?] $(,)?
     ) => {
-        const SPEC_METRICS_RAW: &str =
-            include_str!(concat!(env!("OUT_DIR"), "/spec_metrics.txt"));
-        const EMITTED_METRICS: &str =
-            include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
-
         #[test]
         fn all_spec_metrics_have_describe_call() {
-            let spec_metrics: ::std::vec::Vec<&str> =
-                SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
+            let obs_md = ::std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../docs/src/observability.md"
+            ))
+            .expect("read docs/src/observability.md");
+            let spec = $crate::metrics::grep_spec_names(&obs_md, $prefix);
             assert!(
-                spec_metrics.len() >= $spec_floor,
-                "spec_metrics.txt has only {} entries — build.rs grep broken?",
-                spec_metrics.len()
+                spec.len() >= $spec_floor,
+                "obs.md grep found only {} {} entries — table format changed?",
+                spec.len(),
+                $prefix,
             );
-            $crate::metrics::assert_spec_metrics_described(
-                &spec_metrics,
-                $describe_fn,
-                $crate_name,
-            );
+            let spec: ::std::vec::Vec<&str> = spec.iter().map(String::as_str).collect();
+            $crate::metrics::assert_spec_metrics_described(&spec, $describe_fn, $crate_name);
         }
 
         #[test]
         fn all_emitted_metrics_are_described() {
+            let emitted =
+                $crate::metrics::grep_emitted_names(env!("CARGO_MANIFEST_DIR")).join("\n");
             $crate::metrics::assert_emitted_metrics_described(
-                EMITTED_METRICS,
+                &emitted,
                 $emit_floor,
                 $describe_fn,
                 $crate_name,
@@ -412,9 +479,8 @@ pub fn assert_emitted_metrics_described(
 
     assert!(
         emitted.len() >= min_emitted,
-        "EMITTED_METRICS has only {} entries (threshold {min_emitted}) — \
-         build-script grep likely broke (check build.rs regex vs. src/ \
-         macro call style)",
+        "emitted-metrics grep found only {} entries (threshold {min_emitted}) — \
+         regex likely broke (check grep_emitted_names vs. src/ macro call style)",
         emitted.len()
     );
 
@@ -491,4 +557,35 @@ pub fn assert_histograms_have_buckets(
          configured: {configured:?}\n\
          exempt: {exempt:?}"
     );
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::grep_spec_names;
+
+    #[test]
+    fn grep_extracts_table_column_one() {
+        let obs_md = "\
+| Metric | Type | Description |
+|---|---|---|
+| `rio_gateway_foo_total` | Counter | desc |
+| `rio_gateway_bar_seconds` | Histogram | desc |
+| rio_scheduler_baz | Counter | wrong prefix (excluded) |
+| `rio_gateway_foo_total` | Counter | dup row — deduped |
+
+prose mention of rio_gateway_inline (excluded — no leading `|`)
+
+| `rio_gateway_foo_total`, `rio_builder_bar` | `[1, 5]` | excluded — comma-sep cell |
+";
+        assert_eq!(
+            grep_spec_names(obs_md, "rio_gateway_"),
+            vec!["rio_gateway_bar_seconds", "rio_gateway_foo_total"],
+            "sort+dedup; prose, comma-cells excluded"
+        );
+        // Separator + header rows excluded.
+        assert_eq!(
+            grep_spec_names("|---|---|\n| `rio_x_ok` | g |\n", "rio_x_"),
+            vec!["rio_x_ok"]
+        );
+    }
 }

@@ -9,6 +9,7 @@
 rio_test_support::metrics_suite! {
     describe_fn: rio_builder::describe_metrics,
     crate_name: "rio-builder",
+    prefix: "rio_builder_",
     histogram_buckets: rio_builder::HISTOGRAM_BUCKETS,
     spec_floor: 10,
     emit_floor: 15,
