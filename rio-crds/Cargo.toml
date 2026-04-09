@@ -8,10 +8,16 @@ repository.workspace = true
 publish = false
 description = "CustomResourceDefinition types for rio-build (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)"
 
-# CRD types extracted from rio-controller so rio-cli (P0237) can
-# depend on them without pulling the full reconciler stack (~500
-# transitive deps via kube-runtime). This crate is type-definitions
-# only — no reconcile logic, no kube::Client, no tokio runtime.
+# CRD types + thin kube::Error classification helpers, extracted from
+# rio-controller so rio-cli (P0237) and rio-scheduler can depend on
+# them without pulling the full reconciler stack (~500 transitive
+# deps via kube-runtime). No reconcile logic, no kube::Client, no
+# tokio runtime — only `kube` with the `derive` feature.
+#
+# The error helpers (KubeErrorExt/KubeResultExt) live here because
+# rio-common is intentionally kube-free and rio-controller is too
+# heavy for scheduler/xtask to depend on. This crate is the lightest
+# kube-adjacent leaf in the workspace.
 
 [dependencies]
 # `derive` feature only — CustomResource + KubeSchema proc-macros.

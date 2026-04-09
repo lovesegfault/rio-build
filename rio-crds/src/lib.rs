@@ -13,6 +13,14 @@
 //! Extracted from rio-controller so rio-cli can import CRD types
 //! without the full reconciler dependency graph. rio-controller
 //! re-exports this crate verbatim (`pub use rio_crds as crds;`).
+//!
+//! Also hosts [`KubeErrorExt`]/[`KubeResultExt`] — small
+//! `kube::Error` classification helpers shared by
+//! controller/scheduler/xtask. Not strictly "type definitions",
+//! but this is the lightest kube-adjacent crate in the workspace
+//! (rio-common stays kube-free; rio-controller pulls
+//! kube-runtime), so they live here rather than spawning a
+//! `rio-kube` micro-crate for ~30 lines.
 
 pub mod builderpool;
 pub mod builderpoolset;
@@ -23,9 +31,9 @@ pub mod fetcherpool;
 // ----- kube::Error classification helpers ---------------------------
 //
 // `kube::Error::Api(ae) if ae.code == 404` was open-coded across
-// rio-controller / rio-scheduler / xtask. Hosted here (not rio-common,
-// which stays kube-free; not rio-controller, which scheduler can't
-// depend on without pulling the reconciler stack).
+// rio-controller / rio-scheduler / xtask. See module-level doc for
+// placement rationale. rio-controller re-exports these so its own
+// modules can `use crate::reconcilers::KubeErrorExt`.
 
 /// Classify a `kube::Error` by API status code. Covers the two codes
 /// callers actually branch on: 404 (delete-race / get-missing) and
