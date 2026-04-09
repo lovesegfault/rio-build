@@ -289,35 +289,21 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
 /// check_build_completion never fires → Active forever.
 #[tokio::test]
 async fn test_recovery_completes_all_terminal_build() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // --- Phase 1: write state simulating "crashed before build→Succeeded" ---
     let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx = merge_single_node(&handle, build_id, "x5-drv", PriorityClass::Scheduled).await?;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        merge_single_node(&handle, build_id, "x5-drv", PriorityClass::Scheduled).await?;
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
+        // Backdate: drv → completed, build stays active (crash-after-last-drv-complete).
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'x5-drv'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
 
-    // Backdate: drv → completed (terminal), build stays active.
-    // This simulates crash-after-last-drv-complete.
-    sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'x5-drv'")
-        .execute(&db.pool)
-        .await?;
-    // Build stays 'active' (merge_chain sets it Active via handle_merge_dag).
-
-    // --- Phase 2: fresh actor recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-
-    // The post-recovery sweep should fire check_build_completion
-    // for the build. With 0 recovered derivations (all terminal,
-    // filtered by TERMINAL_STATUSES), total=0, completed=0, failed=0
-    // → all_completed → complete_build → Succeeded.
-    let status = query_status(&handle, build_id).await?;
+    // The post-recovery sweep fires check_build_completion → Succeeded.
+    let status = query_status(&f.handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
@@ -335,46 +321,26 @@ async fn test_recovery_completes_all_terminal_build() -> TestResult {
 /// PG and the dashboard showed 0/443 for a build that was at 1111/1555.
 #[tokio::test]
 async fn test_recovery_seeds_denorm_counts_from_pg() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // --- Phase 1: write a 3-drv chain via a real actor ---
     let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx = merge_chain(
-            &handle,
-            build_id,
-            &["i111-a", "i111-b", "i111-c"],
-            PriorityClass::Scheduled,
-        )
-        .await?;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        merge_chain(&handle, build_id, &["i111-a", "i111-b", "i111-c"], PriorityClass::Scheduled)
+            .await?;
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Backdate: 2 of 3 drvs completed (terminal — NOT loaded into DAG
-    // at recovery), 1 remains queued. Denorm columns say 100/50/12 —
-    // deliberately distinct from what the DAG would compute (3/0/0
-    // pre-fix would persist as 1/0/0 since only 1 drv loads).
-    sqlx::query(
-        "UPDATE derivations SET status = 'completed' \
-         WHERE drv_hash IN ('i111-a', 'i111-b')",
-    )
-    .execute(&db.pool)
+        // Backdate: 2 of 3 drvs completed (terminal — NOT loaded into DAG
+        // at recovery). Denorm columns say 100/50/12 — deliberately
+        // distinct from what the DAG would compute.
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash IN ('i111-a', 'i111-b')")
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE builds SET total_drvs = 100, completed_drvs = 50, cached_drvs = 12 WHERE build_id = $1")
+            .bind(build_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
     .await?;
-    sqlx::query(
-        "UPDATE builds SET total_drvs = 100, completed_drvs = 50, cached_drvs = 12 \
-         WHERE build_id = $1",
-    )
-    .bind(build_id)
-    .execute(&db.pool)
-    .await?;
-
-    // --- Phase 2: fresh actor recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    let (db, handle) = (f.db, f.handle);
 
     // recover_from_pg's post-load sweep calls update_build_counts for
     // every active build. Pre-fix that wrote (1, 0, 0) — derivation_
@@ -757,34 +723,28 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // Seed a VALID row via the normal merge path (simpler than
-    // hand-crafting all columns for a minimal INSERT).
-    let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx =
-            merge_single_node(&handle, build_id, "z1-good-drv", PriorityClass::Scheduled).await?;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // Valid row via normal merge.
+        merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "z1-good-drv",
+            PriorityClass::Scheduled,
+        )
+        .await?;
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Seed a BAD row with a garbage drv_path that StorePath::parse
-    // will reject. Other columns must satisfy NOT NULL + CHECK;
-    // status='ready' keeps it non-terminal (loadable by recovery).
-    sqlx::query(
-        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
-         VALUES ('z1-bad-drv', 'not-a-store-path', 'x86_64-linux', 'ready')",
-    )
-    .execute(&db.pool)
+        // Bad row: garbage drv_path that StorePath::parse rejects.
+        sqlx::query(
+            "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+             VALUES ('z1-bad-drv', 'not-a-store-path', 'x86_64-linux', 'ready')",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
     .await?;
-
-    // Fresh actor recovers.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    let handle = f.handle;
 
     // The bad-row skip should have logged.
     assert!(
@@ -816,45 +776,34 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
 /// mark prevents that: after recovery, generation >= PG max + 1.
 #[tokio::test]
 async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // Seed a derivation (FK target for assignments) + an assignment
-    // with generation=100. Use the normal merge path to write the
-    // derivation row with all required columns, then insert the
-    // assignment directly.
-    let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx =
-            merge_single_node(&handle, build_id, "z2-gen-drv", PriorityClass::Scheduled).await?;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // Seed a derivation (FK target) + an assignment with generation=100.
+        merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "z2-gen-drv",
+            PriorityClass::Scheduled,
+        )
+        .await?;
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Look up the derivation_id for the FK.
-    let (drv_id,): (Uuid,) =
-        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = 'z2-gen-drv'")
-            .fetch_one(&db.pool)
-            .await?;
-
-    // Seed assignment with generation=100.
-    sqlx::query(
-        "INSERT INTO assignments (derivation_id, builder_id, generation, status) \
-         VALUES ($1, 'seed-worker', 100, 'completed')",
-    )
-    .bind(drv_id)
-    .execute(&db.pool)
+        let (drv_id,): (Uuid,) =
+            sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = 'z2-gen-drv'")
+                .fetch_one(&pool)
+                .await?;
+        sqlx::query(
+            "INSERT INTO assignments (derivation_id, builder_id, generation, status) \
+             VALUES ($1, 'seed-worker', 100, 'completed')",
+        )
+        .bind(drv_id)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
     .await?;
 
-    // Fresh actor recovers. The default setup_actor starts with
-    // generation=1 (non-K8s mode); recovery's fetch_max should
-    // bump it to max(1, 100+1) = 101.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-
-    let g = handle.leader_generation();
+    // Recovery's fetch_max should bump gen to max(1, 100+1) = 101.
+    let g = f.handle.leader_generation();
     assert!(
         g >= 101,
         "generation should be seeded from PG high-water mark: expected >= 101, got {g}"
@@ -871,32 +820,25 @@ async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_recovery_z16_orphan_build_skipped() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // Seed a builds row DIRECTLY with NO build_derivations links.
-    // status='active' so it's loadable (non-terminal).
     let orphan_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
-        .bind(orphan_id)
-        .execute(&db.pool)
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // Seed orphan (NO build_derivations links) + normal build.
+        sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+            .bind(orphan_id)
+            .execute(&pool)
+            .await?;
+        merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "z16-normal",
+            PriorityClass::Scheduled,
+        )
         .await?;
-
-    // Also seed a NORMAL build (with links) to prove recovery
-    // doesn't skip everything.
-    let normal_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx =
-            merge_single_node(&handle, normal_id, "z16-normal", PriorityClass::Scheduled).await?;
         barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Fresh actor recovers.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
 
     // The orphan-skip should have logged.
     assert!(
@@ -1015,59 +957,20 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
 /// persistence, poison TTL would reset on every scheduler restart.
 #[tokio::test]
 async fn test_recovery_loads_poisoned_derivations() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
+    let f =
+        RecoveryFixture::run(async |handle, _| seed_poisoned(&handle, "poison-rec").await).await?;
 
-    // --- Phase 1: actor A poisons a derivation ---
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "poison-rec-w", "x86_64-linux").await?;
-        let _ev = merge_single_node(
-            &handle,
-            Uuid::new_v4(),
-            "poison-rec",
-            PriorityClass::Scheduled,
-        )
-        .await?;
-        let _ = worker_rx.recv().await.expect("assignment");
-        complete_failure(
-            &handle,
-            "poison-rec-w",
-            &test_drv_path("poison-rec"),
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        // Barrier: ensure persist_poisoned hit PG.
-        barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Verify PG has it poisoned + poisoned_at set (precondition).
+    // Verify PG has it poisoned + poisoned_at set (the as_bytes bug broke this).
     let (status, has_ts): (String, bool) =
         sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
             .bind("poison-rec")
-            .fetch_one(&db.pool)
+            .fetch_one(&f.db.pool)
             .await?;
-    assert_eq!(status, "poisoned", "PG status should be poisoned");
-    assert!(
-        has_ts,
-        "PG poisoned_at should be set (the as_bytes bug broke this)"
-    );
-
-    // --- Phase 2: fresh actor B recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    // Before recovery: DAG is empty.
-    let pre = handle.debug_query_derivation("poison-rec").await?;
-    assert!(pre.is_none(), "fresh actor has empty DAG");
-
-    // LeaderAcquired → recover_from_pg loads poisoned derivations.
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    assert_eq!(status, "poisoned");
+    assert!(has_ts, "PG poisoned_at should be set");
 
     // After recovery: derivation is back in the DAG with Poisoned status.
-    let post = expect_drv(&handle, "poison-rec").await;
+    let post = expect_drv(&f.handle, "poison-rec").await;
     assert_eq!(
         post.status,
         DerivationStatus::Poisoned,
@@ -1088,58 +991,23 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
 /// comparison is immune to node uptime.
 #[tokio::test]
 async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // --- Phase 1: actor A poisons a derivation, then we backdate PG ---
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "exp-poison-w", "x86_64-linux").await?;
-        let _ev = merge_single_node(
-            &handle,
-            Uuid::new_v4(),
-            "exp-poison",
-            PriorityClass::Scheduled,
-        )
-        .await?;
-        let _ = worker_rx.recv().await.expect("assignment");
-        complete_failure(
-            &handle,
-            "exp-poison-w",
-            &test_drv_path("exp-poison"),
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        seed_poisoned(&handle, "exp-poison").await?;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Backdate poisoned_at well past POISON_TTL (cfg(test) = 100ms, so
-    // 10s is 100× past). PG computes elapsed_secs = now() - poisoned_at
-    // at load time.
-    sqlx::query(
-        "UPDATE derivations SET poisoned_at = now() - interval '10 seconds' WHERE drv_hash = $1",
-    )
-    .bind("exp-poison")
-    .execute(&db.pool)
+        // Backdate poisoned_at well past POISON_TTL (cfg(test) = 100ms,
+        // so 10s is 100× past). PG computes elapsed_secs at load time.
+        sqlx::query(
+            "UPDATE derivations SET poisoned_at = now() - interval '10 seconds' WHERE drv_hash = $1",
+        )
+        .bind("exp-poison")
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
     .await?;
 
-    // Precondition: PG still shows poisoned.
-    let (status, _): (String, bool) =
-        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
-            .bind("exp-poison")
-            .fetch_one(&db.pool)
-            .await?;
-    assert_eq!(status, "poisoned");
-
-    // --- Phase 2: fresh actor B recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-
     // Derivation NOT in the DAG — recovery filtered it.
-    let post = handle.debug_query_derivation("exp-poison").await?;
+    let post = f.handle.debug_query_derivation("exp-poison").await?;
     assert!(
         post.is_none(),
         "expired-at-load poison should be cleared, not reloaded into DAG"
@@ -1149,7 +1017,7 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
     let (status, has_ts): (String, bool) =
         sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
             .bind("exp-poison")
-            .fetch_one(&db.pool)
+            .fetch_one(&f.db.pool)
             .await?;
     assert_eq!(status, "created", "clear_poison sets status='created'");
     assert!(!has_ts, "clear_poison NULLs poisoned_at");
@@ -1171,33 +1039,15 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
 async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // --- Phase 1: actor A poisons a derivation ---
+    // Phase 1: actor A poisons a derivation.
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "zombie-w", "x86_64-linux").await?;
-        let _ev = merge_single_node(
-            &handle,
-            Uuid::new_v4(),
-            "zombie-drv",
-            PriorityClass::Scheduled,
-        )
-        .await?;
-        let _ = worker_rx.recv().await.expect("assignment");
-        complete_failure(
-            &handle,
-            "zombie-w",
-            &test_drv_path("zombie-drv"),
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
+        seed_poisoned(&handle, "zombie-drv").await?;
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    // --- Phase 2: fresh actor B recovers, operator clears poison,
-    //     user resubmits ---
+    // Phase 2: fresh actor B recovers, operator clears poison, user resubmits.
     let (handle, _task) = setup_actor(db.pool.clone());
     let mut worker_rx = connect_executor(&handle, "zombie-w2", "x86_64-linux").await?;
 
@@ -1248,166 +1098,60 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
 }
 
 // r[verify sched.recovery.poisoned-failed-count]
-/// Route 1: crash between persist_poisoned and the build transition to
-/// Failed. PG has drv status='poisoned', poisoned_at SET (atomic persist
-/// landed), build status='active'. Recovery must load the poisoned drv
-/// into id_to_hash → bd_rows join succeeds → build_summary counts it in
-/// `failed` → build → Failed.
+/// Route 1: crash between `persist_poisoned` and the build transition
+/// to Failed. PG has drv `status='poisoned'`, `poisoned_at` SET, build
+/// `status='active'`. Recovery must load the poisoned drv into
+/// `id_to_hash` → `bd_rows` join succeeds → `build_summary` counts it
+/// in `failed` → build → Failed. Regardless of `keep_going`.
 ///
-/// Simulation: don't actually crash mid-await. Directly write the
-/// inconsistent PG state that a crash WOULD leave, then recover. The
-/// actor's completion path is deterministic; we're testing recovery's
-/// interpretation of the state, not the crash itself.
-///
-/// Before the keystone fix: the poisoned row was loaded into the DAG but
-/// NOT into id_to_hash → bd_rows join fell through → build_drv_hashes
-/// stayed empty → total=0, completed=0, failed=0 → 0>=0 && 0==0 →
-/// spurious Succeeded. After: total=1, failed=1 → Failed.
+/// - **keep_going=true**: exercises `all_resolved && failed>0`. Before
+///   the keystone fix: poisoned row loaded into DAG but NOT id_to_hash
+///   → join fell through → total=0 → spurious Succeeded.
+/// - **keep_going=false** (default): before the `|| !keep_going` fix in
+///   `check_build_completion`, fell through both branches → stuck
+///   Active forever (live failures go through `handle_derivation_failure`;
+///   recovery's sweep calls `check_build_completion` directly).
+#[rstest::rstest]
+#[case::keep_going_true(true)]
+#[case::keep_going_false(false)]
 #[tokio::test]
-async fn test_recovery_poisoned_orphan_build_fails_not_succeeds() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
+async fn test_recovery_poisoned_orphan_build_fails(#[case] keep_going: bool) -> TestResult {
     let build_id = Uuid::new_v4();
-
-    // Phase 1: actor A merges a single-drv build with keep_going=true.
-    // This variant exercises the `all_resolved && failed>0` half of the
-    // condition. The _keep_going_false variant below covers the default
-    // (and more common) path. Dispatches it, then we directly write the
-    // crash-window PG state and kill actor A.
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "r1-w", "x86_64-linux").await?;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let mut rx = connect_executor(&handle, "r1-w", "x86_64-linux").await?;
         let _ev = merge_dag(
             &handle,
             build_id,
             vec![make_node("r1-drv")],
             vec![],
-            true, // keep_going
+            keep_going,
         )
         .await?;
-        let _ = worker_rx.recv().await.expect("assignment");
+        let _ = rx.recv().await.expect("assignment");
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Simulate crash-after-persist_poisoned-before-handle_derivation_failure:
-    // drv is poisoned+timestamped, build is still active.
-    sqlx::query("UPDATE derivations SET status='poisoned', poisoned_at=now() WHERE drv_hash=$1")
+        // Simulate crash-after-persist_poisoned: drv poisoned, build still active.
+        sqlx::query(
+            "UPDATE derivations SET status='poisoned', poisoned_at=now() WHERE drv_hash=$1",
+        )
         .bind("r1-drv")
-        .execute(&db.pool)
+        .execute(&pool)
         .await?;
-    // Build row: leave as-is (status='active' from merge).
-    let (build_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
-        .bind(build_id)
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(
-        build_status, "active",
-        "precondition: build still active in PG"
-    );
+        Ok(())
+    })
+    .await?;
 
-    // Phase 2: fresh actor B recovers.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-
-    // THE assertion: build must be Failed, not Succeeded.
-    // Before the keystone fix: Succeeded (total=0, failed=0).
-    // After: Failed (total=1, failed=1).
-    let status = query_status(&handle, build_id).await?;
+    let status = query_status(&f.handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
-        "recovered build with only-poisoned drv MUST be Failed, got state={}",
-        status.state
+        "recovered build with only-poisoned drv MUST be Failed (keep_going={keep_going})"
     );
-
-    // Belt-and-suspenders: PG should reflect the transition.
     let (pg_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
         .bind(build_id)
-        .fetch_one(&db.pool)
+        .fetch_one(&f.db.pool)
         .await?;
     assert_eq!(pg_status, "failed", "PG build status must follow in-mem");
-
-    Ok(())
-}
-
-// r[verify sched.recovery.poisoned-failed-count]
-/// Route 1, keep_going=false (the DEFAULT): same crash window as the
-/// _fails_not_succeeds test above, but with the common-case flag.
-///
-/// This is the spec's unconditional claim: a crash between
-/// persist_poisoned and the build transition MUST result in Failed on
-/// recovery — regardless of keep_going. Before the `|| !keep_going`
-/// condition fix in check_build_completion, keep_going=false builds
-/// fell through: failed=1 but `keep_going && all_resolved` was false
-/// → no branch taken → build stuck Active forever. (Live keep_going=
-/// false failures go through handle_derivation_failure, but recovery's
-/// sweep doesn't invoke that path — it calls check_build_completion
-/// directly.)
-#[tokio::test]
-async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let build_id = Uuid::new_v4();
-
-    // Phase 1: actor A merges a single-drv build with keep_going=FALSE
-    // (the default — this is the common case). Dispatch, then write
-    // the crash-window PG state and kill actor A.
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "r1f-w", "x86_64-linux").await?;
-        let _ev = merge_dag(
-            &handle,
-            build_id,
-            vec![make_node("r1f-drv")],
-            vec![],
-            false, // keep_going=false — the default
-        )
-        .await?;
-        let _ = worker_rx.recv().await.expect("assignment");
-        barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Simulate crash-after-persist_poisoned-before-handle_derivation_failure:
-    // drv is poisoned+timestamped, build is still active.
-    sqlx::query("UPDATE derivations SET status='poisoned', poisoned_at=now() WHERE drv_hash=$1")
-        .bind("r1f-drv")
-        .execute(&db.pool)
-        .await?;
-    let (build_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
-        .bind(build_id)
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(
-        build_status, "active",
-        "precondition: build still active in PG"
-    );
-
-    // Phase 2: fresh actor B recovers.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
-
-    // THE assertion: build must be Failed. NOT Succeeded, NOT Active.
-    // Before the `|| !keep_going` fix: Active (fell through both branches).
-    // After: Failed (failed=1, !keep_going → branch fires).
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "recovered keep_going=false build with poisoned drv MUST be Failed (not stuck Active), got state={}",
-        status.state
-    );
-
-    // PG follows in-mem.
-    let (pg_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
-        .bind(build_id)
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(pg_status, "failed", "PG build status must follow in-mem");
-
     Ok(())
 }
 
@@ -1419,130 +1163,59 @@ async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestRes
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Lease flaps during recovery: gen bumps mid-flight → discard.
+/// Recovery TOCTOU: if the lease flaps (lose→reacquire, generation
+/// bumps) mid-recovery, discard the stale DAG instead of dispatching
+/// from it with the NEW generation stamped on. If no bump, complete
+/// normally (proves no false-positive — would regress every recovery
+/// test).
 ///
-/// Timeline simulated:
-///   T+0   lease loop acquires (gen 1→2), sends LeaderAcquired
-///   T+1   actor enters handle_leader_acquired, snapshots gen=2
-///   T+1   actor runs recover_from_pg (fast, empty PG)
-///   T+1   actor hits the test gate, signals "reached", blocks
-///   T+4   [SIMULATED] lease loop lose-transition: clears
-///         recovery_complete=false
-///   T+9   [SIMULATED] lease loop re-acquire: fetch_add gen 2→3
-///   T+9   test releases the gate
-///   T+12  actor re-loads gen=3, sees 3 ≠ 2 → DISCARD, early-return
-///
-/// Pre-fix: the unconditional store(true) at the old :367 would
-/// clobber the lease loop's clear at T+4. dispatch_ready would then
-/// fire with a DAG loaded under gen=2 but stamped with gen=3.
+/// Timeline (bump case): actor snapshots gen=2 → runs recover_from_pg
+/// → parks at gate → [test simulates lease flap: clear
+/// recovery_complete + fetch_add gen 2→3] → release → actor re-loads
+/// gen=3, sees 3≠2 → DISCARD. Pre-fix: unconditional `store(true)`
+/// clobbered the lease loop's clear → dispatch_ready fired with gen-2
+/// DAG and gen-3 stamps.
+#[rstest::rstest]
+#[case::gen_bump_discards(true, false)]
+#[case::no_bump_completes(false, true)]
 #[tokio::test]
-async fn test_recovery_toctou_gen_bump_discards() -> TestResult {
+async fn test_recovery_toctou_on_lease_flap(
+    #[case] bump_gen: bool,
+    #[case] expect_recovery_complete: bool,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-
-    // Shared atomics simulating LeaderState. Start gen=2 (lease
-    // loop's first fetch_add already happened).
     let generation = Arc::new(AtomicU64::new(2));
     let recovery_complete = Arc::new(AtomicBool::new(false));
-
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
 
-    let gen_for_actor = Arc::clone(&generation);
-    let rc_for_actor = Arc::clone(&recovery_complete);
+    let (g, rc) = (Arc::clone(&generation), Arc::clone(&recovery_complete));
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            gen_for_actor,
-            Arc::new(AtomicBool::new(true)),
-            rc_for_actor,
-        );
-        p.recovery_toctou_gate = Some((reached_tx, release_rx));
-    });
-
-    // Trigger recovery.
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-
-    // Deterministic rendezvous: actor signals it has finished
-    // recover_from_pg and is parked at the gate. No sleep/yield.
-    tokio::time::timeout(Duration::from_secs(10), reached_rx)
-        .await
-        .expect("actor reached gate within 10s")
-        .expect("reached_tx not dropped");
-
-    // Simulate lease flap: lose (clear) + reacquire (bump gen).
-    // Order matches the real lease loop (lose-transition at
-    // lease/mod.rs clears recovery_complete, THEN next acquire
-    // fetch_add's). Both are Relaxed/Release there.
-    recovery_complete.store(false, Ordering::Relaxed);
-    generation.fetch_add(1, Ordering::Release); // 2 → 3
-
-    // Release recovery. Actor re-loads gen, sees 3 ≠ 2, discards.
-    release_tx.send(()).expect("actor still listening");
-    barrier(&handle).await;
-
-    // THE assertion: recovery_complete must STILL be false. The
-    // early-return preserved the lease loop's clear. Without the
-    // fix, the unconditional store(true) clobbers it → dispatch_
-    // ready would fire with the stale (gen-2) DAG.
-    assert!(
-        !recovery_complete.load(Ordering::Acquire),
-        "TOCTOU: recovery_complete clobbered lease loop's clear \u{2014} \
-         would dispatch gen-2 DAG with gen-3 stamps"
-    );
-
-    // DAG discarded: debug_query returns None for any hash.
-    // (Empty PG → nothing was loaded anyway, but this proves the
-    // clear-on-discard didn't leave half-state.)
-    let info = handle.debug_query_derivation("nonexistent").await?;
-    assert!(info.is_none(), "DAG should be empty after discard");
-
-    Ok(())
-}
-
-/// Negative control: generation stable during recovery → normal
-/// completion. Proves the TOCTOU check doesn't false-positive on a
-/// clean recovery (would regress every existing recovery test if so).
-#[tokio::test]
-async fn test_recovery_toctou_no_bump_completes() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    let generation = Arc::new(AtomicU64::new(2));
-    let recovery_complete = Arc::new(AtomicBool::new(false));
-
-    let (reached_tx, reached_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-
-    let gen_for_actor = Arc::clone(&generation);
-    let rc_for_actor = Arc::clone(&recovery_complete);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            gen_for_actor,
-            Arc::new(AtomicBool::new(true)),
-            rc_for_actor,
-        );
+        p.leader = crate::lease::LeaderState::from_parts(g, Arc::new(AtomicBool::new(true)), rc);
         p.recovery_toctou_gate = Some((reached_tx, release_rx));
     });
 
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-
     tokio::time::timeout(Duration::from_secs(10), reached_rx)
         .await
         .expect("actor reached gate")
         .expect("reached_tx not dropped");
 
-    // NO gen bump. Release immediately.
+    if bump_gen {
+        // Simulate lease flap: lose (clear) + reacquire (bump gen).
+        recovery_complete.store(false, Ordering::Relaxed);
+        generation.fetch_add(1, Ordering::Release);
+    }
     release_tx.send(()).expect("actor still listening");
     barrier(&handle).await;
 
-    // gen_now == gen_at_entry → normal path → store(true).
-    assert!(
-        recovery_complete.load(Ordering::Acquire),
-        "clean recovery (no flap) should set recovery_complete=true"
-    );
     assert_eq!(
-        generation.load(Ordering::Acquire),
-        2,
-        "generation unchanged (empty PG → no fetch_max bump)"
+        recovery_complete.load(Ordering::Acquire),
+        expect_recovery_complete,
+        "bump_gen={bump_gen}: recovery_complete must be {expect_recovery_complete}"
     );
-
+    if !bump_gen {
+        assert_eq!(generation.load(Ordering::Acquire), 2, "gen unchanged");
+    }
     Ok(())
 }

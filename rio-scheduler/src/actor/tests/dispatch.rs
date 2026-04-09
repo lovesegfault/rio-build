@@ -9,8 +9,6 @@ use super::*;
 /// overflow chain walks small→large but a large build never tries small.
 #[tokio::test]
 async fn test_size_class_routing_respects_classification() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
     let db = TestDb::new(&MIGRATOR).await;
 
     // Pre-seed build_history: "bigthing" has a 120s EMA. With a 30s
@@ -25,20 +23,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     .await?;
 
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
+        c.size_classes = size_classes(&[("small", 30.0), ("large", 3600.0)]);
     });
 
     // Connect TWO workers: one small (will NOT get the big build),
@@ -1205,85 +1190,90 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 }
 
 // r[verify sched.fod.size-class-reactive]
+// r[verify sched.builder.size-class-reactive]
 // r[verify sched.dispatch.no-fod-fallback]
-/// I-170: a FOD with `size_class_floor=small` skips tiny-class
-/// fetchers. The overflow chain walks fetcher classes from `floor`
-/// upward — never the builder size_classes chain (the builder
-/// `with_size_classes` config is empty here; the FOD branch reads
-/// `fetcher_size_classes` only).
+/// `size_class_floor=small` skips tiny-class executors even when free.
+/// The overflow chain starts at `max(classify(), floor)`.
+///
+/// - **fod** (I-170): FOD branch reads `fetcher_size_classes` only.
+/// - **builder** (I-177): non-FOD branch ignored floor before fix → a
+///   build that OOM'd on tiny was re-routed to tiny by the
+///   (success-only) EMA classifier → poison-loop.
+///
+/// Shape: 2 tiny + 1 small executor. Merge → first dispatch goes to
+/// tiny (floor=None) → TransientFailure (simulated OOM) → floor
+/// promoted → second dispatch goes to small, tiny skipped.
+#[rstest::rstest]
+#[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod")]
+#[case::builder(rio_proto::types::ExecutorKind::Builder, false, "glibc-177")]
 #[tokio::test]
-async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
+async fn size_class_floor_skips_smaller(
+    #[case] kind: rio_proto::types::ExecutorKind,
+    #[case] is_fod: bool,
+    #[case] tag: &str,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
-        // Zero backoff so the retry redispatches on the next Tick
-        // (default is 5s exponential — test would need to sleep).
+        if is_fod {
+            c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
+        } else {
+            c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
+        }
+        // Zero backoff so the retry redispatches on the next Tick.
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
         };
     });
 
-    // Two tiny fetchers, one small. With floor=None the FOD would
-    // route to a tiny (smallest class, two free executors). With
-    // floor=small it MUST route to f-small.
-    let mut tiny1_rx = connect_fetcher_classed(&handle, "f-tiny-1", "x86_64-linux", "tiny").await?;
-    let mut tiny2_rx = connect_fetcher_classed(&handle, "f-tiny-2", "x86_64-linux", "tiny").await?;
-    let mut small_rx = connect_fetcher_classed(&handle, "f-small", "x86_64-linux", "small").await?;
+    let mut tiny1 =
+        connect_executor_classed(&handle, "tiny-1", "x86_64-linux", "tiny", kind).await?;
+    let mut tiny2 =
+        connect_executor_classed(&handle, "tiny-2", "x86_64-linux", "tiny", kind).await?;
+    let mut small =
+        connect_executor_classed(&handle, "small", "x86_64-linux", "small", kind).await?;
 
-    // Seed a FOD and force its floor to "small" via a prior failure
-    // (the only way size_class_floor is set in production). Merge,
-    // let it dispatch to tiny, report failure → floor bumps; then
-    // it must redispatch to small.
-    let mut node = make_node("oom-fod");
-    node.is_fixed_output = true;
+    let mut node = make_node(tag);
+    node.is_fixed_output = is_fod;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
-    // First dispatch: floor=None → smallest class = tiny.
-    // One of the tiny fetchers gets it. Drain whichever.
+    // First dispatch: floor=None → tiny.
     barrier(&handle).await;
     let (first_exec, first_asgn) = tokio::select! {
-        a = recv_assignment(&mut tiny1_rx) => ("f-tiny-1", a),
-        a = recv_assignment(&mut tiny2_rx) => ("f-tiny-2", a),
+        a = recv_assignment(&mut tiny1) => ("tiny-1", a),
+        a = recv_assignment(&mut tiny2) => ("tiny-2", a),
     };
-    assert!(first_asgn.drv_path.contains("oom-fod"));
-    assert!(
-        small_rx.try_recv().is_err(),
-        "floor=None: small fetcher should NOT receive (overflow walks up only when smaller class is full)"
-    );
+    assert!(first_asgn.drv_path.contains(tag));
+    assert!(small.try_recv().is_err(), "floor=None: small not used");
 
-    // Simulate OOM: executor reports TransientFailure →
-    // handle_transient_failure → record_failure_and_check_poison
-    // → size_class_floor promoted tiny→small. (The production
-    // OOM path is ExecutorDisconnected → reassign_derivations,
-    // which lands in the same record_failure_and_check_poison
-    // helper; TransientFailure is the simpler test driver.)
+    // Simulate OOM → floor promoted tiny→small.
     complete_failure(
         &handle,
         first_exec,
-        "oom-fod",
+        tag,
         rio_proto::types::BuildResultStatus::TransientFailure,
         "simulated OOM",
     )
     .await?;
     tick(&handle).await?;
 
-    let state = expect_drv(&handle, "oom-fod").await;
     assert_eq!(
-        state.sched.size_class_floor.as_deref(),
+        expect_drv(&handle, tag)
+            .await
+            .sched
+            .size_class_floor
+            .as_deref(),
         Some("small"),
         "transient failure on tiny → floor promoted to small"
     );
 
-    // Second dispatch: floor=small. The remaining tiny fetcher is
-    // free but MUST be skipped; small gets it.
-    let asgn = recv_assignment(&mut small_rx).await;
-    assert!(asgn.drv_path.contains("oom-fod"));
+    // Second dispatch: floor=small. Other tiny is free but MUST be skipped.
+    let asgn = recv_assignment(&mut small).await;
+    assert!(asgn.drv_path.contains(tag));
     assert!(
-        tiny1_rx.try_recv().is_err() && tiny2_rx.try_recv().is_err(),
-        "floor=small: tiny fetchers must be skipped even when free"
+        tiny1.try_recv().is_err() && tiny2.try_recv().is_err(),
+        "floor=small: tiny executors skipped even when free"
     );
-
     Ok(())
 }
 
@@ -1356,109 +1346,14 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
 }
 
 // r[verify sched.builder.size-class-reactive]
-/// I-177: a non-FOD with `size_class_floor=small` skips tiny-class
-/// builders even when classify() says tiny. The overflow chain starts
-/// at `max(classify(), floor)`. Before the fix, the non-FOD branch
-/// ignored floor entirely → a build that OOM'd on tiny was re-routed
-/// to tiny by the (success-only) EMA classifier → poison-loop.
-#[tokio::test]
-async fn builder_size_class_floor_skips_smaller() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-        // Zero backoff so the retry redispatches on the next Tick
-        // (default is 5s exponential — test would need to sleep).
-        c.retry_policy = crate::RetryPolicy {
-            backoff_base_secs: 0.0,
-            ..Default::default()
-        };
-    });
-
-    // Two tiny builders, one small. With floor=None and est_dur=30s
-    // (no build_history → DEFAULT_DURATION_SECS), classify() picks
-    // tiny. With floor=small the overflow chain MUST start at small.
-    let mut tiny1_rx = connect_builder_classed(&handle, "b-tiny-1", "x86_64-linux", "tiny").await?;
-    let mut tiny2_rx = connect_builder_classed(&handle, "b-tiny-2", "x86_64-linux", "tiny").await?;
-    let mut small_rx = connect_builder_classed(&handle, "b-small", "x86_64-linux", "small").await?;
-
-    let node = make_node("glibc-177");
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-
-    // First dispatch: floor=None, classify()=tiny → one of the tiny
-    // builders gets it.
-    barrier(&handle).await;
-    let (first_exec, first_asgn) = tokio::select! {
-        a = recv_assignment(&mut tiny1_rx) => ("b-tiny-1", a),
-        a = recv_assignment(&mut tiny2_rx) => ("b-tiny-2", a),
-    };
-    assert!(first_asgn.drv_path.contains("glibc-177"));
-    assert!(
-        small_rx.try_recv().is_err(),
-        "floor=None, classify=tiny: small builder should NOT receive (overflow walks up only when smaller class is full)"
-    );
-
-    // Simulate OOM via TransientFailure → record_failure_and_check_
-    // poison → promote_size_class_floor → floor=small.
-    complete_failure(
-        &handle,
-        first_exec,
-        "glibc-177",
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        "simulated OOM",
-    )
-    .await?;
-    tick(&handle).await?;
-
-    let state = expect_drv(&handle, "glibc-177").await;
-    assert_eq!(
-        state.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "I-177: transient failure on tiny builder → floor promoted to small"
-    );
-
-    // Second dispatch: classify() still says tiny (no successful
-    // sample), but floor=small clamps the chain start. The other
-    // tiny builder is free but MUST be skipped; small gets it.
-    let asgn = recv_assignment(&mut small_rx).await;
-    assert!(asgn.drv_path.contains("glibc-177"));
-    assert!(
-        tiny1_rx.try_recv().is_err() && tiny2_rx.try_recv().is_err(),
-        "floor=small: tiny builders must be skipped even when free and classify()=tiny"
-    );
-
-    Ok(())
-}
-
-// r[verify sched.builder.size-class-reactive]
 /// I-177: `next_builder_class` orders by `cutoff_secs`, not config
 /// order. Clamps at largest; unknown/empty → None.
 #[test]
 fn next_builder_class_cutoff_ordered() {
-    use crate::assignment::{SizeClassConfig, next_builder_class};
-    let mk = |name: &str, cutoff: f64| SizeClassConfig {
-        name: name.into(),
-        cutoff_secs: cutoff,
-        mem_limit_bytes: u64::MAX,
-        cpu_limit_cores: None,
-    };
+    use crate::assignment::next_builder_class;
     // Deliberately unsorted config order — next_builder_class must
     // sort by cutoff, not by Vec position.
-    let classes = vec![mk("large", 3600.0), mk("tiny", 30.0), mk("small", 300.0)];
+    let classes = size_classes(&[("large", 3600.0), ("tiny", 30.0), ("small", 300.0)]);
     assert_eq!(
         next_builder_class("tiny", &classes).as_deref(),
         Some("small")

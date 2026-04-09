@@ -455,28 +455,39 @@ async fn test_ca_cache_miss_stale_realisation() -> TestResult {
 // r[verify sched.merge.ca-fod-substitute]
 /// Fixed-CA FOD: `ca_modular_hash` is 32 bytes (every FOD per
 /// translate.rs:343) AND `expected_output_paths` is non-empty (the
-/// content-addressed path computed from outputHash). No realisation
-/// row exists. The output is NOT in rio-store but IS substitutable
-/// from upstream → MUST cache-hit via the path-based lane.
+/// content-addressed path computed from outputHash). No realisation row.
 ///
-/// Regression for I-203: filtering on `ca_modular_hash.len() != 32`
-/// excluded these from the path-based lane → dispatched to a fetcher
-/// → hit the (dead) origin URL.
+/// - **substitutable**: output not in rio-store but IS substitutable
+///   upstream → MUST cache-hit via path-based lane. I-203 regression:
+///   filtering on `ca_modular_hash.len() != 32` excluded these →
+///   dispatched to fetcher → hit dead origin URL.
+/// - **missing**: plain-missing → proceeds to Ready, dispatches to fetcher.
+#[rstest::rstest]
+#[case::substitutable(true, rio_proto::types::BuildState::Succeeded, 1)]
+#[case::missing(false, rio_proto::types::BuildState::Active, 0)]
 #[tokio::test]
-async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
+async fn test_fixed_ca_fod_path_based_lane(
+    #[case] substitutable: bool,
+    #[case] expect_state: rio_proto::types::BuildState,
+    #[case] expect_cached: u32,
+) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut fetcher_rx =
+        connect_fetcher_classed(&handle, "f-ca-fod", "x86_64-linux", "tiny").await?;
 
-    let fod_out = test_store_path("chromium-buildtools-source");
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(fod_out.clone());
+    let fod_out = test_store_path("ca-fod-out");
+    if substitutable {
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(fod_out.clone());
+    }
 
     // Production shape: FOD ⇒ is_content_addressed + 32-byte modular
     // hash + known expected_output_path. NO realisation row in PG.
-    let mut node = make_node("ca-fod-sub");
+    let mut node = make_node("ca-fod");
     node.is_content_addressed = true;
     node.is_fixed_output = true;
     node.ca_modular_hash = [0x42u8; 32].to_vec();
@@ -487,56 +498,19 @@ async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
     barrier(&handle).await;
 
     let status = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "fixed-CA FOD with known path + substitutable output MUST cache-hit \
-         via path-based lane; got state={}",
-        status.state
-    );
-    assert_eq!(status.cached_derivations, 1);
+    assert_eq!(status.state, expect_state as i32);
+    assert_eq!(status.cached_derivations, expect_cached);
 
-    let qpi = store.calls.qpi_calls.read().unwrap();
-    assert!(
-        qpi.contains(&fod_out),
-        "path-based lane should eager-fetch substitutable FOD output; \
-         qpi_calls={qpi:?}"
-    );
-
-    Ok(())
-}
-
-/// Negative case for `r[sched.merge.ca-fod-substitute]`: same fixed-CA
-/// FOD shape but the output is plain-missing (not substitutable). Node
-/// proceeds to Ready and dispatches to a fetcher.
-#[tokio::test]
-async fn test_fixed_ca_fod_not_substitutable_dispatches() -> TestResult {
-    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
-
-    // FOD ⇒ Fetcher pool, not Builder.
-    let mut fetcher_rx =
-        connect_fetcher_classed(&handle, "f-ca-fod", "x86_64-linux", "tiny").await?;
-
-    let fod_out = test_store_path("not-in-any-cache");
-    let mut node = make_node("ca-fod-miss");
-    node.is_content_addressed = true;
-    node.is_fixed_output = true;
-    node.ca_modular_hash = [0x43u8; 32].to_vec();
-    node.expected_output_paths = vec![fod_out];
-
-    let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    let assn = recv_assignment(&mut fetcher_rx).await;
-    assert!(
-        assn.drv_path.ends_with("ca-fod-miss.drv"),
-        "fixed-CA FOD not in store/upstream → must dispatch; got {}",
-        assn.drv_path
-    );
-
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(status.cached_derivations, 0);
-
+    if substitutable {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(qpi.contains(&fod_out), "path-based lane eager-fetches");
+    } else {
+        let assn = recv_assignment(&mut fetcher_rx).await;
+        assert!(
+            assn.drv_path.ends_with("ca-fod.drv"),
+            "missing → dispatches"
+        );
+    }
     Ok(())
 }
 

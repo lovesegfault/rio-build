@@ -3,108 +3,62 @@
 
 use super::*;
 
-/// keepGoing=false: on PermanentFailure, the entire build fails immediately.
+/// 2-node DAG, hashA fails permanently. With `keep_going=false` the
+/// build fails immediately; with `keep_going=true` it stays Active
+/// until hashB completes, THEN fails.
+#[rstest::rstest]
+#[case::fails_fast(false, rio_proto::types::BuildState::Failed)]
+#[case::waits_all(true, rio_proto::types::BuildState::Active)]
 #[tokio::test]
-async fn test_keepgoing_false_fails_fast() -> TestResult {
-    // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux").await?;
+async fn test_keepgoing_two_node_fail_one(
+    #[case] keep_going: bool,
+    #[case] expect_mid: rio_proto::types::BuildState,
+) -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w1", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
 
-    // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
     let _rx = merge_dag(
         &handle,
         build_id,
         vec![make_node("hashA"), make_node("hashB")],
         vec![],
-        false, // keep_going=false (critical)
+        keep_going,
     )
     .await?;
 
-    // Determine routing: which worker got hashA?
     let a1 = recv_assignment(&mut rx).await;
     let _a2 = recv_assignment(&mut rx2).await;
-    let worker_a = if a1.drv_path.contains("hashA") {
-        "test-worker"
+    let (w_a, w_b) = if a1.drv_path.contains("hashA") {
+        ("kg-w1", "kg-w2")
     } else {
-        "test-worker2"
+        ("kg-w2", "kg-w1")
     };
 
-    // Send PermanentFailure for hashA
     complete_failure(
         &handle,
-        worker_a,
+        w_a,
         &test_drv_path("hashA"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
     .await?;
 
-    // Build should be Failed (not waiting for hashB)
-    let status = query_status(&handle, build_id).await?;
     assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "build should fail fast on PermanentFailure with keepGoing=false"
-    );
-    Ok(())
-}
-
-/// keepGoing=true: build waits for all derivations, fails only at the end.
-#[tokio::test]
-async fn test_keepgoing_true_waits_all() -> TestResult {
-    // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux").await?;
-
-    // Merge a two-node DAG with keepGoing=true
-    let build_id = Uuid::new_v4();
-    let _rx = merge_dag(
-        &handle,
-        build_id,
-        vec![make_node("hashX"), make_node("hashY")],
-        vec![],
-        true, // keep_going=true (critical)
-    )
-    .await?;
-
-    // Determine routing.
-    let a1 = recv_assignment(&mut rx).await;
-    let _a2 = recv_assignment(&mut rx2).await;
-    let (worker_x, worker_y) = if a1.drv_path.contains("hashX") {
-        ("test-worker", "test-worker2")
-    } else {
-        ("test-worker2", "test-worker")
-    };
-
-    // Send PermanentFailure for hashX
-    complete_failure(
-        &handle,
-        worker_x,
-        &test_drv_path("hashX"),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "failed",
-    )
-    .await?;
-
-    // Build should still be Active (waiting for hashY)
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Active as i32,
-        "build should still be Active with keepGoing=true and pending derivations"
+        query_status(&handle, build_id).await?.state,
+        expect_mid as i32,
+        "after hashA fails: keep_going={keep_going} → {expect_mid:?}"
     );
 
-    // Complete hashY successfully
-    complete_success_empty(&handle, worker_y, &test_drv_path("hashY")).await?;
-
-    // Now build should be Failed (all resolved, one failed)
-    let status2 = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status2.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "build should fail after all derivations resolve with keepGoing=true"
-    );
+    if keep_going {
+        // Complete hashB → build now fails (all resolved, one failed).
+        complete_success_empty(&handle, w_b, &test_drv_path("hashB")).await?;
+        assert_eq!(
+            query_status(&handle, build_id).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build should fail after all derivations resolve"
+        );
+    }
     Ok(())
 }
 

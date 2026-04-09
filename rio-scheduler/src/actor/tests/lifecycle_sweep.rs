@@ -610,147 +610,82 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 
 // r[verify sched.build.keep-going]
 // r[verify sched.poison.ttl-persist]
-/// keep_going=true build with 2 independent derivations. D1 gets
-/// poisoned, D2 keeps running (keep_going). POISON_TTL expires, tick
-/// removes D1 from DAG. D2 completes. Pre-fix: derivation_hashes
-/// still has {D1,D2} → total=2, completed=1, failed=0 (D1 gone from
-/// DAG so build_summary doesn't count it) → hang Active forever.
-/// Post-fix: prune drops D1 from derivation_hashes → total=1 →
-/// build reaches terminal state.
+// r[verify sched.admin.clear-poison]
+/// keep_going=true build with 2 independent derivations. D1 poisoned,
+/// D2 keeps running. D1 is removed from the DAG (via TTL-expiry tick OR
+/// admin ClearPoison). D2 completes → build must reach terminal.
+///
+/// Pre-fix: `remove_node` left D1 in `derivation_hashes` → total=2,
+/// completed=1, failed=0 (D1 gone from DAG so `build_summary` doesn't
+/// count it) → hang Active forever. Post-fix: prune drops D1 →
+/// total=1 → terminal.
+#[rstest::rstest]
+#[case::ttl_expiry(true)]
+#[case::admin_clear(false)]
 #[tokio::test]
-async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
-    // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("ttl-w", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "ttl-w2", "x86_64-linux").await?;
+async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("pr-w", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "pr-w2", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![make_node("ttl-d1"), make_node("ttl-d2")],
+        vec![make_node("pr-d1"), make_node("pr-d2")],
         vec![],
         true, // keep_going
     )
     .await?;
 
-    // Determine routing.
     let a1 = recv_assignment(&mut rx).await;
     let _a2 = recv_assignment(&mut rx2).await;
-    let (w_d1, w_d2) = if a1.drv_path.contains("ttl-d1") {
-        ("ttl-w", "ttl-w2")
+    let (w_d1, w_d2) = if a1.drv_path.contains("pr-d1") {
+        ("pr-w", "pr-w2")
     } else {
-        ("ttl-w2", "ttl-w")
+        ("pr-w2", "pr-w")
     };
 
     // Poison D1. keep_going=true → build stays Active, D2 keeps running.
     complete_failure(
         &handle,
         w_d1,
-        &test_drv_path("ttl-d1"),
+        &test_drv_path("pr-d1"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "bad",
     )
     .await?;
-
-    let mid = query_status(&handle, build_id).await?;
     assert_eq!(
-        mid.state,
+        query_status(&handle, build_id).await?.state,
         rio_proto::types::BuildState::Active as i32,
         "keep_going=true: build stays Active while D2 runs"
     );
 
-    // Advance past POISON_TTL (100ms in cfg(test)) then tick.
-    // tick_process_expired_poisons removes D1 from the DAG.
-    tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(50)).await;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    barrier(&handle).await;
-
-    // D1 gone from DAG (TTL expiry removes, not resets).
-    assert!(
-        handle.debug_query_derivation("ttl-d1").await?.is_none(),
-        "TTL expiry must remove the poisoned node from the DAG"
-    );
-
-    // Complete D2. Pre-fix: total=2 (stale derivation_hashes),
-    // completed=1, failed=0 → hang. Post-fix: total=1 → terminal.
-    complete_success_empty(&handle, w_d2, &test_drv_path("ttl-d2")).await?;
-
-    let done = query_status(&handle, build_id).await?;
-    assert_ne!(
-        done.state,
-        rio_proto::types::BuildState::Active as i32,
-        "build must reach terminal state after TTL-expiry prune + D2 complete; \
-         got Active (hang) — derivation_hashes not pruned on remove_node"
-    );
-    Ok(())
-}
-
-// r[verify sched.build.keep-going]
-// r[verify sched.admin.clear-poison]
-/// Same as the TTL-expiry test but admin-triggered ClearPoison
-/// instead. handle_clear_poison has the identical remove_node
-/// without derivation_hashes prune → same hang.
-#[tokio::test]
-async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
-    // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("clr-w", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "clr-w2", "x86_64-linux").await?;
-
-    let build_id = Uuid::new_v4();
-    let _ev = merge_dag(
-        &handle,
-        build_id,
-        vec![make_node("clr-d1"), make_node("clr-d2")],
-        vec![],
-        true, // keep_going
-    )
-    .await?;
-
-    // Determine routing.
-    let a1 = recv_assignment(&mut rx).await;
-    let _a2 = recv_assignment(&mut rx2).await;
-    let (w_d1, w_d2) = if a1.drv_path.contains("clr-d1") {
-        ("clr-w", "clr-w2")
+    // Remove D1 from DAG: either TTL-expiry tick or admin ClearPoison.
+    if via_ttl {
+        tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(50)).await;
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
     } else {
-        ("clr-w2", "clr-w")
-    };
-
-    complete_failure(
-        &handle,
-        w_d1,
-        &test_drv_path("clr-d1"),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "bad",
-    )
-    .await?;
-
-    let mid = query_status(&handle, build_id).await?;
-    assert_eq!(mid.state, rio_proto::types::BuildState::Active as i32);
-
-    // Admin ClearPoison — removes D1 from DAG while D2 still running.
-    let (tx, rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::ClearPoison {
-            drv_hash: "clr-d1".into(),
-            reply: tx,
-        })
-        .await?;
-    assert!(rx.await?, "ClearPoison → cleared=true");
-
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::ClearPoison {
+                drv_hash: "pr-d1".into(),
+                reply: tx,
+            })
+            .await?;
+        assert!(rx.await?, "ClearPoison → cleared=true");
+    }
     assert!(
-        handle.debug_query_derivation("clr-d1").await?.is_none(),
-        "ClearPoison must remove the node from the DAG"
+        handle.debug_query_derivation("pr-d1").await?.is_none(),
+        "D1 must be removed from the DAG"
     );
 
     // Complete D2. Pre-fix hang; post-fix terminal.
-    complete_success_empty(&handle, w_d2, &test_drv_path("clr-d2")).await?;
-
-    let done = query_status(&handle, build_id).await?;
+    complete_success_empty(&handle, w_d2, &test_drv_path("pr-d2")).await?;
     assert_ne!(
-        done.state,
+        query_status(&handle, build_id).await?.state,
         rio_proto::types::BuildState::Active as i32,
-        "build must reach terminal state after ClearPoison prune + D2 complete; \
-         got Active (hang) — derivation_hashes not pruned on remove_node"
+        "build must reach terminal — derivation_hashes pruned on remove_node"
     );
     Ok(())
 }
