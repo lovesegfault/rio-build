@@ -79,7 +79,7 @@ pub(crate) mod tests;
 pub(crate) const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
 
 /// Max store paths per `PrefetchHint`. Shared between the initial-warm
-/// hint in `worker.rs` (`on_worker_registered`) and the per-dispatch
+/// hint in `on_executor_registered` and the per-dispatch
 /// hint in `dispatch.rs` — bump BOTH semantics by changing this once.
 pub(crate) const MAX_PREFETCH_PATHS: usize = 100;
 

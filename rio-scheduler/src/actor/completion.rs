@@ -1694,7 +1694,7 @@ impl DagActor {
     ) {
         // Record failure (in-mem HashSet insert + PG append,
         // best-effort) + get poison verdict in one call — same
-        // helper as reassign_derivations (worker.rs) and
+        // helper as `reassign_derivations` and
         // handle_reconcile_assignments (recovery.rs).
         let FailureOutcome {
             reached_poison,

@@ -654,7 +654,7 @@ impl DerivationState {
         // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
         // (poisoned_at = -infinity::timestamp would make from_secs_f64
         // panic). Follows the `.max(0.0).min(MAX)` pattern from
-        // worker.rs:207.
+        // `state/executor.rs`.
         //
         // Note: recovery.rs filters out rows with elapsed_secs >
         // POISON_TTL before calling this, so the checked_sub(elapsed)

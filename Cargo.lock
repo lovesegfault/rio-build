@@ -6664,7 +6664,6 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-types",
- "rand 0.10.0",
  "regex",
  "rio-auth",
  "rio-common",
