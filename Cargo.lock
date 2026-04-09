@@ -6432,7 +6432,6 @@ dependencies = [
  "metrics",
  "nix 0.31.2",
  "prost-types",
- "rand 0.10.0",
  "regex",
  "rio-common",
  "rio-nix",

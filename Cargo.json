@@ -20407,10 +20407,6 @@
           "packageId": "prost-types"
         },
         {
-          "name": "rand",
-          "packageId": "rand 0.10.0"
-        },
-        {
           "name": "regex",
           "packageId": "regex"
         },

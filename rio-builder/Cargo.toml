@@ -43,7 +43,6 @@ futures-util = { workspace = true }
 # axum on a separate port. K8s readinessProbe hits /readyz.
 axum = { workspace = true }
 scopeguard = { workspace = true }
-rand = { workspace = true }
 serde = { workspace = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 # Already in [build-dependencies] + transitive in Cargo.lock.

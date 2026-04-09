@@ -18,6 +18,16 @@ mod tests;
 
 pub use client::StoreClients;
 
+/// Process-unique suffix for spool/tmp filenames. The cache dir is a
+/// per-pod emptyDir (dies with the pod), so cross-process collisions
+/// are impossible; a monotone counter is sufficient and avoids the
+/// `rand` dep for two call sites.
+fn next_temp_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 use std::io;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -540,10 +550,9 @@ fn fetch_extract_insert(
     // Spool name pattern `*.nar-<16hex>`; the scopeguard below removes
     // it on any exit. A process-kill mid-spool leaves the orphan in
     // emptyDir, which dies with the pod.
-    let spool_path = cache.cache_dir().join(format!(
-        "{store_basename}.nar-{:016x}",
-        rand::random::<u64>()
-    ));
+    let spool_path = cache
+        .cache_dir()
+        .join(format!("{store_basename}.nar-{:016x}", next_temp_suffix()));
     // Guard: remove the spool on ANY exit (success or error). Runs after
     // the `?` early-returns below; the only way to leak a spool is a hard
     // kill, which the startup sweeper handles.
@@ -722,7 +731,7 @@ fn commit_to_cache(
     store_path: &str,
     store_basename: &str,
 ) -> Result<(), Errno> {
-    let tmp_path = local_path.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
+    let tmp_path = local_path.with_extension(format!("tmp-{:016x}", next_temp_suffix()));
     std::fs::File::open(spool_path)
         .map_err(rio_nix::nar::NarError::Io)
         .and_then(|f| {
