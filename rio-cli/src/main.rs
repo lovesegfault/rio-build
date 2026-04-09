@@ -13,14 +13,14 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use rio_common::backoff::{Backoff, Jitter};
+use rio_common::grpc::{RetryOpts, is_unavailable, retry_status};
 
 use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
-use tonic::Code;
 use tonic::transport::Channel;
 
 mod bps;
@@ -63,12 +63,14 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 /// with 1s/2s backoff covers a leader-election flip without making a
 /// genuinely-down scheduler hang the CLI for minutes.
 // r[impl cli.rpc-retry]
-const RPC_RETRY_ATTEMPTS: u32 = 3;
-const RPC_RETRY_BACKOFF: Backoff = Backoff {
-    base: Duration::from_secs(1),
-    mult: 2.0,
-    cap: Duration::from_secs(4),
-    jitter: Jitter::None,
+const RPC_RETRY: RetryOpts = RetryOpts {
+    backoff: Backoff {
+        base: Duration::from_secs(1),
+        mult: 2.0,
+        cap: Duration::from_secs(4),
+        jitter: Jitter::None,
+    },
+    max_attempts: 3,
 };
 
 /// Wrap an AdminService RPC call with timeout, `UNAVAILABLE` retry,
@@ -86,24 +88,25 @@ pub(crate) async fn rpc<T>(
     what: &'static str,
     mut op: impl AsyncFnMut() -> Result<tonic::Response<T>, tonic::Status>,
 ) -> anyhow::Result<T> {
-    let mut attempt = 0u32;
-    loop {
-        match tokio::time::timeout(RPC_TIMEOUT, op()).await {
-            Err(_) => bail!("{what}: deadline exceeded after {RPC_TIMEOUT:?}"),
-            Ok(Ok(r)) => return Ok(r.into_inner()),
-            Ok(Err(s)) if s.code() == Code::Unavailable && attempt + 1 < RPC_RETRY_ATTEMPTS => {
-                eprintln!(
-                    "{what}: UNAVAILABLE ({}); retry {}/{}",
-                    s.message(),
-                    attempt + 1,
-                    RPC_RETRY_ATTEMPTS - 1
-                );
-                tokio::time::sleep(RPC_RETRY_BACKOFF.duration(attempt)).await;
-                attempt += 1;
-            }
-            Ok(Err(s)) => bail!("{what}: {} ({:?})", s.message(), s.code()),
-        }
-    }
+    retry_status(
+        &RPC_RETRY,
+        is_unavailable,
+        |n, s| {
+            eprintln!(
+                "{what}: UNAVAILABLE ({}); retry {n}/{}",
+                s.message(),
+                RPC_RETRY.max_attempts - 1
+            );
+        },
+        async || {
+            tokio::time::timeout(RPC_TIMEOUT, op()).await.map_err(|_| {
+                tonic::Status::deadline_exceeded(format!("deadline exceeded after {RPC_TIMEOUT:?}"))
+            })?
+        },
+    )
+    .await
+    .map(|r| r.into_inner())
+    .map_err(|s| anyhow!("{what}: {} ({:?})", s.message(), s.code()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

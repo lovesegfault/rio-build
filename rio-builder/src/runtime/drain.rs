@@ -80,6 +80,9 @@ pub(super) fn reconnect_drain_gate(
 /// terminationGracePeriodSeconds=7200 (2h). If we exceed that,
 /// SIGKILL — builds lost. 2h is enough for ~any single build.
 pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
+    use rio_common::backoff::{Backoff, Jitter};
+    use rio_common::grpc::{RetryOpts, is_unavailable, retry_status};
+
     // I-091: scheduler_addr is the k8s Service — kube-proxy picks a
     // replica per TCP connection, so ~50% land on the standby, which
     // rejects with Unavailable("not leader"). One retry on a FRESH
@@ -87,40 +90,46 @@ pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
     // client would hit the same pod) gives kube-proxy another roll.
     // Still best-effort: two standby picks in a row falls through to
     // the warn path; heartbeat already reported draining either way.
-    for attempt in 0..2 {
-        match rio_proto::client::connect_single::<rio_proto::AdminServiceClient<_>>(scheduler_addr)
+    const OPTS: RetryOpts = RetryOpts {
+        backoff: Backoff {
+            base: std::time::Duration::ZERO,
+            mult: 1.0,
+            cap: std::time::Duration::ZERO,
+            jitter: Jitter::None,
+        },
+        max_attempts: 2,
+    };
+    let result = retry_status(
+        &OPTS,
+        is_unavailable,
+        |_, e| tracing::debug!(error = %e, "DrainExecutor hit standby; reconnecting once"),
+        async || {
+            // Fresh channel each attempt — see I-091 above.
+            let mut admin = rio_proto::client::connect_single::<rio_proto::AdminServiceClient<_>>(
+                scheduler_addr,
+            )
             .await
-        {
-            Ok(mut admin) => {
-                match admin
-                    .drain_executor(rio_proto::types::DrainExecutorRequest {
-                        executor_id: executor_id.to_string(),
-                        force: false,
-                    })
-                    .await
-                {
-                    Ok(resp) => {
-                        let r = resp.into_inner();
-                        info!(
-                            accepted = r.accepted,
-                            busy = r.busy,
-                            "drain acknowledged by scheduler"
-                        );
-                        break;
-                    }
-                    Err(e) if e.code() == tonic::Code::Unavailable && attempt == 0 => {
-                        tracing::debug!(error = %e, "DrainExecutor hit standby; reconnecting once");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "admin connect failed; heartbeat already reported draining");
-                break;
-            }
+            .map_err(|e| tonic::Status::unavailable(format!("admin connect: {e}")))?;
+            admin
+                .drain_executor(rio_proto::types::DrainExecutorRequest {
+                    executor_id: executor_id.to_string(),
+                    force: false,
+                })
+                .await
+        },
+    )
+    .await;
+    match result {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            info!(
+                accepted = r.accepted,
+                busy = r.busy,
+                "drain acknowledged by scheduler"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
         }
     }
     info!("drain complete, exiting");
