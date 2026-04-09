@@ -512,10 +512,10 @@ impl ChunkBackend for S3ChunkBackend {
         // would work but be antisocial (100 chunks = 100 simultaneous
         // requests; S3 can handle it but the caller's network might not).
         //
-        // NOTE: PutPath does NOT use this — it checks PG `chunks`
-        // refcounts via the inline RETURNING clause in cas.rs:do_upload
-        // for one RTT instead of N HeadObject calls. This S3
-        // exists_batch is kept for trait completeness.
+        // PutPath does NOT use this (it checks PG `chunks.uploaded_at`
+        // via the upsert RETURNING in `upgrade_manifest_to_chunked` for
+        // one RTT instead of N HeadObjects). The live caller is
+        // StoreAdminService.VerifyChunks (admin.rs).
         //
         // Chunked into batches of 16, each batch awaited concurrently via
         // join_all. Simpler than pulling in futures-util just for buffered().

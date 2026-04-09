@@ -223,11 +223,15 @@ pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) 
 /// chunks themselves were already uploaded + refcounted by
 /// [`crate::cas::stage_chunked`] outside the tx; only the visibility
 /// flip is atomic.
+///
+/// Takes `&mut PgConnection` (not `&mut Transaction`) for symmetry with
+/// [`complete_manifest_inline_in_tx`] — `&mut *tx` deref-coerces a
+/// `Transaction` at the call site.
 pub async fn complete_manifest_chunked_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
 ) -> Result<()> {
-    super::complete_manifest_in_conn(&mut *tx, info, None).await
+    super::complete_manifest_in_conn(conn, info, None).await
 }
 
 /// Reclaim a failed chunked upload: decrement refcounts + delete rows.

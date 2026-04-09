@@ -173,9 +173,7 @@ pub async fn query_path_info_batch(
     let mut by_path: std::collections::HashMap<String, ValidatedPathInfo> =
         std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let info = row
-            .try_into_validated()
-            .map_err(MetadataError::MalformedRow)?;
+        let info = row.try_into_validated()?;
         by_path.insert(info.store_path.to_string(), info);
     }
 
@@ -243,10 +241,7 @@ pub async fn get_manifest_batch(
 
     for row in rows {
         let inline_blob = row.inline_blob;
-        let info = row
-            .narinfo
-            .try_into_validated()
-            .map_err(MetadataError::MalformedRow)?;
+        let info = row.narinfo.try_into_validated()?;
         let path = info.store_path.to_string();
         match inline_blob {
             Some(blob) => {

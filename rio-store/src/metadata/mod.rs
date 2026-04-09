@@ -46,13 +46,26 @@ mod queries;
 mod tenant_keys;
 pub mod upstreams;
 
-// Public API — re-exports so all external callers in grpc/, cas.rs,
-// cache_server.rs keep their `metadata::foo` paths.
-pub use chunked::*;
-pub use cluster_key_history::*;
-pub use inline::*;
-pub use queries::*;
-pub use tenant_keys::*;
+// Public API — explicit re-exports so all external callers in grpc/,
+// cas.rs, cache_server.rs keep their `metadata::foo` paths. Kept
+// explicit (not `pub use chunked::*` etc.) so dead items in submodules
+// surface as `unused` instead of being silently exported.
+pub use chunked::{
+    complete_manifest_chunked, complete_manifest_chunked_in_tx, delete_manifest_chunked_uploading,
+    mark_chunks_uploaded, upgrade_manifest_to_chunked,
+};
+pub use cluster_key_history::load_cluster_key_history;
+pub use inline::{
+    check_manifest_complete, complete_manifest_inline, complete_manifest_inline_in_tx,
+    insert_manifest_uploading,
+};
+#[cfg(test)]
+pub use inline::{delete_manifest_uploading, manifest_uploading_age};
+pub use queries::{
+    append_signatures, find_missing_paths, get_manifest, get_manifest_batch, path_by_nar_hash,
+    query_by_hash_part, query_by_hash_part_for_tenant, query_path_info, query_path_info_batch,
+};
+pub use tenant_keys::get_active_signer;
 pub use upstreams::{SigMode, Upstream};
 
 /// Typed error for the metadata/DB layer. Replaces `anyhow::Result` so
@@ -303,10 +316,26 @@ pub(crate) struct NarinfoRow {
 }
 
 impl NarinfoRow {
-    pub(crate) fn try_into_validated(
-        self,
-    ) -> std::result::Result<ValidatedPathInfo, PathInfoValidationError> {
+    pub(crate) fn try_into_validated(self) -> Result<ValidatedPathInfo> {
         use rio_proto::types::PathInfo;
+        // i64 → u64: PG stores nar_size and registration_time as bigint
+        // (signed). Both are non-negative by construction (nar_size from a
+        // Vec::len(); registration_time from epoch seconds). A negative
+        // value is row-level corruption — surface it as InvariantViolation
+        // rather than `as u64`-wrapping to a huge value that masquerades
+        // as valid downstream.
+        let nar_size = u64::try_from(self.nar_size).map_err(|_| {
+            MetadataError::InvariantViolation(format!(
+                "narinfo.nar_size for {} is negative ({})",
+                self.store_path, self.nar_size
+            ))
+        })?;
+        let registration_time = u64::try_from(self.registration_time).map_err(|_| {
+            MetadataError::InvariantViolation(format!(
+                "narinfo.registration_time for {} is negative ({})",
+                self.store_path, self.registration_time
+            ))
+        })?;
         // Build raw PathInfo then delegate to the centralized TryFrom —
         // keeps validation logic in one place (rio-proto::validated), not
         // duplicated here.
@@ -315,16 +344,14 @@ impl NarinfoRow {
             store_path_hash: self.store_path_hash,
             deriver: self.deriver.unwrap_or_default(),
             nar_hash: self.nar_hash,
-            nar_size: self.nar_size as u64,
+            nar_size,
             references: self.references,
-            // `as u64` cast: registration_time is Unix epoch seconds,
-            // non-negative in practice. A negative value in the DB would
-            // be corruption; the cast wraps, which is detectable downstream.
-            registration_time: self.registration_time as u64,
+            registration_time,
             ultimate: self.ultimate,
             signatures: self.signatures,
             content_address: self.ca.unwrap_or_default(),
         })
+        .map_err(MetadataError::MalformedRow)
     }
 }
 
@@ -335,9 +362,7 @@ impl NarinfoRow {
 /// nar_hash) would otherwise propagate silently. Caught here at the trust
 /// boundary — PG doesn't enforce these as CHECK constraints.
 pub(crate) fn validate_row(row: Option<NarinfoRow>) -> Result<Option<ValidatedPathInfo>> {
-    row.map(NarinfoRow::try_into_validated)
-        .transpose()
-        .map_err(MetadataError::MalformedRow)
+    row.map(NarinfoRow::try_into_validated).transpose()
 }
 
 /// Fill the real narinfo fields (replacing placeholder zeros).
