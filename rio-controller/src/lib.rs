@@ -85,7 +85,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_reconcile_errors_total",
-        "Reconcile errors. reconciler=builderpool|builderpoolset, error_kind=kube|finalizer|invalid_spec|conflict. \
+        "Reconcile errors. reconciler=builderpool|builderpoolset|fetcherpool|componentscaler, \
+         error_kind=kube|finalizer|invalid_spec. \
          error_kind is the variant discriminator (stable, low cardinality). \
          Sustained rate > 0 = check controller logs."
     );

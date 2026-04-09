@@ -51,7 +51,7 @@ const FINALIZER: &str = "builderpool.rio.build/drain";
 pub(crate) use crate::reconcilers::common::pod::POOL_LABEL;
 
 /// Top-level reconcile. [`timed`] opens the `reconcile{reconciler,
-/// name, ns}` span and records the duration histogram; [`finalized`]
+/// name, ns}` span and records the duration histogram; `finalized`
 /// handles the `metadata.finalizers` dance (Apply on normal
 /// reconcile, Cleanup when deletionTimestamp is set).
 pub async fn reconcile(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {

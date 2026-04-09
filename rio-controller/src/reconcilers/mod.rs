@@ -12,9 +12,10 @@
 
 pub mod builderpool;
 pub mod builderpoolset;
-// WONTFIX: pub(crate) here ICEs stable rustdoc 1.94.1 ("no resolutions for a doc link"
-// at common/mod.rs:14). Nightly is fine. Leaf binary; pub-ness is cosmetic. Re-tighten
-// once the upstream ICE is fixed.
+// WONTFIX: pub(crate) here ICEs stable rustdoc 1.94.1 ("no resolutions
+// for a doc link" — collect_intra_doc_links). Re-verified 2026-04: still
+// crashes the .#checks.*.doc build. Nightly is fine. Leaf binary; pub-ness
+// is cosmetic. Re-tighten once the upstream ICE is fixed.
 pub mod common;
 pub mod componentscaler;
 pub mod fetcherpool;
