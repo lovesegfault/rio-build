@@ -48,13 +48,14 @@ async fn read_u64_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
 /// Read a length-prefixed, padded string field and return ALL its raw bytes
 /// (length prefix + string content + padding).
 async fn read_string_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
+    use rio_nix::protocol::wire::padding_len;
     use tokio::io::AsyncReadExt;
 
     let mut len_bytes = [0u8; 8];
     cursor.read_exact(&mut len_bytes).await.unwrap();
     let len = u64::from_le_bytes(len_bytes) as usize;
 
-    let padded_len = (len + 7) & !7;
+    let padded_len = len + padding_len(len);
     let mut content = vec![0u8; padded_len];
     if padded_len > 0 {
         cursor.read_exact(&mut content).await.unwrap();
@@ -68,27 +69,14 @@ async fn read_string_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
 
 /// Read a count-prefixed string collection and return ALL raw bytes.
 async fn read_strings_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
-    use tokio::io::AsyncReadExt;
-
-    let mut count_bytes = [0u8; 8];
-    cursor.read_exact(&mut count_bytes).await.unwrap();
-    let count = u64::from_le_bytes(count_bytes) as usize;
+    let count_bytes = read_u64_field(cursor).await;
+    let count = u64::from_le_bytes(count_bytes.clone().try_into().unwrap()) as usize;
 
     let mut result = Vec::new();
     result.extend_from_slice(&count_bytes);
 
     for _ in 0..count {
-        let mut len_bytes = [0u8; 8];
-        cursor.read_exact(&mut len_bytes).await.unwrap();
-        let len = u64::from_le_bytes(len_bytes) as usize;
-        let padded_len = (len + 7) & !7;
-
-        result.extend_from_slice(&len_bytes);
-        if padded_len > 0 {
-            let mut content = vec![0u8; padded_len];
-            cursor.read_exact(&mut content).await.unwrap();
-            result.extend_from_slice(&content);
-        }
+        result.extend(read_string_field(cursor).await);
     }
 
     result

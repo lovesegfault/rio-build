@@ -1,6 +1,28 @@
 //! Build event → STDERR translation and build opcode handlers.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+
+use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
+use rio_common::tenant::NormalizedName;
+use rio_nix::derivation::Derivation;
+use rio_nix::protocol::build::{
+    BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
+};
+use rio_nix::protocol::derived_path::DerivedPath;
+use rio_nix::protocol::stderr::{
+    ActivityType, ResultField, ResultType, StderrError, StderrWriter, verbosity,
+};
+use rio_nix::protocol::wire;
+use rio_proto::{SchedulerServiceClient, StoreServiceClient, types};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tonic::transport::Channel;
+use tracing::{debug, instrument, warn};
+
+use super::grpc::grpc_is_valid_path;
+use super::{GatewayError, PROGRAM_NAME, SessionContext, with_jwt};
+use crate::drv_cache::resolve_derivation;
+use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
+use crate::translate;
 
 /// Error from `process_build_events`. Distinguishes transport
 /// errors (scheduler connection dropped — reconnect-worthy) from
@@ -184,6 +206,226 @@ impl Default for BuildActivityState {
     }
 }
 
+// r[impl gw.stderr.result.build-log-line]
+/// Relay one `LogBatch` to the client. Lines attach to the per-drv
+/// activity as `STDERR_RESULT{aid, BuildLogLine, [line]}` so nom and
+/// `--log-format bar` show the last line under the owning build;
+/// fallback to `STDERR_NEXT` when no activity exists for this drv
+/// (logs arriving before `Derivation::Started`, or gateway-originated
+/// diagnostics like the `trace_id` line).
+async fn relay_log_batch<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &BuildActivityState,
+    log_batch: types::BuildLogBatch,
+) -> Result<(), StreamProcessError> {
+    let aid = act.drv.get(&log_batch.derivation_path).copied();
+    for line in &log_batch.lines {
+        // Log display, not parse-path. Build log lines are
+        // arbitrary builder output (may contain invalid UTF-8
+        // from whatever the build script printed); lossy
+        // replacement is the correct behavior for display.
+        #[allow(clippy::disallowed_methods)]
+        let text = String::from_utf8_lossy(line);
+        match aid {
+            Some(aid) => {
+                stderr
+                    .result(
+                        aid,
+                        ResultType::BuildLogLine,
+                        &[ResultField::String(text.into_owned())],
+                    )
+                    .await?;
+            }
+            None => stderr.log(&text).await?,
+        }
+    }
+    Ok(())
+}
+
+// r[impl gw.stderr.activity+2]
+/// Relay one `DerivationEvent` (Started/Completed/Failed/Cached/Queued)
+/// to the client as `actBuild` start/stop activity frames. Mutates
+/// `act.drv` to track which activity-id belongs to which derivation
+/// across reconnects.
+async fn relay_derivation_status<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+    drv_event: types::DerivationEvent,
+) -> Result<(), StreamProcessError> {
+    match drv_event.status {
+        Some(types::derivation_event::Status::Started(ref started)) => {
+            // actBuild fields per upstream
+            // `derivation-building-goal.cc`:
+            // [drvPath, machineName, curRound, nrRounds].
+            // nom reads fields[0] for the drv name and
+            // fields[1] for the "on <machine>" suffix;
+            // rounds are fixed (1,1) — rio doesn't repeat.
+            //
+            // machineName: NOT the executor pod ID — that
+            // leaks ephemeral pod names to the client and
+            // breaks the "cluster is one machine" abstraction
+            // (a build with 200 pods would show 200 machine
+            // names cycling). Use a stable cluster identifier
+            // from RIO_GATEWAY_MACHINE_NAME (helm sets it to
+            // the cluster name); empty default = upstream's
+            // local-build semantics (nom shows no suffix).
+            let _ = &started.executor_id; // intentionally unused — see above
+            let aid = stderr
+                .start_activity(
+                    ActivityType::Build,
+                    &format!("building '{}'", drv_event.derivation_path),
+                    verbosity::INFO,
+                    act.builds_root.unwrap_or(0),
+                    &[
+                        ResultField::String(drv_event.derivation_path.clone()),
+                        ResultField::String(act.machine_name.clone()),
+                        ResultField::Int(1),
+                        ResultField::Int(1),
+                    ],
+                )
+                .await?;
+            // I-206: a duplicate Started (replay after
+            // reconnect, or scheduler retry) overwrites the
+            // prior aid — the client then has TWO actBuild
+            // for this drv, and Completed only stops the
+            // newest. Stop the old one here so nom doesn't
+            // show a phantom-stuck build.
+            if let Some(prev) = act.drv.insert(drv_event.derivation_path.clone(), aid) {
+                debug!(
+                    drv = %drv_event.derivation_path,
+                    prev_aid = prev,
+                    new_aid = aid,
+                    "duplicate Started; stopping prior activity"
+                );
+                stderr.stop_activity(prev).await?;
+            }
+        }
+        Some(types::derivation_event::Status::Completed(_)) => {
+            if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            } else {
+                // I-206 witness: Completed for a drv we
+                // never (or no longer) have an aid for —
+                // path-key mismatch, or Started was dropped
+                // by a Lagged window. Display-only; the
+                // root actBuilds stop at terminal clears
+                // children. Logged so the next repro
+                // captures which case.
+                debug!(
+                    drv = %drv_event.derivation_path,
+                    tracked = act.drv.len(),
+                    "Completed with no tracked activity (I-206)"
+                );
+            }
+        }
+        Some(types::derivation_event::Status::Failed(ref failed)) => {
+            if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            } else {
+                debug!(
+                    drv = %drv_event.derivation_path,
+                    tracked = act.drv.len(),
+                    "Failed with no tracked activity (I-206)"
+                );
+            }
+            // Log failure via STDERR_NEXT
+            stderr
+                .log(&format!(
+                    "derivation '{}' failed: {}",
+                    drv_event.derivation_path, failed.error_message
+                ))
+                .await?;
+        }
+        Some(types::derivation_event::Status::Cached(_)) => {
+            // No activity to start/stop for cached derivations
+        }
+        Some(types::derivation_event::Status::Queued(_)) => {
+            // No STDERR message for queued state
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+// r[impl gw.stderr.result.progress]
+/// Relay `BuildStarted` / `Progress` events to the top-level
+/// `actBuilds` activity. `Started` opens the root activity (idempotent
+/// across reconnects) and emits `SetExpected{actBuild, N}`; `Progress`
+/// emits `resProgress{done, expected, running, failed}`.
+async fn relay_build_progress<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+    ev: &types::build_event::Event,
+) -> Result<(), StreamProcessError> {
+    match ev {
+        types::build_event::Event::Started(started) => {
+            debug!(
+                total = started.total_derivations,
+                cached = started.cached_derivations,
+                "build started"
+            );
+            // Top-level actBuilds activity. nom and progress-bar
+            // aggregate per-drv actBuild children under this; the
+            // SetExpected{actBuild, N} result drives the "N/M
+            // built" denominator. Idempotent: a second BuildStarted
+            // (replayed via WatchBuild after reconnect) re-uses the
+            // existing root rather than emitting a duplicate.
+            if act.builds_root.is_none() {
+                let aid = stderr
+                    .start_activity(ActivityType::Builds, "", verbosity::DEBUG, 0, &[])
+                    .await?;
+                act.builds_root = Some(aid);
+            }
+            let to_build = u64::from(
+                started
+                    .total_derivations
+                    .saturating_sub(started.cached_derivations),
+            );
+            if let Some(aid) = act.builds_root {
+                stderr
+                    .result(
+                        aid,
+                        ResultType::SetExpected,
+                        &[
+                            ResultField::Int(ActivityType::Build as u64),
+                            ResultField::Int(to_build),
+                        ],
+                    )
+                    .await?;
+            }
+        }
+        types::build_event::Event::Progress(prog) => {
+            debug!(
+                completed = prog.completed,
+                running = prog.running,
+                queued = prog.queued,
+                total = prog.total,
+                "build progress"
+            );
+            // resProgress fields: [done, expected, running, failed].
+            // `expected` is `total` (NOT total-cached): upstream
+            // progress-bar takes `max(SetExpected, Progress.expected)`
+            // so this is informational.
+            if let Some(aid) = act.builds_root {
+                stderr
+                    .result(
+                        aid,
+                        ResultType::Progress,
+                        &[
+                            ResultField::Int(u64::from(prog.completed)),
+                            ResultField::Int(u64::from(prog.total)),
+                            ResultField::Int(u64::from(prog.running)),
+                            ResultField::Int(0),
+                        ],
+                    )
+                    .await?;
+            }
+        }
+        _ => unreachable!("relay_build_progress only handles Started/Progress"),
+    }
+    Ok(())
+}
+
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
@@ -216,41 +458,10 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             *seq = event.sequence;
         }
 
+        use types::build_event::Event;
         match event.event {
-            Some(types::build_event::Event::Log(log_batch)) => {
-                // r[impl gw.stderr.result.build-log-line]
-                // Attach log lines to the per-drv activity as
-                // `STDERR_RESULT{aid, BuildLogLine, [line]}` so nom and
-                // `--log-format bar` show the last line under the
-                // owning build. Fallback to STDERR_NEXT only when no
-                // activity exists for this drv (logs arriving before
-                // Derivation::Started — race possible if scheduler
-                // sends a ForwardLogBatch ahead of the Started event,
-                // or for gateway-originated diagnostics like the
-                // trace_id line).
-                let aid = act.drv.get(&log_batch.derivation_path).copied();
-                for line in &log_batch.lines {
-                    // Log display, not parse-path. Build log lines are
-                    // arbitrary builder output (may contain invalid UTF-8
-                    // from whatever the build script printed); lossy
-                    // replacement is the correct behavior for display.
-                    #[allow(clippy::disallowed_methods)]
-                    let text = String::from_utf8_lossy(line);
-                    match aid {
-                        Some(aid) => {
-                            stderr
-                                .result(
-                                    aid,
-                                    ResultType::BuildLogLine,
-                                    &[ResultField::String(text.into_owned())],
-                                )
-                                .await?;
-                        }
-                        None => stderr.log(&text).await?,
-                    }
-                }
-            }
-            Some(types::build_event::Event::Phase(phase)) => {
+            Some(Event::Log(log_batch)) => relay_log_batch(stderr, act, log_batch).await?,
+            Some(Event::Phase(phase)) => {
                 // r[impl gw.stderr.result.set-phase]
                 // Builder forwarded the daemon's SetPhase. Attach to the
                 // owning per-drv activity so nom shows the phase column.
@@ -264,182 +475,26 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                         .await?;
                 }
             }
-            Some(types::build_event::Event::Derivation(drv_event)) => {
-                match drv_event.status {
-                    Some(types::derivation_event::Status::Started(ref started)) => {
-                        // r[impl gw.stderr.activity+2]
-                        // actBuild fields per upstream
-                        // `derivation-building-goal.cc`:
-                        // [drvPath, machineName, curRound, nrRounds].
-                        // nom reads fields[0] for the drv name and
-                        // fields[1] for the "on <machine>" suffix;
-                        // rounds are fixed (1,1) — rio doesn't repeat.
-                        //
-                        // machineName: NOT the executor pod ID — that
-                        // leaks ephemeral pod names to the client and
-                        // breaks the "cluster is one machine" abstraction
-                        // (a build with 200 pods would show 200 machine
-                        // names cycling). Use a stable cluster identifier
-                        // from RIO_GATEWAY_MACHINE_NAME (helm sets it to
-                        // the cluster name); empty default = upstream's
-                        // local-build semantics (nom shows no suffix).
-                        let _ = &started.executor_id; // intentionally unused — see above
-                        let aid = stderr
-                            .start_activity(
-                                ActivityType::Build,
-                                &format!("building '{}'", drv_event.derivation_path),
-                                verbosity::INFO,
-                                act.builds_root.unwrap_or(0),
-                                &[
-                                    ResultField::String(drv_event.derivation_path.clone()),
-                                    ResultField::String(act.machine_name.clone()),
-                                    ResultField::Int(1),
-                                    ResultField::Int(1),
-                                ],
-                            )
-                            .await?;
-                        // I-206: a duplicate Started (replay after
-                        // reconnect, or scheduler retry) overwrites the
-                        // prior aid — the client then has TWO actBuild
-                        // for this drv, and Completed only stops the
-                        // newest. Stop the old one here so nom doesn't
-                        // show a phantom-stuck build.
-                        if let Some(prev) = act.drv.insert(drv_event.derivation_path.clone(), aid) {
-                            debug!(
-                                drv = %drv_event.derivation_path,
-                                prev_aid = prev,
-                                new_aid = aid,
-                                "duplicate Started; stopping prior activity"
-                            );
-                            stderr.stop_activity(prev).await?;
-                        }
-                    }
-                    Some(types::derivation_event::Status::Completed(_)) => {
-                        if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
-                            stderr.stop_activity(aid).await?;
-                        } else {
-                            // I-206 witness: Completed for a drv we
-                            // never (or no longer) have an aid for —
-                            // path-key mismatch, or Started was dropped
-                            // by a Lagged window. Display-only; the
-                            // root actBuilds stop at terminal clears
-                            // children. Logged so the next repro
-                            // captures which case.
-                            debug!(
-                                drv = %drv_event.derivation_path,
-                                tracked = act.drv.len(),
-                                "Completed with no tracked activity (I-206)"
-                            );
-                        }
-                    }
-                    Some(types::derivation_event::Status::Failed(ref failed)) => {
-                        if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
-                            stderr.stop_activity(aid).await?;
-                        } else {
-                            debug!(
-                                drv = %drv_event.derivation_path,
-                                tracked = act.drv.len(),
-                                "Failed with no tracked activity (I-206)"
-                            );
-                        }
-                        // Log failure via STDERR_NEXT
-                        stderr
-                            .log(&format!(
-                                "derivation '{}' failed: {}",
-                                drv_event.derivation_path, failed.error_message
-                            ))
-                            .await?;
-                    }
-                    Some(types::derivation_event::Status::Cached(_)) => {
-                        // No activity to start/stop for cached derivations
-                    }
-                    Some(types::derivation_event::Status::Queued(_)) => {
-                        // No STDERR message for queued state
-                    }
-                    None => {}
-                }
+            Some(Event::Derivation(drv_event)) => {
+                relay_derivation_status(stderr, act, drv_event).await?;
             }
-            Some(types::build_event::Event::Started(started)) => {
-                debug!(
-                    total = started.total_derivations,
-                    cached = started.cached_derivations,
-                    "build started"
-                );
-                // r[impl gw.stderr.result.progress]
-                // Top-level actBuilds activity. nom and progress-bar
-                // aggregate per-drv actBuild children under this; the
-                // SetExpected{actBuild, N} result drives the "N/M
-                // built" denominator. Idempotent: a second BuildStarted
-                // (replayed via WatchBuild after reconnect) re-uses the
-                // existing root rather than emitting a duplicate.
-                if act.builds_root.is_none() {
-                    let aid = stderr
-                        .start_activity(ActivityType::Builds, "", verbosity::DEBUG, 0, &[])
-                        .await?;
-                    act.builds_root = Some(aid);
-                }
-                let to_build = u64::from(
-                    started
-                        .total_derivations
-                        .saturating_sub(started.cached_derivations),
-                );
-                if let Some(aid) = act.builds_root {
-                    stderr
-                        .result(
-                            aid,
-                            ResultType::SetExpected,
-                            &[
-                                ResultField::Int(ActivityType::Build as u64),
-                                ResultField::Int(to_build),
-                            ],
-                        )
-                        .await?;
-                }
+            Some(ref ev @ (Event::Started(_) | Event::Progress(_))) => {
+                relay_build_progress(stderr, act, ev).await?;
             }
-            Some(types::build_event::Event::InputsResolved(_)) => {
+            Some(Event::InputsResolved(_)) => {
                 // Scheduler's store cache-check done; dispatch begins
                 // next. The info to print (N to build = total - cached)
                 // arrived in Started above as SetExpected.
                 debug!("build inputs resolved");
             }
-            Some(types::build_event::Event::Progress(prog)) => {
-                debug!(
-                    completed = prog.completed,
-                    running = prog.running,
-                    queued = prog.queued,
-                    total = prog.total,
-                    "build progress"
-                );
-                // r[impl gw.stderr.result.progress]
-                // resProgress fields: [done, expected, running, failed].
-                // `expected` is `total` (NOT total-cached): upstream
-                // progress-bar takes `max(SetExpected, Progress.expected)`
-                // so this is informational.
-                if let Some(aid) = act.builds_root {
-                    stderr
-                        .result(
-                            aid,
-                            ResultType::Progress,
-                            &[
-                                ResultField::Int(u64::from(prog.completed)),
-                                ResultField::Int(u64::from(prog.total)),
-                                ResultField::Int(u64::from(prog.running)),
-                                ResultField::Int(0),
-                            ],
-                        )
-                        .await?;
-                }
-            }
-            Some(types::build_event::Event::Completed(_)) => {
-                return Ok(BuildEventOutcome::Completed);
-            }
-            Some(types::build_event::Event::Failed(failed)) => {
+            Some(Event::Completed(_)) => return Ok(BuildEventOutcome::Completed),
+            Some(Event::Failed(failed)) => {
                 return Ok(BuildEventOutcome::Failed {
                     status: failed.status(),
                     error_message: failed.error_message,
                 });
             }
-            Some(types::build_event::Event::Cancelled(cancelled)) => {
+            Some(Event::Cancelled(cancelled)) => {
                 return Ok(BuildEventOutcome::Cancelled {
                     reason: cancelled.reason,
                 });
@@ -473,24 +528,21 @@ enum BuildEventOutcome {
     },
 }
 
-/// Submit a build to the scheduler and process events, returning a BuildResult.
-#[instrument(
-    skip_all,
-    fields(tenant = %request.tenant_name, build_id = tracing::field::Empty)
-)]
-async fn submit_and_process_build<W: AsyncWrite + Unpin>(
+/// Issue the `SubmitBuild` RPC and read its initial response metadata
+/// (`x-rio-build-id`, `x-rio-trace-id`). Records `build_id` in
+/// `active_build_ids` at seq=0 so a stream error before event 0 is
+/// reconnectable. Emits the trace-id diagnostic line to the client.
+///
+/// On `SubmitBuild` failure, logs a `STDERR_NEXT` diagnostic (NOT
+/// `STDERR_ERROR` — see comment) before returning the error so callers
+/// that convert `Err` → `BuildResult::failure` produce the correct
+/// `STDERR_LAST + BuildResult` sequence.
+async fn submit_initial<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
-    request: types::SubmitBuildRequest,
+    request: tonic::Request<types::SubmitBuildRequest>,
     active_build_ids: &mut HashMap<String, u64>,
-    jwt_token: Option<&str>,
-) -> anyhow::Result<BuildResult> {
-    // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
-    // with_jwt injects the enclosing span's context + tenant JWT — this
-    // is THE hop that makes distributed tracing work; without it,
-    // scheduler spans are orphaned root traces.
-    let request = super::with_jwt(request, jwt_token)?;
-
+) -> anyhow::Result<(String, tonic::codec::Streaming<types::BuildEvent>)> {
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
         rio_common::grpc::SUBMIT_BUILD_TIMEOUT,
@@ -538,7 +590,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let mut event_stream = resp.into_inner();
+    let event_stream = resp.into_inner();
 
     let build_id = match header_build_id {
         Some(id) => {
@@ -578,6 +630,30 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     if !trace_id.is_empty() {
         let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
     }
+
+    Ok((build_id, event_stream))
+}
+
+/// Submit a build to the scheduler and process events, returning a BuildResult.
+#[instrument(
+    skip_all,
+    fields(tenant = %request.tenant_name, build_id = tracing::field::Empty)
+)]
+async fn submit_and_process_build<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    scheduler_client: &mut SchedulerServiceClient<Channel>,
+    request: types::SubmitBuildRequest,
+    active_build_ids: &mut HashMap<String, u64>,
+    jwt_token: Option<&str>,
+) -> anyhow::Result<BuildResult> {
+    // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
+    // with_jwt injects the enclosing span's context + tenant JWT — this
+    // is THE hop that makes distributed tracing work; without it,
+    // scheduler spans are orphaned root traces.
+    let request = with_jwt(request, jwt_token)?;
+
+    let (build_id, mut event_stream) =
+        submit_initial(stderr, scheduler_client, request, active_build_ids).await?;
 
     // Process remaining events, with reconnect on stream error.
     // Scheduler failover/restart drops the stream; we reconnect
@@ -798,8 +874,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         quota_cache,
         ..
     } = ctx;
-    let drv_path_str = wire::read_string(reader).await?;
-    tracing::Span::current().record("path", drv_path_str.as_str());
+    let (drv_path_str, drv_path) = match super::read_store_path(reader).await {
+        Ok(v) => v,
+        Err(e) => stderr_err!(stderr, "wopBuildDerivation: {e}"),
+    };
     let Ok(basic_drv) = read_basic_derivation(reader).await else {
         stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
     };
@@ -847,11 +925,6 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
     // The .drv should have been uploaded via wopAddToStoreNar before this call.
-    let drv_path = match StorePath::parse(&drv_path_str) {
-        Ok(p) => p,
-        Err(e) => stderr_err!(stderr, "invalid drv path '{drv_path_str}': {e}"),
-    };
-
     let full_drv = resolve_derivation(&drv_path, store_client, drv_cache).await;
 
     let (nodes, edges) = match &full_drv {

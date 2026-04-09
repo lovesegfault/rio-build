@@ -34,16 +34,19 @@ use governor::{DefaultKeyedRateLimiter, NotUntil, Quota};
 /// anonymous sessions share one bucket.
 const ANON_KEY: &str = "__anon__";
 
-/// Operator-supplied quota. Both fields must be ≥1 (`governor::Quota`
-/// takes `NonZeroU32`). `burst` is the bucket capacity; `per_minute`
+/// Operator-supplied quota. `burst` is the bucket capacity; `per_minute`
 /// is the refill rate. A burst of N means N builds can fire
 /// back-to-back before the limiter kicks in — useful for
 /// `nix copy --to ssh-ng://…` which uploads a closure worth of
 /// derivations then submits one build per root.
+///
+/// Fields are [`NonZeroU32`] so a zero value is rejected at config
+/// deserialization (figment surfaces the serde error naming the
+/// field) rather than panicking inside [`TenantLimiter::new`].
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub struct RateLimitConfig {
-    pub per_minute: u32,
-    pub burst: u32,
+    pub per_minute: NonZeroU32,
+    pub burst: NonZeroU32,
 }
 
 /// Per-tenant token-bucket limiter.
@@ -66,17 +69,10 @@ pub struct TenantLimiter {
 
 impl TenantLimiter {
     /// `config: None` → disabled (every `check()` passes).
-    ///
-    /// Panics if `per_minute == 0` or `burst == 0` — both are
-    /// operator misconfiguration, better to fail loud at startup than
-    /// silently rate-limit to zero.
     pub fn new(config: Option<RateLimitConfig>) -> Self {
         let clock = QuantaClock::default();
         let inner = config.map(|c| {
-            let per_minute =
-                NonZeroU32::new(c.per_minute).expect("rate_limit.per_minute must be >= 1");
-            let burst = NonZeroU32::new(c.burst).expect("rate_limit.burst must be >= 1");
-            let quota = Quota::per_minute(per_minute).allow_burst(burst);
+            let quota = Quota::per_minute(c.per_minute).allow_burst(c.burst);
             Arc::new(DefaultKeyedRateLimiter::keyed(quota))
         });
         Self { inner, clock }
@@ -123,6 +119,13 @@ impl TenantLimiter {
 mod tests {
     use super::*;
 
+    fn cfg(per_minute: u32, burst: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            per_minute: NonZeroU32::new(per_minute).unwrap(),
+            burst: NonZeroU32::new(burst).unwrap(),
+        }
+    }
+
     /// Disabled limiter is a no-op. 10_000 checks all pass.
     #[test]
     fn disabled_never_blocks() {
@@ -138,10 +141,7 @@ mod tests {
     /// than one token's refill interval (6s).
     #[test]
     fn burst_then_block() {
-        let lim = TenantLimiter::new(Some(RateLimitConfig {
-            per_minute: 10,
-            burst: 30,
-        }));
+        let lim = TenantLimiter::new(Some(cfg(10, 30)));
         for i in 0..30 {
             assert!(
                 lim.check(Some("tenant-a")).is_ok(),
@@ -168,10 +168,7 @@ mod tests {
     /// limiting — one noisy tenant can't DoS another.
     #[test]
     fn tenants_independent() {
-        let lim = TenantLimiter::new(Some(RateLimitConfig {
-            per_minute: 10,
-            burst: 30,
-        }));
+        let lim = TenantLimiter::new(Some(cfg(10, 30)));
         // Drain A.
         for _ in 0..30 {
             lim.check(Some("tenant-a")).unwrap();
@@ -195,10 +192,7 @@ mod tests {
     /// via `None` means `Some("")` is also drained — same key.
     #[test]
     fn anon_key_aliases() {
-        let lim = TenantLimiter::new(Some(RateLimitConfig {
-            per_minute: 10,
-            burst: 3,
-        }));
+        let lim = TenantLimiter::new(Some(cfg(10, 3)));
         lim.check(None).unwrap();
         lim.check(Some("")).unwrap();
         lim.check(None).unwrap();
@@ -215,10 +209,7 @@ mod tests {
     /// limiters, it's N handles to one.
     #[test]
     fn clones_share_state() {
-        let lim = TenantLimiter::new(Some(RateLimitConfig {
-            per_minute: 10,
-            burst: 2,
-        }));
+        let lim = TenantLimiter::new(Some(cfg(10, 2)));
         let lim2 = lim.clone();
         lim.check(Some("x")).unwrap();
         lim2.check(Some("x")).unwrap();

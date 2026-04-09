@@ -7,10 +7,16 @@
 //! store-side tenant-scoped operations (substitution, narinfo
 //! visibility gate) short-circuit — see `r[gw.jwt.issue]`.
 
-use super::*;
+use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
+use rio_common::limits::MAX_NAR_SIZE;
+use rio_nix::store_path::StorePath;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
-use tokio::io::AsyncReadExt;
+use rio_proto::{StoreServiceClient, types};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tonic::transport::Channel;
+
+use super::{GatewayError, jwt_metadata, with_jwt};
 
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(crate) async fn grpc_query_path_info(
@@ -243,7 +249,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 /// auto-advance fires the GRPC_STREAM_TIMEOUT before in-process gRPC
 /// I/O completes (observed in wire_opcodes::build reconnect tests when
 /// P0465 initially inlined this; reverted to delegation).
-pub(super) async fn grpc_get_path(
+pub(crate) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,

@@ -1,6 +1,21 @@
 //! Read-only opcode handlers (query, ensure, temp-root, options).
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+
+use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
+use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
+use rio_nix::protocol::pathinfo;
+use rio_nix::protocol::stderr::StderrWriter;
+use rio_nix::protocol::wire;
+use rio_nix::store_path::StorePath;
+use rio_proto::types;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::{debug, error, info, instrument, warn};
+
+use super::grpc::{grpc_is_valid_path, grpc_query_path_info};
+use super::{PROGRAM_NAME, SessionContext, read_store_path, with_jwt};
+use crate::drv_cache::resolve_derivation;
+use crate::translate;
 
 /// JWT for store lookups — but NOT for `.drv` paths.
 ///
@@ -29,9 +44,10 @@ fn jwt_unless_drv<'a>(jwt_token: Option<&'a str>, path: &StorePath) -> Option<&'
 pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopIsValidPath");
@@ -61,9 +77,10 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
 pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopEnsurePath");
@@ -95,14 +112,15 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
+    ctx: &mut SessionContext,
+) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
     // r[impl store.tenant.narinfo-filter]
     // JWT propagation: x-rio-tenant-token reaches store's QueryPathInfo
     // handler → tenant-scoped narinfo visibility gate. Without this,
     // the store sees anonymous → gate short-circuits → path invisible
     // even if the tenant's trusted_keys would admit it.
-    jwt_token: Option<&str>,
-) -> anyhow::Result<()> {
+    let jwt_token = ctx.jwt_token.as_deref();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopQueryPathInfo");
@@ -132,17 +150,23 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
         Some(info) => {
             wire::write_bool(w, true).await?;
-            // deriver: Option<StorePath> → empty string if None (wire convention)
-            wire::write_string(w, info.deriver.as_deref().unwrap_or("")).await?;
-            wire::write_nar_hash(w, &info.nar_hash).await?;
-            // references: Vec<StorePath> — StorePath: AsRef<str>
-            wire::write_strings(w, &info.references).await?;
-            wire::write_u64(w, info.registration_time).await?;
-            wire::write_u64(w, info.nar_size).await?;
-            wire::write_bool(w, info.ultimate).await?;
-            wire::write_strings(w, &info.signatures).await?;
-            // content_address: Option<String> → empty string if None
-            wire::write_string(w, info.content_address.as_deref().unwrap_or("")).await?;
+            pathinfo::write_body(
+                w,
+                &pathinfo::PathInfoBody {
+                    // deriver: Option<StorePath> → empty string if None (wire convention)
+                    deriver: info.deriver.map(|d| d.to_string()).unwrap_or_default(),
+                    nar_hash: info.nar_hash.to_vec(),
+                    // references: Vec<StorePath> — StorePath: AsRef<str>
+                    references: info.references.iter().map(|r| r.to_string()).collect(),
+                    registration_time: info.registration_time,
+                    nar_size: info.nar_size,
+                    ultimate: info.ultimate,
+                    signatures: info.signatures,
+                    // content_address: Option<String> → empty string if None
+                    content_address: info.content_address.unwrap_or_default(),
+                },
+            )
+            .await?;
         }
     }
 
@@ -155,9 +179,10 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
 pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let path_strs = wire::read_strings(reader).await?;
     let _substitute = wire::read_bool(reader).await?;
     tracing::Span::current().record("count", path_strs.len());
@@ -215,6 +240,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    _ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -247,6 +273,7 @@ pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + U
 pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    _ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let _keep_failed = wire::read_bool(reader).await?;
     let _keep_going = wire::read_bool(reader).await?;
@@ -292,20 +319,15 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
-    let path_str = wire::read_string(reader).await?;
-    tracing::Span::current().record("path", path_str.as_str());
-    debug!(path = %path_str, "wopNarFromPath");
-
-    let path = match StorePath::parse(&path_str) {
-        Ok(p) => p,
-        Err(e) => {
-            debug!(path = %path_str, error = %e, "invalid store path in wopNarFromPath");
-            stderr_err!(stderr, "invalid store path '{path_str}': {e}");
-        }
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let (path_str, path) = match read_store_path(reader).await {
+        Ok(v) => v,
+        Err(e) => stderr_err!(stderr, "{e}"),
     };
+    debug!(path = %path_str, "wopNarFromPath");
 
     // Fetch the FULL NAR before sending STDERR_LAST. We can't stream
     // incrementally: a mid-stream gRPC error would leave the client's
@@ -362,9 +384,10 @@ pub(super) async fn handle_query_path_from_hash_part<
 >(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let hash_part = wire::read_string(reader).await?;
     tracing::Span::current().record("hash_part", hash_part.as_str());
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
@@ -407,9 +430,10 @@ pub(super) async fn handle_query_path_from_hash_part<
 pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let path_str = wire::read_string(reader).await?;
     let sigs = wire::read_strings(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -478,9 +502,10 @@ fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let json = wire::read_string(reader).await?;
     debug!(json_len = json.len(), "wopRegisterDrvOutput");
 
@@ -627,9 +652,10 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
 pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
     let id = wire::read_string(reader).await?;
     tracing::Span::current().record("id", id.as_str());
 
@@ -735,7 +761,9 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
 pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
+    ctx: &mut SessionContext,
+) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
     // r[impl store.substitute.upstream]
     // JWT propagation: x-rio-tenant-token reaches store's FindMissingPaths
     // handler → try_substitute_on_miss reads tenant_id from Claims →
@@ -743,9 +771,8 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     // → substitute short-circuits at rio-store/src/grpc/mod.rs
     // tenant_id_or_skip → client is told to BUILD what it could FETCH.
     // This was the P0465 blocker for `cargo xtask k8s -p kind rsb`.
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-) -> anyhow::Result<()> {
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
     let raw_paths = wire::read_strings(reader).await?;
     tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopQueryMissing");
@@ -907,21 +934,16 @@ pub(super) async fn handle_query_derivation_output_map<
 >(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
-    let drv_path_str = wire::read_string(reader).await?;
-    tracing::Span::current().record("path", drv_path_str.as_str());
-    info!(path = %drv_path_str, "wopQueryDerivationOutputMap");
-
-    let drv_path = match StorePath::parse(&drv_path_str) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(path = %drv_path_str, error = %e, "invalid store path");
-            stderr_err!(stderr, "invalid store path '{drv_path_str}': {e}");
-        }
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
+    let (drv_path_str, drv_path) = match read_store_path(reader).await {
+        Ok(v) => v,
+        Err(e) => stderr_err!(stderr, "{e}"),
     };
+    info!(path = %drv_path_str, "wopQueryDerivationOutputMap");
 
     let drv = match resolve_derivation(&drv_path, store_client, drv_cache).await {
         Ok(d) => d,

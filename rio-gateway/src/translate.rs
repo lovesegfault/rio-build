@@ -6,7 +6,6 @@
 // r[impl gw.dag.reconstruct+2]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::{BasicDerivation, Derivation, DerivationLike};
@@ -29,38 +28,7 @@ const MAX_INLINE_DRV_BYTES: usize = 64 * 1024;
 /// still a huge win over inlining zero.
 const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::handler::resolve_derivations_batch;
-
-/// Default cap on transitive input derivations resolved per build (DoS guard).
-/// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the wire layer
-/// already bounds at 1M, so a tighter cap here only rejects DAGs the wire
-/// admitted (I-016: 10k→100k; I-135: 100k→1M after hello-deep-1024x's >100k
-/// .drv closure). Memory: 1M parsed `Derivation` ≈ 1–3 GB/session at the cap;
-/// gateway pod limit raised to 4 GiB (I-134) to accommodate. Override via
-/// `RIO_MAX_TRANSITIVE_INPUTS`.
-pub const DEFAULT_MAX_TRANSITIVE_INPUTS: usize = 1_048_576;
-
-/// Process-global limit. Set once via [`init_max_transitive_inputs`] in main()
-/// AFTER config load. Same OnceLock pattern as `rio_common::grpc::CLIENT_TLS`
-/// — threading this through `reconstruct_dag` + `resolve_derivation` +
-/// `try_cache_drv` (~18 call sites including tests) is invasive for a value
-/// that IS process-global (one DoS guard, not per-session policy).
-static MAX_TRANSITIVE_INPUTS: OnceLock<usize> = OnceLock::new();
-
-/// Set the process-wide transitive-input cap. Call ONCE in main(), after
-/// loading config but before any SSH session can call `reconstruct_dag`.
-/// Calling twice is a silent no-op (OnceLock semantics — first wins).
-pub fn init_max_transitive_inputs(n: usize) {
-    let _ = MAX_TRANSITIVE_INPUTS.set(n);
-}
-
-/// Current cap. Falls back to [`DEFAULT_MAX_TRANSITIVE_INPUTS`] if main()
-/// never called init (tests, or a future binary that forgot to wire it).
-pub(crate) fn max_transitive_inputs() -> usize {
-    *MAX_TRANSITIVE_INPUTS
-        .get()
-        .unwrap_or(&DEFAULT_MAX_TRANSITIVE_INPUTS)
-}
+use crate::drv_cache::{max_transitive_inputs, resolve_derivations_batch};
 
 /// Reconstruct the full derivation DAG starting from a root derivation.
 ///

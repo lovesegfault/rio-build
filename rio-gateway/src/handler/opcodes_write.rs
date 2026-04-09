@@ -1,10 +1,21 @@
 //! Write opcode handlers (add-to-store, add-text, add-multiple).
 
-use super::*;
+use rio_common::limits::MAX_NAR_SIZE;
+use rio_nix::hash::{HashAlgo, NixHash};
+use rio_nix::nar::{self, NarNode};
+use rio_nix::protocol::pathinfo;
+use rio_nix::protocol::stderr::{StderrError, StderrWriter};
+use rio_nix::protocol::wire;
+use rio_nix::store_path::StorePath;
+use rio_proto::types;
 use rio_proto::validated::ValidatedPathInfo;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::task::JoinSet;
-use tracing::Instrument;
+use tracing::{Instrument, debug, instrument, warn};
+
+use super::grpc::{grpc_put_path, grpc_put_path_streaming};
+use super::{GatewayError, PROGRAM_NAME, SessionContext};
+use crate::drv_cache::{DRV_NAR_BUFFER_LIMIT, try_cache_drv};
 
 // r[impl gw.wire.framed-max-total+2]
 // Guard against future drift: if MAX_NAR_SIZE is bumped without
@@ -67,10 +78,11 @@ fn parse_reference_paths(refs: &[String], context: &str) -> Result<Vec<StorePath
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
     let EntryHead {
         path,
         path_str,
@@ -167,61 +179,59 @@ struct EntryHead {
     nar_hash_bytes: Vec<u8>,
 }
 
-/// Read and validate one entry's metadata from the framed stream.
+/// Read and validate one entry's metadata from the wire.
 ///
-/// Wire format (per Nix `Store::addMultipleToStore(Source &, ...)` in
-/// store-api.cc, called with protocol version 16):
+/// Shared by two opcodes that send the same `path` + [`PathInfoBody`]
+/// head:
+///
+/// - `wopAddToStoreNar` (39): reads from the OUTER stream; the NAR
+///   payload that follows is FRAMED (`FramedStreamReader`).
+/// - `wopAddMultipleToStore` (44): reads from inside an
+///   already-framed stream; NAR payload is `narSize` plain bytes
+///   (NOT nested-framed — `addToStore(info, source)` reads directly
+///   from the already-framed outer stream).
+///
+/// Wire format (`ValidPathInfo::read` in store-api.cc, protocol ≥16):
 ///   path: string
-///   deriver: string (empty if none)
-///   narHash: string (hex — `Hash::parseAny(.., SHA256)`)
-///   references: [string]
-///   registrationTime: u64
-///   narSize: u64
-///   ultimate: bool
-///   sigs: [string]
-///   ca: string (empty if none)
-///   NAR: narSize plain bytes (NOT framed — `addToStore(info, source)` reads
-///        narSize bytes directly from the already-framed outer stream)
+///   [`PathInfoBody`] (8 fields — see `rio_nix::protocol::pathinfo`)
+///   NAR: see per-opcode note above
 ///
 /// Returns with the NAR bytes still unread — caller decides buffer vs stream.
+///
+/// [`PathInfoBody`]: rio_nix::protocol::pathinfo::PathInfoBody
 async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result<EntryHead> {
     let path_str = wire::read_string(framed).await?;
-    let deriver_str = wire::read_string(framed).await?;
-    let nar_hash_bytes = wire::read_nar_hash(framed).await?;
-    let references = wire::read_strings(framed).await?;
-    let registration_time = wire::read_u64(framed).await?;
-    let nar_size = wire::read_u64(framed).await?;
-    let ultimate = wire::read_bool(framed).await?;
-    let sigs = wire::read_strings(framed).await?;
-    let ca_str = wire::read_string(framed).await?;
+    let body = pathinfo::read_body(framed).await?;
 
-    debug!(path = %path_str, nar_size, "read PathInfo wire head");
+    debug!(path = %path_str, nar_size = body.nar_size, "read PathInfo wire head");
 
     let path = StorePath::parse(&path_str).map_err(|e| GatewayError::InvalidStorePath {
         path: path_str.clone(),
         source: e,
     })?;
 
-    if nar_size > rio_common::limits::MAX_NAR_SIZE {
+    if body.nar_size > MAX_NAR_SIZE {
         return Err(GatewayError::NarTooLarge {
             context: format!("entry '{path_str}'"),
-            got: nar_size,
-            max: rio_common::limits::MAX_NAR_SIZE,
+            got: body.nar_size,
+            max: MAX_NAR_SIZE,
         }
         .into());
     }
 
+    let nar_size = body.nar_size;
+    let nar_hash_bytes = body.nar_hash.clone();
     let raw_info = types::PathInfo {
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
-        deriver: deriver_str,
-        nar_hash: nar_hash_bytes.clone(),
-        nar_size,
-        references,
-        registration_time,
-        ultimate,
-        signatures: sigs,
-        content_address: ca_str,
+        deriver: body.deriver,
+        nar_hash: body.nar_hash,
+        nar_size: body.nar_size,
+        references: body.references,
+        registration_time: body.registration_time,
+        ultimate: body.ultimate,
+        signatures: body.signatures,
+        content_address: body.content_address,
     };
     let info =
         ValidatedPathInfo::try_from(raw_info).map_err(|e| GatewayError::InvalidPathInfo {
@@ -273,10 +283,11 @@ async fn drain_put_tasks(
 pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
     let cam_str = wire::read_string(reader).await?;
     let references = wire::read_strings(reader).await?;
@@ -367,14 +378,20 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let w = stderr.inner_mut();
 
     wire::write_string(w, path.as_str()).await?;
-    wire::write_string(w, "").await?;
-    wire::write_string(w, &nar_hash.to_hex()).await?;
-    wire::write_strings(w, &references).await?;
-    wire::write_u64(w, 0).await?;
-    wire::write_u64(w, nar_size).await?;
-    wire::write_bool(w, true).await?;
-    wire::write_strings(w, wire::NO_STRINGS).await?;
-    wire::write_string(w, &ca).await?;
+    pathinfo::write_body(
+        w,
+        &pathinfo::PathInfoBody {
+            deriver: String::new(),
+            nar_hash: nar_hash.digest().to_vec(),
+            references,
+            registration_time: 0,
+            nar_size,
+            ultimate: true,
+            signatures: Vec::new(),
+            content_address: ca,
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -385,10 +402,11 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
     let text = wire::read_string(reader).await?;
     let references = wire::read_strings(reader).await?;
@@ -490,10 +508,11 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError>
 pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let store_client = &mut ctx.store_client;
+    let jwt_token = ctx.jwt_token.as_deref();
+    let drv_cache = &mut ctx.drv_cache;
     let _repair = wire::read_bool(reader).await?;
     let _dont_check_sigs = wire::read_bool(reader).await?;
 

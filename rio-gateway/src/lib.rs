@@ -4,6 +4,8 @@
 //! translates protocol operations into gRPC calls to the scheduler
 //! and store services.
 
+pub mod config;
+pub mod drv_cache;
 pub mod handler;
 pub(crate) mod quota;
 pub(crate) mod ratelimit;

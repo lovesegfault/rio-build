@@ -21065,10 +21065,6 @@
           "packageId": "figment"
         },
         {
-          "name": "metrics",
-          "packageId": "metrics"
-        },
-        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
@@ -21087,10 +21083,6 @@
         {
           "name": "tokio",
           "packageId": "tokio"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
         }
       ],
       "crateBin": [
