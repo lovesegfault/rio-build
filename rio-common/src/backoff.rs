@@ -66,8 +66,15 @@ impl Jitter {
                 // Clamp f to [0, 1]: a fraction outside that range is
                 // a config error, but degrading is safer than
                 // panicking on `random_range(hi < lo)` or producing a
-                // negative factor.
-                let f = f.clamp(0.0, 1.0);
+                // negative factor. Non-finite (NaN/inf) survives
+                // `f64::clamp` unchanged — `NaN.clamp(0,1) = NaN` —
+                // so guard explicitly and degrade to no-jitter rather
+                // than panic in `mul_f64`.
+                let f = if f.is_finite() {
+                    f.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 if f == 0.0 {
                     return d;
                 }
@@ -127,13 +134,14 @@ impl Backoff {
         // per IEEE 754); .min(MAX) handles inf.
         #[allow(clippy::manual_clamp)]
         let safe = capped.max(0.0).min(MAX_BACKOFF.as_secs_f64());
-        // Jitter::Proportional can multiply by up to (1+f), pushing
-        // the result above `cap`. Re-clamp so the policy cap is a
-        // hard ceiling regardless of jitter — matches the original
-        // RetryPolicy::backoff_duration semantics.
+        // Jitter is applied AFTER the cap and NOT re-clamped: clipping
+        // the jittered value at `cap` would collapse the distribution
+        // tail onto a single point, re-synchronizing the herd exactly
+        // when desync matters most (every retrier sitting at cap). The
+        // `cap` field doc states this contract; the MAX_BACKOFF clamp
+        // remains as the panic guard for misconfigured `cap = inf`.
         self.jitter
             .apply(Duration::from_secs_f64(safe))
-            .min(self.cap)
             .min(MAX_BACKOFF)
     }
 }
@@ -300,6 +308,45 @@ mod tests {
         // degrades it to f=1.0 → factor in [0, 2).
         let d = Jitter::Proportional(5.0).apply(Duration::from_secs(1));
         assert!(d <= Duration::from_secs(2));
+    }
+
+    /// `f64::clamp` does NOT scrub NaN (`NaN.clamp(0,1) = NaN`), so a
+    /// `Proportional(NaN)` previously reached `mul_f64(NaN)` and
+    /// panicked — contradicting the "degrading is safer than
+    /// panicking" comment two lines above the clamp. Non-finite `f`
+    /// now degrades to no-jitter.
+    #[test]
+    fn jitter_proportional_non_finite_degrades() {
+        let base = Duration::from_secs(4);
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(Jitter::Proportional(f).apply(base), base, "f={f}");
+        }
+    }
+
+    /// `cap` is applied BEFORE jitter, not after — clipping the
+    /// jittered value would re-synchronize a herd sitting at cap.
+    /// With `Proportional(0.5)` and a saturated curve, the result
+    /// must spread over `[0.5×cap, 1.5×cap]`, not collapse to `cap`.
+    #[test]
+    fn jitter_at_cap_not_clipped() {
+        let p = Backoff {
+            jitter: Jitter::Proportional(0.5),
+            ..P
+        };
+        let cap = P.cap;
+        // attempt 100 → raw is far past cap → capped at 16s, then
+        // jittered ±50%.
+        let samples: Vec<_> = (0..200).map(|_| p.duration(100)).collect();
+        for s in &samples {
+            assert!(
+                *s >= cap.mul_f64(0.5) && *s <= cap.mul_f64(1.5),
+                "{s:?} outside [0.5×cap, 1.5×cap]"
+            );
+        }
+        assert!(
+            samples.iter().any(|s| *s > cap),
+            "200 samples never exceeded cap — jitter is being clipped"
+        );
     }
 
     #[test]
