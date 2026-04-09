@@ -75,14 +75,6 @@ pub(crate) struct Config {
     /// without our signature; still serveable, just unverified). The
     /// key file should be mode 0600 and NOT in git.
     pub signing_key_path: Option<PathBuf>,
-    /// Plaintext gRPC health listen address. K8s gRPC probes can't
-    /// do mTLS, so when server TLS is enabled, the main port's
-    /// health check is unreachable to K8s. This spawns a second
-    /// tonic server with ONLY `grpc.health.v1.Health`, plaintext,
-    /// sharing the SAME HealthReporter so status toggles propagate.
-    /// Only listens if server TLS is configured — plaintext main
-    /// port already serves health, no second listener needed.
-    pub health_addr: std::net::SocketAddr,
     /// HMAC key file for verifying assignment tokens on PutPath.
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
@@ -93,15 +85,6 @@ pub(crate) struct Config {
     /// Unset = interceptor inert (dev mode). SIGHUP reloads from the
     /// same path. Set via `RIO_JWT__KEY_PATH`.
     pub jwt: rio_common::config::JwtConfig,
-    /// Client-cert CNs/SAN-DNSNames that bypass HMAC verification
-    /// on PutPath. The gateway handles `nix copy --to` and has no
-    /// assignment token; its client cert identity is allowlisted
-    /// instead. Matching checks CN first, then each SAN DNSName
-    /// entry — either match grants bypass. SAN matching enables
-    /// cert-manager-issued certs that put identity in SAN
-    /// extensions and leave CN empty (modern best practice).
-    /// Default: `["rio-gateway"]`.
-    pub hmac_bypass_cns: Vec<String>,
     /// HMAC key file for verifying `x-rio-service-token` on PutPath.
     /// SEPARATE from `hmac_key_path` (different secret). Unset =
     /// service-token bypass disabled (gateway falls back to mTLS
@@ -152,12 +135,8 @@ impl Default for Config {
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
             nar_buffer_budget_bytes: None,
             signing_key_path: None,
-            // 9102 = gRPC (9002) + 100. Same +100 pattern as
-            // gateway (9090→9190). Only used when TLS is on.
-            health_addr: rio_common::default_addr(9102),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
-            hmac_bypass_cns: vec!["rio-gateway".into()],
             service_hmac_key_path: None,
             service_bypass_callers: vec!["rio-gateway".into()],
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
@@ -288,12 +267,7 @@ mod tests {
         // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
         assert!(d.nar_buffer_budget_bytes.is_none());
         assert!(d.signing_key_path.is_none());
-        // Plaintext health listener for K8s probes when mTLS is on the main port.
-        assert_eq!(d.health_addr.to_string(), "[::]:9102");
-        assert!(!d.common.tls.is_configured());
-        // HMAC bypass allowlist defaults to rio-gateway (backward-compat
         // with the pre-allowlist hardcoded CN check).
-        assert_eq!(d.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
         // JWT verification off by default (interceptor inert until
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
@@ -494,7 +468,6 @@ mod tests {
         "store",
         r#"
         nar_buffer_budget_bytes = 99999
-        hmac_bypass_cns = ["rio-gateway", "rio-admin"]
         chunk_cache_capacity_bytes = 123456
         chunk_upload_max_concurrent = 64
         s3_max_attempts = 5
@@ -502,9 +475,6 @@ mod tests {
         [chunk_backend]
         kind = "filesystem"
         base_dir = "/custom/path"
-
-        [tls]
-        cert_path = "/etc/tls/cert.pem"
 
         [jwt]
         required = true
@@ -514,15 +484,9 @@ mod tests {
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
             assert_eq!(cfg.chunk_upload_max_concurrent, 64);
             assert_eq!(cfg.s3_max_attempts, 5);
-            assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway", "rio-admin"]);
             assert!(
                 matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
                 "[chunk_backend] table must thread through figment"
-            );
-            assert_eq!(
-                cfg.common.tls.cert_path.as_deref(),
-                Some(std::path::Path::new("/etc/tls/cert.pem")),
-                "[tls] table must thread through figment into TlsConfig"
             );
             assert!(
                 cfg.jwt.required,
@@ -536,9 +500,7 @@ mod tests {
     rio_test_support::jail_defaults!("store", r#"listen_addr = "0.0.0.0:9002""#, |cfg: Config| {
         assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
         assert!(cfg.nar_buffer_budget_bytes.is_none());
-        assert!(!cfg.common.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
-        assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         assert!(cfg.signing_key_path.is_none());
         assert!(cfg.hmac_key_path.is_none());
         assert_eq!(

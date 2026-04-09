@@ -150,8 +150,8 @@ pkgs.testers.runNixOSTest {
     # builder-egress + fetcher-egress in 02-workloads.yaml → k3s
     # auto-applied at boot. If either get fails, the override didn't
     # take or the template if-gate is miswired.
-    kubectl("get networkpolicy builder-egress -o name", ns="${nsBuilders}")
-    kubectl("get networkpolicy fetcher-egress -o name", ns="${nsFetchers}")
+    kubectl("get ciliumnetworkpolicy builder-egress -o name", ns="${nsBuilders}")
+    kubectl("get ciliumnetworkpolicy fetcher-egress -o name", ns="${nsFetchers}")
     # kube-router watch latency (same 10s margin as netpol.nix:78).
     time.sleep(10)
 

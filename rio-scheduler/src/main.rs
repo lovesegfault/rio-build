@@ -333,32 +333,6 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = cfg.listen_addr;
     let max_message_size = rio_common::grpc::max_message_size();
 
-    // Server TLS: if configured, the main port requires client certs.
-    // K8s gRPC probes can't do mTLS — so we spawn a SECOND server on
-    // `health_addr` with ONLY the health service, plaintext, SHARING
-    // the same HealthReporter. The health-toggle loop above writes
-    // to that reporter → both servers see the status change → probe
-    // on the plaintext port correctly reflects leadership.
-    //
-    // If the plaintext port had a FRESH reporter, it would never be
-    // set to NOT_SERVING (no toggle loop for it) → standby always
-    // appears Ready → K8s routes to a non-leader → cluster split.
-    // Shared reporter is load-bearing.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.common.tls)?;
-
-    if server_tls.is_some() {
-        // r[impl sched.health.shared-reporter]
-        // HealthServer<HealthService> clone shares the underlying
-        // Arc<RwLock<HashMap>> status map — the toggle loop writes
-        // once, both ports see it. See rio_common::server docs.
-        rio_common::server::spawn_health_plaintext(
-            health_service.clone(),
-            cfg.health_addr,
-            serve_shutdown.clone(),
-        );
-        info!("server mTLS enabled — clients must present CA-signed certs");
-    }
-
     // r[impl sec.jwt.pubkey-mount]
     // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
     // loop. kubelet remounts the ConfigMap on rotation; operator
@@ -384,7 +358,6 @@ async fn main() -> anyhow::Result<()> {
         store_addr = %cfg.store.addr,
         max_message_size,
         log_s3_bucket = ?cfg.log_s3_bucket,
-        tls = server_tls.is_some(),
         jwt = jwt_pubkey.is_some(),
         "starting gRPC server"
     );
@@ -399,13 +372,9 @@ async fn main() -> anyhow::Result<()> {
     // through any proxy's idle-timeout. Replaces the Envoy Gateway
     // ClientTrafficPolicy `streamIdleTimeout: 1h` — the stream is
     // never idle from the proxy's view.
-    let mut builder = rio_common::server::tonic_builder()
+    rio_common::server::tonic_builder()
         .accept_http1(true)
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)));
-    if let Some(tls) = server_tls {
-        builder = builder.tls_config(tls)?;
-    }
-    builder
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
         // Layer order: first .layer() = outermost. CORS must see the
         // OPTIONS preflight before GrpcWebLayer (which would reject
         // a non-grpc-web content-type). GrpcWebLayer translates
@@ -582,7 +551,7 @@ async fn init_db_pool(
 /// (detects half-open connections within ~40s). The channel
 /// transparently reconnects to the new pod. The Endpoint
 /// building lives in rio-proto so it can reuse the process-global
-/// CLIENT_TLS config alongside the other `connect_*` helpers.
+/// the other `connect_*` helpers.
 ///
 /// No retry loop: lazy never fails at creation time (only on malformed
 /// addr, which is a config bug → fatal). First RPC connects; if the

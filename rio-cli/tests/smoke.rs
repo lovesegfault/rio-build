@@ -4,7 +4,6 @@
 //! This does NOT assert on output formatting — that's what cli.nix
 //! checks against a real scheduler. This proves the binary:
 //!   1. parses each subcommand's args
-//!   2. connects over gRPC (plaintext — no RIO_TLS__* set)
 //!   3. issues the right RPC (server sees a call)
 //!   4. drains streams to completion (Logs, Gc)
 //!   5. exits 0
@@ -26,7 +25,6 @@ use rio_test_support::grpc::spawn_mock_admin;
 /// Each subcommand is a separate process, not a library call: rio-cli
 /// is binary-only (no lib.rs), and its config loading reads process env.
 /// Subprocess isolation also means one test can't poison the next via
-/// the `init_client_tls` OnceLock.
 ///
 /// BLOCKING call — tests MUST use `#[tokio::test(flavor = "multi_thread")]`.
 /// On the default current-thread runtime, `.output()` blocks the reactor
@@ -37,14 +35,8 @@ fn run_cli(
     addr: &std::net::SocketAddr,
     args: &[&str],
 ) -> (std::process::ExitStatus, String, String) {
-    // RIO_TLS__* deliberately NOT set: MockAdmin is plaintext.
-    // `load_client_tls` on a default TlsConfig (all None) returns
-    // Ok(None) → `init_client_tls(None)` → plaintext channel.
     let out = Command::new(env!("CARGO_BIN_EXE_rio-cli"))
         .args(args)
-        .env_remove("RIO_TLS__CERT_PATH")
-        .env_remove("RIO_TLS__KEY_PATH")
-        .env_remove("RIO_TLS__CA_PATH")
         .env("RIO_SCHEDULER_ADDR", addr.to_string())
         .output()
         .expect("spawn rio-cli");

@@ -160,10 +160,6 @@ pub fn describe_metrics() {
         "PutPath rejections by HMAC assignment-token check (labeled by reason)"
     );
     describe_counter!(
-        "rio_store_hmac_bypass_total",
-        "PutPath HMAC checks bypassed via mTLS cert CN=rio-gateway (labeled by cn)"
-    );
-    describe_counter!(
         "rio_store_service_token_accepted_total",
         "PutPath HMAC checks bypassed via x-rio-service-token (labeled by caller)"
     );

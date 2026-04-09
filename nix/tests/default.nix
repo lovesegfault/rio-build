@@ -115,7 +115,7 @@ let
       '';
     };
     # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
-    # (no withPki → no mTLS). ssh-ng:// doesn't surface build_id to the
+    # (no withHmac → no mTLS). ssh-ng:// doesn't surface build_id to the
     # client, and client-disconnect mid-wopBuildDerivation doesn't fire
     # session.rs's EOF-cancel path (handler/build.rs:462 removes the
     # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
@@ -200,10 +200,10 @@ in
       # post-build, so the scheduler's HMAC token has
       # expected_outputs=[""]. Without Claims.is_ca, the store's
       # path-in-claims check rejects the realized path →
-      # PERMISSION_DENIED on every CA upload. withPki=true enables
+      # PERMISSION_DENIED on every CA upload. withHmac=true enables
       # HMAC on this fixture — build-1 failing here means the is_ca
       # bypass at rio-store/src/grpc/mod.rs regressed.
-      withPki = true;
+      withHmac = true;
     };
   };
 

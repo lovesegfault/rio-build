@@ -19,7 +19,6 @@ pub mod server;
 pub mod signal;
 pub mod task;
 pub mod tenant;
-pub mod tls;
 
 /// Default bind address for a service port. Used in config defaults.
 ///

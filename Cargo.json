@@ -21251,10 +21251,6 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
-        },
-        {
-          "name": "x509-parser",
-          "packageId": "x509-parser"
         }
       ],
       "devDependencies": [
@@ -21277,10 +21273,6 @@
         {
           "name": "proptest",
           "packageId": "proptest"
-        },
-        {
-          "name": "rcgen",
-          "packageId": "rcgen"
         },
         {
           "name": "rio-store",
@@ -26418,10 +26410,6 @@
           "packageId": "tokio"
         },
         {
-          "name": "tokio-rustls",
-          "packageId": "tokio-rustls 0.26.4"
-        },
-        {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
         },
@@ -26443,14 +26431,11 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "_tls-any",
         "channel",
         "codegen",
         "default",
         "router",
         "server",
-        "tls-aws-lc",
-        "tls-connect-info",
         "transport"
       ],
       "libCrateTypes": [
@@ -30125,6 +30110,10 @@
           "packageId": "ctutils"
         },
         {
+          "name": "data-encoding",
+          "packageId": "data-encoding"
+        },
+        {
           "name": "der",
           "packageId": "der 0.7.10"
         },
@@ -30286,14 +30275,6 @@
           "name": "nix",
           "packageId": "nix 0.31.2",
           "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "nom",
-          "packageId": "nom"
-        },
-        {
-          "name": "num-bigint",
-          "packageId": "num-bigint"
         },
         {
           "name": "num-bigint-dig",
@@ -30464,6 +30445,16 @@
           "packageId": "tokio-rustls 0.26.4"
         },
         {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls 0.26.4",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls 0.26.4",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
         },
@@ -30594,10 +30585,6 @@
           "name": "digest",
           "packageId": "digest 0.10.7",
           "rename": "digest_93f6ce9d446188ac"
-        },
-        {
-          "name": "displaydoc",
-          "packageId": "displaydoc"
         },
         {
           "name": "either",

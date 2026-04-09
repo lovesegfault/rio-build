@@ -39,9 +39,6 @@ spec:
       {{- toYaml $bps.systems | nindent 6 }}
     features:
       {{- toYaml $tpl.features | nindent 6 }}
-    {{- if $root.Values.tls.enabled }}
-    tlsSecretName: rio-builder-tls
-    {{- end }}
     {{- include "rio.optBool" (list $tpl "privileged" $tpl.privileged) | nindent 4 }}
     {{- include "rio.optBool" (list $tpl "hostUsers" $tpl.hostUsers) | nindent 4 }}
     {{- with $tpl.seccompProfile }}

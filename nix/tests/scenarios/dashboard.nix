@@ -134,7 +134,7 @@ pkgs.testers.runNixOSTest {
     # won't be 0x00.
     #
     # Empty proto body = 5-byte header (1 byte flag + 4 bytes len=0).
-    # wait_until_succeeds: the GRPCRoute backendRef load-balances
+    # wait_until_succeeds: the HTTPRoute backendRef load-balances
     # across scheduler replicas; non-leader returns Unavailable. ~5
     # retries covers the 50% hit rate.
     with subtest("gRPC-Web unary via nginx: ClusterStatus 0x00 prefix"):

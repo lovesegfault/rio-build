@@ -39,17 +39,13 @@ spec:
               containerPort: 9002
             - name: metrics
               containerPort: 9092
-            # Plaintext health for K8s probes when mTLS is on. Shares the
-            # same HealthReporter as the main port.
-            - name: health
-              containerPort: 9102
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "tls")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9002"
-            - name: RIO_HEALTH_ADDR
-              value: "[::]:9102"
+            - name: RIO_SERVICE_HMAC_KEY_PATH
+              value: /etc/rio/hmac/service-hmac.key
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
             # the default endpoint is v4-only. Without this, v6-only
             # pods reach S3 via DNS64+NAT64 (works, but adds a hop).
@@ -92,22 +88,15 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "tls" "cov" "jwtVerify")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify")) | nindent 12 }}
           # tonic-health set_serving() runs AFTER migrations in main.rs —
           # "PG connected + migrations done" = Ready.
-          #
-          # TLS retarget: when mTLS is on, port 9002 rejects the K8s probe
-          # (no client cert). 9102 is the plaintext health port, same
-          # HealthReporter. Strategic-merge patches can't do this (adding a
-          # second handler type → K8s rejects "may not specify more than 1"),
-          # which is why the old kustomize overlay templated the whole probe.
           readinessProbe:
             grpc:
-              port: {{ if .Values.tls.enabled }}9102{{ else }}9002{{ end }}
+              port: 9002
               service: rio.store.StoreService
             periodSeconds: 5
             failureThreshold: 3
-          # Liveness stays on 9002: tcpSocket completes before the TLS layer.
           livenessProbe:
             tcpSocket: {port: 9002}
             periodSeconds: 10
@@ -115,7 +104,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov" "jwtVerify") "tlsSecret" "rio-store-tls") | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify")) | nindent 8 }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
 # single-channel against the ClusterIP means scaling rio-store doesn't

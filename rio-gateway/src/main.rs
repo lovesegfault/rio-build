@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     // Process-global DoS cap. Set ONCE before any SSH session can
-    // call reconstruct_dag. Same OnceLock pattern as CLIENT_TLS
+    // call reconstruct_dag. OnceLock pattern
     // — the alternative (threading through ~18 call sites) is
     // invasive for a value that IS process-wide.
     rio_gateway::drv_cache::init_max_transitive_inputs(cfg.max_transitive_inputs);
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
     // is always on a separate plaintext port. Same shared-reporter
     // pattern applies: the SIGTERM drain loop above flips NOT_SERVING
     // via this reporter.
-    rio_common::server::spawn_health_plaintext(
+    rio_common::server::spawn_health_server(
         health_service,
         cfg.health_addr,
         serve_shutdown.clone(),

@@ -195,13 +195,11 @@ spec:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.fetchers.name }}
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
-    # Health (9101) + metrics (9091): kubelet probes + Prometheus
-    # scrape. kubelet is host-network → `host`/`remote-node` entity.
+    # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
     - fromEntities: [host, remote-node, cluster]
       toPorts:
         - ports:
-            - {port: "9101", protocol: TCP}
             - {port: "9091", protocol: TCP}
 ---
 # Store ingress: GetPath/PutPath/FindMissingPaths from rio components
@@ -229,7 +227,6 @@ spec:
     - fromEntities: [host, remote-node, cluster]
       toPorts:
         - ports:
-            - {port: "9102", protocol: TCP}
             - {port: "9092", protocol: TCP}
 ---
 # r[impl store.netpol.egress]

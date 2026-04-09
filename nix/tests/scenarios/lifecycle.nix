@@ -100,7 +100,6 @@ let
     ns
     nsStore
     nsBuilders
-    pki
     ;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
@@ -109,14 +108,8 @@ let
   # store path directly — it's pulled into the VM closure by interpolation.
   grpcurl = "${pkgs.grpcurl}/bin/grpcurl";
 
-  # mTLS client cert args. The fixture's PKI generates per-component
-  # certs; the controller cert works as a generic client (rio checks
-  # CA-signed, not CN). SANs include `localhost` so grpcurl-via-port-
-  # forward (connects to localhost:19001, SNI=localhost) verifies.
-  grpcurlTls =
-    "-cacert ${pki}/ca.crt "
-    + "-cert ${pki}/rio-controller/tls.crt "
-    + "-key ${pki}/rio-controller/tls.key";
+  # rio-* gRPC is plaintext-on-WireGuard; grpcurl needs -plaintext.
+  grpcurlTls = "-plaintext";
 
   # ── Test derivations ────────────────────────────────────────────────
   # Distinct markers so each build creates a fresh derivations row —

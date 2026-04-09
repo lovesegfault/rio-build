@@ -2,7 +2,7 @@
 //!
 //! **Layering rule:** anything that depends on `tonic` types but NOT on
 //! generated proto types belongs here — timeout wrappers, [`StatusExt`],
-//! [`check_bound`], the `CLIENT_TLS` OnceLock, [`max_message_size`], h2
+//! [`check_bound`], [`max_message_size`], h2
 //! tuning, the shared transient-status predicate, `x-rio-*` metadata
 //! key constants. Anything that names a generated client or message type
 //! (`connect_single`, `BalancedChannel`, NAR stream chunk/collect) belongs
@@ -18,12 +18,10 @@
 
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use tonic::Status;
 use tonic::metadata::MetadataMap;
-use tonic::transport::ClientTlsConfig;
 
 // ---------------------------------------------------------------------------
 // `x-rio-*` gRPC metadata header keys
@@ -132,44 +130,6 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 /// The double underscore is figment's nesting separator — misleading here.
 pub fn max_message_size() -> usize {
     crate::config::env_or("RIO_GRPC_MAX_MESSAGE_SIZE", DEFAULT_MAX_MESSAGE_SIZE)
-}
-
-/// Process-global client TLS config. Set once via [`init_client_tls`] in
-/// each binary's `main()` (via [`crate::server::bootstrap`]) AFTER config
-/// load but BEFORE any `connect_*`.
-///
-/// Why a global instead of threading `ClientTlsConfig` through every
-/// connect call: the controller's reconcilers connect lazily per-reconcile,
-/// holding only `String` addrs. Threading TLS config through ~11 call
-/// sites + 4 wrapper fns is invasive. A OnceLock initialized once in
-/// main() is the minimal change — and TLS config IS process-global (same
-/// cert for all outgoing connections; we don't vary it per target).
-///
-/// `None` in the OnceLock = plaintext (init_client_tls called with None,
-/// or never called at all). Both mean "TLS not configured."
-static CLIENT_TLS: OnceLock<Option<ClientTlsConfig>> = OnceLock::new();
-
-/// Set the process-wide client TLS config. Call ONCE in each binary's
-/// main(), after loading TlsConfig but before any `connect_*`.
-///
-/// `None` → plaintext (`http://`). `Some` → TLS (`https://` + the given
-/// config). Calling twice is a silent no-op (OnceLock semantics) — the
-/// first call wins. Tests that need to re-init should use a fresh
-/// process (nextest's default) or accept the first-wins behavior.
-pub fn init_client_tls(cfg: Option<ClientTlsConfig>) {
-    // `let _`: set() returns Err if already set. Not an error —
-    // just means another call raced us (main-only → shouldn't
-    // happen) or tests re-init (first wins, fine).
-    let _ = CLIENT_TLS.set(cfg);
-}
-
-/// Read the process-global client TLS config. `None` if [`init_client_tls`]
-/// was never called or was called with `None` (plaintext). Used by
-/// `rio-proto::client` to wire scheme + `.tls_config()` on each
-/// `connect_*`, and by `BalancedChannel` to build per-endpoint channels
-/// with a `domain_name` override.
-pub fn client_tls() -> Option<ClientTlsConfig> {
-    CLIENT_TLS.get().and_then(|o| o.as_ref()).cloned()
 }
 
 /// Timeout for `SubmitBuild`.

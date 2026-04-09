@@ -24,13 +24,8 @@ let
   # rio-cli is a Rust binary, linked to glibc (which the NixOS VM has).
   rioCli = "${common.rio-workspace}/bin/rio-cli";
 
-  # mTLS client cert — controller's cert works (rio checks CA-signed,
-  # not CN). SANs include `localhost` so port-forward's implicit
-  # SNI=localhost verifies. Same cert lifecycle.nix uses for grpcurl.
-  tlsEnv =
-    "RIO_TLS__CERT_PATH=${pki}/rio-controller/tls.crt "
-    + "RIO_TLS__KEY_PATH=${pki}/rio-controller/tls.key "
-    + "RIO_TLS__CA_PATH=${pki}/ca.crt ";
+  # rio-cli speaks plaintext gRPC (Cilium WireGuard handles encryption).
+  tlsEnv = "";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";

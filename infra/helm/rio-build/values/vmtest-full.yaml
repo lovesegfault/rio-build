@@ -25,9 +25,6 @@ namespaces:
 # TLS Secrets provided out-of-band via lib/pki-k8s.nix → k3s manifest.
 # Makes the fixture representative of production (mTLS on all gRPC
 # links, plaintext health port on 9101/9102/9194 for K8s probes).
-tls:
-  enabled: true
-  provisioner: external
 
 # EKS-only (IRSA → Secrets Manager).
 externalSecrets:

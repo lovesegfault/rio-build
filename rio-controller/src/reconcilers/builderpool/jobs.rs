@@ -588,63 +588,6 @@ mod tests {
         assert_eq!(job.spec.as_ref().unwrap().active_deadline_seconds, Some(1));
     }
 
-    /// I-045: ephemeral Job pods stuck `READY 0/1`, "no SERVING
-    /// endpoints for rio-scheduler-headless" — the gRPC balance
-    /// client uses mTLS and the Job's pod spec was missing the `tls`
-    /// volume. The live BuilderPool CR had `ephemeral: true` but no
-    /// `tlsSecretName` (helm template doesn't render `ephemeral`, so
-    /// the test CR was hand-applied and skipped the field).
-    ///
-    /// This isn't a controller bug — `build_job → build_pod_spec →
-    /// executor_params` reads `wp.spec.tls_secret_name` correctly.
-    /// When the live pod was missing TLS, "is build_job dropping it?"
-    /// was an open question. This pins it shut: same volume/mount/env
-    /// trio, sourced from `common/pod.rs::build_executor_pod_spec`.
-    #[test]
-    fn job_tls_secret_mounted_when_set() {
-        let mut wp = test_wp();
-        wp.spec.tls_secret_name = Some("rio-builder-tls".into());
-        let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
-        let pod = job.spec.unwrap().template.spec.unwrap();
-
-        let tls_vol = pod
-            .volumes
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|v| v.name == "tls")
-            .expect(
-                "tls volume missing from ephemeral Job pod — without it the \
-                 mTLS balance client has no client cert and every health \
-                 probe fails the TLS handshake → 'no SERVING endpoints' → \
-                 pod never goes Ready",
-            );
-        assert_eq!(
-            tls_vol.secret.as_ref().unwrap().secret_name,
-            Some("rio-builder-tls".into())
-        );
-
-        let container = &pod.containers[0];
-        let mount = container
-            .volume_mounts
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|m| m.name == "tls")
-            .expect("tls mount");
-        assert_eq!(mount.mount_path, "/etc/rio/tls");
-        assert_eq!(mount.read_only, Some(true));
-
-        let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
-        assert_eq!(
-            envs.get("RIO_TLS__CERT_PATH"),
-            Some(&"/etc/rio/tls/tls.crt")
-        );
-        assert_eq!(envs.get("RIO_TLS__KEY_PATH"), Some(&"/etc/rio/tls/tls.key"));
-        assert_eq!(envs.get("RIO_TLS__CA_PATH"), Some(&"/etc/rio/tls/ca.crt"));
-    }
-
     // scheduler_unreachable_condition_shape, random_suffix_valid_
     // dns1123, spawn_count_subtracts_active moved to common::job::
     // tests alongside their functions.

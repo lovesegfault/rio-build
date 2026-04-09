@@ -537,11 +537,10 @@ where
 // r[impl sec.image.control-plane-minimal]
 /// Port-forward scheduler:9001 + store:9002, fetch the mTLS client
 /// cert into a tempdir, set `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR`/
-/// `RIO_TLS__*` on a prepared shell, run `f`. Tunnels + tempdir tear
+/// Set up port-forwards on a prepared shell, run `f`. Tunnels + tempdir tear
 /// down on return.
 ///
 /// The `rio-scheduler-tls` Secret already carries a `localhost` SAN
-/// (cert-manager.yaml — originally for in-pod rio-cli). Port-forward
 /// preserves that `:authority`, so the fetched cert validates cleanly
 /// with no new Certificate resource. Enables running rio-cli LOCALLY
 /// instead of via `kubectl exec deploy/rio-scheduler`, which in turn
@@ -552,20 +551,12 @@ pub async fn with_cli_tunnel<F>(p: &dyn Provider, sched: u16, store: u16, f: F) 
 where
     F: FnOnce(&xshell::Shell) -> Result<()>,
 {
-    let client = kube::client().await?;
     let ((sched, _g1), (store, _g2)) =
         ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
-    let (_dir, cert, key, ca) = ui::step("fetch mTLS cert", || {
-        kube::fetch_tls_to_tempdir(&client, NS, "rio-scheduler-tls")
-    })
-    .await?;
 
     let sh = sh::shell()?;
     let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
     let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
-    let _e3 = sh.push_env("RIO_TLS__CERT_PATH", &cert);
-    let _e4 = sh.push_env("RIO_TLS__KEY_PATH", &key);
-    let _e5 = sh.push_env("RIO_TLS__CA_PATH", &ca);
     f(&sh)
 }
 

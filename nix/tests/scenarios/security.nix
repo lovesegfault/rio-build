@@ -45,8 +45,7 @@
 #     extraPackages = [ pkgs.grpcurl pkgs.grpc-health-probe pkgs.postgresql ];
 #   };
 #
-# withPki=true → fixture.pki is a store path to lib/pki.nix output
-# (ca.crt, server.crt/key, client.crt/key, gateway.crt/key, hmac.key).
+# (hmac.key, service-hmac.key).
 # The fixture wires RIO_TLS__* + RIO_HMAC_KEY_PATH via extraServiceEnv;
 # gateway gets CN=rio-gateway cert (store PutPath HMAC bypass).
 #

@@ -68,14 +68,6 @@ spec:
               containerPort: 9001
             - name: metrics
               containerPort: 9091
-            # Plaintext health — only listens when server mTLS is configured
-            # (RIO_TLS__* set). K8s gRPC probes can't present client certs.
-            # Shares SAME HealthReporter as main port: leader-toggle loop's
-            # set_not_serving propagates → standby correctly fails readiness.
-            # Without shared reporter: standby always SERVING → K8s routes to
-            # non-leader → cluster split.
-            - name: health
-              containerPort: 9101
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "tls")) | nindent 12 }}
@@ -94,8 +86,6 @@ spec:
                 fieldRef: {fieldPath: metadata.name}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9001"
-            - name: RIO_HEALTH_ADDR
-              value: "[::]:9101"
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_STORE__ADDR
@@ -117,7 +107,7 @@ spec:
             - name: RIO_DASHBOARD__CORS_ALLOW_ORIGINS
               value: {{ .Values.dashboard.cors.allowOrigins | join "," | quote }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "tls" "cov" "jwtVerify")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify")) | nindent 12 }}
             {{- if $hasClasses }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries [[size_classes]] entries; everything else
@@ -161,7 +151,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov" "jwtVerify") "tlsSecret" "rio-scheduler-tls") | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify")) | nindent 8 }}
         {{- if $hasClasses }}
         - name: config
           configMap:

@@ -37,7 +37,7 @@ spec:
       port: 8080
       allowedRoutes:
         kinds:
-          - kind: GRPCRoute
+          - kind: HTTPRoute
 ---
 # ── Read-only methods: routed unconditionally ─────────────────────────
 # r[dash.auth.method-gate] — the method split is here. Status/list/log/
@@ -45,12 +45,19 @@ spec:
 # page load. Exposing them via gRPC-Web is low-risk (worst case: an
 # attacker learns cluster state they could also learn from /metrics).
 #
+# HTTPRoute (NOT GRPCRoute): clients send `content-type: application/
+# grpc-web+proto` which GRPCRoute does NOT match (it expects
+# `application/grpc`). gRPC-Web translation happens in-process at the
+# scheduler (tonic-web layer per D3), so the Gateway just routes HTTP.
+# gRPC paths are `/<service>/<method>`, so `Exact` path matches give
+# the same per-method allowlist GRPCRoute's `method:` matchers did.
+#
 # SchedulerService: the dashboard only calls WatchBuild (streaming
 # status updates for the DAG view) and QueryBuildStatus (poll fallback).
 # SubmitBuild/CancelBuild are mutating — the production entrypoint for
 # those is ssh-ng via rio-gateway, not the dashboard.
 apiVersion: gateway.networking.k8s.io/v1
-kind: GRPCRoute
+kind: HTTPRoute
 metadata:
   name: rio-scheduler-readonly
   namespace: {{ $ns }}
@@ -61,16 +68,16 @@ spec:
     - name: rio-dashboard
   rules:
     - matches:
-        - method: { service: rio.admin.AdminService, method: ClusterStatus }
-        - method: { service: rio.admin.AdminService, method: ListExecutors }
-        - method: { service: rio.admin.AdminService, method: ListPoisoned }
-        - method: { service: rio.admin.AdminService, method: ListBuilds }
-        - method: { service: rio.admin.AdminService, method: GetBuildLogs }
-        - method: { service: rio.admin.AdminService, method: ListTenants }
-        - method: { service: rio.admin.AdminService, method: GetBuildGraph }
-        - method: { service: rio.admin.AdminService, method: GetSizeClassStatus }
-        - method: { service: rio.scheduler.SchedulerService, method: WatchBuild }
-        - method: { service: rio.scheduler.SchedulerService, method: QueryBuildStatus }
+        - path: { type: Exact, value: /rio.admin.AdminService/ClusterStatus }
+        - path: { type: Exact, value: /rio.admin.AdminService/ListExecutors }
+        - path: { type: Exact, value: /rio.admin.AdminService/ListPoisoned }
+        - path: { type: Exact, value: /rio.admin.AdminService/ListBuilds }
+        - path: { type: Exact, value: /rio.admin.AdminService/GetBuildLogs }
+        - path: { type: Exact, value: /rio.admin.AdminService/ListTenants }
+        - path: { type: Exact, value: /rio.admin.AdminService/GetBuildGraph }
+        - path: { type: Exact, value: /rio.admin.AdminService/GetSizeClassStatus }
+        - path: { type: Exact, value: /rio.scheduler.SchedulerService/WatchBuild }
+        - path: { type: Exact, value: /rio.scheduler.SchedulerService/QueryBuildStatus }
       backendRefs:
         - name: rio-scheduler
           port: 9001
@@ -87,7 +94,7 @@ spec:
 # e.g. POST /rio.admin.AdminService/ClearPoison. Use rio-cli for these
 # until dashboard-native authz lands.
 apiVersion: gateway.networking.k8s.io/v1
-kind: GRPCRoute
+kind: HTTPRoute
 metadata:
   name: rio-scheduler-mutating
   namespace: {{ $ns }}
@@ -98,10 +105,10 @@ spec:
     - name: rio-dashboard
   rules:
     - matches:
-        - method: { service: rio.admin.AdminService, method: ClearPoison }
-        - method: { service: rio.admin.AdminService, method: DrainExecutor }
-        - method: { service: rio.admin.AdminService, method: CreateTenant }
-        - method: { service: rio.admin.AdminService, method: TriggerGC }
+        - path: { type: Exact, value: /rio.admin.AdminService/ClearPoison }
+        - path: { type: Exact, value: /rio.admin.AdminService/DrainExecutor }
+        - path: { type: Exact, value: /rio.admin.AdminService/CreateTenant }
+        - path: { type: Exact, value: /rio.admin.AdminService/TriggerGC }
       backendRefs:
         - name: rio-scheduler
           port: 9001

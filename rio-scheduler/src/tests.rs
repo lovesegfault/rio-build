@@ -22,8 +22,6 @@ fn config_defaults_are_stable() {
     assert_eq!(d.log_s3_prefix, "logs");
     // Size-classes: optional feature, off by default.
     assert!(d.size_classes.is_empty());
-    // Phase3b: plaintext health port for K8s probes when mTLS on.
-    assert_eq!(d.health_addr.to_string(), "[::]:9101");
     assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
     // Phase 4a (plan 21E): lease config via figment, not raw env.
     assert_eq!(d.lease_name, None, "non-K8s mode by default");

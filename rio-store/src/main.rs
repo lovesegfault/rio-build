@@ -123,11 +123,9 @@ async fn main() -> anyhow::Result<()> {
     // builders chain directly; Option<T> from config applies via
     // `if let` so each builder keeps its concrete-argument signature
     // for tests. Config-is-single-source-of-truth fields
-    // (hmac_bypass_cns, chunk_upload_max_concurrent, max_batch_paths)
     // always replace the constructor default; nar_buffer_budget only
     // overrides when explicitly set.
     let mut store_service = StoreServiceImpl::new(pool.clone())
-        .with_hmac_bypass_cns(cfg.hmac_bypass_cns)
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
         .with_max_batch_paths(cfg.max_batch_paths);
     if let Some(cache) = &chunk_cache {
@@ -217,20 +215,6 @@ async fn main() -> anyhow::Result<()> {
         .set_serving::<StoreServiceServer<StoreServiceImpl>>()
         .await;
 
-    // Server TLS + plaintext health split. K8s gRPC probes can't do
-    // mTLS, so when TLS is on, spawn a second plaintext listener
-    // with ONLY health, sharing the SAME HealthReporter so
-    // set_serving above propagates. See rio_common::server docs.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.common.tls)?;
-    if server_tls.is_some() {
-        rio_common::server::spawn_health_plaintext(
-            health_service.clone(),
-            cfg.health_addr,
-            serve_shutdown.clone(),
-        );
-        info!("server mTLS enabled — clients must present CA-signed certs");
-    }
-
     // JWT pubkey from ConfigMap mount + SIGHUP reload loop. One
     // gateway signing key → one pubkey across all verifier services →
     // same ConfigMap mount path, same SIGHUP rotation story as
@@ -245,16 +229,11 @@ async fn main() -> anyhow::Result<()> {
     info!(
         addr = %addr,
         max_msg_size,
-        tls = server_tls.is_some(),
         jwt = jwt_pubkey.is_some(),
         "starting gRPC server"
     );
 
-    let mut builder = rio_common::server::tonic_builder();
-    if let Some(tls) = server_tls {
-        builder = builder.tls_config(tls)?;
-    }
-    builder
+    rio_common::server::tonic_builder()
         // JWT tenant-token verify layer. jwt_pubkey computed above.
         // Installed unconditionally for type stability (see
         // scheduler/main.rs for the full note).

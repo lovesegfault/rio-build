@@ -12,8 +12,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
     EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Toleration, Volume,
-    VolumeMount,
+    ResourceRequirements, SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -354,16 +353,6 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 });
             }
-            if let Some(secret) = &p.deploy.tls_secret_name {
-                v.push(Volume {
-                    name: "tls".into(),
-                    secret: Some(SecretVolumeSource {
-                        secret_name: Some(secret.clone()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                });
-            }
             // nix.conf ConfigMap. `optional: true` so a missing
             // ConfigMap mounts an empty dir → setup_nix_conf falls
             // back to WORKER_NIX_CONF.
@@ -495,11 +484,6 @@ fn build_executor_container(
             if let Some(n) = p.fuse_threads {
                 e.push(env("RIO_FUSE_THREADS", &n.to_string()));
             }
-            if p.deploy.tls_secret_name.is_some() {
-                e.push(env("RIO_TLS__CERT_PATH", "/etc/rio/tls/tls.crt"));
-                e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
-                e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
-            }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively).
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
@@ -544,14 +528,6 @@ fn build_executor_container(
                 m.push(VolumeMount {
                     name: "dev-fuse".into(),
                     mount_path: "/dev/fuse".into(),
-                    ..Default::default()
-                });
-            }
-            if p.deploy.tls_secret_name.is_some() {
-                m.push(VolumeMount {
-                    name: "tls".into(),
-                    mount_path: "/etc/rio/tls".into(),
-                    read_only: Some(true),
                     ..Default::default()
                 });
             }

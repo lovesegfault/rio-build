@@ -48,7 +48,6 @@ server = [
   "dep:reqwest",
   "dep:clap",
   "dep:metrics",
-  "dep:x509-parser",
   "dep:anyhow",
   "dep:scopeguard",
   "dep:serde",
@@ -165,8 +164,7 @@ rstest = { workspace = true }
 rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
 tempfile = { workspace = true }
-# In-memory cert generation for cert_cn() unit tests (CN parsing).
-rcgen = { workspace = true }
+# In-memory cert generation for tls_integration tests.
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = { workspace = true }

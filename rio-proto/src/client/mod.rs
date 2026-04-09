@@ -37,12 +37,6 @@ use crate::StoreServiceClient;
 
 /// Connect to a gRPC endpoint at `host:port` and return a raw [`Channel`].
 ///
-/// Scheme and TLS wiring depend on the process-global
-/// [`rio_common::grpc::client_tls`]: set → `https://` + `.tls_config()`;
-/// unset → `http://` (plaintext). The global is initialized by
-/// [`rio_common::grpc::init_client_tls`] (via `bootstrap()` in each
-/// binary's main); if never called (or called with `None`), plaintext.
-///
 /// 10s connect timeout: tonic's default is UNBOUNDED. A stale address
 /// (e.g., scheduler pod killed → replacement has new IP, but DNS TTL /
 /// caller's cached addr hasn't updated) hangs forever on TCP SYN.
@@ -96,29 +90,15 @@ pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::trans
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
-/// Build an `Endpoint` for `host:port`: scheme-select from
-/// [`client_tls`], `from_shared`, [`CONNECT_TIMEOUT`], conditional
-/// `tls_config`. Callers layer their own `with_h2_*` tuning and
-/// connect mode (eager vs lazy) on top.
+/// Build an `Endpoint` for `host:port`: `from_shared`,
+/// [`CONNECT_TIMEOUT`]. Callers layer their own `with_h2_*` tuning and
+/// connect mode (eager vs lazy) on top. Inter-component gRPC is
+/// plaintext-over-WireGuard (Cilium handles encryption).
 ///
 /// Shared by [`connect_channel`] (eager + throughput-only) and
-/// [`connect_store_lazy`] (lazy + keepalive) — the endpoint
-/// construction is identical, only the h2 wrapper and connect call
-/// differ.
+/// [`connect_store_lazy`] (lazy + keepalive).
 fn build_endpoint(addr: &str) -> anyhow::Result<tonic::transport::Endpoint> {
-    // `client_tls()` collapses both "OnceLock not initialized" and
-    // "initialized with None" to plaintext. Tests that never call
-    // init_client_tls stay plaintext.
-    let (scheme, tls) = match client_tls() {
-        Some(tls) => ("https", Some(tls)),
-        None => ("http", None),
-    };
-    let mut ep =
-        Channel::from_shared(format!("{scheme}://{addr}"))?.connect_timeout(CONNECT_TIMEOUT);
-    if let Some(tls) = tls {
-        ep = ep.tls_config(tls)?;
-    }
-    Ok(ep)
+    Ok(Channel::from_shared(format!("http://{addr}"))?.connect_timeout(CONNECT_TIMEOUT))
 }
 
 pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
@@ -135,8 +115,7 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
 /// Per-client constants for the generic [`connect`] / [`BalancedChannel`]
 /// path. Implemented for each tonic-generated `XServiceClient<Channel>`;
 /// the impl supplies the `grpc.health.v1` service name (what
-/// [`BalancedChannel`] probes) and the TLS-domain override (cert SAN —
-/// what the balanced channel verifies pod-IP connections against).
+/// [`BalancedChannel`] probes).
 ///
 /// Collapses what was previously 9 near-identical `connect_X` /
 /// `connect_X_balanced` wrappers (each varying only in client type +
@@ -152,11 +131,6 @@ pub trait ProtoClient: Sized {
     /// leader-toggle only flips the named SchedulerService entry, and
     /// all three share the same port + leader gate.
     const HEALTH_SERVICE: &'static str;
-    /// TLS domain (cert SAN) for pod-IP connections. The balanced
-    /// channel connects to `https://<pod-ip>:<port>` but verifies
-    /// against this name. Matches `dnsNames` in
-    /// `infra/helm/rio-build/templates/cert-manager.yaml`.
-    const TLS_DOMAIN: &'static str;
     /// Construct from a `Channel` and apply [`max_message_size`]. The
     /// generated `XServiceClient::new` doesn't share a trait, so each
     /// impl spells the three calls out — but at least they live next
@@ -167,10 +141,9 @@ pub trait ProtoClient: Sized {
 /// Macro for the repetitive [`ProtoClient`] impls: each generated
 /// client has the same `new(ch).max_decoding_….max_encoding_…` shape.
 macro_rules! proto_client {
-    ($ty:ty, $health:expr, $domain:expr) => {
+    ($ty:ty, $health:expr) => {
         impl ProtoClient for $ty {
             const HEALTH_SERVICE: &'static str = $health;
-            const TLS_DOMAIN: &'static str = $domain;
             fn wrap(ch: Channel) -> Self {
                 <$ty>::new(ch)
                     .max_decoding_message_size(max_message_size())
@@ -182,32 +155,27 @@ macro_rules! proto_client {
 
 // Scheduler-hosted: SchedulerService, ExecutorService, AdminService all
 // share the scheduler's port + leader gate, so the same health-service
-// name + TLS domain. Store-hosted: StoreService, StoreAdminService,
-// ChunkService share the store's.
+// name. Store-hosted: StoreService, StoreAdminService, ChunkService
+// share the store's.
 proto_client!(
     crate::SchedulerServiceClient<Channel>,
-    balance::SCHEDULER_HEALTH_SERVICE,
-    balance::SCHEDULER_TLS_DOMAIN
+    balance::SCHEDULER_HEALTH_SERVICE
 );
 proto_client!(
     crate::ExecutorServiceClient<Channel>,
-    balance::SCHEDULER_HEALTH_SERVICE,
-    balance::SCHEDULER_TLS_DOMAIN
+    balance::SCHEDULER_HEALTH_SERVICE
 );
 proto_client!(
     crate::AdminServiceClient<Channel>,
-    balance::SCHEDULER_HEALTH_SERVICE,
-    balance::SCHEDULER_TLS_DOMAIN
+    balance::SCHEDULER_HEALTH_SERVICE
 );
 proto_client!(
     crate::StoreServiceClient<Channel>,
-    balance::STORE_HEALTH_SERVICE,
-    balance::STORE_TLS_DOMAIN
+    balance::STORE_HEALTH_SERVICE
 );
 proto_client!(
     crate::StoreAdminServiceClient<Channel>,
-    balance::STORE_HEALTH_SERVICE,
-    balance::STORE_TLS_DOMAIN
+    balance::STORE_HEALTH_SERVICE
 );
 
 /// Connect to a single-channel `addr` and wrap in a typed client.
@@ -246,7 +214,6 @@ pub async fn connect<C: ProtoClient>(
 /// generated clients — `connect::<StoreServiceClient>` would discard
 /// the channel inside the typed client, and tonic clients don't expose
 /// `into_inner()`. The `C` type parameter still picks the
-/// `HEALTH_SERVICE` / `TLS_DOMAIN` constants for the balanced path.
 pub async fn connect_raw<C: ProtoClient>(
     addrs: &rio_common::config::UpstreamAddrs,
 ) -> anyhow::Result<(Channel, Option<BalancedChannel>)> {
@@ -284,9 +251,9 @@ pub async fn connect_raw<C: ProtoClient>(
 /// (minutes). Without while-idle, an idle channel wouldn't notice the
 /// peer vanished until the next RPC — keepalive surfaces it proactively.
 ///
-/// Returns `Err` only on malformed `addr` (scheme parse) or bad TLS
-/// config — never on connection failure (that's deferred to first RPC).
-/// So callers can drop their retry loop: the channel ALWAYS constructs.
+/// Returns `Err` only on malformed `addr` (scheme parse) — never on
+/// connection failure (that's deferred to first RPC). So callers can
+/// drop their retry loop: the channel ALWAYS constructs.
 pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
     let ch = with_h2_keepalive(build_endpoint(addr)?).connect_lazy();
     Ok(StoreServiceClient::wrap(ch))

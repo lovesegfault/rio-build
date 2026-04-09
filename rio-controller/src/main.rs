@@ -321,25 +321,13 @@ mod tests {
         "controller",
         r#"
         gc_interval_hours = 0
-
-        [tls]
-        cert_path = "/etc/tls/cert.pem"
         "#,
         |cfg: Config| {
             assert_eq!(cfg.gc_interval_hours, 0);
-            assert_eq!(
-                cfg.common.tls.cert_path.as_deref(),
-                Some(std::path::Path::new("/etc/tls/cert.pem")),
-                "[tls] table must thread through figment into TlsConfig"
-            );
-            // Unspecified sub-field defaults via #[serde(default)]
-            // on TlsConfig (partial table must work).
-            assert!(cfg.common.tls.key_path.is_none());
         }
     );
 
     rio_test_support::jail_defaults!("controller", "gc_interval_hours = 24", |cfg: Config| {
-        assert!(!cfg.common.tls.is_configured());
         assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.gc_interval_hours, 24);
     });

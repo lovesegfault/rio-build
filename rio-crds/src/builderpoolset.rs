@@ -79,7 +79,7 @@ impl_common_deref!(SizeClassSpec => SizeClassCommon);
 #[serde(rename_all = "camelCase")]
 pub struct PoolTemplate {
     /// `image` / `systems` / `node_selector` / `tolerations` /
-    /// `tls_secret_name` / `host_users`. Flattened — wire format
+    /// `host_users` etc. Flattened — wire format
     /// unchanged; `Deref` keeps `template.image` working. Shared
     /// with `PoolSpecCommon` so `build_child_builderpool` can
     /// `template.deploy.clone()` instead of copying field-by-field.
@@ -201,7 +201,6 @@ mod tests {
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("hostNetwork"));
         assert!(json.contains("hostUsers"));
-        assert!(json.contains("tlsSecretName"));
         // ClassStatus
         assert!(json.contains("effectiveCutoffSecs"));
         assert!(json.contains("childPool"));

@@ -51,10 +51,7 @@ ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
 # gRPC
-# tls-aws-lc: matches the rustls CryptoProvider choice (aws-lc-rs, not
-# ring). tonic's tls feature family wraps rustls; without tls-*, there's
-# no ClientTlsConfig/ServerTlsConfig at all. Phase 3b mTLS needs both.
-tonic = { version = "0.14", features = ["transport", "tls-aws-lc"] }
+tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
@@ -236,7 +233,6 @@ hmac = "0.13"
 rcgen = "0.14"
 # Parse TLS client certs for CN-based HMAC bypass (rio-store PutPath).
 # Already a transitive dep (via rustls pki chain); direct for API.
-x509-parser = "0.18"
 
 # Encoding
 hex = "0.4"

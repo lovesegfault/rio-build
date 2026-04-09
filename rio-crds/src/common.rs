@@ -81,12 +81,6 @@ pub struct PoolDeployKnobs {
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
-    /// mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).
-    /// Same cert across builders and fetchers — same binary, same
-    /// scheduler/store endpoints. Unset = plaintext gRPC (dev mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_secret_name: Option<String>,
-
     /// Explicit `hostUsers` override. `None` defaults to `hostUsers:
     /// false` (userns isolation per ADR-012). Set `true` for k3s/
     /// containerd deployments that don't chown the pod cgroup to the
@@ -117,7 +111,7 @@ pub struct PoolSpecCommon {
     pub deadline_seconds: Option<u32>,
 
     /// `image` / `systems` / `node_selector` / `tolerations` /
-    /// `tls_secret_name` / `host_users`. Flattened — wire format
+    /// `host_users` etc. Flattened — wire format
     /// unchanged; `Deref` keeps `wp.spec.image` working.
     #[serde(flatten)]
     pub deploy: PoolDeployKnobs,

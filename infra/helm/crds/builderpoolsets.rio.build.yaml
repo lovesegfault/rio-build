@@ -183,15 +183,6 @@ spec:
                     items:
                       type: string
                     type: array
-                  tlsSecretName:
-                    description: "mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).\n\
-                      Same cert across builders and fetchers \u2014 same binary, same\n\
-                      scheduler/store endpoints. Unset = plaintext gRPC (dev mode)."
-                    nullable: true
-                    type: string
-                  tolerations:
-                    description: 'Tolerations for the Job pod spec. Typed `Toleration`
-                      (not
 
                       `serde_json::Value`); `any_object_array` passthrough because
 

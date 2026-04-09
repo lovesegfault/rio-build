@@ -7,7 +7,7 @@
 #
 # Returns an attrset with `nodes` (drop into runNixOSTest), `waitReady`
 # + `pyNodeVars` (Python snippets for testScript interpolation), and
-# `pki` (the PKI store path, for grpcurl cert args when withPki=true).
+# `pki` (the PKI store path, for grpcurl cert args when withHmac=true).
 {
   pkgs,
   rio-workspace,
@@ -25,7 +25,7 @@ let
       coverage
       ;
   };
-  mkPki = import ../lib/pki.nix { inherit pkgs; };
+  mkHmacKeys = import ../lib/hmac-keys.nix { inherit pkgs; };
 in
 {
   # Attrset of worker-node-name → mkWorkerNode args. Keys become
@@ -38,10 +38,8 @@ in
   # For the common 1-worker case: workers = { worker = { }; }
   workers,
 
-  # mTLS + HMAC. Builds a PKI (lib/pki.nix), applies RIO_TLS__* env
-  # to all services. Gateway gets CN=rio-gateway cert (HMAC bypass);
-  # scheduler/store get CN=control; workers get CN=rio-builder.
-  withPki ? false,
+  # HMAC keys for assignment+service tokens (lib/hmac-keys.nix).
+  withHmac ? false,
 
   # opentelemetry-collector on control (OTLP gRPC :4317, file exporter
   # to /var/lib/otelcol/traces.json). Sets RIO_OTEL_ENDPOINT on all
@@ -63,32 +61,19 @@ in
   extraClientModules ? [ ],
 }:
 let
-  pki = if withPki then mkPki { } else null;
+  hmacKeys = if withHmac then mkHmacKeys { } else null;
 
-  # ── PKI env attrsets (no-op {} when withPki=false) ──────────────────
-  # figment double-underscore nesting: RIO_TLS__CERT_PATH → tls.cert_path.
-  # See phase3b.nix controlTlsEnv rationale for why gateway needs a
-  # separate CN=rio-gateway cert (store PutPath HMAC bypass).
-
-  controlTlsEnv = lib.optionalAttrs withPki {
-    RIO_TLS__CERT_PATH = "${pki}/server.crt";
-    RIO_TLS__KEY_PATH = "${pki}/server.key";
-    RIO_TLS__CA_PATH = "${pki}/ca.crt";
-    RIO_HMAC_KEY_PATH = "${pki}/hmac.key";
-    RIO_SERVICE_HMAC_KEY_PATH = "${pki}/service-hmac.key";
+  # ── HMAC env (no-op {} when withHmac=false) ──────────────────────────
+  # Scheduler+store share the assignment-token key; gateway+store share
+  # the service-token key. Workers get neither (they receive assignment
+  # tokens from the scheduler at dispatch, not from a key file).
+  controlHmacEnv = lib.optionalAttrs withHmac {
+    RIO_HMAC_KEY_PATH = "${hmacKeys}/hmac.key";
+    RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
-  gatewayTlsEnv = lib.optionalAttrs withPki {
-    RIO_SERVICE_HMAC_KEY_PATH = "${pki}/service-hmac.key";
-    RIO_TLS__CERT_PATH = "${pki}/gateway.crt";
-    RIO_TLS__KEY_PATH = "${pki}/gateway.key";
-    RIO_TLS__CA_PATH = "${pki}/ca.crt";
-  };
-
-  workerTlsEnv = lib.optionalAttrs withPki {
-    RIO_TLS__CERT_PATH = "${pki}/client.crt";
-    RIO_TLS__KEY_PATH = "${pki}/client.key";
-    RIO_TLS__CA_PATH = "${pki}/ca.crt";
+  gatewayHmacEnv = lib.optionalAttrs withHmac {
+    RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
   # ── OTel env ────────────────────────────────────────────────────────
@@ -138,13 +123,12 @@ let
   # ── Control node ────────────────────────────────────────────────────
   # mkControlNode's extraServiceEnv goes to ALL three services (store,
   # scheduler, gateway). NixOS module merge then composes the gateway
-  # override on top — same-key last-writer wins, so gateway ends up
-  # with gatewayTlsEnv's cert paths.
+  # override on top (same-key last-writer wins).
   controlNode = {
     imports = [
       (common.mkControlNode {
         hostName = "control";
-        extraServiceEnv = controlTlsEnv // otelEnv;
+        extraServiceEnv = controlHmacEnv // otelEnv;
         inherit extraSchedulerConfig extraStoreConfig extraPackages;
         # Metrics ports open for cross-VM scraping (scheduling fanout
         # scenario asserts worker metrics from control).
@@ -158,14 +142,14 @@ let
     ];
     systemd.services = {
       # Gateway CN override + gateway-only env. mkControlNode's
-      # extraServiceEnv applies controlTlsEnv to ALL three services
+      # extraServiceEnv applies controlHmacEnv to ALL three services
       # (including gateway). NixOS module merge of two string values
       # for the same key → conflict. mapAttrs mkForce makes the gateway
       # cert paths win unambiguously. extraGatewayEnv merges alongside
       # (no mkForce — it's gateway-only, no conflict with
       # extraServiceEnv's shared keys).
       rio-gateway.environment =
-        (lib.optionalAttrs withPki (lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv)) // extraGatewayEnv;
+        (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
 
       # Serialize migration runs — migration 011's CREATE INDEX
       # CONCURRENTLY deadlocks with sqlx's pg_advisory_lock when store
@@ -204,15 +188,9 @@ let
   workerNodes = lib.mapAttrs (
     name: args:
     common.mkWorkerNode (
-      # Strip extraServiceEnv from args BEFORE the // merge, then
-      # compose it WITH the fixture's workerTlsEnv. Without this,
-      # the // at `args // {...}` would overwrite per-worker env
-      # with the fixture-level TLS env (scenarios couldn't set
-      # RIO_FUSE_PASSTHROUGH on just one worker).
-      (builtins.removeAttrs args [ "extraServiceEnv" ])
+      args
       // {
         hostName = name;
-        extraServiceEnv = workerTlsEnv // (args.extraServiceEnv or { });
         otelEndpoint = workerOtelEndpoint;
       }
     )
@@ -220,9 +198,7 @@ let
 
 in
 {
-  # Exposed for testScript cert args: `grpcurl -cacert ${fixture.pki}/ca.crt`.
-  # null when withPki=false.
-  inherit pki;
+  inherit hmacKeys;
 
   # SSH target for `ssh-ng://${gatewayHost}` + Python node var for
   # `${gatewayHost}.succeed(...)`. Scenarios interpolate into both.

@@ -7,7 +7,7 @@
 //!    that was 5×-duplicated across controller/gateway/scheduler/store/
 //!    worker main.rs. ~40L per binary → one call.
 //!
-//! 2. [`spawn_health_plaintext`] / [`spawn_drain_task`] — tonic server
+//! 2. [`spawn_health_server`] / [`spawn_drain_task`] — tonic server
 //!    lifecycle helpers, extracted earlier from three near-identical
 //!    copies (scheduler:644, store:462, gateway:329). Any tonic-health
 //!    upgrade or shutdown-signal change had to be three-way synced.
@@ -123,27 +123,21 @@ pub struct Bootstrap<C> {
     pub root_span: tracing::span::EnteredSpan,
 }
 
-/// The 6-step cold-start prologue every rio binary runs before its own
+/// The cold-start prologue every rio binary runs before its own
 /// wiring. Canonical order:
 ///
 /// 1. `rustls` crypto provider install (aws-lc-rs; must precede any TLS
-///    use — dual ring+aws-lc-rs feature activation panics otherwise)
+///    use by kube-rs/aws-sdk — dual ring+aws-lc-rs feature activation
+///    panics otherwise)
 /// 2. tracing init (returns OtelGuard, held by `Bootstrap`). Runs BEFORE
 ///    config load so figment errors land in structured logs — tracing
 ///    reads only env vars (`RUST_LOG`, `RIO_LOG_FORMAT`,
 ///    `RIO_OTEL_ENDPOINT`), no dependency on the figment-loaded config.
 /// 3. figment config load (defaults → TOML → env → CLI)
-/// 4. client TLS load + [`crate::grpc::init_client_tls`] — sets the
-///    process-global OnceLock that `rio-proto::client::connect_*`
-///    reads. The `info!("client mTLS enabled")` log fires here so it
-///    lands once regardless of which binary.
-/// 5. `ValidateConfig::validate` bounds check (after TLS load so a bad
-///    TLS path surfaces BEFORE a bad required-field — TLS errors are
-///    more actionable; a missing `scheduler_addr` often masks "wrong
-///    ConfigMap mounted")
-/// 6. shutdown signal + metrics exporter (with per-crate `histogram_buckets`
+/// 4. `ValidateConfig::validate` bounds check
+/// 5. shutdown signal + metrics exporter (with per-crate `histogram_buckets`
 ///    overrides) + `describe_metrics` callback
-/// 7. root span (`component = {component}`) + version `info!`
+/// 6. root span (`component = {component}`) + version `info!`
 ///
 /// The root span is created with `component` as its only field.
 /// rio-builder records `executor_id` separately after resolving it
@@ -173,12 +167,6 @@ where
         .inspect_err(|e| tracing::error!(error = %e, "config load failed"))?;
 
     let common = cfg.common();
-    let client_tls = crate::tls::load_client_tls(&common.tls)?;
-    if common.tls.is_configured() {
-        tracing::info!("client mTLS enabled for outgoing gRPC");
-    }
-    crate::grpc::init_client_tls(client_tls);
-
     cfg.validate()?;
 
     let shutdown = crate::signal::shutdown_signal();
@@ -219,7 +207,7 @@ where
 /// — it has no "connected but not ready" state).
 ///
 /// Serve via [`spawn_axum`] for graceful shutdown wiring. Distinct
-/// from [`spawn_health_plaintext`] (gRPC `grpc.health.v1.Health` for
+/// from [`spawn_health_server`] (gRPC `grpc.health.v1.Health` for
 /// tonic-served binaries) — this is the plain-HTTP variant for
 /// binaries with no tonic listener.
 pub fn health_router(ready: Arc<AtomicBool>) -> Router {
@@ -273,43 +261,34 @@ pub fn spawn_axum(
     })
 }
 
-/// Spawn a plaintext tonic server with ONLY `grpc.health.v1.Health`, on a
-/// dedicated port, sharing the SAME `HealthReporter` state as the caller's
-/// main server.
-///
-/// **Why separate port:** K8s gRPC readiness probes can't do mTLS. When the
-/// main port is mTLS, the probe needs a plaintext endpoint. The health_service
-/// passed here is a `.clone()` of the one on the main port — cloning
-/// `HealthServer<HealthService>` shares the underlying `Arc<RwLock<HashMap>>`
-/// status map, so `set_serving()` / `set_not_serving()` on the reporter
-/// propagates to BOTH ports. See `r[sched.health.shared-reporter]`.
+/// Spawn a tonic server with ONLY `grpc.health.v1.Health`, on a
+/// dedicated port. For binaries whose main listener is NOT tonic (the
+/// gateway's main port is SSH; the controller has no main gRPC server)
+/// — they need a separate gRPC endpoint for kubelet `grpc:` probes.
+/// Scheduler and store register the health service on their main tonic
+/// port and do NOT call this.
 ///
 /// **Why `cancelled_owned`:** the spawned task outlives the caller's stack
 /// frame, so it needs owned access to the token. Pass the CHILD token (not
 /// the parent) — health server should survive the drain window same as the
 /// main server (K8s probe gets NOT_SERVING during drain, not ECONNREFUSED).
 ///
-/// **Caller decides whether to call this.** Scheduler/store gate on
-/// `server_tls.is_some()` (only need plaintext when main is mTLS). Gateway
-/// always calls (its main listener is SSH, not tonic — health is always
-/// separate).
-///
 /// Generic over `T: Health` because `tonic_health::server::health_reporter()`
 /// returns `HealthServer<impl Health>` (opaque type) — callers can't name the
 /// concrete `HealthService` type, so this function can't either.
-pub fn spawn_health_plaintext<T: Health>(
+pub fn spawn_health_server<T: Health>(
     health_service: HealthServer<T>,
     health_addr: SocketAddr,
     shutdown: CancellationToken,
 ) {
-    tracing::info!(addr = %health_addr, "spawning plaintext health server for K8s probes");
-    spawn_monitored("health-plaintext", async move {
+    tracing::info!(addr = %health_addr, "spawning health server for K8s probes");
+    spawn_monitored("health-grpc", async move {
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(health_service)
             .serve_with_shutdown(health_addr, shutdown.cancelled_owned())
             .await
         {
-            tracing::error!(error = %e, "plaintext health server failed");
+            tracing::error!(error = %e, "health server failed");
         }
     });
 }

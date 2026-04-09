@@ -204,36 +204,15 @@ pub struct StoreServiceImpl {
     /// header → PERMISSION_DENIED. When Some + valid token: the
     /// uploaded path must be in `claims.expected_outputs`.
     ///
-    /// mTLS bypass: if `request.peer_certs()` is present AND the
-    /// cert CN or any SAN DNSName is in `hmac_bypass_cns` → skip
-    /// HMAC (gateway uploads don't have assignment tokens — `nix
-    /// copy` just sends paths). This ties HMAC to mTLS: you can
-    /// only bypass if you have a CA-signed cert whose identity is
-    /// explicitly allowlisted.
-    ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
-    hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
-    /// Client-cert identities (CN or SAN DNSName) that bypass the
-    /// HMAC check above. Default `["rio-gateway"]`. The bypass check
-    /// reads peer_certs()[0], parses CN + SAN DNSNames, returns true
-    /// if ANY of them appears in this list. Empty Vec = no bypass at
-    /// all (every PutPath needs a token, including the gateway —
-    /// not a supported deployment shape but the config allows it).
-    ///
-    /// Not `Arc<>` — `Vec<String>` is small (typically 1-3 entries)
-    /// and `StoreServiceImpl` isn't cloned per-request (tonic shares
-    /// one instance across all handlers via `&self`).
-    hmac_bypass_cns: Vec<String>,
+    hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
     /// HMAC verifier for `x-rio-service-token` (SEPARATE key from
     /// `hmac_verifier`). When Some + token verifies + `caller` is in
     /// `service_bypass_callers` → skip the assignment-token check.
-    /// Transport-agnostic replacement for the mTLS CN-allowlist;
-    /// `hmac_bypass_cns` stays as a fallback while application-level
-    /// TLS is still on.
-    service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
-    /// Allowlist of `ServiceClaims.caller` values that bypass the
-    /// assignment-token check via a valid `x-rio-service-token`.
-    /// Default `["rio-gateway"]`.
+    /// Transport-agnostic — see [`rio_common::hmac::ServiceClaims`].
+    service_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    /// Service-token callers that may skip the assignment-token check
+    /// via a valid `x-rio-service-token`. Default `["rio-gateway"]`.
     service_bypass_callers: Vec<String>,
     /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
     /// handlers. Each handler acquires `chunk.len()` permits before extending
@@ -281,7 +260,6 @@ impl StoreServiceImpl {
             chunk_cache: None,
             signer: None,
             hmac_verifier: None,
-            hmac_bypass_cns: vec!["rio-gateway".to_string()],
             service_verifier: None,
             service_bypass_callers: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
@@ -320,16 +298,6 @@ impl StoreServiceImpl {
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
     pub fn with_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
         self.hmac_verifier = Some(Arc::new(verifier));
-        self
-    }
-
-    /// Set the CN/SAN-DNSName allowlist for HMAC bypass on PutPath.
-    /// Replaces the constructor default (`["rio-gateway"]`). main.rs
-    /// always calls this with the loaded config — config is the
-    /// single source of truth. Tests can pass `vec![]` to disable
-    /// bypass entirely or custom CNs to exercise the allowlist.
-    pub fn with_hmac_bypass_cns(mut self, cns: Vec<String>) -> Self {
-        self.hmac_bypass_cns = cns;
         self
     }
 
@@ -393,13 +361,14 @@ impl StoreServiceImpl {
     /// assert backpressure behavior without mocking the full PutPath
     /// streaming protocol.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
         &self.nar_bytes_budget
     }
 
     /// Extract `tenant_id` from a request's JWT-interceptor extension.
     /// `None` when no interceptor is wired, no token was sent, or the
-    /// caller is mTLS-bypassed. All three cases correctly skip
+    /// caller has no token. All cases skip tenant-filtering.
     /// substitution / tenant-filtering.
     fn request_tenant_id<T>(request: &Request<T>) -> Option<uuid::Uuid> {
         request

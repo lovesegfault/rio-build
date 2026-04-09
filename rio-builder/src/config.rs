@@ -391,9 +391,6 @@ mod tests {
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
         systems = ["x86_64-linux", "aarch64-linux"]
-
-        [tls]
-        cert_path = "/etc/tls/cert.pem"
         "#,
         |cfg: Config| {
             assert!(
@@ -402,19 +399,10 @@ mod tests {
             );
             assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
-            assert_eq!(
-                cfg.common.tls.cert_path.as_deref(),
-                Some(std::path::Path::new("/etc/tls/cert.pem")),
-                "[tls] table must thread through figment into TlsConfig"
-            );
-            // Unspecified sub-field defaults via #[serde(default)]
-            // on TlsConfig (partial table must work).
-            assert!(cfg.common.tls.key_path.is_none());
         }
     );
 
     rio_test_support::jail_defaults!("builder", "", |cfg: Config| {
-        assert!(!cfg.common.tls.is_configured());
         assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.systems.is_empty());

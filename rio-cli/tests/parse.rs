@@ -19,9 +19,6 @@ use std::process::Command;
 fn run_cli(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rio-cli"))
         .args(args)
-        .env_remove("RIO_TLS__CERT_PATH")
-        .env_remove("RIO_TLS__KEY_PATH")
-        .env_remove("RIO_TLS__CA_PATH")
         .env("RIO_SCHEDULER_ADDR", "127.0.0.1:1")
         .output()
         .expect("spawn rio-cli")

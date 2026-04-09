@@ -55,10 +55,6 @@ pub(super) struct Config {
     /// I-213: each entry MAY carry `floor_hint = "<size-class>"` so the
     /// strip also seeds `size_class_floor` (e.g. big-parallel → xlarge).
     pub(super) soft_features: Vec<rio_scheduler::SoftFeature>,
-    /// Plaintext health listen address for K8s probes when mTLS is on.
-    /// Shares the same HealthReporter as the main server → leadership
-    /// toggles propagate. Only listens if server TLS is configured.
-    pub(super) health_addr: std::net::SocketAddr,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
@@ -153,9 +149,6 @@ impl Default for Config {
             size_classes: Vec::new(),
             fetcher_size_classes: Vec::new(),
             soft_features: Vec::new(),
-            // 9101 = gRPC (9001) + 100. Same +100 pattern as
-            // gateway. Only used when server TLS is configured.
-            health_addr: rio_common::default_addr(9101),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,

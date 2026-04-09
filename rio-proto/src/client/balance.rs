@@ -14,21 +14,6 @@
 //! with the named service (e.g. `rio.scheduler.SchedulerService`),
 //! feed `Change::Insert` for SERVING and `Change::Remove` for
 //! NOT_SERVING. The balance channel only ever sees the leader.
-//!
-//! ## TLS domain override
-//!
-//! The balancer connects to *pod IPs* (`https://10.42.2.140:9001`),
-//! but the cert's SAN is the service name (`rio-scheduler`), not the
-//! IP. `ClientTlsConfig::domain_name()` decouples the verify domain
-//! from the connect URI: we connect to the IP, tonic verifies against
-//! the domain we supply. No cert-manager SAN change needed.
-//!
-//! ## First-tick blocking
-//!
-//! `BalancedChannel::new` awaits the first probe cycle before
-//! returning. Without this, the p2c starts empty and the first RPC
-//! fails "no ready endpoints" --- which in the gateway/builder is a
-//! fail-fast `?` out of `main()`.
 
 // r[impl sched.grpc.leader-guard]
 // r[impl proto.client.balanced]
@@ -48,37 +33,18 @@ use tracing::{debug, warn};
 /// answer Health/Check is as good as down for routing purposes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Endpoint builder: wraps a pod IP in an `Endpoint` with the
-/// TLS domain override applied. Factored out because both the
-/// balance feed (Insert) and the health probe itself need to
-/// connect to pod IPs with the same TLS config.
-fn build_endpoint(addr: SocketAddr, tls_domain: &str) -> anyhow::Result<Endpoint> {
-    let ep = match rio_common::grpc::client_tls() {
-        Some(tls) => {
-            // domain_name overrides the SNI + SAN-verify domain.
-            // The connect URI's host (the pod IP) is still what
-            // we dial, but rustls presents `tls_domain` as SNI
-            // and checks the cert's SAN against it.
-            //
-            // IPv6: wrap in brackets for the URI authority.
-            // SocketAddr's Display does NOT bracket the IP part
-            // when you format the IP alone, so do it manually.
-            let uri = match addr {
-                SocketAddr::V4(_) => format!("https://{}:{}", addr.ip(), addr.port()),
-                SocketAddr::V6(a) => format!("https://[{}]:{}", a.ip(), a.port()),
-            };
-            Endpoint::from_shared(uri)?
-                .tls_config(tls.domain_name(tls_domain))?
-                .connect_timeout(PROBE_TIMEOUT)
-        }
-        None => {
-            let uri = match addr {
-                SocketAddr::V4(_) => format!("http://{}:{}", addr.ip(), addr.port()),
-                SocketAddr::V6(a) => format!("http://[{}]:{}", a.ip(), a.port()),
-            };
-            Endpoint::from_shared(uri)?.connect_timeout(PROBE_TIMEOUT)
-        }
+/// Endpoint builder: wraps a pod IP in an `Endpoint`. Factored out
+/// because both the balance feed (Insert) and the health probe itself
+/// need to connect to pod IPs with the same config.
+fn build_endpoint(addr: SocketAddr) -> anyhow::Result<Endpoint> {
+    // IPv6: wrap in brackets for the URI authority. SocketAddr's
+    // Display does NOT bracket the IP part when you format the IP
+    // alone, so do it manually.
+    let uri = match addr {
+        SocketAddr::V4(_) => format!("http://{}:{}", addr.ip(), addr.port()),
+        SocketAddr::V6(a) => format!("http://[{}]:{}", a.ip(), a.port()),
     };
+    let ep = Endpoint::from_shared(uri)?.connect_timeout(PROBE_TIMEOUT);
     // h2 keepalive is NOT optional here. Probe rediscovery emits
     // Change::Remove --- that drops the endpoint from the p2c selection
     // pool, but does NOT close existing TCP connections. In-flight bidi
@@ -99,8 +65,8 @@ fn build_endpoint(addr: SocketAddr, tls_domain: &str) -> anyhow::Result<Endpoint
 ///
 /// Uses an ephemeral Channel, NOT the balanced channel. Chicken and
 /// egg: we're deciding whether to PUT this endpoint INTO the balance.
-async fn probe(addr: SocketAddr, tls_domain: &str, service: &str) -> bool {
-    let endpoint = match build_endpoint(addr, tls_domain) {
+async fn probe(addr: SocketAddr, service: &str) -> bool {
+    let endpoint = match build_endpoint(addr) {
         Ok(e) => e,
         Err(e) => {
             // Should never happen (we control the URI format) but
@@ -144,7 +110,6 @@ async fn tick(
     host: &str,
     port: u16,
     service: &str,
-    tls_domain: &str,
     live: &HashSet<SocketAddr>,
     tx: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
 ) -> HashSet<SocketAddr> {
@@ -171,9 +136,8 @@ async fn tick(
     // a slow standby doesn't delay seeing the leader.
     let mut probes = Vec::with_capacity(resolved.len());
     for &addr in &resolved {
-        let tls_domain = tls_domain.to_string();
         let service = service.to_string();
-        probes.push(async move { (addr, probe(addr, &tls_domain, &service).await) });
+        probes.push(async move { (addr, probe(addr, &service).await) });
     }
     let results: Vec<(SocketAddr, bool)> = futures_util::future::join_all(probes).await;
     let serving: HashSet<SocketAddr> = results
@@ -184,7 +148,7 @@ async fn tick(
     // Diff. Send Insert for new SERVING, Remove for no-longer-SERVING.
     // Order doesn't matter to p2c.
     for &addr in serving.difference(live) {
-        match build_endpoint(addr, tls_domain) {
+        match build_endpoint(addr) {
             Ok(ep) => {
                 debug!(%addr, "balance: insert");
                 if tx.send(Change::Insert(addr, ep)).await.is_err() {
@@ -239,7 +203,6 @@ impl BalancedChannel {
     ///   `rio.scheduler.SchedulerService` --- proto package +
     ///   service, NOT empty string (the scheduler only toggles
     ///   the named service, not `""`)
-    /// - `tls_domain`: SAN to verify the server cert against.
     ///   Typically the ClusterIP Service name (`rio-scheduler`)
     ///   since that's what cert-manager puts in `dnsNames`.
     /// - `probe_interval`: how often to re-resolve + re-probe.
@@ -254,7 +217,6 @@ impl BalancedChannel {
         host: String,
         port: u16,
         health_service: String,
-        tls_domain: String,
         probe_interval: Duration,
     ) -> anyhow::Result<Self> {
         // Channel::balance_channel takes a buffer capacity for the
@@ -264,15 +226,7 @@ impl BalancedChannel {
 
         // First tick: blocking, so the channel has ≥1 endpoint
         // before the caller makes an RPC.
-        let live = tick(
-            &host,
-            port,
-            &health_service,
-            &tls_domain,
-            &HashSet::new(),
-            &tx,
-        )
-        .await;
+        let live = tick(&host, port, &health_service, &HashSet::new(), &tx).await;
         anyhow::ensure!(
             !live.is_empty(),
             "balance: no SERVING endpoints for {host}:{port} (service={health_service}); \
@@ -292,7 +246,7 @@ impl BalancedChannel {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                live = tick(&host, port, &health_service, &tls_domain, &live, &tx).await;
+                live = tick(&host, port, &health_service, &live, &tx).await;
             }
         });
 
@@ -302,7 +256,7 @@ impl BalancedChannel {
         })
     }
 
-    /// [`Self::new`] with `health_service`/`tls_domain` taken from a
+    /// [`Self::new`] with `health_service` taken from a
     /// [`ProtoClient`](super::ProtoClient) impl and `probe_interval` =
     /// `DEFAULT_PROBE_INTERVAL`. The generic [`super::connect`]
     /// dispatches here when `balance_host` is set.
@@ -310,14 +264,7 @@ impl BalancedChannel {
         host: String,
         port: u16,
     ) -> anyhow::Result<Self> {
-        Self::new(
-            host,
-            port,
-            C::HEALTH_SERVICE.into(),
-            C::TLS_DOMAIN.into(),
-            DEFAULT_PROBE_INTERVAL,
-        )
-        .await
+        Self::new(host, port, C::HEALTH_SERVICE.into(), DEFAULT_PROBE_INTERVAL).await
     }
 
     /// Get a clone of the balanced channel. Cheap --- tonic
@@ -337,10 +284,6 @@ impl BalancedChannel {
 // r[impl ctrl.probe.named-service]
 pub(crate) const SCHEDULER_HEALTH_SERVICE: &str = "rio.scheduler.SchedulerService";
 
-/// Default TLS domain for scheduler connections. Matches the
-/// first SAN in `infra/helm/rio-build/templates/cert-manager.yaml`.
-pub(crate) const SCHEDULER_TLS_DOMAIN: &str = "rio-scheduler";
-
 /// Default probe interval. CoreDNS headless-Service TTL is 5s
 /// by default; 3s means we catch a leadership flip within one
 /// missed heartbeat window.
@@ -352,23 +295,15 @@ pub(crate) const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// just "migrations done + listening", not leader detection.
 pub(crate) const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
 
-/// Default TLS domain for store connections. First SAN in
-/// `infra/helm/rio-build/templates/cert-manager.yaml`.
-pub const STORE_TLS_DOMAIN: &str = "rio-store";
-
 /// Connect a `StoreAdminServiceClient` to a SPECIFIC pod IP (not the
 /// balanced channel). The ComponentScaler reconciler fans out
 /// `GetLoad` to every store pod — it needs each pod's individual
 /// reading, so the p2c balanced channel (which would route all calls
 /// to one or two pods) is the wrong tool.
-///
-/// Uses `build_endpoint` so the TLS-domain override applies (cert
-/// SAN is `rio-store`, not the pod IP). Without this, mTLS deployments
-/// fail the SAN check on every per-pod connect.
 pub async fn connect_store_admin_at(
     addr: SocketAddr,
 ) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
-    let ep = build_endpoint(addr, STORE_TLS_DOMAIN)?;
+    let ep = build_endpoint(addr)?;
     let ch = ep.connect().await?;
     Ok(super::ProtoClient::wrap(ch))
 }
@@ -378,15 +313,14 @@ mod tests {
     use super::*;
 
     /// Smoke: build_endpoint formats IPv4/v6 URIs correctly.
-    /// (No TLS in tests --- `rio_common::grpc::CLIENT_TLS` is unset.)
     #[test]
     fn build_endpoint_formats_uri() {
         let v4: SocketAddr = "10.42.2.140:9001".parse().unwrap();
-        let ep = build_endpoint(v4, "rio-scheduler").unwrap();
+        let ep = build_endpoint(v4).unwrap();
         assert_eq!(ep.uri().to_string(), "http://10.42.2.140:9001/");
 
         let v6: SocketAddr = "[::1]:9001".parse().unwrap();
-        let ep = build_endpoint(v6, "rio-scheduler").unwrap();
+        let ep = build_endpoint(v6).unwrap();
         assert_eq!(ep.uri().to_string(), "http://[::1]:9001/");
     }
 
@@ -396,7 +330,7 @@ mod tests {
     async fn probe_dead_addr_false() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let start = std::time::Instant::now();
-        assert!(!probe(addr, "x", "x").await);
+        assert!(!probe(addr, "x").await);
         // Should fail fast (connection refused), not hit the 2s
         // timeout. Give it 1s of slack for CI.
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -432,7 +366,6 @@ mod tests {
             "127.0.0.1",
             addr.port(),
             "test.Service",
-            "unused",
             &HashSet::new(),
             &tx,
         )
@@ -446,15 +379,7 @@ mod tests {
             .await;
 
         // Tick 2: SERVING → Insert.
-        let live = tick(
-            "127.0.0.1",
-            addr.port(),
-            "test.Service",
-            "unused",
-            &live,
-            &tx,
-        )
-        .await;
+        let live = tick("127.0.0.1", addr.port(), "test.Service", &live, &tx).await;
         assert_eq!(live.len(), 1);
         match rx.try_recv().expect("Insert should be emitted") {
             Change::Insert(a, _) => assert_eq!(a, addr),
@@ -467,15 +392,7 @@ mod tests {
             .await;
 
         // Tick 3: Remove.
-        let live = tick(
-            "127.0.0.1",
-            addr.port(),
-            "test.Service",
-            "unused",
-            &live,
-            &tx,
-        )
-        .await;
+        let live = tick("127.0.0.1", addr.port(), "test.Service", &live, &tx).await;
         assert!(live.is_empty());
         match rx.try_recv().expect("Remove should be emitted") {
             Change::Remove(a) => assert_eq!(a, addr),

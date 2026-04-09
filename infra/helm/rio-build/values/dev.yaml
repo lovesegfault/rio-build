@@ -14,8 +14,6 @@ namespaces:
   # didn't create ("invalid ownership metadata").
   create: false
 
-tls:
-  enabled: false
 
 podDisruptionBudget:
   enabled: false

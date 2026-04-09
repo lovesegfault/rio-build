@@ -3,13 +3,10 @@
 //! Intended for LOCAL use via port-forward (`cargo xtask k8s cli --
 //! <cmd>`): xtask opens tunnels to scheduler:9001 + store:9002, fetches
 //! the mTLS client cert from the cluster Secret, and execs THIS binary
-//! with `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR`/`RIO_TLS__*` set.
+//! with `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR` set.
 //!
 //! In-pod exec (`kubectl exec deploy/rio-scheduler -- rio-cli <cmd>`)
-//! also works — the scheduler pod has `RIO_TLS__*` env + certs at
-//! `/etc/rio/tls/` — but forces the scheduler image to bundle rio-cli
-//! and every runtime dep (jq for `--json`, column for tables, …). See
-//! `r[sec.image.control-plane-minimal]`.
+//! also works.
 
 use std::time::Duration;
 
@@ -130,7 +127,6 @@ struct Config {
     /// (scheduler pod is in rio-system; store pod is in rio-store
     /// namespace since P0454's four-namespace split).
     store_addr: String,
-    tls: rio_common::tls::TlsConfig,
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -150,7 +146,6 @@ impl Default for Config {
             // Service FQDN. Override via `RIO_STORE_ADDR` for
             // port-forward / standalone use.
             store_addr: "rio-store.rio-store:9002".into(),
-            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -179,7 +174,6 @@ impl Config {
 
 // rio-cli's CLI surface is the subcommand enum; the cross-cutting
 // flags are `--scheduler-addr` and `--json`. TLS is env-only
-// (RIO_TLS__*) — no flags, because the in-pod case (the common case)
 // sets it via env anyway and three cert-path flags would clutter --help.
 #[derive(Parser, Serialize, Default)]
 #[command(name = "rio-cli", about = "Admin CLI for rio-build")]
@@ -321,8 +315,6 @@ enum Cmd {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
     let cmd = cli
         .cmd
@@ -341,7 +333,6 @@ async fn main() -> anyhow::Result<()> {
         use rio_common::config::ValidateConfig as _;
         cfg.validate()?;
     }
-    rio_common::grpc::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
 
     match cmd {
         // kube-only — talks to the K8s apiserver via KUBECONFIG /

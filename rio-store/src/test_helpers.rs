@@ -63,7 +63,6 @@ pub fn mem_backend() -> std::sync::Arc<MemoryChunkBackend> {
 ///
 /// Uses [`rio_proto::client::connect_single`] (which sets
 /// `max_decoding_message_size`) so large-NAR tests don't hit tonic's
-/// 4 MiB default. Tests that don't init `client_tls()` get plaintext.
 pub async fn spawn_store_service(
     service: StoreServiceImpl,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {

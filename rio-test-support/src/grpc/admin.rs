@@ -135,7 +135,7 @@ impl AdminService for MockAdmin {
 /// Spawn a MockAdmin on an ephemeral port. Returns `(admin, addr, handle)`.
 ///
 /// Plaintext — no TLS. For rio-cli smoke tests: run with no
-/// `RIO_TLS__*` env vars and `load_client_tls` returns `None`.
+///
 pub async fn spawn_mock_admin()
 -> anyhow::Result<(MockAdmin, SocketAddr, tokio::task::JoinHandle<()>)> {
     let admin = MockAdmin::new();

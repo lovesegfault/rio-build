@@ -67,7 +67,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "tls" "cov")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
           # /healthz serves 200 once kube client + scheduler admin client
           # connected. Controller that can't watch CRDs is useless → NotReady
           # is correct. Already plaintext HTTP — no TLS retarget needed.
@@ -81,5 +81,5 @@ spec:
           resources:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov") "tlsSecret" "rio-controller-tls") | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
 {{- end }}

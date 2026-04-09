@@ -58,9 +58,12 @@ pkgs.testers.runNixOSTest {
             "| grep -qx True",
             timeout=120,
         )
-        # GRPCRoute Accepted (proves parentRef resolved, backendRef valid).
+        # HTTPRoute Accepted (proves parentRef resolved, backendRef valid).
+        # HTTPRoute (not GRPCRoute): grpc-web content-type doesn't match
+        # GRPCRoute; the scheduler does grpc-web translation in-process,
+        # so the Gateway routes plain HTTP by exact path.
         k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} get grpcroute rio-scheduler-readonly "
+            "k3s kubectl -n ${ns} get httproute rio-scheduler-readonly "
             "-o jsonpath='{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}' "
             "| grep -qx True",
             timeout=90,
@@ -69,7 +72,7 @@ pkgs.testers.runNixOSTest {
         # false. Any accidental render = fail-open on ClearPoison/
         # DrainExecutor/CreateTenant/TriggerGC.
         k3s_server.fail(
-            "k3s kubectl -n ${ns} get grpcroute rio-scheduler-mutating"
+            "k3s kubectl -n ${ns} get httproute rio-scheduler-mutating"
         )
 
     # ── CiliumEnvoyConfig generated ─────────────────────────────────────
@@ -85,37 +88,114 @@ pkgs.testers.runNixOSTest {
             timeout=60,
         )
 
-    # ── gRPC-Web curl assertions: DEFERRED to Phase 5 ───────────────────
-    # Two blockers, both resolved by the TLS rip:
-    #   (1) Cilium's per-Gateway Service is selectorless — the eBPF L7
-    #       redirect to cilium-envoy fires for pod-netns traffic only,
-    #       not host-netns curl. port-forward svc/ has no endpoints to
-    #       pick. From-pod curl needs a curl-capable preloaded image.
-    #   (2) Backend (rio-scheduler:9001) is mTLS-only. Cilium Gateway's
-    #       envoy has no client cert (BackendTLSPolicy was deleted in
-    #       4b — correct for the Phase-5 plaintext target, premature
-    #       for the curl assertions).
-    # After Phase 5: scheduler is plaintext, and the direct-to-
-    # scheduler subtest (already TODO'd below) plus a from-pod curl
-    # through the gateway both become trivial.
-    # TODO(phase-5): re-enable the 0x00/0x80/method-gate curls once
-    # scheduler is plaintext. The structural checks above prove Phase
-    # 4b/4c (Cilium Gateway reconciles; Envoy Gateway operator gone).
-
     # ── D3: gRPC-Web direct to scheduler (no Gateway) ───────────────────
     # Proves the scheduler serves gRPC-Web NATIVELY (tonic-web layer),
-    # independent of any proxy. DEFERRED to Phase 5: while mTLS is on,
-    # tonic's tls_config ALPN-negotiates h2-only, so accept_http1 does
-    # not apply over TLS — the h1 grpc-web curl hangs. After Phase 5
-    # (TLS rip) the scheduler is plain-HTTP and this becomes a trivial
-    # `curl http://localhost:19001/...`. The Gateway-proxied subtests
-    # above already prove the grpc-web framing end-to-end.
-    # TODO(phase-5): re-enable as plain-http curl once `tls.enabled=false`.
+    # independent of any proxy. Scheduler is plaintext on 9001 — plain
+    # port-forward + http://localhost curl. accept_http1(true) means
+    # the h1 gRPC-Web POST works alongside native h2 gRPC on one port.
+    # Runs FIRST: if tonic-web is broken, the Gateway tests can't pass
+    # either — fail here with the simpler reproduction.
+    with subtest("gRPC-Web direct: scheduler tonic-web ClusterStatus"):
+        k3s_server.succeed(
+            "k3s kubectl -n ${ns} port-forward svc/rio-scheduler 19001:9001 "
+            ">/tmp/pf-sched.log 2>&1 & echo $! > /tmp/pf-sched.pid"
+        )
+        k3s_server.wait_until_succeeds(
+            "${pkgs.netcat}/bin/nc -z localhost 19001", timeout=10
+        )
+        try:
+            k3s_server.wait_until_succeeds(
+                "printf '\\x00\\x00\\x00\\x00\\x00' | "
+                "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/ClusterStatus "
+                "-H 'content-type: application/grpc-web+proto' "
+                "-H 'x-grpc-web: 1' --data-binary @- "
+                "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+                timeout=60,
+            )
+        except Exception:
+            print("── DIAGNOSTIC: scheduler tonic-web direct ──")
+            print(k3s_server.succeed(
+                "curl -sv -X POST http://localhost:19001/rio.admin.AdminService/ClusterStatus "
+                "-H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' "
+                "--data-raw "" 2>&1 | head -30; "
+                "k3s kubectl -n ${ns} logs deploy/rio-scheduler --tail=40 2>&1"
+            ))
+            raise
+        finally:
+            k3s_server.execute("kill $(cat /tmp/pf-sched.pid) 2>/dev/null || true")
 
-    # method-gate runtime curls (ClearPoison 404, ClusterStatus 200,
-    # ListExecutors grpc-status:0) deferred with the rest — same two
-    # blockers. The structural proof (rio-scheduler-mutating GRPCRoute
-    # absent, checked in the Gateway-Programmed subtest above) is the
-    # Phase-4 method-gate evidence.
+    # ── gRPC-Web through Cilium Gateway (from-pod) ──────────────────────
+    # Cilium's per-Gateway Service is selectorless — the eBPF L7
+    # redirect to cilium-envoy fires for pod-netns traffic only, not
+    # host-netns. So wget from inside the rio-dashboard nginx pod
+    # (alpine, has busybox wget+od). Same-ns → short-name DNS works.
+    # busybox wget needs --post-file (no --data-binary); write the
+    # 5-byte grpc-web header to a tmpfile first.
+    gw_url = "http://cilium-gateway-rio-dashboard:8080"
+
+    def pod_wget(script):
+        # Heredoc-via-stdin avoids the nested-quote escaping of
+        # `sh -c '...'` inside Python inside Nix.
+        return (
+            "k3s kubectl -n ${ns} exec -i deploy/rio-dashboard -c nginx -- sh "
+            f"<<'PODEOF'\n{script}\nPODEOF"
+        )
+
+    with subtest("gRPC-Web unary via Gateway: ClusterStatus DATA frame 0x00"):
+        # Empty proto body = 5-byte header (compression flag + 4-byte
+        # length, all zero). Response DATA frame starts with same 0x00.
+        # wait_until_succeeds: HTTPRoute backendRef load-balances across
+        # scheduler replicas; a non-leader hit yields Unavailable.
+        try:
+            k3s_server.wait_until_succeeds(
+                pod_wget(
+                    "printf '\\000\\000\\000\\000\\000' >/tmp/b && "
+                    "wget -qO- --header='content-type: application/grpc-web+proto' "
+                    "--header='x-grpc-web: 1' --post-file=/tmp/b "
+                    f"{gw_url}/rio.admin.AdminService/ClusterStatus "
+                    "| od -An -tx1 -N1 | grep -qw 00"
+                ),
+                timeout=90,
+            )
+        except Exception:
+            print("── DIAGNOSTIC: from-pod wget via Gateway ──")
+            print(k3s_server.succeed(pod_wget(
+                "wget -SO- --header='content-type: application/grpc-web+proto' "
+                "--header='x-grpc-web: 1' --post-data=x "
+                f"{gw_url}/rio.admin.AdminService/ClusterStatus 2>&1 | head -30 || true"
+            )))
+            print(k3s_server.succeed(
+                "k3s kubectl -n ${ns} get svc cilium-gateway-rio-dashboard -o wide 2>&1; "
+                "k3s kubectl -n ${ns} get httproute rio-scheduler-readonly -o yaml 2>&1 | tail -30"
+            ))
+            raise
+
+    with subtest("gRPC-Web streaming via Gateway: GetBuildLogs trailer 0x80"):
+        # GetBuildLogs{derivation_path:"nonexist"} (field 2, type 2,
+        # len 8) → handler returns Ok(stream-yielding-Err) so tonic-web
+        # emits the trailer as a 0x80-flagged length-prefixed-message.
+        k3s_server.wait_until_succeeds(
+            pod_wget(
+                "printf '\\000\\000\\000\\000\\012\\022\\010nonexist' >/tmp/b && "
+                "wget -qO- --header='content-type: application/grpc-web+proto' "
+                "--header='x-grpc-web: 1' --post-file=/tmp/b "
+                f"{gw_url}/rio.admin.AdminService/GetBuildLogs "
+                "| od -An -tx1 -N1 | grep -qw 80"
+            ),
+            timeout=90,
+        )
+
+    # ── r[dash.auth.method-gate] runtime: ClearPoison unrouted ──────────
+    # enableMutatingMethods=false → mutating HTTPRoute absent → Cilium
+    # Gateway has no route for /ClearPoison → 404. Live proof the
+    # method-gate holds at the data plane (helm-lint proves it
+    # statically; this proves the operator's xDS respects it).
+    # busybox wget exits nonzero on 4xx → wrap in `! wget` for the 404.
+    with subtest("method-gate via Gateway: ClearPoison 404"):
+        k3s_server.succeed(pod_wget(
+            "! wget -qO- --post-data=x "
+            f"{gw_url}/rio.admin.AdminService/ClearPoison 2>&1 "
+            "| grep -q ."
+        ))
   '';
 }

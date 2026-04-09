@@ -1,5 +1,5 @@
 # dashboard.enabled=true MUST render exactly one each of GatewayClass/
-# Gateway/GRPCRoute (standard Gateway API only — Cilium controller, no
+# Gateway/HTTPRoute (standard Gateway API only — Cilium controller, no
 # vendor CRDs). Any Go-template syntax error, bad nindent, or Values
 # typo surfaces here before the VM test spends 5min on k3s bring-up.
 
@@ -10,7 +10,7 @@ helm template rio . \
   --set postgresql.enabled=false \
   >"$out"
 
-for k in GatewayClass Gateway GRPCRoute; do
+for k in GatewayClass Gateway HTTPRoute; do
   grep -qx "kind: $k" "$out" || {
     echo "FAIL: dashboard.enabled=true did not render kind: $k" >&2
     exit 1

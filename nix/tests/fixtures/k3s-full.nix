@@ -66,8 +66,35 @@ let
     pulled.cilium-agent
     pulled.cilium-operator-generic
   ];
-  mkPkiK8s = import ../lib/pki-k8s.nix { inherit pkgs; };
   jwtKeys = import ../lib/jwt-keys.nix;
+  hmacKeys = import ../lib/hmac-keys.nix { inherit pkgs; } null;
+  # HMAC Secrets for the namespaces that mount them. Gateway+scheduler
+  # live in rio-system; store lives in rio-store. Both keys go to both
+  # namespaces (scheduler signs assignment tokens, store verifies both;
+  # gateway signs service tokens). runCommand keeps base64 at build
+  # time — no IFD on a non-deterministic openssl-rand output.
+  hmacSecretsManifest = pkgs.runCommand "rio-hmac-secrets.yaml" { } ''
+    for ns in rio-system rio-store; do
+      cat >> $out <<EOF
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: rio-hmac
+      namespace: $ns
+    data:
+      hmac.key: $(base64 -w0 < ${hmacKeys}/hmac.key)
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: rio-service-hmac
+      namespace: $ns
+    data:
+      service-hmac.key: $(base64 -w0 < ${hmacKeys}/service-hmac.key)
+    EOF
+    done
+  '';
 in
 {
   # --set overrides layered on top of vmtest-full.yaml. scenarios/
@@ -172,9 +199,6 @@ let
   # phase4c). Makes the fixture representative of production: mTLS
   # on all gRPC links, plaintext health ports (9101/9102/9194).
   #
-  pkiK8s = mkPkiK8s {
-    inherit ns;
-  };
 
   # ── Airgap image set ────────────────────────────────────────────────
   # Same list on BOTH nodes — pods land on either via scheduler whims
@@ -507,10 +531,10 @@ let
             stringData:
               authorized_keys: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICOWXl9/32g/wAtRqYblAdI7wmPNL6phTBMlkn2o6psr placeholder-unused-vmtest"
           '';
-          # mTLS certs. Applied before 02-workloads so pods' TLS
-          # Secret volume mounts resolve on first start (no Pending
-          # on unbound Secret). See lib/pki-k8s.nix.
-          "01-rio-tls-secrets".source = pkiK8s.secretsManifest;
+          # HMAC keys. Applied before 02-workloads so pods' Secret
+          # volume mounts resolve on first start (no Pending →
+          # ContainerCreating churn waiting for the Secret).
+          "01-rio-hmac-secrets".source = hmacSecretsManifest;
         };
         extraFlags = [
           # Cilium IS the CNI — disable k3s's bundled flannel + kube-router
@@ -616,7 +640,6 @@ rec {
   # For grpcurl client cert args (scenarios/lifecycle.nix sched_grpc
   # etc). The controller cert works as a generic mTLS client — rio
   # doesn't check CN, only that the cert chains to the shared CA.
-  inherit (pkiK8s) pki;
 
   nodes = {
     k3s-server = serverNode;

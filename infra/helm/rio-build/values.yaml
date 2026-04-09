@@ -46,15 +46,6 @@ namespaces:
   builders: {name: rio-builders, psa: privileged}
   fetchers: {name: rio-fetchers, psa: privileged}
 
-# TLS on → mounts TLS secrets into each Deployment + sets RIO_TLS__* env +
-# retargets store's readiness probe to the plaintext health port (9102).
-#
-# provisioner:
-#   cert-manager — renders ClusterIssuer bootstrap + root CA + namespaced
-#     Issuer + per-component Certificates. Requires cert-manager in cluster.
-#   external — Secrets (rio-{scheduler,store,gateway,controller,worker}-tls)
-#     are provided out-of-band. Use for VM tests (openssl PKI) or any
-#     deployment that doesn't use cert-manager.
 # LLVM coverage profraw collection. When enabled, each rio pod gets
 # LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw + a hostPath
 # volume mounted there. Profraws flush via atexit on graceful SIGTERM.
@@ -62,10 +53,6 @@ namespaces:
 # when running instrumented binaries.
 coverage:
   enabled: false
-
-tls:
-  enabled: true
-  provisioner: cert-manager
 
 # JWT tenant tokens — asymmetric ed25519. Gateway signs (Secret),
 # scheduler+store verify (ConfigMap). Dual-mode PERMANENT: jwt.enabled

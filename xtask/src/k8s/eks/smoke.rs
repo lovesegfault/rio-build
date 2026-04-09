@@ -52,37 +52,26 @@ const FETCHER_POOL: &str = "x86-64";
 /// `step_status` provider-agnostic).
 pub struct CliCtx {
     _guards: ((u16, ProcessGuard), (u16, ProcessGuard)),
-    _dir: tempfile::TempDir,
     sched: u16,
     store: u16,
-    cert: std::path::PathBuf,
-    key: std::path::PathBuf,
-    ca: std::path::PathBuf,
 }
 
 impl CliCtx {
-    /// Open scheduler+store tunnels and fetch the mTLS cert. Cheap:
-    /// two `kubectl port-forward` children + one Secret GET.
-    pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
+    /// Open scheduler+store tunnels. Cheap: two `kubectl port-forward`
+    /// children.
+    pub async fn open(_client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
         let guards = crate::k8s::shared::tunnel_grpc(sched, store).await?;
         // I-101: tunnel_grpc may bind ephemeral ports when 0 was
         // passed — use what kubectl actually bound, not the request.
         let (sched, store) = (guards.0.0, guards.1.0);
-        let (dir, cert, key, ca) =
-            kube::fetch_tls_to_tempdir(client, NS, "rio-scheduler-tls").await?;
         Ok(Self {
             _guards: guards,
-            _dir: dir,
             sched,
             store,
-            cert,
-            key,
-            ca,
         })
     }
 
     /// Run rio-cli locally with RIO_SCHEDULER_ADDR/RIO_STORE_ADDR/
-    /// RIO_TLS__* set, capture combined output. Prefers an installed
     /// `rio-cli` on PATH; falls back to `cargo run -p rio-cli`.
     ///
     /// **Exit-code contract:** non-zero exit propagates as `Err` via
@@ -94,9 +83,6 @@ impl CliCtx {
         let sh = shell()?;
         let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{}", self.sched));
         let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{}", self.store));
-        let _e3 = sh.push_env("RIO_TLS__CERT_PATH", &self.cert);
-        let _e4 = sh.push_env("RIO_TLS__KEY_PATH", &self.key);
-        let _e5 = sh.push_env("RIO_TLS__CA_PATH", &self.ca);
         let on_path = sh::try_read(cmd!(sh, "command -v rio-cli")).is_ok();
         if on_path {
             sh::try_read(cmd!(sh, "rio-cli {args...}"))
