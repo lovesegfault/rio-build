@@ -11,17 +11,19 @@ pub mod cas;
 pub(crate) mod chunker;
 pub mod gc;
 pub mod grpc;
+pub(crate) mod ingest;
 // pub (not pub(crate)) so the fuzz target at rio-store/fuzz/ can call
 // Manifest::deserialize. The fuzz crate is a separate workspace root.
 pub mod manifest;
 pub(crate) mod metadata;
 pub mod migrations;
-// pub(crate) per ADR-018 §3 — resolution logic belongs in the scheduler,
-// which re-implements query/insert directly against PG (both crates share
-// the pool + migrations). See rio-scheduler/src/ca/resolve.rs for the
-// scheduler-side mirror. Schema changes to the realisations table MUST
-// update both sites.
-pub(crate) mod realisations;
+// Per ADR-018 §3 resolution logic belongs in the scheduler, but the
+// scheduler accesses the same `realisations` table on the shared pool.
+// Exported pub so rio-scheduler can call `rio_store::realisations::query`
+// instead of duplicating the raw SQL (rio-scheduler/src/ca/resolve.rs
+// `query_realisation` is a near-verbatim copy). Single owner for the
+// table's SQL means schema changes touch one crate.
+pub mod realisations;
 pub mod signing;
 pub mod substitute;
 #[cfg(any(test, feature = "test-utils"))]
@@ -162,6 +164,13 @@ pub fn describe_metrics() {
         "Percent of sweep-eligible paths with zero references at GC time. \
          High values trigger the 'suspicious GC sweep' error log (threshold \
          configurable); sustained high = upstream ref-scanner likely broken."
+    );
+    describe_counter!(
+        "rio_store_sign_tenant_key_fallback_total",
+        "PutPath/PutPathBatch tenant-key lookups that failed (transient PG \
+         error) and fell back to the cluster key. The upload still succeeds \
+         with a valid cluster signature; tenants that trust ONLY their own \
+         key will see verify failures. Alert if sustained nonzero."
     );
     describe_counter!(
         "rio_store_sign_empty_refs_total",

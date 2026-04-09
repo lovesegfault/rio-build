@@ -485,17 +485,16 @@ pub async fn insert_realisation_deps(
 /// Query the realisations table for one (modular_hash, output_name).
 ///
 /// Returns `None` for a cache miss (realisation not registered).
-/// This is the same query as `rio_store::realisations::query` but
-/// local to the scheduler — the scheduler accesses `realisations`
-/// directly (both crates share the PG pool and migrations), not via
-/// the store gRPC. ADR-018 §3: "resolution logic belongs in the
-/// scheduler."
+/// The scheduler accesses `realisations` directly (both crates share
+/// the PG pool and migrations), not via the store gRPC. ADR-018 §3:
+/// "resolution logic belongs in the scheduler."
 ///
-/// **Schema coupling:** the store-side module is `pub(crate)` (see
-/// `rio-store/src/lib.rs`), so this duplication is intentional, not a
-/// visibility bug. The store uses validated `[u8;32]` types; here we
-/// accept raw slices. Any migration touching the `realisations` table
-/// MUST update both query sites or risk silent drift.
+/// TODO(b02): replace this raw-SQL copy with
+/// `rio_store::realisations::query` (now `pub`). The store-side fn
+/// returns the full `Realisation` struct with row validation; this
+/// shim only needs `output_path`. Swapping requires adding rio-store
+/// as a scheduler dep (with default-features=false to avoid pulling
+/// the gRPC server stack) — deferred to the b02-scheduler bundle.
 pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],

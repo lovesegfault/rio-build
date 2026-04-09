@@ -31,8 +31,15 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::ChunkBackend;
 use crate::cas;
+use crate::ingest::{self, IngestHooks, PersistError, PlaceholderClaim};
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
+
+/// Substitution hooks for the shared ingest core.
+const SUBSTITUTE_HOOKS: IngestHooks = IngestHooks {
+    stale_reclaimed_metric: "rio_store_substitute_stale_reclaimed_total",
+    ctx_label: "substitute",
+};
 
 /// How old an `'uploading'` placeholder must be before the
 /// substitution ingest path reclaims it instead of returning a miss.
@@ -510,8 +517,10 @@ impl Substituter {
     }
 
     /// Write-ahead ingest: placeholder → chunked-or-inline → complete.
-    /// Same flow as PutPath (grpc/put_path.rs:511-580), minus the
-    /// streaming/HMAC bits — we already have the full NAR in memory.
+    /// Thin wrapper over [`crate::ingest`] (the same core PutPath uses)
+    /// plus substitution-specific bits: sig_mode handling, and on
+    /// `AlreadyComplete` append our sigs to the existing row instead of
+    /// returning `created=false`.
     async fn ingest(
         &self,
         tenant_id: Uuid,
@@ -530,76 +539,33 @@ impl Substituter {
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
 
-        // Write-ahead placeholder. If another uploader raced us (or
-        // another substituter for the same path), the `inserted`
-        // return is false and complete_manifest will PlaceholderMissing
-        // — which we treat as a retriable race (caller can re-query).
-        let mut inserted = metadata::insert_manifest_uploading(
+        match ingest::claim_placeholder(
             &self.pool,
+            self.chunk_backend.as_ref(),
             &store_path_hash,
             info.store_path.as_str(),
             &refs_str,
+            SUBSTITUTE_HOOKS,
         )
-        .await?;
-        if !inserted {
-            // Lost the race. Re-check if the winner completed — if so,
-            // append our sigs to the existing row and return it.
-            if let Some(existing) =
-                metadata::query_path_info(&self.pool, info.store_path.as_str()).await?
-            {
+        .await?
+        {
+            PlaceholderClaim::Owned => {}
+            PlaceholderClaim::AlreadyComplete => {
+                // Lost the race; winner completed. Append our sigs to
+                // the existing row (idempotent — append_signatures
+                // dedupes) and return it.
                 metadata::append_signatures(&self.pool, info.store_path.as_str(), &info.signatures)
                     .await?;
-                return Ok(existing);
+                return metadata::query_path_info(&self.pool, info.store_path.as_str())
+                    .await?
+                    .ok_or_else(|| {
+                        SubstituteError::Ingest(metadata::MetadataError::PlaceholderMissing {
+                            store_path: info.store_path.to_string(),
+                        })
+                    });
             }
-            // Placeholder exists, status='uploading', no completed
-            // row. Either a live concurrent uploader holds it OR a
-            // crashed uploader left it. Check age: if stale, reclaim
-            // and retry. The orphan scanner would catch this in 15min;
-            // we can't wait that long on the hot path.
-            //
-            // I-040: this previously called the inline-only
-            // `delete_manifest_uploading`, which leaks chunk
-            // refcounts when the stale placeholder is CHUNKED (left
-            // by an interrupted `cas::put_chunked`). Post-M033 a
-            // leaked refcount no longer causes upload-skip (the
-            // upsert keys on `uploaded_at`, not refcount), but
-            // `gc::orphan::reap_one` is still correct here for
-            // refcount hygiene — it reads `manifest_data.chunk_list`
-            // and decrements.
-            // r[impl store.substitute.stale-reclaim]
-            let threshold_secs = SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-            let reaped = crate::gc::orphan::reap_one(
-                &self.pool,
-                &store_path_hash,
-                Some(threshold_secs),
-                self.chunk_backend.as_ref(),
-            )
-            .await
-            .map_err(metadata::MetadataError::from)?;
-            if reaped {
-                warn!(
-                    store_path = %info.store_path,
-                    threshold = ?SUBSTITUTE_STALE_THRESHOLD,
-                    "stale 'uploading' placeholder — reclaimed"
-                );
-                metrics::counter!("rio_store_substitute_stale_reclaimed_total").increment(1);
-                // Retry the insert. If THIS also fails, a live
-                // concurrent uploader really did grab the slot
-                // between our delete and re-insert — fall through
-                // to PlaceholderMissing (retriable).
-                inserted = metadata::insert_manifest_uploading(
-                    &self.pool,
-                    &store_path_hash,
-                    info.store_path.as_str(),
-                    &refs_str,
-                )
-                .await?;
-            }
-            // reaped=false: young placeholder (genuine concurrent
-            // uploader) or gone entirely (another reclaimer beat us
-            // — TOCTOU, harmless). Either way: don't re-insert,
-            // fall through to PlaceholderMissing below.
-            if !inserted {
+            PlaceholderClaim::Concurrent => {
+                // Live uploader holds the slot. Retriable.
                 return Err(SubstituteError::Ingest(
                     metadata::MetadataError::PlaceholderMissing {
                         store_path: info.store_path.to_string(),
@@ -608,49 +574,26 @@ impl Substituter {
             }
         }
 
-        // Inline vs chunked. Same threshold as PutPath.
-        let result = if let Some(backend) =
-            cas::should_chunk(self.chunk_backend.as_ref(), nar_bytes.len())
+        if let Err(e) = ingest::persist_nar(
+            &self.pool,
+            self.chunk_backend.as_ref(),
+            &info,
+            nar_bytes.into(),
+            self.chunk_upload_max_concurrent,
+            SUBSTITUTE_HOOKS,
+        )
+        .await
         {
-            cas::put_chunked(
-                &self.pool,
-                backend,
-                &info,
-                &nar_bytes,
-                self.chunk_upload_max_concurrent,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| SubstituteError::Chunked(e.to_string()))
-        } else {
-            metadata::complete_manifest_inline(&self.pool, &info, nar_bytes)
-                .await
-                .map_err(SubstituteError::Ingest)
-        };
-
-        // On failure, clean up the placeholder. Best-effort — if
-        // cleanup also fails, the orphan-sweeper will reclaim it.
-        //
-        // `cas::put_chunked` already calls its own internal rollback
-        // (delete_manifest_chunked_uploading) before returning Err,
-        // so this is normally a no-op (placeholder already gone).
-        // But if put_chunked's rollback ALSO failed (rare — PG
-        // transient), the placeholder is still chunked and we need
-        // chunk-aware cleanup (I-040 — same leak path as the
-        // stale-reclaim above). threshold=None: this is OUR
-        // placeholder from a few lines up, no stale check needed.
-        if let Err(e) = result {
-            if let Err(ce) = crate::gc::orphan::reap_one(
-                &self.pool,
-                &store_path_hash,
-                None,
-                self.chunk_backend.as_ref(),
-            )
-            .await
-            {
-                warn!(error = %ce, "cleanup after failed ingest also failed");
-            }
-            return Err(e);
+            // Best-effort cleanup. `PersistError::Chunked` already
+            // rolled back internally; the abort is a harmless no-op
+            // there but covers the case where put_chunked's rollback
+            // itself failed (I-040). threshold=None: our placeholder.
+            ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), &store_path_hash)
+                .await;
+            return Err(match e {
+                PersistError::Chunked(e) => SubstituteError::Chunked(e.to_string()),
+                PersistError::Inline(e) => SubstituteError::Ingest(e),
+            });
         }
 
         Ok(info)

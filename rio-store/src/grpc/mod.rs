@@ -430,16 +430,8 @@ impl StoreServiceImpl {
     /// the error metric. Call this on any error path AFTER
     /// `insert_manifest_uploading` returned true (i.e., we own the placeholder).
     async fn abort_upload(&self, store_path_hash: &[u8]) {
-        if let Err(e) = crate::gc::orphan::reap_one(
-            &self.pool,
-            store_path_hash,
-            None,
-            self.chunk_backend.as_ref(),
-        )
-        .await
-        {
-            error!(error = %e, "PutPath: failed to clean up placeholder during abort");
-        }
+        crate::ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), store_path_hash)
+            .await;
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
     }
 }

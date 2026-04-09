@@ -23,20 +23,18 @@
 //! around the same state machine.
 
 use super::*;
+use crate::ingest;
 
-/// Result of [`StoreServiceImpl::claim_placeholder`].
-pub(in crate::grpc) enum PlaceholderClaim {
-    /// Path is already `status='complete'`. Caller returns
-    /// `created=false` without writing anything.
-    AlreadyComplete,
-    /// We inserted (or stale-reclaimed-then-inserted) the
-    /// `status='uploading'` placeholder. Caller now OWNS it and MUST
-    /// reap on any error path (`abort_upload` / `abort_batch`).
-    Owned,
-    /// Another uploader holds a live (heartbeating) placeholder.
-    /// Caller returns `Status::aborted` so the client retries.
-    Concurrent,
-}
+/// Re-export of [`crate::ingest::PlaceholderClaim`] — the write-ahead
+/// state machine lives in `ingest` (shared with `Substituter`); this
+/// keeps existing `grpc::` callers' paths stable.
+pub(in crate::grpc) use crate::ingest::PlaceholderClaim;
+
+/// gRPC PutPath/PutPathBatch hooks for the shared ingest core.
+const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
+    stale_reclaimed_metric: "rio_store_putpath_stale_reclaimed_total",
+    ctx_label: "PutPath",
+};
 
 /// How the NAR was persisted. Batch uses this to pick the right
 /// `complete_manifest_*_in_tx` variant inside its atomic tx.
@@ -389,140 +387,75 @@ impl StoreServiceImpl {
         Ok(())
     }
 
-    // r[impl store.put.idempotent]
-    // r[impl store.put.stale-reclaim]
-    /// Idempotency check + `status='uploading'` placeholder insert +
-    /// hot-path stale-reclaim. The shared step-2/step-3 of the
-    /// write-ahead flow.
-    ///
-    /// Flow:
-    /// 1. `check_manifest_complete` → [`PlaceholderClaim::AlreadyComplete`]
-    /// 2. `insert_manifest_uploading` → if inserted: [`PlaceholderClaim::Owned`]
-    /// 3. ON CONFLICT no-op: try `reap_one` with the stale threshold
-    ///    (I-207 — a fetcher that died mid-upload leaves a placeholder
-    ///    the orphan scanner won't reap for 15min, but the scheduler
-    ///    retries within seconds). If reap succeeded, re-insert.
-    /// 4. Still not inserted → [`PlaceholderClaim::Concurrent`] (live
-    ///    uploader's heartbeat keeps `updated_at` fresh, so reap_one's
-    ///    threshold check protected it).
-    ///
-    /// `ctx_label` prefixes the warn! lines for log disambiguation.
-    /// Metrics (`exists` / `stale_reclaimed` / `concurrent_upload`) are
-    /// emitted here so callers don't have to.
+    /// gRPC wrapper around [`ingest::claim_placeholder`]: adds the
+    /// PutPath-specific result counters (`put_path_total{result=exists}`,
+    /// `putpath_retries_total{reason=concurrent_upload}`) on top of the
+    /// shared write-ahead core. `ctx_label` is unused now that the core
+    /// emits its own log prefix; kept for call-site readability between
+    /// PutPath and PutPathBatch.
     pub(in crate::grpc) async fn claim_placeholder(
         &self,
         store_path_hash: &[u8],
         store_path: &str,
         refs: &[String],
-        ctx_label: &str,
+        _ctx_label: &str,
     ) -> Result<PlaceholderClaim, metadata::MetadataError> {
-        if metadata::check_manifest_complete(&self.pool, store_path_hash).await? {
-            metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
-            return Ok(PlaceholderClaim::AlreadyComplete);
-        }
-
-        // STRUCTURAL: insert_manifest_uploading takes references and
-        // writes them into the placeholder narinfo. Mark's CTE walks them
-        // from commit → the closure is GC-protected without holding a
-        // session lock for the full upload. The lock is transaction-scoped
-        // (pg_try_advisory_xact_lock_shared inside the tx, ~ms). On lock
-        // contention (mark running), returns MetadataError::Serialization
-        // → metadata_status maps to Status::aborted and the worker retries.
-        let mut inserted =
-            metadata::insert_manifest_uploading(&self.pool, store_path_hash, store_path, refs)
-                .await?;
-
-        if !inserted {
-            let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-            match crate::gc::orphan::reap_one(
-                &self.pool,
-                store_path_hash,
-                Some(threshold),
-                self.chunk_backend.as_ref(),
-            )
-            .await
-            {
-                Ok(true) => {
-                    warn!(%store_path, "{ctx_label}: stale 'uploading' placeholder — reclaimed");
-                    metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
-                    inserted = metadata::insert_manifest_uploading(
-                        &self.pool,
-                        store_path_hash,
-                        store_path,
-                        refs,
-                    )
-                    .await
-                    .unwrap_or(false);
-                }
-                Ok(false) => {} // not stale → live concurrent uploader
-                Err(e) => warn!(error = %e,
-                    "{ctx_label}: stale-reclaim failed (proceeding to concurrent-abort)"),
+        let claim = ingest::claim_placeholder(
+            &self.pool,
+            self.chunk_backend.as_ref(),
+            store_path_hash,
+            store_path,
+            refs,
+            PUTPATH_HOOKS,
+        )
+        .await?;
+        match &claim {
+            PlaceholderClaim::AlreadyComplete => {
+                metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
             }
+            PlaceholderClaim::Concurrent => {
+                metrics::counter!("rio_store_putpath_retries_total",
+                    "reason" => "concurrent_upload")
+                .increment(1);
+            }
+            PlaceholderClaim::Owned => {}
         }
-
-        if !inserted {
-            metrics::counter!("rio_store_putpath_retries_total",
-                "reason" => "concurrent_upload")
-            .increment(1);
-            return Ok(PlaceholderClaim::Concurrent);
-        }
-
-        Ok(PlaceholderClaim::Owned)
+        Ok(claim)
     }
 
-    /// Persist a validated, hash-verified NAR for ONE output. Branches
-    /// on `nar_data.len()` vs [`cas::INLINE_THRESHOLD`]: inline goes
-    /// to `manifests.inline_blob` in one tx; chunked goes through
-    /// [`cas::put_chunked`] (FastCDC + S3 + refcounts, own write-ahead
-    /// + rollback).
+    /// gRPC wrapper around [`ingest::persist_nar`]: maps
+    /// [`ingest::PersistError`] → `tonic::Status` with the
+    /// PutPath-specific code mapping (`storage_error` for the chunked
+    /// branch so `BackendAuthError` → `FailedPrecondition` and the
+    /// builder fails fast instead of retrying forever;
+    /// `putpath_metadata_status` for the inline branch so retriable PG
+    /// errors get retriable codes + the `putpath_retries_total`
+    /// counter).
     ///
-    /// Caller must have an [`PlaceholderClaim::Owned`] placeholder for
-    /// `info.store_path_hash`. On chunked-path failure the placeholder
-    /// is consumed by `put_chunked`'s internal rollback; on inline
-    /// failure the caller still owns it and must `abort_upload`.
-    /// Returns `true` iff the chunked branch was taken (so the caller
-    /// knows NOT to `abort_upload` on error — already cleaned up).
+    /// Returns `true` iff the chunked branch was taken (legacy — every
+    /// current caller `abort_upload`s on error regardless, which is a
+    /// safe no-op when chunked already rolled back).
     pub(in crate::grpc) async fn persist_nar(
         &self,
         info: &ValidatedPathInfo,
         nar_data: Vec<u8>,
         ctx_label: &str,
     ) -> Result<bool, Status> {
-        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
-            match cas::put_chunked(
-                &self.pool,
-                backend,
-                info,
-                &nar_data,
-                self.chunk_upload_max_concurrent,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    debug!(
-                        store_path = %info.store_path.as_str(),
-                        total_chunks = stats.total_chunks,
-                        deduped = stats.deduped_chunks,
-                        ratio = stats.dedup_ratio(),
-                        "{ctx_label}: chunked upload completed"
-                    );
-                    metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-                    Ok(true)
-                }
-                // storage_error (not status_internal): distinguishes
-                // BackendAuthError → FailedPrecondition so the builder
-                // fails fast instead of retrying forever. Error metric
-                // is the caller's responsibility (abort_upload /
-                // abort_batch) so it counts once regardless of branch.
-                Err(e) => Err(storage_error(ctx_label, e)),
-            }
-        } else {
-            metadata::complete_manifest_inline(&self.pool, info, Bytes::from(nar_data))
-                .await
-                .map_err(|e| putpath_metadata_status(ctx_label, e))?;
-            debug!(store_path = %info.store_path.as_str(), "{ctx_label}: inline upload completed");
-            Ok(false)
-        }
+        let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
+        ingest::persist_nar(
+            &self.pool,
+            self.chunk_backend.as_ref(),
+            info,
+            nar_data,
+            self.chunk_upload_max_concurrent,
+            PUTPATH_HOOKS,
+        )
+        .await
+        .map_err(|e| match e {
+            ingest::PersistError::Chunked(e) => storage_error(ctx_label, e),
+            ingest::PersistError::Inline(e) => putpath_metadata_status(ctx_label, e),
+        })?;
+        Ok(chunked)
     }
 
     /// Batch-phase staging: for outputs ≥ [`cas::INLINE_THRESHOLD`],
