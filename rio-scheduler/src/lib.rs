@@ -25,6 +25,7 @@ pub(crate) mod ca;
 pub(crate) mod critical_path;
 pub(crate) mod dag;
 pub mod db;
+pub(crate) mod domain;
 pub(crate) mod estimator;
 pub mod event_log;
 pub mod grpc;

@@ -1,6 +1,17 @@
 use super::*;
-use rio_proto::types::{DerivationEdge, DerivationNode};
-use rio_test_support::fixtures::{make_derivation_node as make_node, make_edge, test_drv_path};
+use crate::domain::{DerivationEdge, DerivationNode};
+use rio_test_support::fixtures::{make_derivation_node, test_drv_path};
+
+/// Proto fixture → domain. `rio_test_support::make_derivation_node`
+/// returns the proto type (shared with gateway/gRPC tests); the DAG
+/// operates on domain types. b03 will migrate the fixture itself.
+fn make_node(tag: &str, system: &str) -> DerivationNode {
+    make_derivation_node(tag, system).into()
+}
+
+fn make_edge(parent_tag: &str, child_tag: &str) -> DerivationEdge {
+    rio_test_support::fixtures::make_edge(parent_tag, child_tag).into()
+}
 
 /// Build a test node with an EXPLICIT `drv_path` (for deep-chain tests
 /// that generate their own valid 32-char-hash paths).

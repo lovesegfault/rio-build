@@ -264,8 +264,8 @@ impl DerivationDag {
     pub fn merge(
         &mut self,
         build_id: Uuid,
-        nodes: &[rio_proto::types::DerivationNode],
-        edges: &[rio_proto::types::DerivationEdge],
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
         submitter_traceparent: &str,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();

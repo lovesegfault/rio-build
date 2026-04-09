@@ -521,14 +521,15 @@ impl DagActor {
         // zero-means-no-signal semantics; unpacked immediately.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
     ) {
-        let status =
-            rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
-                tracing::warn!(
-                    raw_status = result.status,
-                    "unknown BuildResultStatus from worker, treating as Unspecified"
-                );
-                rio_proto::types::BuildResultStatus::Unspecified
-            });
+        // Arch#13: proto→domain at the actor boundary. Status
+        // normalization (raw i32 → enum, unknown → Unspecified) happens
+        // inside `domain::BuildResult::from`; everything downstream
+        // matches on the typed enum and reads `SystemTime` instead of
+        // `prost_types::Timestamp`. `ActorCommand::ProcessCompletion`
+        // stays proto-typed so `actor/tests/` keeps constructing it
+        // unchanged (b03 reconciles post-integration).
+        let result: crate::domain::BuildResult = result.into();
+        let status = result.status;
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
         // Boundary: construct the typed DrvHash ONCE here, then pass &DrvHash
@@ -708,7 +709,7 @@ impl DagActor {
             rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
                     drv_hash = %drv_hash,
-                    status = result.status,
+                    status = ?result.status,
                     "unknown build result status, treating as transient failure"
                 );
                 self.handle_transient_failure(drv_hash, executor_id).await;
@@ -730,7 +731,7 @@ impl DagActor {
     pub(super) async fn handle_success_completion(
         &mut self,
         drv_hash: &DrvHash,
-        result: &rio_proto::types::BuildResult,
+        result: &crate::domain::BuildResult,
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
@@ -832,9 +833,9 @@ impl DagActor {
         // Also emit the accuracy metric: how close was our estimate?
         if let Some(state) = self.dag.node(drv_hash)
             && state.sched.est_duration > 0.0
-            && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
+            && let Some(actual) = result.duration()
         {
-            let actual_secs = stop.seconds.saturating_sub(start.seconds) as f64;
+            let actual_secs = actual.as_secs_f64();
             if actual_secs > 0.0 {
                 metrics::histogram!("rio_scheduler_critical_path_accuracy")
                     .record(actual_secs / state.sched.est_duration);
@@ -864,7 +865,7 @@ impl DagActor {
     async fn complete_ca_bookkeeping(
         &mut self,
         drv_hash: &DrvHash,
-        built_outputs: &[rio_proto::types::BuiltOutput],
+        built_outputs: &[crate::domain::BuiltOutput],
     ) -> HashSet<Uuid> {
         self.ca_insert_realisations(drv_hash, built_outputs).await;
         let prior_seeds = self.ca_cutoff_compare(drv_hash, built_outputs).await;
@@ -880,7 +881,7 @@ impl DagActor {
     async fn ca_insert_realisations(
         &self,
         drv_hash: &DrvHash,
-        built_outputs: &[rio_proto::types::BuiltOutput],
+        built_outputs: &[crate::domain::BuiltOutput],
     ) {
         // Realisation insert: for a CA derivation, write
         // `(modular_hash, output_name) → (output_path, output_hash)`
@@ -958,7 +959,7 @@ impl DagActor {
     async fn ca_cutoff_compare(
         &mut self,
         drv_hash: &DrvHash,
-        built_outputs: &[rio_proto::types::BuiltOutput],
+        built_outputs: &[crate::domain::BuiltOutput],
     ) -> Vec<(Vec<u8>, String)> {
         // CA early-cutoff compare: if this was a CA derivation, check
         // each output_path against the realisations table for a PRIOR
@@ -1235,7 +1236,7 @@ impl DagActor {
     async fn ca_insert_realisation_deps(
         &mut self,
         drv_hash: &DrvHash,
-        built_outputs: &[rio_proto::types::BuiltOutput],
+        built_outputs: &[crate::domain::BuiltOutput],
     ) {
         // realisation_deps insert: the CA-on-CA resolve at dispatch
         // time recorded every `(dep_modular_hash, dep_output_name)`
@@ -1289,21 +1290,17 @@ impl DagActor {
     async fn record_build_history(
         &mut self,
         drv_hash: &DrvHash,
-        result: &rio_proto::types::BuildResult,
+        result: &crate::domain::BuildResult,
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
     ) {
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
-            && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
+            && let Some(actual) = result.duration()
         {
-            // Convert to seconds FIRST, then subtract. Subtracting
-            // nanos separately underflows when stop.nanos < start.nanos
-            // (e.g., start=10.900s, stop=11.100s → real diff 0.2s, but
-            // separate-subtract gives 1s+0ns = 1.0s). Computing each
-            // timestamp as a single f64 in seconds is correct.
-            let start_f = start.seconds as f64 + start.nanos as f64 / 1_000_000_000.0;
-            let stop_f = stop.seconds as f64 + stop.nanos as f64 / 1_000_000_000.0;
-            let duration_secs = stop_f - start_f;
+            // `domain::BuildResult::duration()` returns
+            // `stop.duration_since(start)` — `None` on out-of-order
+            // timestamps (matches the `> 0.0` gate below).
+            let duration_secs = actual.as_secs_f64();
             // Sanity bound: reject durations > 30 days (bogus worker timestamps)
             if duration_secs > 0.0 && duration_secs < 30.0 * 86400.0 {
                 // 0 → None: "no signal" must not drag the EMA toward

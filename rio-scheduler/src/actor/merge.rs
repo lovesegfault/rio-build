@@ -34,7 +34,7 @@ use super::{ActorError, DagActor, MergeDagRequest};
 pub(super) struct MergeIngest {
     pub build_id: Uuid,
     /// Post-topdown-prune node set (may be smaller than the request's).
-    pub nodes: Vec<rio_proto::types::DerivationNode>,
+    pub nodes: Vec<crate::domain::DerivationNode>,
     /// Only `edges.len()` survives past step 5 (for the total-time log);
     /// the edges themselves are consumed by `dag.merge` + persist.
     pub edges_len: usize,
@@ -178,6 +178,12 @@ impl DagActor {
             jti,
             jwt_token,
         } = req;
+        // Arch#13: proto→domain at the actor boundary. `MergeDagRequest`
+        // keeps proto-typed `nodes`/`edges` so `actor/tests/` and
+        // `rio-test-support` (b03 territory) can keep constructing it
+        // unchanged; everything downstream of this line is wire-agnostic.
+        let nodes = crate::domain::nodes_from_proto(nodes);
+        let edges = crate::domain::edges_from_proto(edges);
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
@@ -268,7 +274,7 @@ impl DagActor {
         self.builds.insert(build_id, build_info);
 
         // Index proto nodes by hash for efficient lookup during cache-check + transitions.
-        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
+        let node_index: HashMap<&str, &crate::domain::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         // I-099/I-094: existing nodes (inserted by an earlier build, not
@@ -366,8 +372,8 @@ impl DagActor {
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
-        nodes: &[rio_proto::types::DerivationNode],
-        edges: &[rio_proto::types::DerivationEdge],
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(build_id, nodes, edges, &merge_result.newly_inserted)
@@ -439,7 +445,7 @@ impl DagActor {
         let newly_inserted = &merge_result.newly_inserted;
         // Rebuild node_index here: it borrows from `nodes`, so it can't
         // live in MergeIngest (self-referential). Cheap: one iter pass.
-        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
+        let node_index: HashMap<&str, &crate::domain::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         let mut t_phase = Instant::now();
@@ -539,7 +545,7 @@ impl DagActor {
     async fn apply_cached_hits(
         &mut self,
         ingest: &MergeIngest,
-        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+        node_index: &HashMap<&str, &crate::domain::DerivationNode>,
     ) -> u32 {
         let MergeIngest {
             build_id,
@@ -849,7 +855,7 @@ impl DagActor {
     /// availability gate like `check_cached_outputs`.
     async fn verify_preexisting_completed(
         &mut self,
-        nodes: &[rio_proto::types::DerivationNode],
+        nodes: &[crate::domain::DerivationNode],
         newly_inserted: &HashSet<DrvHash>,
         cached_hits: &HashMap<DrvHash, Vec<String>>,
         jwt_token: Option<&str>,
@@ -1078,8 +1084,8 @@ impl DagActor {
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
-        nodes: &[rio_proto::types::DerivationNode],
-        edges: &[rio_proto::types::DerivationEdge],
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
@@ -1291,7 +1297,7 @@ impl DagActor {
     async fn check_cached_outputs(
         &mut self,
         probe_set: &HashSet<DrvHash>,
-        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+        node_index: &HashMap<&str, &crate::domain::DerivationNode>,
         jwt_token: Option<&str>,
     ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
         // Floating-CA lane: PG realisations lookup + store-existence verify.
@@ -1381,7 +1387,7 @@ impl DagActor {
     async fn check_ca_realisation_hits(
         &self,
         probe_set: &HashSet<DrvHash>,
-        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+        node_index: &HashMap<&str, &crate::domain::DerivationNode>,
     ) -> HashMap<DrvHash, Vec<String>> {
         let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
 
@@ -1399,8 +1405,7 @@ impl DagActor {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
-            let Ok(modular_hash): Result<[u8; 32], _> = n.ca_modular_hash.as_slice().try_into()
-            else {
+            let Some(modular_hash) = n.ca_modular_hash else {
                 continue; // IA or malformed — handled by path-based lane below
             };
             if n.expected_output_paths.iter().any(|p| !p.is_empty()) {
@@ -1629,10 +1634,10 @@ impl DagActor {
     /// authoritative gate is at step 4.
     async fn check_roots_topdown(
         &mut self,
-        nodes: &[rio_proto::types::DerivationNode],
-        edges: &[rio_proto::types::DerivationEdge],
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
         jwt_token: Option<&str>,
-    ) -> Option<Vec<rio_proto::types::DerivationNode>> {
+    ) -> Option<Vec<crate::domain::DerivationNode>> {
         let store_client = self.store_client.as_ref()?;
 
         // Skip if there's nothing to prune. Single-node and roots-only
@@ -1648,7 +1653,7 @@ impl DagActor {
         // A root is a node that appears as no edge's child. Edges key
         // by drv_path (proto-level), so collect child paths and filter.
         let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
-        let roots: Vec<&rio_proto::types::DerivationNode> = nodes
+        let roots: Vec<&crate::domain::DerivationNode> = nodes
             .iter()
             .filter(|n| !children.contains(n.drv_path.as_str()))
             .collect();
@@ -1664,7 +1669,7 @@ impl DagActor {
         // until build time). The realisations-table lookup in
         // check_cached_outputs handles them; we can't pre-check here.
         // Conservative: ANY CA root → fall through entirely.
-        if roots.iter().any(|n| n.ca_modular_hash.len() == 32) {
+        if roots.iter().any(|n| n.ca_modular_hash.is_some()) {
             return None;
         }
 

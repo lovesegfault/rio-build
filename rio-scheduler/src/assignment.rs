@@ -517,7 +517,8 @@ mod tests {
     }
 
     fn make_drv() -> DerivationState {
-        DerivationState::try_from_node(&make_derivation_node("test-drv", "x86_64-linux")).unwrap()
+        DerivationState::try_from_node(&make_derivation_node("test-drv", "x86_64-linux").into())
+            .unwrap()
     }
 
     fn workers_map(ws: Vec<ExecutorState>) -> HashMap<ExecutorId, ExecutorState> {
@@ -581,8 +582,8 @@ mod tests {
             w
         };
         let mk_fod = |system: &str| {
-            let mut d =
-                DerivationState::try_from_node(&make_derivation_node("fod", system)).unwrap();
+            let mut d = DerivationState::try_from_node(&make_derivation_node("fod", system).into())
+                .unwrap();
             d.is_fixed_output = true;
             d
         };

@@ -509,7 +509,7 @@ impl DerivationState {
     /// is belt-and-suspenders for when the actor is driven by something
     /// other than gRPC (tests, future admin APIs).
     pub fn try_from_node(
-        node: &rio_proto::types::DerivationNode,
+        node: &crate::domain::DerivationNode,
     ) -> Result<Self, rio_nix::store_path::StorePathError> {
         let drv_path = rio_nix::store_path::StorePath::parse(&node.drv_path)?;
         Ok(Self {
@@ -524,13 +524,13 @@ impl DerivationState {
                 // r[impl sched.ca.detect]
                 is_ca: node.is_content_addressed,
                 needs_resolve: node.needs_resolve,
-                // Gateway sends 32 bytes for CA nodes it could compute
-                // the modular hash for, empty otherwise (IA, or
-                // BasicDerivation fallback with no transitive closure).
-                // try_into rejects non-32-byte (including empty) →
-                // None. Belt-and-suspenders vs the gateway's own IA
-                // gate (populate_ca_modular_hashes skips non-CA).
-                modular_hash: node.ca_modular_hash.as_slice().try_into().ok(),
+                // Decoded once at the proto→domain boundary. Gateway
+                // sends 32 bytes for CA nodes it could compute the
+                // modular hash for; `domain::DerivationNode::from`
+                // maps non-32-byte (including empty) → None.
+                // Belt-and-suspenders vs the gateway's own IA gate
+                // (populate_ca_modular_hashes skips non-CA).
+                modular_hash: node.ca_modular_hash,
                 pending_realisation_deps: Vec::new(),
                 output_unchanged: false,
             },
@@ -872,8 +872,8 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 mod tests {
     use super::*;
 
-    fn dummy_node() -> rio_proto::types::DerivationNode {
-        rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux")
+    fn dummy_node() -> crate::domain::DerivationNode {
+        rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux").into()
     }
 
     // r[verify sched.ca.detect]

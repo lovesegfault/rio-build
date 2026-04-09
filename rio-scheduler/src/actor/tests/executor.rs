@@ -2347,6 +2347,12 @@ fn build_fanned_dag(n_ready: usize, paths_each: usize) -> crate::dag::Derivation
     // UUID (every parent gets interested_builds.len()==1 from this);
     // we'll bump per-parent counts below via node_mut.
     let all_nodes: Vec<_> = parent_nodes.into_iter().chain(child_nodes).collect();
+    // Arch#13 boundary shim: dag.merge takes domain types; the proto
+    // fixtures convert via `From`. Full test-side migration is b03's
+    // post-integration step — this is the only direct dag.merge call
+    // outside dag/tests.rs.
+    let all_nodes = crate::domain::nodes_from_proto(all_nodes);
+    let edges = crate::domain::edges_from_proto(edges);
     dag.merge(Uuid::new_v4(), &all_nodes, &edges, "").unwrap();
 
     // Set statuses: parents → Ready, children → Completed.
