@@ -256,8 +256,18 @@ impl StoreServiceImpl {
     /// Resolve the tenant's signer ONCE for a batch. All outputs share
     /// the same tenant (one JWT → one Claims.sub), so resolving inside
     /// the phase-3 tx-loop would do N identical `get_active_signer`
-    /// queries while holding manifest row locks. On lookup error, fall
-    /// back to the cluster key (matches `maybe_sign`'s behaviour).
+    /// queries while holding manifest row locks.
+    ///
+    /// On lookup error (any `SignerError::TenantKeyLookup` — including
+    /// transient PG `Connection`/`PoolTimedOut`), fall back to the
+    /// cluster key. This is intentional defense, matching
+    /// [`Self::maybe_sign`]: a transient PG hiccup shouldn't fail the
+    /// upload; the cluster sig is still cryptographically valid, just
+    /// not tenant-scoped. The trade-off: a tenant that ONLY trusts its
+    /// own key will see `nix store verify` fail for these paths. The
+    /// `rio_store_sign_tenant_key_fallback_total` counter makes the
+    /// degradation visible — alert if sustained nonzero.
+    ///
     /// `None` iff signing is disabled entirely.
     async fn resolve_batch_signer(
         &self,
@@ -272,6 +282,7 @@ impl StoreServiceImpl {
                     ?tenant_id,
                     "PutPathBatch: tenant-key lookup failed; batch will sign with cluster key"
                 );
+                metrics::counter!("rio_store_sign_tenant_key_fallback_total").increment(1);
                 Some((ts.cluster().clone(), false))
             }
         }

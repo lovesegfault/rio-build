@@ -201,12 +201,13 @@ impl StoreServiceImpl {
             Ok(pair) => pair,
             Err(e) => {
                 // Transient PG failure — don't fail the upload. Fall back
-                // to cluster key (sync, no DB hit). Log loud so ops
+                // to cluster key (sync, no DB hit). Log loud + metric so ops
                 // notices: a tenant WITH a configured key is now getting
                 // cluster-signed paths, which `nix store verify
                 // --trusted-public-keys tenant:<pk>` will reject. The
                 // upload succeeds; the tenant's verify chain breaks.
                 warn!(error = %e, ?tenant_id, "tenant-key lookup failed; falling back to cluster key");
+                metrics::counter!("rio_store_sign_tenant_key_fallback_total").increment(1);
                 (ts.cluster().clone(), false)
             }
         };
