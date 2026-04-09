@@ -93,7 +93,7 @@ impl ExecutorService for SchedulerGrpc {
         // For the Progress arm's proactive ema. None in bare-actor
         // tests (new_for_tests) — Progress becomes a no-op there,
         // which is what those tests want anyway.
-        let pool_for_recv = self.pool.clone();
+        let pool_for_recv = self.db.as_ref().map(|d| d.pool().clone());
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
             loop {

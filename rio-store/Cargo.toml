@@ -22,7 +22,7 @@ path = "src/main.rs"
 test-utils = ["dep:rio-test-support"]
 
 [dependencies]
-rio-common = { workspace = true }
+rio-common = { workspace = true, features = ["postgres", "aws"] }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so
@@ -52,9 +52,9 @@ sqlx = { workspace = true }
 # Per-tenant accounting (gc/tenant.rs) + cache_server auth extension.
 uuid = { workspace = true }
 
-# S3
+# S3. Client builder shared with rio-scheduler via rio-common's `aws`
+# feature; aws-sdk-s3 stays a direct dep for backend.rs op types.
 aws-sdk-s3 = { workspace = true }
-aws-config = { workspace = true }
 
 # Byte buffers
 bytes = { workspace = true }

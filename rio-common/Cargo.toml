@@ -8,7 +8,22 @@ repository.workspace = true
 publish = false
 description = "Shared configuration, observability, and error types for rio-build"
 
+[features]
+# Shared sqlx migration runner (migrate.rs). Only rio-store +
+# rio-scheduler enable this — gateway/builder/controller stay
+# sqlx-free.
+postgres = ["dep:sqlx"]
+# Shared aws-sdk-s3 client builder (s3.rs). Only rio-store +
+# rio-scheduler enable this.
+aws = ["dep:aws-config", "dep:aws-sdk-s3"]
+
 [dependencies]
+# Optional: shared migration wrapper (postgres feature).
+sqlx = { workspace = true, optional = true }
+# Optional: shared S3 client builder (aws feature).
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
 # Logging & metrics
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

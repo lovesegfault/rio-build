@@ -243,16 +243,16 @@ impl BenchHarness {
     pub async fn spawn() -> anyhow::Result<Self> {
         let inner = ActorHarness::spawn().await?;
         let actor = inner.actor.clone();
-        let pool = inner._db.pool.clone();
+        let db = SchedulerDb::new(inner._db.pool.clone());
 
-        // Production constructor: shared LogBuffers + pool + leader
+        // Production constructor: shared LogBuffers + db + leader
         // flag. is_leader hardwired true — there's no lease loop in
         // this harness, and the gRPC handlers reject with UNAVAILABLE
         // if false.
         let grpc = SchedulerGrpc::with_log_buffers(
             actor.clone(),
             Arc::new(LogBuffers::new()),
-            pool,
+            db,
             Arc::new(AtomicBool::new(true)),
         );
         let router = tonic::transport::Server::builder()

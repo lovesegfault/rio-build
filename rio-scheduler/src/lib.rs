@@ -49,8 +49,12 @@ pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 // filter and the manifest RPC agree on the baked-in default.
 pub use estimator::DEFAULT_HEADROOM_MULTIPLIER;
 
-/// Shared sqlx migrator for the `migrations/` directory. See
-/// rio-store's MIGRATOR for rationale — same pattern.
+/// Shared sqlx migrator for the `migrations/` directory. Test-only
+/// (`TestDb::new(&MIGRATOR)`) — production goes through
+/// `rio_common::migrate::run` in `main.rs`. Same migration set as
+/// rio-store; each crate embeds its own copy because `sqlx::migrate!`
+/// resolves the path relative to the crate's `CARGO_MANIFEST_DIR` at
+/// compile time.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// Histogram bucket boundaries for `rio_scheduler_critical_path_accuracy`.

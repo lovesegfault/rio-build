@@ -28,6 +28,7 @@ use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
 use crate::actor::{ActorCommand, ActorError, ActorHandle};
+use crate::db::SchedulerDb;
 use crate::logs::LogBuffers;
 
 /// Shared scheduler state passed to gRPC handlers.
@@ -45,11 +46,15 @@ pub struct SchedulerGrpc {
     /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
     /// and all handlers + the spawned recv tasks need the same buffers.
     pub(super) log_buffers: Arc<LogBuffers>,
-    /// PG pool for WatchBuild's event-log replay. `Option` so
-    /// `new_for_tests` can skip it (None → broadcast-only, no
-    /// replay). Production always sets it — main.rs already has
-    /// the pool for the DB handle.
-    pub(super) pool: Option<sqlx::PgPool>,
+    /// DB handle for tenant resolve / jti revocation / WatchBuild
+    /// event-log replay. `Option` so `new_for_tests` can skip it
+    /// (None → broadcast-only, no replay, no tenant resolve).
+    /// Production always sets it — main.rs constructs the same
+    /// `SchedulerDb` for the actor. Holds `SchedulerDb` (not bare
+    /// `PgPool`) so all SQL goes through the `db/` module; raw pool
+    /// is reachable via [`SchedulerDb::pool`] where the event-log
+    /// free fn needs it.
+    pub(super) db: Option<SchedulerDb>,
     /// Shared with the lease loop. When false (standby), all
     /// handlers return UNAVAILABLE immediately — clients with
     /// a health-aware balanced channel route to the leader
@@ -70,7 +75,7 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
-            pool: None,
+            db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -82,7 +87,7 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
-            pool: Some(pool),
+            db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -96,13 +101,13 @@ impl SchedulerGrpc {
     pub fn with_log_buffers(
         actor: ActorHandle,
         log_buffers: Arc<LogBuffers>,
-        pool: sqlx::PgPool,
+        db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor,
             log_buffers,
-            pool: Some(pool),
+            db: Some(db),
             is_leader,
         }
     }
@@ -161,19 +166,17 @@ impl SchedulerGrpc {
 /// Shared by `SubmitBuild` / `ResolveTenant` (here) and `ListBuilds`
 /// (admin/mod.rs).
 ///
-/// The gateway sends the tenant NAME (from the `authorized_keys` entry's
-/// comment field); the scheduler resolves it here. [`NormalizedName`]
-/// guarantees non-empty/trimmed at the type level — the caller handles
-/// the empty-string → single-tenant-mode branch *before* calling (see
-/// [`NormalizedName::from_maybe_empty`]). Unknown name →
-/// `Status::invalid_argument`. PG error → `Status::internal`.
+/// [`NormalizedName`] guarantees non-empty/trimmed at the type level —
+/// the caller handles the empty-string → single-tenant-mode branch
+/// *before* calling (see [`NormalizedName::from_maybe_empty`]). Unknown
+/// name → `Status::invalid_argument`. PG error → `Status::internal`.
+/// SQL lives in [`SchedulerDb::lookup_tenant_id`] — the gRPC layer
+/// holds no inline queries.
 pub(crate) async fn resolve_tenant_name(
-    pool: &sqlx::PgPool,
+    db: &SchedulerDb,
     name: &NormalizedName,
 ) -> Result<Uuid, Status> {
-    sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
-        .bind(name.as_str())
-        .fetch_optional(pool)
+    db.lookup_tenant_id(name.as_str())
         .await
         .status_internal("tenant lookup failed")?
         .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))

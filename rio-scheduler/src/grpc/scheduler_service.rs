@@ -163,10 +163,10 @@ impl SchedulerService for SchedulerGrpc {
         let tenant_id = match NormalizedName::from_maybe_empty(&req.tenant_name) {
             None => None,
             Some(name) => {
-                let pool = self.pool.as_ref().ok_or_else(|| {
+                let db = self.db.as_ref().ok_or_else(|| {
                     Status::failed_precondition("tenant lookup requires database connection")
                 })?;
-                Some(resolve_tenant_name(pool, &name).await?)
+                Some(resolve_tenant_name(db, &name).await?)
             }
         };
 
@@ -194,25 +194,19 @@ impl SchedulerService for SchedulerGrpc {
         // time we get here: the interceptor either attached them or
         // returned UNAUTHENTICATED upstream, never a third state.
         if let Some(claims) = &jwt_claims {
-            // Same pool-presence gate as tenant resolve. If pool is
+            // Same db-presence gate as tenant resolve. If db is
             // None AND Claims are Some, something is misconfigured
             // (JWT mode requires PG for revocation); fail loud.
-            let pool = self.pool.as_ref().ok_or_else(|| {
+            let db = self.db.as_ref().ok_or_else(|| {
                 Status::failed_precondition(
                     "jti revocation check requires database connection \
                      (JWT mode enabled but scheduler pool is None)",
                 )
             })?;
-            // EXISTS — short-circuits at first match, no row data
-            // transferred. PK index on jti makes this O(log n). The
-            // table is small (revocations are rare events) so this
-            // is ~1 index page hit.
-            let revoked: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jwt_revoked WHERE jti = $1)")
-                    .bind(&claims.jti)
-                    .fetch_one(pool)
-                    .await
-                    .status_internal("jti revocation lookup failed")?;
+            let revoked = db
+                .is_jwt_revoked(&claims.jti)
+                .await
+                .status_internal("jti revocation lookup failed")?;
             if revoked {
                 return Err(Status::unauthenticated("token revoked"));
             }
@@ -324,9 +318,9 @@ impl SchedulerService for SchedulerGrpc {
         // everything, empty range, skip the PG round-trip.
         // `since_sequence == 0 && last_seq == 0` → build just
         // started, nothing emitted yet — common case, cheap exit.
-        let replay = match &self.pool {
-            Some(pool) if req.since_sequence < last_seq => Some(EventReplay {
-                pool: pool.clone(),
+        let replay = match &self.db {
+            Some(db) if req.since_sequence < last_seq => Some(EventReplay {
+                pool: db.pool().clone(),
                 build_id,
                 since: req.since_sequence,
                 last_seq,
@@ -434,11 +428,11 @@ impl SchedulerService for SchedulerGrpc {
             ))
         })?;
 
-        let pool = self.pool.as_ref().ok_or_else(|| {
+        let db = self.db.as_ref().ok_or_else(|| {
             Status::failed_precondition("tenant resolution requires database connection")
         })?;
 
-        let tenant_id = resolve_tenant_name(pool, &name).await?;
+        let tenant_id = resolve_tenant_name(db, &name).await?;
 
         Ok(Response::new(rio_proto::scheduler::ResolveTenantResponse {
             tenant_id: tenant_id.to_string(),

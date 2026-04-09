@@ -479,7 +479,7 @@ async fn main() -> anyhow::Result<()> {
     // `#[serde(default)]` if absent — same behavior unless the
     // operator writes a `[poison]` / `[retry]` table).
     let actor = ActorHandle::spawn(
-        db,
+        db.clone(),
         rio_scheduler::actor::DagActorConfig {
             size_classes: cfg.size_classes,
             fetcher_size_classes: cfg.fetcher_size_classes,
@@ -584,7 +584,7 @@ async fn main() -> anyhow::Result<()> {
     let grpc_service = SchedulerGrpc::with_log_buffers(
         actor.clone(),
         Arc::clone(&log_buffers),
-        pool.clone(),
+        db,
         Arc::clone(&is_leader_for_grpc),
     );
 
@@ -815,7 +815,16 @@ async fn init_db_pool(
     };
     info!("connected to PostgreSQL");
 
-    sqlx::migrate!("../migrations").run(&pool).await?;
+    // r[impl store.db.migrate-try-lock] — same try-then-wait advisory
+    // lock as rio-store. Both services run the SAME migration set
+    // against the SAME database; sqlx's default blocking
+    // `pg_advisory_lock` deadlocks against migrations 011/022's CREATE
+    // INDEX CONCURRENTLY when ≥2 replicas (of either service) start
+    // together (I-194). Raw `Migrator::run` here would also lock on a
+    // DIFFERENT key (sqlx hashes the DB name) than rio-store's
+    // `MIGRATE_LOCK_ID`, so a scheduler and a store starting together
+    // would not mutually exclude. See rio_common::migrate::run.
+    rio_common::migrate::run(&pool, sqlx::migrate!("../migrations")).await?;
     info!("database migrations applied");
 
     let db = SchedulerDb::new(pool.clone());
@@ -896,10 +905,12 @@ async fn init_log_pipeline(
         );
         return (None, None);
     };
-    let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .load()
-        .await;
-    let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+    // Same client builder as rio-store's chunk backend (raised retry
+    // attempts, stalled-stream protection OFF — gzipped log batches
+    // are small pre-buffered bodies, exactly the case that trips the
+    // sdk's stall monitor on S3-compatible servers). One config home
+    // for both services. See rio_common::s3::default_client.
+    let s3 = rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
     let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
     let flusher = rio_scheduler::logs::LogFlusher::new(
         s3.clone(),

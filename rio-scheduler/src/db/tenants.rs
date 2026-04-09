@@ -1,8 +1,32 @@
-//! Tenant CRUD queries — `tenants` table.
+//! Tenant CRUD + auth queries — `tenants` and `jwt_revoked` tables.
+
+use uuid::Uuid;
 
 use super::{SchedulerDb, TenantRow};
 
 impl SchedulerDb {
+    /// Resolve a tenant name to its UUID. `None` if no such tenant.
+    /// Used by SubmitBuild / ResolveTenant / ListBuilds — the gateway
+    /// sends the tenant NAME (from the `authorized_keys` comment
+    /// field); the scheduler resolves it here.
+    pub(crate) async fn lookup_tenant_id(&self, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Check if a JWT `jti` is in the revocation table. EXISTS —
+    /// short-circuits at first match, no row data transferred. PK
+    /// index on `jti` makes this O(log n); the table is small
+    /// (revocations are rare events) so this is ~1 index page hit.
+    pub(crate) async fn is_jwt_revoked(&self, jti: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jwt_revoked WHERE jti = $1)")
+            .bind(jti)
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// List all tenants (for AdminService.ListTenants).
     pub(crate) async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
         sqlx::query_as(

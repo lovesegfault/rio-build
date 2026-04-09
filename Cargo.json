@@ -20528,6 +20528,14 @@
           "packageId": "anyhow"
         },
         {
+          "name": "aws-config",
+          "packageId": "aws-config"
+        },
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
+        },
+        {
           "name": "axum",
           "packageId": "axum"
         },
@@ -20590,6 +20598,10 @@
         {
           "name": "sha2",
           "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
         },
         {
           "name": "thiserror",
@@ -20665,6 +20677,10 @@
           "name": "tower",
           "packageId": "tower"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "aws",
+        "postgres"
       ],
       "libCrateTypes": [
         "lib"
@@ -21215,10 +21231,6 @@
           "packageId": "anyhow"
         },
         {
-          "name": "aws-config",
-          "packageId": "aws-config"
-        },
-        {
           "name": "aws-sdk-s3",
           "packageId": "aws-sdk-s3"
         },
@@ -21428,10 +21440,6 @@
         {
           "name": "async-trait",
           "packageId": "async-trait"
-        },
-        {
-          "name": "aws-config",
-          "packageId": "aws-config"
         },
         {
           "name": "aws-sdk-s3",

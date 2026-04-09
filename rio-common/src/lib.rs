@@ -11,7 +11,11 @@ pub mod hmac;
 pub mod jwt;
 pub mod jwt_interceptor;
 pub mod limits;
+#[cfg(feature = "postgres")]
+pub mod migrate;
 pub mod observability;
+#[cfg(feature = "aws")]
+pub mod s3;
 pub mod server;
 pub mod signal;
 pub mod task;

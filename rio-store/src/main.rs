@@ -518,8 +518,9 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
     // r[impl store.db.migrate-try-lock] — try-then-wait advisory
     // lock; sqlx's default blocking `pg_advisory_lock` deadlocks
     // against migrations 011/022's CREATE INDEX CONCURRENTLY when
-    // ≥2 replicas start together (I-194). See migrations::run.
-    rio_store::migrations::run(&pool, sqlx::migrate!("../migrations"))
+    // ≥2 replicas start together (I-194). Shared with rio-scheduler
+    // (same DB, same migrations) — see rio_common::migrate::run.
+    rio_common::migrate::run(&pool, sqlx::migrate!("../migrations"))
         .await
         .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
     info!("database migrations applied");
@@ -571,37 +572,13 @@ async fn init_chunk_backend(
             // chunk op than to race IMDS).
             //
             // r[impl store.cas.s3-retry]
-            // Two departures from aws-sdk defaults:
-            //
-            // 1. `max_attempts` raised from 3 → `s3_max_attempts`
-            //    (default 10). S3-compatible backends (rustfs, MinIO)
-            //    recycle idle connections more aggressively than AWS
-            //    S3; a pooled connection that was closed server-side
-            //    surfaces as `DispatchFailure` on the next request.
-            //    The sdk's standard retry DOES classify this as
-            //    transient and retries, but at 3 attempts a burst of
-            //    connection churn (e.g. rustfs restart, or its idle
-            //    timeout firing mid-ingest) can exhaust retries
-            //    before the pool reconnects. Observed on kind: 134
-            //    dispatch failures at only 8 concurrent puts.
-            //
-            // 2. Stalled-stream protection OFF. The sdk's default
-            //    grace period can trip on small chunks (≤256 KiB)
-            //    against local S3-compatible servers where the
-            //    upload completes faster than the throughput monitor
-            //    can establish a baseline. A false-positive stall
-            //    aborts the request → `DispatchFailure`. We have no
-            //    untrusted-server streaming here (all chunks are
-            //    tiny, pre-buffered), so the protection is pure
-            //    downside.
-            use aws_config::retry::RetryConfig;
-            use aws_config::stalled_stream_protection::StalledStreamProtectionConfig;
-            let aws_cfg = aws_config::from_env()
-                .retry_config(RetryConfig::standard().with_max_attempts(s3_max_attempts))
-                .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
-                .load()
-                .await;
-            let client = aws_sdk_s3::Client::new(&aws_cfg);
+            // Two departures from aws-sdk defaults (raised
+            // max_attempts, stalled-stream protection OFF) — see
+            // rio_common::s3::default_client for the full rationale.
+            // Shared with rio-scheduler's log flusher so the two
+            // services don't drift on credential/endpoint/retry
+            // resolution.
+            let client = rio_common::s3::default_client(s3_max_attempts).await;
             let backend: Arc<dyn ChunkBackend> =
                 Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
             Some(Arc::new(ChunkCache::with_capacity(

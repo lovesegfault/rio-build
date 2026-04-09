@@ -246,11 +246,11 @@ impl AdminService for AdminServiceImpl {
         // Empty filter → no tenant filter (list all). Non-empty →
         // resolve to UUID. Unknown name → InvalidArgument (the CLI
         // tool surfaces it verbatim).
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
         let tenant_filter = match NormalizedName::from_maybe_empty(&req.tenant_filter) {
             None => None,
-            Some(name) => Some(crate::grpc::resolve_tenant_name(&self.pool, &name).await?),
+            Some(name) => Some(crate::grpc::resolve_tenant_name(&db, &name).await?),
         };
-        let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = builds::list_builds(
             &db,
             &req.status_filter,
