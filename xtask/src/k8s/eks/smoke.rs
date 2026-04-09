@@ -320,13 +320,13 @@ async fn step_nlb_health(client: &kube::Client, region: &str) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            let healthy: Vec<&str> = seen
-                .iter()
-                .filter(|(_, st)| st == "healthy")
-                .map(|(ip, _)| ip.as_str())
-                .collect();
-            let all = want.iter().all(|ip| healthy.contains(&ip.as_str()));
-            Ok(all.then_some(()))
+            // target-type: instance → target IDs are instance IDs, not
+            // pod IPs. Compare counts rather than IDs so this works for
+            // both ip and instance modes. With externalTrafficPolicy:
+            // Local + instance, only nodes hosting a gateway pod pass
+            // the health check, so healthy count == replica count.
+            let healthy = seen.iter().filter(|(_, st)| st == "healthy").count();
+            Ok((healthy >= want.len()).then_some(()))
         }
     })
     .await
