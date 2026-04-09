@@ -968,14 +968,14 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
 }
 
 // r[verify sched.fod.size-class-reactive]
-/// I-173: a FOD assigned to a tiny NON-ephemeral fetcher that
-/// disconnects while status==Assigned MUST get its `size_class_floor`
-/// promoted. DerivationStatus stays Assigned for the build's whole
-/// lifetime (Running is set only at completion via ensure_running()),
-/// so the production disconnect path is always Assigned-status.
-/// Non-ephemeral disconnect = unexpected death (plausibly OOM) →
-/// promote. Live: 14 OOMs, retry_count=0, size_class_floor=NULL
-/// before this promotion was wired.
+/// I-173: a FOD assigned to a tiny fetcher that disconnects while
+/// status==Assigned with NO CompletionReport sent MUST get its
+/// `size_class_floor` promoted. DerivationStatus stays Assigned for
+/// the build's whole lifetime (Running is set only at completion via
+/// ensure_running()), so the production disconnect path is always
+/// Assigned-status. Disconnect-without-completion = unexpected death
+/// (plausibly OOM) → promote. Live: 14 OOMs, retry_count=0,
+/// size_class_floor=NULL before this promotion was wired.
 ///
 /// Also asserts I-097's invariant still holds (no failed_builders
 /// entry, status=Ready) — promotion is decoupled from poison-record.
@@ -1023,7 +1023,7 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
-        "I-173: non-ephemeral Assigned-disconnect must promote FOD floor tiny→small"
+        "I-173: Assigned-disconnect-without-completion must promote FOD floor tiny→small"
     );
     // I-097 still holds: no failure recorded.
     assert!(
@@ -1037,11 +1037,12 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
 }
 
 // r[verify sched.builder.size-class-reactive]
-/// I-177: a non-FOD assigned to a tiny NON-ephemeral builder that
-/// disconnects while status==Assigned MUST get its `size_class_floor`
-/// promoted, same as the FOD path (I-173). 103 tiny builders
-/// OOMKilled on bootstrap-stage0-glibc / llvm-src; without promotion
-/// floor stayed NULL, retry routed back to tiny → poison.
+/// I-177: a non-FOD assigned to a tiny builder that disconnects while
+/// status==Assigned with NO CompletionReport sent MUST get its
+/// `size_class_floor` promoted, same as the FOD path (I-173). 103
+/// tiny builders OOMKilled on bootstrap-stage0-glibc / llvm-src;
+/// without promotion floor stayed NULL, retry routed back to tiny →
+/// poison.
 ///
 /// Mirrors `test_assigned_disconnect_promotes_fod_floor` with a
 /// builder-kind executor + builder size_classes config.
@@ -1104,7 +1105,7 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
-        "I-177: non-ephemeral Assigned-disconnect must promote builder floor tiny→small"
+        "I-177: Assigned-disconnect-without-completion must promote builder floor tiny→small"
     );
     // I-097 still holds: no failure recorded for Assigned-only disconnect.
     assert!(
@@ -1118,18 +1119,16 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
 }
 
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
-/// I-197 (refines I-188 fix 1): a non-FOD assigned to a tiny EPHEMERAL
-/// builder that disconnects WITHOUT having sent a CompletionReport
-/// MUST get its `size_class_floor` promoted. The pod was OOMKilled
-/// mid-build — that IS a size-adequacy signal. I-188's blanket
-/// "ephemeral disconnect → never promote" made openssl OOM-loop on
-/// `tiny` for hours with `size_class_floor` empty.
+/// I-197 (refines I-188 fix 1): a non-FOD assigned to a tiny builder
+/// that disconnects WITHOUT having sent a CompletionReport MUST get
+/// its `size_class_floor` promoted. The pod was OOMKilled mid-build —
+/// that IS a size-adequacy signal. I-188's blanket "one-shot
+/// disconnect → never promote" made openssl OOM-loop on `tiny` for
+/// hours with `size_class_floor` empty.
 ///
-/// Converse (ephemeral disconnect AFTER completion → does NOT promote,
-/// the original I-188 race) at
+/// Converse (disconnect AFTER completion → does NOT promote, the
+/// original I-188 race) at
 /// `test_ephemeral_disconnect_after_completion_no_promote`.
-/// Non-ephemeral disconnect → promote at
-/// `test_assigned_disconnect_promotes_builder_floor`.
 ///
 /// Tests the reassign-side gate in isolation: disconnect is direct
 /// (ExecutorDisconnected), not via ProcessCompletion, so the
@@ -1156,15 +1155,7 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
         ];
     });
 
-    // Ephemeral builder, classed "tiny". connect_builder_classed +
-    // an extra heartbeat with ephemeral=true to set the flag (the
-    // existing helper is non-ephemeral).
     let mut rx = connect_builder_classed(&handle, "b-eph", "x86_64-linux", "tiny").await?;
-    send_heartbeat_with(&handle, "b-eph", "x86_64-linux", |hb| {
-        hb.size_class = Some("tiny".into());
-    })
-    .await?;
-    barrier(&handle).await;
 
     let node = make_test_node("eph-glibc-188", "x86_64-linux");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -1205,11 +1196,11 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
 }
 
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
-/// I-188 race case (the suppress that I-197 KEEPS): an EPHEMERAL
-/// builder that disconnects with `running_build == Some(X)` AFTER
-/// having sent CompletionReport(X) MUST NOT promote `size_class_
-/// floor`. `last_completed == running_build` → expected one-shot
-/// exit, not a size-adequacy signal.
+/// I-188 race case (the suppress that I-197 KEEPS): a builder that
+/// disconnects with `running_build == Some(X)` AFTER having sent
+/// CompletionReport(X) MUST NOT promote `size_class_floor`.
+/// `last_completed == running_build` → expected one-shot exit, not a
+/// size-adequacy signal.
 ///
 /// Setup synthesizes the race directly: complete X (sets
 /// `last_completed=X`, clears `running_build`, sets `draining`),
@@ -1539,7 +1530,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
 ///
 /// Counterpart to test_force_drain_idle_worker_no_cancel_signals — that
 /// one proves the CancelSignal loop does 0 iterations on idle; this one
-/// proves it does N iterations on busy. Covers worker.rs:211-258 (the
+/// proves it does N iterations on busy. Covers `state/executor.rs`-258 (the
 /// `if force { ... }` body with a non-empty to_reassign).
 #[tokio::test]
 async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
@@ -1563,7 +1554,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     let result = reply_rx.await?;
 
     assert!(result.accepted, "known worker → accepted");
-    // force=true → running_build: 0 (worker.rs:277 "reassigned:
+    // force=true → running_build: 0 (`state/executor.rs` "reassigned:
     // caller doesn't wait"). The count is only nonzero for
     // force=false (caller polls until it drains naturally).
     assert!(
@@ -1572,7 +1563,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     );
 
     // CancelSignal should arrive in the worker's stream with the
-    // force-drain reason (worker.rs:244). try_send on the stream_tx
+    // force-drain reason (`state/executor.rs`). try_send on the stream_tx
     // is synchronous; barrier ensures the actor finished processing.
     barrier(&handle).await;
     let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -1644,7 +1635,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
         setup_with_worker("metric-drain-worker", "x86_64-linux").await?;
 
     // Assign one build so to_reassign is non-empty (the increment at
-    // worker.rs:255 is gated on `if !to_reassign.is_empty()`).
+    // `state/executor.rs` is gated on `if !to_reassign.is_empty()`).
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(
         &handle,
@@ -1668,7 +1659,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
         })
         .await?;
     // handle_drain_executor increments the counter synchronously at
-    // worker.rs:255 before reassign_derivations().await, and the actor
+    // `state/executor.rs` before reassign_derivations().await, and the actor
     // sends the reply after handle_drain_executor returns (mod.rs:472) —
     // so this await is a true barrier for the increment.
     let result = reply_rx.await?;
@@ -1815,7 +1806,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
 
     // ── Boundary: 59s elapsed — NOT timed out ────────────────────────
     // 59 < 60 → elapsed.as_secs() > build_timeout is false. The check
-    // uses strict > (worker.rs), so 60s elapsed would also NOT fire
+    // uses strict `>`, so 60s elapsed would also NOT fire
     // (elapsed().as_secs() truncates to 60, and 60 > 60 is false).
     // 59 gives a comfortable margin below; 61 is unambiguously past.
     let ok = handle.debug_backdate_submitted(build_id, 59).await?;
@@ -2192,7 +2183,7 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
 // r[verify sched.assign.warm-gate]
 /// Connect-then-empty-queue: a worker registering with an EMPTY
 /// ready queue flips `warm=true` immediately (the short-circuit at
-/// worker.rs:126-136 — "nothing queued → nothing to prefetch → gate
+/// `state/executor.rs`-136 — "nothing queued → nothing to prefetch → gate
 /// open now"). Proves: merge AFTER connect → Assignment arrives
 /// WITHOUT a PrefetchComplete ACK round-trip.
 #[tokio::test]
@@ -2241,7 +2232,7 @@ async fn on_worker_registered_empty_queue_flips_warm_immediately() -> TestResult
 // r[verify sched.assign.warm-gate]
 /// Hint-send-fails: if the initial hint's `try_send` fails (channel
 /// full or closed), `on_worker_registered` flips `warm=true` anyway
-/// (defensive path at worker.rs:158-163 — "gate is optimization, not
+/// (defensive path at `state/executor.rs`-163 — "gate is optimization, not
 /// correctness"). The scheduler doesn't wedge.
 ///
 /// Inducing the fail: use a 1-slot channel pre-filled with a dummy

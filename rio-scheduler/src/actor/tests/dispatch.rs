@@ -690,24 +690,9 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 // CA recovery-resolve: fetch ATerm from store when drv_content empty
 // -----------------------------------------------------------------------------
 
-/// Receive the next WorkAssignment, skipping over PrefetchHint messages.
-/// Parent dispatch sends a hint before the assignment when the parent
-/// has DAG children with `expected_output_paths` set.
-async fn recv_assignment_skip_prefetch(
-    rx: &mut mpsc::Receiver<rio_proto::types::SchedulerMessage>,
-) -> rio_proto::types::WorkAssignment {
-    loop {
-        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("recv_assignment_skip_prefetch: timeout")
-            .expect("recv_assignment_skip_prefetch: channel closed");
-        match msg.msg {
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return a,
-            Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
-            other => panic!("recv_assignment_skip_prefetch: unexpected {other:?}"),
-        }
-    }
-}
+// `recv_assignment` (helpers.rs) already skips Prefetch — alias kept so
+// the CA-on-CA test bodies below stay readable at the old name.
+use super::recv_assignment as recv_assignment_skip_prefetch;
 
 /// Build a CA-on-CA fixture: (child_node, parent_node, parent_aterm,
 /// placeholder, child_modular_hash, realized_path).

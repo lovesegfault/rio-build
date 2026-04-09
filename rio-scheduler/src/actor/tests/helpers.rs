@@ -11,6 +11,13 @@ pub(crate) use rio_test_support::fixtures::{
     make_derivation_node as make_test_node, make_edge as make_test_edge, test_drv_path,
     test_store_path,
 };
+
+/// [`make_test_node`] with `system = "x86_64-linux"` (the default for
+/// the overwhelming majority of scheduler tests). Use the two-arg form
+/// directly only when the test exercises arch-aware routing.
+pub(crate) fn make_node(tag: &str) -> rio_proto::types::DerivationNode {
+    make_test_node(tag, "x86_64-linux")
+}
 pub(super) use rio_test_support::{TestDb, TestResult};
 pub(super) use std::time::Duration;
 
@@ -326,6 +333,22 @@ pub(crate) async fn connect_executor_no_ack_kind(
     system: &str,
     kind: rio_proto::types::ExecutorKind,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    connect_executor_with(handle, executor_id, system, false, |hb| hb.kind = kind).await
+}
+
+/// Single body backing every `connect_executor*` variant: stream
+/// connect, first heartbeat (with caller-mutated [`HeartbeatFields`]),
+/// and optional warm-gate `PrefetchComplete` ACK. The named wrappers
+/// below pass the 1-2 fields they care about; when
+/// `ActorCommand::ExecutorConnected` / `Heartbeat` grow a field, this
+/// is the only edit.
+async fn connect_executor_with(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    ack: bool,
+    f: impl FnOnce(&mut HeartbeatFields),
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
@@ -333,7 +356,15 @@ pub(crate) async fn connect_executor_no_ack_kind(
             stream_tx,
         })
         .await?;
-    send_heartbeat_with(handle, executor_id, system, |hb| hb.kind = kind).await?;
+    send_heartbeat_with(handle, executor_id, system, f).await?;
+    if ack {
+        handle
+            .send_unchecked(ActorCommand::PrefetchComplete {
+                executor_id: executor_id.into(),
+                paths_fetched: 0,
+            })
+            .await?;
+    }
     Ok(stream_rx)
 }
 
@@ -349,25 +380,11 @@ pub(crate) async fn connect_executor_classed(
     size_class: &str,
     kind: rio_proto::types::ExecutorKind,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx,
-        })
-        .await?;
-    send_heartbeat_with(handle, executor_id, system, |hb| {
+    connect_executor_with(handle, executor_id, system, true, |hb| {
         hb.kind = kind;
         hb.size_class = Some(size_class.into());
     })
-    .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(stream_rx)
+    .await
 }
 
 /// [`connect_executor_classed`] with `kind = Fetcher`.
@@ -468,7 +485,6 @@ pub(crate) async fn connect_executor(
     executor_id: &str,
     system: &str,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let stream_rx = connect_executor_no_ack(handle, executor_id, system).await?;
     // Warm-gate: unconditionally ACK so the worker flips warm=true
     // regardless of whether on_worker_registered sent an initial
     // PrefetchHint (it only does so when the ready queue is non-
@@ -482,13 +498,7 @@ pub(crate) async fn connect_executor(
     // PrefetchHint on stream_rx before any Assignment. Such tests
     // must drain the hint themselves (recv + match Prefetch) or
     // use a recv loop that skips Prefetch variants.
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(stream_rx)
+    connect_executor_with(handle, executor_id, system, true, |_| {}).await
 }
 
 /// Merge a single-node DAG and return the event receiver.

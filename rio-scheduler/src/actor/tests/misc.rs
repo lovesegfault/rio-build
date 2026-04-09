@@ -59,13 +59,13 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
 /// reducers pick nondeterministically.
 ///
 /// Mechanism mirrors test_force_drain_increments_cancel_signals_total
-/// (tests/worker.rs:444): `set_default_local_recorder` installs a
+/// (tests/`state/executor.rs`): `set_default_local_recorder` installs a
 /// thread-local recorder; `#[tokio::test]`'s current-thread runtime
 /// means the actor task sees it at `.await` points. The recorder's
 /// `register_gauge` tracks names touched — absence of all four gauge
 /// names after Tick proves the gate held.
 ///
-/// No connect_executor: the inc/dec at worker.rs:52/76/384 would touch
+/// No connect_executor: the inc/dec at `state/executor.rs`/76/384 would touch
 /// `workers_active` outside the gated block. MergeDag is safe —
 /// dispatch_ready (the only gauge path reachable from merge) early-
 /// returns at dispatch.rs:18 on a standby before touching
