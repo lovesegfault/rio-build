@@ -261,6 +261,17 @@ spec:
         - ports:
             - {port: "53", protocol: UDP}
             - {port: "53", protocol: TCP}
+    # S3 chunk uploads + STS + upstream-cache narinfo checks. Upstream
+    # caches can be configured at runtime via AdminService (DB-persisted)
+    # so the conditional store-egress-upstream CNP isn't sufficient —
+    # store needs unconditional :443 egress to world. S3 alone needs it
+    # regardless. FindMissingPaths blocks on the upstream check, so a
+    # drop here surfaces as a gateway-side gRPC timeout.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - {port: "443", protocol: TCP}
     # In-cluster postgres (bitnami chart, VM tests / dev). Subchart
     # deploys into the helm release namespace (system), not store.
     - toEndpoints:
