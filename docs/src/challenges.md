@@ -126,7 +126,7 @@ The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. FUSE conte
 
 **Phase 1a spike results (EKS AL2023, kernel 6.12, c8a.xlarge):**
 
-Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but production `rio-fuse` must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. See [archived benchmark data](./phases-archive/phase1a.md).
+Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but the production FUSE daemon must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. Full benchmark tables are preserved in git history (`docs/src/phases-archive/phase1a.md`, removed post-roadmap-retirement).
 
 ## 14. Size-Class Cold Start and Misclassification
 

@@ -61,19 +61,3 @@
 
 - [GC Enablement Checklist](./runbooks/gc-enablement.md)
 - [EKS Smoke Test](./runbooks/eks-smoke.md)
-
-# Archive
-
-- [Phase history (archived)](./phases-archive.md)
-  - [Phase 1a](./phases-archive/phase1a.md)
-  - [Phase 1b](./phases-archive/phase1b.md)
-  - [Phase 2a](./phases-archive/phase2a.md)
-  - [Phase 2b](./phases-archive/phase2b.md)
-  - [Phase 2c](./phases-archive/phase2c.md)
-  - [Phase 3a](./phases-archive/phase3a.md)
-  - [Phase 3b](./phases-archive/phase3b.md)
-  - [Phase 4](./phases-archive/phase4.md)
-  - [Phase 4a](./phases-archive/phase4a.md)
-  - [Phase 4b](./phases-archive/phase4b.md)
-  - [Phase 4c](./phases-archive/phase4c.md)
-  - [Phase 5](./phases-archive/phase5.md)

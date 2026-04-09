@@ -5,7 +5,7 @@ Accepted (Spike — 2026-03-19, P0247)
 
 ## Context
 
-[ADR-004](./004-ca-ready-design.md) committed to CA-ready schema from Phase 2c. [`opcodes_read.rs`](../../../rio-gateway/src/handler/opcodes_read.rs) discards `dependentRealisations` from `wopRegisterDrvOutput` and hardcodes `{}` for `wopQueryRealisation`. [phase5.md:19](../phases-archive/phase5.md) claimed "resolution will require persisting it." [`r[sched.ca.resolve]`](../components/scheduler.md) claims the junction table is "populated by `wopRegisterDrvOutput`."
+[ADR-004](./004-ca-ready-design.md) committed to CA-ready schema from Phase 2c. [`opcodes_read.rs`](../../../rio-gateway/src/handler/opcodes_read.rs) discards `dependentRealisations` from `wopRegisterDrvOutput` and hardcodes `{}` for `wopQueryRealisation`. The original Phase 5 roadmap claimed "resolution will require persisting it." [`r[sched.ca.resolve]`](../components/scheduler.md) claims the junction table is "populated by `wopRegisterDrvOutput`."
 
 This spike was planned as a live-daemon wire capture (strace a CA-on-CA build chain in a VM). Source-level analysis of the locked flake input `github:NixOS/Nix@26842787` made live capture unnecessary: **Nix removed `dependentRealisations` from the data model upstream**. Live capture of any CA chain against current Nix would only confirm the source — it's always `{}`.
 
@@ -90,7 +90,6 @@ In the locked nixpkgs (flake input, 37,187 `.nix` files under `pkgs/`), **3 file
 | **P0249 migration 015** | Schema unchanged | Schema unchanged — column sizes confirmed (64-byte hex + output name per key, store path per value). No FK to wire data. |
 | **P0253 T1** | "parse `dependentRealisations` JSON, INSERT into `realisation_deps`" | **Drop T1 gateway-parse.** Gateway stays as-is. `realisation_deps` populated by scheduler during resolve (P0253 T2/T3 scope). |
 | **P0253 T2/T3** | Scheduler resolve step | Unchanged — now also the population source for `realisation_deps`. |
-| **phase5.md:19** | "resolution will require persisting it" | Stale — corrected by this ADR. Resolution requires persisting *rio's own lookups*, not the wire field. |
 | **`r[sched.ca.resolve]`** | "junction table populated by `wopRegisterDrvOutput`" | Stale — needs `tracey bump`. Populated by scheduler during resolve, not by gateway from wire. |
 
 ## Consequences
