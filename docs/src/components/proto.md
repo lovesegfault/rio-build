@@ -25,7 +25,7 @@ r[proto.metadata.assignment-token]
 `x-rio-assignment-token` is the **only** input the store trusts when authorizing `PutPath`. The token is minted scheduler-side at dispatch (HMAC over executor_id + drv_hash + expected_outputs + expiry) and carried through the executor verbatim. The store MUST reject uploads with a missing, expired, or mismatched-output token. Builder pods are airgapped and untrusted — builder-supplied data MUST NOT drive authorization; the token is the cryptographic link back to a scheduler decision.
 
 r[proto.metadata.tenant-token]
-`x-rio-tenant-token` is set by the gateway on every outbound RPC in JWT mode. Server-side (`rio_common::jwt_interceptor`): missing header is pass-through (dual-mode / single-tenant), present-but-unverifiable is `Unauthenticated`. Verified claims populate request extensions; handlers read tenant identity from extensions, never from request body fields.
+`x-rio-tenant-token` is set by the gateway on every outbound RPC in JWT mode. Server-side (`rio_auth::jwt_interceptor`): missing header is pass-through (dual-mode / single-tenant), present-but-unverifiable is `Unauthenticated`. Verified claims populate request extensions; handlers read tenant identity from extensions, never from request body fields.
 
 ## Services
 
