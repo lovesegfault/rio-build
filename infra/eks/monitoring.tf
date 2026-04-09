@@ -31,6 +31,14 @@ resource "helm_release" "kube_prometheus_stack" {
       name  = "prometheusOperator.hostNetwork"
       value = "true"
     },
+    # hostNetwork shares the node's port namespace. The chart default
+    # --web.listen-address=:10250 is kubelet's port → "bind: address
+    # already in use" → CrashLoopBackOff. The Service uses a named
+    # targetPort ("https"), so the chart wires it through automatically.
+    {
+      name  = "prometheusOperator.tls.internalPort"
+      value = "10260"
+    },
     # P0539b ships dashboards as ConfigMaps in rio-system labelled
     # `grafana_dashboard=1`. The sidecar watches for that label and
     # mounts the JSON into Grafana. searchNamespace=ALL because the
