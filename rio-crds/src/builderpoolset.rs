@@ -10,15 +10,12 @@
 //!
 //! This file is type-definitions only — no reconcile logic.
 
-use std::collections::BTreeMap;
-
-use k8s_openapi::api::core::v1::Toleration;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::builderpool::SeccompProfileKind;
-use crate::common::{SizeClassCommon, impl_common_deref};
+use crate::common::{PoolDeployKnobs, SizeClassCommon, impl_common_deref};
 
 /// BuilderPoolSet spec. Each `classes[]` entry becomes a child
 /// BuilderPool owned by this CR (ownerReference → cascade delete).
@@ -81,36 +78,18 @@ impl_common_deref!(SizeClassSpec => SizeClassCommon);
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolTemplate {
-    /// Container image. Shared across classes — same builder
-    /// binary, different resource allocations. REQUIRED —
-    /// `BuilderPoolSpec.image` has no default. The reconciler's
-    /// child builder errors with `InvalidSpec` if this is empty.
-    pub image: String,
-
-    /// Target systems (e.g., `["x86_64-linux"]`). Shared across
-    /// classes — all size classes in one BPS run the same binary
-    /// on the same arch; separate arches warrant separate BPSes.
-    /// REQUIRED — child BuilderPool CEL rejects empty `systems[]`.
-    pub systems: Vec<String>,
+    /// `image` / `systems` / `node_selector` / `tolerations` /
+    /// `tls_secret_name` / `host_users`. Flattened — wire format
+    /// unchanged; `Deref` keeps `template.image` working. Shared
+    /// with `PoolSpecCommon` so `build_child_builderpool` can
+    /// `template.deploy.clone()` instead of copying field-by-field.
+    #[serde(flatten)]
+    pub deploy: PoolDeployKnobs,
 
     /// requiredSystemFeatures this pool advertises. Shared
     /// across classes for the same reason as `systems`.
     #[serde(default)]
     pub features: Vec<String>,
-
-    /// Node selector. Shared because builder nodes are usually
-    /// tainted/labeled uniformly (`rio.build/builder: "true"`),
-    /// not per-class.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_selector: Option<BTreeMap<String, String>>,
-
-    /// Tolerations. Shared — pairs with node_selector.
-    /// Typed `Toleration` (not serde_json::Value) to match
-    /// builderpool.rs; `any_object_array` passthrough because
-    /// k8s-openapi types don't impl JsonSchema.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object_array")]
-    pub tolerations: Option<Vec<Toleration>>,
 
     /// Seccomp profile (P0223). Applied uniformly — the syscall
     /// filter doesn't vary by builder size. The Localhost profile
@@ -130,20 +109,11 @@ pub struct PoolTemplate {
     /// (e.g., bare-metal with NAR-heavy store traffic), all do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
-
-    /// Explicit hostUsers override. Shared — cluster runtime cgroup
-    /// delegation behavior (containerd OwnerUID under userns) is
-    /// the same for all class pods. See `BuilderPoolSpec.host_users`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_users: Option<bool>,
-
-    /// mTLS client cert Secret name. Shared — same cert-manager
-    /// Certificate across all builder pods regardless of size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_secret_name: Option<String>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to FetcherPools which have direct egress. Squid is gone.
 }
+
+impl_common_deref!(PoolTemplate => PoolDeployKnobs, deploy);
 
 /// BuilderPoolSet status. Reconciler writes; `kubectl get bps`
 /// reads.

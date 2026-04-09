@@ -64,12 +64,7 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
             // --- Per-class (SizeClassSpec) ---
             max_concurrent,
             // --- Shared (PoolTemplate) ---
-            image: template.image.clone(),
-            systems: template.systems.clone(),
-            node_selector: template.node_selector.clone(),
-            tolerations: template.tolerations.clone(),
-            host_users: template.host_users,
-            tls_secret_name: template.tls_secret_name.clone(),
+            deploy: template.deploy.clone(),
             // None → build_job derives `cutoff × DEADLINE_MULTIPLIER`
             // from `size_class_cutoff_secs` below (I-200, `r[ctrl.pool.
             // per-class-deadline]`). No PoolTemplate override knob — the
@@ -175,16 +170,15 @@ pub(super) mod tests {
         let spec = BuilderPoolSetSpec {
             classes,
             pool_template: PoolTemplate {
-                image: "rio-builder:test".into(),
-                systems: vec!["x86_64-linux".into()],
+                deploy: rio_crds::common::PoolDeployKnobs {
+                    image: "rio-builder:test".into(),
+                    systems: vec!["x86_64-linux".into()],
+                    ..Default::default()
+                },
                 features: vec!["kvm".into()],
-                node_selector: None,
-                tolerations: None,
                 seccomp_profile: None,
                 privileged: None,
                 host_network: None,
-                host_users: None,
-                tls_secret_name: None,
             },
         };
         let mut wps = BuilderPoolSet::new("test-bps", spec);

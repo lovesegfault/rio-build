@@ -48,26 +48,19 @@ pub struct PoolStatusCommon {
     pub conditions: Vec<Condition>,
 }
 
-/// Spec fields shared by `BuilderPoolSpec` and `FetcherPoolSpec`.
+/// Deployment knobs shared by `PoolSpecCommon` (→ BuilderPool /
+/// FetcherPool) AND `PoolTemplate` (→ BuilderPoolSet). Factored
+/// because the BPS reconciler's `build_child_builderpool` was
+/// copying these field-by-field from template to child spec; with
+/// the struct shared, that becomes one `template.deploy.clone()`.
 ///
-/// Fetchers run the SAME `rio-builder` binary with a different
-/// `RIO_EXECUTOR_KIND`, so the deployment knobs (image, systems,
-/// node placement, mTLS) are identical. Per-role fields (FUSE
-/// tuning, seccomp, `resources`, `classes[]`) stay on the outer
-/// structs.
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+/// `Default`: required for `PoolTemplate: Default`. The zero
+/// values (`image = ""`, `systems = []`) are NOT valid — the
+/// apiserver rejects them via the `required:` schema list — so
+/// `Default` is for test fixtures and `..Default::default()` only.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PoolSpecCommon {
-    /// Concurrent-Job ceiling. The reconciler spawns one Job per
-    /// dispatch-need up to this many active at once. Both CRDs add
-    /// a struct-level CEL `self.maxConcurrent > 0`.
-    pub max_concurrent: u32,
-
-    /// Backstop `activeDeadlineSeconds` on Jobs. `None` = per-role
-    /// default (3600 for builders, 300 for fetchers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_seconds: Option<u32>,
-
+pub struct PoolDeployKnobs {
     /// Container image ref. Required — there's no sensible default
     /// (depends on how operators build/tag).
     pub image: String,
@@ -103,6 +96,33 @@ pub struct PoolSpecCommon {
     pub host_users: Option<bool>,
 }
 
+/// Spec fields shared by `BuilderPoolSpec` and `FetcherPoolSpec`.
+///
+/// Fetchers run the SAME `rio-builder` binary with a different
+/// `RIO_EXECUTOR_KIND`, so the deployment knobs (image, systems,
+/// node placement, mTLS) are identical. Per-role fields (FUSE
+/// tuning, seccomp, `resources`, `classes[]`) stay on the outer
+/// structs.
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolSpecCommon {
+    /// Concurrent-Job ceiling. The reconciler spawns one Job per
+    /// dispatch-need up to this many active at once. Both CRDs add
+    /// a struct-level CEL `self.maxConcurrent > 0`.
+    pub max_concurrent: u32,
+
+    /// Backstop `activeDeadlineSeconds` on Jobs. `None` = per-role
+    /// default (3600 for builders, 300 for fetchers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_seconds: Option<u32>,
+
+    /// `image` / `systems` / `node_selector` / `tolerations` /
+    /// `tls_secret_name` / `host_users`. Flattened — wire format
+    /// unchanged; `Deref` keeps `wp.spec.image` working.
+    #[serde(flatten)]
+    pub deploy: PoolDeployKnobs,
+}
+
 /// Fields shared by `SizeClassSpec` (builder) and `FetcherSizeClass`.
 ///
 /// Builder classes additionally carry `cutoff_secs` (a-priori
@@ -129,34 +149,48 @@ pub struct SizeClassCommon {
 }
 
 /// Stamps `Deref`/`DerefMut` from an embedding struct to its
-/// `#[serde(flatten)] common` field. Lets call sites keep writing
-/// `wp.spec.image` (auto-deref) instead of `wp.spec.common.image`,
+/// `#[serde(flatten)]` field. Lets call sites keep writing
+/// `wp.spec.image` (auto-deref through `PoolSpecCommon` →
+/// `PoolDeployKnobs`) instead of `wp.spec.common.deploy.image`,
 /// so the refactor doesn't churn rio-controller / rio-cli.
+///
+/// Two-arg form defaults the field name to `common` (the
+/// majority case); three-arg form takes an explicit field
+/// name (`deploy` for the `PoolDeployKnobs` layer).
 ///
 /// `#[macro_export]` not used: `pub(crate)` semantics via the
 /// `pub(crate) use` re-export below — only embedding CRD modules
 /// in this crate need it.
 macro_rules! impl_common_deref {
     ($outer:ty => $inner:ty) => {
+        impl_common_deref!($outer => $inner, common);
+    };
+    ($outer:ty => $inner:ty, $field:ident) => {
         impl ::core::ops::Deref for $outer {
             type Target = $inner;
             fn deref(&self) -> &Self::Target {
-                &self.common
+                &self.$field
             }
         }
         impl ::core::ops::DerefMut for $outer {
             fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.common
+                &mut self.$field
             }
         }
         impl ::core::convert::AsRef<$inner> for $outer {
             fn as_ref(&self) -> &$inner {
-                &self.common
+                &self.$field
             }
         }
     };
 }
 pub(crate) use impl_common_deref;
+
+// Chained Deref: `BuilderPoolSpec` → `PoolSpecCommon` →
+// `PoolDeployKnobs`, so `wp.spec.image` resolves through both
+// layers. Declared after the macro because `macro_rules!`
+// visibility is textual-order.
+impl_common_deref!(PoolSpecCommon => PoolDeployKnobs, deploy);
 
 #[cfg(test)]
 mod tests {
@@ -176,12 +210,14 @@ mod tests {
             crate::builderpoolset::BuilderPoolSet::crd(),
         ] {
             let json = serde_json::to_string(&crd).unwrap();
-            assert!(
-                !json.contains("\"common\""),
-                "{}: flattened `common` field leaked into the CRD schema as a \
-                 property — schemars/kube-derive flatten regression",
-                crd.spec.names.kind
-            );
+            for field in ["common", "deploy"] {
+                assert!(
+                    !json.contains(&format!("\"{field}\"")),
+                    "{}: flattened `{field}` field leaked into the CRD schema \
+                     as a property — schemars/kube-derive flatten regression",
+                    crd.spec.names.kind
+                );
+            }
         }
     }
 
@@ -190,8 +226,10 @@ mod tests {
     /// regression here would mean `image` / `maxConcurrent` /
     /// `systems` silently become optional and `kubectl apply` with
     /// an incomplete spec is accepted. All three required fields
-    /// come from PoolSpecCommon; the outer structs contribute none
-    /// (every builder-/fetcher-only field is optional or defaulted).
+    /// come from PoolSpecCommon (`maxConcurrent` directly, `image`
+    /// / `systems` via the nested `PoolDeployKnobs` flatten); the
+    /// outer structs contribute none (every builder-/fetcher-only
+    /// field is optional or defaulted).
     #[test]
     fn flatten_preserves_required() {
         for crd in [
@@ -206,5 +244,14 @@ mod tests {
                 crd.spec.names.kind,
             );
         }
+        // BuilderPoolSet.spec.poolTemplate gets `image` / `systems`
+        // via the same PoolDeployKnobs flatten — verify the second
+        // embedding site's required-merge too.
+        let json = serde_json::to_string(&crate::builderpoolset::BuilderPoolSet::crd()).unwrap();
+        assert!(
+            json.contains(r#""required":["image","systems"]"#),
+            "BuilderPoolSet: poolTemplate.required drifted — flatten dropped \
+             a PoolDeployKnobs required field",
+        );
     }
 }

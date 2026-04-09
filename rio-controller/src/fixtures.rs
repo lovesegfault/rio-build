@@ -45,12 +45,11 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
             max_concurrent: 10,
             deadline_seconds: None,
-            systems: vec!["x86_64-linux".into()],
-            image: "rio-builder:test".into(),
-            node_selector: None,
-            tolerations: None,
-            host_users: None,
-            tls_secret_name: None,
+            deploy: rio_crds::common::PoolDeployKnobs {
+                systems: vec!["x86_64-linux".into()],
+                image: "rio-builder:test".into(),
+                ..Default::default()
+            },
         },
         resources: None,
         sizing: Sizing::Static,
@@ -77,12 +76,11 @@ pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
             max_concurrent: 8,
             deadline_seconds: None,
-            systems: vec!["x86_64-linux".into()],
-            image: "rio-fetcher:test".into(),
-            node_selector: None,
-            tolerations: None,
-            host_users: None,
-            tls_secret_name: None,
+            deploy: rio_crds::common::PoolDeployKnobs {
+                systems: vec!["x86_64-linux".into()],
+                image: "rio-fetcher:test".into(),
+                ..Default::default()
+            },
         },
         // CEL enforces `size(self.classes) > 0` (I-170); the fixture
         // ships one default class so unit tests match the apiserver-

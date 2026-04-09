@@ -108,26 +108,21 @@ spec:
                     nullable: true
                     type: boolean
                   hostUsers:
-                    description: "Explicit hostUsers override. Shared \u2014 cluster\
-                      \ runtime cgroup\ndelegation behavior (containerd OwnerUID under\
-                      \ userns) is\nthe same for all class pods. See `BuilderPoolSpec.host_users`."
+                    description: "Explicit `hostUsers` override. `None` defaults to\
+                      \ `hostUsers:\nfalse` (userns isolation per ADR-012). Set `true`\
+                      \ for k3s/\ncontainerd deployments that don't chown the pod\
+                      \ cgroup to the\nuserns-mapped root UID \u2014 see `BuilderPoolSpec.host_users`\
+                      \ doc\nfor the full diagnostic."
                     nullable: true
                     type: boolean
                   image:
-                    description: "Container image. Shared across classes \u2014 same\
-                      \ builder\nbinary, different resource allocations. REQUIRED\
-                      \ \u2014\n`BuilderPoolSpec.image` has no default. The reconciler's\n\
-                      child builder errors with `InvalidSpec` if this is empty."
+                    description: "Container image ref. Required \u2014 there's no\
+                      \ sensible default\n(depends on how operators build/tag)."
                     type: string
                   nodeSelector:
                     additionalProperties:
                       type: string
-                    description: 'Node selector. Shared because builder nodes are
-                      usually
-
-                      tainted/labeled uniformly (`rio.build/builder: "true"`),
-
-                      not per-class.'
+                    description: Node selector for the Job pod spec.
                     nullable: true
                     type: object
                   privileged:
@@ -179,25 +174,28 @@ spec:
                     - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile)
                         : !has(self.localhostProfile)'
                   systems:
-                    description: "Target systems (e.g., `[\"x86_64-linux\"]`). Shared\
-                      \ across\nclasses \u2014 all size classes in one BPS run the\
-                      \ same binary\non the same arch; separate arches warrant separate\
-                      \ BPSes.\nREQUIRED \u2014 child BuilderPool CEL rejects empty\
-                      \ `systems[]`."
+                    description: 'Target systems (e.g., `["x86_64-linux"]`). Builders
+                      AND
+
+                      fetchers execute derivation `builder` scripts, so the host
+
+                      system must match.'
                     items:
                       type: string
                     type: array
                   tlsSecretName:
-                    description: "mTLS client cert Secret name. Shared \u2014 same\
-                      \ cert-manager\nCertificate across all builder pods regardless\
-                      \ of size."
+                    description: "mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).\n\
+                      Same cert across builders and fetchers \u2014 same binary, same\n\
+                      scheduler/store endpoints. Unset = plaintext gRPC (dev mode)."
                     nullable: true
                     type: string
                   tolerations:
-                    description: "Tolerations. Shared \u2014 pairs with node_selector.\n\
-                      Typed `Toleration` (not serde_json::Value) to match\nbuilderpool.rs;\
-                      \ `any_object_array` passthrough because\nk8s-openapi types\
-                      \ don't impl JsonSchema."
+                    description: 'Tolerations for the Job pod spec. Typed `Toleration`
+                      (not
+
+                      `serde_json::Value`); `any_object_array` passthrough because
+
+                      k8s-openapi types don''t impl JsonSchema.'
                     items:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
