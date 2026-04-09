@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rio_proto::types::BuildLogBatch;
 
 mod flush;
@@ -56,39 +56,35 @@ type Line = (u64, Vec<u8>);
 /// blob and N `build_logs` PG rows (one per interested build, same s3_key).
 pub struct LogBuffers {
     buffers: DashMap<String, VecDeque<Line>>,
+    /// Tombstone set: derivations that have reached a terminal state.
+    /// [`Self::push`] drops batches for sealed paths so a late
+    /// `LogBatch` (still in flight on the BuildExecution stream after
+    /// the worker sent CompletionReport) cannot recreate a buffer
+    /// that the flusher already drained. Bounds entry count over
+    /// scheduler lifetime — without sealing, every completed
+    /// derivation that emits one late line leaves one orphan entry.
+    sealed: DashSet<String>,
 }
 
 impl LogBuffers {
     pub fn new() -> Self {
         Self {
             buffers: DashMap::new(),
+            sealed: DashSet::new(),
         }
     }
 
     /// Push a batch. Evicts oldest lines if the buffer exceeds `RING_CAPACITY`.
     ///
-    /// # Late-push leak (known, bounded by builds-per-process)
-    ///
-    /// `.entry().or_default()` will RECREATE a buffer for `drv_path` if
-    /// it was already removed by [`Self::drain`]. The race: completion
-    /// fires `FlushRequest::Completion` → flusher drains → entry gone →
-    /// a late `LogBatch` (still in flight on the same BuildExecution
-    /// stream, batched before the worker sent CompletionReport) lands
-    /// here and recreates an entry that nothing will drain again. The
-    /// per-buffer ring cap bounds memory; entry COUNT is unbounded
-    /// over scheduler lifetime.
-    ///
-    /// TODO: close by having the actor call a `seal(drv_path)` on
-    /// dispatch-end (so push() becomes `get_mut`-only), or by sweeping
-    /// keys not in the actor's live drv set on Tick. The completion
-    /// surface is now stable (`terminal_failure_epilogue` /
-    /// `handle_success_completion` in `actor/completion.rs`), but the
-    /// actor has no direct `LogBuffers` handle — wiring needs either an
-    /// `Arc<LogBuffers>` threaded into `DagActor`, or a `seal` flag on
-    /// `FlushRequest` so the flusher tombstones post-drain. Retry must
-    /// un-seal on re-dispatch, so the open/seal pair spans
-    /// dispatch+completion.
+    /// Drops the batch entirely if `drv_path` is [`Self::seal`]ed
+    /// (terminal completion already fired). The late lines are lost —
+    /// the build is done, the flusher has (or will) upload the final
+    /// snapshot, and a few trailing batched lines are not worth an
+    /// unbounded entry-count leak.
     pub fn push(&self, batch: &BuildLogBatch) {
+        if self.sealed.contains(&batch.derivation_path) {
+            return;
+        }
         // `entry()` locks the shard's write lock for the duration of the
         // closure. For the same-key case (one worker per drv_path), this is
         // uncontended. For cross-key, DashMap's sharding means we rarely
@@ -161,8 +157,34 @@ impl LogBuffers {
     /// Called on worker disconnect mid-build when the derivation gets
     /// reassigned — the new worker's logs replace the old ones from scratch
     /// (the old partial log is meaningless without the build that produced it).
+    /// Also un-seals: re-dispatch after a terminal state (e.g. poison-clear)
+    /// goes through the same reassign path, and the new worker's pushes must
+    /// land.
     pub fn discard(&self, drv_path: &str) {
         self.buffers.remove(drv_path);
+        self.sealed.remove(drv_path);
+    }
+
+    /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
+    ///
+    /// Called by the actor's completion handlers (`handle_success_completion`,
+    /// `terminal_failure_epilogue`) BEFORE `trigger_log_flush`. The flusher's
+    /// [`Self::drain`] still owns buffer removal — sealing only prevents
+    /// post-drain recreation by a late batch. Any buffer present at seal
+    /// time is left for the flusher; sealing then draining yields the same
+    /// contents as draining alone.
+    ///
+    /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
+    /// [`Self::discard`], which also un-seals).
+    pub fn seal(&self, drv_path: &str) {
+        self.sealed.insert(drv_path.to_owned());
+    }
+
+    /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called on
+    /// re-dispatch after a terminal state (poison-clear, manual retry).
+    /// Idempotent; no-op if not sealed.
+    pub fn unseal(&self, drv_path: &str) {
+        self.sealed.remove(drv_path);
     }
 
     /// Number of active buffers. For metrics + flusher periodic-scan skip.
@@ -368,5 +390,52 @@ mod tests {
                 "drv-{i} should have all 50 lines"
             );
         }
+    }
+
+    /// Regression: late LogBatch after completion must not recreate a
+    /// drained entry. seal() tombstones the path so push() drops; the
+    /// flusher's drain() still returns the pre-seal contents.
+    #[test]
+    fn seal_blocks_late_push_and_preserves_drain() {
+        let bufs = LogBuffers::new();
+        bufs.push(&mk_batch("drv-a", 0, &[b"line0", b"line1"]));
+
+        // Actor seals on completion (BEFORE flusher drains).
+        bufs.seal("drv-a");
+
+        // Late batch from the same BuildExecution stream — dropped.
+        bufs.push(&mk_batch("drv-a", 2, &[b"late"]));
+
+        // Flusher drains: gets the 2 pre-seal lines (seal did NOT
+        // remove the buffer, only tombstoned it).
+        let (count, _bytes, lines) = bufs.drain("drv-a").expect("buffer should exist");
+        assert_eq!(count, 2);
+        assert_eq!(lines, vec![b"line0".to_vec(), b"line1".to_vec()]);
+
+        // Another late batch after drain — still sealed, still dropped.
+        // This is the entry-count leak the seal closes: without it,
+        // this push would recreate an orphan entry.
+        bufs.push(&mk_batch("drv-a", 3, &[b"later"]));
+        assert_eq!(
+            bufs.active_count(),
+            0,
+            "sealed path must not recreate entry"
+        );
+        assert!(bufs.drain("drv-a").is_none());
+
+        // Re-dispatch (poison-clear / retry) un-seals; new worker's
+        // pushes land again.
+        bufs.unseal("drv-a");
+        bufs.push(&mk_batch("drv-a", 0, &[b"retry"]));
+        assert_eq!(bufs.active_count(), 1);
+    }
+
+    #[test]
+    fn discard_also_unseals() {
+        let bufs = LogBuffers::new();
+        bufs.seal("drv-a");
+        bufs.discard("drv-a");
+        bufs.push(&mk_batch("drv-a", 0, &[b"fresh"]));
+        assert_eq!(bufs.active_count(), 1, "discard must clear seal");
     }
 }

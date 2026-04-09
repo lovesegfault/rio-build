@@ -816,6 +816,10 @@ impl DagActor {
         // log (flusher hasn't drained yet — it's async on a separate task).
         // So AdminService.GetBuildLogs can serve from the ring buffer in the
         // gap between Completed and the S3 upload landing.
+        // Seal first: late LogBatch pushes between now and the
+        // flusher's drain are dropped instead of recreating an orphan
+        // entry; the buffer present NOW survives for drain.
+        self.seal_log_buffer(drv_hash);
         self.trigger_log_flush(drv_hash, interested_builds.clone());
 
         // r[impl sched.gc.path-tenants-upsert]
@@ -1563,6 +1567,13 @@ impl DagActor {
         drv_hash: &DrvHash,
         event: Option<(&str, rio_proto::types::BuildResultStatus)>,
     ) {
+        // Seal the log buffer unconditionally — even the `event=None`
+        // path (poison-threshold reached without a fresh failure event)
+        // is a terminal transition for THIS drv. The conditional
+        // trigger_log_flush below still drains for the upload; sealing
+        // only stops late pushes from leaking an orphan entry.
+        self.seal_log_buffer(drv_hash);
+
         // Cascade: parents of a terminally-failed derivation can never
         // complete. Transition them to DependencyFailed so keepGoing
         // builds terminate.

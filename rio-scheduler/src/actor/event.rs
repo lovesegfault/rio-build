@@ -335,4 +335,21 @@ impl DagActor {
             interested_builds,
         });
     }
+
+    /// Seal the log ring buffer for `drv_hash` so late `LogBatch`
+    /// pushes (still in flight on the BuildExecution stream after the
+    /// worker sent CompletionReport) cannot recreate an entry the
+    /// flusher already drained. Called from terminal completion
+    /// handlers BEFORE [`Self::trigger_log_flush`] — the flusher's
+    /// drain still returns the pre-seal contents; sealing only blocks
+    /// post-drain recreation. No-op if `log_buffers` unwired (tests).
+    pub(super) fn seal_log_buffer(&self, drv_hash: &DrvHash) {
+        let Some(bufs) = &self.log_buffers else {
+            return;
+        };
+        let Some(drv_path) = self.dag.path_for_hash(drv_hash) else {
+            return;
+        };
+        bufs.seal(drv_path);
+    }
 }

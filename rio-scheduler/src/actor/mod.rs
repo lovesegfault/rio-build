@@ -137,6 +137,11 @@ pub struct DagActor {
     /// Per-build event broadcast channels + sequence/debounce state +
     /// persister/flusher wires. See [`BuildEventBus`].
     events: BuildEventBus,
+    /// Shared log ring buffers. The actor only seals (via
+    /// [`Self::seal_log_buffer`]) on terminal completion so a late
+    /// `LogBatch` can't recreate an entry the flusher already drained.
+    /// `None` in tests that don't exercise the log pipeline.
+    log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
     /// Retry policy.
@@ -310,6 +315,7 @@ impl DagActor {
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
             events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
+            log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,

@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         rio_scheduler::actor::DagActorPlumbing {
             store_client,
             log_flush_tx,
+            log_buffers: Some(Arc::clone(&log_buffers)),
             event_persist_tx: Some(event_persist_tx),
             hmac_signer: hmac_signer.map(Arc::new),
             leader: leader.clone(),

@@ -174,6 +174,11 @@ pub struct DagActorPlumbing {
     /// Channel to the LogFlusher task. Completion handlers `try_send` a
     /// FlushRequest here.
     pub log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+    /// Shared log ring buffers. The actor only calls
+    /// [`LogBuffers::seal`](crate::logs::LogBuffers::seal) on terminal
+    /// completion so a late `LogBatch` can't recreate a drained entry.
+    /// `None` in tests that don't exercise the log pipeline.
+    pub log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Channel to the event-log persister task.
     pub event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
@@ -204,6 +209,7 @@ impl Default for DagActorPlumbing {
         Self {
             store_client: None,
             log_flush_tx: None,
+            log_buffers: None,
             event_persist_tx: None,
             hmac_signer: None,
             leader: LeaderState::default(),
