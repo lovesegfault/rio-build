@@ -121,17 +121,13 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // field still exists for `kubectl get` observability — populated
     // from the in-process counter, but the reconciler reads from Ctx.
     let key = error_key(cs.as_ref());
-    let low_ticks_in = ctx
-        .component_low_ticks
-        .lock()
-        .get(&key)
-        .copied()
-        .unwrap_or(0);
+    let low_ticks_in = ctx.scaler.low_ticks.lock().get(&key).copied().unwrap_or(0);
     let since_up = status.last_scale_up_time.as_ref().and_then(since);
     let mut status_in = status.clone();
     status_in.low_load_ticks = low_ticks_in;
     let decision = component::decide(spec, &status_in, current, builders, max_load, since_up);
-    ctx.component_low_ticks
+    ctx.scaler
+        .low_ticks
         .lock()
         .insert(key, decision.low_load_ticks);
 

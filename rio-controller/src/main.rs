@@ -198,10 +198,9 @@ async fn main() -> anyhow::Result<()> {
         store: cfg.store.clone(),
         recorder: recorder.clone(),
         error_counts: Default::default(),
-        manifest_idle: Default::default(),
         size_class_cache: Default::default(),
-        component_low_ticks: Default::default(),
-        scale_down_window: std::time::Duration::from_secs(600),
+        manifest: Default::default(),
+        scaler: Default::default(),
     });
 
     // ---- Reconcilers ----

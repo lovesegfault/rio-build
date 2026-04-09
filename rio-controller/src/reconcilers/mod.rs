@@ -88,16 +88,6 @@ pub struct Ctx {
     /// a single HashMap op, and parking_lot has no poison so a
     /// panic in one reconciler can't wedge another's error_policy.
     pub error_counts: Mutex<HashMap<String, u32>>,
-    /// Per-pool per-bucket idle-since timestamp for manifest-mode
-    /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
-    /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
-    /// est_cpu_millicores)` — same as `common::job::Bucket`.
-    /// Value: the Instant the bucket FIRST went surplus
-    /// (`supply > demand`). Cleared when demand returns. A bucket
-    /// idle for `scale_down_window` is eligible for Job deletion.
-    ///
-    /// `parking_lot::Mutex` — same reasoning as `error_counts`.
-    pub manifest_idle: Mutex<HashMap<String, ManifestIdleState>>,
     /// TTL-cached `GetSizeClassStatus` response. The static-sizing
     /// builderpool reconciler and the ComponentScaler reconciler
     /// both poll this on ~10s ticks; without the cache they'd
@@ -110,6 +100,46 @@ pub struct Ctx {
     /// section spans an await (the gRPC call).
     pub size_class_cache:
         tokio::sync::Mutex<Option<(Instant, rio_proto::types::GetSizeClassStatusResponse)>>,
+    /// In-process state owned by the manifest BuilderPool reconciler.
+    /// Grouped so future per-reconciler state lands here instead of
+    /// accreting onto `Ctx` directly.
+    pub manifest: ManifestState,
+    /// In-process state owned by the ComponentScaler reconciler.
+    pub scaler: ScalerState,
+}
+
+/// Manifest-mode reconciler state. `Default` = empty idle map +
+/// the production 600s scale-down window; tests that need a different
+/// window override the one field.
+pub struct ManifestState {
+    /// Per-pool per-bucket idle-since timestamp for manifest-mode
+    /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
+    /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
+    /// est_cpu_millicores)` — same as `common::job::Bucket`.
+    /// Value: the Instant the bucket FIRST went surplus
+    /// (`supply > demand`). Cleared when demand returns. A bucket
+    /// idle for `scale_down_window` is eligible for Job deletion.
+    ///
+    /// `parking_lot::Mutex` — same reasoning as `error_counts`.
+    pub idle: Mutex<HashMap<String, ManifestIdleState>>,
+    /// Scale-down stabilization window for the manifest reconciler's
+    /// per-bucket idle grace. 600s default / env-tunable — anti-flap:
+    /// don't reap surplus Jobs right before the next burst.
+    pub scale_down_window: Duration,
+}
+
+impl Default for ManifestState {
+    fn default() -> Self {
+        Self {
+            idle: Mutex::default(),
+            scale_down_window: Duration::from_secs(600),
+        }
+    }
+}
+
+/// ComponentScaler reconciler state.
+#[derive(Default)]
+pub struct ScalerState {
     /// Per-ComponentScaler low-load tick counter, keyed by
     /// `{ns}/{name}`. In-process (NOT in `.status`): writing
     /// `lowLoadTicks` to status on every tick changes the CR,
@@ -119,11 +149,7 @@ pub struct Ctx {
     /// restart resets the streak (≤5 min of extra over-
     /// provisioning) — acceptable. `learnedRatio` (the durable
     /// bit) stays in `.status`.
-    pub component_low_ticks: Mutex<HashMap<String, u32>>,
-    /// Scale-down stabilization window for the manifest reconciler's
-    /// per-bucket idle grace. 600s default / env-tunable — anti-flap:
-    /// don't reap surplus Jobs right before the next burst.
-    pub scale_down_window: Duration,
+    pub low_ticks: Mutex<HashMap<String, u32>>,
 }
 
 impl Ctx {
