@@ -246,6 +246,11 @@
           workspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
+            # build.rs include!() target shared by 5 crates. crate2nix
+            # wires this via a per-derivation symlink (nix/crate2nix.nix
+            # metricsGrepFileset), but the fuzz builds + misc-checks
+            # consume this fileset directly and need the file in-tree.
+            ./build-support
             ./rio-auth
             ./rio-bench
             ./rio-cli
