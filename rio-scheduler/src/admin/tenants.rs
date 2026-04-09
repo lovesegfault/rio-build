@@ -38,7 +38,7 @@ pub(super) async fn create_tenant(
     let cache_token = req.cache_token.as_deref().map(str::trim);
     if cache_token.is_some_and(str::is_empty) {
         return Err(Status::invalid_argument(
-            "cache_token must not be empty string (omit field for no-cache-auth)",
+            "cache_token must not be empty string (omit field for none)",
         ));
     }
     // u32→i32 / u64→i64 would wrap to negative for out-of-range

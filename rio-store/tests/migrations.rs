@@ -215,9 +215,11 @@ async fn cross_service_schema_contract() {
     const STORE_READS: &[(&str, &str, &str)] = &[
         // gc/mark.rs ROOTS_SQL (UNION arm), gc/sweep.rs RECHECK_SQL
         ("scheduler_live_pins", "store_path_hash", "bytea"),
-        // gc/tenant.rs quota lookup
+        // gc/tenant.rs quota lookup (full TenantRow projection — incl.
+        // cache_token IS NOT NULL for the shared struct shape)
         ("tenants", "tenant_id",          "uuid"),
         ("tenants", "tenant_name",        "text"),
+        ("tenants", "cache_token",        "text"),
         ("tenants", "gc_max_store_bytes", "int8"),
     ];
 

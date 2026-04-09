@@ -29,17 +29,6 @@ in
 
     metricsAddr = rioLib.mkMetricsOption 9092;
 
-    cacheHttpAddr = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = ''
-        Binary-cache HTTP listen address (narinfo + nar.zst routes).
-        Null = disabled. Nix clients hit this with plain HTTP GETs
-        (`nix.settings.substituters = [ "http://store:8080" ]`).
-        Separate from listenAddr (that's gRPC).
-      '';
-    };
-
     signingKeyFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -100,9 +89,6 @@ in
         RIO_LISTEN_ADDR = cfg.listenAddr;
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
-      }
-      // lib.optionalAttrs (cfg.cacheHttpAddr != null) {
-        RIO_CACHE_HTTP_ADDR = cfg.cacheHttpAddr;
       }
       // lib.optionalAttrs (cfg.signingKeyFile != null) {
         # toString: the option type is path but figment parses

@@ -42,14 +42,12 @@ pub struct LivePin {
 /// `tenants` row.
 ///
 /// Scheduler owns CRUD (`rio-scheduler/src/db/tenants.rs`); store
-/// reads for cache-auth (`rio-store/src/cache_server/auth.rs`, lookup
-/// by `cache_token`) and GC quota (`rio-store/src/gc/tenant.rs`,
-/// lookup by `tenant_name`).
+/// reads for GC quota (`rio-store/src/gc/tenant.rs`, lookup by
+/// `tenant_name`).
 ///
-/// `cache_token` is intentionally NOT a field: `query_as!` already
-/// compile-checks it via the WHERE-clause bind (`WHERE cache_token =
-/// $1`), and round-tripping the secret through every list/auth result
-/// is a foot-gun. `has_cache_token` is the safe projection.
+/// `cache_token` is intentionally NOT a field: round-tripping the
+/// secret through every list result is a foot-gun. `has_cache_token`
+/// is the safe projection.
 /// `created_at` is epoch seconds via `EXTRACT(EPOCH FROM
 /// created_at)::bigint` — keeps this module chrono-free.
 #[derive(Debug, sqlx::FromRow)]

@@ -460,7 +460,7 @@ pkgs.testers.runNixOSTest {
     # in-memory state (metrics counters, rate-limiter buckets), and
     # the burst=3 config would interfere with earlier subtests if
     # applied sooner. Teardown at the end removes the config + restarts
-    # so cache-auth + jwt-dual-mode subtests run unconstrained.
+    # so the jwt-dual-mode subtests run unconstrained.
 
     with subtest("rate-limit: 4th rapid build from same tenant rejected"):
         # Drop-in: figment's env layer reads RIO_RATE_LIMIT__PER_MINUTE

@@ -58,8 +58,6 @@ service StoreService {
   // '/nix/store/' || hash_part || '-%'. Without this RPC, the gateway was
   // calling QueryPathInfo with a constructed path that has no name — always
   // a miss.
-  //
-  // Also reused by cache_server.rs for /{hash}.narinfo HTTP requests.
   rpc QueryPathFromHashPart(rio.types.QueryPathFromHashPartRequest) returns (rio.types.PathInfo);
 
   // Append signatures to an existing store path's narinfo.
