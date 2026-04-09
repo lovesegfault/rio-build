@@ -73,7 +73,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     let submit_req = rio_proto::types::SubmitBuildRequest {
         tenant_name: String::new(),
         priority_class: "scheduled".into(),
-        nodes: vec![make_test_node("e2e-hash", "x86_64-linux")],
+        nodes: vec![make_node("e2e-hash")],
         edges: vec![],
         max_silent_time: 0,
         build_timeout: 0,
@@ -213,7 +213,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     let mut event_stream = sched_client
         .submit_build(rio_proto::types::SubmitBuildRequest {
             priority_class: "scheduled".into(),
-            nodes: vec![make_test_node("log-pipeline-drv", "x86_64-linux")],
+            nodes: vec![make_node("log-pipeline-drv")],
             ..Default::default()
         })
         .await?

@@ -419,10 +419,7 @@ async fn merge_chain(
     hashes: &[&str],
     priority_class: PriorityClass,
 ) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
-    let nodes: Vec<_> = hashes
-        .iter()
-        .map(|h| make_test_node(h, "x86_64-linux"))
-        .collect();
+    let nodes: Vec<_> = hashes.iter().map(|h| make_node(h)).collect();
     // Edges: parent=next, child=prev (parent depends on child).
     // So nodes[1] depends on nodes[0], nodes[2] on nodes[1], etc.
     let edges: Vec<_> = hashes
@@ -480,7 +477,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
         // Single-node DAG — the orphan-completed drv IS the whole
         // build. This is the critical case: if check_build_completion
         // doesn't fire, NOTHING else will (no other drv completing).
-        let mut node = make_test_node("orphan-drv", "x86_64-linux");
+        let mut node = make_node("orphan-drv");
         node.expected_output_paths = vec![out_path.clone()];
         let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
         barrier(&handle).await;
@@ -575,7 +572,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     let build_id = Uuid::new_v4();
     {
         let (handle, task) = setup_actor(sched_db.pool.clone());
-        let mut node = make_test_node("y2-drv", "x86_64-linux");
+        let mut node = make_node("y2-drv");
         node.expected_output_paths = vec![out_path.clone()];
         let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
         barrier(&handle).await;
@@ -676,7 +673,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // --- Phase 1: merge build, shut down ---
     {
         let (handle, task) = setup_actor(sched_db.pool.clone());
-        let node = make_test_node("phantom-drv", "x86_64-linux");
+        let node = make_node("phantom-drv");
         let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
         barrier(&handle).await;
         drop(handle);
@@ -971,7 +968,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
     let build_id = Uuid::new_v4();
     {
         let (handle, task) = setup_actor(sched_db.pool.clone());
-        let mut node = make_test_node("z4-drv", "x86_64-linux");
+        let mut node = make_node("z4-drv");
         // Must have expected_output_paths or the reconcile short-
         // circuits before the store call ("No expected outputs =
         // can't verify orphan completion. Conservative: treat as
@@ -1321,7 +1318,7 @@ async fn test_recovery_poisoned_orphan_build_fails_not_succeeds() -> TestResult 
         let _ev = merge_dag(
             &handle,
             build_id,
-            vec![make_test_node("r1-drv", "x86_64-linux")],
+            vec![make_node("r1-drv")],
             vec![],
             true, // keep_going
         )
@@ -1401,7 +1398,7 @@ async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestRes
         let _ev = merge_dag(
             &handle,
             build_id,
-            vec![make_test_node("r1f-drv", "x86_64-linux")],
+            vec![make_node("r1f-drv")],
             vec![],
             false, // keep_going=false — the default
         )

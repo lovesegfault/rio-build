@@ -24,7 +24,7 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
 
     // Use a node with pname so update_build_history is called.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("fault-hash", "x86_64-linux");
+    let mut node = make_node("fault-hash");
     node.pname = "fault-pkg".into();
     let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
@@ -120,10 +120,7 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
     let _evt_rx = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("nrA", "x86_64-linux"),
-            make_test_node("nrB", "x86_64-linux"),
-        ],
+        vec![make_node("nrA"), make_node("nrB")],
         vec![make_test_edge("nrA", "nrB")],
         false,
     )

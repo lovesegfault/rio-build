@@ -717,7 +717,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     // and dispatch one-per-worker.
     let build_id = Uuid::new_v4();
     let nodes: Vec<_> = (0..N)
-        .map(|i| make_test_node(&format!("batch-{i:03}"), "x86_64-linux"))
+        .map(|i| make_node(&format!("batch-{i:03}")))
         .collect();
     let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
 

@@ -164,7 +164,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     };
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ca-mixed");
-    let mut node = make_test_node("ca-mixed", "x86_64-linux");
+    let mut node = make_node("ca-mixed");
     node.is_content_addressed = true;
     node.ca_modular_hash = mixed_modular.to_vec();
     node.output_names = vec!["out".into(), "dev".into()];
@@ -212,7 +212,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let _rx3 = connect_executor(&f.actor, "ca-w3", "x86_64-linux").await?;
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ia-skip");
-    let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
+    let node = make_node("ia-skip"); // is_content_addressed=false
     let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
     // Seed a prior for the IA path — if the is_ca guard were missing,
@@ -536,15 +536,15 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     let b_out = test_store_path("verify-b");
 
     // Chain A→B→C, all CA with pname set (name-suffix match).
-    let mut node_a = make_test_node("verify-a", "x86_64-linux");
+    let mut node_a = make_node("verify-a");
     node_a.is_content_addressed = true;
     node_a.ca_modular_hash = a_modular.to_vec();
     node_a.pname = "verify-a".into();
-    let mut node_b = make_test_node("verify-b", "x86_64-linux");
+    let mut node_b = make_node("verify-b");
     node_b.is_content_addressed = true;
     node_b.ca_modular_hash = b_modular.to_vec();
     node_b.pname = "verify-b".into();
-    let mut node_c = make_test_node("verify-c", "x86_64-linux");
+    let mut node_c = make_node("verify-c");
     node_c.is_content_addressed = true;
     node_c.ca_modular_hash = c_modular.to_vec();
     node_c.pname = "verify-c".into();
@@ -725,7 +725,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
 
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ca-shortcircuit");
-    let mut node = make_test_node("ca-shortcircuit", "x86_64-linux");
+    let mut node = make_node("ca-shortcircuit");
     node.is_content_addressed = true;
     node.ca_modular_hash = vec![0xDD; 32];
     node.output_names = vec!["out".into(), "dev".into(), "doc".into(), "man".into()];
@@ -1807,10 +1807,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     let _rx = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("chainA", "x86_64-linux"),
-            make_test_node("chainB", "x86_64-linux"),
-        ],
+        vec![make_node("chainA"), make_node("chainB")],
         vec![make_test_edge("chainA", "chainB")],
         false,
     )
@@ -2116,7 +2113,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
     // Merge with pname — the EMA-update block (completion.rs:247-249)
     // gates on pname.is_some(). Without it, misclass detection never fires.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("misc-drv", "x86_64-linux");
+    let mut node = make_node("misc-drv");
     node.pname = "slowthing".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
@@ -2206,7 +2203,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
     // "test-pkg", which is fine, but a unique pname makes the
     // SELECT below unambiguous if other tests ever share the pool.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("bs-drv", "x86_64-linux");
+    let mut node = make_node("bs-drv");
     node.pname = "sample-pkg".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
@@ -2340,7 +2337,7 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
         setup_with_worker("clamp-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("clamp-drv", "x86_64-linux");
+    let mut node = make_node("clamp-drv");
     node.pname = "clamp-pkg".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     let _assignment = recv_assignment(&mut stream_rx).await;
@@ -2429,7 +2426,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     build_id,
                     tenant_id: Some(tenant),
                     priority_class: PriorityClass::Scheduled,
-                    nodes: vec![make_test_node(drv_tag, "x86_64-linux")],
+                    nodes: vec![make_node(drv_tag)],
                     edges: vec![],
                     options: BuildOptions::default(),
                     keep_going: false,

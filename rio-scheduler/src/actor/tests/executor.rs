@@ -990,7 +990,7 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
 
     let mut rx = connect_fetcher_classed(&handle, "f-tiny", "x86_64-linux", "tiny").await?;
 
-    let mut node = make_test_node("oom-fod-173", "x86_64-linux");
+    let mut node = make_node("oom-fod-173");
     node.is_fixed_output = true;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -1072,7 +1072,7 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
 
     // Non-FOD, no build_history → est_duration=DEFAULT (30s) →
     // classify() picks "tiny" (30 ≤ 30). Routes to b-tiny.
-    let node = make_test_node("oom-glibc-177", "x86_64-linux");
+    let node = make_node("oom-glibc-177");
     assert!(!node.is_fixed_output, "precondition: non-FOD");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -1157,7 +1157,7 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
 
     let mut rx = connect_builder_classed(&handle, "b-eph", "x86_64-linux", "tiny").await?;
 
-    let node = make_test_node("eph-glibc-188", "x86_64-linux");
+    let node = make_node("eph-glibc-188");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     let asgn = recv_assignment(&mut rx).await;
@@ -1240,7 +1240,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    let node = make_test_node("eph-race-188", "x86_64-linux");
+    let node = make_node("eph-race-188");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     let asgn = recv_assignment(&mut rx).await;
@@ -1320,8 +1320,8 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
     let mut rx = connect_executor(&handle, "eph-1", "x86_64-linux").await?;
 
     // parent → child chain. Parent dispatches first (child blocked).
-    let parent = make_test_node("eph-parent", "x86_64-linux");
-    let child = make_test_node("eph-child", "x86_64-linux");
+    let parent = make_node("eph-parent");
+    let child = make_node("eph-child");
     let _ev = merge_dag(
         &handle,
         Uuid::new_v4(),
@@ -1789,7 +1789,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
             build_id,
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("pbt-drv", "x86_64-linux")],
+            nodes: vec![make_node("pbt-drv")],
             edges: vec![],
             options: BuildOptions {
                 max_silent_time: 0,
@@ -2102,9 +2102,9 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // (approx_input_closure(A) = children's expected_output_paths)
     // is non-empty. B is leaf → Ready immediately; A Queued.
     let build_id = Uuid::new_v4();
-    let mut node_b = make_test_node("warm-b", "x86_64-linux");
+    let mut node_b = make_node("warm-b");
     node_b.expected_output_paths = vec![test_store_path("warm-b-out")];
-    let node_a = make_test_node("warm-a", "x86_64-linux");
+    let node_a = make_node("warm-a");
     let _ev = merge_dag(
         &handle,
         build_id,
@@ -2247,12 +2247,12 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     // attempted (not the empty-closure short-circuit). B completes
     // via a throwaway worker → A goes Ready.
     let build_id = Uuid::new_v4();
-    let mut node_b = make_test_node("fail-b", "x86_64-linux");
+    let mut node_b = make_node("fail-b");
     node_b.expected_output_paths = vec![test_store_path("fail-b-out")];
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![make_test_node("fail-a", "x86_64-linux"), node_b],
+        vec![make_node("fail-a"), node_b],
         vec![make_test_edge("fail-a", "fail-b")],
         false,
     )
@@ -2310,7 +2310,7 @@ fn build_fanned_dag(n_ready: usize, paths_each: usize) -> crate::dag::Derivation
     let n_children = n_ready + paths_each - 1;
     let child_nodes: Vec<_> = (0..n_children)
         .map(|j| {
-            let mut c = make_test_node(&format!("child-{j:04}"), "x86_64-linux");
+            let mut c = make_node(&format!("child-{j:04}"));
             c.expected_output_paths = vec![test_store_path(&format!("child-{j:04}-out"))];
             c
         })
@@ -2322,7 +2322,7 @@ fn build_fanned_dag(n_ready: usize, paths_each: usize) -> crate::dag::Derivation
     // Actually: C(j)'s parent-count = min(j+1, paths_each, n_ready,
     // n_children-j) — a trapezoidal distribution peaking in the middle.
     let parent_nodes: Vec<_> = (0..n_ready)
-        .map(|i| make_test_node(&format!("parent-{i:04}"), "x86_64-linux"))
+        .map(|i| make_node(&format!("parent-{i:04}")))
         .collect();
     let mut edges = Vec::with_capacity(n_ready * paths_each);
     for i in 0..n_ready {
@@ -2616,12 +2616,12 @@ async fn test_prefetch_complete_burst_capped() -> TestResult {
     // (1) child C + (CAP+1) roots all depending on C. C has an
     // expected_output_path so each root's input closure is non-empty
     // once C completes.
-    let mut child = make_test_node("pfc-child", "x86_64-linux");
+    let mut child = make_node("pfc-child");
     child.expected_output_paths = vec![test_store_path("pfc-child-out")];
     let mut nodes = vec![child];
     let mut edges = Vec::new();
     for i in 0..n_roots {
-        nodes.push(make_test_node(&format!("pfc-root-{i}"), "x86_64-linux"));
+        nodes.push(make_node(&format!("pfc-root-{i}")));
         edges.push(make_test_edge(&format!("pfc-root-{i}"), "pfc-child"));
     }
     let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, false).await?;

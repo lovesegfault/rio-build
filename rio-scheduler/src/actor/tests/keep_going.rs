@@ -15,10 +15,7 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
     let _rx = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("hashA", "x86_64-linux"),
-            make_test_node("hashB", "x86_64-linux"),
-        ],
+        vec![make_node("hashA"), make_node("hashB")],
         vec![],
         false, // keep_going=false (critical)
     )
@@ -65,10 +62,7 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
     let _rx = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("hashX", "x86_64-linux"),
-            make_test_node("hashY", "x86_64-linux"),
-        ],
+        vec![make_node("hashX"), make_node("hashY")],
         vec![],
         true, // keep_going=true (critical)
     )
@@ -130,9 +124,9 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
         &handle,
         build_id,
         vec![
-            make_test_node("cascadeA", "x86_64-linux"),
-            make_test_node("cascadeB", "x86_64-linux"),
-            make_test_node("cascadeC", "x86_64-linux"),
+            make_node("cascadeA"),
+            make_node("cascadeB"),
+            make_node("cascadeC"),
         ],
         vec![
             make_test_edge("cascadeA", "cascadeB"),
@@ -242,10 +236,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     let _rx2 = merge_dag(
         &handle,
         build2,
-        vec![
-            make_test_node("preparent", "x86_64-linux"),
-            make_test_node("preleaf", "x86_64-linux"),
-        ],
+        vec![make_node("preparent"), make_node("preleaf")],
         vec![make_test_edge("preparent", "preleaf")],
         false,
     )

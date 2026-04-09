@@ -152,7 +152,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     // Merge a node WITH expected_output_paths set — the token's
     // claims must include them.
     let expected_out = test_store_path("hmac-expected-out");
-    let mut node = make_test_node("hmac-drv", "x86_64-linux");
+    let mut node = make_node("hmac-drv");
     node.expected_output_paths = vec![expected_out.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -210,7 +210,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
             build_id: Uuid::new_v4(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("clamp-drv", "x86_64-linux")],
+            nodes: vec![make_node("clamp-drv")],
             edges: vec![],
             options: BuildOptions {
                 build_timeout: u64::MAX,
@@ -261,7 +261,7 @@ async fn test_gc_roots_collects_expected_outputs() -> TestResult {
     // non-terminal, so it should appear in roots.
     let out1 = test_store_path("gcroot-out1");
     let out2 = test_store_path("gcroot-out2");
-    let mut node = make_test_node("gcroot-drv", "x86_64-linux");
+    let mut node = make_node("gcroot-drv");
     node.expected_output_paths = vec![out1.clone(), out2.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -284,9 +284,9 @@ async fn test_gc_roots_dedupes() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     let shared_out = test_store_path("gcroot-shared");
-    let mut n1 = make_test_node("gc-dup1", "x86_64-linux");
+    let mut n1 = make_node("gc-dup1");
     n1.expected_output_paths = vec![shared_out.clone()];
-    let mut n2 = make_test_node("gc-dup2", "x86_64-linux");
+    let mut n2 = make_node("gc-dup2");
     n2.expected_output_paths = vec![shared_out.clone()];
 
     merge_dag(&handle, Uuid::new_v4(), vec![n1, n2], vec![], false).await?;
@@ -326,7 +326,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
                 build_id,
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("orphan-drv", "x86_64-linux")],
+                nodes: vec![make_node("orphan-drv")],
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
@@ -989,7 +989,7 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
     let (_db, handle, _task, mut stream_rx) = setup_with_worker("w-idiag", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
-    let node = make_test_node("idiag-drv", "x86_64-linux");
+    let node = make_node("idiag-drv");
     let _events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     // dispatch_ready ran inside merge → drain the assignment so the
     // worker stream stays unblocked.
@@ -1504,16 +1504,12 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
     // seen → est_duration falls back to DEFAULT_DURATION_SECS (30s)
     // → classify() picks smallest covering class = tiny. One FOD
     // node → must NOT appear in any size-class queued.
-    let mut fod = make_test_node("cold-fod", "x86_64-linux");
+    let mut fod = make_node("cold-fod");
     fod.is_fixed_output = true;
     let _rx = merge_dag(
         &handle,
         Uuid::new_v4(),
-        vec![
-            make_test_node("cold-a", "x86_64-linux"),
-            make_test_node("cold-b", "x86_64-linux"),
-            fod,
-        ],
+        vec![make_node("cold-a"), make_node("cold-b"), fod],
         vec![],
         false,
     )

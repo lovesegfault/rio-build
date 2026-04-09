@@ -255,7 +255,7 @@ async fn test_cascade_notifies_merged_builds() -> TestResult {
     let _ev_x = merge_dag(
         &handle,
         build_x,
-        vec![make_test_node("casc-leaf", "x86_64-linux")],
+        vec![make_node("casc-leaf")],
         vec![],
         true, // keep_going so X doesn't fail-fast on leaf alone
     )
@@ -265,10 +265,7 @@ async fn test_cascade_notifies_merged_builds() -> TestResult {
     let _ev_y = merge_dag(
         &handle,
         build_y,
-        vec![
-            make_test_node("casc-parent", "x86_64-linux"),
-            make_test_node("casc-leaf", "x86_64-linux"),
-        ],
+        vec![make_node("casc-parent"), make_node("casc-leaf")],
         vec![make_test_edge("casc-parent", "casc-leaf")],
         true, // keep_going so cascade termination is via check_build_completion
     )
@@ -337,9 +334,9 @@ async fn test_cascade_notifies_union_across_chain() -> TestResult {
         &handle,
         build_x,
         vec![
-            make_test_node("chain-a", "x86_64-linux"),
-            make_test_node("chain-b", "x86_64-linux"),
-            make_test_node("chain-c", "x86_64-linux"),
+            make_node("chain-a"),
+            make_node("chain-b"),
+            make_node("chain-c"),
         ],
         vec![
             make_test_edge("chain-a", "chain-b"),
@@ -351,14 +348,7 @@ async fn test_cascade_notifies_union_across_chain() -> TestResult {
 
     // Build Y: only A. A now has interested_builds={X,Y}.
     let build_y = Uuid::new_v4();
-    let _ev_y = merge_dag(
-        &handle,
-        build_y,
-        vec![make_test_node("chain-a", "x86_64-linux")],
-        vec![],
-        true,
-    )
-    .await?;
+    let _ev_y = merge_dag(&handle, build_y, vec![make_node("chain-a")], vec![], true).await?;
 
     // C fails. Cascade: B→DependencyFailed, A→DependencyFailed.
     complete_failure(
@@ -399,10 +389,7 @@ async fn test_cancel_transitions_queued() -> TestResult {
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("canc-a", "x86_64-linux"),
-            make_test_node("canc-b", "x86_64-linux"),
-        ],
+        vec![make_node("canc-a"), make_node("canc-b")],
         vec![make_test_edge("canc-a", "canc-b")],
         false,
     )
@@ -467,10 +454,7 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("kg-a", "x86_64-linux"),
-            make_test_node("kg-b", "x86_64-linux"),
-        ],
+        vec![make_node("kg-a"), make_node("kg-b")],
         vec![],
         false, // keep_going=false (critical)
     )
@@ -533,7 +517,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
     let out_path = test_store_path("cached-out");
     store.seed_with_content(&out_path, b"dummy");
 
-    let mut node = make_test_node("cached-drv", "x86_64-linux");
+    let mut node = make_node("cached-drv");
     node.expected_output_paths = vec![out_path.clone()];
 
     let build_id = Uuid::new_v4();
@@ -589,7 +573,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             build_id: build_a,
             tenant_id: Some(tenant_a),
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("pre-drv", "x86_64-linux")],
+            nodes: vec![make_node("pre-drv")],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -612,7 +596,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             build_id: build_b,
             tenant_id: Some(tenant_b),
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("pre-drv", "x86_64-linux")],
+            nodes: vec![make_node("pre-drv")],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -686,10 +670,7 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("ttl-d1", "x86_64-linux"),
-            make_test_node("ttl-d2", "x86_64-linux"),
-        ],
+        vec![make_node("ttl-d1"), make_node("ttl-d2")],
         vec![],
         true, // keep_going
     )
@@ -762,10 +743,7 @@ async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
     let _ev = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("clr-d1", "x86_64-linux"),
-            make_test_node("clr-d2", "x86_64-linux"),
-        ],
+        vec![make_node("clr-d1"), make_node("clr-d2")],
         vec![],
         true, // keep_going
     )

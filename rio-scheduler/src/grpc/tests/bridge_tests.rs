@@ -94,7 +94,7 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
     let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
         tenant_name: String::new(),
         priority_class: String::new(),
-        nodes: vec![make_test_node(tag, "x86_64-linux")],
+        nodes: vec![make_node(tag)],
         edges: vec![],
         max_silent_time: 0,
         build_timeout: 0,

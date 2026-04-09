@@ -30,10 +30,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
     merge_dag(
         &handle,
         build_lo,
-        vec![
-            make_test_node("shared-x", "x86_64-linux"),
-            make_test_node("filler-y", "x86_64-linux"),
-        ],
+        vec![make_node("shared-x"), make_node("filler-y")],
         vec![],
         false,
     )
@@ -51,7 +48,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
             build_id: build_hi,
             tenant_id: None,
             priority_class: PriorityClass::Interactive,
-            nodes: vec![make_test_node("shared-x", "x86_64-linux")],
+            nodes: vec![make_node("shared-x")],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -129,7 +126,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("cache-err", "x86_64-linux");
+    let mut node = make_node("cache-err");
     node.expected_output_paths = vec![test_store_path("expected-out")];
 
     // Merge should SUCCEED despite the store error.
@@ -169,7 +166,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
         seq += 1;
         // Unique tag per call — different drv_hash → always newly_inserted.
         let tag = format!("{label}-{seq}");
-        let mut node = make_test_node(&tag, "x86_64-linux");
+        let mut node = make_node(&tag);
         node.expected_output_paths = vec![test_store_path("expected-out")];
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = ActorCommand::MergeDag {
@@ -267,7 +264,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
     let mut do_merge = |label: &str| {
         seq += 1;
         let tag = format!("{label}-{seq}");
-        let mut node = make_test_node(&tag, "x86_64-linux");
+        let mut node = make_node(&tag);
         node.expected_output_paths = vec![test_store_path("expected-out")];
         let build_id = Uuid::new_v4();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -375,7 +372,7 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
     .await?;
 
     // Merge a floating-CA node with the seeded modular_hash.
-    let mut node = make_test_node("ca-cache-hit", "x86_64-linux");
+    let mut node = make_node("ca-cache-hit");
     node.is_content_addressed = true;
     node.ca_modular_hash = modular_hash.to_vec();
     node.expected_output_paths = vec![String::new()]; // floating-CA placeholder
@@ -432,7 +429,7 @@ async fn test_ca_cache_miss_stale_realisation() -> TestResult {
     crate::ca::insert_realisation(&_db.pool, &modular_hash, "out", &stale_path, &[0x22u8; 32])
         .await?;
 
-    let mut node = make_test_node("ca-stale-real", "x86_64-linux");
+    let mut node = make_node("ca-stale-real");
     node.is_content_addressed = true;
     node.ca_modular_hash = modular_hash.to_vec();
     node.expected_output_paths = vec![String::new()];
@@ -479,7 +476,7 @@ async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
 
     // Production shape: FOD ⇒ is_content_addressed + 32-byte modular
     // hash + known expected_output_path. NO realisation row in PG.
-    let mut node = make_test_node("ca-fod-sub", "x86_64-linux");
+    let mut node = make_node("ca-fod-sub");
     node.is_content_addressed = true;
     node.is_fixed_output = true;
     node.ca_modular_hash = [0x42u8; 32].to_vec();
@@ -521,7 +518,7 @@ async fn test_fixed_ca_fod_not_substitutable_dispatches() -> TestResult {
         connect_fetcher_classed(&handle, "f-ca-fod", "x86_64-linux", "tiny").await?;
 
     let fod_out = test_store_path("not-in-any-cache");
-    let mut node = make_test_node("ca-fod-miss", "x86_64-linux");
+    let mut node = make_node("ca-fod-miss");
     node.is_content_addressed = true;
     node.is_fixed_output = true;
     node.ca_modular_hash = [0x43u8; 32].to_vec();
@@ -550,7 +547,7 @@ async fn test_ca_cache_miss_no_realisation() -> TestResult {
     let test_db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(test_db.pool.clone());
 
-    let mut node = make_test_node("ca-cache-miss", "x86_64-linux");
+    let mut node = make_node("ca-cache-miss");
     node.is_content_addressed = true;
     node.ca_modular_hash = [0x99u8; 32].to_vec();
     node.expected_output_paths = vec![String::new()];
@@ -600,7 +597,7 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
         .unwrap()
         .push(sub_path.clone());
 
-    let mut node = make_test_node("sub-probe", "x86_64-linux");
+    let mut node = make_node("sub-probe");
     node.expected_output_paths = vec![sub_path.clone()];
 
     let build_id = Uuid::new_v4();
@@ -652,7 +649,7 @@ async fn test_substitutable_fetch_failure_demotes_to_miss() -> TestResult {
         .fail_query_path_info
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let mut node = make_test_node("sub-fetch-fail", "x86_64-linux");
+    let mut node = make_node("sub-fetch-fail");
     node.expected_output_paths = vec![sub_path];
 
     let build_id = Uuid::new_v4();
@@ -683,7 +680,7 @@ async fn test_missing_non_substitutable_stays_missing() -> TestResult {
     let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     // No seeding: path is missing AND not substitutable.
-    let mut node = make_test_node("truly-missing", "x86_64-linux");
+    let mut node = make_node("truly-missing");
     node.expected_output_paths = vec![test_store_path("truly-missing-out")];
 
     let build_id = Uuid::new_v4();
@@ -726,13 +723,13 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
         .push(root_out.clone());
 
     // DAG: hello (root) → glibc, gcc, stdenv (deps).
-    let mut root = make_test_node("hello", "x86_64-linux");
+    let mut root = make_node("hello");
     root.expected_output_paths = vec![root_out.clone()];
-    let mut glibc = make_test_node("glibc", "x86_64-linux");
+    let mut glibc = make_node("glibc");
     glibc.expected_output_paths = vec![test_store_path("glibc-out")];
-    let mut gcc = make_test_node("gcc", "x86_64-linux");
+    let mut gcc = make_node("gcc");
     gcc.expected_output_paths = vec![test_store_path("gcc-out")];
-    let mut stdenv = make_test_node("stdenv", "x86_64-linux");
+    let mut stdenv = make_node("stdenv");
     stdenv.expected_output_paths = vec![test_store_path("stdenv-out")];
 
     let nodes = vec![root, glibc, gcc, stdenv];
@@ -795,9 +792,9 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
         .unwrap()
         .push(glibc_out.clone());
 
-    let mut root = make_test_node("app", "x86_64-linux");
+    let mut root = make_node("app");
     root.expected_output_paths = vec![test_store_path("app-out")];
-    let mut glibc = make_test_node("glibc-ft", "x86_64-linux");
+    let mut glibc = make_node("glibc-ft");
     glibc.expected_output_paths = vec![glibc_out.clone()];
 
     let nodes = vec![root, glibc];
@@ -858,9 +855,9 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
         .push(glibc_out.clone());
 
     // Build A: hello → glibc. hello substitutable → glibc pruned.
-    let mut hello = make_test_node("hello-a", "x86_64-linux");
+    let mut hello = make_node("hello-a");
     hello.expected_output_paths = vec![hello_out.clone()];
-    let mut glibc_a = make_test_node("glibc-a", "x86_64-linux");
+    let mut glibc_a = make_node("glibc-a");
     glibc_a.expected_output_paths = vec![glibc_out.clone()];
 
     let build_a = Uuid::new_v4();
@@ -886,9 +883,9 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
     // Build B: app → glibc. app NOT substitutable → falls through
     // → full merge → glibc is newly_inserted (NOT pre-existing from
     // A, because A pruned it) → check_cached_outputs fetches glibc.
-    let mut app = make_test_node("app-b", "x86_64-linux");
+    let mut app = make_node("app-b");
     app.expected_output_paths = vec![test_store_path("app-b-out")];
-    let mut glibc_b = make_test_node("glibc-a", "x86_64-linux");
+    let mut glibc_b = make_node("glibc-a");
     glibc_b.expected_output_paths = vec![glibc_out.clone()];
 
     let build_b = Uuid::new_v4();
@@ -944,10 +941,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     merge_dag(
         &handle,
         build_a,
-        vec![
-            make_test_node("app-a", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-a"), make_node("fod-dep")],
         vec![make_test_edge("app-a", "fod-dep")],
         false,
     )
@@ -987,10 +981,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     merge_dag(
         &handle,
         build_b,
-        vec![
-            make_test_node("app-b", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-b"), make_node("fod-dep")],
         vec![make_test_edge("app-b", "fod-dep")],
         false,
     )
@@ -1045,10 +1036,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     merge_dag(
         &handle,
         build_a,
-        vec![
-            make_test_node("app-a", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-a"), make_node("fod-dep")],
         vec![make_test_edge("app-a", "fod-dep")],
         false,
     )
@@ -1081,10 +1069,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     merge_dag(
         &handle,
         build_b,
-        vec![
-            make_test_node("app-b", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-b"), make_node("fod-dep")],
         vec![make_test_edge("app-b", "fod-dep")],
         false,
     )
@@ -1136,10 +1121,7 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     merge_dag(
         &handle,
         build_a,
-        vec![
-            make_test_node("app-a", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-a"), make_node("fod-dep")],
         vec![make_test_edge("app-a", "fod-dep")],
         false,
     )
@@ -1171,10 +1153,7 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     merge_dag(
         &handle,
         build_b,
-        vec![
-            make_test_node("app-b", "x86_64-linux"),
-            make_test_node("fod-dep", "x86_64-linux"),
-        ],
+        vec![make_node("app-b"), make_node("fod-dep")],
         vec![make_test_edge("app-b", "fod-dep")],
         false,
     )
@@ -1211,10 +1190,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     merge_dag(
         &handle,
         build_a,
-        vec![
-            make_test_node("fo-app-a", "x86_64-linux"),
-            make_test_node("fo-dep", "x86_64-linux"),
-        ],
+        vec![make_node("fo-app-a"), make_node("fo-dep")],
         vec![make_test_edge("fo-app-a", "fo-dep")],
         false,
     )
@@ -1232,10 +1208,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     merge_dag(
         &handle,
         build_b,
-        vec![
-            make_test_node("fo-app-b", "x86_64-linux"),
-            make_test_node("fo-dep", "x86_64-linux"),
-        ],
+        vec![make_node("fo-app-b"), make_node("fo-dep")],
         vec![make_test_edge("fo-app-b", "fo-dep")],
         false,
     )
@@ -1269,7 +1242,7 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let path = test_store_path("reprobe-ready");
-    let mut node = make_test_node("reprobe-ready", "x86_64-linux");
+    let mut node = make_node("reprobe-ready");
     node.expected_output_paths = vec![path.clone()];
 
     // Build #1: path NOT substitutable → A is Ready (no deps, no cache).
@@ -1330,7 +1303,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let path = test_store_path("reprobe-poison");
-    let mut node = make_test_node("reprobe-poison", "x86_64-linux");
+    let mut node = make_node("reprobe-poison");
     node.expected_output_paths = vec![path.clone()];
 
     // Build #1 + worker: assign → PermanentFailure → Poisoned.
@@ -1414,7 +1387,7 @@ async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Build #1: single node, force-poison at retry_count=2.
-    let node = make_test_node("i169-under", "x86_64-linux");
+    let node = make_node("i169-under");
     let build1 = Uuid::new_v4();
     merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
     assert!(handle.debug_force_poisoned("i169-under", 2).await?);
@@ -1466,7 +1439,7 @@ async fn test_resubmit_fail_fasts_poisoned_at_retry_limit() -> TestResult {
 
     let (_db, handle, _task) = setup().await;
 
-    let node = make_test_node("i169-at-limit", "x86_64-linux");
+    let node = make_node("i169-at-limit");
     let build1 = Uuid::new_v4();
     merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
     assert!(
@@ -1553,7 +1526,7 @@ async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
         .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
-            ..make_test_node("x", "x86_64-linux")
+            ..make_node("x")
         })
         .collect();
     let mut edges = Vec::with_capacity(N * FANOUT);
@@ -1641,7 +1614,7 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
         .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
-            ..make_test_node("x", "x86_64-linux")
+            ..make_node("x")
         })
         .collect();
     let mut edges = Vec::with_capacity(N * FANOUT);
@@ -1777,7 +1750,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
         .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
-            ..make_test_node("x", "x86_64-linux")
+            ..make_node("x")
         })
         .collect();
     let edges: Vec<_> = (W..N)
@@ -1864,7 +1837,7 @@ async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     // Pre-seed: prior run promoted this FOD to floor='small', then went
     // terminal. New build re-merges it; ON CONFLICT RETURNING must
     // bring the floor back into the freshly-constructed in-memory state.
-    let mut fod = make_test_node("i208-fod", "x86_64-linux");
+    let mut fod = make_node("i208-fod");
     fod.is_fixed_output = true;
     fod.expected_output_paths = vec![test_store_path("i208-out")];
     sqlx::query(
@@ -1916,9 +1889,9 @@ async fn merge_reheaps_preexisting_ready_on_priority_raise() -> TestResult {
     // est_duration via input_srcs_nar_size proxy so its base
     // critical-path priority is higher than "shared" — under build 1
     // alone, "low" would dispatch first.
-    let mut shared = make_test_node("shared", "x86_64-linux");
+    let mut shared = make_node("shared");
     shared.input_srcs_nar_size = 1;
-    let mut low = make_test_node("low", "x86_64-linux");
+    let mut low = make_node("low");
     low.input_srcs_nar_size = 1_000_000_000; // higher closure-size proxy
     let _ev1 = merge_dag(
         &handle,

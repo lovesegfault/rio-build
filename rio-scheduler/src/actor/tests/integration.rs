@@ -43,7 +43,7 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
     // pre-populated path. No worker needed — scheduler should find it
     // cached and complete immediately.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("cached-hash", "x86_64-linux");
+    let mut node = make_node("cached-hash");
     node.expected_output_paths = vec![cached_output.to_string()];
 
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
@@ -81,7 +81,7 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("uncached-hash", "x86_64-linux");
+    let mut node = make_node("uncached-hash");
     // expected_output_paths set but store client is None — should NOT short-circuit
     node.expected_output_paths = vec![test_store_path("uncached-out")];
 
@@ -178,10 +178,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
 
     let build_id = Uuid::new_v4();
     // A depends on B, B depends on A — cycle.
-    let nodes = vec![
-        make_test_node("cycA", "x86_64-linux"),
-        make_test_node("cycB", "x86_64-linux"),
-    ];
+    let nodes = vec![make_node("cycA"), make_node("cycB")];
     let edges = vec![
         make_test_edge("cycA", "cycB"),
         make_test_edge("cycB", "cycA"),
@@ -323,14 +320,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
     // Merge 1 leaf derivation. Dispatch picks tight-worker, try_send
     // fails (receiver gone) — this triggers the recovery path.
     let build_id = Uuid::new_v4();
-    let _event_rx = merge_dag(
-        &handle,
-        build_id,
-        vec![make_test_node("drvA", "x86_64-linux")],
-        vec![],
-        false,
-    )
-    .await?;
+    let _event_rx = merge_dag(&handle, build_id, vec![make_node("drvA")], vec![], false).await?;
 
     // Worker should have ZERO running builds — the failed send must
     // have cleaned up running_build, not leaked the phantom entry.

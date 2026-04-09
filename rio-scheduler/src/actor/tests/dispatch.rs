@@ -77,7 +77,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
 
     // Merge a build with pname="bigthing" so estimator matches.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("bigthing-hash", "x86_64-linux");
+    let mut node = make_node("bigthing-hash");
     node.pname = "bigthing".into();
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
@@ -168,7 +168,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
             build_id,
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("opts-hash", "x86_64-linux")],
+            nodes: vec![make_node("opts-hash")],
             edges: vec![],
             options: BuildOptions {
                 max_silent_time: 60,
@@ -225,7 +225,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
             build_id,
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node("trace-hash", "x86_64-linux")],
+            nodes: vec![make_node("trace-hash")],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -263,7 +263,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
         build_id: Uuid::new_v4(),
         tenant_id: None,
         priority_class: PriorityClass::Scheduled,
-        nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
+        nodes: vec![make_node("dedup-hash")],
         edges: vec![],
         options: BuildOptions::default(),
         keep_going: false,
@@ -302,7 +302,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
         build_id: Uuid::new_v4(),
         tenant_id: None,
         priority_class: PriorityClass::Scheduled,
-        nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
+        nodes: vec![make_node("upgrade-hash")],
         edges: vec![],
         options: BuildOptions::default(),
         keep_going: false,
@@ -349,10 +349,7 @@ async fn test_interactive_priority_boost() -> TestResult {
     let _rx1 = merge_dag(
         &handle,
         build1,
-        vec![
-            make_test_node("prioQ", "x86_64-linux"),
-            make_test_node("prioR", "x86_64-linux"),
-        ],
+        vec![make_node("prioQ"), make_node("prioR")],
         vec![],
         false,
     )
@@ -368,10 +365,7 @@ async fn test_interactive_priority_boost() -> TestResult {
             build_id: build2,
             tenant_id: None,
             priority_class: PriorityClass::Interactive,
-            nodes: vec![
-                make_test_node("prioA", "x86_64-linux"),
-                make_test_node("prioB", "x86_64-linux"),
-            ],
+            nodes: vec![make_node("prioA"), make_node("prioB")],
             edges: vec![make_test_edge("prioA", "prioB")],
             options: BuildOptions::default(),
             keep_going: false,
@@ -505,9 +499,9 @@ async fn test_prefetch_hint_before_assignment() -> TestResult {
     // most tests don't care about it. approx_input_closure DOES care
     // (that's what it iterates). Populate explicitly.
     let child_out = rio_test_support::fixtures::test_store_path("child-out");
-    let mut child = make_test_node("child", "x86_64-linux");
+    let mut child = make_node("child");
     child.expected_output_paths = vec![child_out.clone()];
-    let parent = make_test_node("parent", "x86_64-linux");
+    let parent = make_node("parent");
     let edge = make_test_edge("parent", "child");
 
     let _ev = merge_dag(
@@ -623,9 +617,9 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     // explicitly so approx_input_closure has something to collect.
     let build_id = Uuid::new_v4();
     let child_out = test_store_path("x9-child-out");
-    let mut child = make_test_node("x9-child", "x86_64-linux");
+    let mut child = make_node("x9-child");
     child.expected_output_paths = vec![child_out.clone()];
-    let parent = make_test_node("x9-parent", "x86_64-linux");
+    let parent = make_node("x9-parent");
     let _rx = merge_dag(
         &handle,
         build_id,
@@ -724,14 +718,14 @@ fn ca_on_ca_fixture() -> (
         r#"Derive([("out","","sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("out",""),("system","x86_64-linux")])"#
     );
 
-    let mut child = make_test_node("ca-child", "x86_64-linux");
+    let mut child = make_node("ca-child");
     child.is_content_addressed = true;
     child.needs_resolve = true;
     child.ca_modular_hash = child_modular.to_vec();
     // expected_output_paths can stay empty — parent's PrefetchHint
     // will be empty and skipped (leaf child → no hint anyway).
 
-    let mut parent = make_test_node("ca-parent", "x86_64-linux");
+    let mut parent = make_node("ca-parent");
     parent.is_content_addressed = true;
     parent.needs_resolve = true;
     parent.drv_content = parent_aterm.clone().into_bytes();
@@ -934,7 +928,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux").await?;
 
     let original_content = b"dummy-ia-aterm-content".to_vec();
-    let mut node = make_test_node("ia-drv", "x86_64-linux");
+    let mut node = make_node("ia-drv");
     node.is_content_addressed = false; // explicit: IA
     node.needs_resolve = false; // explicit: no CA inputs either
     node.drv_content = original_content.clone();
@@ -976,7 +970,7 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
         .await?;
 
     let original_content = b"dummy-fod-aterm-content".to_vec();
-    let mut node = make_test_node("fod-drv", "x86_64-linux");
+    let mut node = make_node("fod-drv");
     node.is_content_addressed = true;
     node.is_fixed_output = true;
     node.needs_resolve = false; // gateway: FOD with no CA inputs → no resolve
@@ -1003,14 +997,14 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("noca-w", "x86_64-linux").await?;
 
     let original_content = b"floating-ca-with-ia-deps".to_vec();
-    let mut parent = make_test_node("noca-parent", "x86_64-linux");
+    let mut parent = make_node("noca-parent");
     parent.is_content_addressed = true;
     parent.is_fixed_output = false;
     parent.needs_resolve = true; // floating-CA self — gate passes
     parent.drv_content = original_content.clone();
 
     // IA child — collect_ca_inputs skips it (is_ca=false).
-    let child = make_test_node("noca-child", "x86_64-linux");
+    let child = make_node("noca-child");
 
     let _ev = merge_dag(
         &handle,
@@ -1116,7 +1110,7 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
 
     let nodes: Vec<_> = (0..5)
         .map(|i| {
-            let mut n = make_test_node(&format!("i163-fod-{i}"), "x86_64-linux");
+            let mut n = make_node(&format!("i163-fod-{i}"));
             n.is_fixed_output = true;
             // batch pre-pass filters on !expected_output_paths.is_empty()
             n.expected_output_paths = vec![test_store_path(&format!("i163-fod-{i}-out"))];
@@ -1158,7 +1152,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux").await?;
 
-    let mut n = make_test_node("i163-fo-fod", "x86_64-linux");
+    let mut n = make_node("i163-fo-fod");
     n.is_fixed_output = true;
     n.expected_output_paths = vec![test_store_path("i163-fo-fod-out")];
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
@@ -1247,7 +1241,7 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
     // (the only way size_class_floor is set in production). Merge,
     // let it dispatch to tiny, report failure → floor bumps; then
     // it must redispatch to small.
-    let mut node = make_test_node("oom-fod", "x86_64-linux");
+    let mut node = make_node("oom-fod");
     node.is_fixed_output = true;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -1356,7 +1350,7 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
         })
         .await?;
 
-    let mut node = make_test_node("plain-fod", "x86_64-linux");
+    let mut node = make_node("plain-fod");
     node.is_fixed_output = true;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -1414,7 +1408,7 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
     let mut tiny2_rx = connect_builder_classed(&handle, "b-tiny-2", "x86_64-linux", "tiny").await?;
     let mut small_rx = connect_builder_classed(&handle, "b-small", "x86_64-linux", "small").await?;
 
-    let node = make_test_node("glibc-177", "x86_64-linux");
+    let node = make_node("glibc-177");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     // First dispatch: floor=None, classify()=tiny → one of the tiny

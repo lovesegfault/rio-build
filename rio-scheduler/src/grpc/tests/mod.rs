@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::MIGRATOR;
-use crate::actor::tests::{make_test_node, setup_actor};
+use crate::actor::tests::{make_node, setup_actor};
 // P0356: the trait impls moved to scheduler_service.rs / worker_service.rs.
 // `use super::*` no longer pulls in `SchedulerService` / `ExecutorService` /
 // `Request` as a side effect; tests call the trait methods on

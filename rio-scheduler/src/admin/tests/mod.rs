@@ -302,15 +302,15 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
 /// count) AND the status inclusion (Assigned counts, not just Ready).
 #[tokio::test]
 async fn cluster_status_counts_queued_fod_separately() -> anyhow::Result<()> {
-    use crate::actor::tests::{make_test_node, merge_dag};
+    use crate::actor::tests::{make_node, merge_dag};
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // No worker connected → both nodes stay queued (no dispatch
     // capacity). Clean discriminator test: queue contents only.
-    let mut fod = make_test_node("fod-q", "x86_64-linux");
+    let mut fod = make_node("fod-q");
     fod.is_fixed_output = true;
-    let nonfod = make_test_node("nonfod-q", "x86_64-linux");
+    let nonfod = make_node("nonfod-q");
 
     // Separate builds (no edges → both root → both Ready post-merge).
     merge_dag(&actor, uuid::Uuid::new_v4(), vec![fod], vec![], false).await?;
@@ -339,7 +339,7 @@ async fn cluster_status_counts_queued_fod_separately() -> anyhow::Result<()> {
 async fn cluster_status_queued_fod_includes_assigned() -> anyhow::Result<()> {
     use crate::actor::ActorCommand;
     use crate::actor::tests::{
-        connect_executor_no_ack_kind, make_test_node, merge_dag, recv_assignment,
+        connect_executor_no_ack_kind, make_node, merge_dag, recv_assignment,
     };
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
@@ -359,9 +359,9 @@ async fn cluster_status_queued_fod_includes_assigned() -> anyhow::Result<()> {
             paths_fetched: 0,
         })
         .await?;
-    let mut a = make_test_node("fod-a", "x86_64-linux");
+    let mut a = make_node("fod-a");
     a.is_fixed_output = true;
-    let mut b = make_test_node("fod-b", "x86_64-linux");
+    let mut b = make_node("fod-b");
     b.is_fixed_output = true;
     merge_dag(&actor, uuid::Uuid::new_v4(), vec![a], vec![], false).await?;
     merge_dag(&actor, uuid::Uuid::new_v4(), vec![b], vec![], false).await?;

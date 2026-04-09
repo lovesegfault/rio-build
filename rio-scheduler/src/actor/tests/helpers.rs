@@ -131,7 +131,7 @@ pub(crate) async fn setup_ca_fixture_configured(
         use sha2::{Digest, Sha256};
         Sha256::digest(format!("ca-fixture:{key}").as_bytes()).into()
     };
-    let mut node = make_test_node(key, "x86_64-linux");
+    let mut node = make_node(key);
     node.is_content_addressed = true;
     node.ca_modular_hash = modular_hash.to_vec();
     let drv_path = node.drv_path.clone();
@@ -517,7 +517,7 @@ pub(crate) async fn merge_single_node(
                 build_id,
                 tenant_id: None,
                 priority_class,
-                nodes: vec![make_test_node(tag, "x86_64-linux")],
+                nodes: vec![make_node(tag)],
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
