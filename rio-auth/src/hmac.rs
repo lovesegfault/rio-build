@@ -23,10 +23,6 @@
 //! key (`RIO_SERVICE_HMAC_KEY_PATH`) and `caller` is in the store's
 //! allowlist. The gateway mints a fresh [`ServiceClaims`] per call
 //! (60s expiry — sub-µs to sign, no caching).
-//!
-//! The mTLS CN-allowlist bypass (`request.peer_certs()` → CN check)
-//! remains as a fallback while transport-level TLS is still on; it is
-//! removed once Cilium WireGuard replaces application-level mTLS.
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};

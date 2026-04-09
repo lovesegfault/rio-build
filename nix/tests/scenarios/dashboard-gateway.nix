@@ -14,9 +14,8 @@
 # gRPC-Web spec (browsers can't read HTTP/2 trailers).
 #
 # k3s-full fixture with gatewayEnabled=true: vendors Gateway API CRDs,
-# enables cilium-envoy DaemonSet + gatewayAPI in cilium-render.nix,
-# preloads quay.io/cilium/cilium-envoy. ~5min (bring-up ~4min + Cilium
-# Gateway reconcile + curls).
+# enables gatewayAPI in cilium-render.nix (embedded envoy — no separate
+# cilium-envoy DaemonSet; see eds-rootcause.md). ~5min.
 {
   pkgs,
   common,
