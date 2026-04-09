@@ -833,42 +833,17 @@ impl DagActor {
     /// Transition a derivation to Assigned and send it to the worker.
     /// Returns `true` if the assignment was sent, `false` if it failed
     /// (caller should defer the derivation, not retry immediately).
+    ///
+    /// Phases (each a sub-method below): transition → record (PG +
+    /// in-mem) → send (with rollback) → emit. Split so the rollback
+    /// inverse-of-record relationship is auditable side-by-side.
     pub(super) async fn assign_to_worker(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
     ) -> bool {
-        // Transition ready -> assigned. Do this FIRST (before recording latency
-        // or clearing ready_at) so a rejected transition doesn't pollute metrics.
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            if let Err(e) = state.transition(DerivationStatus::Assigned) {
-                // Not in Ready state (TOCTOU vs. the dispatch_ready pre-check).
-                // Caller will defer; the next dispatch pass drops it via the
-                // status != Ready guard. Log so operators can spot races.
-                warn!(
-                    drv_hash = %drv_hash,
-                    executor_id = %executor_id,
-                    current = ?state.status(),
-                    error = %e,
-                    "Ready->Assigned transition rejected in assign_to_worker (TOCTOU)"
-                );
-                metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "assigned")
-                    .increment(1);
-                return false;
-            }
-            // Record dispatch wait (Ready -> Assigned time) after transitioning.
-            // Fed from `ready_at` (set on transition→Ready in DerivationState).
-            if let Some(ready_at) = state.ready_at.take() {
-                metrics::histogram!("rio_scheduler_dispatch_wait_seconds")
-                    .record(ready_at.elapsed().as_secs_f64());
-            }
-            // Clear retry-backoff deadline: we're dispatching, the
-            // backoff has been honored (dispatch_ready wouldn't
-            // have let us here otherwise). Next failure gets a
-            // fresh computed backoff from the (incremented)
-            // retry_count.
-            state.retry.backoff_until = None;
-            state.assigned_executor = Some(executor_id.clone());
+        if !self.transition_to_assigned(drv_hash, executor_id) {
+            return false;
         }
 
         // Single atomic load. The lease task may fetch_add the
@@ -884,63 +859,14 @@ impl DagActor {
         // (is_leader=true, which dispatch_ready checked at loop top).
         let generation = self.leader.generation();
 
-        // Update DB (non-terminal: log failure, don't block dispatch)
-        self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))
+        self.record_assignment(drv_hash, executor_id, generation)
             .await;
 
-        // Create assignment in DB. PG BIGINT is signed; cast at THIS
-        // boundary, not at the proto-encode sites below. One cast
-        // instead of two, and the proto sites are hotter (this PG
-        // write is best-effort anyway — log+continue on error).
-        if let Some(state) = self.dag.node(drv_hash)
-            && let Some(db_id) = state.db_id
-            && let Err(e) = self
-                .db
-                .insert_assignment(db_id, executor_id, generation as i64)
-                .await
-        {
-            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e, "failed to insert assignment record");
-        }
-
-        // Track on worker. has_capacity() (running_build.is_none()) was
-        // checked by hard_filter before we got here, so this never
-        // overwrites a live assignment.
-        if let Some(worker) = self.executors.get_mut(executor_id) {
-            debug_assert!(
-                worker.running_build.is_none(),
-                "assign_to_worker called for busy executor (hard_filter gap?)"
-            );
-            worker.running_build = Some(drv_hash.clone());
-        }
-
-        // r[impl sched.gc.live-pins]
-        // Auto-pin: write input-closure paths to scheduler_live_pins
-        // so GC's mark CTE protects them. Same closure
-        // approximation as send_prefetch_hint (approx_input_closure).
-        // Best-effort: PG failure logs + continues; 24h grace period
-        // is the fallback. Empty for leaf derivations → no-op.
-        {
-            let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
-            if !input_paths.is_empty()
-                && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
-            {
-                debug!(drv_hash = %drv_hash, error = %e,
-                       "failed to pin live inputs (best-effort; grace period is fallback)");
-            }
-        }
-
         // PrefetchHint BEFORE WorkAssignment: the worker starts
-        // warming its FUSE cache while still parsing the .drv
-        // (which it fetches or extracts from drv_content below).
-        // A few seconds of head-start on a multi-minute fetch
-        // is the win.
-        //
-        // Best-effort: try_send, failure logs debug not warn
-        // (hint not contract). If the channel is full (worker's
-        // recv loop busy), the assignment that follows will
-        // likely also fail → the reset_to_ready cleanup below
-        // handles it. If only the HINT fails, the build still
-        // works, just fetches on-demand via FUSE.
+        // warming its FUSE cache while still parsing the .drv. A few
+        // seconds of head-start on a multi-minute fetch is the win.
+        // Best-effort: try_send, failure logs debug not warn. If only
+        // the HINT fails, the build still works (on-demand FUSE).
         self.send_prefetch_hint(executor_id, drv_hash);
 
         // Resolve CA inputs + construct the WorkAssignment proto.
@@ -954,90 +880,207 @@ impl DagActor {
             return false;
         };
 
-        // Send WorkAssignment to worker via stream
-        {
-            let msg = rio_proto::types::SchedulerMessage {
-                msg: Some(rio_proto::types::scheduler_message::Msg::Assignment(
-                    assignment,
-                )),
-            };
-
-            if let Some(worker) = self.executors.get(executor_id)
-                && let Some(tx) = &worker.stream_tx
-                && let Err(e) = tx.try_send(msg)
-            {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %drv_hash,
-                    error = %e,
-                    "failed to send assignment to worker"
-                );
-                // Clean up worker tracking (we set drv_hash above;
-                // without this, the worker appears busy, causing a
-                // phantom capacity leak).
-                if let Some(worker) = self.executors.get_mut(executor_id)
-                    && worker.running_build.as_ref() == Some(drv_hash)
-                {
-                    worker.running_build = None;
-                }
-                // Reset state: Assigned -> Ready. Caller (dispatch_ready)
-                // will defer the derivation; next dispatch pass retries.
-                // Do NOT push_front here — that would cause the inner
-                // dispatch loop to spin (channel is still full).
-                if let Some(state) = self.dag.node_mut(drv_hash)
-                    && let Err(e) = state.reset_to_ready()
-                {
-                    // We already transitioned to Assigned, cleared running_build,
-                    // and now can't reset. Derivation is orphaned in Assigned
-                    // with no worker actually building. Heartbeat reconciliation
-                    // may eventually catch this, but it's a visible hang until then.
-                    error!(
-                        drv_hash = %drv_hash,
-                        executor_id = %executor_id,
-                        current = ?state.status(),
-                        error = %e,
-                        "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
-                    );
-                    metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
-                        .increment(1);
-                }
-
-                // Also clean up PG state written above.
-                // unpin: pin_live_inputs wrote scheduler_live_pins
-                // rows. Without unpinning, they leak until terminal
-                // cleanup (which never runs if this drv stays stuck).
-                self.unpin_best_effort(drv_hash).await;
-                // delete assignment: insert_assignment wrote a
-                // 'pending' row. On recovery, this row is misleading
-                // (the worker never got the assignment). log-on-fail:
-                // this is best-effort cleanup.
-                if let Some(state) = self.dag.node(drv_hash)
-                    && let Some(db_id) = state.db_id
-                    && let Err(e) = self.db.delete_latest_assignment(db_id).await
-                {
-                    warn!(drv_hash = %drv_hash, error = %e,
-                          "delete_latest_assignment failed during try_send rollback");
-                }
-
-                // This derivation WAS Assigned (counted in running), now
-                // Ready (queued). emit_progress so the dashboard sees
-                // the rollback instead of stale state until re-dispatch.
-                for build_id in self.get_interested_builds(drv_hash) {
-                    self.emit_progress(build_id);
-                }
-
-                return false;
-            }
+        if !self.try_send_assignment(drv_hash, executor_id, assignment) {
+            self.rollback_assignment(drv_hash, executor_id).await;
+            return false;
         }
 
-        // Emit derivation started event
-        let interested_builds = self.get_interested_builds(drv_hash);
-        for build_id in &interested_builds {
+        self.emit_assignment_started(drv_hash, executor_id);
+        debug!(drv_hash = %drv_hash, executor_id = %executor_id, "assigned derivation to worker");
+        metrics::counter!("rio_scheduler_assignments_total").increment(1);
+        true
+    }
+
+    /// Phase 1 of [`assign_to_worker`](Self::assign_to_worker):
+    /// Ready→Assigned transition + dispatch_wait metric + clear
+    /// backoff. Returns `false` on TOCTOU (caller defers).
+    fn transition_to_assigned(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return true; // node gone — let downstream phases handle
+        };
+        // Transition FIRST so a rejected transition doesn't pollute
+        // the dispatch_wait metric or clear ready_at.
+        if let Err(e) = state.transition(DerivationStatus::Assigned) {
+            // Not in Ready state (TOCTOU vs. the dispatch_ready
+            // pre-check). Caller defers; next dispatch pass drops it
+            // via the status != Ready guard.
+            warn!(
+                drv_hash = %drv_hash,
+                executor_id = %executor_id,
+                current = ?state.status(),
+                error = %e,
+                "Ready->Assigned transition rejected in assign_to_worker (TOCTOU)"
+            );
+            metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "assigned")
+                .increment(1);
+            return false;
+        }
+        // Record dispatch wait (Ready -> Assigned time). Fed from
+        // `ready_at` (set on transition→Ready in DerivationState).
+        if let Some(ready_at) = state.ready_at.take() {
+            metrics::histogram!("rio_scheduler_dispatch_wait_seconds")
+                .record(ready_at.elapsed().as_secs_f64());
+        }
+        // Clear retry-backoff: dispatch_ready wouldn't have let us
+        // here unless honored. Next failure recomputes from the
+        // (incremented) retry_count.
+        state.retry.backoff_until = None;
+        state.assigned_executor = Some(executor_id.clone());
+        true
+    }
+
+    /// Phase 2 of [`assign_to_worker`](Self::assign_to_worker): record
+    /// the assignment everywhere except the worker stream — PG status,
+    /// PG `assignments` row, in-mem `worker.running_build`, GC
+    /// `scheduler_live_pins`. All best-effort (log+continue). Inverse
+    /// is [`rollback_assignment`](Self::rollback_assignment).
+    // r[impl sched.gc.live-pins]
+    async fn record_assignment(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor_id: &ExecutorId,
+        generation: u64,
+    ) {
+        self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))
+            .await;
+
+        // PG BIGINT is signed; cast at THIS boundary, not at the
+        // proto-encode sites (hotter). Best-effort: log+continue.
+        if let Some(state) = self.dag.node(drv_hash)
+            && let Some(db_id) = state.db_id
+            && let Err(e) = self
+                .db
+                .insert_assignment(db_id, executor_id, generation as i64)
+                .await
+        {
+            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                   "failed to insert assignment record");
+        }
+
+        // has_capacity() (running_build.is_none()) was checked by
+        // hard_filter, so this never overwrites a live assignment.
+        if let Some(worker) = self.executors.get_mut(executor_id) {
+            debug_assert!(
+                worker.running_build.is_none(),
+                "assign_to_worker called for busy executor (hard_filter gap?)"
+            );
+            worker.running_build = Some(drv_hash.clone());
+        }
+
+        // Auto-pin input-closure paths to scheduler_live_pins so GC's
+        // mark CTE protects them. Same closure approximation as
+        // send_prefetch_hint. Best-effort; 24h grace is fallback.
+        let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+        if !input_paths.is_empty()
+            && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
+        {
+            debug!(drv_hash = %drv_hash, error = %e,
+                   "failed to pin live inputs (best-effort; grace period is fallback)");
+        }
+    }
+
+    /// Phase 3a of [`assign_to_worker`](Self::assign_to_worker):
+    /// `try_send` the proto onto the worker's bidi stream. `false` if
+    /// the channel is full/closed (caller rolls back).
+    ///
+    /// If the worker has no `stream_tx` (or vanished from the map),
+    /// returns `true` WITHOUT sending — preserves pre-refactor behavior
+    /// where the if-let chain fell through. The actor is
+    /// single-threaded so an executor selected by `best_executor` can't
+    /// disappear before this point; the fall-through is unreachable in
+    /// practice but kept verbatim. A `debug_assert!` flags it in tests.
+    fn try_send_assignment(
+        &self,
+        drv_hash: &DrvHash,
+        executor_id: &ExecutorId,
+        assignment: rio_proto::types::WorkAssignment,
+    ) -> bool {
+        let Some(tx) = self
+            .executors
+            .get(executor_id)
+            .and_then(|w| w.stream_tx.as_ref())
+        else {
+            debug_assert!(
+                false,
+                "selected executor {executor_id} has no stream_tx at send time"
+            );
+            return true;
+        };
+        let msg = rio_proto::types::SchedulerMessage {
+            msg: Some(rio_proto::types::scheduler_message::Msg::Assignment(
+                assignment,
+            )),
+        };
+        if let Err(e) = tx.try_send(msg) {
+            warn!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
+                  "failed to send assignment to worker");
+            return false;
+        }
+        true
+    }
+
+    /// Phase 3b of [`assign_to_worker`](Self::assign_to_worker):
+    /// inverse of [`record_assignment`](Self::record_assignment) +
+    /// [`transition_to_assigned`](Self::transition_to_assigned). Clears
+    /// `worker.running_build`, resets state to Ready, unpins, deletes
+    /// the PG assignments row, emits progress so the dashboard sees the
+    /// rollback. Do NOT re-queue here — channel is still full; caller's
+    /// `ctx.deferred` handles that next pass.
+    async fn rollback_assignment(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
+        // Worker tracking (set in record_assignment). Without this the
+        // worker appears busy → phantom capacity leak.
+        if let Some(worker) = self.executors.get_mut(executor_id)
+            && worker.running_build.as_ref() == Some(drv_hash)
+        {
+            worker.running_build = None;
+        }
+        // Assigned -> Ready. Caller (dispatch_ready) defers; next pass
+        // retries.
+        if let Some(state) = self.dag.node_mut(drv_hash)
+            && let Err(e) = state.reset_to_ready()
+        {
+            // Already transitioned to Assigned, can't reset. Orphaned
+            // in Assigned with no worker building. Heartbeat reconcile
+            // may eventually catch this — visible hang until then.
+            error!(
+                drv_hash = %drv_hash,
+                executor_id = %executor_id,
+                current = ?state.status(),
+                error = %e,
+                "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
+            );
+            metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
+                .increment(1);
+        }
+        // PG cleanup (inverse of record_assignment):
+        //   - unpin: pin_live_inputs wrote scheduler_live_pins rows;
+        //     leak until terminal cleanup if not undone.
+        //   - delete_latest_assignment: insert_assignment wrote a
+        //     'pending' row; misleading on recovery.
+        self.unpin_best_effort(drv_hash).await;
+        if let Some(state) = self.dag.node(drv_hash)
+            && let Some(db_id) = state.db_id
+            && let Err(e) = self.db.delete_latest_assignment(db_id).await
+        {
+            warn!(drv_hash = %drv_hash, error = %e,
+                  "delete_latest_assignment failed during try_send rollback");
+        }
+        // Was Assigned (counted in running), now Ready (queued).
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.emit_progress(build_id);
+        }
+    }
+
+    /// Phase 4 of [`assign_to_worker`](Self::assign_to_worker): emit
+    /// `DerivationStarted` + progress to interested gateways.
+    fn emit_assignment_started(&mut self, drv_hash: &DrvHash, executor_id: &ExecutorId) {
+        let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+        for build_id in self.get_interested_builds(drv_hash) {
             self.events.emit(
-                *build_id,
+                build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
+                        derivation_path: drv_path.clone(),
                         status: Some(rio_proto::types::derivation_event::Status::Started(
                             rio_proto::types::DerivationStarted {
                                 executor_id: executor_id.to_string(),
@@ -1047,15 +1090,10 @@ impl DagActor {
                 ),
             );
             // Progress snapshot: running count +1, worker set changed.
-            // Critpath unchanged on dispatch (no completion, no
-            // update_ancestors) — but the dashboard also uses
-            // Progress for the running/queued columns, so emit.
-            self.emit_progress(*build_id);
+            // Critpath unchanged on dispatch (no completion) — but the
+            // dashboard also uses Progress for running/queued columns.
+            self.emit_progress(build_id);
         }
-
-        debug!(drv_hash = %drv_hash, executor_id = %executor_id, "assigned derivation to worker");
-        metrics::counter!("rio_scheduler_assignments_total").increment(1);
-        true
     }
 
     /// Construct the [`WorkAssignment`] proto for `drv_hash` →
