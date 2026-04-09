@@ -856,7 +856,7 @@ impl DagActor {
     /// Phases 2-5 of success completion for content-addressed
     /// derivations: realisation insert, cutoff-compare, cutoff-
     /// propagate cascade, realisation_deps insert. All four are
-    /// no-ops for IA derivations (each block gates on `state.ca.is_ca`
+    /// no-ops for IA derivations (each phase gates on `state.ca.is_ca`
     /// / `state.ca.modular_hash` internally). Returns the union of
     /// `interested_builds` over all cascade-skipped nodes — the caller
     /// folds these into its `check_build_completion` loop so a merged
@@ -866,7 +866,22 @@ impl DagActor {
         drv_hash: &DrvHash,
         built_outputs: &[rio_proto::types::BuiltOutput],
     ) -> HashSet<Uuid> {
-        // r[impl sched.ca.resolve+2]
+        self.ca_insert_realisations(drv_hash, built_outputs).await;
+        let prior_seeds = self.ca_cutoff_compare(drv_hash, built_outputs).await;
+        let skipped_interested = self.ca_cutoff_cascade(drv_hash, &prior_seeds).await;
+        self.ca_insert_realisation_deps(drv_hash, built_outputs)
+            .await;
+        skipped_interested
+    }
+
+    /// Phase 2: realisation insert. Best-effort — PG blip degrades
+    /// CA-on-CA resolve, not the build itself.
+    // r[impl sched.ca.resolve+2]
+    async fn ca_insert_realisations(
+        &self,
+        drv_hash: &DrvHash,
+        built_outputs: &[rio_proto::types::BuiltOutput],
+    ) {
         // Realisation insert: for a CA derivation, write
         // `(modular_hash, output_name) → (output_path, output_hash)`
         // to PG NOW, before `find_newly_ready` below queues the
@@ -931,8 +946,20 @@ impl DagActor {
                 }
             }
         }
+    }
 
-        // r[impl sched.ca.cutoff-compare]
+    /// Phase 3: per-output cutoff-compare. Queries `realisations` for a
+    /// PRIOR build (different `modular_hash`, same `output_path`) for
+    /// each output; AND-folds into `state.ca.output_unchanged`. Returns
+    /// the discovered prior `(modular_hash, output_name)` seeds for
+    /// [`Self::ca_cutoff_cascade`]. No-op (empty seeds, `output_unchanged`
+    /// untouched) for IA / no-modular-hash.
+    // r[impl sched.ca.cutoff-compare]
+    async fn ca_cutoff_compare(
+        &mut self,
+        drv_hash: &DrvHash,
+        built_outputs: &[rio_proto::types::BuiltOutput],
+    ) -> Vec<(Vec<u8>, String)> {
         // CA early-cutoff compare: if this was a CA derivation, check
         // each output_path against the realisations table for a PRIOR
         // build (different modular_hash, same path). All-match →
@@ -1050,8 +1077,22 @@ impl DagActor {
                 state.ca.output_unchanged = all_matched;
             }
         }
+        prior_seeds
+    }
 
-        // r[impl sched.ca.cutoff-propagate+2]
+    /// Phase 4: cutoff-propagate cascade. If [`Self::ca_cutoff_compare`]
+    /// set `output_unchanged=true`, verify the prior outputs still exist
+    /// (GC-defense), transitively skip downstream Queued derivations,
+    /// stamp/persist each skipped node, and promote any newly-Ready
+    /// parents-of-Skipped. Returns the union of `interested_builds`
+    /// across skipped nodes — folded into the caller's
+    /// `check_build_completion` loop.
+    // r[impl sched.ca.cutoff-propagate+2]
+    async fn ca_cutoff_cascade(
+        &mut self,
+        drv_hash: &DrvHash,
+        prior_seeds: &[(Vec<u8>, String)],
+    ) -> HashSet<Uuid> {
         // Cascade: if the compare set ca_output_unchanged=true,
         // transitively skip downstream Queued derivations whose only
         // incomplete dep was this one.
@@ -1078,7 +1119,7 @@ impl DagActor {
             .node(drv_hash)
             .is_some_and(|s| s.ca.output_unchanged)
         {
-            let verified = self.verify_cutoff_candidates(drv_hash, &prior_seeds).await;
+            let verified = self.verify_cutoff_candidates(drv_hash, prior_seeds).await;
             let (skipped, cap_hit) = self
                 .dag
                 .cascade_cutoff(drv_hash, |h| verified.contains_key(h));
@@ -1183,8 +1224,19 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_ca_cutoff_depth_cap_hits_total").increment(1);
             }
         }
+        skipped_interested
+    }
 
-        // r[impl sched.ca.resolve+2]
+    /// Phase 5: realisation_deps insert. Drains
+    /// `pending_realisation_deps` (recorded at dispatch-time CA-on-CA
+    /// resolve) into PG. Best-effort — `realisation_deps` is rio's
+    /// derived-build-trace cache, not correctness-critical.
+    // r[impl sched.ca.resolve+2]
+    async fn ca_insert_realisation_deps(
+        &mut self,
+        drv_hash: &DrvHash,
+        built_outputs: &[rio_proto::types::BuiltOutput],
+    ) {
         // realisation_deps insert: the CA-on-CA resolve at dispatch
         // time recorded every `(dep_modular_hash, dep_output_name)`
         // lookup into `pending_realisation_deps`. The FK ordering
@@ -1229,8 +1281,6 @@ impl DagActor {
                 );
             }
         }
-
-        skipped_interested
     }
 
     /// Phase 7 of success completion: build_history EMA update,
