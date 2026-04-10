@@ -26,7 +26,7 @@ use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, shell};
 use crate::{ssh, tofu, ui};
 
-const TENANT: &str = "smoke-test";
+pub const TENANT: &str = "smoke-test";
 
 /// Default upstream binary cache for the smoke tenant. Without this,
 /// substitution is dead (`cache_token=no`), and FODs whose live URL
@@ -132,8 +132,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             CliCtx::open(&client, SCHED_PORT, STORE_PORT)
         })
         .await?;
-        ui::step("bootstrap tenant", || step_tenant(&cli)).await?;
-        ui::step("configure upstream cache", || step_upstream(&cli)).await?;
+        ui::step("bootstrap tenant", || step_tenant(&cli, TENANT)).await?;
+        ui::step("configure upstream cache", || step_upstream(&cli, TENANT)).await?;
         ui::step("install ssh key", || step_install_key(&client)).await?;
         ui::step("restart gateway", || step_restart_gateway(&client)).await?;
         // NLB target registration + health-check cycle is separate
@@ -169,16 +169,16 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
-    info!("bootstrapping tenant '{TENANT}'");
+pub async fn step_tenant(cli: &CliCtx, tenant: &str) -> Result<()> {
+    info!("bootstrapping tenant '{tenant}'");
     // rio-cli exits non-zero on AlreadyExists → CliCtx::run returns Err.
     // Check the error text for idempotent re-run before propagating.
-    let out = match cli.run(&["create-tenant", TENANT]) {
+    let out = match cli.run(&["create-tenant", tenant]) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("{e:#}");
             if msg.to_lowercase().contains("already exists") {
-                info!("tenant '{TENANT}' already exists (idempotent re-run)");
+                info!("tenant '{tenant}' already exists (idempotent re-run)");
                 return Ok(());
             }
             debug!("create-tenant error text (no already-exists match): {msg}");
@@ -186,17 +186,17 @@ pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
         }
     };
     // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
-    if !out.contains(&format!("tenant {TENANT}")) {
+    if !out.contains(&format!("tenant {tenant}")) {
         bail!("create-tenant failed: {out}");
     }
     Ok(())
 }
 
-/// I-092: configure cache.nixos.org as the smoke tenant's upstream
+/// I-092: configure cache.nixos.org as the tenant's upstream
 /// substitution cache. Idempotent — checks `upstream list` first.
 /// Relies on I-093 (`--tenant` accepts a name).
-pub async fn step_upstream(cli: &CliCtx) -> Result<()> {
-    let listed = cli.run(&["upstream", "list", "--tenant", TENANT, "--json"])?;
+pub async fn step_upstream(cli: &CliCtx, tenant: &str) -> Result<()> {
+    let listed = cli.run(&["upstream", "list", "--tenant", tenant, "--json"])?;
     if listed.contains(UPSTREAM_URL) {
         info!("upstream {UPSTREAM_URL} already configured (idempotent re-run)");
         return Ok(());
@@ -205,13 +205,13 @@ pub async fn step_upstream(cli: &CliCtx) -> Result<()> {
         "upstream",
         "add",
         "--tenant",
-        TENANT,
+        tenant,
         "--url",
         UPSTREAM_URL,
         "--trusted-key",
         UPSTREAM_KEY,
     ])?;
-    info!("added upstream {UPSTREAM_URL} for tenant '{TENANT}'");
+    info!("added upstream {UPSTREAM_URL} for tenant '{tenant}'");
     Ok(())
 }
 
@@ -570,8 +570,8 @@ pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> 
         .replace("@CHUNK@", &"x".repeat(1023));
     // IdentitiesOnly=yes (see `shared::NIX_SSHOPTS_BASE`): the user's
     // deploy key (comment "default") is in authorized_keys too. Without
-    // this, ssh-agent offers that key first → gateway sees tenant
-    // "default" → scheduler rejects "unknown tenant".
+    // this, ssh-agent offers that key first → gateway routes the build
+    // to tenant "default" instead of [`TENANT`].
     const SSHOPTS: &str = crate::k8s::shared::NIX_SSHOPTS_BASE;
 
     // Scope each Shell to end before .await so the future stays Send

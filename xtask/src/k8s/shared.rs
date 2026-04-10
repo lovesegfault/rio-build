@@ -133,9 +133,11 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
 /// Write the `rio-gateway-ssh` Secret. When `tenant` is `None` and
 /// `RIO_SSH_TENANT` is unset, preserves the existing Secret's comment
 /// instead of clobbering to `default` (I-100: a bare `xtask deploy`
-/// after smoke wrote `smoke-test` would otherwise break tenant routing
-/// — `unknown tenant: default`). Falls through to [`crate::ssh::DEFAULT_TENANT`]
-/// only on first deploy (Secret absent).
+/// after smoke wrote `smoke-test` would otherwise silently re-route
+/// the user's key to a different tenant). Falls through to
+/// [`crate::ssh::DEFAULT_TENANT`] only on first deploy (Secret absent);
+/// EKS deploy creates that tenant in the scheduler so `rsb` works
+/// out of the box.
 pub async fn ensure_gateway_ssh_secret(
     client: &kube::Client,
     cfg: &XtaskConfig,

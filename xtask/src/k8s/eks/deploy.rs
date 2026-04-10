@@ -340,6 +340,20 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     })
     .await?;
 
+    // Bootstrap the `default` tenant + cache.nixos.org upstream so
+    // `xtask rsb` works out of the box. The user's SSH key (written
+    // above with comment [`crate::ssh::DEFAULT_TENANT`]) routes to this
+    // tenant; without it the first `rsb` after a fresh `up` fails with
+    // `SubmitBuild: unknown tenant: default`. Idempotent — re-deploys
+    // see AlreadyExists. Tunnel uses ephemeral local ports (port-
+    // forward to scheduler+store; helm --wait above guarantees Ready).
+    ui::step("bootstrap default tenant", || async {
+        let cli = super::smoke::CliCtx::open(&client, 0, 0).await?;
+        super::smoke::step_tenant(&cli, crate::ssh::DEFAULT_TENANT).await?;
+        super::smoke::step_upstream(&cli, crate::ssh::DEFAULT_TENANT).await
+    })
+    .await?;
+
     // P0539e: helm --wait returns when PODS are Ready, but the NLB's
     // target registration + health-check round lags ~30-90s behind.
     // A follow-up `rsb` in that window connects to a TG with zero

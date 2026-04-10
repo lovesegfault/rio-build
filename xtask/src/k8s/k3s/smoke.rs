@@ -29,8 +29,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT)
         })
         .await?;
-        ui::step("bootstrap tenant", || chaos::step_tenant(&cli)).await?;
-        ui::step("configure upstream cache", || chaos::step_upstream(&cli)).await?;
+        ui::step("bootstrap tenant", || chaos::step_tenant(&cli, chaos::TENANT)).await?;
+        ui::step("configure upstream cache", || chaos::step_upstream(&cli, chaos::TENANT)).await?;
         ui::step("install ssh key", || chaos::step_install_key(&client)).await?;
         ui::step("restart gateway", || chaos::step_restart_gateway(&client)).await?;
         // Port-forward to the gateway Service (instead of SSM→NLB).
