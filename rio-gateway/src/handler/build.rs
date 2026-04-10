@@ -13,6 +13,7 @@ use rio_nix::protocol::stderr::{
     ActivityType, ResultField, ResultType, StderrError, StderrWriter, verbosity,
 };
 use rio_nix::protocol::wire;
+use rio_nix::store_path::StorePath;
 use rio_proto::{SchedulerServiceClient, StoreServiceClient, types};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tonic::transport::Channel;
@@ -1084,6 +1085,26 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     Ok(DagSubmitOutcome::Built(result))
 }
 
+/// Resolve a `.drv` and reconstruct its full transitive DAG. Shared
+/// `DerivedPath::Built` arm of the two `wopBuildPaths*` handlers — both
+/// do `resolve_derivation` → `reconstruct_dag` → extend nodes/edges,
+/// differing only in error sink (`stderr_err!` abort vs. per-path
+/// `BuildResult::failure`).
+async fn resolve_built_dag(
+    drv: &StorePath,
+    ctx: &mut SessionContext,
+) -> anyhow::Result<(
+    Vec<types::DerivationNode>,
+    Vec<types::DerivationEdge>,
+    Derivation,
+)> {
+    let drv_obj = resolve_derivation(drv, &mut ctx.store_client, &mut ctx.drv_cache).await?;
+    let (nodes, edges) =
+        translate::reconstruct_dag(drv, &drv_obj, &mut ctx.store_client, &mut ctx.drv_cache)
+            .await?;
+    Ok((nodes, edges, drv_obj))
+}
+
 // r[impl gw.opcode.build-paths]
 /// wopBuildPaths (9): Build a set of derivations.
 #[instrument(skip_all, fields(count = tracing::field::Empty))]
@@ -1126,33 +1147,13 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                     Err(e) => stderr_err!(stderr, "store error: {e}"),
                 }
             }
-            DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(
-                    drv,
-                    &mut ctx.store_client,
-                    &mut ctx.drv_cache,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => stderr_err!(stderr, "store error: {e}"),
-                };
-
-                match translate::reconstruct_dag(
-                    drv,
-                    &drv_obj,
-                    &mut ctx.store_client,
-                    &mut ctx.drv_cache,
-                )
-                .await
-                {
-                    Ok((nodes, edges)) => {
-                        all_nodes.extend(nodes);
-                        all_edges.extend(edges);
-                    }
-                    Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
+            DerivedPath::Built { drv, .. } => match resolve_built_dag(drv, ctx).await {
+                Ok((nodes, edges, _)) => {
+                    all_nodes.extend(nodes);
+                    all_edges.extend(edges);
                 }
-            }
+                Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
+            },
         }
     }
 
@@ -1244,45 +1245,19 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     };
                 opaque_results.insert(idx, result);
             }
-            DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(
-                    drv,
-                    &mut ctx.store_client,
-                    &mut ctx.drv_cache,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        opaque_results.insert(
-                            idx,
-                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
-                        );
-                        continue;
-                    }
-                };
-
-                match translate::reconstruct_dag(
-                    drv,
-                    &drv_obj,
-                    &mut ctx.store_client,
-                    &mut ctx.drv_cache,
-                )
-                .await
-                {
-                    Ok((nodes, edges)) => {
-                        all_nodes.extend(nodes);
-                        all_edges.extend(edges);
-                        drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
-                    }
-                    Err(e) => {
-                        opaque_results.insert(
-                            idx,
-                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
-                        );
-                    }
+            DerivedPath::Built { drv, .. } => match resolve_built_dag(drv, ctx).await {
+                Ok((nodes, edges, drv_obj)) => {
+                    all_nodes.extend(nodes);
+                    all_edges.extend(edges);
+                    drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
                 }
-            }
+                Err(e) => {
+                    opaque_results.insert(
+                        idx,
+                        BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
+                    );
+                }
+            },
         }
     }
 
