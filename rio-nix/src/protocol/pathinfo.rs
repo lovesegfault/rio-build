@@ -13,7 +13,7 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::wire::{
-    self, Result, read_bool, read_nar_hash, read_string, read_strings, read_u64, write_bool,
+    Result, read_bool, read_nar_hash, read_string, read_strings, read_u64, write_bool,
     write_nar_hash, write_string, write_strings, write_u64,
 };
 
@@ -81,23 +81,6 @@ pub async fn read_valid_path_info<R: AsyncRead + Unpin>(r: &mut R) -> Result<Val
     })
 }
 
-/// Compute the on-wire byte length of a [`ValidPathInfo`] body. Used by
-/// streaming framers (`wopAddMultipleToStore`) that need to size a header
-/// before the NAR payload.
-pub fn encoded_len(info: &ValidPathInfo) -> u64 {
-    let str_len = |s: &str| 8 + s.len() as u64 + wire::padding_len(s.len()) as u64;
-    let strs_len = |v: &[String]| 8 + v.iter().map(|s| str_len(s)).sum::<u64>();
-    str_len(info.deriver.as_deref().unwrap_or(""))
-        // nar_hash → lowercase hex string (2 chars/byte)
-        + str_len(&hex::encode(&info.nar_hash))
-        + strs_len(&info.references)
-        + 8 // registration_time
-        + 8 // nar_size
-        + 8 // ultimate
-        + strs_len(&info.signatures)
-        + str_len(info.content_address.as_deref().unwrap_or(""))
-}
-
 fn none_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -148,16 +131,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn encoded_len_matches_wire() -> anyhow::Result<()> {
-        for info in [sample(), ValidPathInfo::default()] {
-            let mut buf = Vec::new();
-            write_valid_path_info(&mut buf, &info).await?;
-            assert_eq!(encoded_len(&info), buf.len() as u64);
-        }
-        Ok(())
-    }
-
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -195,7 +168,6 @@ mod tests {
                 rt.block_on(async {
                     let mut buf = Vec::new();
                     write_valid_path_info(&mut buf, &info).await.unwrap();
-                    prop_assert_eq!(encoded_len(&info), buf.len() as u64);
                     let parsed = read_valid_path_info(&mut Cursor::new(&buf)).await.unwrap();
                     prop_assert_eq!(parsed, info);
                     Ok(())
