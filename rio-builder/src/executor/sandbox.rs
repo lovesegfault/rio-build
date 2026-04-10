@@ -83,18 +83,12 @@ pub(super) async fn prepare_sandbox(
     // but the builder's $out (from BasicDerivation env) is the REAL path →
     // output path mismatch → "builder failed to produce output path".
     //
-    // CA floating outputs have an empty path (computed post-build from the
-    // NAR hash). Inserting an empty-string path makes nix-daemon's
-    // queryStaticPartialDerivationOutputMap call parseStorePath("") which
-    // aborts the daemon (core dump). Real Nix never writes DerivationOutputs
-    // rows for floating-CA — the output path is unknown until the build
-    // finishes and the daemon writes a Realisations row instead. Filter them
-    // here; nix-daemon computes scratchPath internally for CA outputs and
-    // doesn't need the DerivationOutputs hint.
+    // Filter floating-CA via static_outputs(): nix-daemon computes
+    // scratchPath internally for CA outputs and doesn't need the
+    // DerivationOutputs hint.
+    use rio_nix::derivation::DerivationLike as _;
     let drv_outputs: Vec<SynthDrvOutput> = drv
-        .outputs()
-        .iter()
-        .filter(|o| !o.path().is_empty())
+        .static_outputs()
         .map(|o| SynthDrvOutput {
             drv_path: drv_path.to_string(),
             output_name: o.name().to_string(),

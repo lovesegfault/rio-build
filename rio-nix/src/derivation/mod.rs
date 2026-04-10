@@ -188,6 +188,16 @@ pub trait DerivationLike {
     fn is_content_addressed(&self) -> bool {
         self.is_fixed_output() || self.has_ca_floating_outputs()
     }
+
+    /// Outputs with a statically-known store path. Floating-CA outputs
+    /// have an empty path (computed post-build from the NAR hash) and
+    /// must be excluded from any pre-build path bookkeeping — synth-db
+    /// rows, overlay whiteouts, reference scanning. See
+    /// `rio-builder/src/executor/sandbox.rs` for the daemon-crash
+    /// rationale (parseStorePath("") aborts nix-daemon).
+    fn static_outputs(&self) -> impl Iterator<Item = &DerivationOutput> {
+        self.outputs().iter().filter(|o| !o.path().is_empty())
+    }
 }
 
 /// A full Nix derivation parsed from a `.drv` file.
