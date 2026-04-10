@@ -495,7 +495,7 @@ r[ts.fixtures.builders]
 `fixtures` provides `rand_store_hash()` (32 random nixbase32 chars, distinct per call — use when scheduler dedup must NOT short-circuit), `make_derivation_node`/`make_edge` (DAG builders keyed on a tag), `make_nar`/`make_large_nar`/`make_path_info_for_nar` (NAR + ValidatedPathInfo builders), `pseudo_random_bytes` (FastCDC-friendly deterministic content), and `seed_store_output` (writes a file under `{tmp}/nix/store/{basename}` for builder upload/FOD tests).
 
 r[ts.metrics.asserts]
-`metrics_suite!` expands to the three-test `metrics_registered.rs` body. The bodies call `assert_spec_metrics_described` (spec→describe), `assert_emitted_metrics_described` (emit→describe, with a min-count regex-health guard), and `assert_histograms_have_buckets` (describe→bucket, against the crate's `HISTOGRAM_BUCKETS` table). `CountingRecorder`/`GaugeValues` are the runtime recorder impls for behavioral assertions.
+`metrics_suite!` expands to the three-test `metrics_registered.rs` body. The bodies call `assert_spec_metrics_described` (spec→describe), `assert_emitted_metrics_described` (emit→describe, with a min-count regex-health guard), and `assert_histograms_have_buckets` (describe→bucket, against the crate's `HISTOGRAM_BUCKETS` table). `CountingRecorder` is the runtime recorder impl for behavioral assertions.
 
 ### rio-crds — Kubernetes CRD types
 

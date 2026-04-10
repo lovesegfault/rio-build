@@ -284,7 +284,7 @@ async fn apply_pass_writes_cutoffs_through_rwlock() {
     );
 }
 
-use rio_test_support::metrics::GaugeValues;
+use rio_test_support::metrics::CountingRecorder;
 
 /// Regression: `rio_scheduler_cutoff_seconds` gauge re-emits after
 /// `apply_pass`. Before this fix, main.rs emitted once at startup and
@@ -329,7 +329,7 @@ async fn cutoff_seconds_gauge_re_emitted_after_apply_pass() {
 
     // Guard-scoped thread-local recorder — visible across .await on a
     // current-thread tokio runtime (#[tokio::test] default).
-    let recorder = GaugeValues::default();
+    let recorder = CountingRecorder::default();
     let result = {
         let _guard = metrics::set_default_local_recorder(&recorder);
         apply_pass(&db, &size_classes, &cfg)
@@ -339,7 +339,7 @@ async fn cutoff_seconds_gauge_re_emitted_after_apply_pass() {
 
     // The gauge value the operator sees:
     let observed = recorder
-        .get("rio_scheduler_cutoff_seconds{class=default}")
+        .gauge_value("rio_scheduler_cutoff_seconds{class=default}")
         .expect("cutoff_seconds gauge emitted for class=default");
 
     // Mutation target: comment out the gauge-emit block in apply_pass

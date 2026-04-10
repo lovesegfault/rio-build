@@ -6,13 +6,10 @@
 //!   "every spec'd metric has a describe call" checks (the
 //!   `metrics_registered.rs` pattern). `register_*` return noop.
 //!
-//! - [`CountingRecorder`] — captures `counter!().increment()` deltas
-//!   keyed by `name{sorted,labels}`. For "this code path fired this
-//!   metric" behavioral assertions. Gauge touch-set for absence checks.
-//!
-//! - [`GaugeValues`] — captures `gauge!().set()` values (not just names).
-//!   For "this gauge was set to value X" assertions. f64 roundtrips via
-//!   `AtomicU64::to_bits/from_bits` — no precision loss.
+//! - [`CountingRecorder`] — captures `counter!().increment()` deltas and
+//!   `gauge!().set()` values keyed by `name{sorted,labels}`. For "this
+//!   code path fired this metric" behavioral assertions. Gauge f64
+//!   roundtrips via `AtomicU64::to_bits/from_bits` — no precision loss.
 //!
 //! All pair with `metrics::with_local_recorder` (sync closure) or
 //! `metrics::set_default_local_recorder` (guard-scoped, visible across
@@ -32,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
 /// Render a `metrics::Key` as `name{k=v,k2=v2}` with labels sorted.
-/// Shared by [`CountingRecorder`] and [`GaugeValues`] for map keying.
+/// Used by [`CountingRecorder`] for map keying.
 fn render_key(key: &Key) -> String {
     let mut labels: Vec<_> = key
         .labels()
@@ -135,12 +132,13 @@ pub struct CountingRecorder {
     // `metrics` provides `impl CounterFn for AtomicU64` (atomics.rs), so
     // `Counter::from_arc(Arc<AtomicU64>)` is a valid counter handle.
     counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    // Gauge touch-set: names only, no values. `gauge!(name).set()`
-    // expands to `recorder.register_gauge(key, _).set(v)` — the
-    // register call fires on EVERY `gauge!()` invocation, so tracking
-    // the key here captures "gauge was touched" regardless of value.
-    // Used for absence-checks (leader-gate: standby must NOT set).
-    gauges: Mutex<HashSet<String>>,
+    // Gauge values keyed by rendered `name{labels}`. `metrics` provides
+    // `impl GaugeFn for AtomicU64` (stores `f64::to_bits` on set()), so
+    // `Gauge::from_arc(Arc<AtomicU64>)` is a real handle and
+    // [`gauge_value`] reads back via `f64::from_bits` — no precision
+    // loss. Presence in the map also serves as the touch-set for
+    // absence-checks (leader-gate: standby must NOT set).
+    gauges: Mutex<HashMap<String, Arc<AtomicU64>>>,
     // Histogram touch-set: names only, mirroring `gauges`. For "this
     // code path recorded into this histogram" assertions where the
     // value is non-deterministic (elapsed time).
@@ -169,11 +167,21 @@ impl CountingRecorder {
         keys
     }
 
+    /// Returns the last value set for `rendered_key` (rendered as
+    /// `name{k=v}` with sorted labels), or `None` if never touched.
+    pub fn gauge_value(&self, rendered_key: &str) -> Option<f64> {
+        self.gauges
+            .lock()
+            .unwrap()
+            .get(rendered_key)
+            .map(|a| f64::from_bits(a.load(Ordering::Relaxed)))
+    }
+
     /// True if any `gauge!()` invocation has been observed for `name`
     /// (unlabeled name only — sufficient for the handle_tick gauges,
     /// which carry no labels).
     pub fn gauge_touched(&self, name: &str) -> bool {
-        self.gauges.lock().unwrap().contains(name)
+        self.gauge_value(&format!("{name}{{}}")).is_some()
     }
 
     /// True if any `histogram!()` invocation has been observed for `name`
@@ -187,7 +195,7 @@ impl CountingRecorder {
     /// diagnostics: when an absence-check fails, this shows what DID
     /// get touched.
     pub fn gauge_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.gauges.lock().unwrap().iter().cloned().collect();
+        let mut names: Vec<_> = self.gauges.lock().unwrap().keys().cloned().collect();
         names.sort();
         names
     }
@@ -210,57 +218,6 @@ impl Recorder for CountingRecorder {
         Counter::from_arc(atomic)
     }
     fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
-        self.gauges.lock().unwrap().insert(key.name().to_string());
-        Gauge::noop()
-    }
-    fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
-        self.histograms
-            .lock()
-            .unwrap()
-            .insert(key.name().to_string());
-        Histogram::noop()
-    }
-}
-
-// ===========================================================================
-// GaugeValues — captures gauge.set() values (not just names)
-// ===========================================================================
-
-/// Captures `gauge!().set()` values for test assertions. Partner to
-/// [`CountingRecorder`] (which tracks gauge NAMES but not values).
-///
-/// `register_gauge` hands back an `Arc<AtomicU64>` (metrics' `GaugeFn
-/// for AtomicU64` stores `f64::to_bits` on set()); [`GaugeValues::get`]
-/// reads back via `f64::from_bits` — no precision loss for exact sets.
-///
-/// Keys render as `name{k=v,k2=v2}` with labels sorted, so tests can
-/// assert on the full labeled metric identity.
-#[derive(Default)]
-pub struct GaugeValues {
-    gauges: Mutex<std::collections::HashMap<String, Arc<AtomicU64>>>,
-}
-
-impl GaugeValues {
-    /// Returns the last value set for `rendered_key` (rendered as
-    /// `name{k=v}` with sorted labels), or `None` if never touched.
-    pub fn get(&self, rendered_key: &str) -> Option<f64> {
-        self.gauges
-            .lock()
-            .unwrap()
-            .get(rendered_key)
-            .map(|a| f64::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)))
-    }
-}
-
-impl Recorder for GaugeValues {
-    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-    fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-
-    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
-        Counter::noop()
-    }
-    fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
         let rendered = render_key(key);
         let atomic = self
             .gauges
@@ -271,7 +228,11 @@ impl Recorder for GaugeValues {
             .clone();
         Gauge::from_arc(atomic)
     }
-    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+    fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
+        self.histograms
+            .lock()
+            .unwrap()
+            .insert(key.name().to_string());
         Histogram::noop()
     }
 }
