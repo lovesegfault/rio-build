@@ -69,37 +69,18 @@ impl<D: sha2::Digest> std::io::Write for DigestWriter<D> {
 /// NAR buffering (O(1) memory). Blocking I/O; call via
 /// `spawn_blocking` in async contexts.
 fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<u8>> {
-    use anyhow::Context;
-    use sha2::Digest;
-
-    // Each arm instantiates DigestWriter<D> with the right digest type.
-    // Can't box dyn Digest (associated types), so match per-arm.
-    Ok(match algo {
-        FodHashAlgo::Sha1 => {
-            let mut w = DigestWriter {
-                digest: sha1::Sha1::new(),
-            };
-            rio_nix::nar::dump_path_streaming(path, &mut w)
-                .with_context(|| format!("NAR streaming failed for {}", path.display()))?;
-            w.digest.finalize().to_vec()
-        }
-        FodHashAlgo::Sha256 => {
-            let mut w = DigestWriter {
-                digest: sha2::Sha256::new(),
-            };
-            rio_nix::nar::dump_path_streaming(path, &mut w)
-                .with_context(|| format!("NAR streaming failed for {}", path.display()))?;
-            w.digest.finalize().to_vec()
-        }
-        FodHashAlgo::Sha512 => {
-            let mut w = DigestWriter {
-                digest: sha2::Sha512::new(),
-            };
-            rio_nix::nar::dump_path_streaming(path, &mut w)
-                .with_context(|| format!("NAR streaming failed for {}", path.display()))?;
-            w.digest.finalize().to_vec()
-        }
-    })
+    fn with<D: sha2::Digest>(path: &Path) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context;
+        let mut w = DigestWriter { digest: D::new() };
+        rio_nix::nar::dump_path_streaming(path, &mut w)
+            .with_context(|| format!("NAR streaming failed for {}", path.display()))?;
+        Ok(w.digest.finalize().to_vec())
+    }
+    match algo {
+        FodHashAlgo::Sha1 => with::<sha1::Sha1>(path),
+        FodHashAlgo::Sha256 => with::<sha2::Sha256>(path),
+        FodHashAlgo::Sha512 => with::<sha2::Sha512>(path),
+    }
 }
 
 /// Verify FOD output hashes match the declared outputHash (defense-in-depth;
