@@ -299,7 +299,9 @@ mod tests {
 
     /// Records call order; per-method delays make ready-set
     /// interleaving observable. `provision_done` is the witness for
-    /// the "ami error must not cancel provision" test.
+    /// the "ami error must not cancel provision" test; `bootstrap_at`
+    /// timestamps bootstrap completion relative to construction (for
+    /// the I-198 raw-blocking test).
     struct MockProvider {
         log: Log,
         provision_delay: Duration,
@@ -307,6 +309,8 @@ mod tests {
         push_delay: Duration,
         push_err: bool,
         provision_done: Arc<AtomicBool>,
+        t0: std::time::Instant,
+        bootstrap_at: Arc<Mutex<Option<Duration>>>,
     }
 
     impl MockProvider {
@@ -318,6 +322,8 @@ mod tests {
                 push_delay: Duration::ZERO,
                 push_err: false,
                 provision_done: Arc::new(AtomicBool::new(false)),
+                t0: std::time::Instant::now(),
+                bootstrap_at: Arc::default(),
             }
         }
         fn record(&self, what: &'static str) {
@@ -332,6 +338,7 @@ mod tests {
         }
         async fn bootstrap(&self, _: &XtaskConfig) -> Result<()> {
             self.record("bootstrap");
+            *self.bootstrap_at.lock().unwrap() = Some(self.t0.elapsed());
             Ok(())
         }
         async fn provision(&self, _: &XtaskConfig, _: bool) -> Result<()> {
@@ -562,7 +569,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn up_dag_raw_blocking_does_not_stall_sibling() {
         let log: Log = Arc::default();
-        let bootstrap_at = Arc::new(Mutex::new(None::<Duration>));
 
         let ami_log = log.clone();
         let ami = async move {
@@ -574,16 +580,12 @@ mod tests {
             Ok(())
         };
 
-        let t0 = std::time::Instant::now();
-        // Wrap bootstrap to timestamp its completion. Ami is first in
-        // `selected` so it dispatches (and parks its worker) before
-        // bootstrap is spawned — if both ran on one task, bootstrap_at
-        // would be ≥200ms.
-        let p: Arc<dyn Provider> = Arc::new(TimestampBootstrap {
-            inner: MockProvider::new(log.clone()),
-            t0,
-            at: bootstrap_at.clone(),
-        });
+        // Ami is first in `selected` so it dispatches (and parks its
+        // worker) before bootstrap is spawned — if both ran on one
+        // task, bootstrap_at would be ≥200ms.
+        let mp = MockProvider::new(log.clone());
+        let bootstrap_at = mp.bootstrap_at.clone();
+        let p: Arc<dyn Provider> = Arc::new(mp);
         run_up_phases(
             p,
             cfg(),
@@ -607,56 +609,6 @@ mod tests {
         // holds regardless of which task the runtime schedules first.
         assert!(pos(&log, "bootstrap") < pos(&log, "ami"), "log: {log:?}");
         assert!(log.contains(&"ami:start"), "log: {log:?}");
-    }
-
-    /// Wraps a MockProvider to timestamp bootstrap completion.
-    struct TimestampBootstrap {
-        inner: MockProvider,
-        t0: std::time::Instant,
-        at: Arc<Mutex<Option<Duration>>>,
-    }
-
-    #[async_trait]
-    impl Provider for TimestampBootstrap {
-        fn context_matches(&self, c: &str) -> bool {
-            self.inner.context_matches(c)
-        }
-        async fn bootstrap(&self, c: &XtaskConfig) -> Result<()> {
-            self.inner.bootstrap(c).await?;
-            *self.at.lock().unwrap() = Some(self.t0.elapsed());
-            Ok(())
-        }
-        async fn provision(&self, c: &XtaskConfig, a: bool) -> Result<()> {
-            self.inner.provision(c, a).await
-        }
-        async fn kubeconfig(&self, c: &XtaskConfig) -> Result<()> {
-            self.inner.kubeconfig(c).await
-        }
-        async fn build(&self, c: &XtaskConfig) -> Result<provider::BuiltImages> {
-            self.inner.build(c).await
-        }
-        async fn push(&self, i: &provider::BuiltImages, c: &XtaskConfig) -> Result<()> {
-            self.inner.push(i, c).await
-        }
-        async fn deploy(&self, c: &XtaskConfig, o: &provider::DeployOpts) -> Result<()> {
-            self.inner.deploy(c, o).await
-        }
-        async fn smoke(&self, _: &XtaskConfig) -> Result<()> {
-            unimplemented!()
-        }
-        async fn tunnel(&self, _: u16) -> Result<shared::ProcessGuard> {
-            unimplemented!()
-        }
-        async fn tunnel_grpc(
-            &self,
-            _: u16,
-            _: u16,
-        ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
-            unimplemented!()
-        }
-        async fn destroy(&self, _: &XtaskConfig) -> Result<()> {
-            unimplemented!()
-        }
     }
 
     /// A failed phase poisons its dependents but NOT its siblings.
