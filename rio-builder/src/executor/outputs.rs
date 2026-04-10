@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use tonic::transport::Channel;
 use tracing::instrument;
 
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput};
 
@@ -27,6 +27,21 @@ pub(super) struct BuildOutputs {
     pub(super) proto_result: ProtoBuildResult,
     /// Sum of uploaded NAR sizes. 0 on build failure or output rejection.
     pub(super) output_size_bytes: u64,
+}
+
+impl BuildOutputs {
+    /// Failure-path shorthand: status + error_msg only, all other
+    /// `ProtoBuildResult` fields default, `output_size_bytes` 0.
+    fn failed(status: BuildResultStatus, error_msg: impl Into<String>) -> Self {
+        Self {
+            proto_result: ProtoBuildResult {
+                status: status.into(),
+                error_msg: error_msg.into(),
+                ..Default::default()
+            },
+            output_size_bytes: 0,
+        }
+    }
 }
 
 /// Collect build outputs: FOD verify, upload, map to proto BuildResult.
@@ -70,17 +85,13 @@ pub(super) async fn collect_outputs(
                 "daemon ENOENT on closure input — reclassifying MiscFailure → \
                  InfrastructureFailure (warm timeout / FUSE EIO / I-043 race)"
             );
-            return Ok(BuildOutputs {
-                proto_result: ProtoBuildResult {
-                    status: BuildResultStatus::InfrastructureFailure.into(),
-                    error_msg: format!(
-                        "input materialization failed (I-043/I-178): {}",
-                        build_result.error_msg
-                    ),
-                    ..Default::default()
-                },
-                output_size_bytes: 0,
-            });
+            return Ok(BuildOutputs::failed(
+                BuildResultStatus::InfrastructureFailure,
+                format!(
+                    "input materialization failed (I-043/I-178): {}",
+                    build_result.error_msg
+                ),
+            ));
         }
         tracing::warn!(
             drv_path = %drv_path,
@@ -88,14 +99,10 @@ pub(super) async fn collect_outputs(
             error = %build_result.error_msg,
             "build failed"
         );
-        return Ok(BuildOutputs {
-            proto_result: ProtoBuildResult {
-                status: BuildResultStatus::from(build_result.status).into(),
-                error_msg: build_result.error_msg.clone(),
-                ..Default::default()
-            },
-            output_size_bytes: 0,
-        });
+        return Ok(BuildOutputs::failed(
+            BuildResultStatus::from(build_result.status),
+            build_result.error_msg.clone(),
+        ));
     }
 
     // FOD defense-in-depth BEFORE upload: verify_fod_hashes
@@ -128,14 +135,10 @@ pub(super) async fn collect_outputs(
             // already has peak_memory_bytes/peak_cpu_cores from the
             // cgroup; they're meaningful even though we reject output.
             // r[impl fetcher.upload.hash-verify-before]
-            return Ok(BuildOutputs {
-                proto_result: ProtoBuildResult {
-                    status: BuildResultStatus::OutputRejected.into(),
-                    error_msg: format!("FOD output hash verification failed: {e}"),
-                    ..Default::default()
-                },
-                output_size_bytes: 0,
-            });
+            return Ok(BuildOutputs::failed(
+                BuildResultStatus::OutputRejected,
+                format!("FOD output hash verification failed: {e}"),
+            ));
         }
     }
 
@@ -157,12 +160,7 @@ pub(super) async fn collect_outputs(
     //     legal (e.g., a -dev output referencing the lib output's rpath,
     //     or a binary embedding its own store path in an rpath).
     let mut ref_candidates: Vec<String> = input_paths.to_vec();
-    ref_candidates.extend(
-        drv.outputs()
-            .iter()
-            .filter(|o| !o.path().is_empty())
-            .map(|o| o.path().to_string()),
-    );
+    ref_candidates.extend(drv.static_outputs().map(|o| o.path().to_string()));
     // Floating-CA: .drv has path = ""; the real path comes from
     // the daemon's BuildResult. Needed for self-references.
     ref_candidates.extend(
@@ -172,7 +170,7 @@ pub(super) async fn collect_outputs(
             .map(|bo| bo.out_path.clone()),
     );
 
-    let proto_result = match upload::upload_all_outputs(
+    match upload::upload_all_outputs(
         store_client,
         &overlay_mount.upper_store(),
         // Pass the assignment token as gRPC metadata on each
@@ -207,12 +205,8 @@ pub(super) async fn collect_outputs(
             // lookup below with "not in derivation outputs" —
             // the upload scanned the real /nix/store/<hash>-name
             // but path_to_name only had "" → name.
-            let mut path_to_name: HashMap<&str, &str> = drv
-                .outputs()
-                .iter()
-                .filter(|o| !o.path().is_empty())
-                .map(|o| (o.path(), o.name()))
-                .collect();
+            let mut path_to_name: HashMap<&str, &str> =
+                drv.static_outputs().map(|o| (o.path(), o.name())).collect();
             for bo in &build_result.built_outputs {
                 if let Some(name) = bo.drv_output_id.rsplit('!').next() {
                     path_to_name.insert(bo.out_path.as_str(), name);
@@ -269,7 +263,7 @@ pub(super) async fn collect_outputs(
                     nanos: 0,
                 })
             };
-            return Ok(BuildOutputs {
+            Ok(BuildOutputs {
                 proto_result: ProtoBuildResult {
                     status: BuildResultStatus::Built.into(),
                     error_msg: String::new(),
@@ -279,22 +273,16 @@ pub(super) async fn collect_outputs(
                     built_outputs,
                 },
                 output_size_bytes,
-            });
+            })
         }
         Err(e) => {
             tracing::error!(drv_path = %drv_path, error = %e, "output upload failed");
-            ProtoBuildResult {
-                status: BuildResultStatus::InfrastructureFailure.into(),
-                error_msg: format!("output upload failed: {e}"),
-                ..Default::default()
-            }
+            Ok(BuildOutputs::failed(
+                BuildResultStatus::InfrastructureFailure,
+                format!("output upload failed: {e}"),
+            ))
         }
-    };
-
-    Ok(BuildOutputs {
-        proto_result,
-        output_size_bytes: 0,
-    })
+    }
 }
 
 /// True iff the daemon's `MiscFailure` is `getting attributes of path
