@@ -36,8 +36,7 @@
   # Coverage-instrumented variant of the crate tree (nix/crate2nix.nix
   # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
   # Used to produce test binaries that emit .profraw files at runtime.
-  # null → coverage targets not exposed.
-  crateBuildCov ? null,
+  crateBuildCov,
   # Runtime inputs for test execution (PG, nix-cli, openssh).
   runtimeTestInputs ? [ ],
   # Env vars set on all test-runner derivations (RIO_GOLDEN_* /
@@ -292,11 +291,10 @@ let
         name = "${old.name}-clippy";
       });
 
-  # Test binary build: same rustc, but with --test + dev-deps.
-  # buildRustCrate has a `buildTests = true` knob that switches to
-  # `rustc --test` (produces a test harness binary per lib.rs/bin).
-  # The output's tests/ dir contains one executable per target —
-  # those are what nextest or direct execution runs.
+  # Test-binary variants: build with `rustc --test` + dev-deps.
+  # buildRustCrate's `buildTests = true` knob switches to `rustc
+  # --test` (produces a test harness binary per lib.rs/bin); the
+  # output's tests/ dir contains one executable per target.
   #
   # dev-deps are appended to the dependencies list. buildRustCrate
   # doesn't distinguish normal from dev at the rustc level (both
@@ -304,17 +302,26 @@ let
   # deps are LINKED. Cargo links dev-deps only for test/bench
   # targets; since we're setting buildTests=true, appending to
   # dependencies is correct.
-  testMember =
+  #
+  # `extraOverride` lets clippyTestMember inject the clippy driver +
+  # lint flags on top of the test-build shape.
+  mkTestVariant =
+    {
+      suffix,
+      devDeps,
+      extraOverride ? { },
+    }:
     name: base:
-    (base.override (old: {
-      buildTests = true;
-      # Append dev-deps. old.dependencies is the normal deps list;
-      # dev-deps are resolved via devDepsFor from Cargo.json's
-      # devDependencies field. No-op if the member has none.
-      dependencies = old.dependencies ++ devDepsFor name;
-    })).overrideAttrs
+    (base.override (
+      old:
+      {
+        buildTests = true;
+        dependencies = old.dependencies ++ devDeps name;
+      }
+      // extraOverride
+    )).overrideAttrs
       (old: {
-        name = "${old.name}-test";
+        name = "${old.name}-${suffix}";
         # Cargo sets CARGO_BIN_EXE_<bin> for integration tests so they
         # can `env!("CARGO_BIN_EXE_foo")` the crate's own binary.
         # buildRustCrate doesn't — the test build (buildTests=true)
@@ -327,24 +334,23 @@ let
         "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
+  testMember = mkTestVariant {
+    suffix = "test";
+    devDeps = devDepsFor;
+  };
+
   # Clippy check on TEST targets: same driver as clippyMember, but
   # buildTests=true so #[cfg(test)] blocks and tests/*.rs are
-  # compiled. dev-deps appended same as testMember. This is the half
-  # of `--all-targets` that clippyMember alone misses.
-  clippyTestMember =
-    name: base:
-    (base.override (old: {
+  # compiled. This is the half of `--all-targets` that clippyMember
+  # alone misses.
+  clippyTestMember = mkTestVariant {
+    suffix = "clippy-test";
+    devDeps = devDepsFor;
+    extraOverride = {
       rust = clippyRustc;
-      buildTests = true;
-      dependencies = old.dependencies ++ devDepsFor name;
       extraRustcOpts = clippyFlags;
-    })).overrideAttrs
-      (old: {
-        name = "${old.name}-clippy-test";
-        # See testMember — env!("CARGO_BIN_EXE_<name>") needs this at
-        # compile time. clippy-driver IS rustc, same macro expansion.
-        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
-      });
+    };
+  };
 
   # Doc build: rustdoc instead of rustc. The wrapper translates
   # buildRustCrate's rustc invocation to rustdoc (strips codegen
@@ -387,18 +393,13 @@ let
   # crate2nix.nix. devDepsForCov (defined alongside devDepsFor above)
   # dereferences crateBuildCov's builtCrates so instrumented rlibs
   # link together.
-  covTestMember =
-    name: base:
-    (base.override (old: {
-      buildTests = true;
-      dependencies = old.dependencies ++ devDepsForCov name;
-    })).overrideAttrs
-      (old: {
-        name = "${old.name}-cov-test";
-        # See testMember. `base` here is the instrumented build
-        # (crateBuildCov tree), so the subprocess emits profraws too.
-        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
-      });
+  #
+  # `base` for this variant is the instrumented build (crateBuildCov
+  # tree), so the CARGO_BIN_EXE_ subprocess emits profraws too.
+  covTestMember = mkTestVariant {
+    suffix = "cov-test";
+    devDeps = devDepsForCov;
+  };
 
   # ──────────────────────────────────────────────────────────────────
   # Aggregates
@@ -415,9 +416,9 @@ let
   clippyTestDrvs = lib.mapAttrs (name: m: clippyTestMember name m.build) members;
   testBinDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
   docDrvs = lib.mapAttrs (name: m: docMember name m.build) members;
-  covTestBinDrvs = lib.optionalAttrs (crateBuildCov != null) (
-    lib.mapAttrs (name: m: covTestMember name m.build) crateBuildCov.cargoNix.workspaceMembers
-  );
+  covTestBinDrvs = lib.mapAttrs (
+    name: m: covTestMember name m.build
+  ) crateBuildCov.cargoNix.workspaceMembers;
 
   clippyAll = pkgs.symlinkJoin {
     name = "rio-clippy-all";
@@ -872,11 +873,10 @@ in
   testBins = testBinDrvs;
   doc = docDrvs;
 
-  # Coverage (populated when crateBuildCov is passed). covProfraw
-  # runs instrumented tests + collects raw profile data; coverage is
-  # the merged lcov.
-  covProfraw = if crateBuildCov != null then covProfraw else null;
-  coverage = if crateBuildCov != null then coverageLcov else null;
+  # Coverage. covProfraw runs instrumented tests + collects raw
+  # profile data; coverage is the merged lcov.
+  inherit covProfraw;
+  coverage = coverageLcov;
 
   # Aggregate checks (CI entry points). All of these go in checks.*:
   #   checks.clippy  — fails if any workspace member has clippy warnings
