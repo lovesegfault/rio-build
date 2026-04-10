@@ -7,130 +7,51 @@
 
 use super::*;
 use rio_store::test_helpers::seed_tenant;
+use rstest::rstest;
 
-/// SubmitBuild with an empty drv_hash in a node should be rejected at
-/// the gRPC boundary (proto types have no validation; an empty hash
-/// would become a DAG primary key).
+type Req = rio_proto::types::SubmitBuildRequest;
+
+/// Ingress-validation table: each `#[case]` mutates one field on a
+/// well-formed [`SubmitBuildRequest`](Req), then asserts the handler
+/// rejects with `InvalidArgument` and `expected_field` in the message.
+/// Per-case comments capture WHY the validation exists — most guard
+/// silent-stuck modes (Ready-forever, PG CHECK leak), not crashes.
+///
+/// `unknown_tenant` / `resolves_known_tenant` stay separate (need
+/// `setup_grpc_with_pool()` + multi-part assertions).
+#[rstest]
+// Empty drv_hash would become a DAG primary key (proto types carry no validation).
+#[case::empty_drv_hash(|r: &mut Req| r.nodes[0].drv_hash = String::new(), "drv_hash")]
+// Empty drv_path → StorePath::parse fails; would break reverse-lookup if accepted.
+#[case::empty_drv_path(|r: &mut Req| r.nodes[0].drv_path = String::new(), "drv_path")]
+// Empty system never matches any worker → sits Ready forever with no feedback.
+#[case::empty_system(|r: &mut Req| r.nodes[0].system = String::new(), "system")]
+// >256 KB drv_content — defensive bound (gateway caps at 64 KB; hostile client may bypass).
+#[case::oversized_drv_content(
+    |r: &mut Req| r.nodes[0].drv_content = vec![b'a'; 256 * 1024 + 1],
+    "drv_content"
+)]
+// Unrecognized priority_class would leak as a PG CHECK violation in Status::internal.
+#[case::invalid_priority_class(|r: &mut Req| r.priority_class = "urgent".into(), "priority_class")]
+// > MAX_DAG_EDGES — DoS guard (O(edges) merge loop). Content irrelevant; len-check fires first.
+#[case::too_many_edges(
+    |r: &mut Req| r.edges = vec![Default::default(); rio_common::limits::MAX_DAG_EDGES + 1],
+    "edges"
+)]
 #[tokio::test]
-async fn test_submit_build_rejects_empty_drv_hash() {
+async fn test_submit_build_rejects(#[case] mutate: fn(&mut Req), #[case] expected_field: &str) {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let mut bad_node = make_node("h");
-    bad_node.drv_hash = String::new(); // empty!
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![bad_node],
-        edges: vec![],
-        ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "empty drv_hash should be rejected");
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("drv_hash"),
-        "error should mention drv_hash: {}",
-        status.message()
-    );
-}
-
-/// SubmitBuild with an empty drv_path should be rejected.
-#[tokio::test]
-async fn test_submit_build_rejects_empty_drv_path() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let mut bad_node = make_node("h");
-    bad_node.drv_path = String::new(); // empty!
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![bad_node],
-        edges: vec![],
-        ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "empty drv_path should be rejected");
-    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
-}
-
-/// SubmitBuild with an empty system should be rejected. An empty system
-/// never matches any worker's system (e.g., "x86_64-linux"), so the
-/// derivation would sit in Ready forever with no feedback.
-#[tokio::test]
-async fn test_submit_build_rejects_empty_system() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let mut bad_node = make_node("h");
-    bad_node.system = String::new(); // empty!
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![bad_node],
-        edges: vec![],
-        ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "empty system should be rejected");
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("system"),
-        "error should mention system: {}",
-        status.message()
-    );
-}
-
-/// Oversized drv_content (>256 KB) should be rejected at gRPC ingress.
-/// The gateway caps at 64 KB, but a buggy/hostile client could bypass
-/// that — this is the defensive bound.
-#[tokio::test]
-async fn test_submit_build_rejects_oversized_drv_content() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let mut bad_node = make_node("h");
-    // 256 KB + 1 byte → over limit.
-    bad_node.drv_content = vec![b'a'; 256 * 1024 + 1];
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![bad_node],
-        edges: vec![],
-        ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "oversized drv_content should be rejected");
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("drv_content"),
-        "error should mention drv_content: {}",
-        status.message()
-    );
-}
-
-/// SubmitBuild with an unrecognized priority_class should be rejected
-/// at the gRPC boundary (PriorityClass::FromStr). Without gRPC-level
-/// validation, this leaks as a PostgreSQL CHECK constraint violation
-/// in Status::internal.
-#[tokio::test]
-async fn test_submit_build_rejects_invalid_priority_class() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+    let mut req = Req {
         nodes: vec![make_node("h")],
         edges: vec![],
-        priority_class: "urgent".into(), // not in {ci, interactive, scheduled}
         ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "invalid priority_class should be rejected");
-    let status = result.unwrap_err();
+    };
+    mutate(&mut req);
+    let status = grpc.submit_build(Request::new(req)).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
-        status.message().contains("priority_class"),
-        "error should mention priority_class: {}",
+        status.message().contains(expected_field),
+        "error should mention {expected_field}: {}",
         status.message()
     );
 }
@@ -416,38 +337,6 @@ async fn test_resolve_tenant_works_on_standby() {
     assert_eq!(
         resp.into_inner().tenant_id.parse::<uuid::Uuid>().unwrap(),
         expected
-    );
-}
-
-/// SubmitBuild with more edges than MAX_DAG_EDGES should be rejected
-/// (DoS prevention: O(edges) merge loop).
-#[tokio::test]
-async fn test_submit_build_rejects_too_many_edges() {
-    let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
-    // happens before any path validation.
-    let too_many: Vec<_> = (0..rio_common::limits::MAX_DAG_EDGES + 1)
-        .map(|i| rio_proto::types::DerivationEdge {
-            parent_drv_path: format!("/nix/store/{i}-parent.drv"),
-            child_drv_path: format!("/nix/store/{i}-child.drv"),
-        })
-        .collect();
-
-    let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![make_node("h")],
-        edges: too_many,
-        ..Default::default()
-    });
-
-    let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "too many edges should be rejected");
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("edges"),
-        "error should mention edges: {}",
-        status.message()
     );
 }
 
