@@ -30,6 +30,21 @@
       "kernel.panic_on_oops" = 1;
     };
 
+    # Same panic knobs on the kernel cmdline. The sysctls above are the
+    # values kubelet protectKernelDefaults validates; the cmdline copies
+    # are belt-and-braces for panics BEFORE sysctl.d applies (early boot)
+    # or where the sysctl write itself never happened. Live QA hit a
+    # cgwb_release list_del corruption (cgroup-writeback teardown under
+    # one-cgroup-per-build churn) where panic=10 was in effect but the
+    # panic path hung after "Shutting down cpus with NMI" — neither the
+    # sysctl nor the cmdline helps that specific hang (Karpenter
+    # NodeRepair is the recovery), but cmdline removes one variable when
+    # diagnosing the next one.
+    kernelParams = [
+      "panic=10"
+      "panic_on_oops=1"
+    ];
+
     # ── kernel config (P3, baked now since the AMI is rebuilding) ─────
     # EROFS_FS_ONDEMAND + CACHEFILES_ONDEMAND: the per-page FUSE / riofs
     # track. NETFS_SUPPORT is the dependency CACHEFILES selects upstream;

@@ -103,6 +103,25 @@ resource "helm_release" "karpenter" {
         clusterName       = module.eks.cluster_name
         clusterEndpoint   = module.eks.cluster_endpoint
         interruptionQueue = module.karpenter.queue_name
+        # NodeRepair (alpha): terminate+replace nodes that stay
+        # NotReady past the toleration threshold. Live QA hit a
+        # cgwb_release kernel panic (cgroup-writeback teardown under
+        # rio's one-cgroup-per-build churn) where the panic handler
+        # itself hung — kubelet dead, Node NotReady for 4h+, 8 pods
+        # stuck Terminating. WhenEmpty consolidation ignores
+        # "non-empty" NotReady; this is the only repair path.
+        #
+        # Per-instance CloudWatch StatusCheckFailed_Instance →
+        # automate:ec2:terminate alarms are not declaratively
+        # feasible for ephemeral Karpenter nodes (alarm dimension
+        # binds a specific InstanceId; instances are short-lived).
+        # The submodule already routes aws.health events to the
+        # interruption queue (covers AWS-side scheduled/system
+        # issues). OS-level failures (kernel panic, kubelet wedge)
+        # surface as Node NotReady, which NodeRepair handles.
+        featureGates = {
+          nodeRepair = true
+        }
       }
       # Pin controller to system nodes — can't run Karpenter on
       # Karpenter-provisioned nodes (chicken-and-egg on first boot).
