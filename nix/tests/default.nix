@@ -521,7 +521,6 @@ in
           "overlay-readdir"
           # r[verify builder.fuse.canonical-metadata+2]
           "canonical-meta"
-          # r[verify store.inline.threshold]
           # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"

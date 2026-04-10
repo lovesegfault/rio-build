@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0582 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
+**Plan-number range:** P0541–P0583 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
@@ -126,6 +126,7 @@ P0552 GetNarIndex + indexer_loop  │                   │                     
    │                              │             ★ FIRST SHIPPED VALUE (U2)
    │                              │             P0579 compat config+helm ──► P0566 compat writer ──► P0580 vm:compat-substitute  ★ U6 LANDS
    │                              │                                              └─► P0581 compat GC ──► P0582 compat reconciler
+   │                              │             P0583 drop inline_blob (one code path; chunk_backend required)
    │                              │
 ┌── Phase 4 composefs store-side (gated on Phase-0 + P0546) ──┐
 P0556 composefs-sys + encode.rs (libcomposefs FFI; nix-patched user.* + no-root-whiteouts) + golden VM
@@ -370,7 +371,7 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 **Crate:** `rio-store` · **Deps:** P0549, P0579 · **Complexity:** MED
 | File | Change |
 |---|---|
-| `rio-store/src/compat/writer.rs` | new — `async fn write(&self, path_info: &PathInfo, manifest: &ManifestKind) -> Result<(), CompatError>`. Reassemble NAR bytes from `manifest` (chunked: `ChunkCache::get` over the just-written chunks, moka-hot; inline: read `inline_blob`). Stream through `async-compression` zstd encoder while computing `sha256(compressed)`. `put_blob("nar/{file_hash}.nar.zst", body)`. Render narinfo via the existing `rio-nix::narinfo::render` (same one the HTTP server uses) **with** `FileHash`/`FileSize`/`Compression` populated; `put_blob("{store_path_hash}.narinfo", body)`. On first-ever write, `put_blob("nix-cache-info", "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n")` if absent. `// r[impl store.compat.{nar-on-put,narinfo-on-put}]` `// r[impl obs.metric.compat]` |
+| `rio-store/src/compat/writer.rs` | new — `async fn write(&self, path_info: &PathInfo, chunk_list: &[ChunkRef]) -> Result<(), CompatError>`. Reassemble NAR bytes via `ChunkCache::get` over the just-written chunks (moka-hot). Stream through `async-compression` zstd encoder while computing `sha256(compressed)`. `put_blob("nar/{file_hash}.nar.zst", body)`. Render narinfo via the existing `rio-nix::narinfo::render` (same one the HTTP server uses) **with** `FileHash`/`FileSize`/`Compression` populated; `put_blob("{store_path_hash}.narinfo", body)`. On first-ever write, `put_blob("nix-cache-info", "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n")` if absent. `// r[impl store.compat.{nar-on-put,narinfo-on-put}]` `// r[impl obs.metric.compat]` |
 | `rio-store/src/grpc/put_path.rs` | after the PG-commit (status flips `'uploading'`→`'complete'`), if `cfg.binary_cache_compat.enabled`: `compat_writer.write(...).await` — failure logged + `rio_store_compat_write_failures_total` inc, **does not** fail the RPC. `// r[impl store.compat.write-after-commit]` |
 | `rio-store/src/lib.rs` | `pub mod compat;` + `rio_store_compat_write_seconds{result}` histogram + `rio_store_compat_write_failures_total` counter |
 | tests | unit: PutPath a 2-chunk path with compat ON → in-memory S3 backend has `{hash}.narinfo` and `nar/{filehash}.nar.zst`; round-trip narinfo via `rio-nix::narinfo::parse`; decompressed NAR sha256 == `nar_hash`. compat OFF → neither object present. `// r[verify store.compat.{nar-on-put,narinfo-on-put,write-after-commit,runtime-toggle}]` |
@@ -394,6 +395,24 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 ### P0582 — compat reconciler (deferred-priority)
 **Crate:** `rio-store` · **Deps:** P0566, P0581 · **Complexity:** LOW
 `rio-store/src/compat/reconciler.rs`: background loop, `SELECT store_path_hash FROM narinfo WHERE compat_file_hash IS NULL AND status='complete' LIMIT 64` → `compat_writer.write(...)` for each → sleep 30s if empty. Handles the crash-between-PG-commit-and-S3-write window and backfills paths ingested while compat was OFF. Spawned in `main.rs` only when `enabled`. **Exit:** `.#ci` green; unit: insert a `compat_file_hash IS NULL` row → one tick → row populated + S3 objects present.
+
+### P0583 — drop `inline_blob` storage; all NARs chunked
+**Crate:** `rio-store, rio-proto` · **Deps:** P0544 · **Complexity:** MED
+| File | Change |
+|---|---|
+| `rio-store/src/cas.rs` | delete `INLINE_THRESHOLD` const |
+| `rio-store/src/manifest.rs` | delete `ManifestKind::Inline` variant; `ManifestKind` collapses to a single chunk-list shape (or is replaced by the bare `Vec<ChunkRef>`/`ChunkManifest` type — implementer's call) |
+| `rio-store/src/grpc/put_path.rs` | remove the `nar_len < INLINE_THRESHOLD` size-branch; every NAR goes through `put_chunked`. A NAR shorter than `CHUNK_MIN` yields a single chunk equal to the input (FastCDC behavior — no special-case needed) |
+| `rio-store/src/grpc/get_path.rs` | remove the `ManifestKind::Inline` arm; `chunk_cache` is now required (drop the `Option<>` wrapper and the `failed_precondition("inline-only")` guard) |
+| `rio-store/src/grpc/put_path_batch.rs` | drop the `INLINE_THRESHOLD` size-gate + `FailedPrecondition` fallback; batch handler chunks every output |
+| `rio-store/src/grpc/chunk.rs` | drop the `Option<Arc<ChunkCache>>` wrapper + `require_cache()` guard (backend always present) |
+| `rio-store/src/metadata/inline.rs` | **delete file**; fold any non-inline-specific helpers (placeholder-row insert, `update_narinfo_complete`) into `metadata/chunked.rs` or `metadata/mod.rs` |
+| `rio-store/src/config.rs` | delete `ChunkBackendKind::Inline`; `chunk_backend` becomes a required field (no `Default`); error message names `filesystem`/`s3`/`memory` |
+| `migrations/033_nar_index.sql` (P0551 — same migration, greenfield) | `+ ALTER TABLE manifests DROP COLUMN inline_blob;` |
+| tests | drop inline-specific test cases; update fixtures that relied on `chunk_backend = { kind = "inline" }` to use `memory` |
+**Dropped marker:** `r[store.inline.threshold]` — remove any `r[impl store.inline.threshold]` / `r[verify …]` annotations in code.
+**Note for P0566/P0582:** depend on this for the `chunk_list: &[ChunkRef]` signature simplification; sequence after P0583 if not already merged.
+**Exit:** `.#ci` green; `tracey query rule store.inline.threshold` reports no-such-rule.
 
 ---
 
@@ -664,6 +683,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":580,"title":"VM test: stock-Nix substitutes from S3 with rio-store stopped","deps":[566],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":"U6 LANDS"}
 {"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
 {"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
+{"plan":583,"title":"drop inline_blob: all NARs chunked; ChunkBackendKind::Inline removed; chunk_backend required","deps":[544],"crate":"rio-store,rio-proto","priority":80,"status":"UNIMPL","complexity":"MED","note":"greenfield: ALTER TABLE manifests DROP COLUMN inline_blob in mig 033; ManifestKind collapses; chunk_cache no longer Option"}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
@@ -769,7 +789,9 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 |---|---|---|
 | `rio-store/src/backend/{chunk.rs,tiered.rs,mod.rs}` | P0548, P0549 | P0548 → P0549 (dep edge) |
 | `rio-store/src/grpc/mod.rs` | P0552, P0557 | P0552 → P0557 (dep edge) |
-| `rio-store/src/grpc/put_path.rs` | P0566, P0557 | independent hunks (sidecar-write vs eager-index); both append after `complete_manifest` — P0557 rebases on P0566 |
+| `rio-store/src/grpc/put_path.rs` | P0566, P0557, P0583 | P0583 (size-branch removal) first; P0566/P0557 append after `complete_manifest` — P0557 rebases on P0566 |
+| `rio-store/src/grpc/get_path.rs` | P0583 only | — |
+| `rio-store/src/metadata/{inline.rs,chunked.rs,mod.rs}` | P0583 only | — |
 | `rio-store/src/nar_index.rs` | P0552 (create), P0572 (directories insert), P0557 (eager) | P0552 → P0572 → P0557 |
 | `rio-store/src/lib.rs` | P0548, P0552, P0557 | append-only metric registrations; dep chain serialises |
 | `rio-builder/src/composefs/digest_fuse.rs` | P0559 (create), P0571 (cache metrics), P0575 (streaming) | P0559 → P0571 → P0575 |
@@ -784,7 +806,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `infra/helm/rio-build/values.yaml` | P0554, P0564 | distinct top-level keys |
 | `rio-controller/src/reconcilers/common/sts.rs` | P0564 only | — |
 | `nix/nixos-node/eks-node.nix` | P0564, P0571 | distinct hunks (drop smarter-device-manager static-pod vs tmpfiles) |
-| `migrations/033_nar_index.sql` | P0551, P0572 (adds `directories`+`file_blobs` tables) | P0551 → P0572; same migration file (greenfield) |
+| `migrations/033_nar_index.sql` | P0551, P0572, P0581, P0583 | P0551 → P0572 → P0581 → P0583; same migration file (greenfield) |
 | `rio-proto/proto/types.proto` | P0545, P0572 | P0545 → P0572 (append fields 7, 8) |
 | `rio-nix/src/nar.rs` | P0546, P0572 | P0546 → P0572 (second pass in same fn) |
 | `rio-store/src/grpc/directory.rs` | P0573 (create), P0577 (ReadBlob) | P0573 → P0577 |

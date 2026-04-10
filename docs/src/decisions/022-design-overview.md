@@ -212,7 +212,7 @@ Four tiers, by role:
 |---|---|---|
 | **S3 standard** (regional) | chunks (always); `{hash}.narinfo` + `nar/{filehash}.nar.zst` (when `binary_cache_compat` enabled) | unrecoverable data loss — this is the source of truth |
 | **S3 Express One Zone** (per-AZ) | chunk read-through cache | that AZ's replicas cold-read from S3 standard; nothing lost (§9) |
-| **PostgreSQL** (single-region) | narinfo, manifests, refcounts, `inline_blob`, `nar_index`, `directories`/`file_blobs`, scheduler state | with compat **enabled**: stock-Nix substitution from S3 still works; rio's gRPC surface, dedup, CA-cutoff, and `inline_blob` fast-path are down. With compat **disabled**: nothing substitutes. PG is rebuildable-in-principle from S3 when compat is enabled (every narinfo+NAR is there). |
+| **PostgreSQL** (single-region) | narinfo, manifests, refcounts, `nar_index`, `directories`/`file_blobs`, scheduler state | with compat **enabled**: stock-Nix substitution from S3 still works; rio's gRPC surface, dedup, and CA-cutoff are down. With compat **disabled**: nothing substitutes. PG is rebuildable-in-principle from S3 when compat is enabled (every narinfo+NAR is there). |
 | **moka** (per-replica, in-memory) | hottest chunks + singleflight coalescing | one replica cold-reads its L2; nothing lost |
 
 r[store.compat.runtime-toggle]
@@ -221,7 +221,7 @@ The binary-cache compatibility layer is a **runtime** config value (`store.binar
 
 r[store.compat.nar-on-put]
 
-When enabled, `PutPath` writes the NAR — zstd-compressed by default — to S3-standard at `nar/{FileHash}.nar.zst`, where `FileHash = sha256(compressed bytes)`. The bytes are reassembled from chunks immediately post-commit (chunks were just written and are moka-hot); inline-stored NARs are read directly from the just-committed `inline_blob` row.
+When enabled, `PutPath` writes the NAR — zstd-compressed by default — to S3-standard at `nar/{FileHash}.nar.zst`, where `FileHash = sha256(compressed bytes)`. The bytes are reassembled from chunks immediately post-commit (chunks were just written and are moka-hot).
 
 r[store.compat.narinfo-on-put]
 
@@ -235,7 +235,7 @@ r[store.compat.stock-nix-substitute]
 
 With compat enabled and at least one `nix-cache-info` object present at the bucket root, the S3-standard bucket is a valid `nix copy --from s3://bucket?region=…` substituter with no rio process running. This is the migration on-ramp (existing Nix infrastructure reads the bucket directly while rio is rolled out) and the disaster-recovery floor (PG outage degrades to the slower stock-Nix path instead of a total outage).
 
-**`inline_blob` durability note.** With compat enabled, every inline-stored NAR's bytes are also durably in S3 (inside the compressed NAR object). `inline_blob` becomes a pure read-latency optimization for tiny paths — its original durability rationale ("PG holds the only copy of small NARs") no longer applies. Dropping the inline path entirely is a possible future simplification (one code path, no PG byte-serving load); not in scope here.
+**Considered alternative — inline storage in PostgreSQL.** Earlier rio-store versions stored NARs ≤256 KiB directly in a `manifests.inline_blob` `BYTEA` column, bypassing chunking and S3. Dropped: with the compat layer above, those bytes are durably in S3 anyway (inside `nar/*.nar.zst`), so inline's durability rationale is gone; what remained — saving one S3 GET per tiny path — costs a second code path through `PutPath`/`GetPath`/`ManifestKind`, puts byte-serving load on PostgreSQL, and in pure-rio mode leaves PG holding the only copy. Removing it gives one code path, uniform dedup (identical `.drv` files across builds share a chunk), and tiny NARs hit moka/Express like everything else. The trade is ~79% more S3 objects by count (mostly sub-16 KiB single-chunk paths) — negligible at S3-standard PUT cost, and on the read path these are exactly what the moka L1 absorbs.
 
 ## 11. Privilege boundary
 
