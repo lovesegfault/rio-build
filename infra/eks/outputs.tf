@@ -3,11 +3,6 @@ output "cluster_name" {
   value       = module.eks.cluster_name
 }
 
-output "cluster_endpoint" {
-  description = "EKS API server endpoint"
-  value       = module.eks.cluster_endpoint
-}
-
 output "kubeconfig_command" {
   description = "Run this to configure kubectl for the cluster"
   value       = "aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}"
@@ -26,11 +21,6 @@ output "scheduler_iam_role_arn" {
 output "bootstrap_iam_role_arn" {
   description = "IAM role ARN for the rio-bootstrap Job IRSA (helm pre-install hook that seeds rio/* secrets in Secrets Manager)"
   value       = module.rio_bootstrap_irsa.arn
-}
-
-output "oidc_provider_arn" {
-  description = "OIDC provider ARN (for additional IRSA roles if needed)"
-  value       = module.eks.oidc_provider_arn
 }
 
 output "ecr_registry" {
