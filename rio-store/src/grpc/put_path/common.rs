@@ -36,7 +36,6 @@ use crate::cas;
 use crate::grpc::{StoreServiceImpl, putpath_metadata_status, storage_error};
 use crate::ingest;
 use crate::metadata;
-use crate::validate::validate_nar_digest;
 
 /// Re-export of [`crate::ingest::PlaceholderClaim`] — the write-ahead
 /// state machine lives in `ingest` (shared with `Substituter`); this
@@ -208,20 +207,41 @@ pub(in crate::grpc) async fn read_first_metadata(
 }
 
 // r[impl store.integrity.verify-on-put]
+// r[impl sec.drv.validate]
 /// Hash the buffered NAR and check against the trailer-declared
 /// `nar_hash` / `nar_size` (already applied to `info` via
 /// [`apply_trailer`]). The integrity gate of
 /// `r[store.integrity.verify-on-put]` — server computes the digest
 /// independently of the client.
+///
+/// Status messages contain the substrings "size mismatch" / "hash
+/// mismatch"; protocol tests assert on those.
 pub(in crate::grpc) fn verify_nar(
     nar_data: &[u8],
     info: &ValidatedPathInfo,
     ctx_label: &str,
 ) -> Result<(), Status> {
-    validate_nar_digest(nar_data, &info.nar_hash, info.nar_size).map_err(|e| {
+    use sha2::{Digest, Sha256};
+    let fail = |e: String| {
         warn!(store_path = %info.store_path, error = %e, "{ctx_label}: NAR validation failed");
         Status::invalid_argument(format!("{ctx_label}: NAR validation failed: {e}"))
-    })
+    };
+    let actual_size = nar_data.len() as u64;
+    if actual_size != info.nar_size {
+        return Err(fail(format!(
+            "NAR size mismatch: declared {}, actual {actual_size}",
+            info.nar_size
+        )));
+    }
+    let actual_hash: [u8; 32] = Sha256::digest(nar_data).into();
+    if actual_hash != info.nar_hash {
+        return Err(fail(format!(
+            "NAR hash mismatch: declared {}, computed {}",
+            hex::encode(info.nar_hash),
+            hex::encode(actual_hash)
+        )));
+    }
+    Ok(())
 }
 
 impl StoreServiceImpl {
@@ -500,5 +520,26 @@ impl StoreServiceImpl {
         } else {
             Ok(NarPersist::Inline(Bytes::from(nar_data)))
         }
+    }
+}
+
+// r[verify sec.drv.validate]
+// r[verify store.integrity.verify-on-put]
+#[cfg(test)]
+mod verify_nar_tests {
+    use super::*;
+    use rio_test_support::fixtures::{make_path_info_for_nar, test_store_path};
+
+    #[test]
+    fn verify_nar_size_and_hash() {
+        let data = b"valid nar data";
+        let info = make_path_info_for_nar(&test_store_path("v"), data);
+        assert!(verify_nar(data, &info, "t").is_ok());
+
+        let e = verify_nar(b"short", &info, "t").unwrap_err();
+        assert!(e.message().contains("size mismatch"), "got: {e:?}");
+
+        let e = verify_nar(b"different data", &info, "t").unwrap_err();
+        assert!(e.message().contains("hash mismatch"), "got: {e:?}");
     }
 }

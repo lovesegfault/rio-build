@@ -49,24 +49,12 @@ async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
     }
 }
 
-/// Extract the subject CN from a DER-encoded X509 certificate.
-/// Returns None if parse fails or no CN found. Kept for logging
-/// (the rejected-cert path wants to name WHICH CN was rejected);
-/// authorization goes through `cert_identity_in_allowlist` below.
-fn cert_cn(der: &[u8]) -> Option<String> {
-    use x509_parser::prelude::*;
-    let (_, cert) = X509Certificate::from_der(der).ok()?;
-    cert.subject()
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-        .map(String::from)
-}
-
 // r[impl store.hmac.san-bypass]
-/// Check whether a DER-encoded X509 certificate's identity is in the
-/// allowlist. Identity = subject CN OR any SAN DNSName entry — either
-/// match grants bypass.
+/// Parse a DER-encoded X509 certificate and check whether its identity
+/// (subject CN OR any SAN DNSName entry) is in the allowlist. Returns
+/// `(in_allowlist, cn)` so callers get both the authorization bit and
+/// the CN for logging/metrics from a SINGLE parse — previously the CN
+/// was re-extracted (and DER re-parsed) up to 3× on the no-token paths.
 ///
 /// CN-first, SAN-second ordering is an optimization only (CN is
 /// cheaper to extract); security-wise they're equivalent since any
@@ -82,24 +70,26 @@ fn cert_cn(der: &[u8]) -> Option<String> {
 /// names because that's what cert-manager emits and what the gateway
 /// cert carries.
 ///
-/// Returns false on parse failure (malformed DER) — fail closed.
-fn cert_identity_in_allowlist(der: &[u8], allowlist: &[String]) -> bool {
+/// Returns `(false, None)` on parse failure (malformed DER) — fail closed.
+fn cert_identity_in_allowlist(der: &[u8], allowlist: &[String]) -> (bool, Option<String>) {
     use x509_parser::extensions::GeneralName;
     use x509_parser::prelude::*;
 
     let Ok((_, cert)) = X509Certificate::from_der(der) else {
-        return false;
+        return (false, None);
     };
 
-    // CN check
-    if let Some(cn) = cert
+    let cn = cert
         .subject()
         .iter_common_name()
         .next()
         .and_then(|a| a.as_str().ok())
-        && allowlist.iter().any(|a| a == cn)
+        .map(String::from);
+
+    if let Some(c) = cn.as_deref()
+        && allowlist.iter().any(|a| a == c)
     {
-        return true;
+        return (true, cn);
     }
 
     // SAN DNSName check. subject_alternative_name() returns
@@ -112,12 +102,12 @@ fn cert_identity_in_allowlist(der: &[u8], allowlist: &[String]) -> bool {
             if let GeneralName::DNSName(dns) = gn
                 && allowlist.iter().any(|a| a == dns)
             {
-                return true;
+                return (true, cn);
             }
         }
     }
 
-    false
+    (false, cn)
 }
 
 impl StoreServiceImpl {
@@ -153,15 +143,15 @@ impl StoreServiceImpl {
         // worker omits the token → uploads arbitrary paths → backdoored
         // libc injection. Now: only allowlisted identities bypass.
         //
-        // peer_cert_der held separately from peer_in_allowlist so the
-        // rejection branch can log the CN (allowlist says no, but WHICH
-        // identity was rejected is useful for debugging misissued certs).
-        let peer_cert_der = request
+        // CN held separately from peer_in_allowlist so the rejection
+        // branch can log WHICH CN was rejected (debugging misissued
+        // certs).
+        let (peer_in_allowlist, peer_cn) = request
             .peer_certs()
-            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
-        let peer_in_allowlist = peer_cert_der
+            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()))
             .as_deref()
-            .is_some_and(|der| cert_identity_in_allowlist(der, &self.hmac_bypass_cns));
+            .map(|der| cert_identity_in_allowlist(der, &self.hmac_bypass_cns))
+            .unwrap_or((false, None));
 
         let token = request
             .metadata()
@@ -188,16 +178,13 @@ impl StoreServiceImpl {
                 // when present, else "san-only" when the cert has no
                 // CN (cert-manager default). Cardinality bounded by
                 // allowlist size (typically 1-3 entries).
-                let label = peer_cert_der
-                    .as_deref()
-                    .and_then(cert_cn)
-                    .unwrap_or_else(|| "san-only".to_string());
+                let label = peer_cn.unwrap_or_else(|| "san-only".to_string());
                 debug!(identity = %label, "PutPath: cert identity in HMAC bypass allowlist");
                 metrics::counter!("rio_store_hmac_bypass_total", "cn" => label).increment(1);
                 Ok(None)
             }
             None => {
-                match peer_cert_der.as_deref().and_then(cert_cn) {
+                match peer_cn {
                     Some(rejected_cn) => {
                         // mTLS client with NON-allowlisted identity
                         // (worker, controller) and no token → REJECT.
@@ -310,6 +297,12 @@ impl StoreServiceImpl {
 mod tests {
     use super::*;
 
+    /// Test-only shorthand for the CN half of
+    /// [`cert_identity_in_allowlist`]'s return tuple.
+    fn cert_cn(der: &[u8]) -> Option<String> {
+        cert_identity_in_allowlist(der, &[]).1
+    }
+
     /// CN parsing: verify cert_cn extracts the CN correctly.
     /// Uses rcgen to build an in-memory cert (test-only dep).
     fn make_cert_with_cn(cn: &str) -> Vec<u8> {
@@ -399,10 +392,7 @@ mod tests {
             None,
             "precondition: cert must have NO CN for this test to prove SAN matching"
         );
-        assert!(cert_identity_in_allowlist(
-            &der,
-            &["rio-gateway".to_string()]
-        ));
+        assert!(cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0);
     }
 
     /// SAN DNSName NOT in allowlist → no bypass. Worker-issued certs
@@ -410,10 +400,7 @@ mod tests {
     #[test]
     fn san_mismatch_does_not_bypass() {
         let der = make_cert_with_san(&["rio-builder"], None);
-        assert!(!cert_identity_in_allowlist(
-            &der,
-            &["rio-gateway".to_string()]
-        ));
+        assert!(!cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0);
     }
 
     /// Backward-compat: CN-only certs (pre-cert-manager, manually
@@ -422,10 +409,7 @@ mod tests {
     #[test]
     fn cn_still_bypasses_backward_compat() {
         let der = make_cert_with_cn("rio-gateway");
-        assert!(cert_identity_in_allowlist(
-            &der,
-            &["rio-gateway".to_string()]
-        ));
+        assert!(cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0);
     }
 
     /// Custom allowlist entries work (deployments that name their
@@ -435,19 +419,16 @@ mod tests {
     #[test]
     fn custom_allowlist_works() {
         let der = make_cert_with_cn("my-custom-gateway");
-        assert!(cert_identity_in_allowlist(
-            &der,
-            &["my-custom-gateway".to_string()]
-        ));
+        assert!(cert_identity_in_allowlist(&der, &["my-custom-gateway".to_string()]).0);
         assert!(
-            !cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]),
+            !cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0,
             "my-custom-gateway must NOT match rio-gateway allowlist"
         );
         // Inverse: rio-gateway cert against custom-only allowlist → reject.
         // Proves the string "rio-gateway" is NOT special-cased in the impl.
         let gw_der = make_cert_with_cn("rio-gateway");
         assert!(
-            !cert_identity_in_allowlist(&gw_der, &["my-custom-gateway".to_string()]),
+            !cert_identity_in_allowlist(&gw_der, &["my-custom-gateway".to_string()]).0,
             "rio-gateway must NOT bypass when allowlist doesn't include it"
         );
     }
@@ -466,10 +447,7 @@ mod tests {
             None,
         );
         // Only the short name is in the allowlist — still matches.
-        assert!(cert_identity_in_allowlist(
-            &der,
-            &["rio-gateway".to_string()]
-        ));
+        assert!(cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0);
     }
 
     /// CN mismatch + SAN match → bypass. CN doesn't have to be in
@@ -478,10 +456,7 @@ mod tests {
     fn cn_mismatch_san_match_bypasses() {
         let der = make_cert_with_san(&["rio-gateway"], Some("some-other-cn"));
         assert_eq!(cert_cn(&der), Some("some-other-cn".into()));
-        assert!(cert_identity_in_allowlist(
-            &der,
-            &["rio-gateway".to_string()]
-        ));
+        assert!(cert_identity_in_allowlist(&der, &["rio-gateway".to_string()]).0);
     }
 
     /// Empty allowlist → nothing bypasses, including rio-gateway.
@@ -490,19 +465,16 @@ mod tests {
     #[test]
     fn empty_allowlist_bypasses_nothing() {
         let der = make_cert_with_cn("rio-gateway");
-        assert!(!cert_identity_in_allowlist(&der, &[]));
+        assert!(!cert_identity_in_allowlist(&der, &[]).0);
         let san_der = make_cert_with_san(&["rio-gateway"], None);
-        assert!(!cert_identity_in_allowlist(&san_der, &[]));
+        assert!(!cert_identity_in_allowlist(&san_der, &[]).0);
     }
 
     /// Malformed DER → false (fail closed). Same as cert_cn's
     /// garbage-returns-None, but for the authz path.
     #[test]
     fn garbage_der_does_not_bypass() {
-        assert!(!cert_identity_in_allowlist(
-            b"not a cert",
-            &["rio-gateway".to_string()]
-        ));
+        assert!(!cert_identity_in_allowlist(b"not a cert", &["rio-gateway".to_string()]).0);
     }
 
     /// T3: NAR byte budget backpressure. `with_nar_budget(N)` sets a

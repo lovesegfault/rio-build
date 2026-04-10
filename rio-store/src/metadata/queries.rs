@@ -14,6 +14,39 @@ use tracing::instrument;
 // narinfo_cols! is #[macro_export] so it lands at crate root — re-import.
 use crate::narinfo_cols;
 
+/// `SELECT <narinfo cols>[extra] FROM narinfo n JOIN manifests m … WHERE
+/// <pred> AND m.status='complete'`. Every read query that returns full
+/// `NarinfoRow`s shares this shell; only the WHERE predicate (and
+/// `get_manifest_batch`'s extra `m.inline_blob` column) varies. Factored
+/// so the JOIN clause + status filter can't drift between the four
+/// callers (I-078 made the index strategy load-bearing).
+macro_rules! narinfo_complete_select {
+    ($pred:literal) => {
+        narinfo_complete_select!($pred, "")
+    };
+    ($pred:literal, $extra_cols:literal) => {
+        concat!(
+            "SELECT ",
+            narinfo_cols!(),
+            $extra_cols,
+            " FROM narinfo n \
+             INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+             WHERE ",
+            $pred,
+            " AND m.status = 'complete'"
+        )
+    };
+}
+
+/// Batch hash prep: parse + SHA-256 each path into the `bytea[]` shape
+/// the `= ANY($1)` queries bind. Shared by every `*_batch` reader.
+fn batch_hashes(paths: &[String]) -> Result<Vec<Vec<u8>>> {
+    paths
+        .iter()
+        .map(|p| path_hash(p).map(|h| h.to_vec()))
+        .collect()
+}
+
 /// SHA-256 of the full path string — the `narinfo` PK. The gRPC layer
 /// has already run `validate_store_path` (which calls `StorePath::
 /// parse`), so this re-parse can't fail; the `Err` path is for direct
@@ -115,17 +148,11 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
 #[instrument(skip(pool))]
 pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<ValidatedPathInfo>> {
     let hash = path_hash(store_path)?;
-    let row: Option<NarinfoRow> = sqlx::query_as(concat!(
-        "SELECT ",
-        narinfo_cols!(),
-        " FROM narinfo n \
-         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE n.store_path_hash = $1 AND m.status = 'complete'"
-    ))
-    .bind(hash.as_slice())
-    .fetch_optional(pool)
-    .await?;
-
+    let row: Option<NarinfoRow> =
+        sqlx::query_as(narinfo_complete_select!("n.store_path_hash = $1"))
+            .bind(hash.as_slice())
+            .fetch_optional(pool)
+            .await?;
     validate_row(row)
 }
 
@@ -149,22 +176,13 @@ pub async fn query_path_info_batch(
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
+    let hashes = batch_hashes(store_paths)?;
 
-    let hashes: Vec<Vec<u8>> = store_paths
-        .iter()
-        .map(|p| path_hash(p).map(|h| h.to_vec()))
-        .collect::<Result<_>>()?;
-
-    let rows: Vec<NarinfoRow> = sqlx::query_as(concat!(
-        "SELECT ",
-        narinfo_cols!(),
-        " FROM narinfo n \
-         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE n.store_path_hash = ANY($1) AND m.status = 'complete'"
-    ))
-    .bind(&hashes)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<NarinfoRow> =
+        sqlx::query_as(narinfo_complete_select!("n.store_path_hash = ANY($1)"))
+            .bind(&hashes)
+            .fetch_all(pool)
+            .await?;
 
     // Index by store_path then re-project in input order. validate_row
     // applies the same DB-egress check as the single-path query —
@@ -205,11 +223,7 @@ pub async fn get_manifest_batch(
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
-
-    let hashes: Vec<Vec<u8>> = store_paths
-        .iter()
-        .map(|p| path_hash(p).map(|h| h.to_vec()))
-        .collect::<Result<_>>()?;
+    let hashes = batch_hashes(store_paths)?;
 
     // Query 1: narinfo + manifests.inline_blob in one go (LEFT side of
     // the inline/chunked branch). One row per complete path.
@@ -219,13 +233,9 @@ pub async fn get_manifest_batch(
         narinfo: NarinfoRow,
         inline_blob: Option<Vec<u8>>,
     }
-    let rows: Vec<Row> = sqlx::query_as(concat!(
-        "SELECT ",
-        narinfo_cols!(),
-        ", m.inline_blob \
-         FROM narinfo n \
-         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE n.store_path_hash = ANY($1) AND m.status = 'complete'"
+    let rows: Vec<Row> = sqlx::query_as(narinfo_complete_select!(
+        "n.store_path_hash = ANY($1)",
+        ", m.inline_blob"
     ))
     .bind(&hashes)
     .fetch_all(pool)
@@ -322,11 +332,7 @@ pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
-
-    let hashes: Vec<Vec<u8>> = store_paths
-        .iter()
-        .map(|p| path_hash(p).map(|h| h.to_vec()))
-        .collect::<Result<_>>()?;
+    let hashes = batch_hashes(store_paths)?;
 
     let complete = sqlx::query!(
         r#"
@@ -405,17 +411,10 @@ pub async fn query_by_hash_part(
     // including it makes the match exact.
     let pattern = format!("/nix/store/{hash_part}-%");
 
-    let row: Option<NarinfoRow> = sqlx::query_as(concat!(
-        "SELECT ",
-        narinfo_cols!(),
-        " FROM narinfo n \
-         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE n.store_path LIKE $1 AND m.status = 'complete'"
-    ))
-    .bind(&pattern)
-    .fetch_optional(pool)
-    .await?;
-
+    let row: Option<NarinfoRow> = sqlx::query_as(narinfo_complete_select!("n.store_path LIKE $1"))
+        .bind(&pattern)
+        .fetch_optional(pool)
+        .await?;
     validate_row(row)
 }
 

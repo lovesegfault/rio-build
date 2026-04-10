@@ -538,6 +538,7 @@ mod tests {
     use crate::test_helpers::{StoreSeed, mem_backend};
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
+    use rstest::rstest;
 
     /// GetLoad reflects checked-out connections as a fraction of
     /// `max_connections`.
@@ -732,6 +733,25 @@ mod tests {
         Ok(last_ok.expect("stream produced at least one message"))
     }
 
+    /// Dry-run TriggerGC with the given gate parameters; return the
+    /// drained final progress (Ok) or the gate-refused Status (Err).
+    async fn run_gate_gc(
+        svc: &StoreAdminServiceImpl,
+        grace_hours: u32,
+        force: bool,
+    ) -> Result<GcProgress, Status> {
+        let resp = svc
+            .trigger_gc(Request::new(GcRequest {
+                dry_run: true,
+                grace_period_hours: Some(grace_hours),
+                extra_roots: vec![],
+                force,
+            }))
+            .await
+            .expect("handler returns Ok(stream)");
+        drain_gc_stream(&mut resp.into_inner()).await
+    }
+
     /// r[verify store.gc.empty-refs-gate]
     /// Store with >10% empty-ref non-CA paths past grace → gate refuses
     /// with FailedPrecondition. Message names the ratio + suggests force.
@@ -749,18 +769,7 @@ mod tests {
             seed_narinfo_for_gate(&db.pool, &format!("good-{i}"), &good_ref, None).await;
         }
 
-        let resp = svc
-            .trigger_gc(Request::new(GcRequest {
-                dry_run: true,
-                grace_period_hours: Some(1),
-                extra_roots: vec![],
-                force: false,
-            }))
-            .await
-            .expect("handler returns Ok(stream)");
-        let mut stream = resp.into_inner();
-
-        let err = drain_gc_stream(&mut stream)
+        let err = run_gate_gc(&svc, 1, false)
             .await
             .expect_err("gate should refuse");
         assert_eq!(
@@ -770,127 +779,52 @@ mod tests {
             err.code(),
             err.message()
         );
-        // Message contains ratio + force hint.
         let msg = err.message();
-        assert!(
-            msg.contains("GC refused"),
-            "message should say GC refused: {msg}"
-        );
+        assert!(msg.contains("GC refused"), "should say GC refused: {msg}");
         assert!(
             msg.contains("8/10") && msg.contains("80.0%"),
-            "message should show 8/10 (80.0%) ratio: {msg}"
+            "should show 8/10 (80.0%) ratio: {msg}"
         );
         assert!(
             msg.contains("force=true"),
-            "message should hint force override: {msg}"
+            "should hint force override: {msg}"
         );
     }
 
     /// r[verify store.gc.empty-refs-gate]
-    /// Same high-ratio setup, but `force=true` bypasses the gate.
-    /// GC proceeds to mark+sweep (dry-run so nothing actually deleted).
+    /// Three ways the gate must PASS even with 5× empty-ref paths:
+    /// - `force_overrides`: 100% empty-ref non-CA, but `force=true`
+    ///   bypasses the gate entirely.
+    /// - `ca_excluded`: all CA → numerator=0 (fetchurl outputs etc.
+    ///   legitimately have no runtime deps; spec says CA paths are
+    ///   exempt).
+    /// - `inside_grace`: `seed_narinfo_for_gate` sets `created_at` 7d
+    ///   ago; with grace=720h (30d) they're inside grace →
+    ///   denominator=0 (protected from sweep anyway).
+    ///
+    /// All cases assert `is_complete` AND that the result isn't the
+    /// advisory-lock early-return ("already running").
+    #[rstest]
+    #[case::force_overrides(None, 1, true)]
+    #[case::ca_excluded(Some("fixed:r:sha256:abc"), 1, false)]
+    #[case::inside_grace(None, 720, false)]
     #[tokio::test]
-    async fn gc_force_overrides_empty_refs_gate() {
+    async fn gc_gate_passes(#[case] ca: Option<&str>, #[case] grace: u32, #[case] force: bool) {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
 
-        // 100% empty-ref non-CA.
         for i in 0..5 {
-            seed_narinfo_for_gate(&db.pool, &format!("empty-{i}"), &[], None).await;
+            seed_narinfo_for_gate(&db.pool, &format!("p-{i}"), &[], ca).await;
         }
 
-        let resp = svc
-            .trigger_gc(Request::new(GcRequest {
-                dry_run: true, // don't actually sweep, just verify gate is bypassed
-                grace_period_hours: Some(1),
-                extra_roots: vec![],
-                force: true,
-            }))
+        let final_msg = run_gate_gc(&svc, grace, force)
             .await
-            .expect("handler returns Ok(stream)");
-        let mut stream = resp.into_inner();
-
-        // Gate bypassed → mark+sweep runs → stream ends with Ok(complete).
-        let final_msg = drain_gc_stream(&mut stream)
-            .await
-            .expect("force=true should bypass gate and complete");
-        assert!(
-            final_msg.is_complete,
-            "force=true should let GC complete, got: {final_msg:?}"
-        );
+            .expect("gate should pass");
+        assert!(final_msg.is_complete, "GC should complete: {final_msg:?}");
         assert!(
             !final_msg.current_path.contains("already running"),
             "should not be the advisory-lock early-return path"
         );
-    }
-
-    /// r[verify store.gc.empty-refs-gate]
-    /// CA paths with empty refs are NOT counted toward the threshold
-    /// (fetchurl outputs etc. legitimately have no runtime deps).
-    /// 100% of paths have empty refs but they're all CA → gate passes.
-    #[tokio::test]
-    async fn gc_gate_excludes_ca_paths_from_ratio() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-
-        // All empty-ref but all CA. Numerator = 0, pct = 0%.
-        for i in 0..5 {
-            seed_narinfo_for_gate(
-                &db.pool,
-                &format!("ca-{i}"),
-                &[],
-                Some("fixed:r:sha256:abc"),
-            )
-            .await;
-        }
-
-        let resp = svc
-            .trigger_gc(Request::new(GcRequest {
-                dry_run: true,
-                grace_period_hours: Some(1),
-                extra_roots: vec![],
-                force: false,
-            }))
-            .await
-            .expect("handler returns Ok(stream)");
-        let mut stream = resp.into_inner();
-
-        let final_msg = drain_gc_stream(&mut stream)
-            .await
-            .expect("CA-only store should pass gate");
-        assert!(final_msg.is_complete);
-    }
-
-    /// r[verify store.gc.empty-refs-gate]
-    /// Paths INSIDE the grace window don't count toward the ratio
-    /// (they're protected from sweep anyway). Seed recent empty-ref
-    /// paths + use a large grace → denominator = 0 → gate passes.
-    #[tokio::test]
-    async fn gc_gate_excludes_paths_inside_grace() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-
-        // seed_narinfo_for_gate sets created_at = 7 days ago.
-        // With grace = 30 days (720h), they're INSIDE grace → excluded.
-        for i in 0..5 {
-            seed_narinfo_for_gate(&db.pool, &format!("recent-{i}"), &[], None).await;
-        }
-
-        let resp = svc
-            .trigger_gc(Request::new(GcRequest {
-                dry_run: true,
-                grace_period_hours: Some(720), // 30 days > 7 days
-                extra_roots: vec![],
-                force: false,
-            }))
-            .await
-            .expect("handler returns Ok(stream)");
-        let mut stream = resp.into_inner();
-
-        let final_msg = drain_gc_stream(&mut stream)
-            .await
-            .expect("paths inside grace don't trip gate");
-        assert!(final_msg.is_complete);
     }
 
     // ────────────────────────────────────────────────────────────────

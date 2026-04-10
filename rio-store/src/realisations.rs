@@ -110,16 +110,6 @@ pub async fn query(
 // Internal
 // ---------------------------------------------------------------------------
 
-/// A `BYTEA` column that should be 32 bytes (SHA-256) came back a different
-/// length. The DB schema doesn't enforce length on BYTEA, so this catches
-/// corrupt writes at the read boundary instead of panicking in a `try_into()`.
-#[derive(Debug, thiserror::Error)]
-#[error("{field} must be 32 bytes, got {got}")]
-pub(crate) struct RealisationRowError {
-    field: &'static str,
-    got: usize,
-}
-
 #[derive(sqlx::FromRow)]
 struct RealisationRow {
     drv_hash: Vec<u8>,
@@ -130,23 +120,23 @@ struct RealisationRow {
 }
 
 impl RealisationRow {
-    fn try_into_validated(self) -> Result<Realisation, RealisationRowError> {
-        let drv_hash: [u8; 32] =
-            self.drv_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| RealisationRowError {
-                    field: "drv_hash",
-                    got: self.drv_hash.len(),
-                })?;
-        let output_hash: [u8; 32] =
-            self.output_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| RealisationRowError {
-                    field: "output_hash",
-                    got: self.output_hash.len(),
-                })?;
+    /// DB-egress validation: BYTEA columns that should be 32 bytes
+    /// (SHA-256). The schema doesn't enforce length on BYTEA, so this
+    /// catches corrupt writes at the read boundary instead of panicking
+    /// in a `try_into()`. Error is a plain `String` — its only consumer
+    /// formats it straight into `MetadataError::InvariantViolation`.
+    fn try_into_validated(self) -> Result<Realisation, String> {
+        let bad = |field: &str, got: usize| format!("{field} must be 32 bytes, got {got}");
+        let drv_hash: [u8; 32] = self
+            .drv_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| bad("drv_hash", self.drv_hash.len()))?;
+        let output_hash: [u8; 32] = self
+            .output_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| bad("output_hash", self.output_hash.len()))?;
         Ok(Realisation {
             drv_hash,
             output_name: self.output_name,

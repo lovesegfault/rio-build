@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use super::put_path::common::NarPersist;
 
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, warn};
+use tracing::warn;
 
 use rio_proto::types::{
     PutPathBatchRequest, PutPathBatchResponse, PutPathTrailer, put_path_request,
@@ -173,13 +173,7 @@ impl StoreServiceImpl {
     /// loop holds `&mut outputs`.
     async fn abort_batch(&self, owned_placeholders: &[Vec<u8>]) {
         for hash in owned_placeholders {
-            if let Err(e) =
-                crate::gc::orphan::reap_one(&self.pool, hash, None, self.chunk_backend.as_ref())
-                    .await
-            {
-                error!(store_path_hash = %hex::encode(hash), error = %e,
-                       "PutPathBatch abort: failed to clean up placeholder");
-            }
+            crate::ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), hash).await;
         }
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
     }

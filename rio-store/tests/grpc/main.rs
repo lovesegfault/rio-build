@@ -50,13 +50,20 @@ pub struct StoreSession {
 }
 
 impl StoreSession {
+    /// Shared ctor core: ephemeral PG → caller-supplied service builder
+    /// → in-process server. Mirrors `RioStack::build_inner` at
+    /// `rio-gateway/tests/functional/mod.rs`.
+    async fn build(mk: impl FnOnce(sqlx::PgPool) -> StoreServiceImpl) -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = mk(db.pool.clone());
+        let (client, server) = spawn_store_server(service).await?;
+        Ok(Self { db, client, server })
+    }
+
     /// Inline-only store (no chunk backend). NARs of any size go into
     /// `manifests.inline_blob`. Most tests use this.
     pub async fn new() -> anyhow::Result<Self> {
-        let db = TestDb::new(&MIGRATOR).await;
-        let service = StoreServiceImpl::new(db.pool.clone());
-        let (client, server) = spawn_store_server(service).await?;
-        Ok(Self { db, client, server })
+        Self::build(StoreServiceImpl::new).await
     }
 
     /// Store with a signing key. For narinfo signing tests.
@@ -67,35 +74,30 @@ impl StoreSession {
     /// to the cluster key without touching the pool. Callers testing
     /// per-tenant keys seed `tenant_keys` on `s.db.pool` first.
     pub async fn new_with_signer(signer: rio_store::signing::Signer) -> anyhow::Result<Self> {
-        let db = TestDb::new(&MIGRATOR).await;
-        let ts = rio_store::signing::TenantSigner::new(signer, db.pool.clone());
-        let service = StoreServiceImpl::new(db.pool.clone()).with_signer(ts);
-        let (client, server) = spawn_store_server(service).await?;
-        Ok(Self { db, client, server })
+        Self::build(|pool| {
+            let ts = rio_store::signing::TenantSigner::new(signer, pool.clone());
+            StoreServiceImpl::new(pool).with_signer(ts)
+        })
+        .await
     }
 
     /// Store with HMAC verifier enabled. PutPath requires a valid
     /// `x-rio-assignment-token` header unless peer is mTLS-identified
     /// as rio-gateway. For testing the assignment-token enforcement.
     pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
-        let db = TestDb::new(&MIGRATOR).await;
         let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
-        let service = StoreServiceImpl::new(db.pool.clone()).with_hmac_verifier(verifier);
-        let (client, server) = spawn_store_server(service).await?;
-        Ok(Self { db, client, server })
+        Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(verifier)).await
     }
 
     /// Store WITH chunk backend. NARs ≥ 256 KiB are FastCDC-chunked.
     /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
-        let db = TestDb::new(&MIGRATOR).await;
         let backend = mem_backend();
         let cache = Arc::new(rio_store::cas::ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
-        let service = StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(cache);
-        let (client, server) = spawn_store_server(service).await?;
-        Ok((Self { db, client, server }, backend))
+        let s = Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await?;
+        Ok((s, backend))
     }
 }
 

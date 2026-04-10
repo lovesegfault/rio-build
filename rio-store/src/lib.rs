@@ -61,8 +61,6 @@ pub mod signing;
 pub mod substitute;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
-#[cfg(feature = "server")]
-pub(crate) mod validate;
 
 /// Shared sqlx migrator for the `migrations/` directory. Embeds
 /// migration SQL at compile time via `sqlx::migrate!`.
