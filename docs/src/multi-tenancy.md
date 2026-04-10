@@ -100,7 +100,8 @@ The `FindMissingChunks` RPC can reveal whether another tenant has built a specif
 > `chunk_tenants` junction table (migration 018). `FindMissingChunks`
 > and `PutChunk` both require a JWT with `Claims.sub` (fail-closed on
 > missing — `UNAUTHENTICATED`). A chunk is reported present to a
-> tenant IFF that tenant has a junction row; different tenants can
+> tenant IFF that tenant has a junction row AND `chunks.durable=TRUE`
+> (see `r[store.chunk.durable-flag]`); different tenants can
 > share the same `chunks` row (dedup preserved) while each sees only
 > their own uploads. The global chunk namespace (option 1 above) is
 > no longer available.
