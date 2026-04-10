@@ -18,5 +18,16 @@ resolver = "2"
 # https://doc.rust-lang.org/rustc/platform-support.html
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
+# Dev-only features (tokio[test-util], aws-sdk-s3[test-util],
+# aws-smithy-runtime[test-util], figment[test]) appear in workspace-hack's
+# [dependencies] — not [dev-dependencies] — and so compile into release
+# binaries. This is hakari's intended one-build-per-dep tradeoff: a single
+# feature set per crate across dev+release means tokio etc. build exactly
+# once. Excluding the test crates via [final-excludes] would re-introduce
+# the duplicate builds hakari exists to remove. Accepted: the test-util
+# surface is small (mock connectors, paused-clock); revisit if a test-only
+# feature ever pulls a heavyweight transitive (audit via `cargo tree
+# -e features -i <crate>` against a non-hakari build).
+
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
