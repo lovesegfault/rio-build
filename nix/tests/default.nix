@@ -13,34 +13,10 @@
   coverage ? false,
 }:
 let
-  common = import ./common.nix {
-    inherit
-      pkgs
-      rio-workspace
-      rioModules
-      coverage
-      ;
-  };
-
-  standalone = import ./fixtures/standalone.nix {
-    inherit
-      pkgs
-      rio-workspace
-      rioModules
-      coverage
-      ;
-  };
-
-  toxiproxy = import ./fixtures/toxiproxy.nix {
-    inherit
-      pkgs
-      rio-workspace
-      rioModules
-      coverage
-      ;
-  };
-
-  k3sFull = import ./fixtures/k3s-full.nix {
+  # Shared arg set for common.nix + every fixture. Fixtures take `...`
+  # so the unused k3s-only attrs (dockerImages, nixhelm, system) are
+  # ignored by standalone/toxiproxy.
+  fixtureArgs = {
     inherit
       pkgs
       rio-workspace
@@ -51,22 +27,15 @@ let
       coverage
       ;
   };
-
+  common = import ./common.nix fixtureArgs;
+  standalone = import ./fixtures/standalone.nix fixtureArgs;
+  toxiproxy = import ./fixtures/toxiproxy.nix fixtureArgs;
+  k3sFull = import ./fixtures/k3s-full.nix fixtureArgs;
   # Prod-parity overlay: bootstrap.enabled=true on top of k3s-full.
   # Three prod regressions from P0493/P0494 all had the same root
   # cause: bootstrap Job never renders in CI. See plan-0500 +
   # fixtures/k3s-prod-parity.nix header for the full rationale.
-  k3sProdParity = import ./fixtures/k3s-prod-parity.nix {
-    inherit
-      pkgs
-      rio-workspace
-      rioModules
-      dockerImages
-      nixhelm
-      system
-      coverage
-      ;
-  };
+  k3sProdParity = import ./fixtures/k3s-prod-parity.nix fixtureArgs;
 
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;

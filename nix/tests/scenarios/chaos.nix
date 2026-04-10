@@ -41,19 +41,17 @@ let
   # switch to a single stream. This drv's retry semantics will shift
   # (one stream reset → whole batch retried). Until then, each output
   # retries independently.
-  twoOutputDrv = pkgs.writeText "drv-chaos-reset.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-test-chaos-reset";
-      outputs = [ "out" "dev" ];
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" '''
-        echo chaos-reset-out > $out
-        echo chaos-reset-dev > $dev
-      ''' ];
-      system = builtins.currentSystem;
-    }
-  '';
+  twoOutputDrv = drvs.mkCustom {
+    name = "rio-test-chaos-reset";
+    extraAttrs.outputs = [
+      "out"
+      "dev"
+    ];
+    script = ''
+      echo chaos-reset-out > $out
+      echo chaos-reset-dev > $dev
+    '';
+  };
 
   # Subtest 3: trivial. Partition is on scheduler_store only — the
   # worker path is unaffected, so any build that gets past cache-check
@@ -69,17 +67,12 @@ let
   # sandbox's /dev allowlist. Non-determinism is fine here: the .drv
   # hash is what's cached, not the output content, and this test runs
   # the build exactly once.
-  largeOutputDrv = pkgs.writeText "drv-chaos-bandwidth.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-test-chaos-bandwidth";
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" '''
-        ''${busybox}/bin/busybox dd if=/dev/urandom of=$out bs=1048576 count=2
-      ''' ];
-      system = builtins.currentSystem;
-    }
-  '';
+  largeOutputDrv = drvs.mkCustom {
+    name = "rio-test-chaos-bandwidth";
+    script = ''
+      ''${busybox}/bin/busybox dd if=/dev/urandom of=$out bs=1048576 count=2
+    '';
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-chaos";
@@ -93,15 +86,12 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
+    ${common.mkBootstrap {
+      inherit fixture gatewayHost;
+      withSeed = true;
+    }}
 
     import time
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${common.sshKeySetup gatewayHost}
-    ${common.seedBusybox gatewayHost}
 
     store_url = "ssh-ng://${gatewayHost}"
     busybox_arg = "--arg busybox '(builtins.storePath ${common.busybox})'"

@@ -47,13 +47,7 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    ${fixture.sshKeySetup}
+    ${common.mkBootstrap { inherit fixture; }}
 
     # ── certgen Job complete (flannel-race gate) ────────────────────────
     # k3s auto-applies manifests at startup (services.k3s.manifests),

@@ -1,35 +1,8 @@
-# Shared helpers for the per-phase VM tests.
+# Shared helpers for the fixture/scenario VM-test architecture.
 #
-# Duplication extracted from phase{1a,1b,2a,2b,2c}.nix:
-#   - Control node config (5× near-identical → mkControlNode)
-#   - PostgreSQL config block (5× identical → postgresqlConfig)
-#   - SSH key setup Python (5× → sshKeySetup)
-#   - Worker node config (3× in 2a/2b/2c → mkWorkerNode)
-#   - Client node config (5× → mkClientNode)
-#   - Control-plane wait testScript (5× → waitForControlPlane)
-#   - Seed-busybox testScript (5× → seedBusybox)
-#   - Build + journal-dump-on-failure (5× → mkBuildHelperV2)
-#   - let-bindings (busybox, busyboxClosure, databaseUrl)
-#
-# Usage:
-#   let
-#     common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-#   in pkgs.testers.runNixOSTest {
-#     nodes.control = common.mkControlNode { hostName = "control"; };
-#     nodes.worker1 = common.mkWorkerNode { hostName = "worker1"; };
-#     nodes.client  = common.mkClientNode { gatewayHost = "control"; };
-#     testScript = ''
-#       start_all()
-#       ${common.waitForControlPlane "control"}
-#       ${common.sshKeySetup "control"}
-#       ${common.seedBusybox "control"}
-#       ${common.mkBuildHelperV2 {
-#         gatewayHost = "control";
-#         dumpLogsExpr = "dump_all_logs([control] + all_workers)";
-#       }}
-#       out = build("${testDrvFile}")
-#     '';
-#   }
+# Node-config builders (mkControlNode/mkWorkerNode/mkClientNode) are
+# consumed by fixtures/; testScript snippets (mkBootstrap, sshKeySetup,
+# seedBusybox, mkBuildHelperV2, mkFragmentTest) by scenarios/.
 {
   pkgs,
   rio-workspace,
@@ -39,13 +12,14 @@
   # collectCoverage emits the profraw-collection testScript snippet.
   # false (default, vmTests) → all three are no-ops.
   coverage ? false,
+  ...
 }:
 let
   inherit (pkgs) lib;
 
   # --- Coverage plumbing (all are no-ops when coverage=false) ---
   # LLVM_PROFILE_FILE template: %p = PID (handles service restarts —
-  # phase3a/3b do `systemctl restart rio-*` multiple times), %m =
+  # several scenarios do `systemctl restart rio-*` multiple times), %m =
   # binary signature (each binary has a distinct coverage map; enables
   # safe on-line merging).
   #
@@ -185,7 +159,50 @@ rec {
   # Scenarios prepend `${common.kvmCheck}` before start_all().
   kvmCheck = import ./lib/kvm-check.nix;
 
-  # ── PostgreSQL config (5× identical across all tests) ───────────────
+  # Canonical testScript bootstrap stanza. Every scenario opens with the
+  # same assertions+kvmCheck+start_all+waitReady sequence; this collapses
+  # it to one interpolation. kubectlHelpers / sshKeySetup are auto-picked
+  # from the fixture when present (k3s fixtures export pod-aware variants;
+  # standalone fixtures don't, so the common.sshKeySetup systemd-restart
+  # variant fires when `gatewayHost` is supplied). `withSsh = false` for
+  # scenarios that defer SSH to a fragment (leader-election) or never
+  # build (substitute).
+  mkBootstrap =
+    {
+      fixture,
+      gatewayHost ? null,
+      withSsh ? true,
+      withSeed ? false,
+    }:
+    let
+      seedHost = if fixture ? sshKeySetup then "k3s-server" else gatewayHost;
+    in
+    ''
+      ${assertions}
+
+      ${kvmCheck}
+      start_all()
+      ${fixture.waitReady}
+      ${fixture.kubectlHelpers or ""}
+      ${lib.optionalString withSsh (
+        fixture.sshKeySetup or (lib.optionalString (gatewayHost != null) (sshKeySetup gatewayHost))
+      )}
+      ${lib.optionalString withSeed (seedBusybox seedHost)}
+    '';
+
+  # Auto-import every <name>.nix in `dir` as { <name> = import <file>; }.
+  # Replaces hand-maintained fragment-index default.nix files — those
+  # drifted (commit 72d1576a dropped a dangling entry). Any .nix directly
+  # under the dir is a fragment; subdirs and default.nix are ignored.
+  importDir =
+    dir:
+    lib.mapAttrs' (n: _: lib.nameValuePair (lib.removeSuffix ".nix" n) (import (dir + "/${n}"))) (
+      lib.filterAttrs (n: t: t == "regular" && n != "default.nix" && lib.hasSuffix ".nix" n) (
+        builtins.readDir dir
+      )
+    );
+
+  # ── PostgreSQL config ───────────────────────────────────────────────
 
   postgresqlConfig = {
     services.postgresql = {
@@ -204,7 +221,7 @@ rec {
     };
   };
 
-  # ── Gateway tmpfiles (5× identical) ─────────────────────────────────
+  # ── Gateway tmpfiles ────────────────────────────────────────────────
   # Gateway starts after store + scheduler via After= in the module, but
   # load_authorized_keys() bails on 0 keys (server.rs:90) → process
   # exit → Restart=on-failure churns every 5s until sshKeySetup runs
@@ -222,17 +239,19 @@ rec {
     "f /var/lib/rio/gateway/authorized_keys 0600 root root - ${gatewayPlaceholderKey}"
   ];
 
-  # ── Control node config (5× near-identical) ─────────────────────────
+  # ── Control node config ─────────────────────────────────────────────
   #
   # Runs PostgreSQL + rio-store + rio-scheduler + rio-gateway on one VM.
-  # All 5 phase tests share this topology for the control plane; only
-  # per-phase knobs (memory, firewall, scheduler extras) vary.
+  # All standalone-fixture scenarios share this topology for the control
+  # plane; only per-scenario knobs (memory, firewall, scheduler extras)
+  # vary.
   #
   # Use as a full node definition for simple cases:
   #   control = common.mkControlNode { hostName = "control"; };
   #
-  # Or as an import when layering extras (phase2b adds Tempo on top —
-  # NixOS module merging handles systemd.services, systemPackages etc.):
+  # Or as an import when layering extras (e.g. observability adds Tempo
+  # on top — NixOS module merging handles systemd.services,
+  # systemPackages etc.):
   #   control = {
   #     imports = [ (common.mkControlNode { hostName = "control"; ... }) ];
   #     systemd.services.tempo = { ... };
@@ -242,22 +261,22 @@ rec {
       hostName,
       memorySize ? 1024,
       diskSize ? 4096,
-      # Merged into services.rio.scheduler via // — phase2c passes
-      # extraConfig + tickIntervalSecs for size-class TOML routing.
+      # Merged into services.rio.scheduler via // — e.g. extraConfig +
+      # tickIntervalSecs for size-class TOML routing.
       extraSchedulerConfig ? { },
-      # Merged into services.rio.store via // — phase2c passes
-      # extraConfig for [chunk_backend] TOML.
+      # Merged into services.rio.store via // — e.g. extraConfig for
+      # [chunk_backend] TOML.
       extraStoreConfig ? { },
-      # Appended to the base set [ 2222 9001 9002 ]. phase2a/2c open
-      # metrics ports; phase2b also opens Tempo's OTLP + query ports.
+      # Appended to the base set [ 2222 9001 9002 ]. Scenarios open
+      # metrics ports here; observability also opens Tempo's OTLP +
+      # query ports.
       extraFirewallPorts ? [ ],
       # Appended to the base [ pkgs.curl ] — every build-capable test
-      # scrapes metrics via curl on the control node. phase1a doesn't
-      # need curl but getting it is harmless.
+      # scrapes metrics via curl on the control node.
       extraPackages ? [ ],
       # Merged into systemd.services.rio-{store,scheduler,gateway}.environment.
-      # phase3b uses this to set RIO_TLS__* + RIO_HMAC_KEY_PATH without
-      # extending the NixOS modules. NixOS attrsOf merge composes this
+      # Security scenario uses this to set RIO_TLS__* + RIO_HMAC_KEY_PATH
+      # without extending the NixOS modules. NixOS attrsOf merge composes this
       # with each module's own `environment = {...}` block — figment reads
       # the union. Same env applied to all three services (TLS is the
       # same cert for the shared control VM; unknown vars are ignored).
@@ -272,8 +291,8 @@ rec {
       ];
       networking.hostName = hostName;
 
-      # phase3b TLS/HMAC env injection + coverage env. Empty attrset
-      # = no-op (NixOS module merge with {} is identity). When set,
+      # extraServiceEnv (TLS/HMAC injection) + coverage env. Empty
+      # attrset = no-op (NixOS module merge with {} is identity). When set,
       # the module system merges these keys with each module's own
       # `environment = {...}` — no risk of clobbering RIO_LISTEN_ADDR
       # etc. covEnv is {} when coverage=false.
@@ -310,8 +329,9 @@ rec {
       environment.systemPackages = [ pkgs.curl ] ++ extraPackages;
 
       # 2222 = gateway SSH (client), 9001 = scheduler gRPC (workers),
-      # 9002 = store gRPC (workers). phase1a has no workers so 9001/9002
-      # are technically unused cross-VM there, but opening them is a no-op.
+      # 9002 = store gRPC (workers). Gateway-only scenarios have no
+      # workers so 9001/9002 are unused cross-VM there, but opening them
+      # is a no-op.
       networking.firewall.allowedTCPPorts = [
         2222
         9001
@@ -326,14 +346,14 @@ rec {
       };
     };
 
-  # ── Worker node config (3× near-identical in 2a/2b/2c) ──────────────
+  # ── Worker node config ──────────────────────────────────────────────
   #
   # Parameterized by:
   #   - hostName: VM hostname (also used as worker_id)
-  #   - sizeClass: optional size-class tag (phase2c only)
-  #   - otelEndpoint: optional OTLP endpoint (phase2b only; worker spans
-  #     not strictly needed for the milestone but make the trace tree
-  #     look like the observability.md spec diagram)
+  #   - sizeClass: optional size-class tag
+  #   - otelEndpoint: optional OTLP endpoint (worker spans not strictly
+  #     needed for the milestone but make the trace tree look like the
+  #     observability.md spec diagram)
   #
   # The writableStore=false setting is load-bearing —
   # see the inline rationale. The 4-core virtualisation setting is also
@@ -345,9 +365,9 @@ rec {
       hostName,
       sizeClass ? null,
       otelEndpoint ? null,
-      # Merged into systemd.services.rio-builder.environment. phase3b
-      # uses this to set RIO_TLS__* (client cert for mTLS to scheduler/
-      # store). Composed with the optional RIO_OTEL_ENDPOINT below via //.
+      # Merged into systemd.services.rio-builder.environment — e.g.
+      # RIO_TLS__* (client cert for mTLS to scheduler/store). Composed
+      # with the optional RIO_OTEL_ENDPOINT below via //.
       extraServiceEnv ? { },
       # Arbitrary store paths to pull into this VM's /nix/store. Used
       # by scenarios/protocol (cold) to pre-stage the busybox file for
@@ -370,8 +390,8 @@ rec {
         // lib.optionalAttrs (sizeClass != null) { inherit sizeClass; };
       };
 
-      # OTel endpoint for the worker (phase2b). Worker spans aren't
-      # strictly needed for the milestone (gateway→scheduler is the
+      # OTel endpoint for the worker. Worker spans aren't strictly
+      # needed for the milestone (gateway→scheduler is the
       # critical trace hop), but having them in Tempo makes the trace
       # tree match the observability.md spec diagram.
       systemd.services.rio-builder.environment =
@@ -414,11 +434,11 @@ rec {
       };
     };
 
-  # ── Client node config (5× near-identical) ──────────────────────────
+  # ── Client node config ──────────────────────────────────────────────
   #
-  # Parameterized by `gatewayHost`: the SSH target hostname (phase1a
-  # uses "gateway", all others use "control"). `extraPackages` lets
-  # phase2a/2b/2c add curl.
+  # Parameterized by `gatewayHost`: the SSH target hostname (varies by
+  # fixture — "gateway" or "control"). `extraPackages` lets scenarios
+  # add curl etc.
   mkClientNode =
     {
       gatewayHost,
@@ -474,10 +494,10 @@ rec {
   #
   # Interpolate as `${common.sshKeySetup "control"}` in testScript.
   # The `gatewayHost` arg is the Python variable name for the gateway
-  # node (phase1a: `gateway`, all others: `control`).
+  # node (fixture-dependent: `gateway` or `control`).
   # -C "" sets an empty key comment. Without it, ssh-keygen defaults
-  # to `user@host` which (since phase4a commit 2.3) the gateway treats
-  # as a tenant name → scheduler rejects as "unknown tenant". Empty
+  # to `user@host` which the gateway treats as a tenant name →
+  # scheduler rejects as "unknown tenant". Empty
   # comment = single-tenant mode (tenant_id = NULL).
   sshKeySetup = gatewayHost: ''
     client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519")
@@ -488,11 +508,11 @@ rec {
     ${gatewayHost}.wait_for_open_port(2222)
   '';
 
-  # ── Control-plane wait (5× identical) ───────────────────────────────
+  # ── Control-plane wait ──────────────────────────────────────────────
   # Blocks until postgres + rio-store + rio-scheduler are all ready.
   # Gateway startup is handled separately by sshKeySetup (restart after
   # populating authorized_keys). `node` is the Python variable name for
-  # the control node (phase1a: `gateway`, all others: `control`).
+  # the control node (fixture-dependent: `gateway` or `control`).
   waitForControlPlane = node: ''
     ${node}.wait_for_unit("postgresql.service")
     ${node}.wait_for_unit("rio-store.service")
@@ -501,11 +521,11 @@ rec {
     ${node}.wait_for_open_port(9001)
   '';
 
-  # ── Seed busybox closure (5× identical modulo ssh target) ───────────
+  # ── Seed busybox closure ────────────────────────────────────────────
   # Uploads the static-busybox closure via `nix copy` over ssh-ng.
   # Exercises wopAddToStoreNar / wopAddMultipleToStore. `--no-check-sigs`
   # because the client's local store paths aren't signed. `gatewayHost`
-  # is the SSH target hostname (phase1a: "gateway", others: "control").
+  # is the SSH target hostname (fixture-dependent: "gateway" or "control").
   seedBusybox = gatewayHost: ''
     client.succeed("ls ${busybox}")
     client.succeed(
@@ -514,7 +534,7 @@ rec {
     )
   '';
 
-  # ── Build helper v2 (5× scenario copies consolidated) ───────────────
+  # ── Build helper v2 ─────────────────────────────────────────────────
   #
   # Scenario build() helper. Supersedes the v1 helper which baked
   # drv_file at Nix-eval time (one drv per test). Scenarios need
@@ -617,7 +637,7 @@ rec {
   #
   # systemctl stop is synchronous (returns when unit inactive). || true
   # tolerates missing services (not every node runs every service).
-  # For k8s nodes (phase3a), also deletes STS so the pod terminates
+  # For k8s nodes, also deletes STS so the pod terminates
   # cleanly (pod PID 1 gets SIGTERM → worker's existing drain →
   # profraw flushed to hostPath mount).
   collectCoverage =
@@ -652,7 +672,7 @@ rec {
                     "systemctl stop rio-gateway rio-scheduler rio-store "
                     "rio-controller 2>/dev/null || true"
                 )
-                # k3s pods (phase3a worker-only, k3s-full all components):
+                # k3s pods (k3s-full fixture — all components):
                 # delete by label → graceful SIGTERM → profraw flush via
                 # atexit. Label selector avoids touching bitnami PG /
                 # kube-system. Only the k3s SERVER runs this (agent

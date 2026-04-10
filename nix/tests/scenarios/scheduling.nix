@@ -74,23 +74,18 @@ let
   # and the retry lands on wlarge — which has RIO_MAX_SILENT_TIME_SECS=10
   # (for the silence subtest). mkTrivial's single-sleep would TimedOut
   # there, so this drv echoes every 5s to keep the silence watchdog fed.
-  reassignDrv = pkgs.writeText "drv-sched-reassign.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-test-sched-reassign";
-      system = builtins.currentSystem;
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" '''
-        i=0
-        while [ $i -lt 5 ]; do
-          echo sched-reassign-tick-$i
-          ''${busybox}/bin/busybox sleep 5
-          i=$((i+1))
-        done
-        echo sched-reassign > $out
-      ''' ];
-    }
-  '';
+  reassignDrv = drvs.mkCustom {
+    name = "rio-test-sched-reassign";
+    script = ''
+      i=0
+      while [ $i -lt 5 ]; do
+        echo sched-reassign-tick-$i
+        ''${busybox}/bin/busybox sleep 5
+        i=$((i+1))
+      done
+      echo sched-reassign > $out
+    '';
+  };
 
   # cancel-timing: 300s sleep — cancelled long before natural end. No
   # pname → default "small" class → lands on wsmall1 OR wsmall2. 300s
@@ -107,51 +102,37 @@ let
   # 60s wall-clock. pname in env so the test can seed build_history and
   # route to wlarge (same pattern as sizeclass/bigthing). mkTrivial echoes
   # AFTER sleep, so inline a custom drv with echo-then-sleep ordering.
-  silenceDrv = pkgs.writeText "drv-sched-silence.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-sched-silence";
-      pname = "rio-sched-silence";
-      system = builtins.currentSystem;
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" '''
-        echo start-silence-marker
-        ''${busybox}/bin/busybox sleep 60
-        echo unreachable > $out
-      ''' ];
-    }
-  '';
+  silenceDrv = drvs.mkCustom {
+    name = "rio-sched-silence";
+    extraAttrs.pname = "rio-sched-silence";
+    script = ''
+      echo start-silence-marker
+      ''${busybox}/bin/busybox sleep 60
+      echo unreachable > $out
+    '';
+  };
 
   # cgroup: needs pname in env (completion.rs:181 guards on state.pname;
   # gateway extracts from drv.env().get("pname")) AND sleep ≥2s (so the
   # 1Hz CPU poll in executor/mod.rs fires at least once). mkTrivial
   # doesn't set pname, so inline a custom drv.
-  cgroupDrv = pkgs.writeText "drv-sched-cgroup.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-sched-cgroup";
-      pname = "rio-sched-cgroup";
-      system = builtins.currentSystem;
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" '''
-        ''${busybox}/bin/busybox sleep 3
-        echo cgroup > $out
-      ''' ];
-    }
-  '';
+  cgroupDrv = drvs.mkCustom {
+    name = "rio-sched-cgroup";
+    extraAttrs.pname = "rio-sched-cgroup";
+    script = ''
+      ''${busybox}/bin/busybox sleep 3
+      echo cgroup > $out
+    '';
+  };
 
   # ── testScript prelude: bootstrap + Python helpers ────────────────────
   # Shared by all fragment compositions. start_all + waitReady + SSH +
   # seed + build() helper + size-class precondition asserts.
   prelude = ''
-    ${common.assertions}
-
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${common.sshKeySetup gatewayHost}
-    ${common.seedBusybox gatewayHost}
+    ${common.mkBootstrap {
+      inherit fixture gatewayHost;
+      withSeed = true;
+    }}
 
     all_workers = [wsmall1, wsmall2, wlarge]
     small_workers = [wsmall1, wsmall2]
@@ -212,7 +193,7 @@ let
       cgroupDrv
       ;
   };
-  fragments = builtins.mapAttrs (_: f: f scope) (import ./scheduling);
+  fragments = builtins.mapAttrs (_: f: f scope) (common.importDir ./scheduling);
 
   mkTest = common.mkFragmentTest {
     scenario = "scheduling";

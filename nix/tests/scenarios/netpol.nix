@@ -60,16 +60,12 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
+    ${common.mkBootstrap {
+      inherit fixture;
+      withSeed = true;
+    }}
 
     import time
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    ${fixture.sshKeySetup}
-    ${common.seedBusybox "k3s-server"}
     ${common.mkBuildHelperV2 {
       gatewayHost = "k3s-server";
       dumpLogsExpr = ''print("(netpol: build failed; pod logs follow)")'';

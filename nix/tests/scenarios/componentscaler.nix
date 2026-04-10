@@ -78,17 +78,10 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    # k3s-full's sshKeySetup (NOT common.sshKeySetup): the gateway is
-    # a pod, not a systemd unit. The fixture variant patches the
-    # rio-gateway-ssh Secret + rollout-restarts the Deployment.
-    ${fixture.sshKeySetup}
-    ${common.seedBusybox "k3s-server"}
+    ${common.mkBootstrap {
+      inherit fixture;
+      withSeed = true;
+    }}
 
     # ── helm-no-replicas: rendered template omits spec.replicas ──────
     # With componentScaler.store.enabled=true the chart MUST omit

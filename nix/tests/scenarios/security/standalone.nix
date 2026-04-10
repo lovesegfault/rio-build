@@ -51,19 +51,13 @@ let
   quotaPassDrv = drvs.mkTrivial { marker = "sec-quota-pass"; };
 
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
-  # Rejection is pre-SubmitBuild so scheduler never sees it. Not using
-  # drvs.mkTrivial — that factory doesn't expose arbitrary env attrs,
-  # and __noChroot is the whole point.
-  noChrootDrv = pkgs.writeText "sec-nochroot.nix" ''
-    { busybox }:
-    derivation {
-      name = "rio-sec-nochroot";
-      system = "x86_64-linux";
-      __noChroot = true;  # ← rejected
-      builder = "''${busybox}/bin/sh";
-      args = [ "-c" "echo should-never-run > $out" ];
-    }
-  '';
+  # Rejection is pre-SubmitBuild so scheduler never sees it. mkCustom
+  # exposes extraAttrs precisely so __noChroot can be passed through.
+  noChrootDrv = drvs.mkCustom {
+    name = "rio-sec-nochroot";
+    extraAttrs.__noChroot = true; # ← rejected
+    script = "echo should-never-run > $out";
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-security";

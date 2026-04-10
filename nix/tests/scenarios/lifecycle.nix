@@ -555,7 +555,7 @@ let
       refsDrvFile
       ;
   };
-  fragments = builtins.mapAttrs (_: f: f scope) (import ./lifecycle);
+  fragments = builtins.mapAttrs (_: f: f scope) (common.importDir ./lifecycle);
 
   mkTest = common.mkFragmentTest {
     scenario = "lifecycle";

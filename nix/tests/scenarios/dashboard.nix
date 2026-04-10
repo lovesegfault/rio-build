@@ -44,13 +44,7 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
-    ${common.assertions}
-
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    ${fixture.sshKeySetup}
+    ${common.mkBootstrap { inherit fixture; }}
 
     # ── Envoy Gateway operator Available ──────────────────────────────
     # Same gate as dashboard-gateway.nix — nginx proxies to the envoy

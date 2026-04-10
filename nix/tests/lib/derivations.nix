@@ -122,4 +122,38 @@ rec {
         system = builtins.currentSystem;
       }
     '';
+
+  # Custom-script busybox derivation as a writeText'd .nix file. Same
+  # shape as mkTrivial but the full sh-script body is caller-supplied.
+  # extraAttrs go into the derivation env (pname for completion-hook
+  # lookup, outputs for multi-output, __noChroot for validate_dag tests,
+  # etc) — rendered via lib.generators.toPretty (NOT toJSON: JSON list
+  # syntax `["a","b"]` is a Nix syntax error), so plain strings / ints /
+  # bools / lists-of-those only.
+  #
+  # `''${busybox}` in `script` becomes literal `${busybox}` in the
+  # written file → the IN-VM nix-build interpolates its own busybox arg.
+  mkCustom =
+    {
+      name,
+      script,
+      extraAttrs ? { },
+    }:
+    let
+      render = pkgs.lib.generators.toPretty { multiline = false; };
+      extra = pkgs.lib.concatStrings (
+        pkgs.lib.mapAttrsToList (k: v: "    ${k} = ${render v};\n") extraAttrs
+      );
+    in
+    pkgs.writeText "drv-${name}.nix" ''
+      { busybox }:
+      derivation {
+        name = "${name}";
+        system = builtins.currentSystem;
+        builder = "''${busybox}/bin/sh";
+        args = [ "-c" '''
+      ${script}
+        ''' ];
+      ${extra}}
+    '';
 }

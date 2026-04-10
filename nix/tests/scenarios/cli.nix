@@ -42,13 +42,7 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    ${fixture.sshKeySetup}
+    ${common.mkBootstrap { inherit fixture; }}
 
     # Port-forward the scheduler leader's gRPC port (9001). Unlike
     # lifecycle.nix's per-call port-forward, this stays up for the

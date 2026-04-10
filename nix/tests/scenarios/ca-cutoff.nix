@@ -37,15 +37,12 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
+    ${common.mkBootstrap {
+      inherit fixture gatewayHost;
+      withSeed = true;
+    }}
 
     import time
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${common.sshKeySetup gatewayHost}
-    ${common.seedBusybox gatewayHost}
 
     store_url = "ssh-ng://${gatewayHost}"
 

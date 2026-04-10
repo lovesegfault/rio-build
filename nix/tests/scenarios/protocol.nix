@@ -255,12 +255,9 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${common.sshKeySetup gatewayHost}
+    ${common.mkBootstrap {
+      inherit fixture gatewayHost;
+    }}
 
     store_url = "ssh-ng://${gatewayHost}"
 

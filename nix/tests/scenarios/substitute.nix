@@ -81,11 +81,10 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
+    ${common.mkBootstrap {
+      inherit fixture;
+      withSsh = false;
+    }}
 
     # ══════════════════════════════════════════════════════════════════
     # Fake upstream: generate narinfo+nar on client, serve via http

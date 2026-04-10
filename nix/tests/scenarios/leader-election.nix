@@ -62,14 +62,10 @@ let
 
   # ── testScript prelude: bootstrap + Python helpers ────────────────────
   prelude = ''
-    ${common.assertions}
-
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-
-    ${fixture.kubectlHelpers}
+    ${common.mkBootstrap {
+      inherit fixture;
+      withSsh = false;
+    }}
 
     def lease_transitions():
         # .spec.leaseTransitions is an int32, present from first acquire

@@ -76,17 +76,13 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
+    ${common.mkBootstrap {
+      inherit fixture;
+      withSeed = true;
+    }}
 
     import time
     import json as _json
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${fixture.kubectlHelpers}
-    ${fixture.sshKeySetup}
-    ${common.seedBusybox "k3s-server"}
 
     # ══════════════════════════════════════════════════════════════════
     # FIXTURE PREP — node labels + "public" origin

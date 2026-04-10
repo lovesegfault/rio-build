@@ -58,16 +58,13 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.assertions}
+    ${common.mkBootstrap {
+      inherit fixture gatewayHost;
+      withSeed = true;
+    }}
 
     import re
     import time
-
-    ${common.kvmCheck}
-    start_all()
-    ${fixture.waitReady}
-    ${common.sshKeySetup gatewayHost}
-    ${common.seedBusybox gatewayHost}
 
     workers = [worker1, worker2, worker3]
 

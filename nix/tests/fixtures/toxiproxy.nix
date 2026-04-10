@@ -55,6 +55,7 @@
   rio-workspace,
   rioModules,
   coverage ? false,
+  ...
 }:
 let
   inherit (pkgs) lib;
