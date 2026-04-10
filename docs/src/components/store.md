@@ -97,10 +97,14 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 | `refcount` | `INTEGER NOT NULL DEFAULT 0` | Number of manifests referencing this chunk |
 | `size` | `BIGINT NOT NULL` | Chunk size in bytes |
 | `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
+| `durable` | `BOOLEAN NOT NULL DEFAULT FALSE` | TRUE once the chunk's S3 PUT is confirmed (via manifest-complete txn or standalone `PutChunk`); never reverts |
 | `deleted` | `BOOLEAN NOT NULL DEFAULT FALSE` | Soft-delete flag (set by GC sweep) |
 
 r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
+
+r[store.chunk.durable-flag]
+`chunks.durable` MUST be set `TRUE` only after the chunk's bytes are confirmed written to the authoritative S3-standard backend, and MUST never revert to `FALSE`. The flip happens in exactly two places: (1) the same transaction that flips a manifest `status='uploading'→'complete'`, for every digest in that manifest's `manifest_data` — `UPDATE chunks SET durable=TRUE WHERE blake3_hash = ANY($sorted_digests) AND NOT durable`; (2) the standalone `PutChunk` handler, immediately after its S3 PUT returns success. `refcount > 0` is NOT sufficient evidence of S3 presence — refcount bumps at WAL-manifest-insert (step 2), before S3 upload (step 3), so a crash mid-upload leaves `refcount=1, durable=FALSE`. Presence checks (`HasChunks`, `FindMissingChunks`) MUST filter on `durable=TRUE AND NOT deleted`; reporting a non-durable chunk as present causes the caller to skip upload, stranding the reference (I-201). `durable` and `deleted` are independent: a chunk may be `durable=TRUE, deleted=TRUE` (was in S3, now soft-deleted pending `pending_s3_deletes` cleanup).
 
 r[store.chunk.lock-order]
 All batch row-locking statements keyed on `blake3_hash` (`UPDATE chunks ... WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash arrays) MUST bind a sorted input array. PostgreSQL acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets across concurrent transactions create circular lock-wait → SQLSTATE 40P01. Sorting makes lock-acquisition order deterministic across all writers. Note: a RETURNING set is NOT in input-array order — re-sort before passing to downstream ANY() statements. A single defensive retry on 40P01 is permitted (index-page splits can still deadlock under extreme contention); unbounded retry is NOT permitted (masks real lock-order bugs).
