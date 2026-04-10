@@ -1,86 +1,41 @@
 {{- $ns := .Values.namespaces.system.name -}}
-# ServiceAccounts first. gateway/store/worker get
-# automountServiceAccountToken: false — no K8s API access. Dedicated SA
-# anyway for IRSA annotations + NetworkPolicy scoping.
-#
+# ServiceAccounts. controller + scheduler automount (k8s API access for
+# CRD watch / lease); the rest get automountServiceAccountToken: false —
+# dedicated SA anyway for IRSA annotations + NetworkPolicy scoping.
 # automountServiceAccountToken is TOP-LEVEL (sibling of metadata), not
 # under metadata. Easy to mis-indent.
-{{- if .Values.controller.enabled }}
+#
+# IRSA: store (S3 chunk bucket) and scheduler (S3 build-log flush) get
+# eks.amazonaws.com/role-arn via projected token — NO static AWS keys.
+#
+# builder/fetcher SAs always rendered (vmtest profile needs them even when
+# nothing else in this chart is enabled); BuilderPool/FetcherPool
+# reconcilers reference them from the per-build Jobs they create.
+{{- range $sa := list
+      (dict "name" "rio-controller" "ns" $ns                              "comp" "controller" "on" .Values.controller.enabled "automount" true)
+      (dict "name" "rio-gateway"    "ns" $ns                              "comp" "gateway"    "on" .Values.gateway.enabled    "automount" false)
+      (dict "name" "rio-store"      "ns" .Values.namespaces.store.name    "comp" "store"      "on" .Values.store.enabled      "automount" false "annot" .Values.store.serviceAccount.annotations)
+      (dict "name" "rio-builder"    "ns" .Values.namespaces.builders.name "comp" "worker"     "on" true                       "automount" false)
+      (dict "name" "rio-fetcher"    "ns" .Values.namespaces.fetchers.name "comp" "worker"     "on" true                       "automount" false)
+      (dict "name" "rio-scheduler"  "ns" $ns                              "comp" "scheduler"  "on" .Values.scheduler.enabled  "automount" true  "annot" .Values.scheduler.serviceAccount.annotations)
+}}
+{{- if $sa.on }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rio-controller
-  namespace: {{ $ns }}
+  name: {{ $sa.name }}
+  namespace: {{ $sa.ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
-{{- end }}
-{{- if .Values.gateway.enabled }}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: rio-gateway
-  namespace: {{ $ns }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
-automountServiceAccountToken: false
-{{- end }}
-{{- if .Values.store.enabled }}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: rio-store
-  namespace: {{ .Values.namespaces.store.name }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
-  {{- with .Values.store.serviceAccount.annotations }}
-  # EKS IRSA: eks.amazonaws.com/role-arn attaches an IAM role via projected
-  # token. Store needs S3 access. NO static AWS keys.
+    {{- include "rio.labels" (dict "root" $ "name" $sa.name "component" $sa.comp) | nindent 4 }}
+  {{- with $sa.annot }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+{{- if not $sa.automount }}
 automountServiceAccountToken: false
 {{- end }}
----
-# Builder SA — BuilderPool reconciler references it from the STS it
-# creates in rio-builders. Always rendered (vmtest profile needs it
-# even when nothing else in this chart is enabled).
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: rio-builder
-  namespace: {{ .Values.namespaces.builders.name }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-builder" "component" "worker") | nindent 4 }}
-automountServiceAccountToken: false
----
-# Fetcher SA — FetcherPool reconciler references it from the STS it
-# creates in rio-fetchers.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: rio-fetcher
-  namespace: {{ .Values.namespaces.fetchers.name }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-fetcher" "component" "worker") | nindent 4 }}
-automountServiceAccountToken: false
-{{- if .Values.scheduler.enabled }}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: rio-scheduler
-  namespace: {{ $ns }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
-  {{- with .Values.scheduler.serviceAccount.annotations }}
-  # EKS IRSA: scheduler flushes build logs to S3. Role attached via
-  # projected token, NO static AWS keys.
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+{{- end }}
 {{- end }}
 
 {{- if .Values.controller.enabled }}
@@ -93,75 +48,54 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
 rules:
-  # Full lifecycle. `update` for finalizer add/remove (finalizer() patches
-  # metadata.finalizers).
+  # rio.build CRD lifecycle. `update` covers finalizer add/remove
+  # (finalizer() patches metadata.finalizers). /status is a separate
+  # permission; never GET /status separately (it's in the main GET).
+  #
+  # /finalizers subresource: OwnerReferencesPermissionEnforcement admission
+  # plugin checks `update` on `<owner>/finalizers` when creating a child
+  # with `blockOwnerDeletion: true` (which controller_owner_ref sets).
+  # Without this verb, child creates fail with "cannot set
+  # blockOwnerDeletion ... not permitted to update the owner resource."
+  # NOT a finalizer() helper concern (that uses JSON-patch on the main
+  # resource).
+  #
+  # Per-CRD verb sets:
+  #   builderpools/fetcherpools — full lifecycle. Reconciler SSA-applies
+  #     per-build/per-FOD Jobs into rio-builders/rio-fetchers (ADR-019);
+  #     the ClusterRoleBinding below grants batch/jobs cluster-wide so
+  #     no per-namespace RoleBinding needed.
+  #   builderpoolsets — aggregating CRD; one WPS spawns one child
+  #     BuilderPool per size class. No create/delete (operators
+  #     `kubectl apply` the WPS); reconciler reads it + patches
+  #     metadata.finalizers and per-class status (effective_cutoff_secs
+  #     + queued from scheduler's GetSizeClassStatus joined with child
+  #     WP replicas).
+  #   componentscalers — predictive store autoscaling. No create/delete
+  #     (operators apply the CR via this chart); reconciler reads spec,
+  #     writes status (learnedRatio persists across restarts), patches
+  #     the target Deployment's /scale subresource. No /finalizers (no
+  #     owned children).
+  {{- $full := list "get" "list" "watch" "create" "update" "patch" "delete" }}
+  {{- $ro   := list "get" "list" "watch" "patch" "update" }}
+  {{- range $r := list
+        (dict "name" "builderpools"     "verbs" $full "status" (list "get" "patch")          "finalizers" true)
+        (dict "name" "builderpoolsets"  "verbs" $ro   "status" (list "get" "patch" "update") "finalizers" true)
+        (dict "name" "fetcherpools"     "verbs" $full "status" (list "get" "patch")          "finalizers" true)
+        (dict "name" "componentscalers" "verbs" $ro   "status" (list "get" "patch" "update") "finalizers" false)
+  }}
   - apiGroups: [rio.build]
-    resources: [builderpools]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # Status subresource = separate permission. Never GET /status separately
-  # (it's in the main GET).
+    resources: [{{ $r.name }}]
+    verbs: {{ toJson $r.verbs }}
   - apiGroups: [rio.build]
-    resources: [builderpools/status]
-    verbs: [get, patch]
-  # /finalizers subresource: OwnerReferencesPermissionEnforcement
-  # admission plugin checks `update` on `<owner>/finalizers` when
-  # creating a child with `blockOwnerDeletion: true` (which
-  # controller_owner_ref sets on the per-build Job). Without this
-  # verb, child creates fail with "cannot set blockOwnerDeletion ...
-  # not permitted to update the owner resource." Mirrors the
-  # builderpoolsets/finalizers rule below.
+    resources: [{{ $r.name }}/status]
+    verbs: {{ toJson $r.status }}
+  {{- if $r.finalizers }}
   - apiGroups: [rio.build]
-    resources: [builderpools/finalizers]
+    resources: [{{ $r.name }}/finalizers]
     verbs: [update]
-  # BuilderPoolSet: aggregating CRD — one WPS spawns one child BuilderPool
-  # per size class. Reconciler watches WPS, SSA-applies child WPs, refreshes
-  # per-class status. No `create`/`delete` — operators `kubectl apply` the
-  # WPS; reconciler only reads it + patches metadata.finalizers (`update`)
-  # and status (below). Child BuilderPool lifecycle is covered by the rule
-  # above.
-  - apiGroups: [rio.build]
-    resources: [builderpoolsets]
-    verbs: [get, list, watch, patch, update]
-  # Per-class status (effective_cutoff_secs + queued from scheduler's
-  # GetSizeClassStatus, joined with observed child WP replicas).
-  - apiGroups: [rio.build]
-    resources: [builderpoolsets/status]
-    verbs: [get, patch, update]
-  # /finalizers subresource: OwnerReferencesPermissionEnforcement
-  # admission plugin checks `update` on `<owner>/finalizers` when
-  # creating a child with `blockOwnerDeletion: true` (which
-  # controller_owner_ref sets). Without this verb, child-WP create
-  # fails with "cannot set blockOwnerDeletion ... not permitted to
-  # update the owner resource" — NOT a finalizer() helper concern
-  # (that uses JSON-patch on the main resource).
-  - apiGroups: [rio.build]
-    resources: [builderpoolsets/finalizers]
-    verbs: [update]
-  # FetcherPool: ADR-019 FOD-only executor pods. Same lifecycle verbs as
-  # builderpools — the reconciler SSA-applies per-FOD Jobs into the
-  # rio-fetchers namespace (the ClusterRoleBinding below grants
-  # batch/jobs cluster-wide, so no per-namespace RoleBinding needed;
-  # the controller SA in rio-system can manage Jobs in rio-builders
-  # AND rio-fetchers).
-  - apiGroups: [rio.build]
-    resources: [fetcherpools]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [rio.build]
-    resources: [fetcherpools/status]
-    verbs: [get, patch]
-  - apiGroups: [rio.build]
-    resources: [fetcherpools/finalizers]
-    verbs: [update]
-  # ComponentScaler: predictive store autoscaling. The reconciler reads
-  # spec, writes status (learnedRatio persists across restarts), and
-  # patches the target Deployment's /scale subresource. No create/
-  # delete — operators apply the CR via this chart.
-  - apiGroups: [rio.build]
-    resources: [componentscalers]
-    verbs: [get, list, watch, patch, update]
-  - apiGroups: [rio.build]
-    resources: [componentscalers/status]
-    verbs: [get, patch, update]
+  {{- end }}
+  {{- end }}
   # Deployment read for current .spec.replicas + /scale subresource
   # for the patch. BuilderPool/FetcherPool reconcilers don't touch
   # Deployments — this is ComponentScaler-only.
