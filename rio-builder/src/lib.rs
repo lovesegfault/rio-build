@@ -36,6 +36,22 @@ pub mod runtime;
 pub(crate) mod synth_db;
 pub(crate) mod upload;
 
+/// Recover the guard from a poisoned [`std::sync`] lock result.
+///
+/// Poisoning happens when a thread panics while holding the lock; in
+/// this crate every guarded value is either rebuilt on the next tick or
+/// only read on a shutdown path, so a partially-updated value is benign.
+/// 30+ call sites previously spelled this out as
+/// `.unwrap_or_else(|e| e.into_inner())`.
+pub(crate) trait IgnorePoison<T> {
+    fn ignore_poison(self) -> T;
+}
+impl<T> IgnorePoison<T> for Result<T, std::sync::PoisonError<T>> {
+    fn ignore_poison(self) -> T {
+        self.unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Histogram bucket boundaries for `rio_builder_upload_references_count`.
 ///
 /// Reference COUNT (not seconds) per output upload — `references.len()`

@@ -12,6 +12,7 @@ use rio_proto::types::HeartbeatRequest;
 
 use super::setup::WorkerClient;
 use super::slot::BuildSlot;
+use crate::IgnorePoison;
 use crate::cgroup::ResourceSnapshotHandle;
 
 /// Heartbeat interval. Shared source of truth with the scheduler's timeout
@@ -49,7 +50,7 @@ pub async fn build_heartbeat_request(
     // top-level HeartbeatRequest field but filling it keeps the
     // ResourceUsage message self-contained for ListExecutors consumers.
     let resources = {
-        let mut ru = *resources.read().unwrap_or_else(|e| e.into_inner());
+        let mut ru = *resources.read().ignore_poison();
         ru.busy = current.is_some();
         ru
     };

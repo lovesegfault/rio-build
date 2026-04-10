@@ -12,6 +12,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+
+use crate::IgnorePoison;
 use std::time::Duration;
 
 /// Per-path coordination for in-flight fetches.
@@ -33,18 +35,18 @@ impl InflightEntry {
     /// `false`; the fetcher's own timeout (`GRPC_STREAM_TIMEOUT`) is the
     /// real deadline.
     pub fn wait(&self, timeout: Duration) -> bool {
-        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        let done = self.done.lock().ignore_poison();
         let (done, wait_result) = self
             .cv
             .wait_timeout_while(done, timeout, |d| !*d)
-            .unwrap_or_else(|e| e.into_inner());
+            .ignore_poison();
         !wait_result.timed_out() && *done
     }
 
     /// Cheap check: has the fetcher finished (guard dropped)? No condvar wait.
     /// Use after a timed-out `wait()` to decide whether to wait again.
     pub fn is_done(&self) -> bool {
-        *self.done.lock().unwrap_or_else(|e| e.into_inner())
+        *self.done.lock().ignore_poison()
     }
 }
 
@@ -70,15 +72,11 @@ pub struct FetchGuard<'a> {
 impl Drop for FetchGuard<'_> {
     fn drop(&mut self) {
         let entry = {
-            let mut inflight = self
-                .cache
-                .inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut inflight = self.cache.inflight.lock().ignore_poison();
             inflight.remove(&self.path)
         };
         if let Some(entry) = entry {
-            *entry.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            *entry.done.lock().ignore_poison() = true;
             entry.cv.notify_all();
         }
     }
@@ -107,9 +105,9 @@ impl FetchSemaphore {
     }
 
     pub(super) fn acquire(&self) -> FetchPermit<'_> {
-        let mut p = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.permits.lock().ignore_poison();
         while *p == 0 {
-            p = self.cv.wait(p).unwrap_or_else(|e| e.into_inner());
+            p = self.cv.wait(p).ignore_poison();
         }
         *p -= 1;
         FetchPermit { sem: self }
@@ -122,7 +120,7 @@ pub(super) struct FetchPermit<'a> {
 
 impl Drop for FetchPermit<'_> {
     fn drop(&mut self) {
-        *self.sem.permits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self.sem.permits.lock().ignore_poison() += 1;
         self.sem.cv.notify_one();
     }
 }
@@ -220,7 +218,7 @@ impl Cache {
     /// immutable. Memory: ~60 B/entry × ~1k paths for the one build.
     // r[impl builder.fuse.jit-register]
     pub fn register_inputs(&self, inputs: impl IntoIterator<Item = (String, u64)>) {
-        let mut g = self.known_inputs.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.known_inputs.write().ignore_poison();
         g.get_or_insert_with(HashMap::new).extend(inputs);
     }
 
@@ -230,7 +228,7 @@ impl Cache {
     /// ENOENT.
     // r[impl builder.warmgate.filter]
     pub fn jit_classify(&self, basename: &str) -> JitClass {
-        match &*self.known_inputs.read().unwrap_or_else(|e| e.into_inner()) {
+        match &*self.known_inputs.read().ignore_poison() {
             None => JitClass::NotArmed,
             Some(m) => match m.get(basename) {
                 Some(&nar_size) => JitClass::KnownInput { nar_size },
@@ -244,7 +242,7 @@ impl Cache {
     pub fn known_inputs_len(&self) -> usize {
         self.known_inputs
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .ignore_poison()
             .as_ref()
             .map_or(0, HashMap::len)
     }
@@ -258,10 +256,7 @@ impl Cache {
         &self,
         hints: impl IntoIterator<Item = (String, rio_proto::types::ManifestHint)>,
     ) {
-        let mut map = self
-            .manifest_hints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.manifest_hints.lock().ignore_poison();
         map.extend(hints);
     }
 
@@ -275,7 +270,7 @@ impl Cache {
     ) -> Option<rio_proto::types::ManifestHint> {
         self.manifest_hints
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .ignore_poison()
             .remove(store_basename)
     }
 
@@ -287,37 +282,27 @@ impl Cache {
     /// Check if a store path is cached.
     #[cfg(test)]
     pub fn contains(&self, store_path: &str) -> bool {
-        self.cached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(store_path)
+        self.cached.lock().ignore_poison().contains(store_path)
     }
 
     /// Get the full filesystem path for a cached store path, or `None` if
     /// not cached.
     pub fn get_path(&self, store_path: &str) -> Option<PathBuf> {
-        let present = self
-            .cached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(store_path);
+        let present = self.cached.lock().ignore_poison().contains(store_path);
         present.then(|| self.cache_dir.join(store_path))
     }
 
     /// Remove a stale index entry. Called when the index says "present"
     /// but the file is gone from disk (external rm, interrupted extract).
     pub fn remove_stale(&self, store_path: &str) {
-        self.cached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(store_path);
+        self.cached.lock().ignore_poison().remove(store_path);
     }
 
     /// Record a store path as cached after extraction.
     pub fn insert(&self, store_path: &str) {
         self.cached
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .ignore_poison()
             .insert(store_path.to_owned());
     }
 

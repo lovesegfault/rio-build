@@ -10,6 +10,8 @@ use std::sync::atomic::AtomicBool;
 
 use tokio::sync::Notify;
 
+use crate::IgnorePoison;
+
 /// Per-claim state. Created atomically by [`BuildSlot::try_claim`] and
 /// torn down by [`BuildSlotGuard::drop`]. The `cancelled` flag exists
 /// from the instant the slot is claimed, so a `Cancel` racing the
@@ -59,7 +61,7 @@ impl BuildSlot {
     /// The returned guard owns the cancel flag for this build; callers
     /// reach it via [`BuildSlotGuard::cancelled`].
     pub fn try_claim(self: &Arc<Self>, drv_path: &str) -> Option<BuildSlotGuard> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().ignore_poison();
         if inner.is_some() {
             return None;
         }
@@ -79,16 +81,13 @@ impl BuildSlot {
     pub fn running(&self) -> Option<String> {
         self.inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .ignore_poison()
             .as_ref()
             .map(|s| s.drv_path.clone())
     }
 
     pub fn is_busy(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.inner.lock().ignore_poison().is_some()
     }
 
     /// Record the cgroup path for the running build. Called by
@@ -96,12 +95,7 @@ impl BuildSlot {
     /// `sanitize_build_id(drv_path)` — predictively, before the cgroup
     /// is actually created. See [`try_cancel_build`].
     pub fn set_cgroup_path(&self, cgroup_path: PathBuf) {
-        if let Some(s) = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-        {
+        if let Some(s) = self.inner.lock().ignore_poison().as_mut() {
             s.cgroup_path = Some(cgroup_path);
         }
     }
@@ -144,7 +138,7 @@ impl BuildSlotGuard {
 
 impl Drop for BuildSlotGuard {
     fn drop(&mut self) {
-        *self.slot.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.slot.inner.lock().ignore_poison() = None;
         self.slot.idle.notify_waiters();
     }
 }
@@ -167,7 +161,7 @@ pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
     // slot holds 0-or-1 entry; the drv_path check guards against a
     // stale CancelSignal (scheduler restarted and re-sent for a build
     // this pod never had).
-    let guard = slot.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = slot.inner.lock().ignore_poison();
     let Some(inner) = guard.as_ref() else {
         tracing::debug!(
             drv_path,

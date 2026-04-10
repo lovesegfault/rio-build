@@ -24,6 +24,7 @@ pub(crate) use fetch::StoreClients;
 mod inode;
 mod ops;
 
+use crate::IgnorePoison;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -163,11 +164,11 @@ impl NixStoreFs {
     }
 
     fn open_files_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u64, File>> {
-        self.open_files.read().unwrap_or_else(|e| e.into_inner())
+        self.open_files.read().ignore_poison()
     }
 
     fn open_files_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<u64, File>> {
-        self.open_files.write().unwrap_or_else(|e| e.into_inner())
+        self.open_files.write().ignore_poison()
     }
 
     fn backing_state_write(&self) -> std::sync::RwLockWriteGuard<'_, BackingState> {
