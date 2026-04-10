@@ -237,6 +237,21 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
 ) -> Result<(), StreamProcessError> {
     match drv_event.kind() {
         types::DerivationEventKind::Started => {
+            // Re-dispatch (in-connection reassign, or replay after a
+            // gateway↔scheduler reconnect) sends Started again for a
+            // drv we already track. The existing aid is still valid on
+            // the client (client→gateway never dropped), so reuse it.
+            // Emitting a fresh start_activity makes nom count the
+            // re-dispatch as a new build (live QA: 27 unique drvs →
+            // 43 starts → "43/29"). I-206's prior start-then-stop
+            // balanced the running count but still inflated total.
+            if act.drv.contains_key(&drv_event.derivation_path) {
+                debug!(
+                    drv = %drv_event.derivation_path,
+                    "duplicate Started; reusing existing activity"
+                );
+                return Ok(());
+            }
             // actBuild fields per upstream
             // `derivation-building-goal.cc`:
             // [drvPath, machineName, curRound, nrRounds].
@@ -267,21 +282,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                     ],
                 )
                 .await?;
-            // I-206: a duplicate Started (replay after
-            // reconnect, or scheduler retry) overwrites the
-            // prior aid — the client then has TWO actBuild
-            // for this drv, and Completed only stops the
-            // newest. Stop the old one here so nom doesn't
-            // show a phantom-stuck build.
-            if let Some(prev) = act.drv.insert(drv_event.derivation_path.clone(), aid) {
-                debug!(
-                    drv = %drv_event.derivation_path,
-                    prev_aid = prev,
-                    new_aid = aid,
-                    "duplicate Started; stopping prior activity"
-                );
-                stderr.stop_activity(prev).await?;
-            }
+            act.drv.insert(drv_event.derivation_path.clone(), aid);
         }
         types::DerivationEventKind::Completed => {
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {

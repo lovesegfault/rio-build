@@ -792,6 +792,74 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
     Ok(())
 }
 
+/// Re-dispatch (2× Started for the same drv) reuses the existing actBuild
+/// activity instead of emitting a fresh start. nom counts each
+/// start_activity(actBuild) toward its total — a fresh start per reassign
+/// inflates "X/N" past N.
+#[tokio::test]
+async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let target = "/nix/store/ccc-redispatch.drv".to_string();
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w1".into()),
+        )),
+        // Reassign to a different executor while still in-flight.
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w2".into()),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::completed(target.clone(), vec![]),
+        )),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    // Exactly one actBuild start across the two Started events. Frame
+    // sequence is identical to the single-Started case above.
+    let starts: Vec<_> = frames
+        .iter()
+        .filter(|m| matches!(m, StderrMessage::StartActivity { activity_type: 105, .. }))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "re-dispatch must reuse existing actBuild aid, not emit a fresh start; frames: {frames:?}"
+    );
+    assert_eq!(frames.len(), 5, "frames: {frames:?}");
+    let drv_id = match &frames[2] {
+        StderrMessage::StartActivity { id, activity_type, .. } => {
+            assert_eq!(*activity_type, 105);
+            *id
+        }
+        other => panic!("frame[2]: expected StartActivity(Build), got {other:?}"),
+    };
+    match &frames[3] {
+        StderrMessage::StopActivity { id } => assert_eq!(
+            *id, drv_id,
+            "Completed must stop the original aid, not a fresh one"
+        ),
+        other => panic!("frame[3]: expected StopActivity(drv), got {other:?}"),
+    }
+
+    let _ = wire::read_u64(&mut h.stream).await?;
+    h.finish().await;
+    Ok(())
+}
+
 /// DerivationEvent::Failed stops the activity AND emits a STDERR_NEXT log line.
 #[tokio::test]
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
