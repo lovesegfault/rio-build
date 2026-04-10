@@ -71,6 +71,20 @@ pub trait HasCommonConfig {
     }
 }
 
+/// Generates the trivial [`HasCommonConfig`] impl that projects
+/// `&self.common`. Four of five binaries have exactly this body; only
+/// rio-builder overrides `metric_labels` and so writes the impl by hand.
+#[macro_export]
+macro_rules! impl_has_common_config {
+    ($ty:ty) => {
+        impl $crate::server::HasCommonConfig for $ty {
+            fn common(&self) -> &$crate::config::CommonConfig {
+                &self.common
+            }
+        }
+    };
+}
+
 /// What [`bootstrap`] hands back. Destructure in `main()`:
 ///
 /// ```ignore

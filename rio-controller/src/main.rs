@@ -102,11 +102,7 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
-impl rio_common::server::HasCommonConfig for Config {
-    fn common(&self) -> &rio_common::config::CommonConfig {
-        &self.common
-    }
-}
+rio_common::impl_has_common_config!(Config);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
