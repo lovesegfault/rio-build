@@ -61,16 +61,13 @@ rustls = { workspace = true }
 
 # PEM body validation (tls.rs validate_pem_sections).
 base64 = { workspace = true }
-# config.rs / task.rs JSON tests.
-serde_json = { workspace = true }
 # schema.rs `Uuid` columns. Auth-stack `serde` feature moved to rio-auth.
 uuid = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
-[dev-dependencies.proptest]
-workspace = true
-
 [dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 # Router::oneshot for health-router unit test.
 tower = { workspace = true, features = ["util"] }

@@ -20273,10 +20273,6 @@
           "packageId": "serde"
         },
         {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
           "name": "sqlx",
           "packageId": "sqlx"
         },
@@ -20337,6 +20333,10 @@
         {
           "name": "rcgen",
           "packageId": "rcgen"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
         },
         {
           "name": "tempfile",
