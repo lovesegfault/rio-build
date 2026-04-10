@@ -125,7 +125,7 @@ pub(super) fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) 
 /// Status: `replicas` / `readyReplicas` / `desiredReplicas` mean
 /// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
 /// (`spec.maxConcurrent`).
-pub(super) async fn reconcile_static(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
+pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let JobReconcilePrologue {
         ns,
         name,
@@ -325,7 +325,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///   - `backoffLimit: 0` — same reasoning. One attempt.
 ///   - `ttlSecondsAfterFinished: 600` — K8s TTL controller reaps.
 ///   - `activeDeadlineSeconds` — backstop for wrong-pool spawns.
-///     `reconcile_static` spawns from the CLUSTER-WIDE
+///     `reconcile` spawns from the CLUSTER-WIDE
 ///     `queued_derivations` count, not pool-matching depth. A
 ///     queue full of x86 work on an arm64 ephemeral pool
 ///     triggers a spawn; the worker heartbeats, never matches
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(orefs[0].kind, "BuilderPool");
         assert_eq!(orefs[0].controller, Some(true));
 
-        // rio.build/pool label → reconcile_static's active-count
+        // rio.build/pool label → reconcile's active-count
         // query finds this Job. Without it, every reconcile thinks
         // active=0 and spawns more Jobs → runaway.
         let labels = job.metadata.labels.as_ref().unwrap();
@@ -636,13 +636,7 @@ mod tests {
         assert_eq!(mount.mount_path, "/etc/rio/tls");
         assert_eq!(mount.read_only, Some(true));
 
-        let envs: std::collections::HashMap<_, _> = container
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e.value.as_ref().map(|v| (e.name.as_str(), v.as_str())))
-            .collect();
+        let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
         assert_eq!(
             envs.get("RIO_TLS__CERT_PATH"),
             Some(&"/etc/rio/tls/tls.crt")

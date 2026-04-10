@@ -2,7 +2,7 @@
 //!
 //! Reconcile flow:
 //! 1. Poll `ClusterStatus`/`GetSizeClassStatus` for queued depth.
-//! 2. Spawn Jobs up to `spec.maxConcurrent` (see `static_sizing.rs`).
+//! 2. Spawn Jobs up to `spec.maxConcurrent` (see `jobs.rs`).
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch BuilderPool.status from active Job count.
 // r[impl ctrl.builderpool.reconcile]
@@ -32,7 +32,7 @@ use rio_crds::builderpool::BuilderPool;
 
 mod builders;
 pub mod disruption;
-pub(super) mod static_sizing;
+pub(super) mod jobs;
 
 #[cfg(test)]
 pub(super) mod tests;
@@ -44,7 +44,7 @@ pub(super) mod tests;
 const FINALIZER: &str = "builderpool.rio.build/drain";
 
 /// Label every BuilderPool-owned pod carries. `builders::labels()`
-/// sets it; `disruption::run` filters on it; `static_sizing` + cleanup
+/// sets it; `disruption::run` filters on it; `jobs` + cleanup
 /// list-selectors match on it. Re-exported from common — shared
 /// with the fetcherpool reconciler.
 pub(crate) use crate::reconcilers::common::pod::POOL_LABEL;
@@ -108,7 +108,7 @@ async fn warn_on_spec_degrades(wp: &BuilderPool, ctx: &Ctx) {
 async fn apply(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
     // Surface silent degrades before spawn — uses build_pod_spec.
     warn_on_spec_degrades(&wp, &ctx).await;
-    static_sizing::reconcile_static(&wp, &ctx).await
+    jobs::reconcile(&wp, &ctx).await
 }
 
 /// Cleanup on delete. Jobs are one-shot and complete on their own;

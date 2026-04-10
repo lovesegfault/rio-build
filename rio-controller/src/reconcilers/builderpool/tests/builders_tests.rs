@@ -676,13 +676,7 @@ fn job_pod_tls_secret_mounted_when_set() {
 
     // Env vars: the three RIO_TLS__* pointing at the mount.
     // Double-underscore is figment nesting (tls.cert_path).
-    let envs: std::collections::HashMap<_, _> = container
-        .env
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter_map(|e| e.value.as_ref().map(|v| (e.name.as_str(), v.as_str())))
-        .collect();
+    let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
     assert_eq!(
         envs.get("RIO_TLS__CERT_PATH"),
         Some(&"/etc/rio/tls/tls.crt")
@@ -747,39 +741,33 @@ fn job_pod_env_vars() {
     let wp = test_wp();
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
-    let envs: BTreeMap<String, String> = container
-        .env
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
-        .collect();
+    let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
 
-    assert_eq!(envs.get("RIO_SCHEDULER__ADDR"), Some(&"sched:9001".into()));
+    assert_eq!(envs.get("RIO_SCHEDULER__ADDR"), Some(&"sched:9001"));
     assert_eq!(
         envs.get("RIO_STORE__ADDR"),
-        Some(&"store:9002".into()),
+        Some(&"store:9002"),
         "from ctx.store.addr (NOT derived from scheduler — \
          different hostnames in kustomize base)"
     );
     assert_eq!(
         envs.get("RIO_STORE__BALANCE_HOST"),
-        Some(&"store-headless".into()),
+        Some(&"store-headless"),
         "balance host injected when ctx.store.balance_host is Some"
     );
-    assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
+    assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
     // systems + features: comma-sep strings. fixture wp has
     // systems=["x86_64-linux"], features=["kvm"]. CRD defines
     // them → reconciler passes them as env → worker's comma_vec
     // deserialize splits them.
     assert_eq!(
         envs.get("RIO_SYSTEMS"),
-        Some(&"x86_64-linux".into()),
+        Some(&"x86_64-linux"),
         "systems comma-joined → worker's comma_vec deserialize"
     );
     assert_eq!(
         envs.get("RIO_FEATURES"),
-        Some(&"kvm".into()),
+        Some(&"kvm"),
         "features comma-joined → worker's comma_vec deserialize"
     );
 
@@ -829,21 +817,15 @@ fn job_pod_worker_knobs_injected_when_set() {
     wp.spec.daemon_timeout_secs = Some(14400);
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
-    let envs: BTreeMap<String, String> = container
-        .env
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
-        .collect();
+    let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
 
-    assert_eq!(envs.get("RIO_FUSE_THREADS"), Some(&"8".into()));
+    assert_eq!(envs.get("RIO_FUSE_THREADS"), Some(&"8"));
     assert_eq!(
         envs.get("RIO_FUSE_PASSTHROUGH"),
-        Some(&"false".into()),
+        Some(&"false"),
         "figment bool parse accepts true/false (rio-common config.rs test)"
     );
-    assert_eq!(envs.get("RIO_DAEMON_TIMEOUT_SECS"), Some(&"14400".into()));
+    assert_eq!(envs.get("RIO_DAEMON_TIMEOUT_SECS"), Some(&"14400"));
 }
 
 #[test]

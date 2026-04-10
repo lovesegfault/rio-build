@@ -1,6 +1,6 @@
 //! FetcherPool Job-per-FOD reconciler.
 //!
-//! Same Job lifecycle as `builderpool/static_sizing.rs` (see that
+//! Same Job lifecycle as `builderpool/jobs.rs` (see that
 //! module's header for the full design rationale — push-vs-poll,
 //! Job naming, zero cross-build state). Differences here:
 //!
@@ -115,7 +115,7 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         })
         .await;
 
-        // I-183: same reap as builderpool/static_sizing.rs — when per-class
+        // I-183: same reap as builderpool/jobs.rs — when per-class
         // queued drops below per-class Pending, delete the excess.
         // FetcherPool's 300s deadline makes this less acute than
         // BuilderPool's 1h, but the Karpenter node-churn cost is the
@@ -124,7 +124,7 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         total_reaped +=
             reap_excess_pending(&jobs_api, &jobs.items, queued_known, &name, &pool_name).await;
 
-        // I-165: same orphan-reap as builderpool/static_sizing.rs. Less
+        // I-165: same orphan-reap as builderpool/jobs.rs. Less
         // acute here (FOD_EPHEMERAL_DEADLINE_SECS=300s ≈ the grace
         // itself) but a stuck fetcher still holds a node for 5min of
         // nothing. Lazy RPC; fail-closed.
@@ -245,7 +245,7 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
 }
 
 /// Build a K8s Job for one ephemeral fetcher pod. Same Job-level
-/// settings as `builderpool/static_sizing::build_job` (`backoffLimit: 0`,
+/// settings as `builderpool/jobs::build_job` (`backoffLimit: 0`,
 /// `restartPolicy: Never`, `ttlSecondsAfterFinished`); the pod spec
 /// comes from the fetcher-hardened `executor_params`.
 // r[impl ctrl.fetcherpool.ephemeral-per-class]

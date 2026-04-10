@@ -73,19 +73,17 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodPar
     // selector. If the operator supplies their own, honor those
     // instead — lets them override for dev clusters without
     // dedicated node pools.
-    let node_selector = fp.spec.node_selector.clone().or_else(|| {
-        Some(BTreeMap::from([(
-            "rio.build/node-role".into(),
-            "fetcher".into(),
-        )]))
-    });
-    let tolerations = fp.spec.tolerations.clone().or_else(|| {
-        Some(vec![Toleration {
+    let mut deploy = fp.spec.common.deploy.clone();
+    deploy
+        .node_selector
+        .get_or_insert_with(|| BTreeMap::from([("rio.build/node-role".into(), "fetcher".into())]));
+    deploy.tolerations.get_or_insert_with(|| {
+        vec![Toleration {
             key: Some("rio.build/fetcher".into()),
             operator: Some("Exists".into()),
             effect: Some("NoSchedule".into()),
             ..Default::default()
-        }])
+        }]
     });
 
     ExecutorPodParams {
@@ -115,11 +113,8 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodPar
         // per-class headless Service selector and ephemeral
         // active-Job count stay per-pool.
         pool_name: format!("{}-{}", fp.name_any(), class.name),
-        node_selector,
-        tolerations,
-        image: fp.spec.image.clone(),
+        deploy,
         image_pull_policy: None,
-        systems: fp.spec.systems.clone(),
         // Fetchers don't advertise features — FODs route by
         // is_fixed_output alone, not by feature set.
         features: vec![],
@@ -141,12 +136,6 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodPar
             localhost_profile: Some("operator/rio-fetcher.json".into()),
         }),
         host_network: None,
-        host_users: fp.spec.host_users,
-        // Same mTLS client cert as builders — same binary, same
-        // scheduler/store endpoints. Without this, the fetcher's
-        // heartbeat is rejected in mTLS deployments (the scheduler
-        // requires a cert chaining to the shared CA).
-        tls_secret_name: fp.spec.tls_secret_name.clone(),
         // 10 minutes — fetches are short. The builder default of
         // 2h is for LLVM-scale builds.
         termination_grace_period_seconds: Some(600),
@@ -210,13 +199,14 @@ mod tests {
         let params = executor_params(&fp, cls(&fp));
         assert_eq!(
             params
+                .deploy
                 .node_selector
                 .as_ref()
                 .unwrap()
                 .get("rio.build/node-role"),
             Some(&"fetcher".into())
         );
-        let tol = &params.tolerations.as_ref().unwrap()[0];
+        let tol = &params.deploy.tolerations.as_ref().unwrap()[0];
         assert_eq!(tol.key.as_deref(), Some("rio.build/fetcher"));
         assert_eq!(tol.effect.as_deref(), Some("NoSchedule"));
     }
@@ -229,11 +219,12 @@ mod tests {
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
         let params = executor_params(&fp, cls(&fp));
         assert_eq!(
-            params.node_selector.as_ref().unwrap().get("custom"),
+            params.deploy.node_selector.as_ref().unwrap().get("custom"),
             Some(&"yes".into())
         );
         assert!(
             !params
+                .deploy
                 .node_selector
                 .as_ref()
                 .unwrap()

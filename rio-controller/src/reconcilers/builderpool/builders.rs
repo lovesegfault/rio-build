@@ -14,7 +14,7 @@ use kube::ResourceExt;
 use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
 use rio_crds::builderpool::BuilderPool;
 
-// Re-export for static_sizing.rs + tests.
+// Re-export for jobs.rs + tests.
 pub use crate::reconcilers::common::pod::UpstreamAddrs;
 
 /// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
@@ -48,11 +48,8 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
         read_only_root_fs: false,
         extra_env,
         pool_name: wp.name_any(),
-        node_selector: wp.spec.node_selector.clone(),
-        tolerations: wp.spec.tolerations.clone(),
-        image: wp.spec.image.clone(),
+        deploy: wp.spec.common.deploy.clone(),
         image_pull_policy: wp.spec.image_pull_policy.clone(),
-        systems: wp.spec.systems.clone(),
         features: wp.spec.features.clone(),
         resources: wp.spec.resources.clone(),
         fuse_cache_quantity: Quantity(BUILDER_FUSE_CACHE.into()),
@@ -60,13 +57,11 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
         privileged: wp.spec.privileged == Some(true),
         seccomp_profile: wp.spec.seccomp_profile.clone(),
         host_network: wp.spec.host_network,
-        host_users: wp.spec.host_users,
-        tls_secret_name: wp.spec.tls_secret_name.clone(),
         termination_grace_period_seconds: wp.spec.termination_grace_period_seconds,
     }
 }
 
-/// The pod spec. Re-exported for `static_sizing::build_job` — the
+/// The pod spec. Re-exported for `jobs::build_job` — the
 /// Job pod is the executor container with `wp.spec.resources` applied.
 pub(super) fn build_pod_spec(
     wp: &BuilderPool,

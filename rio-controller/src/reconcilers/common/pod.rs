@@ -18,6 +18,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use rio_crds::builderpool::SeccompProfileKind;
+use rio_crds::common::PoolDeployKnobs;
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
@@ -128,17 +129,15 @@ pub struct ExecutorPodParams {
     /// Pool CR name. Feeds [`job_name`] (`rio-{role}-{pool_name}-…`).
     pub pool_name: String,
 
-    // ── scheduling ───────────────────────────────────────────────
-    pub node_selector: Option<BTreeMap<String, String>>,
-    pub tolerations: Option<Vec<Toleration>>,
-
-    // ── image ────────────────────────────────────────────────────
-    pub image: String,
+    // ── deployment knobs (image / systems / node placement / mTLS /
+    // host_users) ─────────────────────────────────────────────────
+    /// Shared with the CRD's `PoolSpecCommon.deploy` flatten — both
+    /// reconcilers pass `spec.common.deploy.clone()` (fetcher mutates
+    /// the clone for ADR-019 default node placement).
+    pub deploy: PoolDeployKnobs,
     pub image_pull_policy: Option<String>,
 
     // ── capacity ─────────────────────────────────────────────────
-    /// Comma-joined → `RIO_SYSTEMS`.
-    pub systems: Vec<String>,
     /// Comma-joined → `RIO_FEATURES`. Empty for fetchers.
     pub features: Vec<String>,
     pub resources: Option<ResourceRequirements>,
@@ -155,12 +154,8 @@ pub struct ExecutorPodParams {
     /// CRD seccomp profile. Converted via [`build_seccomp_profile`].
     pub seccomp_profile: Option<SeccompProfileKind>,
     pub host_network: Option<bool>,
-    /// Explicit override. `None` → derived from `!privileged &&
-    /// !host_network`.
-    pub host_users: Option<bool>,
 
     // ── misc ─────────────────────────────────────────────────────
-    pub tls_secret_name: Option<String>,
     /// `None` → 7200s (2h).
     pub termination_grace_period_seconds: Option<i64>,
 }
@@ -267,6 +262,7 @@ pub fn build_executor_pod_spec(
         // spec.hostUsers override handles containerd<2.1 cgroup
         // ownership issues (cgroup_writable knob).
         host_users: p
+            .deploy
             .host_users
             .or_else(|| (!privileged && p.host_network != Some(true)).then_some(false)),
 
@@ -358,7 +354,7 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 });
             }
-            if let Some(secret) = &p.tls_secret_name {
+            if let Some(secret) = &p.deploy.tls_secret_name {
                 v.push(Volume {
                     name: "tls".into(),
                     secret: Some(SecretVolumeSource {
@@ -399,7 +395,7 @@ pub fn build_executor_pod_spec(
         // r[impl ctrl.pod.tgps-default]
         termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
         node_selector: {
-            let mut ns = p.node_selector.clone().unwrap_or_default();
+            let mut ns = p.deploy.node_selector.clone().unwrap_or_default();
             // r[impl ctrl.pod.arch-selector]
             // I-098: a pool with systems=[x86_64-linux] landed pods on an
             // arm64 node (fallback NodePool unconstrained) — builder
@@ -410,7 +406,7 @@ pub fn build_executor_pod_spec(
             // benefit from cheaper Graviton; rio-builder's startup arch
             // check is the safety net for builders that slip through.
             if p.role == ExecutorKind::Builder
-                && let Some(arch) = nix_systems_to_k8s_arch(&p.systems)
+                && let Some(arch) = nix_systems_to_k8s_arch(&p.deploy.systems)
             {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
@@ -426,7 +422,7 @@ pub fn build_executor_pod_spec(
             if ns.is_empty() { None } else { Some(ns) }
         },
         tolerations: {
-            let mut t = p.tolerations.clone().unwrap_or_default();
+            let mut t = p.deploy.tolerations.clone().unwrap_or_default();
             // r[impl ctrl.builderpool.kvm-device]
             // Metal NodePool is tainted rio.build/kvm=true:NoSchedule so
             // non-kvm builders don't bin-pack onto $$ metal. Append
@@ -458,7 +454,7 @@ fn build_executor_container(
 
     Container {
         name: p.role.as_str().into(),
-        image: Some(p.image.clone()),
+        image: Some(p.deploy.image.clone()),
         command: Some(vec!["/bin/rio-builder".into()]),
         image_pull_policy: p.image_pull_policy.clone(),
         env: Some({
@@ -469,7 +465,7 @@ fn build_executor_container(
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
-                env("RIO_SYSTEMS", &p.systems.join(",")),
+                env("RIO_SYSTEMS", &p.deploy.systems.join(",")),
                 env("RIO_FEATURES", &p.features.join(",")),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
@@ -499,7 +495,7 @@ fn build_executor_container(
             if let Some(n) = p.fuse_threads {
                 e.push(env("RIO_FUSE_THREADS", &n.to_string()));
             }
-            if p.tls_secret_name.is_some() {
+            if p.deploy.tls_secret_name.is_some() {
                 e.push(env("RIO_TLS__CERT_PATH", "/etc/rio/tls/tls.crt"));
                 e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
                 e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
@@ -551,7 +547,7 @@ fn build_executor_container(
                     ..Default::default()
                 });
             }
-            if p.tls_secret_name.is_some() {
+            if p.deploy.tls_secret_name.is_some() {
                 m.push(VolumeMount {
                     name: "tls".into(),
                     mount_path: "/etc/rio/tls".into(),

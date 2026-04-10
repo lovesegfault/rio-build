@@ -9,7 +9,7 @@ existing two.
 ## Context
 
 `common/job.rs` already extracts the byte-identical plumbing shared by
-the two Job-mode reconcilers (`builderpool::static_sizing`,
+the two Job-mode reconcilers (`builderpool::jobs`,
 `fetcherpool::jobs`): prologue, Job predicates, `spawn_count`,
 `try_spawn_job`/`SpawnOutcome`, both reap helpers, `patch_job_pool_status`,
 constants. The question was whether the remaining per-reconciler
@@ -26,7 +26,7 @@ hand-written `reconcile()` per role.
 **The two flows differ structurally, not parametrically.** A trait
 driver wants `poll → diff → spawn → reap → patch`. What we have:
 
-| step       | static_sizing            | fetcherpool                  |
+| step       | builderpool              | fetcherpool                  |
 |------------|--------------------------|------------------------------|
 | poll       | one u32 (size-class RPC) | `QueueSignals{flat,by_class}`|
 | iteration  | flat (1 unit)            | per-`classes[]` loop         |
@@ -55,5 +55,5 @@ a reader needs co-located.
 
 ## Revisit when
 
-- a third reconciler arrives that matches `static_sizing` or
+- a third reconciler arrives that matches `builderpool::jobs` or
   `fetcherpool` step-for-step.

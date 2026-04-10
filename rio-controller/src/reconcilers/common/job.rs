@@ -1,5 +1,5 @@
 //! Shared plumbing for the Job-mode reconcilers (`builderpool::
-//! static_sizing` and `fetcherpool::jobs`). Both follow the
+//! jobs` and `fetcherpool::jobs`). Both follow the
 //! same skeleton: list Jobs by label, filter active, diff against
 //! demand, spawn deficit, reap excess, patch status. The diff is
 //! different (per-bucket vs flat-ceiling); the plumbing around it is
@@ -73,7 +73,7 @@ pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 const EPHEMERAL_TGPS: i64 = 30;
 
 /// The shared one-shot Job literal for executor pods. Both
-/// Job-mode reconcilers (`builderpool::static_sizing`,
+/// Job-mode reconcilers (`builderpool::jobs`,
 /// `fetcherpool::jobs`) route through this so the load-bearing
 /// invariants can't drift per call site:
 ///
@@ -628,7 +628,7 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// `Failed` are logged (debug/warn) and the loop CONTINUES — the
 /// P0516 invariant: a spawn error never short-circuits the reconcile
 /// tick, so the caller's status patch still runs. The structural
-/// guard at `builderpool/tests/static_sizing_tests.rs::
+/// guard at `builderpool/tests/jobs_tests.rs::
 /// ephemeral_spawn_fail_still_patches_status` asserts this body
 /// contains no `return Err`.
 ///
