@@ -46,6 +46,10 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `binary_cache_compat.bucket` | string | (`chunk_backend.s3.bucket`) | Target bucket for compat objects. Defaults to the chunk bucket (narinfo at root, `nar/` prefix coexisting with `chunks/`). |
 | `binary_cache_compat.compression` | enum | `zstd` | `zstd` \| `xz` \| `none`. NAR compression for the compat write. |
 | `binary_cache_compat.write_mode` | enum | `sync-after-commit` | `sync-after-commit` only. `async` (background queue) is reserved. |
+| `chunk_backend.express.target_bytes` | u64 | `8796093022208` (8 TiB) | Per-AZ Express bucket size target. Sweep evicts when over `× evict_high_watermark`. |
+| `chunk_backend.express.evict_high_watermark` | f64 | `1.10` | Sweep triggers when bucket size > `target_bytes × this`. |
+| `chunk_backend.express.evict_low_watermark` | f64 | `0.90` | Sweep deletes oldest until size < `target_bytes × this`. |
+| `chunk_backend.express.sweep_interval_secs` | u64 | `3600` | Seconds between Express eviction sweeps (per-AZ leader only). |
 
 `chunk_backend` TOML syntax (tagged enum):
 
@@ -55,6 +59,14 @@ chunk_backend = { kind = "filesystem", base_dir = "/var/rio/chunks" }
 
 # S3 (credentials from aws-sdk default chain — env vars, IRSA, instance profile)
 chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
+
+# Tiered: per-AZ S3 Express read-through cache in front of S3 standard.
+# express_bucket is resolved per-replica from the AZ-ID at startup (see Design Overview §9);
+# target_bytes/watermarks/sweep_interval govern the eviction sweeper.
+[store.chunk_backend]
+kind = "tiered"
+remote = { bucket = "rio-chunks", prefix = "" }
+express = { target_bytes = 8796093022208, evict_high_watermark = 1.10, evict_low_watermark = 0.90, sweep_interval_secs = 3600 }
 ```
 
 `binary_cache_compat` TOML syntax:
