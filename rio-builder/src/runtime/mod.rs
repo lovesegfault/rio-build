@@ -1015,6 +1015,7 @@ pub(super) async fn relay_loop(
 mod tests {
     use super::*;
     use rio_proto::types::ExecutorRegister;
+    use rstest::rstest;
 
     #[test]
     fn validate_host_arch_gates_builders_only() {
@@ -1541,149 +1542,48 @@ mod tests {
         );
     }
 
+    /// `build_heartbeat_request` is field-for-field passthrough. Each
+    /// case varies one input; the body asserts the full proto so a
+    /// hardcoded literal in any position fails every row.
+    ///
+    /// Covers: running_build/busy from slot, size_class verbatim
+    /// ("" = unclassified), store_degraded from CircuitBreaker::is_open()
+    /// (P0211 has_capacity gate), supported_features from CRD config
+    /// (regression: hardcoded-empty silently ignored requiredSystemFeatures).
+    #[rstest]
+    #[case::running(Some("/nix/store/foo.drv"), vec![], "", false)]
+    #[case::idle(None, vec![], "", false)]
+    #[case::size_class(None, vec![], "large", false)]
+    #[case::degraded(None, vec![], "", true)]
+    #[case::features(None, vec!["kvm".into(), "big-parallel".into()], "", false)]
     #[tokio::test]
-    async fn test_heartbeat_reports_running_build() {
+    async fn heartbeat_field_passthrough(
+        #[case] claim: Option<&'static str>,
+        #[case] features: Vec<String>,
+        #[case] size_class: &'static str,
+        #[case] store_degraded: bool,
+    ) {
         let slot = Arc::new(BuildSlot::default());
-        let _guard = slot.try_claim("/nix/store/foo.drv").unwrap();
-
+        let _guard = claim.map(|d| slot.try_claim(d).unwrap());
         let req = build_heartbeat_request(
             "worker-1",
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
-            &[],
-            "",
+            &features,
+            size_class,
             &slot,
             &ResourceSnapshotHandle::default(),
-            false,
+            store_degraded,
             false,
         )
         .await;
-        assert_eq!(req.running_build, Some("/nix/store/foo.drv".to_string()));
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
-        // ResourceUsage.busy mirrors the top-level field.
-        assert!(req.resources.unwrap().busy);
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_idle_running_build() {
-        let slot = Arc::new(BuildSlot::default());
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(req.running_build, None);
-    }
-
-    /// size_class passes through verbatim (scheduler interprets "" as None).
-    #[tokio::test]
-    async fn test_heartbeat_includes_size_class() {
-        let slot = Arc::new(BuildSlot::default());
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "large",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(req.size_class, "large");
-
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(req.size_class, "", "empty = unclassified");
-    }
-
-    /// `store_degraded` passes through to the proto field. main.rs
-    /// reads `CircuitBreaker::is_open()` each heartbeat tick and
-    /// passes it here — this test is the contract between the two:
-    /// whatever bool main.rs observes, the scheduler sees.
-    ///
-    /// No mock circuit: `build_heartbeat_request` takes the bool
-    /// directly (the circuit lives in main.rs's FUSE setup, which
-    /// has no unit-test harness). The scheduler-side consumption
-    /// is `r[verify]`'d separately (P0211, has_capacity excludes
-    /// degraded workers).
-    #[tokio::test]
-    async fn test_heartbeat_store_degraded_passthrough() {
-        let slot = Arc::new(BuildSlot::default());
-
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            true,
-            false,
-        )
-        .await;
-        assert!(
-            req.store_degraded,
-            "circuit open → proto field set → scheduler excludes via has_capacity()"
-        );
-
-        // Control: default path is NOT degraded. Guards against an
-        // accidental hardcode-true in the struct literal.
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-        assert!(!req.store_degraded);
-    }
-
-    /// Regression: supported_features must reflect the config — if
-    /// hardcoded empty, the CRD's features field is silently ignored
-    /// and any derivation with requiredSystemFeatures never dispatches.
-    #[tokio::test]
-    async fn test_heartbeat_includes_systems_and_features() {
-        let slot = Arc::new(BuildSlot::default());
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into(), "aarch64-linux".into()],
-            &["kvm".into(), "big-parallel".into()],
-            "",
-            &slot,
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
-        assert_eq!(req.supported_features, vec!["kvm", "big-parallel"]);
+        assert_eq!(req.running_build.as_deref(), claim);
+        assert_eq!(req.size_class, size_class);
+        assert_eq!(req.store_degraded, store_degraded);
+        assert_eq!(req.supported_features, features);
+        assert_eq!(req.resources.unwrap().busy, claim.is_some());
     }
 
     /// I-212: when the JIT allowlist is armed, `handle_prefetch_hint`
