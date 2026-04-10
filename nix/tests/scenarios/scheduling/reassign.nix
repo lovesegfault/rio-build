@@ -105,24 +105,19 @@ scope: with scope; ''
           f"before={d_before}, after={d_after}"
       )
 
-      # I-177: the disconnect promoted size_class_floor small→large
-      # (no clean OOM signal at scheduler — any disconnect promotes;
-      # over-promoting one class is cheap vs poison-loop on tiny).
-      # The retry routed to wlarge, not the surviving small worker.
+      # I-177-reversed: bare disconnect/SIGKILL must NOT promote
+      # size_class_floor — only controller-reported OOMKilled or
+      # EvictedDiskPressure does (ReportExecutorTermination RPC). The
+      # standalone fixture has no rio-controller pod-watch, so no
+      # termination report is sent; promotion stays at 0. The retry
+      # re-queues at the SAME class (small), not wlarge.
       promo_after = metric_value(disc_after,
           "rio_scheduler_size_class_promotions_total",
           '{kind="builder",from="small",to="large"}') or 0.0
-      assert promo_after >= promo_before + 1, (
-          f"I-177: SIGKILL on small builder should promote "
-          f"size_class_floor; before={promo_before}, after={promo_after}"
-      )
-      wlarge_got = wlarge.succeed(
-          "journalctl -u rio-builder --no-pager | "
-          "grep -c 'rio-test-sched-reassign' || true"
-      ).strip()
-      assert int(wlarge_got or "0") > 0, (
-          "I-177: retry after SIGKILL should route to wlarge "
-          "(floor promoted small→large)"
+      assert promo_after == promo_before, (
+          f"SIGKILL alone must NOT promote size_class_floor "
+          f"(only OOMKilled/DiskPressure does); "
+          f"before={promo_before}, after={promo_after}"
       )
 
       # Wait for the killed worker to come back before collectCoverage
