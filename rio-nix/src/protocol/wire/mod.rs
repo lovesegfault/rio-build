@@ -342,39 +342,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_string_padding() -> anyhow::Result<()> {
-        // String of length 1: needs 7 bytes padding
-        let result = roundtrip_bytes(b"x").await?;
-        assert_eq!(result, b"x");
-
-        // Verify total wire size: 8 (len) + 1 (data) + 7 (pad) = 16
-        let mut buf = Vec::new();
-        write_bytes(&mut buf, b"x").await?;
-        assert_eq!(buf.len(), 16);
-
-        // String of length 8: no padding needed
-        let mut buf = Vec::new();
-        write_bytes(&mut buf, b"12345678").await?;
-        assert_eq!(buf.len(), 16); // 8 (len) + 8 (data) + 0 (pad)
-
-        // String of length 9: needs 7 bytes padding
-        let mut buf = Vec::new();
-        write_bytes(&mut buf, b"123456789").await?;
-        assert_eq!(buf.len(), 24); // 8 (len) + 9 (data) + 7 (pad)
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_string_boundary_lengths() -> anyhow::Result<()> {
-        for len in [0, 1, 7, 8, 9, 15, 16, 17, 100] {
-            let data = vec![b'A'; len];
-            let result = roundtrip_bytes(&data).await?;
-            assert_eq!(result, data, "roundtrip failed for len={len}");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_utf8_string_roundtrip() -> anyhow::Result<()> {
         let cases = ["", "hello", "hello world", "/nix/store/abc-hello-2.12.1"];
         for s in cases {
@@ -534,46 +501,10 @@ mod tests {
         Ok(())
     }
 
-    // Framed stream tests
-
-    #[tokio::test]
-    async fn test_framed_stream_empty() -> anyhow::Result<()> {
-        let mut buf = Vec::new();
-        write_framed_stream(&mut buf, b"", 64).await?;
-
-        // Should just be u64(0) sentinel
-        assert_eq!(buf.len(), 8);
-
-        let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await?;
-        assert!(result.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_framed_stream_single_chunk() -> anyhow::Result<()> {
-        let data = b"hello framed world";
-        let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 1024).await?;
-
-        let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await?;
-        assert_eq!(result, data);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_framed_stream_multiple_chunks() -> anyhow::Result<()> {
-        let data = b"abcdefghijklmnopqrstuvwxyz";
-        let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 10).await?;
-
-        // Should have 3 frames: 10 + 10 + 6 + sentinel
-        let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await?;
-        assert_eq!(result, data);
-        Ok(())
-    }
+    // Framed stream tests — roundtrip coverage (empty/single/multi/chunk-1)
+    // lives in `framed::tests` via FramedStreamReader; `read_framed_stream`
+    // is a thin `read_to_end` over that. This test stays for the byte-layout
+    // assertion (no-padding) which the reader tests don't check.
 
     #[tokio::test]
     async fn test_framed_stream_no_padding() -> anyhow::Result<()> {
@@ -592,19 +523,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_framed_stream_chunk_size_1() -> anyhow::Result<()> {
-        let data = b"test";
-        let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 1).await?;
-
-        // 4 frames of 1 byte each + sentinel
-        let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await?;
-        assert_eq!(result, data);
-        Ok(())
-    }
-
     // ------------------------------------------------------------------
     // Tests targeting specific cargo-mutants MISSED mutants (P0373).
     // The fuzz corpus doesn't cover specific byte patterns (every padding
@@ -612,13 +530,14 @@ mod tests {
     // pin those patterns.
     // ------------------------------------------------------------------
 
-    /// Padding: for every residue 1..=7, the 8-byte alignment must pad
-    /// with exactly `8 - residue` zero bytes. Catches `%` → `/`/`+` and
-    /// `-` → `+`/`/` in `padding_len` (mod.rs:51-52).
+    /// Padding: for every length 0..=17, the 8-byte alignment must pad
+    /// with exactly `(8 - len % 8) % 8` zero bytes. Catches `%` → `/`/`+`
+    /// and `-` → `+`/`/` in `padding_len` (mod.rs:51-52). Covers all
+    /// residues twice plus the zero-length and >8 boundary cases.
     // r[verify gw.wire.string-encoding]
     #[tokio::test]
     async fn string_padding_all_residues() -> anyhow::Result<()> {
-        for len in 1..=7usize {
+        for len in 0..=17usize {
             let s = "x".repeat(len);
             let mut buf = Vec::new();
             write_string(&mut buf, &s).await?;
@@ -640,10 +559,6 @@ mod tests {
             let mut reader = Cursor::new(&buf[..]);
             assert_eq!(read_string(&mut reader).await?, s);
         }
-        // Residue 0 (len=8): no padding bytes at all.
-        let mut buf = Vec::new();
-        write_string(&mut buf, "12345678").await?;
-        assert_eq!(buf.len(), 16); // 8 len + 8 data + 0 pad
         Ok(())
     }
 
