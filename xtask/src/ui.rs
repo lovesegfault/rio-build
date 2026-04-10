@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Select, Text};
 use tracing::level_filters::LevelFilter;
-use tracing::{Instrument, debug, info, info_span};
+use tracing::{Instrument, debug, info_span};
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -53,23 +53,11 @@ pub fn init(level: LevelFilter) {
         .init();
 }
 
-/// No-op passthrough — vestige of the removed span→spinner layer.
-/// Previously cleared the spinner line for raw stdout writes.
-pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
-    f()
-}
-
 /// `eprintln!` to stderr. Kept so the `clippy::print_stderr` allow
 /// lives in one place instead of at every error-dump callsite.
 #[allow(clippy::print_stderr)]
 pub fn eprint(args: std::fmt::Arguments<'_>) {
     let _ = std::io::stderr().write_fmt(args);
-}
-
-/// Debug-level progress tail. Was the spinner message; now a debug
-/// event so `-vv` shows it.
-pub fn set_message(msg: &str) {
-    debug!("{msg}");
 }
 
 // -- inquire prompt helpers ---------------------------------------------
@@ -184,7 +172,7 @@ pub fn step_owned<T>(
 
 /// Log a skipped step (e.g. `tofu apply` when plan shows no diff).
 pub fn step_skip(name: &str, reason: &str) {
-    info!(step = name, reason, "skipped");
+    tracing::info!(step = name, reason, "skipped");
 }
 
 /// Poll `f` every `interval` up to `max` times inside a step span.

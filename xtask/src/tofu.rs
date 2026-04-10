@@ -74,23 +74,13 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     }
 
     if !auto {
-        // ONE suspend() across show+confirm. Releasing between them
-        // lets the spinner repaint over both the diff and the prompt.
         // Applying a plan file skips tofu's own prompt (it treats the
-        // file as pre-approved), so we gate here instead.
+        // file as pre-approved), so we show the diff and gate here.
         let sh = shell()?;
         let pp = &plan_path;
-        let approved = ui::suspend(|| -> Result<bool> {
-            // Direct .run() because we're already inside suspend() —
-            // sh::run_interactive would nest a second pause.
-            #[allow(clippy::disallowed_methods)]
-            cmd!(sh, "tofu -chdir={dir} show {pp}")
-                .quiet()
-                .run()
-                .map_err(anyhow::Error::from)?;
-            ui::confirm_held("Apply these changes?")
-        })?;
-        if !approved {
+        #[allow(clippy::disallowed_methods)]
+        cmd!(sh, "tofu -chdir={dir} show {pp}").quiet().run()?;
+        if !ui::confirm_held("Apply these changes?")? {
             bail!("tofu apply cancelled");
         }
     }
@@ -170,10 +160,10 @@ fn ensure_backend_init(dir: &str) -> Result<()> {
         bucket,
         region: cfg.tfstate_region,
     };
-    ui::set_message(&format!(
+    tracing::debug!(
         "tofu init (fresh worktree, backend s3://{})",
         backend.bucket
-    ));
+    );
     init(dir, &backend)
 }
 

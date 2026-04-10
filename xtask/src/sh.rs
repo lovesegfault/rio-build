@@ -235,7 +235,7 @@ async fn tail<R: tokio::io::AsyncRead + Unpin>(r: R, prefix: &str) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut buf = String::new();
     while let Ok(Some(line)) = lines.next_line().await {
-        ui::set_message(&format!("{prefix}: {line}"));
+        tracing::debug!("{prefix}: {line}");
         buf.push_str(&line);
         buf.push('\n');
     }

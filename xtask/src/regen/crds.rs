@@ -38,6 +38,6 @@ pub async fn run() -> Result<()> {
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
         .count();
-    ui::set_message(&format!("wrote {n} CRDs"));
+    tracing::debug!("wrote {n} CRDs");
     Ok(())
 }

@@ -72,7 +72,7 @@ pub async fn run() -> Result<()> {
     })
     .await?;
     if current {
-        ui::set_message("sqlx cache already current");
+        tracing::debug!("sqlx cache already current");
         return Ok(());
     }
 
@@ -84,7 +84,7 @@ pub async fn run() -> Result<()> {
     let count = std::fs::read_dir(sh.current_dir().join(".sqlx"))
         .map(|d| d.count())
         .unwrap_or(0);
-    ui::set_message(&format!("{count} queries cached"));
+    tracing::debug!("{count} queries cached");
     Ok(())
 }
 
