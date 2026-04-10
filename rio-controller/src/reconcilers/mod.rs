@@ -35,6 +35,17 @@ use crate::error::{Error, Result, error_kind};
 /// KubeErrorExt` without naming rio-crds directly.
 pub use rio_crds::{KubeErrorExt, KubeResultExt};
 
+/// `obj.namespace()` or `InvalidSpec("{Kind} has no namespace")`.
+/// All rio-controller CRDs are `Namespaced`-scope; a missing
+/// namespace is an apply-time error, not a transient. Replaces five
+/// per-reconciler open-coded `ok_or_else(InvalidSpec("X has no
+/// namespace"))` sites with one generic.
+pub fn require_namespace<K: kube::Resource<DynamicType = ()>>(obj: &K) -> Result<String> {
+    use kube::ResourceExt;
+    obj.namespace()
+        .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))
+}
+
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
 ///
@@ -306,11 +317,8 @@ where
     AFut: Future<Output = Result<Action>> + Send,
     CFut: Future<Output = Result<Action>> + Send,
 {
-    use kube::ResourceExt;
     use kube::runtime::finalizer::{Event, finalizer};
-    let ns = obj
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))?;
+    let ns = require_namespace(&*obj)?;
     let api: kube::Api<K> = kube::Api::namespaced(ctx.client.clone(), &ns);
     finalizer(&api, finalizer_name, obj, move |event| async move {
         match event {

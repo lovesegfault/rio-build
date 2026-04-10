@@ -14,7 +14,7 @@ use kube::ResourceExt;
 use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
 use rio_crds::builderpool::BuilderPool;
 
-// Re-export for static_sizing.rs / manifest.rs + tests.
+// Re-export for static_sizing.rs + tests.
 pub use crate::reconcilers::common::pod::UpstreamAddrs;
 
 /// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on

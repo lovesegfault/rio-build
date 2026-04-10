@@ -55,16 +55,16 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kube::api::ListParams;
 use kube::runtime::controller::Action;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::reconcilers::Ctx;
 #[cfg(test)]
 use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    JOB_REQUEUE, JobReconcilePrologue, SpawnOutcome, ephemeral_job, is_active_job,
-    job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
-    reap_orphan_running, spawn_count, try_spawn_job,
+    JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
+    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running, spawn_count,
+    spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
@@ -202,47 +202,12 @@ pub(super) async fn reconcile_static(wp: &BuilderPool, ctx: &Ctx) -> Result<Acti
     let headroom = ceiling.saturating_sub(active).max(0) as u32;
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
-    if to_spawn > 0 {
-        for _ in 0..to_spawn {
-            let job = build_job(wp, oref.clone(), &scheduler, &store)?;
-            // build_job() always sets metadata.name, so this can't
-            // fail today — but .expect() here violates the crate's
-            // "reconciler panic = pod crash-loop" convention
-            // (cf. builderpool/mod.rs:317-319). Error path instead.
-            let job_name = job
-                .metadata
-                .name
-                .clone()
-                .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
-            match try_spawn_job(&jobs_api, &job).await {
-                SpawnOutcome::Spawned => {
-                    info!(
-                        pool = %name, job = %job_name,
-                        queued, active, ceiling,
-                        "spawned ephemeral Job"
-                    );
-                }
-                SpawnOutcome::NameCollision => {
-                    debug!(pool = %name, job = %job_name, "Job name collision; will retry");
-                }
-                SpawnOutcome::Failed(e) => {
-                    // Was `return Err(e.into())` — THE bug. Matches
-                    // pre-P0516 manifest.rs. Now warn+continue:
-                    // status patch at :242 runs regardless; next
-                    // tick retries.
-                    warn!(
-                        pool = %name, job = %job_name,
-                        queued, active, ceiling, error = %e,
-                        "ephemeral Job spawn failed; continuing tick"
-                    );
-                }
-            }
-        }
-    } else {
-        debug!(
-            pool = %name, queued, active, ceiling,
-            "no ephemeral Jobs to spawn"
-        );
+    spawn_n(&jobs_api, to_spawn, &name, &wp.spec.size_class, || {
+        build_job(wp, oref.clone(), &scheduler, &store)
+    })
+    .await;
+    if to_spawn == 0 {
+        debug!(pool = %name, queued, active, ceiling, "no ephemeral Jobs to spawn");
     }
 
     // ---- Reap excess Pending ----

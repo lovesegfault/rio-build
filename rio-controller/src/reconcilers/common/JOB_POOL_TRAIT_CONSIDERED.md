@@ -2,14 +2,14 @@
 
 ## Status
 
-Rejected (wave-3 cleanup, 2026-04). Revisit if a fourth Job-mode
+Rejected (wave-3 cleanup, 2026-04). Revisit if a third Job-mode
 reconciler appears that is structurally identical to one of the
-existing three.
+existing two.
 
 ## Context
 
 `common/job.rs` already extracts the byte-identical plumbing shared by
-the three Job-mode reconcilers (`builderpool::{static_sizing,manifest}`,
+the two Job-mode reconcilers (`builderpool::static_sizing`,
 `fetcherpool::jobs`): prologue, Job predicates, `spawn_count`,
 `try_spawn_job`/`SpawnOutcome`, both reap helpers, `patch_job_pool_status`,
 constants. The question was whether the remaining per-reconciler
@@ -23,26 +23,18 @@ hand-written `reconcile()` per role.
 
 ## Why
 
-**The three flows differ structurally, not parametrically.** A trait
+**The two flows differ structurally, not parametrically.** A trait
 driver wants `poll → diff → spawn → reap → patch`. What we have:
 
-| step       | static_sizing            | fetcherpool                  | manifest                                  |
-|------------|--------------------------|------------------------------|-------------------------------------------|
-| poll       | one u32 (size-class RPC) | `QueueSignals{flat,by_class}`| `(Vec<Estimate>, u32)` from two RPCs      |
-| iteration  | flat (1 unit)            | per-`classes[]` loop         | per-bucket plan + global truncate         |
-| pre-spawn  | —                        | —                            | `sweep_failed` **must** precede spawn (ResourceQuota deadlock) |
-| spawn      | `for 0..n {try_spawn}`   | same, inside class loop      | `spawn_manifest_jobs` with consecutive-fail threshold |
-| reap       | `reap_excess_pending` + `reap_orphan_running` | same, per-class | neither — `reap_surplus_manifest_jobs` (bucket idle-grace + `Ctx::manifest_idle` mutex) |
-| status     | `replicas: Some(active)` | `replicas: None`             | `replicas: Some(active)`                  |
+| step       | static_sizing            | fetcherpool                  |
+|------------|--------------------------|------------------------------|
+| poll       | one u32 (size-class RPC) | `QueueSignals{flat,by_class}`|
+| iteration  | flat (1 unit)            | per-`classes[]` loop         |
+| spawn      | `for 0..n {try_spawn}`   | same, inside class loop      |
+| reap       | `reap_excess_pending` + `reap_orphan_running` | same, per-class |
+| status     | `replicas: Some(active)` | `replicas: None`             |
 
-`manifest` shares prologue/patch and the Job predicates; everything
-between is its own algorithm. A driver that covers it needs ~8 hook
-methods, most of which manifest overrides entirely — that is relocation,
-not deduplication.
-
-**Two-of-three coverage doesn't clear the bar either.** Unifying only
-`static_sizing` + `fetcherpool` (treat static as "fetcher with one
-class") was costed:
+Unifying the two (treat static as "fetcher with one class") was costed:
 
 - before: ~292 LoC across two `reconcile()` bodies
 - after: trait def (~50) + driver (~90) + two impls (~100) ≈ 240 LoC
@@ -54,8 +46,6 @@ class") was costed:
     rationale, and per-role fail-open/closed notes currently sit at
     the line they govern; a generic driver hosts one merged comment
     that is true for neither role precisely
-  - a `trait JobPool` that silently excludes the most complex Job
-    reconciler (`manifest`) is a misleading name
 
 **What is already shared is the right cut.** The wave-1 extraction
 landed every segment that was byte-identical or near. What remains in
@@ -65,7 +55,5 @@ a reader needs co-located.
 
 ## Revisit when
 
-- a fourth reconciler arrives that matches `static_sizing` or
-  `fetcherpool` step-for-step, or
-- `manifest` drops its bucket/idle machinery and converges on the
-  pending/orphan reap path.
+- a third reconciler arrives that matches `static_sizing` or
+  `fetcherpool` step-for-step.

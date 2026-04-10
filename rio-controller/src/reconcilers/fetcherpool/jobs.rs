@@ -25,16 +25,16 @@ use k8s_openapi::api::batch::v1::Job;
 use kube::ResourceExt;
 use kube::api::ListParams;
 use kube::runtime::controller::Action;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::reconcilers::Ctx;
 #[cfg(test)]
 use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    JOB_REQUEUE, JobReconcilePrologue, SpawnOutcome, ephemeral_job, is_active_job,
-    job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
-    reap_orphan_running, spawn_count, try_spawn_job,
+    JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
+    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running, spawn_count,
+    spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, UpstreamAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
@@ -109,35 +109,11 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         let to_spawn = spawn_count(queued, active as u32, headroom);
         total_active += active;
         total_queued += queued;
-        total_spawned += to_spawn;
 
-        for _ in 0..to_spawn {
-            let job = build_job(fp, class, oref.clone(), &scheduler, &store)?;
-            let job_name = job
-                .metadata
-                .name
-                .clone()
-                .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
-            match try_spawn_job(&jobs_api, &job).await {
-                SpawnOutcome::Spawned => {
-                    info!(
-                        pool = %name, class = %pool_name, job = %job_name,
-                        queued, active, ceiling,
-                        "spawned ephemeral fetcher Job"
-                    );
-                }
-                SpawnOutcome::NameCollision => {
-                    debug!(pool = %name, job = %job_name, "Job name collision; will retry");
-                }
-                SpawnOutcome::Failed(e) => {
-                    warn!(
-                        pool = %name, class = %pool_name, job = %job_name,
-                        queued, active, ceiling, error = %e,
-                        "ephemeral fetcher Job spawn failed; continuing tick"
-                    );
-                }
-            }
-        }
+        total_spawned += spawn_n(&jobs_api, to_spawn, &name, &pool_name, || {
+            build_job(fp, class, oref.clone(), &scheduler, &store)
+        })
+        .await;
 
         // I-183: same reap as builderpool/static_sizing.rs — when per-class
         // queued drops below per-class Pending, delete the excess.
@@ -280,7 +256,7 @@ pub(super) fn build_job(
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
 ) -> Result<Job> {
-    let params = executor_params(fp, class)?;
+    let params = executor_params(fp, class);
     // P0556: pool_name (= `rio.build/pool` label) is `{fp.name}-{class.
     // name}` — set inside executor_params. Reused for the Job name
     // prefix so logs/metrics group per class.
@@ -333,13 +309,7 @@ mod tests {
         let spec = job.spec.unwrap();
         let pod = spec.template.spec.unwrap();
         let c = &pod.containers[0];
-        let envs: std::collections::BTreeMap<_, _> = c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
-            .collect();
+        let envs = crate::fixtures::env_map(c.env.as_deref().unwrap());
         assert_eq!(envs.get("RIO_EXECUTOR_KIND"), Some(&"fetcher"));
         assert_eq!(
             c.security_context
@@ -466,13 +436,7 @@ mod tests {
 
         let pod = job.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
-        let envs: std::collections::BTreeMap<_, _> = c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
-            .collect();
+        let envs = crate::fixtures::env_map(c.env.as_deref().unwrap());
         assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
         assert_eq!(
             c.resources

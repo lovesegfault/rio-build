@@ -1,15 +1,15 @@
 //! Shared plumbing for the Job-mode reconcilers (`builderpool::
-//! {static_sizing,manifest}` and `fetcherpool::jobs`). All follow the
+//! static_sizing` and `fetcherpool::jobs`). Both follow the
 //! same skeleton: list Jobs by label, filter active, diff against
 //! demand, spawn deficit, reap excess, patch status. The diff is
 //! different (per-bucket vs flat-ceiling); the plumbing around it is
 //! the same.
 //!
 //! Extracted (P0513) after the mc=60 consolidator pass found 4
-//! byte-identical-or-near segments (~50L) plus two cross-refs from
-//! `manifest.rs` reaching into a sibling for helpers that belong in
-//! neither. Moved from `builderpool/` to `common/` once the fetcher
-//! reconciler started importing through the sibling reconciler.
+//! byte-identical-or-near segments (~50L) reaching across siblings
+//! for helpers that belong in neither. Moved from `builderpool/` to
+//! `common/` once the fetcher reconciler started importing through
+//! the sibling reconciler.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -72,8 +72,8 @@ pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 /// LONG-drain case; ephemeral pods don't drain, they finish and die.)
 const EPHEMERAL_TGPS: i64 = 30;
 
-/// The shared one-shot Job literal for executor pods. All three
-/// Job-mode reconcilers (`builderpool::{static_sizing,manifest}`,
+/// The shared one-shot Job literal for executor pods. Both
+/// Job-mode reconcilers (`builderpool::static_sizing`,
 /// `fetcherpool::jobs`) route through this so the load-bearing
 /// invariants can't drift per call site:
 ///
@@ -95,11 +95,9 @@ const EPHEMERAL_TGPS: i64 = 30;
 ///   - [`EPHEMERAL_TGPS`] — fast SIGTERM exit (one-build-per-pod
 ///     means no drain to wait for).
 ///
-/// Before this helper existed, the manifest path had drifted: it
-/// was missing the karpenter annotation, the fast tgps, AND used
-/// `deadline_seconds.map()` (no backstop when unset) — manifest
-/// builders were exposed to mid-build eviction and unbounded
-/// runtime. Consolidating here fixes that structurally.
+/// Consolidated here so the Job-lifecycle invariants (karpenter
+/// annotation, fast tgps, deadline backstop) can't drift between
+/// callers — pre-P0513 they had.
 ///
 /// `pod_spec` arrives with role-specific content (volumes, env,
 /// resources) already filled by `build_executor_pod_spec`; this
@@ -196,8 +194,7 @@ pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 /// `failed > 0` (Failed under `backoff_limit=0`) is NOT supply — it
 /// won't heartbeat again. Counting only active Jobs prevents
 /// over-spawn (counting a Failed Job as supply would under-spawn;
-/// counting a Complete Job is moot — TTL reaps it in ephemeral mode,
-/// scale-down deletes it in manifest mode).
+/// counting a Complete Job is moot — TTL reaps it).
 pub(crate) fn is_active_job(j: &Job) -> bool {
     let s = j.status.as_ref();
     s.and_then(|st| st.succeeded).unwrap_or(0) == 0 && s.and_then(|st| st.failed).unwrap_or(0) == 0
@@ -307,9 +304,8 @@ pub(crate) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration
 /// `pool_name` from the class iteration.
 ///
 /// warn+continue on delete failure — same posture as the spawn loop
-/// (P0516) and `manifest.rs`'s sweep: one apiserver blip shouldn't
-/// skip the status patch. Next tick re-lists and retries (the Job is
-/// still Pending, still excess).
+/// (P0516): one apiserver blip shouldn't skip the status patch. Next
+/// tick re-lists and retries (the Job is still Pending, still excess).
 ///
 /// `queued = None` → scheduler unreachable; caller treated the poll
 /// error as `queued=0` for spawn (fail-open: don't spawn). Reap MUST
@@ -401,10 +397,9 @@ fn job_older_than(j: &Job, min_age: Duration) -> bool {
 /// `{job_name}-` (pod never registered / already disconnected), OR
 /// such an executor exists with `busy == false` (registered but
 /// idle past the builder's own 120s idle-exit — process can't act,
-/// I-165 D-state). The `{job_name}-` prefix match is the same
-/// pod-name convention as `manifest.rs::select_deletable_jobs`
-/// (`RIO_WORKER_ID=$(POD_NAME)` via downward API; Job pod is
-/// `{job_name}-{5char}`).
+/// I-165 D-state). The `{job_name}-` prefix match relies on
+/// `RIO_WORKER_ID=$(POD_NAME)` via downward API; Job pod is
+/// `{job_name}-{5char}`.
 ///
 /// A Job whose executor reports `busy == true` is excluded —
 /// the scheduler believes a build is in progress; deleting it would
@@ -559,9 +554,7 @@ pub(crate) fn job_reconcile_prologue<K>(wp: &K, ctx: &Ctx) -> Result<JobReconcil
 where
     K: Resource<DynamicType = ()>,
 {
-    let ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))?;
+    let ns = crate::reconcilers::require_namespace(wp)?;
     let name = wp.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
     let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
@@ -581,8 +574,7 @@ where
 }
 
 /// Outcome of a single `jobs_api.create` attempt. Caller decides
-/// what to do on `Failed` — manifest counts toward a consecutive-fail
-/// threshold (P0522); ephemeral just loops.
+/// what to do on `Failed` — both ephemeral reconcilers warn+continue.
 ///
 /// NOT a `Result`: `Failed` is not an error the caller propagates —
 /// it's a classified non-success the caller handles inline. A
@@ -607,9 +599,9 @@ pub(crate) enum SpawnOutcome {
     Failed(kube::Error),
 }
 
-/// Create a Job, classifying the outcome. Shared by manifest +
+/// Create a Job, classifying the outcome. Shared by both
 /// ephemeral spawn loops — both had the same match arm at `ea64f7f2`;
-/// manifest got warn+continue at P0516 (`33424b8a`), ephemeral
+/// warn+continue landed at P0516 (`33424b8a`); ephemeral
 /// didn't. Extracting here means both get it, and P0522's threshold
 /// lives in one place.
 ///
@@ -624,6 +616,61 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
         Err(e) if e.is_conflict() => SpawnOutcome::NameCollision,
         Err(e) => SpawnOutcome::Failed(e),
     }
+}
+
+/// Spawn `n` ephemeral Jobs, logging each outcome. Owns the
+/// `for _ in 0..n { build → try_spawn_job → match SpawnOutcome }`
+/// loop that both Job-mode reconcilers had open-coded ~28 lines
+/// each — sharing the [`SpawnOutcome`] semantics (P0526) without
+/// sharing the warn+continue log was the remaining drift surface.
+///
+/// Returns the count that reached `Spawned`. `NameCollision` and
+/// `Failed` are logged (debug/warn) and the loop CONTINUES — the
+/// P0516 invariant: a spawn error never short-circuits the reconcile
+/// tick, so the caller's status patch still runs. The structural
+/// guard at `builderpool/tests/static_sizing_tests.rs::
+/// ephemeral_spawn_fail_still_patches_status` asserts this body
+/// contains no `return Err`.
+///
+/// `pool`/`class` feed log fields only. For BuilderPool, `class` is
+/// `spec.size_class`; for FetcherPool, the per-class `pool_name`.
+pub(crate) async fn spawn_n(
+    jobs_api: &Api<Job>,
+    n: u32,
+    pool: &str,
+    class: &str,
+    mut build: impl FnMut() -> Result<Job>,
+) -> u32 {
+    let mut spawned = 0;
+    for _ in 0..n {
+        let job = match build() {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(pool, class, error = %e, "build_job failed; continuing tick");
+                continue;
+            }
+        };
+        let job_name = job.metadata.name.clone().unwrap_or_default();
+        match try_spawn_job(jobs_api, &job).await {
+            SpawnOutcome::Spawned => {
+                spawned += 1;
+                info!(pool, class, job = %job_name, "spawned ephemeral Job");
+            }
+            SpawnOutcome::NameCollision => {
+                debug!(pool, class, job = %job_name, "Job name collision; will retry");
+            }
+            SpawnOutcome::Failed(e) => {
+                // P0516: was `return Err(e.into())` in both callers.
+                // warn+continue so the caller's status patch runs
+                // regardless; next tick retries.
+                warn!(
+                    pool, class, job = %job_name, error = %e,
+                    "ephemeral Job spawn failed; continuing tick"
+                );
+            }
+        }
+    }
+    spawned
 }
 
 /// SSA-patch `.status.{replicas?,readyReplicas,desiredReplicas,

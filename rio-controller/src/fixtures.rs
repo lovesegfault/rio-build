@@ -95,6 +95,18 @@ pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
     }
 }
 
+/// Collect a slice of `EnvVar` into a `name → value` map for test
+/// asserts. Skips entries with `value: None` (e.g. `valueFrom`
+/// downward-API refs). Dedup of the per-test `c.env...filter_map`
+/// collectors that every env-var assertion open-coded.
+pub fn env_map(
+    env: &[k8s_openapi::api::core::v1::EnvVar],
+) -> std::collections::BTreeMap<&str, &str> {
+    env.iter()
+        .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+        .collect()
+}
+
 /// `controller_owner_ref` for a test CR. The fixture constructors
 /// above all set `metadata.uid` so this never returns `None`; the
 /// `expect` message names the fix if a future fixture forgets.

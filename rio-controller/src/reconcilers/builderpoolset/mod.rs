@@ -48,7 +48,15 @@ use tracing::{debug, info, warn};
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::error::{Error, Result};
-use crate::reconcilers::{Ctx, KubeErrorExt, finalized, standard_error_policy, timed};
+use crate::reconcilers::{
+    Ctx, KubeErrorExt, finalized, require_namespace, standard_error_policy, timed,
+};
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus};
+
+pub(crate) mod builders;
+use builders::{build_child_builderpool, child_name};
+
 /// Is this BuilderPool owned by a SPECIFIC BuilderPoolSet? Checks
 /// `ownerReferences` for a controller entry whose UID matches
 /// `wps.metadata.uid`. Used by the prune path, where we must not
@@ -69,11 +77,6 @@ pub(crate) fn is_wps_owned_by(pool: &BuilderPool, wps: &BuilderPoolSet) -> bool 
         .iter()
         .any(|or| or.kind == "BuilderPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
 }
-use rio_crds::builderpool::BuilderPool;
-use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus};
-
-pub(crate) mod builders;
-use builders::{build_child_builderpool, child_name};
 
 /// Kubebuilder-convention finalizer name: `{kind}.{group}/{suffix}`.
 /// `cleanup` describes what the finalizer gates (explicit child
@@ -111,9 +114,7 @@ pub async fn reconcile(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action
 /// Normal reconcile: for each size class, SSA-apply its child
 /// BuilderPool. Idempotent — SSA with the same body is a no-op.
 async fn apply(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = wps
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
+    let ns = require_namespace(&*wps)?;
     let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     for class in &wps.spec.classes {
@@ -370,9 +371,7 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// Fine — skip and continue to the next child.
 // r[impl ctrl.wps.cleanup-sweep]
 async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = wps
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
+    let ns = require_namespace(&*wps)?;
     let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     // List all BuilderPools in the namespace, filter by ownerRef

@@ -5,8 +5,8 @@
 //! Size-classed via `spec.classes[]` (CEL-enforced non-empty, I-170): one Job
 //! loop per class, each registering `RIO_SIZE_CLASS=name` so the
 //! scheduler can route by `size_class_floor`. Simpler than
-//! [`builderpool`](super::builderpool): no manifest mode, no
-//! duration-cutoff rebalancer.
+//! [`builderpool`](super::builderpool): no duration-cutoff
+//! rebalancer.
 // r[impl ctrl.fetcherpool.reconcile]
 
 use std::collections::BTreeMap;
@@ -66,7 +66,7 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: Arc<Ctx>) -> Result<Action> {
 /// `size(self.classes) > 0` so every reconcile is per-class.
 /// Security posture (read-only rootfs, seccomp, node placement) is
 /// identical across classes — only resources + size_class env vary.
-fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> Result<ExecutorPodParams> {
+fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodParams {
     // r[impl fetcher.node.dedicated]
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
     // the `rio.build/fetcher=true:NoSchedule` taint + matching
@@ -88,7 +88,7 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> Result<Executo
         }])
     });
 
-    Ok(ExecutorPodParams {
+    ExecutorPodParams {
         role: ExecutorKind::Fetcher,
         // r[impl fetcher.sandbox.strict-seccomp]
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
@@ -150,7 +150,7 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> Result<Executo
         // 10 minutes — fetches are short. The builder default of
         // 2h is for LLVM-scale builds.
         termination_grace_period_seconds: Some(600),
-    })
+    }
 }
 
 /// Requeue policy. Same curve as builderpool — exponential backoff
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn labels_include_fetcher_role() {
         let fp = mk(8);
-        let params = executor_params(&fp, cls(&fp)).unwrap();
+        let params = executor_params(&fp, cls(&fp));
         let labels = pod::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
         assert_eq!(labels.get("rio.build/pool"), Some(&"test-default".into()));
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn security_posture_is_strict() {
         let fp = mk(1);
-        let params = executor_params(&fp, cls(&fp)).unwrap();
+        let params = executor_params(&fp, cls(&fp));
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
         let sp = params.seccomp_profile.as_ref().unwrap();
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn node_placement_defaults_to_fetcher_pool() {
         let fp = mk(1);
-        let params = executor_params(&fp, cls(&fp)).unwrap();
+        let params = executor_params(&fp, cls(&fp));
         assert_eq!(
             params
                 .node_selector
@@ -227,7 +227,7 @@ mod tests {
     fn operator_placement_overrides_default() {
         let mut fp = mk(1);
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
-        let params = executor_params(&fp, cls(&fp)).unwrap();
+        let params = executor_params(&fp, cls(&fp));
         assert_eq!(
             params.node_selector.as_ref().unwrap().get("custom"),
             Some(&"yes".into())
@@ -259,14 +259,10 @@ mod tests {
             max_concurrent: Some(4),
         }
         .into();
-        let params = executor_params(&fp, &class).unwrap();
+        let params = executor_params(&fp, &class);
         // RIO_SIZE_CLASS injected via extra_env (appended after the
         // base env set in the Job pod spec).
-        let env: BTreeMap<_, _> = params
-            .extra_env
-            .iter()
-            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
-            .collect();
+        let env = crate::fixtures::env_map(&params.extra_env);
         assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
         // pool_name = `{fp.name}-{class.name}` so per-arch pools
         // don't collide (multiarch_pools_distinct_job_names below).
@@ -315,7 +311,7 @@ mod tests {
             .spec
             .classes
             .iter()
-            .map(|c| executor_params(&fp, c).unwrap().pool_name)
+            .map(|c| executor_params(&fp, c).pool_name)
             .collect();
         assert_eq!(names, vec!["test-tiny", "test-small"]);
     }
@@ -338,7 +334,7 @@ mod tests {
         let mut arm = mk(8);
         arm.metadata.name = Some("aarch64".into());
 
-        let n = |fp: &FetcherPool| executor_params(fp, &class).unwrap().pool_name;
+        let n = |fp: &FetcherPool| executor_params(fp, &class).pool_name;
         assert_eq!(n(&x86), "x86-64-tiny");
         assert_eq!(n(&arm), "aarch64-tiny");
         assert_ne!(n(&x86), n(&arm), "per-arch pools must not collide");

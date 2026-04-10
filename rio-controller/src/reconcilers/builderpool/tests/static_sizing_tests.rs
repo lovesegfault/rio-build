@@ -1,16 +1,13 @@
 //! Ephemeral reconciler spawn-error-handling tests.
 //!
-//! Sibling to `manifest_tests::spawn_loop_no_early_return_on_error`
-//! (P0516): ephemeral.rs had the exact same `Err(e) => return
-//! Err(e.into())` bail at :226 that P0516 removed from manifest.rs.
-//! Both were rewritten together over `common::job` at ea64f7f2;
-//! manifest got the fix, ephemeral didn't. T1 of P0526 extracted the
-//! common match into `common::job::try_spawn_job` + `SpawnOutcome` so
-//! both reconcilers share warn+continue.
+//! P0516/P0526: the spawn loop had `Err(e) => return Err(e.into())`
+//! at :226 — bailing skipped the status patch. T1 of P0526 extracted
+//! the common match into `common::job::try_spawn_job` + `SpawnOutcome`;
+//! the loop+log later folded into `common::job::spawn_n` so both
+//! reconcilers share warn+continue.
 //!
-//! The structural guard here proves the bail is gone from the spawn
-//! block — no early return between `---- Spawn decision ----` and
-//! `---- Status patch ----` means the status patch at :242 runs even
+//! The structural guard here proves the bail is gone: `spawn_n` body
+//! contains no `return Err`, so the caller's status patch runs even
 //! when every spawn fails.
 
 use k8s_openapi::api::batch::v1::{Job, JobStatus};
@@ -33,39 +30,38 @@ fn ephemeral_spawn_fail_still_patches_status() {
     // Mutation: re-introduce `return Err(e.into())` (or any `return
     // Err`) in the ephemeral Failed arm → this test FAILS.
     //
-    // Sibling of manifest_tests::spawn_loop_no_early_return_on_error
-    // (P0516). Same brittleness-is-the-point: anyone reintroducing a
-    // bail in this block trips this and must consciously decide the
-    // status patch can be skipped.
-    let src = include_str!("../static_sizing.rs");
-    let spawn_start = src
-        .find("---- Spawn decision ----")
-        .expect("spawn section marker present");
-    let spawn_end = src[spawn_start..]
-        .find("---- Status patch ----")
-        .map(|i| i + spawn_start)
-        .expect("status-patch section follows spawn");
-    // Filter comment lines: the Failed arm's doc says "Was `return
+    // Same brittleness-is-the-point: anyone reintroducing a
+    // bail in spawn_n trips this and must consciously decide the
+    // caller's status patch can be skipped.
+    let src = include_str!("../../common/job.rs");
+    let fn_start = src
+        .find("pub(crate) async fn spawn_n(")
+        .expect("spawn_n present in common/job.rs");
+    let fn_end = src[fn_start..]
+        .find("\n}\n")
+        .map(|i| i + fn_start)
+        .expect("spawn_n body terminates");
+    // Filter comment lines: the Failed arm's doc says "was `return
     // Err(e.into())`" to explain the history — we want CODE matches
     // only. treefmt/rustfmt normalizes comment indent, so `trim_start
     // → starts_with("//")` is stable.
-    let spawn_code: String = src[spawn_start..spawn_end]
+    let body: String = src[fn_start..fn_end]
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
 
     assert!(
-        !spawn_code.contains("return Err"),
-        "spawn block must warn+continue on create error, not bail — \
-         bailing skips patch_job_pool_status at :242. Pre-fix line \
-         was `return Err(e.into())` at :226."
+        !body.contains("return Err"),
+        "spawn_n must warn+continue on create error, not bail — \
+         bailing skips the caller's patch_job_pool_status. Pre-fix \
+         line was `return Err(e.into())`."
     );
     // Positive: the warn message is there (proves the Failed arm
     // exists and does something observable).
     assert!(
-        spawn_code.contains("ephemeral Job spawn failed; continuing tick"),
-        "spawn block should warn on create error with a grep-able \
+        body.contains("ephemeral Job spawn failed; continuing tick"),
+        "spawn_n should warn on create error with a grep-able \
          message (SpawnOutcome::Failed arm)"
     );
 }
@@ -75,8 +71,8 @@ fn ephemeral_spawn_fail_still_patches_status() {
 /// (vs `Result`) is that `Failed` forces inline handling — a `?`
 /// at a call site is a type error.
 ///
-/// 403 Forbidden stands in for "quota exceeded" — the scenario P0516
-/// originally fixed on the manifest side. ResourceQuota on
+/// 403 Forbidden stands in for "quota exceeded" — the P0516 scenario.
+/// ResourceQuota on
 /// `count/jobs.batch` exhausted → spawn returns 403 → pre-fix bail
 /// skipped everything downstream.
 ///

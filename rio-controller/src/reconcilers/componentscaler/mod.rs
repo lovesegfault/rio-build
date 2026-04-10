@@ -63,9 +63,7 @@ pub async fn reconcile(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action
 }
 
 async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = cs
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("ComponentScaler has no namespace".into()))?;
+    let ns = crate::reconcilers::require_namespace(&*cs)?;
     let spec = &cs.spec;
     let status = cs.status.clone().unwrap_or_default();
 
