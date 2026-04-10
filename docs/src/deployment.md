@@ -81,11 +81,11 @@ See [Configuration Reference](./configuration.md) for all parameters. The minimu
 |-----------|----------------|
 | Gateway | `host_key`, `authorized_keys`, `scheduler_addr`, `store_addr` |
 | Scheduler | `database_url` |
-| Store | `database_url`, `chunk_backend` (tagged enum: `inline` / `filesystem` / `s3`), `signing_key_path` |
+| Store | `database_url`, `chunk_backend` (tagged enum: `filesystem` / `s3`), `signing_key_path` |
 | Controller | `scheduler_addr` |
 | Builder | `scheduler_addr`, `store_addr` |
 
-> **Store chunk backend config** uses a serde internally-tagged enum (`kind`). TOML example for S3: `[chunk_backend]` / `kind = "s3"` / `bucket = "..."` / `prefix = "..."`. Default is `inline` (NARs stored in PostgreSQL --- fine for dev, does not scale). There is no flat `s3_bucket` field.
+> **Store chunk backend config** uses a serde internally-tagged enum (`kind`). TOML example for S3: `[chunk_backend]` / `kind = "s3"` / `bucket = "..."` / `prefix = "..."`. Required (no default); use `kind = "filesystem"` for local dev. There is no flat `s3_bucket` field.
 
 ## Secrets
 

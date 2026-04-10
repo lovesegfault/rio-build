@@ -33,7 +33,6 @@
 | **NLB** | Network Load Balancer. An AWS L4 load balancer used for the gateway's SSH ingress. Configured with extended idle timeout (3600s) to support long-running build sessions. |
 | **HPA** | Horizontal Pod Autoscaler. A Kubernetes built-in autoscaling mechanism. rio-build does NOT use HPA for builders --- builder pods are one-shot Jobs spawned/reaped by rio-controller based on scheduler queue depth. |
 | **Write-ahead manifest** | rio-store's pattern for durable writes: chunk references are written to a pending manifest before uploading chunks, then promoted to committed after all chunks are verified. Protects against orphaned chunks and broken manifests. |
-| **Inline storage** | A fast-path in rio-store for NARs below 256 KiB (`INLINE_THRESHOLD`, compile-time const) that bypasses FastCDC chunking. Stored directly in the PostgreSQL `manifests.inline_blob` BYTEA column --- inline blobs **never touch S3**. |
 | **Build (request)** | A full build request (DAG of derivations) submitted via `SubmitBuild`. Contains one or more derivations. Tracked by `build_id`. |
 | **Build (derivation)** | Execution of a single derivation on an executor. Multiple derivation builds comprise a build request. Tracked by `derivation_hash`. |
 | **Blob** | An opaque binary object. In rio-store: chunks (FastCDC pieces keyed by BLAKE3) live in S3; inline NARs (< 256 KiB) live in a PostgreSQL BYTEA column, not S3. |

@@ -40,8 +40,7 @@
 │  Streaming builder  │  │  ┌─────────────────────────────────┐       │
 │  assignment        │  │  │ Blobs (S3-compatible)            │       │
 │  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)     │       │
-│                    │  │  │ Inline blobs for NARs < 256 KiB  │       │
-└────────┬───────────┘  │                                             │
+└────────┬───────────┘  │  └─────────────────────────────────┘       │
          │ gRPC         └──────────────┬──────────────────────────────┘
          │  (builders stream            │ gRPC
          │   work via BuildExecution)  │

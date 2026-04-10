@@ -359,8 +359,7 @@ src/
 ├── manifest.rs        # Chunk-list serialize/deserialize
 ├── metadata/          # narinfo + manifests PG tables
 │   ├── mod.rs         # MetadataStore struct + transaction helpers
-│   ├── inline.rs      # Small-NAR inline storage (no chunk manifest)
-│   ├── chunked.rs     # Large-NAR chunked storage (manifest-backed)
+│   ├── chunked.rs     # Manifest + refcount UPSERT (all NARs chunked)
 │   ├── queries.rs     # Shared SELECT/UPDATE helpers + narinfo_cols! macro
 │   ├── tenant_keys.rs # Per-tenant signing-key rows (load + rotate)
 │   ├── cluster_key_history.rs # Prior cluster signing keys (unretired pubkeys for sig_visibility_gate)

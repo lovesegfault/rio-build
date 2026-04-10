@@ -1,6 +1,6 @@
 # Configuration Reference
 
-rio-build uses TOML configuration files with environment variable overrides. Each component reads its own config file. Environment variables use the `RIO_` prefix with `__` for nesting (e.g., `RIO_STORE__INLINE_THRESHOLD=262144`).
+rio-build uses TOML configuration files with environment variable overrides. Each component reads its own config file. Environment variables use the `RIO_` prefix with `__` for nesting (e.g., `RIO_STORE__CHUNK_CACHE_CAPACITY_BYTES=2147483648`).
 
 Precedence (highest to lowest): CLI flags > environment variables > config file > compiled defaults.
 
@@ -38,7 +38,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `listen_addr` | string | `[::]:9002` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
 | `metrics_addr` | socket addr | `[::]:9092` | Prometheus metrics listen address |
-| `chunk_backend` | tagged enum | `{ kind = "inline" }` | Where chunks live. See `ChunkBackendKind` below. |
+| `chunk_backend` | tagged enum | (required) | Where chunks live. See `ChunkBackendKind` below. |
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token verification on PutPath. Env: `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification (dev mode). |
@@ -50,10 +50,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 `chunk_backend` TOML syntax (tagged enum):
 
 ```toml
-# Default — all NARs inline in PG, no chunk backend
-chunk_backend = { kind = "inline" }
-
-# Local filesystem (256-subdir fanout by hash prefix)
+# Local filesystem (256-subdir fanout by hash prefix) — dev/CI
 chunk_backend = { kind = "filesystem", base_dir = "/var/rio/chunks" }
 
 # S3 (credentials from aws-sdk default chain — env vars, IRSA, instance profile)
@@ -70,7 +67,7 @@ compression = "zstd"
 write_mode = "sync-after-commit"
 ```
 
-> **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
+> **Compile-time constants (not configurable):** `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
 
 > **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 15min). See [store: GC](./components/store.md#two-phase-garbage-collection).
 

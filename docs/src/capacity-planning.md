@@ -24,7 +24,6 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 |--------|----------|-------|
 | nixpkgs full closure (uncompressed NARs) | ~200 GB | All packages for one system |
 | With FastCDC dedup | ~100-140 GB | 30-50% chunk dedup savings |
-| Inline paths (< 256 KB) | ~60% by count, ~5% by size | Stored as single blobs, no chunking overhead |
 | Average chunk size | 64 KB | FastCDC target (min 16 KB, max 256 KB) |
 | Incremental rebuild delta | ~5-20 GB | Depends on what changed since last build |
 
