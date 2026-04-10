@@ -456,7 +456,7 @@ impl DagActor {
             };
         }
 
-        let mut cached_count = self.apply_cached_hits(ingest, &node_index).await;
+        let (mut cached_count, deferred_hits) = self.apply_cached_hits(ingest, &node_index).await;
         phase!("6a-cached-hits-loop");
 
         // Compute critical-path priorities for newly-inserted nodes.
@@ -488,7 +488,7 @@ impl DagActor {
         // dependents will correctly be computed as Ready here.
         let remaining_new: HashSet<DrvHash> = newly_inserted
             .iter()
-            .filter(|h| !cached_hits.contains_key(h.as_str()))
+            .filter(|h| !cached_hits.contains_key(h.as_str()) || deferred_hits.contains(*h))
             .cloned()
             .collect();
         let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
@@ -535,7 +535,9 @@ impl DagActor {
     /// to `Completed`, set `output_paths`, clear retry state for
     /// previously-failed re-probes, batch-persist `Completed`, advance
     /// pre-existing Queued dependents of re-probe hits, and emit
-    /// `DerivationCached` events. Returns the cached-hit count.
+    /// `DerivationCached` events. Returns `(cached_count, deferred_hits)`
+    /// — deferred_hits are cache-hits whose inputDrvs are incomplete
+    /// (closure invariant), so the caller seeds them as Queued instead.
     ///
     /// All I/O here is best-effort log-and-continue (build is Active).
     /// Kept as a `&mut self` method (not a free decision fn) because
@@ -546,7 +548,7 @@ impl DagActor {
         &mut self,
         ingest: &MergeIngest,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
-    ) -> u32 {
+    ) -> (u32, HashSet<DrvHash>) {
         let MergeIngest {
             build_id,
             existing_reprobe,
@@ -705,10 +707,9 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
-        cached_count
+        (cached_count, deferred_hits)
     }
 
-<<<<<<< HEAD
     /// Step-6f body: walk pre-existing nodes (not newly-inserted, not
     /// stale-reset, not already counted as a cache-hit) and classify.
     /// `Completed`/`Skipped` → bump cached count + path-tenants upsert;
@@ -734,131 +735,6 @@ impl DagActor {
         let newly_inserted = &merge_result.newly_inserted;
         let mut cached = 0u32;
         let mut first_failed: Option<DrvHash> = None;
-||||||| parent of a2f48a56 (fix(rio-scheduler): cache-hit Completed gates on inputDrv Completion (closure race -> builder ENOENT))
-        // Compute critical-path priorities for newly-inserted nodes.
-        // Done AFTER cache-hit transitions so completed derivations
-        // are correctly excluded from their parents' max-child (a
-        // cached dep doesn't block anything — it's done).
-        //
-        // This sets est_duration (from estimator) + priority (bottom-up)
-        // for new nodes, and propagates to existing nodes if the new
-        // subgraph raises their priority. The ready queue reads these
-        // for BinaryHeap ordering.
-        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
-        phase!("6b-critical-path");
-
-        // I-047: pre-existing Completed nodes may have stale output_paths
-        // (GC deleted the output between the node's original completion and
-        // this merge). Verify outputs exist BEFORE compute_initial_states —
-        // otherwise newly-inserted dependents would be unlocked against a
-        // dep whose output is gone, and the worker fails on isValidPath.
-        // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify]
-        let stale_reset = self
-            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
-            .await;
-        phase!("6c-verify-preexisting");
-
-        // Compute initial states for the remaining (non-cached) newly-inserted
-        // derivations. Cached derivations above are now Completed, so their
-        // dependents will correctly be computed as Ready here.
-        let remaining_new: HashSet<DrvHash> = newly_inserted
-            .iter()
-            .filter(|h| !cached_hits.contains_key(h.as_str()))
-            .cloned()
-            .collect();
-        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
-        phase!("6d-seed-initial-states");
-
-        // Pre-existing Ready nodes whose interest set grew: their
-        // critical-path priority may have risen (compute_initial above
-        // re-walked over newly_inserted, but a pre-existing Ready node
-        // already in the queue under its OLD priority isn't touched by
-        // that walk). Re-push so a higher-priority build's shared dep
-        // doesn't sit behind lower-priority work. ReadyQueue::push on
-        // an already-present hash with a lower priority is a no-op
-        // (higher entry pops first; dup is skipped), so this is safe
-        // for the non-raised case.
-        for hash in &merge_result.interest_added {
-            if self
-                .dag
-                .node(hash)
-                .is_some_and(|s| s.status() == DerivationStatus::Ready)
-            {
-                self.push_ready(hash.clone());
-            }
-        }
-
-        // Also handle nodes that already existed. A pre-existing Completed
-        // node counts as cached; a pre-existing Poisoned/DependencyFailed
-        // node must set first_dep_failed so handle_derivation_failure
-        // fires below. Without the failure arm, a single-node resubmit of
-        // a still-poisoned derivation (within TTL, no ClearPoison yet)
-        // leaves the build Active with completed=0, failed=0, total=1 —
-        // check_build_completion never fires.
-=======
-        // Compute critical-path priorities for newly-inserted nodes.
-        // Done AFTER cache-hit transitions so completed derivations
-        // are correctly excluded from their parents' max-child (a
-        // cached dep doesn't block anything — it's done).
-        //
-        // This sets est_duration (from estimator) + priority (bottom-up)
-        // for new nodes, and propagates to existing nodes if the new
-        // subgraph raises their priority. The ready queue reads these
-        // for BinaryHeap ordering.
-        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
-        phase!("6b-critical-path");
-
-        // I-047: pre-existing Completed nodes may have stale output_paths
-        // (GC deleted the output between the node's original completion and
-        // this merge). Verify outputs exist BEFORE compute_initial_states —
-        // otherwise newly-inserted dependents would be unlocked against a
-        // dep whose output is gone, and the worker fails on isValidPath.
-        // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify]
-        let stale_reset = self
-            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
-            .await;
-        phase!("6c-verify-preexisting");
-
-        // Compute initial states for the remaining (non-cached) newly-inserted
-        // derivations. Cached derivations above are now Completed, so their
-        // dependents will correctly be computed as Ready here.
-        let remaining_new: HashSet<DrvHash> = newly_inserted
-            .iter()
-            .filter(|h| !cached_hits.contains_key(h.as_str()) || deferred_hits.contains(*h))
-            .cloned()
-            .collect();
-        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
-        phase!("6d-seed-initial-states");
-
-        // Pre-existing Ready nodes whose interest set grew: their
-        // critical-path priority may have risen (compute_initial above
-        // re-walked over newly_inserted, but a pre-existing Ready node
-        // already in the queue under its OLD priority isn't touched by
-        // that walk). Re-push so a higher-priority build's shared dep
-        // doesn't sit behind lower-priority work. ReadyQueue::push on
-        // an already-present hash with a lower priority is a no-op
-        // (higher entry pops first; dup is skipped), so this is safe
-        // for the non-raised case.
-        for hash in &merge_result.interest_added {
-            if self
-                .dag
-                .node(hash)
-                .is_some_and(|s| s.status() == DerivationStatus::Ready)
-            {
-                self.push_ready(hash.clone());
-            }
-        }
-
-        // Also handle nodes that already existed. A pre-existing Completed
-        // node counts as cached; a pre-existing Poisoned/DependencyFailed
-        // node must set first_dep_failed so handle_derivation_failure
-        // fires below. Without the failure arm, a single-node resubmit of
-        // a still-poisoned derivation (within TTL, no ClearPoison yet)
-        // leaves the build Active with completed=0, failed=0, total=1 —
-        // check_build_completion never fires.
->>>>>>> a2f48a56 (fix(rio-scheduler): cache-hit Completed gates on inputDrv Completion (closure race -> builder ENOENT))
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;

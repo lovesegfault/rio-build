@@ -16,7 +16,7 @@
 # prelude + the selected fragments + coverage epilogue into a testScript.
 # Key adaptation: scheduler pods are minimal images (no shell, no curl).
 # Metric scrapes go through apiserver pods/proxy (`kubectl get --raw`);
-# grpcurl (needs TCP for mTLS) through `kubectl port-forward`.
+# grpcurl (needs raw TCP) through `kubectl port-forward`.
 # Scheduler has 2 replicas (podAntiAffinity spreads them
 # across server+agent), so killing the leader means the STANDBY takes
 # over — a strictly stronger recovery test than phase3b's single-instance
@@ -400,13 +400,9 @@ let
         print(f"{name}: CEL rejected with {expected_msg!r} ✓")
 
     # grpcurl against the scheduler's gRPC port (9001) and store (9002).
-    # mTLS (tls.enabled=true in vmtest-full.yaml) → present the
-    # controller client cert from the fixture's PKI. port-forward is a
-    # raw TCP tunnel through the apiserver — grpcurl does the TLS
-    # handshake end-to-end with the pod. SNI=localhost (from grpcurl's
-    # :authority derivation on -addr localhost); the server cert has
-    # localhost in its SANs. `-max-time` bounds the RPC itself;
-    # port-forward is killed by trap even if grpcurl hangs.
+    # Plaintext gRPC (Cilium WireGuard handles encryption); port-forward
+    # is a raw TCP tunnel through the apiserver. `-max-time` bounds the
+    # RPC itself; port-forward is killed by trap even if grpcurl hangs.
     def sched_grpc(payload, method):
         """TriggerGC etc. on the scheduler leader. Returns stdout+stderr."""
         return pf_exec(leader_pod(), 9001,

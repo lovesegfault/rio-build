@@ -1,7 +1,8 @@
-# Security scenario: mTLS + HMAC + tenant resolution + gateway validation.
+# Security scenario: HMAC + tenant resolution + gateway validation.
 #
-# Ports phase3b sections T (mTLS) + B (HMAC) + G (gateway-validate), plus
-# phase4 section A (tenant resolution), onto the standalone fixture.
+# Ports phase3b section B (HMAC) + G (gateway-validate), plus phase4
+# section A (tenant resolution), onto the standalone fixture. Transport
+# encryption is Cilium WireGuard (no app-level mTLS).
 #
 # gw.jwt.dual-mode — verify marker at default.nix:vm-security-standalone
 # jwt-dual-mode subtest: proves both branches of the PERMANENT
@@ -13,8 +14,8 @@
 # gateway+scheduler+PG end-to-end.
 #
 # sec.boundary.grpc-hmac — verify marker at default.nix:vm-security-standalone
-# mTLS-reject/-accept + HMAC-verifier prove both halves of the trust
-# boundary: TLS terminates at the gRPC port, HMAC gates PutPath.
+# HMAC-verifier proves the trust boundary: service-HMAC gates the
+# gateway PutPath bypass; assignment-HMAC gates worker PutPath.
 #
 # gw.reject.nochroot — verify marker at default.nix:vm-security-standalone
 # gateway-validate subtest: nix-build a .drv with __noChroot=true via
@@ -41,18 +42,17 @@
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
 #     workers = { worker = { }; };
-#     withPki = true;
 #     extraPackages = [ pkgs.grpcurl pkgs.grpc-health-probe pkgs.postgresql ];
 #   };
 #
 # (hmac.key, service-hmac.key).
-# The fixture wires RIO_TLS__* + RIO_HMAC_KEY_PATH via extraServiceEnv;
-# gateway gets CN=rio-gateway cert (store PutPath HMAC bypass).
+# The fixture wires RIO_HMAC_KEY_PATH + RIO_SERVICE_HMAC_KEY_PATH via
+# extraServiceEnv; gateway PutPath bypass is via x-rio-service-token.
 #
 # ── privileged-hardening-e2e (k3s fixture, vm-security-nonpriv-k3s) ────
 # Separate scenario function: proves MECHANISM of the privileged:false +
 # base_runtime_spec /dev/fuse + hostUsers:false production path. The
-# standalone scenario above proves auth/mTLS/tenant boundaries; this one
+# standalone scenario above proves auth/HMAC/tenant boundaries; this one
 # proves the worker pod security posture is actually FUNCTIONAL (not just
 # rendered correctly by the controller). Uses k3sFull fixture with the
 # vmtest-full-nonpriv.yaml overlay.

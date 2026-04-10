@@ -41,7 +41,7 @@ spec:
               containerPort: 9194
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "tls")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
             - name: RIO_SCHEDULER__ADDR
               value: {{ $c.schedulerAddr | quote }}
             - name: RIO_STORE__ADDR

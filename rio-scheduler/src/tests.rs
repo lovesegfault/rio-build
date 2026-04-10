@@ -33,7 +33,6 @@ fn config_defaults_are_stable() {
         "http://rio-dashboard.rio-system.svc.cluster.local"
     );
     // Phase3b: TLS off by default (dev mode, VM tests).
-    assert!(!d.common.tls.is_configured());
     // JWT verification off by default (interceptor inert until
     // ConfigMap mount configured via RIO_JWT__KEY_PATH).
     assert!(d.jwt.key_path.is_none());

@@ -65,7 +65,6 @@ pkgs.testers.runNixOSTest {
       withSeed = true;
     }}
 
-    import time
     ${common.mkBuildHelperV2 {
       gatewayHost = "k3s-server";
       dumpLogsExpr = ''print("(netpol: build failed; pod logs follow)")'';
@@ -153,7 +152,7 @@ pkgs.testers.runNixOSTest {
     #
     # Raw ClusterIP (no DNS — see nsenter note above). nc -z -w5: pure
     # TCP connect, 5s timeout, exit 0 iff SYN-ACK received. The 9001
-    # port is mTLS gRPC — nc doesn't care, it just wants the handshake.
+    # port is plaintext gRPC — nc doesn't care, it just wants the handshake.
     with subtest("netpol-positive: allowed egress (scheduler:9001) connects"):
         sched_ip = kubectl(
             "get svc rio-scheduler -o jsonpath='{.spec.clusterIP}'"

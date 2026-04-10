@@ -63,7 +63,7 @@ scope: with scope; ''
 
       # CancelBuild via gRPC — the replacement for "delete Build CR →
       # finalizer → CancelBuild". sched_grpc handles port-forward +
-      # mTLS + protoset. Unary RPC, returns CancelBuildResponse.
+      # protoset. Unary RPC, returns CancelBuildResponse.
       cancel_resp = sched_grpc(
           json.dumps({"buildId": build_id, "reason": "vm-test-cancel"}),
           "rio.scheduler.SchedulerService/CancelBuild",

@@ -640,9 +640,6 @@ fn disruption_filter_false_or_absent_returns_none() {
 }
 
 #[test]
-fn job_pod_tls_secret_mounted_when_set() {
-
-#[test]
 fn job_pod_termination_grace() {
     let wp = test_wp();
     let pod = test_pod_spec(&wp);

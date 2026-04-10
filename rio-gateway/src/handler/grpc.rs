@@ -16,7 +16,7 @@ use rio_proto::{StoreServiceClient, types};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tonic::transport::Channel;
 
-use super::{GatewayError, jwt_metadata, with_jwt};
+use super::{GatewayError, attach_service_token, jwt_metadata, with_jwt};
 
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(crate) async fn grpc_query_path_info(

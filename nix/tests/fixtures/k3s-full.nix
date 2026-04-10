@@ -192,14 +192,6 @@ let
     namespace = ns;
   };
 
-  # ── mTLS PKI (replaces cert-manager) ─────────────────────────────────
-  # openssl-generated root CA + per-component leaf certs with k8s
-  # Service-name SANs. Rendered into k8s Secrets so tls.enabled=true
-  # works without cert-manager (which isn't in the airgap set —
-  # phase4c). Makes the fixture representative of production: mTLS
-  # on all gRPC links, plaintext health ports (9101/9102/9194).
-  #
-
   # ── Airgap image set ────────────────────────────────────────────────
   # Same list on BOTH nodes — pods land on either via scheduler whims
   # (especially scheduler.replicas=2 antiAffinity). fod-proxy/bootstrap
@@ -633,9 +625,6 @@ rec {
     nsFetchers
     helmRendered
     ;
-  # For grpcurl client cert args (scenarios/lifecycle.nix sched_grpc
-  # etc). The controller cert works as a generic mTLS client — rio
-  # doesn't check CN, only that the cert chains to the shared CA.
 
   nodes = {
     k3s-server = serverNode;

@@ -2,7 +2,7 @@
 # nodes, cilium-dbg confirms encryption mode.
 #
 # Asserts the data-plane property the rest of the security model leans
-# on once app-level mTLS is removed (Phase 5): pod-to-pod traffic is
+# on (rio components speak plaintext gRPC): pod-to-pod traffic is
 # kernel-encrypted between nodes. The fixture's waitReady has already
 # gated on `rollout status ds/cilium` + `get ciliumnode k3s-agent`, so
 # by the time this runs the mesh is established — these are pure

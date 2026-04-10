@@ -1,7 +1,7 @@
 # lifecycle subtest fragment — composed by scenarios/lifecycle.nix mkTest.
 scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
-  # health-shared — standby NOT_SERVING, leader SERVING on plaintext port
+  # health-shared — standby NOT_SERVING, leader SERVING on gRPC port
   # ══════════════════════════════════════════════════════════════════
   # Ports phase3b section T (phase3b.nix:342-360 + 506-520) onto the
   # k3s-full fixture. In phase3b the standby window was ARTIFICIAL
@@ -9,11 +9,13 @@ scope: with scope; ''
   # the standby is REAL: scheduler.replicas=2, one pod holds the Lease,
   # the other is a live standby.
   #
-  # Proves: the plaintext health port (9101) shares its HealthReporter
-  # with the mTLS port via health_service.clone(). Standby's
-  # set_not_serving on the NAMED service is visible on BOTH ports — if
-  # the reporter weren't shared, the plaintext port would default to
-  # SERVING regardless of lease state.
+  # Proves: the lease-gated set_not_serving on the NAMED service is
+  # observable on the main gRPC port (9001). Pre-Cilium this probed a
+  # separate plaintext health port 9101 (mTLS on 9001 rejected probes
+  # without a client cert). With WireGuard transport encryption (D2)
+  # 9001 is plaintext, the dedicated health port is gone, and the
+  # single tonic-health server is what both k8s probes and the
+  # client-side balancer hit.
   #
   # MUST run BEFORE recovery: recovery deletes the leader pod, which
   # disrupts the stable 2-replica state (the former standby becomes
@@ -45,15 +47,15 @@ scope: with scope; ''
       # it doesn't probe gRPC health). This probe with `-service ...`
       # AND the NOT_SERVING result together prove the named-service
       # gate.
-      pf_open(standby, 19101, 9101, tag="pf-health")
+      pf_open(standby, 19101, 9001, tag="pf-health")
       try:
           out = k3s_server.fail(
               "grpc-health-probe -addr localhost:19101 "
               "-service rio.scheduler.SchedulerService 2>&1"
           )
           assert "NOT_SERVING" in out, (
-              f"standby plaintext health should report NOT_SERVING "
-              f"(shared HealthReporter, lease-gated), got: {out!r}"
+              f"standby gRPC health should report NOT_SERVING "
+              f"(lease-gated named service), got: {out!r}"
           )
       finally:
           pf_close(tag="pf-health")
@@ -66,7 +68,7 @@ scope: with scope; ''
       # ~60s, and port-forward without SO_REUSEADDR can't rebind —
       # it dies silently (stderr→/dev/null), probe gets conn-refused
       # → exit 2. sleep 2 doesn't help; TIME_WAIT outlasts it.
-      pf_open(leader, 19102, 9101, tag="pf-health")
+      pf_open(leader, 19102, 9001, tag="pf-health")
       try:
           k3s_server.succeed(
               "grpc-health-probe -addr localhost:19102 "
@@ -75,5 +77,5 @@ scope: with scope; ''
       finally:
           pf_close(tag="pf-health")
       print("health-shared PASS: standby NOT_SERVING, leader SERVING "
-            "(plaintext port shares reporter with mTLS port)")
+            "(lease-gated named service on main gRPC port)")
 ''

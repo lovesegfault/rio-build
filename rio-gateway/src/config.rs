@@ -258,8 +258,6 @@ mod tests {
         max_connections = 555
         max_transitive_inputs = 250000
 
-        [tls]
-        cert_path = "/etc/tls/cert.pem"
 
         [jwt]
         required = true
@@ -272,11 +270,6 @@ mod tests {
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
             assert_eq!(cfg.max_transitive_inputs, 250_000);
-            assert_eq!(
-                cfg.common.tls.cert_path.as_deref(),
-                Some(std::path::Path::new("/etc/tls/cert.pem")),
-                "[tls] table must thread through figment into TlsConfig"
-            );
             assert!(
                 cfg.jwt.required,
                 "[jwt] table must thread through figment into JwtConfig"
@@ -298,7 +291,6 @@ mod tests {
 
     rio_test_support::jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
         assert_eq!(cfg.session_drain, std::time::Duration::from_secs(60));
-        assert!(!cfg.common.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());
         assert!(cfg.scheduler.balance_host.is_none());

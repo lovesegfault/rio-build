@@ -106,7 +106,7 @@ pub(super) struct Config {
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
 /// natively on its main port (D3) so the ingress is a plain HTTP
 /// router — CORS therefore lives here, not in a proxy CRD.
-// r[impl dash.envoy.grpc-web-translate+2]
+// r[impl dash.envoy.grpc-web-translate+3]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct DashboardConfig {

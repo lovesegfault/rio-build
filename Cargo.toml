@@ -227,13 +227,6 @@ base64 = "0.22"
 # via Mac::verify_slice — never compare raw tag bytes with ==.
 hmac = "0.13"
 
-# Test-only cert generation for mTLS integration tests. Not a prod dep
-# — real deployments use cert-manager. rcgen's in-memory API lets
-# tests build a CA + client/server certs without touching disk.
-rcgen = "0.14"
-# Parse TLS client certs for CN-based HMAC bypass (rio-store PutPath).
-# Already a transitive dep (via rustls pki chain); direct for API.
-
 # Encoding
 hex = "0.4"
 

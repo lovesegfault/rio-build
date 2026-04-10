@@ -183,6 +183,9 @@ spec:
                     items:
                       type: string
                     type: array
+                  tolerations:
+                    description: 'Tolerations for the Job pod spec. Typed `Toleration`
+                      (not
 
                       `serde_json::Value`); `any_object_array` passthrough because
 

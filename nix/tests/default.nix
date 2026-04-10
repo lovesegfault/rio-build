@@ -41,7 +41,7 @@ let
   scheduling = import ./scenarios/scheduling.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
-  # systemd fixture (mTLS/HMAC/tenant/validation); e2e uses k3sFull
+  # systemd fixture (HMAC/tenant/validation); e2e uses k3sFull
   # with the nonpriv values overlay (base_runtime_spec /dev/fuse +
   # cgroup remount).
   security = import ./scenarios/security.nix { inherit pkgs common; };
@@ -115,7 +115,7 @@ let
       '';
     };
     # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
-    # (no withHmac → no mTLS). ssh-ng:// doesn't surface build_id to the
+    # (no withHmac). ssh-ng:// doesn't surface build_id to the
     # client, and client-disconnect mid-wopBuildDerivation doesn't fire
     # session.rs's EOF-cancel path (handler/build.rs:462 removes the
     # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
@@ -402,7 +402,7 @@ in
         worker = {
         };
       };
-      withPki = true;
+      withHmac = true;
       extraPackages = [
         pkgs.grpcurl
         pkgs.grpc-health-probe
@@ -688,7 +688,7 @@ in
 
   # Cilium WireGuard transparent encryption: cilium_wg0 peers + encrypt
   # status on both nodes. Data-plane property the security model leans
-  # on once app-level mTLS is removed. Also asserts the GUA-v6 NodePort
+  # on (rio components speak plaintext gRPC). Also asserts the GUA-v6 NodePort
   # frontend exists (regression guard for the EKS NLB RST bug — auto-
   # detect skips global-unicast; in-cluster tests are socket-LB false
   # positives).

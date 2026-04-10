@@ -121,10 +121,6 @@ in
 # with standalone (callsite: `toxiproxy { }`). Not `{ }:` — statix
 # W10 flags empty destructuring patterns.
 _: {
-  # PKI not wired here — chaos scenarios test transport-layer faults,
-  # not authz. null matches standalone's `withPki = false` shape.
-  pki = null;
-
   gatewayHost = "control";
   toxiproxyHost = "control";
 

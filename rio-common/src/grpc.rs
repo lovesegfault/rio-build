@@ -71,7 +71,7 @@ pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 /// Service-identity HMAC token. Minted by trusted control-plane callers
 /// (gateway) on `PutPath`; the store verifies it as the HMAC-bypass
 /// condition. Transport-agnostic replacement for the mTLS CN-allowlist.
-/// See [`crate::hmac::ServiceClaims`].
+/// See `rio_auth::hmac::ServiceClaims`.
 pub const SERVICE_TOKEN_HEADER: &str = "x-rio-service-token";
 
 /// gRPC metadata key the gateway sets on every outbound call in JWT mode.

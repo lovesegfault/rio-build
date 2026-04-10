@@ -91,6 +91,8 @@ let
       p.hashicorp_time
       p.hashicorp_cloudinit # transitive: terraform-aws-modules/eks
       p.hashicorp_null # transitive: terraform-aws-modules/eks
+      p.hashicorp_http # addons.tf: fetch Gateway API CRD yaml
+      p.gavinbunney_kubectl # addons.tf: apply Gateway API CRDs (kubernetes_manifest can't — plan-time API validation)
     ]))
     kubectl
     skopeo # cargo xtask k8s push -p eks — docker-archive → ECR

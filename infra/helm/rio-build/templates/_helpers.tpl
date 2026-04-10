@@ -47,18 +47,16 @@ defines: same self-guard pattern (renders nothing when the family's
 
 Usage:
   {{- include "rio.mounts" (dict "root" . "form" "env"    "want" (list "cov" "jwtSign")) | nindent 12 }}
-  {{- include "rio.mounts" (dict "root" . "form" "mount"  "want" (list "tls" "cov" "jwtVerify")) | nindent 12 }}
-  {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov") "tlsSecret" "rio-gateway-tls") | nindent 8 }}
+  {{- include "rio.mounts" (dict "root" . "form" "mount"  "want" (list "cov" "jwtVerify")) | nindent 12 }}
+  {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
 
 `want` is the ordered list of families to emit; each entry self-guards
 on its `.on` flag so callers include unconditionally and drop the
-hand-rolled `{{ if or .Values.tls.enabled .Values.coverage.enabled ... }}`
+hand-rolled `{{ if or .Values.coverage.enabled ... }}`
 wrapper around `volumes:` / `volumeMounts:` (a null list-key is valid
 PodSpec — k8s treats it as empty).
 
 Families:
-  tls        .Values.tls.enabled. Per-component secret (cert-manager
-             Certificate per pod CN) — caller passes `tlsSecret`.
   jwtVerify  .Values.jwt.enabled. SCHEDULER + STORE. ConfigMap
              rio-jwt-pubkey (PUBLIC ed25519 verifying key). Without
              the mount, cfg.jwt.key_path stays None → interceptor is
@@ -67,6 +65,12 @@ Families:
              (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
              jwtVerify — JwtConfig is a shared type; gateway loads it
              as SigningKey seed, scheduler/store as VerifyingKey.
+  serviceHmac  always-on. GATEWAY (signer) + STORE (verifier). Secret
+             rio-service-hmac → /etc/rio/hmac/service-hmac.key, env
+             RIO_SERVICE_HMAC_KEY_PATH. Service-identity HMAC replaced
+             mTLS CN-allowlisting when transport encryption moved to
+             Cilium WireGuard (D2). Gateway signs x-rio-service-token
+             on store PutPath; store verifies.
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -80,16 +84,7 @@ Families:
 {{- define "rio.mounts" -}}
 {{- $root := .root -}}
 {{- $form := .form -}}
-{{- $tlsSecret := .tlsSecret | default "" -}}
 {{- $fams := dict
-      "tls" (dict
-        "on"   $root.Values.tls.enabled
-        "vol"  "tls" "path" "/etc/rio/tls" "ro" true
-        "src"  (dict "secret" (dict "secretName" $tlsSecret))
-        "env"  (list
-          (dict "name" "RIO_TLS__CERT_PATH" "value" "/etc/rio/tls/tls.crt")
-          (dict "name" "RIO_TLS__KEY_PATH"  "value" "/etc/rio/tls/tls.key")
-          (dict "name" "RIO_TLS__CA_PATH"   "value" "/etc/rio/tls/ca.crt")))
       "jwtVerify" (dict
         "on"   $root.Values.jwt.enabled
         "vol"  "jwt-pubkey" "path" "/etc/rio/jwt" "ro" true
@@ -109,6 +104,12 @@ Families:
         "env"  (list
           (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
           (dict "name" "LLVM_PROFILE_FILE" "value" "/var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw")))
+      "serviceHmac" (dict
+        "on"   true
+        "vol"  "service-hmac" "path" "/etc/rio/hmac" "ro" true
+        "src"  (dict "secret" (dict "secretName" "rio-service-hmac"))
+        "env"  (list
+          (dict "name" "RIO_SERVICE_HMAC_KEY_PATH" "value" "/etc/rio/hmac/service-hmac.key")))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}

@@ -86,9 +86,8 @@ async fn main() -> anyhow::Result<()> {
     if hmac_verifier.is_some() {
         info!("HMAC assignment token verification enabled on PutPath");
     }
-    let service_verifier =
-        rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
-            .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?;
+    let service_verifier = rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?;
     if service_verifier.is_some() {
         info!("x-rio-service-token bypass enabled on PutPath");
     }

@@ -275,11 +275,11 @@ rec {
       # scrapes metrics via curl on the control node.
       extraPackages ? [ ],
       # Merged into systemd.services.rio-{store,scheduler,gateway}.environment.
-      # Security scenario uses this to set RIO_TLS__* + RIO_HMAC_KEY_PATH
-      # without extending the NixOS modules. NixOS attrsOf merge composes this
-      # with each module's own `environment = {...}` block — figment reads
-      # the union. Same env applied to all three services (TLS is the
-      # same cert for the shared control VM; unknown vars are ignored).
+      # Security scenario uses this to set RIO_HMAC_KEY_PATH +
+      # RIO_SERVICE_HMAC_KEY_PATH without extending the NixOS modules.
+      # NixOS attrsOf merge composes this with each module's own
+      # `environment = {...}` block — figment reads the union. Same env
+      # applied to all three services (unknown vars are ignored).
       extraServiceEnv ? { },
     }:
     {
@@ -365,8 +365,7 @@ rec {
       hostName,
       sizeClass ? null,
       otelEndpoint ? null,
-      # Merged into systemd.services.rio-builder.environment — e.g.
-      # RIO_TLS__* (client cert for mTLS to scheduler/store). Composed
+      # Merged into systemd.services.rio-builder.environment. Composed
       # with the optional RIO_OTEL_ENDPOINT below via //.
       extraServiceEnv ? { },
       # Arbitrary store paths to pull into this VM's /nix/store. Used
@@ -536,7 +535,7 @@ rec {
 
   # ── gRPC SubmitBuild helpers ────────────────────────────────────────
   # _parse_submit_build_id: shared tail of submit_build_grpc — both the
-  # k3s mTLS port-forward variant (lifecycle.nix) and the standalone
+  # k3s port-forward variant (lifecycle.nix) and the standalone
   # plaintext variant (scheduling.nix) end with the same brace-seek +
   # raw_decode + buildId-extract.
   #

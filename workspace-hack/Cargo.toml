@@ -34,6 +34,7 @@ crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
+data-encoding = { version = "2" }
 der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
@@ -68,11 +69,9 @@ libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
-nom = { version = "7" }
-num-bigint = { version = "0.4" }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "std", "u64_digit", "zeroize"] }
 num-integer = { version = "0.1", features = ["i128"] }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
+num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 once_cell = { version = "1" }
 pem-rfc7468 = { version = "0.7", default-features = false, features = ["std"] }
 percent-encoding = { version = "2" }
@@ -109,14 +108,14 @@ ssh-cipher = { version = "0.2", default-features = false, features = ["aes-cbc",
 ssh-encoding = { version = "0.2", default-features = false, features = ["bytes", "pem", "sha2", "std"] }
 subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
-time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "time"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "filter", "limit", "load-shed", "log", "retry"] }
+tower-http = { version = "0.6", features = ["auth", "cors", "map-response-body", "trace", "util"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -137,7 +136,6 @@ cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
-displaydoc = { version = "0.2" }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -152,7 +150,7 @@ indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
+num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -194,8 +192,9 @@ zeroize = { version = "1" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -206,8 +205,9 @@ libc = { version = "0.2", features = ["extra_traits"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
 nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
-tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }

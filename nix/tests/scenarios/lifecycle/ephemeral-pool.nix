@@ -80,16 +80,6 @@ scope: with scope; ''
           # YAML here must spell it out.
           "  image: rio-builder:dev\n"
           "  imagePullPolicy: Never\n"
-          # tlsSecretName: vmtest-full.yaml sets tls.enabled=true, so
-          # the scheduler requires mTLS on its gRPC port. The Helm-
-          # rendered BuilderPoolSet poolTemplate gets this via the
-          # tls.enabled conditional in templates/builderpoolset.yaml;
-          # inline YAML here must
-          # spell it out. Without it, builders.rs skips the RIO_TLS__*
-          # env + tls volume → ephemeral worker connects plaintext →
-          # TLS handshake fails → never heartbeats → build stuck
-          # queued forever.
-          "  tlsSecretName: rio-builder-tls\n"
           "  privileged: true\n"
           "  terminationGracePeriodSeconds: 60\n"
           "  nodeSelector: null\n"

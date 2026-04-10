@@ -223,8 +223,8 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # grpcurl helper — QueryPathInfo with JWT header
     # ══════════════════════════════════════════════════════════════════
-    # -plaintext: standalone fixture doesn't run mTLS on store (no
-    # withPki). protoset: rio servers don't register tonic-reflection.
+    # -plaintext: services run plaintext gRPC (Cilium WireGuard handles
+    # transport). protoset: rio servers don't register tonic-reflection.
     def query_path_info(token, path):
         return ${gatewayHost}.execute(
             f"${grpcurl} -plaintext -max-time 30 "

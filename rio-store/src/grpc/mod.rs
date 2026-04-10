@@ -205,12 +205,12 @@ pub struct StoreServiceImpl {
     /// uploaded path must be in `claims.expected_outputs`.
     ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
-    hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// HMAC verifier for `x-rio-service-token` (SEPARATE key from
     /// `hmac_verifier`). When Some + token verifies + `caller` is in
     /// `service_bypass_callers` → skip the assignment-token check.
-    /// Transport-agnostic — see [`rio_common::hmac::ServiceClaims`].
-    service_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    /// Transport-agnostic — see [`rio_auth::hmac::ServiceClaims`].
+    service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// Service-token callers that may skip the assignment-token check
     /// via a valid `x-rio-service-token`. Default `["rio-gateway"]`.
     service_bypass_callers: Vec<String>,

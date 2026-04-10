@@ -4,8 +4,7 @@ scope: with scope; ''
   # gc-dry-run — TriggerGC via AdminService proxy, sweep ROLLBACK
   # ══════════════════════════════════════════════════════════════════
   # Same RPC path as phase3b (scheduler → store → mark → sweep →
-  # progress stream → proxy back), but -plaintext since vmtest-full
-  # has tls.enabled=false. grace=24h → nothing past grace → empty
+  # progress stream → proxy back). grace=24h → nothing past grace → empty
   # unreachable set → proves the stream runs end-to-end, NOT that
   # the for-batch loop body executes (that's gc-sweep's job).
   with subtest("gc-dry-run: TriggerGC completes, currentPath describes outcome"):

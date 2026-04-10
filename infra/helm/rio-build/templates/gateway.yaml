@@ -51,7 +51,7 @@ spec:
               containerPort: 9190
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtSign" "tls")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:2222"
             # actBuild machineName field — what nom shows as "on <name>".
@@ -82,9 +82,6 @@ spec:
               value: /etc/rio/ssh/authorized_keys
             {{- end }}
           volumeMounts:
-            - name: service-hmac
-              mountPath: /etc/rio/hmac
-              readOnly: true
             {{- if $g.ssh.authorizedKeysSecret }}
             - name: gateway-state
               mountPath: /var/lib/rio/gateway
@@ -92,7 +89,7 @@ spec:
               mountPath: /etc/rio/ssh
               readOnly: true
             {{- end }}
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
           # tonic-health server — SERVING after connect_scheduler succeeds.
           readinessProbe:
             grpc: {port: 9190}
@@ -106,9 +103,6 @@ spec:
           resources:
             {{- toYaml $g.resources | nindent 12 }}
       volumes:
-        - name: service-hmac
-          secret:
-            secretName: rio-service-hmac
         {{- if $g.ssh.authorizedKeysSecret }}
         {{- if $g.ssh.hostKeySecret }}
         # Persistent host key — survives pod reschedule, same key across
@@ -127,7 +121,7 @@ spec:
           secret:
             secretName: {{ $g.ssh.authorizedKeysSecret }}
         {{- end }}
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtSign")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service

@@ -6,7 +6,6 @@
 //! broken.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +53,9 @@ pub struct Report {
     /// Per-subnet IP health. EKS-only (aws-sdk-ec2 describe-subnets);
     /// None for k3s (no subnet concept).
     subnets: Option<Vec<SubnetHealth>>,
+    /// Cilium DaemonSet readiness + encryption mode + KPR. None if the
+    /// DS is absent (cluster not yet provisioned, or non-Cilium CNI).
+    cilium: Option<CiliumStatus>,
     /// NodeClaims stuck in Unknown/Initialized=Unknown over 2min. The
     /// I-021/I-022 signal — Karpenter blocked on ResourceNotRegistered,
     /// InsufficientCapacity, etc.
@@ -110,6 +112,18 @@ pub struct SubnetHealth {
     /// on nodes in this subnet → subnet is fragmented, prefix
     /// delegation can't find a contiguous /28. I-027.
     possibly_fragmented: bool,
+}
+
+#[derive(Serialize)]
+pub struct CiliumStatus {
+    ds: k::DsStatus,
+    /// Second token of `cilium-dbg status` `Encryption:` line —
+    /// `Wireguard` / `IPsec` / `Disabled`. None if the exec failed.
+    encryption: Option<String>,
+    /// `Peers: N` from the Encryption line (WireGuard only).
+    peers: Option<u32>,
+    /// `KubeProxyReplacement:` line shows `True`.
+    kube_proxy_replacement: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -217,14 +231,14 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         });
     }
 
-    // Node → InternalIP map, used by subnet gathering.
-    let node_ips = node_internal_ips(client).await;
+    // Node → AZ map, used by subnet gathering.
+    let node_zones = node_zones(client).await;
 
     let ip_assign_failures = gather_ip_assign_failures(client).await;
 
-    // Subnets last: possibly_fragmented needs ip_assign_failures + node_ips.
+    // Subnets last: possibly_fragmented needs ip_assign_failures + node_zones.
     let subnets = match kind {
-        ProviderKind::Eks => gather_subnets(&node_ips, &ip_assign_failures).await,
+        ProviderKind::Eks => gather_subnets(&node_zones, &ip_assign_failures).await,
         _ => None,
     };
 
@@ -235,6 +249,7 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         builder_pools: list_builder_pools(client).await.unwrap_or_default(),
         fetcher_pools: list_fetcher_pools(client).await.unwrap_or_default(),
         subnets,
+        cilium: gather_cilium(client).await,
         stuck_nodeclaims: gather_stuck_nodeclaims(client).await,
         scheduler_metrics: gather_scheduler_metrics(client).await,
         ip_assign_failures,
@@ -259,9 +274,11 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
 
 // -- gather helpers (all best-effort) -----------------------------------
 
-/// Map of node name → InternalIP. Used by subnet mapping and by
-/// stuck-node detection (to check `unschedulable`).
-async fn node_internal_ips(client: &k::Client) -> HashMap<String, (String, bool)> {
+/// Map of node name → `topology.kubernetes.io/zone` label. Used by
+/// subnet gathering. Zone-match is CNI-agnostic — the previous
+/// IP-in-CIDR match broke under Cilium-on-IPv6-EKS where node
+/// InternalIP is the v6 GUA but subnet `cidr_block` is v4.
+async fn node_zones(client: &k::Client) -> HashMap<String, String> {
     let api: Api<Node> = Api::all(client.clone());
     let Ok(nodes) = api.list(&ListParams::default()).await else {
         debug!("node list failed");
@@ -271,29 +288,23 @@ async fn node_internal_ips(client: &k::Client) -> HashMap<String, (String, bool)
         .into_iter()
         .filter_map(|n| {
             let name = n.metadata.name?;
-            let cordoned = n
-                .spec
-                .as_ref()
-                .and_then(|s| s.unschedulable)
-                .unwrap_or(false);
-            let ip = n
-                .status?
-                .addresses?
-                .into_iter()
-                .find(|a| a.type_ == "InternalIP")?
-                .address;
-            Some((name, (ip, cordoned)))
+            let zone = n
+                .metadata
+                .labels?
+                .get("topology.kubernetes.io/zone")?
+                .clone();
+            Some((name, zone))
         })
         .collect()
 }
 
 /// EC2 describe-subnets filtered by karpenter.sh/discovery tag.
-/// `possibly_fragmented`: free IPs > 50 but a pod on a node in this
-/// subnet had FailedCreatePodSandBox — aws-cni's ENI prefix delegation
-/// wants a contiguous /28, which fragmentation denies even when the
-/// total free-IP count looks healthy.
+/// `available_ips` matters for NODE provisioning (Karpenter needs a
+/// VPC IP per ENI); pod IPs come from Cilium's overlay pool, so
+/// `possibly_fragmented` (an aws-cni prefix-delegation heuristic) no
+/// longer fires in practice but is kept for the failure-event signal.
 async fn gather_subnets(
-    node_ips: &HashMap<String, (String, bool)>,
+    node_zones: &HashMap<String, String>,
     ip_failures: &[IpAssignFailure],
 ) -> Option<Vec<SubnetHealth>> {
     use crate::k8s::eks::TF_DIR;
@@ -330,12 +341,12 @@ async fn gather_subnets(
             let cidr = s.cidr_block?;
             let az = s.availability_zone.unwrap_or_default();
             let available_ips = s.available_ip_address_count.unwrap_or(0);
-            // Count nodes whose InternalIP falls in this CIDR, and
-            // note whether any of them had IP-assign failures.
+            // Count nodes whose zone label matches this subnet's AZ,
+            // and note whether any of them had IP-assign failures.
             let mut node_count = 0;
             let mut has_failing_node = false;
-            for (name, (ip, _)) in node_ips {
-                if cidr_contains(&cidr, ip) {
+            for (name, zone) in node_zones {
+                if *zone == az {
                     node_count += 1;
                     if failing_nodes.contains(name.as_str()) {
                         has_failing_node = true;
@@ -720,31 +731,66 @@ async fn gather_ip_assign_failures(client: &k::Client) -> Vec<IpAssignFailure> {
     out
 }
 
+/// Cilium DaemonSet readiness + parsed `cilium-dbg status` highlights.
+/// Best-effort: returns None if the DS is absent; encryption/kpr are
+/// None if the in-pod exec fails (e.g., no Ready pod yet).
+async fn gather_cilium(client: &k::Client) -> Option<CiliumStatus> {
+    let ds = k::list_daemonset_status(client, "kube-system")
+        .await
+        .ok()?
+        .into_iter()
+        .find(|d| d.name == "cilium")?;
+    let dbg_out = {
+        use crate::sh::{self, shell};
+        use xshell::cmd;
+        shell().ok().and_then(|sh| {
+            sh::read(cmd!(
+                sh,
+                "kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status"
+            ))
+            .inspect_err(|e| debug!("cilium-dbg exec: {e:#}"))
+            .ok()
+        })
+    };
+    let (encryption, peers, kpr) = dbg_out
+        .as_deref()
+        .map(parse_cilium_status)
+        .unwrap_or_default();
+    Some(CiliumStatus {
+        ds,
+        encryption,
+        peers,
+        kube_proxy_replacement: kpr,
+    })
+}
+
+/// Extract encryption type, WireGuard peer count, and KPR flag from
+/// `cilium-dbg status` text output.
+fn parse_cilium_status(out: &str) -> (Option<String>, Option<u32>, Option<bool>) {
+    let mut enc = None;
+    let mut peers = None;
+    let mut kpr = None;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Encryption:") {
+            enc = rest.split_whitespace().next().map(str::to_string);
+            peers = rest
+                .split("Peers:")
+                .nth(1)
+                .and_then(|s| s.trim().split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("KubeProxyReplacement:") {
+            kpr = rest.split_whitespace().next().map(|t| t == "True");
+        }
+    }
+    (enc, peers, kpr)
+}
+
 /// Karpenter NodeClaim CRD via the dynamic API. Cluster-scoped.
 fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
     let gvk = GroupVersionKind::gvk("karpenter.sh", "v1", "NodeClaim");
     let ar = ApiResource::from_gvk(&gvk);
     Api::all_with(client.clone(), &ar)
-}
-
-/// True if `ip` falls inside `cidr` (IPv4 only — EKS VPC subnets
-/// are always IPv4 primary CIDRs).
-fn cidr_contains(cidr: &str, ip: &str) -> bool {
-    let Some((net, prefix)) = cidr.split_once('/') else {
-        return false;
-    };
-    let Ok(prefix) = prefix.parse::<u32>() else {
-        return false;
-    };
-    let (Ok(net), Ok(ip)) = (net.parse::<Ipv4Addr>(), ip.parse::<Ipv4Addr>()) else {
-        return false;
-    };
-    let mask = if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    };
-    (u32::from(net) & mask) == (u32::from(ip) & mask)
 }
 
 async fn list_builder_pools(client: &k::Client) -> Result<Vec<BpStatus>> {
@@ -1051,6 +1097,32 @@ fn render_human(r: &Report) {
         }
     }
 
+    if let Some(c) = &r.cilium {
+        eprintln!();
+        header("Cilium");
+        eprintln!(
+            "  {} DaemonSet  {}/{} ready",
+            glyph(c.ds.ok),
+            c.ds.ready,
+            c.ds.desired
+        );
+        match (&c.encryption, c.peers) {
+            (Some(enc), Some(p)) => eprintln!(
+                "  {} Encryption {}  ({} peers)",
+                glyph(enc != "Disabled"),
+                enc,
+                p
+            ),
+            (Some(enc), None) => {
+                eprintln!("  {} Encryption {}", glyph(enc != "Disabled"), enc)
+            }
+            (None, _) => eprintln!("  {} Encryption (cilium-dbg exec failed)", glyph(false)),
+        }
+        if let Some(kpr) = c.kube_proxy_replacement {
+            eprintln!("  {} KubeProxyReplacement {}", glyph(kpr), kpr);
+        }
+    }
+
     if !r.stuck_nodeclaims.is_empty() {
         eprintln!();
         header("Stuck NodeClaims");
@@ -1137,14 +1209,23 @@ mod tests {
     }
 
     #[test]
-    fn cidr_contains_basics() {
-        assert!(cidr_contains("10.0.32.0/19", "10.0.32.1"));
-        assert!(cidr_contains("10.0.32.0/19", "10.0.63.254"));
-        assert!(!cidr_contains("10.0.32.0/19", "10.0.64.1"));
-        assert!(!cidr_contains("10.0.32.0/19", "10.0.31.255"));
-        assert!(cidr_contains("0.0.0.0/0", "1.2.3.4"));
-        assert!(!cidr_contains("garbage", "10.0.0.1"));
-        assert!(!cidr_contains("10.0.0.0/19", "garbage"));
+    fn parse_cilium_status_basics() {
+        let out = "\
+KVStore:                 Ok   Disabled
+Kubernetes:              Ok   1.35
+KubeProxyReplacement:    True   [ens5   10.42.1.101 fe80::1 (Direct Routing)]
+Cilium:                  Ok   1.19.2
+Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (Pubkey: x, Port: 51871, Peers: 13)]
+";
+        let (enc, peers, kpr) = parse_cilium_status(out);
+        assert_eq!(enc.as_deref(), Some("Wireguard"));
+        assert_eq!(peers, Some(13));
+        assert_eq!(kpr, Some(true));
+
+        let (enc, peers, kpr) = parse_cilium_status("Encryption: Disabled\n");
+        assert_eq!(enc.as_deref(), Some("Disabled"));
+        assert_eq!(peers, None);
+        assert_eq!(kpr, None);
     }
 
     #[test]
@@ -1162,6 +1243,7 @@ mod tests {
                 node_count: 3,
                 possibly_fragmented: false,
             }]),
+            cilium: None,
             stuck_nodeclaims: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],
@@ -1190,6 +1272,7 @@ mod tests {
             builder_pools: vec![],
             fetcher_pools: vec![],
             subnets: None,
+            cilium: None,
             stuck_nodeclaims: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],
@@ -1223,6 +1306,7 @@ mod tests {
                 node_count: 3,
                 possibly_fragmented: false,
             }]),
+            cilium: None,
             stuck_nodeclaims: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],

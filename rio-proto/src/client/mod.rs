@@ -2,10 +2,9 @@
 //! generic [`ProtoClient`] connect helpers.
 //!
 //! - Connection: [`connect_single`] / [`connect`] build
-//!   `"http(s)://{addr}"` from a `host:port` string, apply the
-//!   process-global TLS config (see
-//!   [`rio_common::grpc::init_client_tls`]), connect, and apply
-//!   [`max_message_size`].
+//!   `"http://{addr}"` from a `host:port` string, connect, and apply
+//!   [`max_message_size`]. Inter-component gRPC is plaintext-over-WireGuard
+//!   (Cilium handles encryption).
 //! - Retry: [`connect_with_retry`] / [`connect_forever`] for
 //!   shutdown-aware cold-start connect loops.
 //!
@@ -28,9 +27,7 @@ pub use store::{
 
 use std::time::Duration;
 
-use rio_common::grpc::{
-    H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, client_tls, max_message_size,
-};
+use rio_common::grpc::{H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, max_message_size};
 use tonic::transport::Channel;
 
 use crate::StoreServiceClient;

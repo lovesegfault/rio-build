@@ -145,7 +145,6 @@ metrics = { workspace = true, optional = true }
 # TLS cert parsing for CN-based HMAC bypass on PutPath. tonic's
 # peer_certs() gives DER bytes; we parse to read subject CN.
 # Only CN=rio-gateway bypasses HMAC (not any mTLS client).
-x509-parser = { workspace = true, optional = true }
 
 # Error handling
 anyhow = { workspace = true, optional = true }

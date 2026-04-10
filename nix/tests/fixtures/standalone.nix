@@ -5,9 +5,9 @@
 # phase1/2 tests, never exercised as a deliverable — now it's a fixture
 # in its own right.
 #
-# Returns an attrset with `nodes` (drop into runNixOSTest), `waitReady`
-# + `pyNodeVars` (Python snippets for testScript interpolation), and
-# `pki` (the PKI store path, for grpcurl cert args when withHmac=true).
+# Returns an attrset with `nodes` (drop into runNixOSTest) and
+# `waitReady` + `pyNodeVars` (Python snippets for testScript
+# interpolation).
 {
   pkgs,
   rio-workspace,
@@ -141,13 +141,13 @@ let
       otelModule
     ];
     systemd.services = {
-      # Gateway CN override + gateway-only env. mkControlNode's
-      # extraServiceEnv applies controlHmacEnv to ALL three services
-      # (including gateway). NixOS module merge of two string values
-      # for the same key → conflict. mapAttrs mkForce makes the gateway
-      # cert paths win unambiguously. extraGatewayEnv merges alongside
-      # (no mkForce — it's gateway-only, no conflict with
-      # extraServiceEnv's shared keys).
+      # Gateway-only HMAC env override. mkControlNode's extraServiceEnv
+      # applies controlHmacEnv to ALL three services (including gateway).
+      # NixOS module merge of two string values for the same key →
+      # conflict. mapAttrs mkForce makes the gateway env win
+      # unambiguously. extraGatewayEnv merges alongside (no mkForce —
+      # it's gateway-only, no conflict with extraServiceEnv's shared
+      # keys).
       rio-gateway.environment =
         (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
 
@@ -184,7 +184,7 @@ let
 
   # ── Worker nodes ────────────────────────────────────────────────────
   # mapAttrs' renames to the worker's hostName while passing through
-  # the scenario's per-worker args + fixture-level PKI/OTel.
+  # the scenario's per-worker args + fixture-level OTel.
   workerNodes = lib.mapAttrs (
     name: args:
     common.mkWorkerNode (

@@ -1,4 +1,4 @@
-# security.standalone — mTLS/HMAC/tenant/validation/rate-limit/quota/dual-mode
+# security.standalone — HMAC/tenant/validation/rate-limit/quota/dual-mode
 #
 # Split out of scenarios/security.nix; see that file's header for the
 # full subtest map and r[verify ...] marker placement (default.nix).
@@ -9,7 +9,7 @@
 }:
 { fixture }:
 let
-  inherit (fixture) gatewayHost pki;
+  inherit (fixture) gatewayHost;
 
   # ── Test derivations ────────────────────────────────────────────────
   # Distinct markers so each build creates a fresh `builds` row instead
@@ -84,131 +84,6 @@ pkgs.testers.runNixOSTest {
       dumpLogsExpr = "dump_all_logs([${gatewayHost}, worker])";
     }}
 
-    # ══════════════════════════════════════════════════════════════════
-    # Section: mTLS
-    # ══════════════════════════════════════════════════════════════════
-    # Run FIRST, before any builds — minimal state, pure connectivity
-    # probes. The worker's Register RPC (inside fixture.waitReady's
-    # workers_active wait) already went over mTLS, so reaching this
-    # point IS implicit mTLS-positive proof. The explicit probes here
-    # make the CLIENT cert verification path + plaintext rejection
-    # visible in CI logs.
-
-    with subtest("mtls-reject: plaintext connect to TLS port fails"):
-        # grpcurl -plaintext against the scheduler's main port (9001,
-        # mTLS). The TCP connection succeeds but the TLS handshake
-        # fails — the server expects a ClientHello, gets a plaintext
-        # HTTP/2 preface. grpcurl surfaces this as "connection reset"
-        # or a tls-related error. We only check that it FAILS; the
-        # exact error text varies by grpcurl/tonic version.
-        #
-        # -max-time 5: don't hang if something's misconfigured. The
-        # failure is immediate (handshake), not a timeout.
-        result = ${gatewayHost}.fail(
-            "grpcurl -plaintext -max-time 5 localhost:9001 "
-            "grpc.health.v1.Health/Check 2>&1"
-        )
-        # CRITICAL: the error must NOT be "connection refused". That
-        # would mean the port isn't listening at all — a different
-        # failure mode (service down, wrong port) that this subtest
-        # would otherwise mask as a pass. Any of "tls" / "EOF" /
-        # "connection reset" / "handshake" is fine.
-        assert "refused" not in result.lower(), (
-            f"port should be OPEN (TLS rejects, not refused): {result[:200]}"
-        )
-        print("mtls-reject PASS: plaintext rejected on mTLS port 9001")
-
-    with subtest("mtls-reject-grpc: TLS-on-but-no-client-cert handshake fails"):
-        # The plaintext-reject above proves "no TLS at all → rejected".
-        # THIS proves "TLS handshake started, server cert verified, but
-        # no client cert presented → rejected". Distinct failure mode:
-        # a server configured for TLS-but-not-MUTUAL-TLS would accept
-        # here. That's the mTLS-vs-TLS distinction this subtest pins.
-        #
-        # -cacert only (server cert verified against our CA) — no
-        # -cert/-key (no client cert presented). tonic's mTLS config
-        # sends a CertificateRequest in the handshake; with no client
-        # cert to send, the handshake aborts before any HTTP/2 preface.
-        # Health/Check: no protoset needed (grpcurl bundles those
-        # descriptors), and the handshake fails before any RPC
-        # resolution anyway.
-        result = ${gatewayHost}.fail(
-            "grpcurl -cacert ${pki}/ca.crt -max-time 5 "
-            "localhost:9002 grpc.health.v1.Health/Check 2>&1"
-        )
-        # Same guard as the plaintext case: "refused" = port not
-        # listening = wrong failure (service down, not mTLS working).
-        assert "refused" not in result.lower(), (
-            f"port should be OPEN (mTLS rejects no-cert, not refused): {result[:200]}"
-        )
-        # Scheduler too — both mTLS-gated services.
-        result = ${gatewayHost}.fail(
-            "grpcurl -cacert ${pki}/ca.crt -max-time 5 "
-            "localhost:9001 grpc.health.v1.Health/Check 2>&1"
-        )
-        assert "refused" not in result.lower(), (
-            f"port should be OPEN (mTLS rejects no-cert, not refused): {result[:200]}"
-        )
-        print("mtls-reject-grpc PASS: no-client-cert rejected on 9001 + 9002")
-
-    with subtest("mtls-accept: connect with valid client cert succeeds"):
-        # Use the DEDICATED client cert (CN=rio-builder), not server.crt.
-        # Reusing server.crt would work (same CA) but wouldn't prove
-        # the CLIENT cert verification path — a client-cert-only check
-        # might reject CN=control. client.crt has CN=rio-builder (the
-        # actual worker identity); using it proves client-auth truly
-        # validates against the CA, not server identity.
-        #
-        # -tls-server-name localhost: grpc-health-probe doesn't derive
-        # SNI from -addr the way tonic does; set explicitly to match a
-        # SAN (localhost is in the server cert, see lib/pki.nix).
-        ${gatewayHost}.succeed(
-            "grpc-health-probe -addr localhost:9001 "
-            "-tls -tls-ca-cert ${pki}/ca.crt "
-            "-tls-client-cert ${pki}/client.crt "
-            "-tls-client-key ${pki}/client.key "
-            "-tls-server-name localhost"
-        )
-        # Same for the store.
-        ${gatewayHost}.succeed(
-            "grpc-health-probe -addr localhost:9002 "
-            "-tls -tls-ca-cert ${pki}/ca.crt "
-            "-tls-client-cert ${pki}/client.crt "
-            "-tls-client-key ${pki}/client.key "
-            "-tls-server-name localhost"
-        )
-        print("mtls-accept PASS: client cert (CN=rio-builder) accepted on 9001 + 9002")
-
-    with subtest("mtls-health-shared: plaintext health port spawned when TLS on"):
-        # The scheduler/store spawn a SECOND plaintext server on
-        # health_addr (9101/9102) when TLS is enabled. K8s gRPC
-        # readinessProbes can't do mTLS — this port is for them. It
-        # serves ONLY grpc.health.v1.Health, sharing the HealthReporter
-        # with the main port via health_service.clone().
-        #
-        # ADAPTATION NOTE (vs phase3b): phase3b proves the reporter is
-        # SHARED by probing NOT_SERVING during the scheduler's standby
-        # window (lease config + missing kubeconfig → is_leader=false
-        # → set_not_serving). The standalone fixture has no k8s, so no
-        # lease config → scheduler uses always_leader() →
-        # recovery_complete=true from boot → SERVING immediately. The
-        # NOT_SERVING half of the shared-reporter proof is deferred to
-        # a k3s-fixture variant (scenarios/lifecycle.nix).
-        #
-        # What this subtest DOES prove: the plaintext port is BOUND and
-        # serves the NAMED service. If the second server didn't spawn,
-        # or didn't register the named service, the probe fails. That
-        # the named-service probe succeeds is weak evidence of shared
-        # reporter (both servers register the same name → same
-        # HealthReporter instance, not two independent registrations).
-        ${gatewayHost}.succeed(
-            "grpc-health-probe -addr localhost:9101 "
-            "-service rio.scheduler.SchedulerService"
-        )
-        # Default service (always SERVING once bound) — proves port up.
-        ${gatewayHost}.succeed("grpc-health-probe -addr localhost:9101")
-        ${gatewayHost}.succeed("grpc-health-probe -addr localhost:9102")
-        print("mtls-health-shared PASS: plaintext health ports bound + named service registered")
 
     # ══════════════════════════════════════════════════════════════════
     # SSH + tenant key setup
@@ -246,22 +121,16 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
 
     with subtest("hmac-positive: verifier loaded + build succeeds with token"):
-        # seedBusybox's nix-copy → gateway wopAddToStoreNar → gateway
-        # PutPath to store via mTLS with CN=rio-gateway → bypass path
-        # at put_path.rs. The metric ONLY increments when
-        # hmac_verifier.is_some() (the early-return on None never
-        # reaches the bypass branch). So this proves BOTH (a) verifier
-        # loaded (HmacVerifier::load succeeded with RIO_HMAC_KEY_PATH)
-        # and (b) the CN check ran. Without this assertion, a broken
-        # verifier-load (wrong env var, config wiring bug →
-        # verifier=None) would let the build below pass silently.
         # r[verify sec.authz.service-token]
-        # With RIO_SERVICE_HMAC_KEY_PATH set on gateway and store,
-        # the gateway attaches x-rio-service-token on PutPath and
-        # the store accepts it BEFORE the CN check — so the
-        # service-token metric increments and the CN-bypass metric
-        # stays at 0. Same proof as before (verifier loaded + bypass
-        # ran), via the transport-agnostic path.
+        # seedBusybox's nix-copy → gateway wopAddToStoreNar → gateway
+        # PutPath to store with x-rio-service-token header → bypass
+        # path at put_path.rs. With RIO_SERVICE_HMAC_KEY_PATH set on
+        # gateway and store, the metric increments only when the store
+        # verifies the service-HMAC signature. So this proves BOTH
+        # (a) gateway service_signer loaded and (b) store verifier
+        # accepted the token. Without this assertion, a broken
+        # verifier-load (wrong env var, config wiring bug) would let
+        # the build below pass silently via the assignment-token path.
         assert_metric_ge(
             ${gatewayHost}, 9092,
             "rio_store_service_token_accepted_total", 1.0,

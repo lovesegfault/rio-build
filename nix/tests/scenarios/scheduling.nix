@@ -144,7 +144,7 @@ let
 
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
         """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
-        Standalone fixture variant — no port-forward, no mTLS. Same
+        Standalone fixture variant — no port-forward. Same
         `|| true` swallow-DeadlineExceeded as the k3s variant."""
         out = ${gatewayHost}.succeed(
             f"grpcurl -plaintext -max-time {max_time} "

@@ -4,11 +4,8 @@
 # CreateTenant/ListTenants/ClusterStatus/ListWorkers/ListBuilds; this
 # test exercises all of them end-to-end against a live scheduler.
 #
-# k3s-full fixture: scheduler runs with mTLS on. rio-cli needs a client
-# cert signed by the same CA. lifecycle.nix already uses the fixture's
-# `pki` store-path attr for grpcurl (the certs are on disk in the VM via
-# closure interpolation) — same trick here. No need to extract from the
-# k8s Secret.
+# k3s-full fixture: rio-cli speaks plaintext gRPC (Cilium WireGuard
+# handles transport encryption); only the scheduler address is needed.
 #
 # sched.admin.{create-tenant,list-tenants,list-workers,list-builds,
 # clear-poison} — verify markers at default.nix:vm-cli-k3s
@@ -18,14 +15,9 @@
   fixture,
 }:
 let
-  inherit (fixture) pki;
-
   # Store-path interpolation pulls the binary into the VM closure.
   # rio-cli is a Rust binary, linked to glibc (which the NixOS VM has).
   rioCli = "${common.rio-workspace}/bin/rio-cli";
-
-  # rio-cli speaks plaintext gRPC (Cilium WireGuard handles encryption).
-  tlsEnv = "";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
@@ -53,7 +45,6 @@ pkgs.testers.runNixOSTest {
     def cli(args):
         return k3s_server.succeed(
             "${common.covShellEnv}"
-            "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             f"${rioCli} {args} 2>&1"
         )
@@ -114,7 +105,6 @@ pkgs.testers.runNixOSTest {
         print(f"cli workers output:\n{out}")
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             "${rioCli} workers --json "
             "| ${pkgs.jq}/bin/jq -e '.executors | type == \"array\"'"
@@ -138,7 +128,6 @@ pkgs.testers.runNixOSTest {
         # --json: total_count=0, builds=[] is a valid object.
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             "${rioCli} builds --json "
             "| ${pkgs.jq}/bin/jq -e '.total_count == 0 and (.builds | length == 0)'"
@@ -188,7 +177,6 @@ pkgs.testers.runNixOSTest {
         # --json: cleared=false
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             f"${rioCli} poison-clear {fake_hash} --json "
             "| ${pkgs.jq}/bin/jq -e '.cleared == false'"
@@ -209,7 +197,6 @@ pkgs.testers.runNixOSTest {
     with subtest("cli logs: NotFound when no ring buffer + no build_id"):
         out = k3s_server.fail(
             "${common.covShellEnv}"
-            "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             "${rioCli} logs /nix/store/00000000000000000000000000000000-nothing.drv 2>&1"
         )
