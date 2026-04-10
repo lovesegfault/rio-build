@@ -327,9 +327,17 @@ pub(super) async fn compute_input_closure(
         // Add found paths to closure, collect their refs for next layer.
         for (path, info) in results {
             let Some(info) = info else {
-                // Path not in store yet (output of a not-yet-built
-                // input drv). FUSE will lazy-fetch at build time.
-                tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");
+                // Path not in store. Legitimate for an output of a
+                // not-yet-built input drv (rare — scheduler gates
+                // dispatch on dep completion). Previously also hit for
+                // transitive runtime refs of substituted paths
+                // (BatchQueryPathInfo is local-only; rustc-1.94.0 via
+                // rustc-wrapper) — now closed at the source by
+                // Substituter::ensure_references walking the closure.
+                // A path skipped here is NOT in the JIT allowlist, so
+                // FUSE returns ENOENT (not lazy-fetch — the builder
+                // carries no tenant context to substitute on miss).
+                tracing::debug!(path = %path, "input not in store; dropped from JIT allowlist");
                 continue;
             };
             for r in &info.references {

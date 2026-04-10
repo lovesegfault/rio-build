@@ -282,7 +282,48 @@ impl Substituter {
                 }
             })
             .await;
-        Ok(cached.map(|arc| (*arc).clone()))
+        let result = cached.map(|arc| (*arc).clone());
+        // Closure walk AFTER the singleflight slot is released (recursing
+        // from inside the init future would deadlock on moka). A path is
+        // only usable once its runtime references are also present —
+        // standard Nix substituter semantics. Without this, a builder's
+        // compute_input_closure BFS reaches a transitive ref that was
+        // never fetched, BatchQueryPathInfo (local-only) returns None,
+        // the ref is dropped from the JIT allowlist, and the build fails
+        // with ENOENT when the wrapped binary execs it (e.g.
+        // rustc-wrapper → rustc-1.94.0). The scheduler's
+        // eager_substitute_fetch only covers DAG-output paths, not their
+        // runtime closures, so this is the only place the closure can be
+        // completed.
+        if let Some(info) = &result {
+            Box::pin(self.ensure_references(tenant_id, &info.references)).await;
+        }
+        Ok(result)
+    }
+
+    /// Ensure every reference is present locally, substituting misses.
+    /// Depth-first via mutual recursion with [`try_substitute`] (which
+    /// singleflights per-ref and walks each ref's own closure). The
+    /// local `query_path_info` check short-circuits already-present
+    /// paths so the recursion converges; self-references hit the
+    /// just-ingested row and skip. Best-effort: a failed ref logs +
+    /// continues so a partial closure doesn't poison the seed (the
+    /// build still fails with a clear ENOENT naming the missing ref).
+    async fn ensure_references(&self, tenant_id: Uuid, refs: &[StorePath]) {
+        for r in refs {
+            let r = r.as_str();
+            match metadata::query_path_info(&self.pool, r).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(reference = %r, error = %e, "closure: local check failed");
+                    continue;
+                }
+            }
+            if let Err(e) = Box::pin(self.try_substitute(tenant_id, r)).await {
+                warn!(reference = %r, error = %e, "closure: reference substitution failed");
+            }
+        }
     }
 
     /// One full fetch cycle — the singleflight body.
