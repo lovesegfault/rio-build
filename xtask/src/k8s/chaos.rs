@@ -33,7 +33,6 @@
 use std::fmt;
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -91,7 +90,7 @@ pub enum ChaosKind {
 /// matching `rio.build/role` label. Worker pods are one-shot Jobs with
 /// no stable identity, so the chosen pod is whichever happens to be
 /// Running at resolve time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChaosTarget {
     SchedulerLeader,
     Store,
@@ -99,37 +98,16 @@ pub enum ChaosTarget {
     Fetcher,
 }
 
-impl FromStr for ChaosTarget {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "scheduler-leader" => Ok(Self::SchedulerLeader),
-            "store" => Ok(Self::Store),
-            "builder" => Ok(Self::Builder),
-            "fetcher" => Ok(Self::Fetcher),
-            _ => bail!(
-                "invalid --target {s:?} \
-                 (expected: scheduler-leader, store, builder, fetcher)"
-            ),
-        }
-    }
-}
-
 impl fmt::Display for ChaosTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::SchedulerLeader => "scheduler-leader",
-            Self::Store => "store",
-            Self::Builder => "builder",
-            Self::Fetcher => "fetcher",
-        })
+        f.write_str(self.to_possible_value().unwrap().get_name())
     }
 }
 
 /// Which workers lose connectivity. Resolves to a set of node names —
 /// the chaos pod runs hostNetwork on each, so the iptables rules
 /// affect all pod-to-pod traffic transiting that node.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChaosFrom {
     /// Every node hosting a builder OR fetcher pod (deduped).
     AllWorkers,
@@ -137,25 +115,9 @@ pub enum ChaosFrom {
     Fetcher,
 }
 
-impl FromStr for ChaosFrom {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "all-workers" => Ok(Self::AllWorkers),
-            "builder" => Ok(Self::Builder),
-            "fetcher" => Ok(Self::Fetcher),
-            _ => bail!("invalid --from {s:?} (expected: all-workers, builder, fetcher)"),
-        }
-    }
-}
-
 impl fmt::Display for ChaosFrom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::AllWorkers => "all-workers",
-            Self::Builder => "builder",
-            Self::Fetcher => "fetcher",
-        })
+        f.write_str(self.to_possible_value().unwrap().get_name())
     }
 }
 
@@ -716,45 +678,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_parse() {
-        assert_eq!(
-            "scheduler-leader".parse::<ChaosTarget>().unwrap(),
-            ChaosTarget::SchedulerLeader
-        );
-        assert_eq!("store".parse::<ChaosTarget>().unwrap(), ChaosTarget::Store);
-        assert_eq!(
-            "builder".parse::<ChaosTarget>().unwrap(),
-            ChaosTarget::Builder
-        );
-        assert_eq!(
-            "fetcher".parse::<ChaosTarget>().unwrap(),
-            ChaosTarget::Fetcher
-        );
-        assert!("scheduler".parse::<ChaosTarget>().is_err());
-        assert!("builder-0".parse::<ChaosTarget>().is_err());
-    }
-
-    #[test]
-    fn target_display_roundtrip() {
-        for s in ["scheduler-leader", "store", "builder", "fetcher"] {
-            let t: ChaosTarget = s.parse().unwrap();
-            assert_eq!(t.to_string(), s);
+    fn chaos_enums_roundtrip() {
+        // ValueEnum derive gives kebab-case parse/display; spot-check the
+        // shape and that target/from variant sets stay distinct.
+        for v in ChaosTarget::value_variants() {
+            assert_eq!(ChaosTarget::from_str(&v.to_string(), false).unwrap(), *v);
         }
-    }
-
-    #[test]
-    fn from_parse() {
-        assert_eq!(
-            "all-workers".parse::<ChaosFrom>().unwrap(),
-            ChaosFrom::AllWorkers
-        );
-        assert_eq!("fetcher".parse::<ChaosFrom>().unwrap(), ChaosFrom::Fetcher);
-        assert_eq!("builder".parse::<ChaosFrom>().unwrap(), ChaosFrom::Builder);
-        // scheduler-leader is a valid TARGET but not a valid FROM —
-        // you blackhole the scheduler FROM a worker, not the reverse.
-        assert!("scheduler-leader".parse::<ChaosFrom>().is_err());
-        assert!("all".parse::<ChaosFrom>().is_err());
-        assert!("builder-0".parse::<ChaosFrom>().is_err());
+        for v in ChaosFrom::value_variants() {
+            assert_eq!(ChaosFrom::from_str(&v.to_string(), false).unwrap(), *v);
+        }
+        assert_eq!(ChaosTarget::SchedulerLeader.to_string(), "scheduler-leader");
+        assert_eq!(ChaosFrom::AllWorkers.to_string(), "all-workers");
+        assert!(ChaosTarget::from_str("scheduler", false).is_err());
+        // scheduler-leader is a valid TARGET but not a valid FROM.
+        assert!(ChaosFrom::from_str("scheduler-leader", false).is_err());
     }
 
     #[test]
