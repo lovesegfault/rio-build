@@ -149,5 +149,7 @@ pkgs.testers.runNixOSTest {
             raise
         finally:
             k3s_server.execute("kill $(cat /tmp/pf-sched.pid) 2>/dev/null || true")
+
+    ${common.collectCoverage fixture.pyNodeVars}
   '';
 }

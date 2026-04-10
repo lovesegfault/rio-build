@@ -89,5 +89,7 @@ pkgs.testers.runNixOSTest {
             timeout=30,
         )
         print(f"banner: {banner}")
+
+    ${common.collectCoverage fixture.pyNodeVars}
   '';
 }
