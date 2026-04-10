@@ -17,6 +17,30 @@
   dockerImages,
   nodeAmi,
 }:
+let
+  # Regenerate-then-diff drift check. `generate` populates
+  # $TMPDIR/gen (file or dir); `committed` is the path to compare
+  # against. `diff -r` works for both file and directory inputs.
+  mkDriftCheck =
+    {
+      name,
+      nativeBuildInputs ? [ ],
+      generate,
+      committed,
+      what,
+      regenHint,
+    }:
+    pkgs.runCommand "rio-${name}" { nativeBuildInputs = nativeBuildInputs ++ [ pkgs.diffutils ]; } ''
+      ${generate}
+      diff -r $TMPDIR/gen ${committed} > $TMPDIR/diff || {
+        echo "FAIL: ${what}" >&2
+        echo "Run: ${regenHint}" >&2
+        cat $TMPDIR/diff >&2
+        exit 1
+      }
+      touch $out
+    '';
+in
 {
   # License + advisory audit. Policy: deny GPL-3.0 (project is
   # MIT/Apache), fail on RustSec advisories with a curated
@@ -195,54 +219,33 @@
   # schema diverges from what the controller expects.
   #
   # Calls scripts/split-crds.py (same script xtask uses) to split
-  # multi-doc → one file per metadata.name, into $TMPDIR.
-  # diff -r: recursive, exits non-zero on any difference.
-  crds-drift =
-    let
-      crdsYaml = config.packages.crds;
-      py = pkgs.python3.withPackages (p: [ p.pyyaml ]);
-    in
-    pkgs.runCommand "rio-crds-drift"
-      {
-        nativeBuildInputs = [
-          py
-          pkgs.diffutils
-        ];
-      }
-      ''
-        mkdir -p $TMPDIR/split
-        python3 ${../scripts/split-crds.py} ${crdsYaml} $TMPDIR/split
-        diff -r $TMPDIR/split ${../infra/helm/crds} > $TMPDIR/diff || {
-          echo "FAIL: crdgen output drifted from infra/helm/crds/" >&2
-          echo "Run: cargo xtask regen crds" >&2
-          cat $TMPDIR/diff >&2
-          exit 1
-        }
-        touch $out
-      '';
+  # multi-doc → one file per metadata.name.
+  crds-drift = mkDriftCheck {
+    name = "crds-drift";
+    nativeBuildInputs = [ (pkgs.python3.withPackages (p: [ p.pyyaml ])) ];
+    generate = ''
+      mkdir -p $TMPDIR/gen
+      python3 ${../scripts/split-crds.py} ${config.packages.crds} $TMPDIR/gen
+    '';
+    committed = ../infra/helm/crds;
+    what = "crdgen output drifted from infra/helm/crds/";
+    regenHint = "cargo xtask regen crds";
+  };
 
   # infra/eks/generated.auto.tfvars.json must match nix/pins.nix.
-  # Same pattern as crds-drift: regenerate-then-diff. jq on both
-  # sides so key-order and whitespace don't matter (the committed
-  # file is pretty-printed, writeText output is compact).
-  tfvars-fresh =
-    pkgs.runCommand "rio-tfvars-fresh"
-      {
-        nativeBuildInputs = [
-          pkgs.jq
-          pkgs.diffutils
-        ];
-      }
-      ''
-        jq -S . ${config.packages.tfvars} > $TMPDIR/gen
-        jq -S . ${../infra/eks/generated.auto.tfvars.json} > $TMPDIR/committed
-        diff $TMPDIR/gen $TMPDIR/committed || {
-          echo "FAIL: nix/pins.nix drifted from infra/eks/generated.auto.tfvars.json" >&2
-          echo "Run: nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json" >&2
-          exit 1
-        }
-        touch $out
-      '';
+  # jq -S on both sides so key-order and whitespace don't matter
+  # (committed file is pretty-printed, writeText output is compact).
+  tfvars-fresh = mkDriftCheck {
+    name = "tfvars-fresh";
+    nativeBuildInputs = [ pkgs.jq ];
+    generate = ''
+      jq -S . ${config.packages.tfvars} > $TMPDIR/gen
+      jq -S . ${../infra/eks/generated.auto.tfvars.json} > $TMPDIR/committed
+    '';
+    committed = "$TMPDIR/committed";
+    what = "nix/pins.nix drifted from infra/eks/generated.auto.tfvars.json";
+    regenHint = "nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json";
+  };
 }
 # Linux-only checks (dockerTools, nixosSystem). On Darwin
 # miscChecks degrades to the policy checks above.
