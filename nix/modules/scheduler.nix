@@ -13,19 +13,8 @@ in
   options.services.rio.scheduler = {
     enable = lib.mkEnableOption "rio-scheduler DAG-aware build scheduler";
 
-    listenAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:9001";
-      description = "gRPC listen address for SchedulerService + WorkerService (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack (v4-mapped + v6) on Linux's default `bindv6only=0`.";
-    };
-
-    storeAddr = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        rio-store gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
-        Used for scheduler-side cache checks. E.g., `"localhost:9002"`.
-      '';
-    };
+    listenAddr = rioLib.mkListenAddrOption 9001 "gRPC listen address for SchedulerService + WorkerService";
+    storeAddr = rioLib.mkGrpcAddrOption "store" ''Used for scheduler-side cache checks. E.g., `"localhost:9002"`.'';
 
     databaseUrl = lib.mkOption {
       type = lib.types.str;

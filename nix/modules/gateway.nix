@@ -13,27 +13,9 @@ in
   options.services.rio.gateway = {
     enable = lib.mkEnableOption "rio-gateway SSH frontend speaking the Nix worker protocol";
 
-    listenAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:2222";
-      description = "SSH listen address (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack on Linux's default `bindv6only=0`.";
-    };
-
-    schedulerAddr = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        rio-scheduler gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
-        E.g., `"localhost:9001"`.
-      '';
-    };
-
-    storeAddr = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        rio-store gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
-        E.g., `"localhost:9002"`.
-      '';
-    };
+    listenAddr = rioLib.mkListenAddrOption 2222 "SSH listen address";
+    schedulerAddr = rioLib.mkGrpcAddrOption "scheduler" ''E.g., `"localhost:9001"`.'';
+    storeAddr = rioLib.mkGrpcAddrOption "store" ''E.g., `"localhost:9002"`.'';
 
     hostKeyPath = lib.mkOption {
       type = lib.types.path;

@@ -13,11 +13,7 @@ in
   options.services.rio.store = {
     enable = lib.mkEnableOption "rio-store NAR content-addressable store";
 
-    listenAddr = lib.mkOption {
-      type = lib.types.str;
-      default = "[::]:9002";
-      description = "gRPC listen address (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack on Linux's default `bindv6only=0`.";
-    };
+    listenAddr = rioLib.mkListenAddrOption 9002 "gRPC listen address";
 
     databaseUrl = lib.mkOption {
       type = lib.types.str;

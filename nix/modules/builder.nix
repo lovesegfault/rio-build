@@ -24,21 +24,8 @@ in
       '';
     };
 
-    schedulerAddr = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        rio-scheduler gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
-        Worker opens a bidirectional BuildExecution stream at startup.
-      '';
-    };
-
-    storeAddr = lib.mkOption {
-      type = lib.types.str;
-      description = ''
-        rio-store gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
-        FUSE fetches from here; executor uploads outputs via PutPath.
-      '';
-    };
+    schedulerAddr = rioLib.mkGrpcAddrOption "scheduler" "Worker opens a bidirectional BuildExecution stream at startup.";
+    storeAddr = rioLib.mkGrpcAddrOption "store" "FUSE fetches from here; executor uploads outputs via PutPath.";
 
     fuseMountPoint = lib.mkOption {
       type = lib.types.path;

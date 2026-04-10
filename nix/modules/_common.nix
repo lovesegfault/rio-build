@@ -20,6 +20,29 @@ in
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
 
+  # Service listen-address option. `what` is the protocol prefix for
+  # the description (e.g. "SSH listen address", "gRPC listen address").
+  mkListenAddrOption =
+    port: what:
+    lib.mkOption {
+      type = lib.types.str;
+      default = "[::]:${toString port}";
+      description = "${what} (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack on Linux's default `bindv6only=0`.";
+    };
+
+  # Upstream gRPC address option (client side — points at another rio
+  # service). `service` is the target component name; `extra` is the
+  # per-caller usage note appended after the boilerplate first line.
+  mkGrpcAddrOption =
+    service: extra:
+    lib.mkOption {
+      type = lib.types.str;
+      description = ''
+        rio-${service} gRPC address as `host:port` (NOT a URL — main.rs prepends `http://`).
+        ${extra}
+      '';
+    };
+
   # systemd.services.<name> attrset with the boilerplate every rio
   # binary shares: multi-user.target, network-online ordering,
   # RIO_LOG_FORMAT, ExecStart from services.rio.package, Restart=
