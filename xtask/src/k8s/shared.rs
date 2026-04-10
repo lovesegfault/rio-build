@@ -207,13 +207,11 @@ pub struct JwtKeypair {
 }
 
 // r[impl gw.jwt.issue]
-/// Generate or reuse the JWT ed25519 keypair for k3s deploys.
-/// Idempotent: first deploy generates a fresh 32-byte seed; subsequent
-/// deploys read it back from the helm-rendered `rio-jwt-signing` Secret
-/// so tokens stay valid across `xtask k8s deploy` reruns.
-///
-/// EKS skips this — production keys come from AWS Secrets Manager via
-/// ESO (see `external-secrets.yaml`), not xtask.
+/// Generate or reuse the JWT ed25519 keypair. Idempotent: first deploy
+/// generates a fresh 32-byte seed; subsequent deploys read it back from
+/// the helm-rendered `rio-jwt-signing` Secret so tokens stay valid
+/// across `xtask k8s deploy` reruns. Rotation = `kubectl delete secret
+/// rio-jwt-signing` then redeploy.
 ///
 /// Returns the b64 seed + derived b64 pubkey for passing to helm:
 /// `--set jwt.enabled=true --set jwt.signingSeed=<seed> --set jwt.publicKey=<pubkey>`.

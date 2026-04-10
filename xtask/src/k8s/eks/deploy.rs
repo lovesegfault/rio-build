@@ -171,9 +171,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // reuse its seed (idempotent across deploys). Otherwise generate
     // fresh. Seed never touches disk or source — passes via --set,
     // lives only in process memory + the helm release secret (same
-    // trust boundary as the rendered Secret). Derives pubkey here so
-    // operators don't have to compute it offline.
-    let (jwt_seed_b64, jwt_pubkey_b64) = jwt_keypair(&client).await?;
+    // trust boundary as the rendered Secret).
+    let jwt = shared::ensure_jwt_keypair(&client).await?;
 
     // Subchart symlink (same requirement as dev apply).
     ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
@@ -302,8 +301,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("fetcherDefaults.resources.requests.cpu", "2")
             .set("fetcherDefaults.resources.limits.memory", "4Gi")
             .set("jwt.enabled", "true")
-            .set("jwt.signingSeed", &jwt_seed_b64)
-            .set("jwt.publicKey", &jwt_pubkey_b64)
+            .set("jwt.signingSeed", &jwt.seed)
+            .set("jwt.publicKey", &jwt.pubkey)
             // P0539a: ServiceMonitor/PodMonitor/PrometheusRule. CRDs come
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
@@ -330,44 +329,4 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         super::smoke::wait_any_target_healthy(&region)
     })
     .await
-}
-
-/// Read existing JWT signing seed from `rio-jwt-signing` Secret, or
-/// mint a fresh one. Returns `(seed_b64, pubkey_b64)` ready for
-/// `--set jwt.signingSeed=` / `jwt.publicKey=`.
-///
-/// Idempotent: re-deploys reuse the existing seed so in-flight JWTs
-/// stay valid across `xtask k8s deploy` runs. Rotation = `kubectl
-/// delete secret rio-jwt-signing` then redeploy.
-async fn jwt_keypair(client: &kube::Client) -> anyhow::Result<(String, String)> {
-    use base64::Engine;
-    use ed25519_dalek::SigningKey;
-    use k8s_openapi::api::core::v1::Secret;
-
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let api: ::kube::Api<Secret> = ::kube::Api::namespaced(client.clone(), NS);
-
-    let seed: [u8; 32] = match api.get_opt("rio-jwt-signing").await? {
-        Some(s) => {
-            // Secret.data is already base64-decoded by kube-rs (ByteString).
-            // The chart stores the OPERATOR's b64 string as the value (see
-            // jwt-signing-secret.yaml `b64enc` of an already-b64 input),
-            // so decode once more.
-            let inner_b64 = s
-                .data
-                .as_ref()
-                .and_then(|d| d.get("ed25519_seed"))
-                .map(|b| std::str::from_utf8(&b.0).map(|s| s.to_owned()))
-                .ok_or_else(|| anyhow::anyhow!("rio-jwt-signing Secret missing ed25519_seed"))??;
-            let bytes: Vec<u8> = b64.decode(inner_b64.trim())?;
-            bytes
-                .try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("seed is {} bytes, want 32", v.len()))?
-        }
-        None => SigningKey::generate(&mut ssh_key::rand_core::OsRng).to_bytes(),
-    };
-
-    let sk = SigningKey::from_bytes(&seed);
-    let pk = sk.verifying_key();
-    Ok((b64.encode(seed), b64.encode(pk.to_bytes())))
 }
