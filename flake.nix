@@ -913,193 +913,23 @@
           # --------------------------------------------------------------
           # Mutation testing (weekly tier — NOT in .#ci)
           # --------------------------------------------------------------
-          #
-          # cargo-mutants mutates source (swap < for <=, delete a
-          # statement, replace a return with Default::default()),
-          # reruns the test suite, flags mutations that SURVIVE —
-          # code paths the tests don't actually constrain. Tracey
-          # answers "is this spec rule covered"; mutants answers
-          # "does the test that covers it actually catch bugs".
-          #
-          # Scoped via .config/mutants.toml to high-signal targets
-          # (scheduler state machine, wire primitives, ATerm parser,
-          # HMAC verify, manifest encoding — ~320 mutations). Weekly
-          # cron invokes `nix build .#mutants`; survived-count is
-          # diffed week-over-week. Exit 2 (survived) and 3 (timeouts
-          # only) are EXPECTED and swallowed; everything else
-          # propagates. A baseline-health jq gate additionally fails
-          # the derivation if zero mutations were tested. Findings
-          # are a trend metric, not a gate.
-          #
-          # `packages` not `checks` (same as golden-matrix): hours
-          # per run, not something `nix flake check` should touch.
-          #
-          # crate2nix port: cargo-mutants fundamentally needs a
-          # writable cargo workspace (it mutates source in-place and
-          # re-invokes `cargo build` + `cargo nextest run` per
-          # mutation). crate2nix's per-crate-drv model doesn't map to
-          # that workflow — so this derivation BYPASSES crate2nix
-          # entirely and uses the same stdenv.mkDerivation +
-          # importCargoLock + cargoSetupHook pattern as the `deny`
-          # check and nix/fuzz.nix. The vendored dep tree is cached
-          # (same Cargo.lock as the main build), so the only
-          # per-invocation cost is the baseline cargo build +
-          # per-mutation rebuilds — same as it ever was under crane.
-          # No dep-level caching across invocations, but that was true
-          # of crane's buildDepsOnly too (weekly-tier, cold cache each
-          # cron run is acceptable).
-          mutants = pkgs.stdenv.mkDerivation (
-            sysCrateEnv.allEnv
-            // {
-              pname = "rio-mutants";
-              inherit version;
-
-              src = pkgs.lib.fileset.toSource {
-                root = unfilteredRoot;
-                fileset = pkgs.lib.fileset.unions [
-                  workspaceFileset
-                  ./.config/mutants.toml
-                  ./.config/nextest.toml
-                ];
-              };
-
-              cargoDeps = rustPlatformStable.importCargoLock {
-                lockFile = ./Cargo.lock;
-              };
-
-              nativeBuildInputs = with pkgs; [
+          inherit
+            (import ./nix/mutants.nix {
+              inherit
+                pkgs
+                version
+                unfilteredRoot
+                workspaceFileset
                 rustStable
-                rustPlatformStable.cargoSetupHook
-                cargo-mutants
-                cargo-nextest
-                jq
-                pkg-config
-                protobuf
-                cmake
-                # Test-time deps (baseline run hits the whole workspace).
-                # Same set as crateChecks' runtimeTestInputs.
-                inputs.nix.packages.${system}.nix
-                openssh
-                postgresql_18
-              ];
-
-              buildInputs =
-                with pkgs;
-                [
-                  openssl
-                  llvmPackages.libclang.lib
-                ]
-                ++ sysCrateEnv.allLibs;
-
-              # cmake is in nativeBuildInputs for aws-lc-sys's build.rs,
-              # not for this derivation's configurePhase. The cmake setup
-              # hook would otherwise look for CMakeLists.txt at source
-              # root — there isn't one.
-              dontUseCmakeConfigure = true;
-
-              PROTOC = "${pkgs.protobuf}/bin/protoc";
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              PG_BIN = "${pkgs.postgresql_18}/bin";
-              # Golden fixture paths — the baseline run hits
-              # golden_conformance (workspace-wide). `inherit` from
-              # the shared goldenTestEnv attrset so new golden
-              # fixture vars propagate here automatically.
-              inherit (goldenTestEnv)
-                RIO_GOLDEN_TEST_PATH
-                RIO_GOLDEN_CA_PATH
-                RIO_GOLDEN_FORCE_HERMETIC
+                rustPlatformStable
+                sysCrateEnv
+                goldenTestEnv
                 ;
-              NEXTEST_HIDE_PROGRESS_BAR = "1";
-
-              # `--in-place`: mutate the unpacked source in $PWD
-              # (cargoSetupHook unpacks to a writable tmpdir). Cheaper
-              # than the default copy-per-mutation mode when running
-              # inside a throwaway sandbox anyway.
-              #
-              # `--no-shuffle` is the default in current cargo-mutants
-              # but kept explicit for the week-over-week diff guarantee.
-              #
-              # `--output $out`: cargo-mutants creates mutants.out/
-              # INSIDE the given dir, so result/mutants.out/outcomes.json.
-              #
-              # Exit-code contract (mutants.rs/exit-codes.html): 0 = all
-              # caught, 2 = mutants survived (EXPECTED — no codebase is
-              # 100% mutation-killed), 3 = timeouts only, 4 = baseline
-              # failed, 1 = usage/internal error. We swallow only 2 and
-              # 3 (expected non-zero), propagate everything else, AND
-              # belt-and-braces jq-check that the mutation phase
-              # actually ran (non-baseline outcomes > 0).
-              buildPhase = ''
-                runHook preBuild
-                mkdir -p $out
-                cargo mutants \
-                  --in-place --no-shuffle \
-                  --config .config/mutants.toml \
-                  --output $out \
-                  --timeout-multiplier 2.0 \
-                  || { rc=$?; [ $rc -eq 2 ] || [ $rc -eq 3 ] || exit $rc; }
-
-                # Baseline-health gate: if outcomes.json has zero
-                # MUTATION outcomes (everything that isn't the baseline
-                # Success/Failure entry), the baseline failed and the
-                # run is void. Fail loud — cat debug.log so the build
-                # log shows the actual nextest failure. Catches the
-                # case where cargo-mutants exits 0 with an empty
-                # outcomes list (graceful baseline-skip) as well as
-                # the file-missing case (jq → stderr → tested=0).
-                tested=$(jq '[.outcomes[] | select(.summary != "Success" and .summary != "Failure")] | length' \
-                  $out/mutants.out/outcomes.json 2>/dev/null || echo 0)
-                if [ "$tested" -eq 0 ]; then
-                  echo "mutants baseline failed — zero mutations tested" >&2
-                  cat $out/mutants.out/debug.log >&2 2>/dev/null || true
-                  exit 1
-                fi
-                runHook postBuild
-              '';
-
-              installPhase = ''
-                runHook preInstall
-                # Extract caught/missed counts from the JSON outcome
-                # stream for the weekly-diff step. No `|| echo 0`
-                # fallback: the baseline-health gate above already
-                # fails if outcomes.json is missing — a jq failure
-                # here is a real error (malformed JSON).
-                jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/caught-count
-                jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/missed-count
-                runHook postInstall
-              '';
-            }
-          );
-
-          # Smoke check: assert .#mutants produced ≥1 mutation
-          # outcome. Belt-and-braces with the baseline-health gate
-          # inside the mutants derivation itself — if that gate is
-          # accidentally relaxed, this still catches a void run.
-          # NOT in .#ci (transitively builds mutants, hours). The
-          # weekly cron sequences `nix build .#mutants .#mutants-smoke`
-          # — nix substitutes the mutants output from cache if already
-          # built, so the smoke check adds O(seconds).
-          mutants-smoke =
-            pkgs.runCommand "mutants-smoke"
-              {
-                nativeBuildInputs = [ pkgs.jq ];
-              }
-              ''
-                tested=$(jq '[.outcomes[] | select(.summary != "Success" and .summary != "Failure")] | length' \
-                  ${mutants}/mutants.out/outcomes.json)
-                echo "mutants-smoke: $tested mutations tested" >&2
-                if [ "$tested" -eq 0 ]; then
-                  echo "FAIL: mutants baseline failed — zero mutations tested" >&2
-                  cat ${mutants}/mutants.out/debug.log >&2 2>/dev/null || true
-                  exit 1
-                fi
-                caught=$(cat ${mutants}/caught-count)
-                missed=$(cat ${mutants}/missed-count)
-                echo "mutants-smoke: caught=$caught missed=$missed" >&2
-                echo "$tested" > $out
-              '';
+              nixPkg = inputs.nix.packages.${system}.nix;
+            })
+            mutants
+            mutants-smoke
+            ;
 
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
@@ -1226,150 +1056,11 @@
                 excludes = [ "^Cargo\\.json$" ];
               };
               check-merge-conflicts.enable = true;
-
-              # Reject commits containing cargo-mutants dirty markers.
-              # `cargo xtask mutants` mutates source in-place; if it crashes or is
-              # interrupted, the mutated line (with `/* ~ changed by
-              # cargo-mutants ~ */`) survives in the worktree. A blind
-              # commit then ships a mutant. The marker string is reliable
-              # — cargo-mutants always wraps its mutations with it.
-              check-mutants-marker = {
-                enable = true;
-                name = "check-mutants-marker";
-                entry = toString (
-                  pkgs.writeShellScript "check-mutants-marker" ''
-                    # Marker verified for cargo-mutants 26.2.0 —
-                    # MUTATION_MARKER_COMMENT const at src/mutate.rs
-                    # upstream. If a cargo-mutants bump changes the
-                    # marker string, this hook SILENTLY passes —
-                    # re-verify on major-version bumps.
-                    # Only scan .rs files (cargo-mutants only touches Rust).
-                    # grep -l for file-list, exit 1 if any match.
-                    if git diff --cached --name-only -- '*.rs' \
-                       | xargs -r grep -l 'changed by cargo-mutants' 2>/dev/null \
-                       | grep -q .; then
-                      echo 'error: cargo-mutants marker found in staged .rs files'
-                      echo 'cargo-mutants left a dirty mutation — `git checkout -- <file>` to revert'
-                      git diff --cached --name-only -- '*.rs' \
-                        | xargs -r grep -l 'changed by cargo-mutants' 2>/dev/null
-                      exit 1
-                    fi
-                  ''
-                );
-                files = "\\.rs$";
-                language = "system";
-                pass_filenames = false;
-              };
-
               end-of-file-fixer.enable = true;
               trim-trailing-whitespace.enable = true;
               deadnix.enable = true;
               nil.enable = true;
               statix.enable = true;
-
-              # Reject commits that change a query! SQL string without
-              # regenerating .sqlx/. With SQLX_OFFLINE=true, any query!
-              # whose SQL hash no longer matches a .sqlx/*.json file
-              # fails to compile — so `cargo check` on the crates that
-              # use query! is the definitive staleness check. ~5s
-              # incremental. Fires only on .rs changes to skip docs-only
-              # commits. CI (`.#ci`) catches the same failure via the
-              # clippy/nextest builds, so this hook is dev-ergonomics:
-              # fail at commit time instead of 10min later.
-              sqlx-prepare-check = {
-                enable = true;
-                name = "sqlx-prepare-check";
-                entry = toString (
-                  pkgs.writeShellScript "sqlx-prepare-check" ''
-                    # Only check if any staged .rs file touches a query! macro.
-                    # Otherwise this is a no-op (e.g. pure-refactor commits
-                    # that don't change SQL).
-                    if git diff --cached --name-only -- '*.rs' \
-                       | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
-                       | grep -q .; then
-                      SQLX_OFFLINE=true cargo check --quiet -p rio-scheduler -p rio-store \
-                        || { echo 'sqlx query cache stale — run `cargo xtask regen sqlx`'; exit 1; }
-                    fi
-                  ''
-                );
-                files = "\\.rs$";
-                language = "system";
-                pass_filenames = false;
-              };
-
-              # Reject commits that change Cargo.toml/Cargo.lock without
-              # regenerating Cargo.json. crate2nix reads Cargo.lock to
-              # produce the per-crate build graph; a stale Cargo.json
-              # means nix builds use the OLD dep set while cargo uses
-              # the new one — silent divergence until a nix-only build
-              # fails with "crate foo not found". File-gated on
-              # Cargo.toml/Cargo.lock so unrelated commits don't pay
-              # the ~10s regeneration cost.
-              crate2nix-check = {
-                enable = true;
-                name = "crate2nix-check";
-                entry = toString (
-                  pkgs.writeShellScript "crate2nix-check" ''
-                    set -euo pipefail
-                    # Gate on staged Cargo.{toml,lock}. In the hermetic
-                    # check derivation (pre-commit run --all-files on a
-                    # clean checkout), nothing is staged → no-op. This
-                    # also keeps the hook off the hot path for commits
-                    # that don't touch the dep graph.
-                    if ! git diff --cached --name-only \
-                       | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
-                      exit 0
-                    fi
-                    tmp=$(mktemp -d)
-                    trap 'rm -rf "$tmp"; rm -f Cargo.json.check' EXIT
-                    # Snapshot Cargo.lock — `cargo metadata` inside
-                    # crate2nix can bump transitive deps if the local
-                    # cache is cold. Restore afterward so the check
-                    # has no side effects.
-                    cp Cargo.lock "$tmp/Cargo.lock.orig"
-                    # Generate in workspace root — crate2nix emits path
-                    # fields relative to the output file's directory, so
-                    # -o $tmp/... would produce ../../root/... paths that
-                    # never match the committed Cargo.json.
-                    ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check 2>/dev/null
-                    echo >> Cargo.json.check  # match end-of-file-fixer
-                    cp "$tmp/Cargo.lock.orig" Cargo.lock
-                    if ! diff -q Cargo.json Cargo.json.check >/dev/null; then
-                      echo 'error: Cargo.json is stale — run `cargo xtask regen cargo-json`'
-                      exit 1
-                    fi
-                  ''
-                );
-                files = "(^|/)Cargo\\.(toml|lock)$";
-                language = "system";
-                pass_filenames = false;
-              };
-
-              # Reject commits that change Cargo.toml/Cargo.lock without
-              # regenerating workspace-hack. A stale workspace-hack means
-              # per-package builds use a different feature set than the
-              # workspace build → cache thrash. `hakari verify` is fast
-              # (metadata-only, no compile).
-              hakari-check = {
-                enable = true;
-                name = "hakari-check";
-                entry = toString (
-                  pkgs.writeShellScript "hakari-check" ''
-                    set -euo pipefail
-                    if ! git diff --cached --name-only \
-                       | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
-                      exit 0
-                    fi
-                    ${pkgs.cargo-hakari}/bin/cargo-hakari hakari verify 2>/dev/null || {
-                      echo 'error: workspace-hack is stale — run `cargo xtask regen hakari`'
-                      exit 1
-                    }
-                  ''
-                );
-                files = "(^|/)Cargo\\.(toml|lock)$";
-                language = "system";
-                pass_filenames = false;
-              };
 
               # No kubeconform hook: it fetches ~300MB of schemas from
               # raw.githubusercontent.com at runtime, which fails in the
@@ -1379,165 +1070,27 @@
               #     | kubeconform -strict -skip CustomResourceDefinition,Certificate,...
               # The helm-lint flake check above catches template syntax
               # errors without network.
-            };
+            }
+            # Custom writeShellScript hooks (check-mutants-marker,
+            # sqlx-prepare-check, crate2nix-check, hakari-check).
+            // import ./nix/pre-commit-hooks.nix { inherit pkgs crate2nixCli; };
           };
 
           # --------------------------------------------------------------
-          # Dev shells
+          # Dev shells (extracted to nix/devshell.nix)
           # --------------------------------------------------------------
-          #
-          # Default = nightly so `cargo fuzz run` works out of the box.
-          # CI builds use stable (rustStable via crate2nix), so if you
-          # write nightly-only code, checks.clippy / checks.nextest will
-          # catch it.
-          #
-          # Use `nix develop .#stable` for strict CI-parity dev.
-          devShells =
-            let
-              shellPackages = with pkgs; [
-                # Cargo tools
-                cargo-edit
-                cargo-expand
-                cargo-fuzz # works in default (nightly) shell; errors on stable
-                cargo-hakari # workspace-hack regen — `cargo xtask regen hakari`
-                cargo-mutants # weekly tier — see `cargo xtask mutants` / `.#mutants`
-                cargo-nextest
-                cargo-outdated
-                cargo-watch
-
-                # Debugging tools
-                lldb
-                gdb
-                lcov # `lcov --summary`/`--list` on the coverage output
-                stress-ng # flake-repro under load (.claude/rules/ci-failure-patterns.md)
-
-                # Documentation
-                mdbook
-                mdbook-mermaid
-
-                # Integration test deps
-                postgresql_18
-                sqlx-cli # `cargo xtask regen sqlx` + `cargo sqlx migrate`
-
-                # Local dev stack (`process-compose up`)
-                process-compose
-
-                # Formatting (nix fmt also works, but direct treefmt is handy)
-                config.treefmt.build.wrapper
-
-                # Spec-coverage: `tracey query validate`, `tracey web`
-                traceyPkg
-
-                # crate2nix CLI for regenerating Cargo.json after
-                # Cargo.lock changes. PoC — see
-                # .claude/notes/crate2nix-migration-assessment.md.
-                crate2nixCli
-
-                # Dashboard dev: `pnpm install --lockfile-only` (hash bumps),
-                # `pnpm run dev` (vite dev server with Envoy proxy). Proto
-                # stubs regen: `cd rio-dashboard && buf generate --template
-                # buf.gen.yaml ../rio-proto/proto` (src/gen/ is gitignored).
-                nodejs
-                pnpm_10
-                buf
-                protoc-gen-es
-
-                # Deploy tooling for infra/eks/. Large closures (awscli2
-                # pulls python3 + botocore) but the user asked for
-                # everything-in-one-shell over a separate .#deploy.
-                # Scripts under infra/eks/ also carry nix-shell shebangs
-                # pointing at these same packages, so they work even if
-                # someone runs them outside `nix develop`.
-                awscli2
-                coldsnap # cargo xtask k8s -p eks ami push — direct-to-EBS-snapshot upload (ADR-021)
-                ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
-                lsof # cargo xtask k8s rsb — reap stale tunnel listeners on :2222
-                # opentofu (not terraform: BSL license → unfree in nixpkgs)
-                # with providers bundled via withPlugins. No `tofu init`
-                # download step — providers are in the nix store, pinned by
-                # nixpkgs rev. .terraform.lock.hcl is gitignored (nix is the
-                # lock). The provider set must cover transitive module deps
-                # too (EKS module pulls cloudinit + null).
-                (opentofu.withPlugins (p: [
-                  p.hashicorp_aws
-                  p.hashicorp_helm
-                  p.hashicorp_kubernetes
-                  p.hashicorp_random
-                  p.hashicorp_tls
-                  p.hashicorp_time
-                  p.hashicorp_cloudinit # transitive: terraform-aws-modules/eks
-                  p.hashicorp_null # transitive: terraform-aws-modules/eks
-                ]))
-                kubectl
-                skopeo # cargo xtask k8s push -p eks — docker-archive → ECR
-                manifest-tool # cargo xtask k8s push -p eks — multi-arch OCI index
-                kubernetes-helm
-                kubeconform # ad-hoc schema validation (no pre-commit hook — fetches 300MB, sandbox blocks)
-                yq-go # nix/helm-render.nix
-                grpcurl # manual AdminService poking when rio-cli isn't enough
-                openssl # openssl rand 32 → HMAC key
-                git
-
-                # cargo xtask regen crds → scripts/split-crds.py
-                (python3.withPackages (ps: [ ps.pyyaml ]))
-              ];
-              # Shared mkShell builder. Lists build deps explicitly
-              # (openssl, libclang, sys-crate libs for pkg-config
-              # probes, protobuf+cmake for rio-proto's codegen).
-              mkRioShell =
-                rust:
-                (pkgs.mkShell.override {
-                  # mold via cc-wrapper: rustc's linker is `cc`, so this
-                  # speeds dev-loop relinks without touching RUSTFLAGS
-                  # (shared build-dir fingerprints stay valid). crate2nix
-                  # uses its own stdenv — `nix build` stays on GNU ld.
-                  stdenv = if pkgs.stdenv.isLinux then pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv else pkgs.stdenv;
-                })
-                  (
-                    sysCrateEnv.allEnv
-                    // {
-                      packages = [ rust ] ++ shellPackages;
-                      nativeBuildInputs = with pkgs; [
-                        pkg-config
-                        protobuf
-                        cmake
-                      ];
-                      buildInputs =
-                        with pkgs;
-                        [
-                          openssl
-                          llvmPackages.libclang.lib
-                        ]
-                        ++ sysCrateEnv.allLibs;
-                      RUST_BACKTRACE = "1";
-                      PROTOC = "${pkgs.protobuf}/bin/protoc";
-                      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-                      PG_BIN = "${pkgs.postgresql_18}/bin";
-                      # sqlx query! macros read .sqlx/ instead of connecting
-                      # to PG. `cargo build` works without a live DB.
-                      # `cargo xtask regen sqlx` unsets this locally to regenerate.
-                      SQLX_OFFLINE = "true";
-                      RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
-                      # Repo-local kubeconfig: xtask k8s writes here, so
-                      # direct kubectl/helm in the shell hits the same
-                      # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
-                      shellHook = ''
-                        export KUBECONFIG="$PWD/.kube/config"
-                        # Shared intermediate build cache across all worktrees
-                        # (~/src/rio-build/*). Per-worktree target/ keeps only
-                        # final artifacts. Fine-grain locking (nightly; ignored
-                        # on stable) lets concurrent `cargo check` run lock-free.
-                        export CARGO_BUILD_BUILD_DIR="''${CARGO_BUILD_BUILD_DIR:-$HOME/.cache/rio-build/build}"
-                        export CARGO_UNSTABLE_FINE_GRAIN_LOCKING=true
-                        ${config.pre-commit.installationScript}
-                      '';
-                    }
-                  );
-            in
-            {
-              default = mkRioShell rustNightly;
-              stable = mkRioShell rustStable;
-            };
+          devShells = import ./nix/devshell.nix {
+            inherit
+              pkgs
+              rustStable
+              rustNightly
+              sysCrateEnv
+              traceyPkg
+              crate2nixCli
+              ;
+            treefmtWrapper = config.treefmt.build.wrapper;
+            preCommitInstall = config.pre-commit.installationScript;
+          };
 
           # --------------------------------------------------------------
           # Packages
