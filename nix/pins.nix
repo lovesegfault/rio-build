@@ -31,11 +31,13 @@
   # the EKS module's karpenter submodule compat range (~> 21.0).
   karpenter_version = "1.10.0";
 
-  # NixOS node AMI kernel minor (ADR-021). String form ("6_18") so
+  # NixOS node AMI kernel minor (ADR-021). String form ("6_19") so
   # minimal.nix can do `pkgs."linuxPackages_${node_kernel_minor}"`.
   # Pinned (not linuxPackages_latest) so a nixpkgs flake-input bump
   # can't surprise-rebuild the ~40min kernel derivation.
-  node_kernel_minor = "6_18";
+  # 6.18 EOL; 6.19 still carries e1b849cfa6b6 cgwb WARN-then-free (no
+  # upstream fix yet) — see Q-CGWB.
+  node_kernel_minor = "6_19";
 
   # awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
   # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —

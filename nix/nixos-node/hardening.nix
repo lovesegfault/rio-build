@@ -45,6 +45,14 @@
       "panic_on_oops=1"
     ];
 
+    # kdump: the cgwb_release panic above was preceded by a [W]-taint
+    # WARN whose backtrace would identify which path leaves switch_work
+    # pending — but EC2 console-output's ring buffer kept only 63 lines,
+    # losing it. crashDump (kexec into a capture kernel) writes the full
+    # dmesg + vmcore to /var/crash so an upstream report has the trace
+    # it needs to be actionable.
+    crashDump.enable = true;
+
     # ── kernel config (P3, baked now since the AMI is rebuilding) ─────
     # EROFS_FS_ONDEMAND + CACHEFILES_ONDEMAND: the per-page FUSE / riofs
     # track. NETFS_SUPPORT is the dependency CACHEFILES selects upstream;
