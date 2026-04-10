@@ -176,48 +176,6 @@ impl NarInfo {
         })
     }
 
-    /// Serialize to narinfo text format.
-    ///
-    /// Used by rio-store's `substitute.rs` (sig-append round-trip) and
-    /// the gateway's `wopQueryPathInfo` reply path; also serves as the
-    /// parse↔serialize roundtrip oracle in this crate's proptests.
-    pub fn serialize(&self) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-
-        writeln!(out, "StorePath: {}", self.store_path).unwrap();
-        writeln!(out, "URL: {}", self.url).unwrap();
-        writeln!(out, "Compression: {}", self.compression).unwrap();
-        if let Some(ref fh) = self.file_hash {
-            writeln!(out, "FileHash: {fh}").unwrap();
-        }
-        if let Some(fs) = self.file_size {
-            writeln!(out, "FileSize: {fs}").unwrap();
-        }
-        writeln!(out, "NarHash: {}", self.nar_hash).unwrap();
-        writeln!(out, "NarSize: {}", self.nar_size).unwrap();
-
-        if self.references.is_empty() {
-            writeln!(out, "References:").unwrap();
-        } else {
-            writeln!(out, "References: {}", self.references.join(" ")).unwrap();
-        }
-
-        if let Some(ref d) = self.deriver {
-            writeln!(out, "Deriver: {d}").unwrap();
-        }
-
-        for sig in &self.sigs {
-            writeln!(out, "Sig: {sig}").unwrap();
-        }
-
-        if let Some(ref c) = self.ca {
-            writeln!(out, "CA: {c}").unwrap();
-        }
-
-        out
-    }
-
     /// Verify that at least one `Sig:` entry is signed by a trusted key.
     ///
     /// `trusted_keys` is a slice of `name:base64(pubkey)` strings —
@@ -370,6 +328,7 @@ pub fn fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // ========================================================================
     // fingerprint()
@@ -563,36 +522,6 @@ References:
     }
 
     #[test]
-    fn missing_store_path() {
-        let text = "\
-URL: nar/abc.nar.zst
-Compression: zstd
-NarHash: sha256:0000
-NarSize: 100
-References:
-";
-        assert!(matches!(
-            NarInfo::parse(text),
-            Err(NarInfoError::MissingField("StorePath"))
-        ));
-    }
-
-    #[test]
-    fn missing_nar_hash() {
-        let text = "\
-StorePath: /nix/store/abc-test
-URL: nar/abc.nar.zst
-Compression: zstd
-NarSize: 100
-References:
-";
-        assert!(matches!(
-            NarInfo::parse(text),
-            Err(NarInfoError::MissingField("NarHash"))
-        ));
-    }
-
-    #[test]
     fn invalid_nar_size() {
         let text = "\
 StorePath: /nix/store/abc-test
@@ -608,64 +537,32 @@ References:
         ));
     }
 
-    #[test]
-    fn duplicate_field() {
-        let text = "\
-StorePath: /nix/store/abc-test
-StorePath: /nix/store/def-test
-URL: nar/abc.nar.zst
-Compression: zstd
-NarHash: sha256:0000
-NarSize: 100
-References:
-";
-        assert!(matches!(
-            NarInfo::parse(text),
-            Err(NarInfoError::DuplicateField(_))
-        ));
-    }
-
-    #[test]
-    fn duplicate_deriver() {
-        let text = "\
-StorePath: /nix/store/abc-test
-URL: nar/abc.nar.zst
-Compression: zstd
-NarHash: sha256:0000
-NarSize: 100
-References:
-Deriver: first.drv
-Deriver: second.drv
-";
-        assert!(matches!(
-            NarInfo::parse(text),
-            Err(NarInfoError::DuplicateField(_))
-        ));
-    }
-
-    #[test]
-    fn serialize_omits_empty_optional_fields() -> anyhow::Result<()> {
-        let info = NarInfo {
-            store_path: "/nix/store/abc-test".into(),
-            url: "nar/abc.nar.zst".into(),
-            compression: "none".into(),
-            nar_hash: "sha256:0000".into(),
-            nar_size: 100,
-            references: vec![],
-            deriver: None,
-            sigs: vec![],
-            ca: None,
-            file_hash: None,
-            file_size: None,
-        };
-
-        let text = info.serialize();
-        assert!(!text.contains("Deriver:"));
-        assert!(!text.contains("Sig:"));
-        assert!(!text.contains("CA:"));
-        assert!(!text.contains("FileHash:"));
-        assert!(!text.contains("FileSize:"));
-        Ok(())
+    /// All set-once fields reject a second occurrence with
+    /// `DuplicateField(<name>)`. Builds a valid base text then appends a
+    /// second copy of one line.
+    #[rstest]
+    #[case("StorePath", "StorePath: /nix/store/def-test")]
+    #[case("Deriver", "Deriver: second.drv")]
+    #[case("CA", "CA: fixed:sha256:second")]
+    #[case("FileHash", "FileHash: sha256:second")]
+    fn duplicate_field_rejected(#[case] field: &str, #[case] dup_line: &str) {
+        let text = format!(
+            "StorePath: /nix/store/abc-test\n\
+             URL: nar/abc.nar.zst\n\
+             Compression: zstd\n\
+             NarHash: sha256:0000\n\
+             NarSize: 100\n\
+             References:\n\
+             Deriver: first.drv\n\
+             CA: fixed:sha256:first\n\
+             FileHash: sha256:first\n\
+             {dup_line}\n"
+        );
+        let err = NarInfo::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, NarInfoError::DuplicateField(f) if f == field),
+            "expected DuplicateField({field:?}), got: {err:?}"
+        );
     }
 
     #[test]
@@ -740,72 +637,6 @@ FileSize: 54321
     }
 
     #[test]
-    fn test_roundtrip_narinfo() -> anyhow::Result<()> {
-        let original = NarInfo {
-            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-roundtrip".into(),
-            url: "nar/roundtrip.nar.zst".into(),
-            compression: "zstd".into(),
-            nar_hash: "sha256:abcdef0123456789".into(),
-            nar_size: 42000,
-            references: vec![
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1".to_string(),
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2".to_string(),
-            ],
-            deriver: Some("cccccccccccccccccccccccccccccccc-roundtrip.drv".into()),
-            sigs: vec![
-                "test-key-1:sigdata1==".into(),
-                "test-key-2:sigdata2==".into(),
-            ],
-            ca: Some("fixed:sha256:cafef00d".into()),
-            file_hash: Some("sha256:compressed123".into()),
-            file_size: Some(8000),
-        };
-
-        let serialized = original.serialize();
-        let reparsed = NarInfo::parse(&serialized)?;
-
-        // PartialEq covers all 11 fields.
-        assert_eq!(original, reparsed);
-        Ok(())
-    }
-
-    #[test]
-    fn test_duplicate_ca_rejected() {
-        let text = "\
-StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
-URL: nar/test.nar.zst
-Compression: zstd
-NarHash: sha256:abc123
-NarSize: 12345
-CA: fixed:sha256:first
-CA: fixed:sha256:second
-";
-        let err = NarInfo::parse(text).unwrap_err();
-        assert!(
-            matches!(err, NarInfoError::DuplicateField(f) if f == "CA"),
-            "expected DuplicateField(\"CA\"), got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_file_hash_rejected() {
-        let text = "\
-StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
-URL: nar/test.nar.zst
-Compression: zstd
-NarHash: sha256:abc123
-NarSize: 12345
-FileHash: sha256:first
-FileHash: sha256:second
-";
-        let err = NarInfo::parse(text).unwrap_err();
-        assert!(
-            matches!(err, NarInfoError::DuplicateField(f) if f == "FileHash"),
-            "expected DuplicateField(\"FileHash\"), got: {err:?}"
-        );
-    }
-
-    #[test]
     fn test_missing_required_fields() {
         // Base narinfo text with all required fields present.
         let base_lines = [
@@ -831,66 +662,6 @@ FileHash: sha256:second
                 matches!(err, NarInfoError::MissingField(f) if f == *omit),
                 "omitting {omit}: expected MissingField(\"{omit}\"), got: {err:?}"
             );
-        }
-    }
-
-    mod proptests {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            #![proptest_config(ProptestConfig::with_cases(4096))]
-            #[test]
-            fn narinfo_builder_roundtrip(
-                hash_suffix in "[a-z0-9]{32}",
-                pkg_name in "[a-z][a-z0-9-]{0,10}",
-                url_name in "[a-z0-9]{1,20}",
-                compression in prop_oneof!["zstd", "xz", "bzip2", "none"],
-                nar_hash_hex in "[a-f0-9]{64}",
-                nar_size in any::<u64>(),
-                ref_count in 0_usize..4,
-                ref_hashes in proptest::collection::vec("[a-z0-9]{32}", 4),
-                ref_names in proptest::collection::vec("[a-z][a-z0-9-]{0,8}", 4),
-                has_deriver in any::<bool>(),
-                drv_hash in "[a-z0-9]{32}",
-                drv_name in "[a-z][a-z0-9-]{0,8}",
-                sig_count in 0_usize..3,
-                sig_keys in proptest::collection::vec("[a-z.-]{1,15}", 3),
-                sig_datas in proptest::collection::vec("[a-zA-Z0-9+/]{8,20}={0,2}", 3),
-                has_ca in any::<bool>(),
-                ca_hash in "[a-f0-9]{64}",
-                has_file_hash in any::<bool>(),
-                file_hash_hex in "[a-f0-9]{64}",
-                file_size_val in any::<u64>(),
-            ) {
-                let store_path = format!("/nix/store/{hash_suffix}-{pkg_name}");
-                let url = format!("nar/{url_name}.nar.{compression}");
-                let nar_hash = format!("sha256:{nar_hash_hex}");
-
-                let refs: Vec<String> = (0..ref_count)
-                    .map(|i| format!("{}-{}", ref_hashes[i], ref_names[i]))
-                    .collect();
-
-                let original = NarInfo {
-                    store_path,
-                    url,
-                    compression: compression.clone(),
-                    nar_hash,
-                    nar_size,
-                    references: refs,
-                    deriver: has_deriver.then(|| format!("{drv_hash}-{drv_name}.drv")),
-                    sigs: (0..sig_count)
-                        .map(|i| format!("{}:{}", sig_keys[i], sig_datas[i]))
-                        .collect(),
-                    ca: has_ca.then(|| format!("fixed:sha256:{ca_hash}")),
-                    file_hash: has_file_hash.then(|| format!("sha256:{file_hash_hex}")),
-                    file_size: has_file_hash.then_some(file_size_val),
-                };
-                let serialized = original.serialize();
-                let reparsed = NarInfo::parse(&serialized)?;
-
-                prop_assert_eq!(&original, &reparsed);
-            }
         }
     }
 
