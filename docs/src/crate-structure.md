@@ -37,7 +37,7 @@ graph TD
     rio-proto["rio-proto<br/>(gRPC definitions)"]
     rio-crds["rio-crds<br/>(k8s CRD types)"]
     rio-test-support["rio-test-support<br/>(PG, mock gRPC, wire)"]
-    rio-store["rio-store<br/>(CAS, binary cache)"]
+    rio-store["rio-store<br/>(chunked CAS)"]
     rio-scheduler["rio-scheduler<br/>(DAG, scheduling)"]
     rio-gateway["rio-gateway<br/>(SSH, protocol handler)"]
     rio-builder["rio-builder<br/>(executor, FUSE, overlay)"]

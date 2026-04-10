@@ -8,7 +8,7 @@ rio-build is composed of seven main components, each a dedicated workspace crate
 | [rio-scheduler](./components/scheduler.md) | DAG-aware build scheduler (leader-elected, streaming assignment) |
 | [rio-builder](./components/builder.md) | Build executor with FUSE store, per-build overlay + synthetic SQLite DB |
 | [rio-fetcher](./components/fetcher.md) | FOD-only executor (same binary, egress-open, hash-checked) |
-| [rio-store](./components/store.md) | Chunked CAS with inline fast-path, binary cache server |
+| [rio-store](./components/store.md) | Chunked CAS with inline fast-path |
 | [rio-controller](./components/controller.md) | Kubernetes operator (CRDs, autoscaling, RBAC, lifecycle) |
 | [rio-proto](./components/proto.md) | gRPC service definitions (internal + external APIs) |
 | [rio-dashboard](./components/dashboard.md) | Web dashboard (TypeScript SPA, Phase 5) |

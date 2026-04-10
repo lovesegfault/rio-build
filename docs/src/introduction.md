@@ -58,7 +58,7 @@ Builder pods run with `privileged: false` by default (device plugin +
 |------|----------|---------------------------|
 | **Hydra** | Eval + build + cache | rio-build replaces the build execution and binary cache layers; an external eval orchestrator replaces the eval layer |
 | **Tvix** | Nix reimplementation | Influenced rio-store's CAS design (MIT protobuf refs). Different goals: tvix is a Nix replacement, rio-build is a build backend |
-| **Attic** | Binary cache | rio-store subsumes Attic's functionality (chunked CAS + binary cache HTTP). If you only need a cache, Attic is simpler |
+| **Attic** | Binary cache | rio-store's chunked CAS overlaps Attic's storage design. rio does not serve the HTTP binary-cache protocol; if you only need a substituter, use Attic |
 | **Cachix / Garnix** | Managed CI/cache | SaaS alternatives. rio-build is for self-hosted deployments |
 | **GitHub Actions + Nix** | CI with Nix | The "wrap existing CI" approach. rio-build offers better scheduling but higher operational cost |
 | **ofborg** | Nixpkgs CI | Specialized for nixpkgs PR review. rio-build could serve as ofborg's build execution backend |

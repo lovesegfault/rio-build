@@ -505,7 +505,7 @@ Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/r
 |---|---|---|
 | `rio-gateway` | LoadBalancer or NodePort | SSH ingress for `nix copy` / `nix build --store ssh://` |
 | `rio-scheduler` | ClusterIP | Internal gRPC for executors, gateway, and controller |
-| `rio-store` | ClusterIP + optional Ingress | gRPC for internal components; HTTP for binary cache serving |
+| `rio-store` | ClusterIP | gRPC for internal components |
 
 ## Health Probes
 

@@ -122,9 +122,6 @@ kubectl -n rio-system rollout restart deployment/rio-gateway
 
 # 3. Build a simple package (Service maps external port 22 → container 2222)
 nix build --store "ssh-ng://rio@rio-gateway.example.com?ssh-key=$HOME/.ssh/rio_key" nixpkgs#hello
-
-# 4. Verify binary cache
-curl -s https://rio-cache.example.com/nix-cache-info
 ```
 
 For a complete scripted walkthrough against EKS, run `cargo xtask k8s smoke -p eks`.
