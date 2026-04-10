@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0584 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
+**Plan-number range:** P0541–P0585 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
@@ -128,6 +128,7 @@ P0552 GetNarIndex + indexer_loop  │                   │                     
    │                              │                                              └─► P0581 compat GC ──► P0582 compat reconciler
    │                              │             P0583 drop inline_blob (one code path; chunk_backend required)
    │                              │             P0584 builder-chunked-only auth gate (token role=builder → PutPath PERMISSION_DENIED)
+   │                              │             P0585 Express eviction sweeper (per-AZ Lease; size-bounded MRU; lifecycle as defense-in-depth)
    │                              │
 ┌── Phase 4 composefs store-side (gated on Phase-0 + P0546) ──┐
 P0556 composefs-sys + encode.rs (libcomposefs FFI; nix-patched user.* + no-root-whiteouts) + golden VM
@@ -218,7 +219,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 |---|---|
 | `docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md` | merge `adr-022` (refocused §2 Design / §3 Alternatives). Carries 13 markers: `r[builder.fs.{composefs-stack, userxattr-mount, stub-isize, metacopy-xattr-shape, fd-handoff-ordering, digest-fuse-open, passthrough-on-hit, passthrough-stack-depth, shared-backing-cache, file-digest-integrity, streaming-open-threshold}]` + `r[builder.mountd.{promote-verified, orphan-scan}]`. |
 | `docs/src/decisions/022-design-overview.md` | merge `adr-022`. Canonical design reference. |
-| `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one S3 Express One Zone directory bucket per AZ** is a disposable read-through cache. Both tiers are `S3ChunkBackend` instances; `put` = remote sync + local async; `get` = local → remote fallback + write-through. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3 standard, not service outage; rollback `kind=s3` is instant + lossless. Records FSx-for-Lustre as the considered alternative. Carries `r[infra.express.cache-tier]`. |
+| `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one S3 Express One Zone directory bucket per AZ** is a disposable read-through cache. Both tiers are `S3ChunkBackend` instances; `put` = remote only (S3-standard); `get` = local → remote fallback + write-through; Express fills via read-through only. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3 standard, not service outage; rollback `kind=s3` is instant + lossless. Records FSx-for-Lustre as the considered alternative. Carries `r[infra.express.cache-tier]`. |
 | `docs/src/components/store.md` | append §"NAR index" (incl. `file_digest`) + §"Tiered chunk backend" + §"BlobService" + §"Binary-cache compatibility layer" (`r[store.compat.*]`) |
 | `docs/src/components/builder.md` | **rewrite** §"FUSE Store" → §"composefs lazy lower" + §"digest-FUSE handler" + §"rio-mountd" (delete pre-ADR-022 whole-path FUSE description) |
 | `docs/src/components/gateway.md` | append `r[gw.substitute.dag-delta-sync]` spec text |
@@ -343,7 +344,7 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 
 | File | Change |
 |---|---|
-| `infra/eks/s3-express.tf` | `resource "aws_s3_directory_bucket" "cache" { for_each = toset(local.express_az_ids); bucket = "rio-chunk-cache--${each.key}--x-s3"; location { name = each.key; type = "AvailabilityZone" } }`; IAM policy `s3express:CreateSession` + `s3express:*` attached to the store IRSA role. `// r[impl infra.express.cache-tier]` |
+| `infra/eks/s3-express.tf` | `resource "aws_s3_directory_bucket" "cache" { for_each = toset(local.express_az_ids); bucket = "rio-chunk-cache--${each.key}--x-s3"; location { name = each.key; type = "AvailabilityZone" } }`; IAM policy `s3express:CreateSession` + `s3express:*` attached to the store IRSA role. **Lifecycle (defense-in-depth, age-based — directory buckets [support expiration only](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-objects-lifecycle.html), not size targets):** `aws_s3_bucket_lifecycle_configuration` with `expiration { days = 30 }` + bucket policy allowing `lifecycle.s3.amazonaws.com` `s3express:CreateSession` `SessionMode=ReadWrite`. The size-target sweep is P0585. `// r[impl infra.express.cache-tier]` |
 | `infra/eks/outputs.tf` | `express_bucket_by_az_id` map for helm |
 | `infra/eks/variables.tf` | `express_az_ids` — intersection of subnet zone-ids with the Express-supported set; empty list → cache tier disabled cluster-wide |
 
@@ -426,6 +427,17 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 | tests | unit: builder-role token → `PutPath` returns `PERMISSION_DENIED`; gateway-role token → `PutPath` proceeds; builder-role token → `PutPathChunked` proceeds. `// r[verify store.put.builder-chunked-only]` |
 | `docs/src/security.md` | assignment-token section: document `role` claim |
 **Exit:** `.#ci` green.
+
+### P0585 — Express eviction sweeper (size-bounded MRU)
+**Crate:** `rio-store, infra` · **Deps:** P0548, P0554 · **Complexity:** LOW
+| File | Change |
+|---|---|
+| `rio-store/src/backend/express_sweep.rs` | new — `async fn sweep_loop(cfg, s3_express, lease)`. Per-AZ k8s Lease `rio-store-express-sweep-{az_id}` (rio-store has no leader election today; reuse `kube-leader-election` crate the scheduler already uses). Loop every `sweep_interval_secs`: `ListObjectsV2` (paginated; sum `Size`, collect `(Key, LastModified, Size)` — at 8 TiB / 64 KiB avg ≈ 130M objects, ~1000-key pages ≈ 130K requests, ~10 min list at 200 req/s; acceptable hourly); set `rio_store_express_bytes{az_id}` gauge. If total > `target_bytes × evict_high_watermark`: sort by `LastModified` asc, `DeleteObjects` (batch 1000) oldest until under `target_bytes × evict_low_watermark`; inc `rio_store_express_evicted_total{az_id}` by deleted count. `// r[impl infra.express.bounded-eviction]` `// r[impl obs.metric.express-eviction]` |
+| `rio-store/src/config.rs` | `ExpressConfig { target_bytes: u64 = 8_796_093_022_208, evict_high_watermark: f64 = 1.10, evict_low_watermark: f64 = 0.90, sweep_interval_secs: u64 = 3600 }` under `chunk_backend.tiered` |
+| `rio-store/src/main.rs` | when `chunk_backend.kind == tiered` and `local.is_some()`: spawn `sweep_loop` task |
+| `infra/helm/rio/templates/store-rbac.yaml` | `Role` allowing `coordination.k8s.io/leases` `get/create/update` in store namespace; bind to store SA |
+| tests | unit: in-memory S3 backend with `LastModified` injectable; fill past high-watermark → sweep deletes oldest until under low-watermark; assert byte gauge + evicted counter. `// r[verify infra.express.bounded-eviction]` `// r[verify obs.metric.express-eviction]` |
+**Exit:** `.#ci` green; vm-store-tiered gains `evict-over-target` subtest (P0555 follow-on, optional).
 
 ---
 
@@ -697,7 +709,8 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
 {"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
 {"plan":583,"title":"drop inline_blob: all NARs chunked; ChunkBackendKind::Inline removed; chunk_backend required","deps":[544],"crate":"rio-store,rio-proto","priority":80,"status":"UNIMPL","complexity":"MED","note":"greenfield: ALTER TABLE manifests DROP COLUMN inline_blob in mig 033; ManifestKind collapses; chunk_cache no longer Option"}
-{"plan":584,"title":"builder-chunked-only auth gate: token role=builder rejected by PutPath/PutPathBatch","deps":[544,576],"crate":"rio-store,rio-scheduler,rio-common","priority":80,"status":"UNIMPL","complexity":"LOW","note":"AssignmentClaims.role; PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders"}
+{"plan":584,"title":"builder-chunked-only auth gate: token role=builder rejected by PutPath/PutPathBatch","deps":[544],"crate":"rio-store,rio-scheduler,rio-common","priority":80,"status":"UNIMPL","complexity":"LOW","note":"AssignmentClaims.role; PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders. BLOCKED on PutPathChunked plan (designed at ADR-022 §6, not yet sequenced)"}
+{"plan":585,"title":"Express eviction sweeper: per-AZ Lease, size-bounded MRU (target 8 TiB, hi/lo watermark)","deps":[548,554],"crate":"rio-store,infra","priority":75,"status":"UNIMPL","complexity":"LOW","note":"LastModified=last-cold-miss (read-through-only fill); S3 Lifecycle is age-based ceiling only, app sweep is authoritative for size target"}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
@@ -780,9 +793,11 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `store.chunk.tonic-tuned` | components/store.md | rio-store/main.rs (P0568) | (config-only) |
 | `builder.fetch.batched-stream` | components/builder.md | rio-builder/store_fetch.rs (P0568) | live A/B dashboard (P0568) |
 | `infra.express.cache-tier` | decisions/023 | infra/eks/s3-express.tf (P0553) | (live-only — runbook P0565) |
+| `infra.express.bounded-eviction` | decisions/022 §9 | backend/express_sweep.rs (P0585) | unit (P0585) |
+| `obs.metric.express-eviction` | observability.md | backend/express_sweep.rs (P0585) | unit (P0585) |
 | `infra.node.kernel-composefs` | deployment.md | nix/nixos-node/kernel.nix (prereq) | nix/checks.nix node-kernel-config (prereq) |
 
-60 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
+62 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
 `config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/composefs/resolver.rs` are in scope (or adds them).
 
 ---

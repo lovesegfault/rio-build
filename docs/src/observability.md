@@ -177,6 +177,8 @@ r[obs.metric.store]
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
 | `rio_store_chunk_cache_hits_total` | Counter | moka chunk cache hits (for cross-instance aggregation) |
 | `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
+| `rio_store_express_bytes` | Gauge | Current per-AZ Express bucket size in bytes (labeled `az_id`). Updated each sweep. Alert if > `target_bytes × evict_high_watermark` for >2 sweep intervals (sweeper stuck or losing leadership). |
+| `rio_store_express_evicted_total` | Counter | Chunks deleted from Express by the eviction sweeper (labeled `az_id`). Monotone; `rate()` ≈ churn. |
 | `rio_store_hmac_rejected_total` | Counter | PutPath calls rejected by HMAC verifier (bad signature, expired, path not in `expected_outputs`). Alert if rate > 0: indicates misconfiguration or compromise attempt. |
 | `rio_store_service_token_accepted_total` | Counter | PutPath calls that skipped HMAC verification via `x-rio-service-token` (labeled by `caller`). Transport-agnostic replacement for the CN bypass. |
 | `rio_store_gc_sweep_paths_remaining` | Gauge | Paths not yet processed by the in-progress GC sweep. Ticks down per batch commit (100 paths); `0` between sweeps. Long-tail at non-zero = sweep stalled or PG slow. |
@@ -242,6 +244,9 @@ r[obs.metric.builder]
 | `rio_builder_cgroup_leak_total` | Counter | Per-build cgroup `rmdir` failures on Drop (typically `EBUSY` — processes still in the tree). Leaked cgroups are harmless empty directories; pod restart clears the whole subtree. Alert if rate > 0 sustained: indicates process-kill sequencing bug. |
 
 > **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances. Exception: `rio_store_chunk_dedup_ratio` is a per-upload event gauge (last-written-wins, not averaged) — useful for eyeballing recent PutPath dedup effectiveness but NOT for cross-instance aggregation.
+
+r[obs.metric.express-eviction]
+`rio_store_express_bytes` (gauge, labeled `az_id`) and `rio_store_express_evicted_total` (counter, labeled `az_id`): emitted by the per-AZ Express eviction sweeper (Design Overview §9). The gauge is the size-bound feedback signal; the counter's rate is cache churn. Only the per-AZ Lease holder emits — other replicas in the same AZ do not.
 
 r[obs.metric.input-materialization-failures]
 `rio_builder_input_materialization_failures_total` (counter): incremented each time a daemon `MiscFailure` is reclassified as `InfrastructureFailure` under `r[builder.result.input-enoent-is-infra]`. Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above actual store→builder throughput.
