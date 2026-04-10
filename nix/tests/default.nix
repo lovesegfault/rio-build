@@ -688,10 +688,11 @@ in
 
   # Cilium WireGuard transparent encryption: cilium_wg0 peers + encrypt
   # status on both nodes. Data-plane property the security model leans
-  # on once app-level mTLS is removed.
-  # TODO: add `r[verify sec.transport.cilium-wireguard]` once Phase 7
-  # lands the spec marker in docs/src/security.md (tracey-validate fails
-  # on a verify with no spec).
+  # on once app-level mTLS is removed. Also asserts the GUA-v6 NodePort
+  # frontend exists (regression guard for the EKS NLB RST bug — auto-
+  # detect skips global-unicast; in-cluster tests are socket-LB false
+  # positives).
+  # r[verify sec.transport.cilium-wireguard]
   vm-cilium-encrypt-k3s = cilium-encrypt {
     inherit pkgs common;
     fixture = k3sFull { };

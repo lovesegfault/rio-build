@@ -127,6 +127,14 @@ pkgs.runCommand "cilium-rendered"
       --set k8sServiceHost=k3s-server \
       --set k8sServicePort=6443 \
       --set devices=eth1 \
+      `# nodePort.addresses: auto-detect (empty) programs BPF NodePort` \
+      `# frontends only for link-local + ULA, NOT global-unicast IPv6.` \
+      `# An external LB sending to the node GUA finds no LB-map entry` \
+      `# and gets RST (the EKS NLB bug, commit 022ae5a3). In-cluster` \
+      `# tests are socket-LB false positives — connect() is intercepted` \
+      `# via [::] wildcard before the physical-IP path. Mirrors` \
+      `# infra/eks/addons.tf.` \
+      --set "nodePort.addresses={2001:db8:1::/64,192.168.1.0/24}" \
       --set cgroup.autoMount.enabled=false \
       --set cgroup.hostRoot=/sys/fs/cgroup \
       --set bpf.masquerade=true \
