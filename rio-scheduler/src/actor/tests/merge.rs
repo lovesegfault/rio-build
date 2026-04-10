@@ -392,9 +392,9 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
     let cached_paths = loop {
         let e = ev.recv().await?;
         if let Some(rio_proto::types::build_event::Event::Derivation(d)) = e.event
-            && let Some(rio_proto::types::derivation_event::Status::Cached(c)) = d.status
+            && d.kind() == rio_proto::types::DerivationEventKind::Cached
         {
-            break c.output_paths;
+            break d.output_paths;
         }
     };
     assert_eq!(

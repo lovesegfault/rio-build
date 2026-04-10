@@ -252,8 +252,8 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
     act: &mut BuildActivityState,
     drv_event: types::DerivationEvent,
 ) -> Result<(), StreamProcessError> {
-    match drv_event.status {
-        Some(types::derivation_event::Status::Started(ref started)) => {
+    match drv_event.kind() {
+        types::DerivationEventKind::Started => {
             // actBuild fields per upstream
             // `derivation-building-goal.cc`:
             // [drvPath, machineName, curRound, nrRounds].
@@ -269,7 +269,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // from RIO_GATEWAY_MACHINE_NAME (helm sets it to
             // the cluster name); empty default = upstream's
             // local-build semantics (nom shows no suffix).
-            let _ = &started.executor_id; // intentionally unused — see above
+            // `drv_event.executor_id` intentionally unused — see above.
             let aid = stderr
                 .start_activity(
                     ActivityType::Build,
@@ -300,7 +300,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 stderr.stop_activity(prev).await?;
             }
         }
-        Some(types::derivation_event::Status::Completed(_)) => {
+        types::DerivationEventKind::Completed => {
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
             } else {
@@ -318,7 +318,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 );
             }
         }
-        Some(types::derivation_event::Status::Failed(ref failed)) => {
+        types::DerivationEventKind::Failed => {
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
             } else {
@@ -332,17 +332,12 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             stderr
                 .log(&format!(
                     "derivation '{}' failed: {}",
-                    drv_event.derivation_path, failed.error_message
+                    drv_event.derivation_path, drv_event.error_message
                 ))
                 .await?;
         }
-        Some(types::derivation_event::Status::Cached(_)) => {
-            // No activity to start/stop for cached derivations
-        }
-        Some(types::derivation_event::Status::Queued(_)) => {
-            // No STDERR message for queued state
-        }
-        None => {}
+        // Cached / Queued: no activity to start/stop, no STDERR.
+        types::DerivationEventKind::Cached | types::DerivationEventKind::Queued => {}
     }
     Ok(())
 }

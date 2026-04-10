@@ -8,7 +8,7 @@ package rio.types;
 // `rio.types.rs`, so Rust callers see all types at `rio_proto::types::*`
 // regardless of which .proto file defines them.
 
-import "types.proto"; // DerivationFailed.status → BuildResultStatus
+import "types.proto"; // DerivationEvent.failure_status → BuildResultStatus
 
 // ───────────────────────────────────────────────────────────────────────────
 // Derivation DAG (submitted via SubmitBuildRequest)
@@ -91,35 +91,27 @@ message DerivationEdge {
 // Per-derivation events (nested inside BuildEvent in build_types.proto)
 // ───────────────────────────────────────────────────────────────────────────
 
-// Per-derivation status change within a build.
+// Per-derivation status change within a build. Flat enum + per-kind
+// payload fields rather than a oneof of five near-empty messages
+// (Queued/Started/Completed/Cached/Failed). Helper ctors in
+// rio-proto/src/lib.rs (DerivationEvent::started/completed/...) keep
+// the producer call sites one-liners and document which fields each
+// kind populates.
 message DerivationEvent {
   string derivation_path = 1;
-  oneof status {
-    DerivationQueued queued = 2;
-    DerivationStarted started = 3;
-    DerivationCompleted completed = 4;
-    DerivationCached cached = 5;
-    DerivationFailed failed = 6;
-  }
+  DerivationEventKind kind = 2;
+  string executor_id = 3;                   // STARTED only
+  repeated string output_paths = 4;         // COMPLETED, CACHED only
+  string error_message = 5;                 // FAILED only
+  BuildResultStatus failure_status = 6;     // FAILED only (types.proto)
 }
 
-message DerivationQueued {}
-
-message DerivationStarted {
-  string executor_id = 1;                   // Which executor is building it
-}
-
-message DerivationCompleted {
-  repeated string output_paths = 1;         // Realized output store paths
-}
-
-message DerivationCached {
-  repeated string output_paths = 1;         // Output paths already in store
-}
-
-message DerivationFailed {
-  string error_message = 1;
-  BuildResultStatus status = 2;             // Failure classification (types.proto)
+enum DerivationEventKind {
+  DERIVATION_EVENT_KIND_QUEUED = 0;
+  DERIVATION_EVENT_KIND_STARTED = 1;
+  DERIVATION_EVENT_KIND_COMPLETED = 2;
+  DERIVATION_EVENT_KIND_CACHED = 3;
+  DERIVATION_EVENT_KIND_FAILED = 4;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

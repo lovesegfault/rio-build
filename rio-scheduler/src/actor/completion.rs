@@ -799,14 +799,10 @@ impl DagActor {
             self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
-                        status: Some(rio_proto::types::derivation_event::Status::Completed(
-                            rio_proto::types::DerivationCompleted {
-                                output_paths: output_paths.clone(),
-                            },
-                        )),
-                    },
+                    rio_proto::types::DerivationEvent::completed(
+                        self.dag.path_or_hash_fallback(drv_hash),
+                        output_paths.clone(),
+                    ),
                 ),
             );
         }
@@ -1593,15 +1589,11 @@ impl DagActor {
                 self.events.emit(
                     *build_id,
                     rio_proto::types::build_event::Event::Derivation(
-                        rio_proto::types::DerivationEvent {
-                            derivation_path: drv_path.clone(),
-                            status: Some(rio_proto::types::derivation_event::Status::Failed(
-                                rio_proto::types::DerivationFailed {
-                                    error_message: error_msg.to_string(),
-                                    status: status.into(),
-                                },
-                            )),
-                        },
+                        rio_proto::types::DerivationEvent::failed(
+                            drv_path.clone(),
+                            error_msg.to_string(),
+                            status,
+                        ),
                     ),
                 );
             }

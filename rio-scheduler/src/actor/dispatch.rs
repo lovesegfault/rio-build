@@ -643,13 +643,9 @@ impl DagActor {
             }
         }
 
-        let event =
-            rio_proto::types::build_event::Event::Derivation(rio_proto::types::DerivationEvent {
-                derivation_path: drv_path,
-                status: Some(rio_proto::types::derivation_event::Status::Cached(
-                    rio_proto::types::DerivationCached { output_paths },
-                )),
-            });
+        let event = rio_proto::types::build_event::Event::Derivation(
+            rio_proto::types::DerivationEvent::cached(drv_path, output_paths),
+        );
         for build_id in interested {
             self.events.emit(build_id, event.clone());
             // I-103: dispatch_fod short-circuit is "completed without
@@ -1090,14 +1086,10 @@ impl DagActor {
             self.events.emit(
                 build_id,
                 rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: drv_path.clone(),
-                        status: Some(rio_proto::types::derivation_event::Status::Started(
-                            rio_proto::types::DerivationStarted {
-                                executor_id: executor_id.to_string(),
-                            },
-                        )),
-                    },
+                    rio_proto::types::DerivationEvent::started(
+                        drv_path.clone(),
+                        executor_id.to_string(),
+                    ),
                 ),
             );
             // Progress snapshot: running count +1, worker set changed.

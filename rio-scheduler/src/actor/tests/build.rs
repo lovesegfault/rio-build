@@ -467,9 +467,9 @@ async fn test_inputs_resolved_fires_between_started_and_dispatch() -> TestResult
         let discriminant = match &ev.event {
             Some(Event::Started(_)) => "Started",
             Some(Event::InputsResolved(_)) => "InputsResolved",
-            Some(Event::Derivation(d)) => match &d.status {
-                Some(rio_proto::types::derivation_event::Status::Started(_)) => "DrvStarted",
-                other => panic!("unexpected DerivationEvent status: {other:?}"),
+            Some(Event::Derivation(d)) => match d.kind() {
+                rio_proto::types::DerivationEventKind::Started => "DrvStarted",
+                other => panic!("unexpected DerivationEvent kind: {other:?}"),
             },
             other => panic!("unexpected event in merge sequence: {other:?}"),
         };
@@ -587,10 +587,7 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
             Some(Event::Derivation(d)) => {
                 // DrvStarted should precede Progress (emit order in
                 // dispatch.rs). Assert we see it first.
-                assert!(matches!(
-                    d.status,
-                    Some(rio_proto::types::derivation_event::Status::Started(_))
-                ));
+                assert_eq!(d.kind(), rio_proto::types::DerivationEventKind::Started);
                 saw_drv_started = true;
             }
             Some(Event::Progress(p)) => break p,

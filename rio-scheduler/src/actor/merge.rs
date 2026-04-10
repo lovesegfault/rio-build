@@ -626,14 +626,10 @@ impl DagActor {
             self.events.emit(
                 build_id,
                 rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: node.drv_path.clone(),
-                        status: Some(rio_proto::types::derivation_event::Status::Cached(
-                            rio_proto::types::DerivationCached {
-                                output_paths: output_paths.clone(),
-                            },
-                        )),
-                    },
+                    rio_proto::types::DerivationEvent::cached(
+                        node.drv_path.clone(),
+                        output_paths.clone(),
+                    ),
                 ),
             );
             // r[impl sched.gc.path-tenants-upsert]

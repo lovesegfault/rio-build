@@ -37,6 +37,51 @@ pub mod types {
     tonic::include_proto!("rio.types");
 }
 
+/// `DerivationEvent` helper ctors. The proto is flat (`kind` enum +
+/// per-kind payload fields) rather than a oneof of five near-empty
+/// messages; these restore the one-ctor-per-variant ergonomics at the
+/// 5 scheduler emit sites and keep "which fields are valid for which
+/// kind" documented in one place.
+impl types::DerivationEvent {
+    pub fn started(derivation_path: String, executor_id: String) -> Self {
+        Self {
+            derivation_path,
+            kind: types::DerivationEventKind::Started as i32,
+            executor_id,
+            ..Default::default()
+        }
+    }
+    pub fn completed(derivation_path: String, output_paths: Vec<String>) -> Self {
+        Self {
+            derivation_path,
+            kind: types::DerivationEventKind::Completed as i32,
+            output_paths,
+            ..Default::default()
+        }
+    }
+    pub fn cached(derivation_path: String, output_paths: Vec<String>) -> Self {
+        Self {
+            derivation_path,
+            kind: types::DerivationEventKind::Cached as i32,
+            output_paths,
+            ..Default::default()
+        }
+    }
+    pub fn failed(
+        derivation_path: String,
+        error_message: String,
+        status: types::BuildResultStatus,
+    ) -> Self {
+        Self {
+            derivation_path,
+            kind: types::DerivationEventKind::Failed as i32,
+            error_message,
+            failure_status: status as i32,
+            ..Default::default()
+        }
+    }
+}
+
 /// Scheduler service: gateway-facing RPCs (SubmitBuild, WatchBuild, etc.).
 pub mod scheduler {
     tonic::include_proto!("rio.scheduler");

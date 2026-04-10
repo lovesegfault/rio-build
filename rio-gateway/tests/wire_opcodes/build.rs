@@ -690,22 +690,12 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
             total_derivations: 1,
             cached_derivations: 0,
         })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Started(
-                types::DerivationStarted {
-                    executor_id: "w1".into(),
-                },
-            )),
-        })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Completed(
-                types::DerivationCompleted {
-                    output_paths: vec![],
-                },
-            )),
-        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w1".into()),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::completed(target.clone(), vec![]),
+        )),
         ev(build_event::Event::Completed(types::BuildCompleted {
             output_paths: vec![],
         })),
@@ -812,23 +802,16 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
             total_derivations: 1,
             cached_derivations: 0,
         })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Started(
-                types::DerivationStarted {
-                    executor_id: "w1".into(),
-                },
-            )),
-        })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Failed(
-                types::DerivationFailed {
-                    error_message: "boom".into(),
-                    status: types::BuildResultStatus::PermanentFailure.into(),
-                },
-            )),
-        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w1".into()),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                target.clone(),
+                "boom".into(),
+                types::BuildResultStatus::PermanentFailure,
+            ),
+        )),
         ev(build_event::Event::Failed(types::BuildFailed {
             error_message: "build failed".into(),
             failed_derivation: target.clone(),
@@ -928,19 +911,13 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
             // care — this test asserts Progress is silent (no stderr).
             ..Default::default()
         })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: "/nix/store/cached.drv".into(),
-            status: Some(types::derivation_event::Status::Cached(
-                types::DerivationCached {
-                    output_paths: vec![],
-                },
-            )),
-        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::cached("/nix/store/cached.drv".into(), vec![]),
+        )),
         ev(build_event::Event::Derivation(types::DerivationEvent {
             derivation_path: "/nix/store/queued.drv".into(),
-            status: Some(types::derivation_event::Status::Queued(
-                types::DerivationQueued {},
-            )),
+            kind: types::DerivationEventKind::Queued as i32,
+            ..Default::default()
         })),
         ev(build_event::Event::Completed(types::BuildCompleted {
             output_paths: vec![],
@@ -1023,14 +1000,9 @@ async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result
             total_derivations: 1,
             cached_derivations: 0,
         })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Started(
-                types::DerivationStarted {
-                    executor_id: "rio-builder-x86-64-abc".into(),
-                },
-            )),
-        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "rio-builder-x86-64-abc".into()),
+        )),
         ev(build_event::Event::Phase(types::BuildPhase {
             derivation_path: target.clone(),
             phase: "unpackPhase".into(),
@@ -1041,14 +1013,9 @@ async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result
             lines: vec![b"unpacking source".to_vec()],
             first_line_number: 0,
         })),
-        ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: target.clone(),
-            status: Some(types::derivation_event::Status::Completed(
-                types::DerivationCompleted {
-                    output_paths: vec![],
-                },
-            )),
-        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::completed(target.clone(), vec![]),
+        )),
         ev(build_event::Event::Completed(types::BuildCompleted {
             output_paths: vec![],
         })),
