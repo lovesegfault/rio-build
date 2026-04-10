@@ -76,15 +76,18 @@ pub struct AssignmentClaims {
     pub expiry_unix: u64,
 }
 
-/// Signer: constructed on the scheduler from a key file.
-pub struct HmacSigner {
+/// Shared HMAC key. The scheduler signs, the store verifies — same key
+/// file, same field, and a process is one role or the other (never
+/// both), so a single struct with both methods is sufficient. The
+/// [`HmacSigner`]/[`HmacVerifier`] aliases keep call sites readable.
+pub struct HmacKey {
     key: Vec<u8>,
 }
 
-/// Verifier: constructed on the store from the SAME key file.
-pub struct HmacVerifier {
-    key: Vec<u8>,
-}
+/// Scheduler-side alias. See [`HmacKey`].
+pub type HmacSigner = HmacKey;
+/// Store-side alias. See [`HmacKey`].
+pub type HmacVerifier = HmacKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HmacError {
@@ -149,8 +152,8 @@ fn load_key(path: Option<&std::path::Path>) -> Result<Option<Vec<u8>>, HmacError
     Ok(Some(key))
 }
 
-impl HmacSigner {
-    /// Load from a key file. `None` path → `None` signer (disabled).
+impl HmacKey {
+    /// Load from a key file. `None` path → `None` key (HMAC disabled).
     pub fn load(path: Option<&std::path::Path>) -> Result<Option<Self>, HmacError> {
         Ok(load_key(path)?.map(|key| Self { key }))
     }
@@ -179,19 +182,6 @@ impl HmacSigner {
         // not in base64url's alphabet — unambiguous split.
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         format!("{}.{}", b64.encode(&claims_json), b64.encode(tag))
-    }
-}
-
-impl HmacVerifier {
-    /// Load from a key file. `None` path → `None` verifier (disabled
-    /// = PutPath accepts any caller, dev mode).
-    pub fn load(path: Option<&std::path::Path>) -> Result<Option<Self>, HmacError> {
-        Ok(load_key(path)?.map(|key| Self { key }))
-    }
-
-    /// Construct from raw key bytes (for tests).
-    pub fn from_key(key: Vec<u8>) -> Self {
-        Self { key }
     }
 
     /// Verify a token and return its claims.
