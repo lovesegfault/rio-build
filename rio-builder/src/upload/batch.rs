@@ -115,14 +115,15 @@ pub(super) async fn upload_outputs_batch(
     });
 
     // Drive the gRPC call. The producer feeds `rx` concurrently.
+    // Batch is one-shot (no retries) → all errors map to UploadExhausted
+    // with a synthetic "<batch>" path.
+    let batch_err = |source| UploadError::UploadExhausted {
+        path: "<batch>".into(),
+        source,
+    };
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut req = tonic::Request::new(outbound);
-    attach_assignment_token(&mut req, assignment_token).map_err(|e| {
-        UploadError::UploadExhausted {
-            path: "<batch>".into(),
-            source: e,
-        }
-    })?;
+    attach_assignment_token(&mut req, assignment_token).map_err(batch_err)?;
 
     let mut client = store_client.clone();
     let put_result = rio_common::grpc::with_timeout_status(
@@ -138,17 +139,8 @@ pub(super) async fn upload_outputs_batch(
         .await
         .map_err(|e| tonic::Status::internal(format!("batch producer panicked: {e}")));
 
-    // Surface errors via UploadExhausted (batch is one-shot, no retries).
-    let resp = put_result.map_err(|e| UploadError::UploadExhausted {
-        path: "<batch>".into(),
-        source: e,
-    })?;
-    let results = producer_result
-        .and_then(|r| r)
-        .map_err(|e| UploadError::UploadExhausted {
-            path: "<batch>".into(),
-            source: e,
-        })?;
+    let resp = put_result.map_err(batch_err)?;
+    let results = producer_result.and_then(|r| r).map_err(batch_err)?;
 
     let created = resp.into_inner().created;
     tracing::info!(
