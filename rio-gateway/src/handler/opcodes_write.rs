@@ -464,29 +464,24 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     Ok(())
 }
 
-/// Error from [`parse_cam_str`].
-#[derive(Debug, thiserror::Error)]
-enum CamParseError {
-    #[error("unrecognized content-address method: {0}")]
-    UnknownMethod(String),
-    #[error(transparent)]
-    InvalidAlgo(#[from] rio_nix::hash::HashError),
-}
-
-/// Parse a content-address method string.
-fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError> {
-    if let Some(algo_str) = cam_str.strip_prefix("text:") {
-        Ok((true, false, algo_str.parse()?))
+/// Parse a content-address method string. Errors are formatted for the
+/// Nix client (sole caller `stderr_err!`s the result; nothing matches on
+/// variants).
+fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
+    let algo = |s: &str| s.parse::<HashAlgo>().map_err(|e| e.to_string());
+    if let Some(s) = cam_str.strip_prefix("text:") {
+        Ok((true, false, algo(s)?))
     } else if let Some(rest) = cam_str.strip_prefix("fixed:") {
-        if let Some(algo_str) = rest.strip_prefix("r:") {
-            Ok((false, true, algo_str.parse()?))
-        } else if let Some(algo_str) = rest.strip_prefix("git:") {
-            Ok((false, true, algo_str.parse()?))
+        if let Some(s) = rest
+            .strip_prefix("r:")
+            .or_else(|| rest.strip_prefix("git:"))
+        {
+            Ok((false, true, algo(s)?))
         } else {
-            Ok((false, false, rest.parse()?))
+            Ok((false, false, algo(rest)?))
         }
     } else {
-        Err(CamParseError::UnknownMethod(cam_str.to_string()))
+        Err(format!("unrecognized content-address method: {cam_str}"))
     }
 }
 
