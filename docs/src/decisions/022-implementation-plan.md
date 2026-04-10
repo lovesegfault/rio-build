@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0585 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
+**Plan-number range:** P0541–P0586 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
@@ -157,6 +157,8 @@ P0572 dir_digest/root_digest in NarIndex + directories table (bottom-up in P0546
 P0573 DirectoryService RPC: GetDirectory / HasDirectories / HasBlobs (batch)
    │
 P0577 BlobService.Read(file_digest) server-stream (snix-compatible blob fetch)
+   │
+P0586 PutPathChunked: builder-side fused walk + HasChunks + async narhash verify (closes TODO P0433/P0434)
    │
 P0574 gateway substituter: Directory-DAG delta-sync client  ★ U5 LANDS
 ```
@@ -417,7 +419,7 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 **Exit:** `.#ci` green; `tracey query rule store.inline.threshold` reports no-such-rule.
 
 ### P0584 — builder-chunked-only auth gate
-**Crate:** `rio-store, rio-scheduler, rio-common` · **Deps:** P0544 · **Blocked on:** `PutPathChunked` plan (designed at [§6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked); sequencing TBD — see follow-on note at end of this doc) · **Complexity:** LOW
+**Crate:** `rio-store, rio-scheduler, rio-common` · **Deps:** P0544, P0586 · **Complexity:** LOW
 | File | Change |
 |---|---|
 | `rio-common/src/auth/token.rs` | add `role: TokenRole` field to `AssignmentClaims` (enum `Builder`/`Gateway`/`Admin`; serde-tagged) |
@@ -668,6 +670,25 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 
 **Exit:** `.#ci` green.
 
+### P0586 — `PutPathChunked`: builder-side fused walk + `HasChunks` + async narhash verify
+**Crate:** `rio-store, rio-builder, rio-proto` · **Deps:** P0551, P0572, P0573, P0577 · **Complexity:** HIGH
+
+Moves chunking to the builder; rio-store's per-stream working set drops from `nar_size` bytes to one ≤256 KiB chunk in flight. Closes `TODO(P0433)` (refs forced into separate pre-pass) and `TODO(P0434)` (manifest-first upload). Design at [§6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked).
+
+| File | Change |
+|---|---|
+| `rio-proto/proto/store.proto` | `rpc HasChunks(HasChunksRequest) returns (HasChunksResponse)` — digest list → bitmap, durable-presence semantics (bit set IFF referenced by ≥1 `complete` manifest, not refcount≥1; I-201). `rpc PutPathChunked(stream PutPathChunkedRequest) returns (PutPathResponse)` — `Begin{hmac_token, store_path, deriver, refs, root_dir_digest, nar_hash, nar_size, chunk_manifest}` then `Chunk{digest, bytes}`. `// r[impl store.put.chunked]` |
+| `rio-store/src/grpc/chunk.rs` | `has_chunks`: `SELECT blake3_hash FROM chunks c WHERE c.blake3_hash = ANY($1) AND EXISTS (SELECT 1 FROM manifests m WHERE m.status='complete' AND c.blake3_hash = ANY(decode_manifest_digests(m.manifest_data)))` — or denormalize via a `durable` flag flipped at manifest-complete. `// r[impl store.chunk.has-chunks-durable]` |
+| `rio-store/src/grpc/put_path_chunked.rs` | new — token verify (accepts `Builder`/`Gateway`/`Admin` per `r[store.put.builder-chunked-only]`); insert placeholder manifest (`r[store.put.wal-manifest]`); per `Chunk`: assert `blake3(bytes)==digest` AND digest ∈ `Begin.chunk_manifest` else `INVALID_ARGUMENT`, then `cas::put` (×32 bounded, `r[store.cas.upload-bounded]`); on all-manifest-digests-durable: flip `uploading→complete` with `nar_hash_verified=false`, enqueue verify job. Idempotent re-drive (`r[store.put.idempotent]`). `// r[impl store.chunk.self-verify]` |
+| `rio-store/src/verify_worker.rs` | new — background loop: claim rows `WHERE NOT nar_hash_verified AND status='complete'`; NAR-serialize from chunks via `chunk_manifest`+Directory tree (P0577 `ReadBlob` machinery); compute SHA-256; on match `UPDATE SET nar_hash_verified=true`; on mismatch `UPDATE SET status='quarantined'` + `rio_store_narhash_quarantine_total{}` inc + structured-log `{store_path, drv_path, builder_pod, claimed, computed}`. `// r[impl store.put.narhash-async]` `// r[impl store.put.narhash-quarantine]` |
+| `rio-store/src/http/narinfo.rs` | serving narinfo for `nar_hash_verified=false`: block on the verify job (poll with timeout) or return 404 — config `store.narhash_verify.block_narinfo_ms` (default 5000, 0=404). `GetChunks`/`ReadBlob`/digest-FUSE paths unaffected (self-certifying). |
+| `rio-builder/src/upload.rs` | rewrite `upload_all_outputs`: single canonical-NAR-order walk (`r[builder.nar.entry-name-safety]`); per regular file, one read drives FastCDC (16/64/256 KiB, `r[store.cas.fastcdc]`) emitting `(offset,len,blake3)` + whole-file blake3 → `file_digest` + Boyer-Moore refscan (`r[builder.upload.references-scanned]`) + SHA-256 over NAR-framed bytes (`nar::Encoder` headers/padding into the hash sink only — no NAR materialized). Optional input-reuse shortcut: size match against EROFS-lower xattr table → `cmp` → reuse input's `file_digest`+chunk list. End-of-walk: optionally `HasBlobs([file_digest])` to skip whole files; batch `HasChunks` over remaining; client-stream missing via `PutPathChunked`. `// r[impl builder.upload.fused-walk]` `// r[impl builder.upload.chunked-manifest]` |
+| `migrations/033_nar_index.sql` | `ALTER TABLE manifests ADD COLUMN nar_hash_verified boolean NOT NULL DEFAULT true`; `ALTER TYPE manifest_status ADD VALUE 'quarantined'`; partial index `ON manifests (created_at) WHERE NOT nar_hash_verified AND status='complete'` for verify-worker queue |
+| `nix/tests/scenarios/put-path-chunked.nix` | new — builder→`PutPathChunked` of a multi-file output; `GetPath` round-trip NAR sha256 == claimed; verify-worker flips `nar_hash_verified`; tampered `Chunk` body → `INVALID_ARGUMENT`; deliberately wrong `Begin.nar_hash` → `quarantined` + narinfo 404; `HasChunks` reports false for refcount≥1-but-uploading chunk |
+| `nix/tests/default.nix` | wire `vm-put-path-chunked` subtests; markers placed at the `subtests = [...]` entry per CLAUDE.md convention |
+
+**Exit:** `.#ci` green; `nix build .#checks.x86_64-linux.vm-put-path-chunked` green.
+
 ### P0574 — Gateway substituter: Directory-DAG delta-sync client  ★ U5 LANDS
 **Crate:** `rio-gateway` · **Deps:** P0573, P0577 · **Complexity:** MED
 | File | Change |
@@ -709,8 +730,9 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
 {"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
 {"plan":583,"title":"drop inline_blob: all NARs chunked; ChunkBackendKind::Inline removed; chunk_backend required","deps":[544],"crate":"rio-store,rio-proto","priority":80,"status":"UNIMPL","complexity":"MED","note":"greenfield: ALTER TABLE manifests DROP COLUMN inline_blob in mig 033; ManifestKind collapses; chunk_cache no longer Option"}
-{"plan":584,"title":"builder-chunked-only auth gate: token role=builder rejected by PutPath/PutPathBatch","deps":[544],"crate":"rio-store,rio-scheduler,rio-common","priority":80,"status":"UNIMPL","complexity":"LOW","note":"AssignmentClaims.role; PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders. BLOCKED on PutPathChunked plan (designed at ADR-022 §6, not yet sequenced)"}
+{"plan":584,"title":"builder-chunked-only auth gate: token role=builder rejected by PutPath/PutPathBatch","deps":[544,586],"crate":"rio-store,rio-scheduler,rio-common","priority":80,"status":"UNIMPL","complexity":"LOW","note":"AssignmentClaims.role; PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders"}
 {"plan":585,"title":"Express eviction sweeper: per-AZ Lease, size-bounded MRU (target 8 TiB, hi/lo watermark)","deps":[548,554],"crate":"rio-store,infra","priority":75,"status":"UNIMPL","complexity":"LOW","note":"LastModified=last-cold-miss (read-through-only fill); S3 Lifecycle is age-based ceiling only, app sweep is authoritative for size target"}
+{"plan":586,"title":"PutPathChunked: builder-side fused walk + HasChunks + put_path_chunked handler + async narhash verify + quarantine","deps":[551,572,573,577],"crate":"rio-store,rio-builder,rio-proto","priority":85,"status":"UNIMPL","complexity":"HIGH","note":"closes TODO(P0433/P0434); store working set drops to one chunk; nar_hash claimed not attested → async verify, mismatch → quarantined"}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
@@ -796,8 +818,15 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `infra.express.bounded-eviction` | decisions/022 §9 | backend/express_sweep.rs (P0585) | unit (P0585) |
 | `obs.metric.express-eviction` | observability.md | backend/express_sweep.rs (P0585) | unit (P0585) |
 | `infra.node.kernel-composefs` | deployment.md | nix/nixos-node/kernel.nix (prereq) | nix/checks.nix node-kernel-config (prereq) |
+| `store.put.chunked` | decisions/022 §6 | rio-proto/store.proto + grpc/put_path_chunked.rs (P0586) | vm-put-path-chunked (P0586) |
+| `store.chunk.has-chunks-durable` | decisions/022 §6.2 | grpc/chunk.rs has_chunks (P0586) | vm-put-path-chunked (P0586) |
+| `store.chunk.self-verify` | decisions/022 §6.2 | grpc/put_path_chunked.rs (P0586) | vm-put-path-chunked (P0586) |
+| `store.put.narhash-async` | decisions/022 §6.3 | verify_worker.rs (P0586) | vm-put-path-chunked (P0586) |
+| `store.put.narhash-quarantine` | decisions/022 §6.3 | verify_worker.rs (P0586) | vm-put-path-chunked (P0586) |
+| `builder.upload.fused-walk` | decisions/022 §6.1 | rio-builder/upload.rs (P0586) | vm-put-path-chunked (P0586) |
+| `builder.upload.chunked-manifest` | decisions/022 §6.1 | rio-builder/upload.rs (P0586) | vm-put-path-chunked (P0586) |
 
-62 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
+69 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
 `config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/composefs/resolver.rs` are in scope (or adds them).
 
 ---
@@ -836,8 +865,11 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `infra/helm/rio-build/values.yaml` | P0554, P0564 | distinct top-level keys |
 | `rio-controller/src/reconcilers/common/sts.rs` | P0564 only | — |
 | `nix/nixos-node/eks-node.nix` | P0564, P0571 | distinct hunks (drop smarter-device-manager static-pod vs tmpfiles) |
-| `migrations/033_nar_index.sql` | P0551, P0572, P0581, P0583 | P0551 → P0572 → P0581 → P0583; same migration file (greenfield) |
+| `migrations/033_nar_index.sql` | P0551, P0572, P0581, P0583, P0586 | P0551 → P0572 → P0581 → P0583 → P0586; same migration file (greenfield) |
 | `rio-proto/proto/types.proto` | P0545, P0572 | P0545 → P0572 (append fields 7, 8) |
+| `rio-proto/proto/store.proto` | P0568, P0573, P0577, P0586 | append-only RPC additions; no ordering constraint |
+| `rio-builder/src/upload.rs` | P0586 only (rewrite) | — |
+| `rio-store/src/grpc/chunk.rs` | P0568, P0586 | P0568 → P0586 (HasChunks appended) |
 | `rio-nix/src/nar.rs` | P0546, P0572 | P0546 → P0572 (second pass in same fn) |
 | `rio-store/src/grpc/directory.rs` | P0573 (create), P0577 (ReadBlob) | P0573 → P0577 |
 | `rio-gateway/src/substitute/` | P0574 only | — |
@@ -885,4 +917,4 @@ helm upgrade rio infra/helm/rio-build --reuse-values --set store.chunkBackend.ki
 - **Kernel `BACKING_OPEN` `d_is_reg` relaxation** — [`backing.c:105-108`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c) rejects block-device fds. If lifted upstream, `ublk`-per-giant becomes a viable shared-verified-partial primitive (still needs chunk-addressed verify underneath, but would let B passthrough A's in-progress fill).
 - **fs-verity on the digest cache** — would give kernel-side integrity for warm reads from `/var/rio/objects`, but requires a real fs (not FUSE) as the data-only lower. Possible future: digest-FUSE materializes into an ext4/xfs hostPath with fs-verity, overlay's lower2 is that dir directly (no FUSE on warm path at all). Followup after P0562.
 - **Cross-region deployment** — globally-consistent metadata store, object-store cross-region replication, per-region cache tiers. This plan ensures forward-compat (object-store-authoritative, cache tier stateless) but does not implement it.
-- **Upload-path chunk-granular dedup (`PutPathChunked`)** — now designed at [ADR-022 §6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked); sequencing into plan docs is the follow-on. Depends on primitives this plan already lands: `file_digest` (P0551), Directory merkle + `file_blobs` table (P0572), `HasBlobs`/`HasDirectories` batch RPCs (P0573), `ReadBlob` (P0577). Net-new: `HasChunks` RPC, builder-side fused walk (`upload.rs` rewrite), `nar_hash_verified` column + async-verify worker, `quarantined` manifest state.
+- **Upload-path chunk-granular dedup (`PutPathChunked`)** — sequenced as P0586.

@@ -367,4 +367,4 @@ The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-
 | Platform | `infra.node.kernel-composefs` |
 | Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.express-eviction` · `obs.metric.compat` |
 | Binary-cache compat | `store.compat.runtime-toggle` · `store.compat.nar-on-put` · `store.compat.narinfo-on-put` · `store.compat.write-after-commit` · `store.compat.stock-nix-substitute` · `store.compat.gc-coupled` |
-| Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `store.put.builder-chunked-only` |
+| Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.self-verify` · `store.put.narhash-async` · `store.put.narhash-quarantine` · `store.put.builder-chunked-only` |
