@@ -402,9 +402,9 @@ impl StoreServiceImpl {
                     metrics::counter!("rio_store_substitute_integrity_failures_total").increment(1);
                     Status::data_loss("upstream substitute NAR hash mismatch")
                 }
-                SubstituteError::NarInfo(_)
-                | SubstituteError::Ingest(_)
-                | SubstituteError::Chunked(_) => Status::internal("substitute ingest failed"),
+                SubstituteError::NarInfo(_) | SubstituteError::Ingest(_) => {
+                    Status::internal("substitute ingest failed")
+                }
             }
         })
     }

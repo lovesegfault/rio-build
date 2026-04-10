@@ -475,8 +475,7 @@ impl StoreServiceImpl {
     /// upload chunks + increment refcounts via [`cas::stage_chunked`]
     /// WITHOUT flipping `status='complete'`. Returns the
     /// [`NarPersist`] discriminant so the batch's atomic tx can pick
-    /// `complete_manifest_inline_in_tx` vs
-    /// `complete_manifest_chunked_in_tx`.
+    /// the `inline_blob` arg to [`metadata::complete_manifest_in_conn`].
     ///
     /// On `stage_chunked` error this output's placeholder is already
     /// rolled back; the batch's `abort_batch` handles other outputs'

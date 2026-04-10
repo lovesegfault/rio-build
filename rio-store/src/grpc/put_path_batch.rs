@@ -60,8 +60,8 @@ struct OutputAccum {
     /// `created=false` in the response.
     already_complete: bool,
     /// Phase-2 staging result. `None` until phase 2 ran; then either
-    /// inline bytes (for `complete_manifest_inline_in_tx`) or
-    /// `ChunkedStaged` (for `complete_manifest_chunked_in_tx`).
+    /// inline bytes or `ChunkedStaged` — feeds `inline_blob` of
+    /// [`metadata::complete_manifest_in_conn`].
     staged: Option<NarPersist>,
 }
 
@@ -328,15 +328,13 @@ impl StoreServiceImpl {
             if let Some((signer, was_tenant)) = resolved_signer {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
-            let result = match accum.staged.take().expect("staged in phase 2") {
-                NarPersist::Inline(nar_data) => {
-                    metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
-                }
-                NarPersist::ChunkedStaged => {
-                    metadata::complete_manifest_chunked_in_tx(&mut tx, &info).await
-                }
+            let inline_blob = match accum.staged.take().expect("staged in phase 2") {
+                NarPersist::Inline(data) => Some(data),
+                NarPersist::ChunkedStaged => None,
             };
-            if let Err(e) = result {
+            if let Err(e) =
+                metadata::complete_manifest_in_conn(&mut tx, &info, inline_blob.as_deref()).await
+            {
                 drop(tx);
                 return Err(putpath_metadata_status(
                     "PutPathBatch: complete_manifest",

@@ -51,14 +51,11 @@ pub mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub use chunked::{
-    complete_manifest_chunked, complete_manifest_chunked_in_tx, delete_manifest_chunked_uploading,
-    mark_chunks_uploaded, upgrade_manifest_to_chunked,
+    complete_manifest_chunked, delete_manifest_chunked_uploading, mark_chunks_uploaded,
+    upgrade_manifest_to_chunked,
 };
 pub use cluster_key_history::load_cluster_key_history;
-pub use inline::{
-    check_manifest_complete, complete_manifest_inline, complete_manifest_inline_in_tx,
-    insert_manifest_uploading,
-};
+pub use inline::{check_manifest_complete, complete_manifest_inline, insert_manifest_uploading};
 #[cfg(test)]
 pub use inline::{delete_manifest_uploading, manifest_uploading_age};
 pub use queries::{
@@ -283,12 +280,13 @@ pub(super) async fn update_narinfo_complete(
     .map(|r| r.rows_affected())
 }
 
-/// Shared body of [`inline::complete_manifest_inline_in_tx`] and
-/// [`chunked::complete_manifest_chunked_in_tx`]: narinfo UPDATE, then
-/// flip `manifests.status = 'complete'` (binding `inline_blob` iff
-/// `Some`). Both callers were ~90% identical; the only divergence is
-/// the inline-blob bind.
-pub(super) async fn complete_manifest_in_conn(
+/// Finalize an upload inside a caller-owned tx/connection: narinfo
+/// UPDATE, then flip `manifests.status = 'complete'` (binding
+/// `inline_blob` iff `Some`). `PutPathBatch` calls this N times inside
+/// one `pool.begin()` for cross-output atomicity; the pool-wrapping
+/// [`complete_manifest_inline`] / [`complete_manifest_chunked`] each
+/// wrap a single call.
+pub async fn complete_manifest_in_conn(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
     inline_blob: Option<&[u8]>,

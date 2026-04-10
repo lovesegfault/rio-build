@@ -94,29 +94,10 @@ pub async fn complete_manifest_inline(
     nar_data: Bytes,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    complete_manifest_inline_in_tx(&mut tx, info, nar_data).await?;
+    super::complete_manifest_in_conn(&mut tx, info, Some(nar_data.as_ref())).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())
-}
-
-/// Transaction-body variant of [`complete_manifest_inline`]: runs the
-/// narinfo UPDATE + manifests UPDATE inside a caller-owned transaction.
-///
-/// `PutPathBatch` calls this N times inside ONE `pool.begin()` to achieve
-/// cross-output atomicity (all outputs flip to 'complete' or none do).
-/// [`complete_manifest_inline`] is a thin wrapper that begins/commits
-/// around one call.
-///
-/// Takes `&mut PgConnection` (not `&mut Transaction`) to match
-/// [`update_narinfo_complete`]'s signature — `&mut *tx` deref-coerces
-/// a `Transaction` to `PgConnection`.
-pub async fn complete_manifest_inline_in_tx(
-    conn: &mut sqlx::PgConnection,
-    info: &ValidatedPathInfo,
-    nar_data: Bytes,
-) -> Result<()> {
-    super::complete_manifest_in_conn(conn, info, Some(nar_data.as_ref())).await
 }
 
 /// Age of an existing `'uploading'` placeholder, or `None` if no such

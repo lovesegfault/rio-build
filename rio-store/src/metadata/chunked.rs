@@ -210,28 +210,10 @@ pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<(
 #[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
 pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) -> Result<()> {
     let mut tx = pool.begin().await?;
-    complete_manifest_chunked_in_tx(&mut tx, info).await?;
+    super::complete_manifest_in_conn(&mut tx, info, None).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
-}
-
-/// Transaction-body variant of [`complete_manifest_chunked`]: runs the
-/// narinfo UPDATE + status flip inside a caller-owned tx. PutPathBatch
-/// uses this to flip N chunked outputs to `'complete'` in the same
-/// transaction as inline outputs (`r[store.atomic.multi-output]`). The
-/// chunks themselves were already uploaded + refcounted by
-/// [`crate::cas::stage_chunked`] outside the tx; only the visibility
-/// flip is atomic.
-///
-/// Takes `&mut PgConnection` (not `&mut Transaction`) for symmetry with
-/// [`complete_manifest_inline_in_tx`] — `&mut *tx` deref-coerces a
-/// `Transaction` at the call site.
-pub async fn complete_manifest_chunked_in_tx(
-    conn: &mut sqlx::PgConnection,
-    info: &ValidatedPathInfo,
-) -> Result<()> {
-    super::complete_manifest_in_conn(conn, info, None).await
 }
 
 /// Reclaim a failed chunked upload: decrement refcounts + delete rows.

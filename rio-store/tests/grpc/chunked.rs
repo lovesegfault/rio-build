@@ -611,7 +611,7 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
 /// `INLINE_THRESHOLD`: phase-2 stages each via `cas::stage_chunked`
 /// (chunks uploaded + refcounted, manifest still `'uploading'`),
 /// phase-3's atomic tx flips both to `'complete'` via
-/// `complete_manifest_chunked_in_tx`. Asserts both are queryable and
+/// `complete_manifest_in_conn`. Asserts both are queryable and
 /// both landed as chunked (`manifest_data.chunk_list IS NOT NULL`,
 /// `manifests.inline_blob IS NULL`).
 #[tokio::test]
@@ -659,7 +659,7 @@ async fn gt13_batch_chunked_happy_path() -> TestResult {
     .await?;
     assert_eq!(
         chunked_complete, 2,
-        "both outputs flipped to status='complete' via complete_manifest_chunked_in_tx"
+        "both outputs flipped to status='complete' via complete_manifest_in_conn"
     );
 
     // Backend received chunks (2× 512 KiB at ~64 KiB avg ≈ 16 chunks).

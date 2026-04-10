@@ -119,13 +119,10 @@ pub enum SubstituteError {
     HashMismatch { expected: String, got: String },
 
     /// Metadata-layer failure during ingest (write-ahead,
-    /// complete_manifest). Boxed so this enum stays small.
+    /// complete_manifest, chunked S3/refcount). Boxed so this enum
+    /// stays small.
     #[error("ingest failed: {0}")]
     Ingest(#[from] metadata::MetadataError),
-
-    /// cas::put_chunked failure (S3 upload, refcount upsert).
-    #[error("chunked ingest failed: {0}")]
-    Chunked(String),
 }
 
 /// HTTP narinfo + NAR fetcher with per-tenant upstream lookup.
@@ -591,7 +588,9 @@ impl Substituter {
             ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), &store_path_hash)
                 .await;
             return Err(match e {
-                PersistError::Chunked(e) => SubstituteError::Chunked(e.to_string()),
+                PersistError::Chunked(e) => SubstituteError::Ingest(
+                    metadata::MetadataError::InvariantViolation(e.to_string()),
+                ),
                 PersistError::Inline(e) => SubstituteError::Ingest(e),
             });
         }

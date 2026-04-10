@@ -693,6 +693,7 @@ mod tests {
     use crate::test_helpers::{ChunkSeed, StoreSeed, TenantSeed, mem_backend, path_hash};
     use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
+    use rstest::rstest;
 
     /// Never-cancelled token for sweep tests that don't exercise
     /// the shutdown path.
@@ -886,8 +887,35 @@ mod tests {
     /// Without the closure-delete from sweep_unreachable, the
     /// anti-join keeps excluding Y as a referrer of Z and Z is
     /// deleted, leaving live P→Y→Z dangling.
+    ///
+    /// `forward` [Y, Z]: Y's pass-1 re-check resurrects + closure-
+    /// deletes Z; Z's pass-1 re-check then sees Y as live.
+    ///
+    /// `reverse` [Z, Y]: Z's pass-1 re-check finds no live referrer
+    /// (Y is in sweep_unreachable, anti-join excludes it) → Z is a
+    /// delete candidate. Y's pass-1 re-check then resurrects and
+    /// closure-deletes Z. Pass-2's filter sees Z gone and skips it.
+    /// Single-pass would have already deleted Z.
+    ///
+    /// `cross_batch` [Z, filler, Y] with cfg(test) SWEEP_BATCH_SIZE=2:
+    /// Z lands in batch 1, Y in batch 2. Without the whole-sweep
+    /// resurrection drain, batch 1's tx commits Z deleted before
+    /// batch 2 ever observes P→Y→Z. Filler is genuinely unreachable
+    /// → `paths_deleted == 1`.
+    #[rstest]
+    #[case::forward(false, false, 0)]
+    #[case::reverse(true, false, 0)]
+    #[case::cross_batch(true, true, 1)]
     #[tokio::test]
-    async fn sweep_resurrection_is_transitive() {
+    async fn sweep_resurrection_is_transitive(
+        #[case] z_first: bool,
+        #[case] with_filler: bool,
+        #[case] expected_deleted: u64,
+    ) {
+        const _: () = assert!(
+            SWEEP_BATCH_SIZE == 2,
+            "cross_batch case assumes batch size 2"
+        );
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // Z: leaf, marked unreachable.
@@ -906,18 +934,19 @@ mod tests {
             .seed(&db.pool)
             .await;
 
-        // Forward order [Y, Z]: Y's pass-1 re-check resurrects + closure-
-        // deletes Z; Z's pass-1 re-check then sees Y as live.
-        let stats = sweep(
-            &db.pool,
-            None,
-            vec![y_hash.clone(), z_hash.clone()],
-            false,
-            &no_shutdown(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stats.paths_deleted, 0, "neither Y nor Z deleted");
+        let unreachable = match (z_first, with_filler) {
+            (false, _) => vec![y_hash.clone(), z_hash.clone()],
+            (true, false) => vec![z_hash.clone(), y_hash.clone()],
+            (true, true) => {
+                let filler = StoreSeed::path("transitive-filler").seed(&db.pool).await;
+                vec![z_hash.clone(), filler, y_hash.clone()]
+            }
+        };
+
+        let stats = sweep(&db.pool, None, unreachable, false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, expected_deleted);
         assert_eq!(stats.paths_resurrected, 2, "Y resurrected by P; Z by Y");
 
         for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
@@ -929,106 +958,6 @@ mod tests {
             .await
             .unwrap();
             assert!(exists, "{name} must survive (transitive resurrection)");
-        }
-    }
-
-    /// Same as `sweep_resurrection_is_transitive` but with batch order
-    /// reversed. Z's pass-1 re-check finds no live referrer (Y is in
-    /// sweep_unreachable, anti-join excludes it) → Z is a delete
-    /// candidate. Y's pass-1 re-check then resurrects and closure-
-    /// deletes Z from sweep_unreachable. Pass-2's filter sees Z is
-    /// gone and skips it. Single-pass would have already deleted Z.
-    #[tokio::test]
-    async fn sweep_resurrection_is_transitive_reverse_order() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        let z = test_store_path("transitive-rev-z");
-        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
-        let y = test_store_path("transitive-rev-y");
-        let y_hash = StoreSeed::raw_path(&y)
-            .with_refs(&[&z])
-            .seed(&db.pool)
-            .await;
-        StoreSeed::path("transitive-rev-p")
-            .with_refs(&[&y])
-            .seed(&db.pool)
-            .await;
-
-        // Z FIRST — the order the single-pass implementation got wrong.
-        let stats = sweep(
-            &db.pool,
-            None,
-            vec![z_hash.clone(), y_hash.clone()],
-            false,
-            &no_shutdown(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stats.paths_deleted, 0, "neither Y nor Z deleted");
-        assert_eq!(
-            stats.paths_resurrected, 2,
-            "Y by P (pass-1); Z by filter (pass-2)"
-        );
-
-        for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
-            )
-            .bind(h)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-            assert!(
-                exists,
-                "{name} must survive (reverse-order transitive resurrection)"
-            );
-        }
-    }
-
-    /// Cross-batch reverse order: Z in batch 1, Y in batch 2 (forced
-    /// via a filler item with cfg(test) SWEEP_BATCH_SIZE=2). Without
-    /// the whole-sweep resurrection drain, batch 1's tx commits Z
-    /// deleted before batch 2 ever observes P→Y→Z.
-    #[tokio::test]
-    async fn sweep_resurrection_is_transitive_cross_batch() {
-        const _: () = assert!(SWEEP_BATCH_SIZE == 2, "test assumes batch size 2");
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        let z = test_store_path("xbatch-z");
-        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
-        let filler_hash = StoreSeed::path("xbatch-filler").seed(&db.pool).await;
-        let y = test_store_path("xbatch-y");
-        let y_hash = StoreSeed::raw_path(&y)
-            .with_refs(&[&z])
-            .seed(&db.pool)
-            .await;
-        StoreSeed::path("xbatch-p")
-            .with_refs(&[&y])
-            .seed(&db.pool)
-            .await;
-
-        // [Z, filler] = batch 1; [Y] = batch 2.
-        let stats = sweep(
-            &db.pool,
-            None,
-            vec![z_hash.clone(), filler_hash, y_hash.clone()],
-            false,
-            &no_shutdown(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stats.paths_deleted, 1, "only filler deleted");
-        assert_eq!(stats.paths_resurrected, 2, "Y by P; Z by Y");
-
-        for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
-            )
-            .bind(h)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-            assert!(exists, "{name} must survive (cross-batch resurrection)");
         }
     }
 
