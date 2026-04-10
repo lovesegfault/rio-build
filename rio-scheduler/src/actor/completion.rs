@@ -128,6 +128,24 @@ impl DagActor {
         }
     }
 
+    /// Walk parents of a just-completed/skipped derivation: any
+    /// `Queued` parent whose deps are now all completed-equivalent
+    /// transitions to `Ready`, gets persisted, and is pushed to the
+    /// ready queue. Shared by every completion-like path
+    /// (`release_downstream`, `complete_ready_fod_from_store`,
+    /// `ca_cutoff_cascade`, recovery's `adopt_orphan_completion`).
+    pub(super) async fn promote_newly_ready(&mut self, completed: &DrvHash) {
+        for ready_hash in self.dag.find_newly_ready(completed) {
+            if let Some(s) = self.dag.node_mut(&ready_hash)
+                && s.transition(DerivationStatus::Ready).is_ok()
+            {
+                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
+                    .await;
+                self.push_ready(ready_hash);
+            }
+        }
+    }
+
     // r[impl sched.gc.path-tenants-upsert]
     /// Best-effort `path_tenants` upsert for a derivation that just
     /// reached a completed-equivalent state (Completed/Skipped/
@@ -571,8 +589,6 @@ impl DagActor {
         // heartbeat) of dead capacity per leaked slot.
         //
         // Idempotent: clearing None or a different drv is a no-op.
-        // The later clear below is now redundant for the happy path
-        // but kept for clarity (and harmless).
         if let Some(worker) = self.executors.get_mut(executor_id)
             && worker.running_build.as_ref() == Some(drv_hash)
         {
@@ -714,14 +730,6 @@ impl DagActor {
                 );
                 self.handle_transient_failure(drv_hash, executor_id).await;
             }
-        }
-
-        // Free worker capacity (redundant with the hoist above; kept
-        // for clarity, harmless when already None or different).
-        if let Some(worker) = self.executors.get_mut(executor_id)
-            && worker.running_build.as_ref() == Some(drv_hash)
-        {
-            worker.running_build = None;
         }
 
         // Dispatch newly ready derivations
@@ -1205,15 +1213,7 @@ impl DagActor {
             // [C] (C is Queued and all_deps_completed — Skipped now
             // accepted there).
             for s in &skipped {
-                for ready_hash in self.dag.find_newly_ready(s) {
-                    if let Some(state) = self.dag.node_mut(&ready_hash)
-                        && state.transition(DerivationStatus::Ready).is_ok()
-                    {
-                        self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                            .await;
-                        self.push_ready(ready_hash);
-                    }
-                }
+                self.promote_newly_ready(s).await;
             }
             if cap_hit {
                 tracing::warn!(
@@ -1447,24 +1447,13 @@ impl DagActor {
     /// completion check. `interested_builds` is the trigger's set;
     /// `skipped_interested` (from CA cutoff cascade) is unioned in so a
     /// merged build the trigger does NOT belong to still terminates.
-    async fn release_downstream(
+    pub(super) async fn release_downstream(
         &mut self,
         drv_hash: &DrvHash,
         interested_builds: &[Uuid],
         skipped_interested: HashSet<Uuid>,
     ) {
-        // Release downstream: find newly ready derivations.
-        // push_ready handles interactive boost via priority.
-        let newly_ready = self.dag.find_newly_ready(drv_hash);
-        for ready_hash in newly_ready {
-            if let Some(state) = self.dag.node_mut(&ready_hash)
-                && state.transition(DerivationStatus::Ready).is_ok()
-            {
-                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                    .await;
-                self.push_ready(ready_hash);
-            }
-        }
+        self.promote_newly_ready(drv_hash).await;
 
         // Update build completion status. Union the trigger's
         // interested_builds with skipped nodes' — a CA-cutoff-skipped
@@ -1762,31 +1751,6 @@ impl DagActor {
         };
 
         if should_retry {
-            let retry_count = self.dag.node(drv_hash).map_or(0, |s| s.retry.count);
-
-            // Schedule retry with backoff
-            let backoff = self.retry_policy.backoff_duration(retry_count);
-            let drv_hash_owned: DrvHash = drv_hash.clone();
-
-            if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
-                if !promoted {
-                    state.retry.count += 1;
-                }
-                state.assigned_executor = None;
-            }
-
-            if !promoted && let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
-            }
-
-            debug!(
-                drv_hash = %drv_hash,
-                retry_count = retry_count + u32::from(!promoted),
-                promoted,
-                backoff_secs = backoff.as_secs_f64(),
-                "scheduling retry after transient failure"
-            );
-
             // Delayed re-queue: set backoff_until on the state, then
             // Failed → Ready + push. dispatch_ready checks
             // backoff_until and defers if not yet elapsed. Stateless
@@ -1794,13 +1758,28 @@ impl DagActor {
             // cancelled meanwhile (backoff_until is just an Option
             // on the state, ignored for non-Ready). Cleared on
             // successful dispatch in assign_to_worker.
-            if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                let backoff = self.retry_policy.backoff_duration(state.retry.count);
+                if !promoted {
+                    state.retry.count += 1;
+                }
+                state.assigned_executor = None;
                 state.retry.backoff_until = Some(Instant::now() + backoff);
+                debug!(
+                    drv_hash = %drv_hash,
+                    retry_count = state.retry.count,
+                    promoted,
+                    backoff_secs = backoff.as_secs_f64(),
+                    "scheduling retry after transient failure"
+                );
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
                     warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                 } else {
-                    self.push_ready(drv_hash_owned);
+                    self.push_ready(drv_hash.clone());
                 }
+            }
+            if !promoted && let Err(e) = self.db.increment_retry_count(drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
             // PG status: Ready, NOT Failed. The in-mem state machine
             // goes Failed→Ready (Failed is an intermediate); PG must

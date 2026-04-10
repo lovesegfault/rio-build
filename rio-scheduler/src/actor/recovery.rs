@@ -804,13 +804,12 @@ impl DagActor {
 
     /// Reconcile path for an orphaned assignment whose outputs ARE in
     /// the store: the build completed while the scheduler was down.
-    /// Transition Completed, persist, attribute tenants, unpin,
-    /// release parents, and fire `check_build_completion` for
-    /// interested builds. Partial re-implementation of
-    /// `handle_success_completion` — DON'T emit BuildEvent (the build
-    /// is recovered, subscribers are gone), DON'T update build_history
-    /// (no timing data for an orphan), DON'T update ancestor
-    /// priorities (full_sweep on next tick does it anyway).
+    /// Transition Completed, persist, attribute tenants, unpin, then
+    /// reuse [`release_downstream`](Self::release_downstream) for the
+    /// newly-ready cascade + per-build completion check. Skips the
+    /// `handle_success_completion` steps that need worker-result data
+    /// (build_history, CA bookkeeping, ancestor priorities — full_sweep
+    /// on next tick handles the latter).
     async fn adopt_orphan_completion(
         &mut self,
         drv_hash: &DrvHash,
@@ -819,25 +818,10 @@ impl DagActor {
     ) {
         info!(drv_hash = %drv_hash, executor_id = ?executor_id,
               "reconcile: orphan completion (outputs found in store)");
-        // Capture interested_builds BEFORE transitioning —
-        // check_build_completion (below) needs to know which
-        // builds care. Must read before node_mut (borrow).
-        let interested: Vec<Uuid> = self
-            .dag
-            .node(drv_hash)
-            .map(|s| s.interested_builds.iter().copied().collect())
-            .unwrap_or_default();
+        let interested = self.get_interested_builds(drv_hash);
 
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            // Assigned → Running first if needed (state
-            // machine doesn't allow Assigned → Completed).
-            if state.status() == DerivationStatus::Assigned
-                && let Err(e) = state.transition(DerivationStatus::Running)
-            {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "orphan completion Assigned→Running transition failed");
-                return;
-            }
+            state.ensure_running();
             if let Err(e) = state.transition(DerivationStatus::Completed) {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "orphan completion transition failed");
@@ -856,33 +840,12 @@ impl DagActor {
         // under-retains. output_paths was just set above
         // (= expected_outputs, verified present in store).
         self.upsert_path_tenants_for(drv_hash).await;
-        // Terminal → unpin. Without this, the pins
-        // (written at original dispatch before the crash)
-        // leak until next restart's sweep_stale_live_pins.
-        // sweep_stale_live_pins ran BEFORE reconcile (the
-        // drv was Assigned/Running in PG then — kept), so
-        // it won't catch this one.
+        // Terminal → unpin. sweep_stale_live_pins ran BEFORE
+        // reconcile (the drv was Assigned/Running in PG then —
+        // kept), so it won't catch this one.
         self.unpin_best_effort(drv_hash).await;
-        let newly_ready = self.dag.find_newly_ready(drv_hash);
-        for ready_hash in newly_ready {
-            if let Some(s) = self.dag.node_mut(&ready_hash)
-                && s.transition(DerivationStatus::Ready).is_ok()
-            {
-                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                    .await;
-                self.push_ready(ready_hash);
-            }
-        }
-
-        // Fire build completion check (same as
-        // handle_success_completion does). Without this,
-        // if the orphan-completed drv was the LAST
-        // outstanding one, the build stays Active forever
-        // — no other completion will trigger the check.
-        for build_id in &interested {
-            self.update_build_counts(*build_id).await;
-            self.check_build_completion(*build_id).await;
-        }
+        self.release_downstream(drv_hash, &interested, HashSet::new())
+            .await;
     }
 
     /// Reconcile path for an orphaned assignment whose outputs are NOT

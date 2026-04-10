@@ -632,16 +632,7 @@ impl DagActor {
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
         self.upsert_path_tenants_for(drv_hash).await;
-
-        for ready_hash in self.dag.find_newly_ready(drv_hash) {
-            if let Some(s) = self.dag.node_mut(&ready_hash)
-                && s.transition(DerivationStatus::Ready).is_ok()
-            {
-                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                    .await;
-                self.push_ready(ready_hash);
-            }
-        }
+        self.promote_newly_ready(drv_hash).await;
 
         let event = rio_proto::types::build_event::Event::Derivation(
             rio_proto::types::DerivationEvent::cached(drv_path, output_paths),

@@ -88,12 +88,6 @@ impl From<proto::DerivationNode> for DerivationNode {
     }
 }
 
-impl From<&proto::DerivationNode> for DerivationNode {
-    fn from(n: &proto::DerivationNode) -> Self {
-        n.clone().into()
-    }
-}
-
 /// Domain mirror of [`rio_proto::types::DerivationEdge`].
 #[derive(Debug, Clone)]
 pub struct DerivationEdge {
@@ -107,12 +101,6 @@ impl From<proto::DerivationEdge> for DerivationEdge {
             parent_drv_path: e.parent_drv_path,
             child_drv_path: e.child_drv_path,
         }
-    }
-}
-
-impl From<&proto::DerivationEdge> for DerivationEdge {
-    fn from(e: &proto::DerivationEdge) -> Self {
-        e.clone().into()
     }
 }
 

@@ -507,9 +507,7 @@ mod tests {
     /// is dropped, so `tx.is_closed()` is true. Models the window
     /// between gRPC stream drop and ExecutorDisconnected processing.
     fn make_worker_closed_stream(id: &str) -> ExecutorState {
-        let mut w = ExecutorState::new(id.into());
-        w.systems = vec!["x86_64-linux".into()];
-        w.warm = true;
+        let mut w = make_worker(id, 0);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         w.stream_tx = Some(tx);
