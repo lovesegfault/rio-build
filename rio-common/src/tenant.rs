@@ -114,23 +114,6 @@ impl NormalizedName {
     }
 }
 
-impl TryFrom<&str> for NormalizedName {
-    type Error = NameError;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        Self::new(s)
-    }
-}
-
-impl TryFrom<String> for NormalizedName {
-    type Error = NameError;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        // Could avoid the realloc when `s` is already trimmed, but
-        // tenant names are short (< 64 bytes) and this runs once
-        // per-RPC — not worth the branch.
-        Self::new(&s)
-    }
-}
-
 impl fmt::Display for NormalizedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
