@@ -154,6 +154,10 @@ pub fn describe_metrics() {
         "Derivations served from cache (labeled by source: scheduler/existing)"
     );
     describe_counter!(
+        "rio_scheduler_cache_hit_deferred_total",
+        "Cache-hit derivations deferred to Queued because their inputDrvs are not yet Completed"
+    );
+    describe_counter!(
         "rio_scheduler_cache_check_failures_total",
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );

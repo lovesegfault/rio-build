@@ -717,6 +717,113 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
+/// Cache-hit `Created→Completed` gates on inputDrv Completion: a
+/// substitutable output whose inputDrv is NOT substitutable must NOT
+/// flip to Completed at merge time. Without this gate, dependents
+/// dispatch with the inputDrv's output absent → builder
+/// `compute_input_closure` drops it → ENOENT (rustc-wrapper
+/// substitutes in <1s, rustc-1.94.0 times out at
+/// `eager_substitute_fetch` and builds → git dispatches against an
+/// incomplete closure).
+#[tokio::test]
+async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // git → wrapper → rustc. Only wrapper's output is substitutable.
+    let wrapper_out = test_store_path("wrapper-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(wrapper_out.clone());
+
+    let mut git = make_test_node("git", "x86_64-linux");
+    git.expected_output_paths = vec![test_store_path("git-out")];
+    let mut wrapper = make_test_node("wrapper", "x86_64-linux");
+    wrapper.expected_output_paths = vec![wrapper_out];
+    let mut rustc = make_test_node("rustc", "x86_64-linux");
+    rustc.expected_output_paths = vec![test_store_path("rustc-out")];
+
+    let wrapper_hash = wrapper.drv_hash.clone();
+    let git_hash = git.drv_hash.clone();
+    let rustc_hash = rustc.drv_hash.clone();
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![git, wrapper, rustc],
+        vec![
+            make_test_edge("git", "wrapper"),
+            make_test_edge("wrapper", "rustc"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Core assertion: wrapper is NOT Completed (deferred — its
+    // inputDrv rustc is incomplete). seed_initial_states set it
+    // Queued. Before the gate, wrapper was Completed here and git
+    // went Ready → dispatched with rustc's output absent.
+    let w = handle
+        .debug_query_derivation(&wrapper_hash)
+        .await?
+        .expect("wrapper in DAG");
+    assert_eq!(
+        w.status,
+        DerivationStatus::Queued,
+        "cache-hit wrapper must defer to Queued while inputDrv rustc is incomplete"
+    );
+    let g = handle
+        .debug_query_derivation(&git_hash)
+        .await?
+        .expect("git in DAG");
+    assert_eq!(
+        g.status,
+        DerivationStatus::Queued,
+        "git must stay Queued (wrapper deferred, not Completed)"
+    );
+    let r = handle
+        .debug_query_derivation(&rustc_hash)
+        .await?
+        .expect("rustc in DAG");
+    assert_eq!(r.status, DerivationStatus::Ready, "rustc has no deps");
+
+    // Fixed-point: when BOTH wrapper2 and rustc2 are substitutable,
+    // the worklist re-walk completes the chain in one merge pass.
+    let wrapper2_out = test_store_path("wrapper2-out");
+    let rustc2_out = test_store_path("rustc2-out");
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(wrapper2_out.clone());
+        sub.push(rustc2_out.clone());
+    }
+    let mut wrapper2 = make_test_node("wrapper2", "x86_64-linux");
+    wrapper2.expected_output_paths = vec![wrapper2_out];
+    let mut rustc2 = make_test_node("rustc2", "x86_64-linux");
+    rustc2.expected_output_paths = vec![rustc2_out];
+    let build2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build2,
+        vec![wrapper2, rustc2],
+        vec![make_test_edge("wrapper2", "rustc2")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let status2 = query_status(&handle, build2).await?;
+    assert_eq!(
+        status2.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "both substitutable → fixed-point should complete the chain in one merge"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.merge.substitute-topdown]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.

@@ -562,81 +562,119 @@ impl DagActor {
         // (Poisoned-only / tenant_id-present-only) and rare relative
         // to cached_hits.len().
         let mut completed_batch: Vec<DrvHash> = Vec::with_capacity(cached_hits.len());
-        for (drv_hash, output_paths) in cached_hits {
-            let Some(node) = node_index.get(drv_hash.as_str()) else {
-                continue;
-            };
-            let is_reprobe = existing_reprobe.contains(drv_hash);
-            let from_status = {
-                let Some(state) = self.dag.node_mut(drv_hash) else {
+        // Closure invariant: a cache-hit's output references ⊆ its
+        // inputDrv outputs' closure (Nix referential integrity). If A
+        // is marked Completed while inputDrv B is still being
+        // built/substituted, A's dependents dispatch with B's output
+        // absent → builder compute_input_closure drops B → ENOENT
+        // (e.g. rustc-wrapper Completed via 2KB substitute, but
+        // rustc-1.94.0 timed out at eager_substitute_fetch and is
+        // building → git dispatches → rustc not in JIT allowlist).
+        // Fixed-point: apply Completed only when all_deps_completed;
+        // re-walk until no progress (handles chains of hits). Hits
+        // whose deps never complete here fall through to
+        // seed_initial_states as Queued and BUILD when deps complete
+        // — correctness over the cache-hit shortcut (wrapper drvs
+        // are cheap to rebuild).
+        let mut worklist: Vec<DrvHash> = cached_hits.keys().cloned().collect();
+        let deferred_hits: HashSet<DrvHash> = loop {
+            let before = worklist.len();
+            let mut still_pending: Vec<DrvHash> = Vec::new();
+            let pass = std::mem::take(&mut worklist);
+            for drv_hash in &pass {
+                if !self.dag.all_deps_completed(drv_hash) {
+                    still_pending.push(drv_hash.clone());
+                    continue;
+                }
+                let output_paths = &cached_hits[drv_hash];
+                let Some(node) = node_index.get(drv_hash.as_str()) else {
                     continue;
                 };
-                let from = match state.transition(DerivationStatus::Completed) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(drv_hash = %drv_hash, error = %e, "cache-hit →Completed transition failed");
+                let is_reprobe = existing_reprobe.contains(drv_hash);
+                let from_status = {
+                    let Some(state) = self.dag.node_mut(drv_hash) else {
                         continue;
+                    };
+                    let from = match state.transition(DerivationStatus::Completed) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!(drv_hash = %drv_hash, error = %e, "cache-hit →Completed transition failed");
+                            continue;
+                        }
+                    };
+                    // GAP-4 fix: for floating-CA nodes this is the REALIZED path
+                    // from the realisations table (not the [""] placeholder from
+                    // expected_output_paths). For IA nodes it's expected_output_paths
+                    // (same as before). check_cached_outputs populates the right one.
+                    state.output_paths = output_paths.clone();
+                    // I-099/I-094: re-probe hit on a previously-failed node
+                    // — failure history is moot now we have the output.
+                    if matches!(
+                        from,
+                        DerivationStatus::Poisoned
+                            | DerivationStatus::DependencyFailed
+                            | DerivationStatus::Failed
+                    ) {
+                        state.retry.clear();
                     }
+                    from
                 };
-                // GAP-4 fix: for floating-CA nodes this is the REALIZED path
-                // from the realisations table (not the [""] placeholder from
-                // expected_output_paths). For IA nodes it's expected_output_paths
-                // (same as before). check_cached_outputs populates the right one.
-                state.output_paths = output_paths.clone();
-                // I-099/I-094: re-probe hit on a previously-failed node
-                // — failure history is moot now we have the output.
+                cached_count += 1;
+                let source = if is_reprobe { "reprobe" } else { "scheduler" };
+                metrics::counter!("rio_scheduler_cache_hits_total", "source" => source)
+                    .increment(1);
+
+                // I-094: PG-side poison clear (status='created', NULLs
+                // poisoned_at/retry_count/failed_builders) so recovery
+                // doesn't resurrect the poison. Best-effort like the
+                // status update below.
                 if matches!(
-                    from,
-                    DerivationStatus::Poisoned
-                        | DerivationStatus::DependencyFailed
-                        | DerivationStatus::Failed
-                ) {
-                    state.retry.clear();
-                }
-                from
-            };
-            cached_count += 1;
-            let source = if is_reprobe { "reprobe" } else { "scheduler" };
-            metrics::counter!("rio_scheduler_cache_hits_total", "source" => source).increment(1);
-
-            // I-094: PG-side poison clear (status='created', NULLs
-            // poisoned_at/retry_count/failed_builders) so recovery
-            // doesn't resurrect the poison. Best-effort like the
-            // status update below.
-            if matches!(
-                from_status,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(drv_hash).await
-            {
-                warn!(drv_hash = %drv_hash, error = %e,
+                    from_status,
+                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+                ) && let Err(e) = self.db.clear_poison(drv_hash).await
+                {
+                    warn!(drv_hash = %drv_hash, error = %e,
                       "failed to clear poison in PG after re-probe cache hit");
-            }
-            completed_batch.push(drv_hash.clone());
+                }
+                completed_batch.push(drv_hash.clone());
 
-            if is_reprobe {
-                info!(drv_hash = %drv_hash, from = ?from_status,
+                if is_reprobe {
+                    info!(drv_hash = %drv_hash, from = ?from_status,
                       "re-probe: existing not-done node found in upstream cache");
-                // Existing dependents in Queued can now advance.
-                // Newly-inserted dependents are handled by
-                // compute_initial_states below; this catches the
-                // pre-existing ones.
-                reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
-            }
+                    // Existing dependents in Queued can now advance.
+                    // Newly-inserted dependents are handled by
+                    // compute_initial_states below; this catches the
+                    // pre-existing ones.
+                    reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
+                }
 
-            self.events.emit(
-                build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::cached(
-                        node.drv_path.clone(),
-                        output_paths.clone(),
+                self.events.emit(
+                    build_id,
+                    rio_proto::types::build_event::Event::Derivation(
+                        rio_proto::types::DerivationEvent::cached(
+                            node.drv_path.clone(),
+                            output_paths.clone(),
+                        ),
                     ),
-                ),
+                );
+                // r[impl sched.gc.path-tenants-upsert]
+                // Cache hit during merge: path already in store, new
+                // tenant needs attribution so GC retains under their
+                // policy. output_paths were just set above.
+                self.upsert_path_tenants_for(drv_hash).await;
+            }
+            if still_pending.is_empty() || still_pending.len() == before {
+                break still_pending.into_iter().collect();
+            }
+            worklist = still_pending;
+        };
+        if !deferred_hits.is_empty() {
+            debug!(
+                count = deferred_hits.len(),
+                "cache-hits deferred to build (inputDrvs incomplete; closure invariant)"
             );
-            // r[impl sched.gc.path-tenants-upsert]
-            // Cache hit during merge: path already in store, new
-            // tenant needs attribution so GC retains under their
-            // policy. output_paths were just set above.
-            self.upsert_path_tenants_for(drv_hash).await;
+            metrics::counter!("rio_scheduler_cache_hit_deferred_total")
+                .increment(deferred_hits.len() as u64);
         }
         if !completed_batch.is_empty() {
             let hashes: Vec<&str> = completed_batch.iter().map(DrvHash::as_str).collect();
@@ -670,6 +708,7 @@ impl DagActor {
         cached_count
     }
 
+<<<<<<< HEAD
     /// Step-6f body: walk pre-existing nodes (not newly-inserted, not
     /// stale-reset, not already counted as a cache-hit) and classify.
     /// `Completed`/`Skipped` → bump cached count + path-tenants upsert;
@@ -695,6 +734,131 @@ impl DagActor {
         let newly_inserted = &merge_result.newly_inserted;
         let mut cached = 0u32;
         let mut first_failed: Option<DrvHash> = None;
+||||||| parent of a2f48a56 (fix(rio-scheduler): cache-hit Completed gates on inputDrv Completion (closure race -> builder ENOENT))
+        // Compute critical-path priorities for newly-inserted nodes.
+        // Done AFTER cache-hit transitions so completed derivations
+        // are correctly excluded from their parents' max-child (a
+        // cached dep doesn't block anything — it's done).
+        //
+        // This sets est_duration (from estimator) + priority (bottom-up)
+        // for new nodes, and propagates to existing nodes if the new
+        // subgraph raises their priority. The ready queue reads these
+        // for BinaryHeap ordering.
+        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        phase!("6b-critical-path");
+
+        // I-047: pre-existing Completed nodes may have stale output_paths
+        // (GC deleted the output between the node's original completion and
+        // this merge). Verify outputs exist BEFORE compute_initial_states —
+        // otherwise newly-inserted dependents would be unlocked against a
+        // dep whose output is gone, and the worker fails on isValidPath.
+        // Reset stale nodes to Ready; they re-dispatch and re-complete.
+        // r[impl sched.merge.stale-completed-verify]
+        let stale_reset = self
+            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
+            .await;
+        phase!("6c-verify-preexisting");
+
+        // Compute initial states for the remaining (non-cached) newly-inserted
+        // derivations. Cached derivations above are now Completed, so their
+        // dependents will correctly be computed as Ready here.
+        let remaining_new: HashSet<DrvHash> = newly_inserted
+            .iter()
+            .filter(|h| !cached_hits.contains_key(h.as_str()))
+            .cloned()
+            .collect();
+        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
+        phase!("6d-seed-initial-states");
+
+        // Pre-existing Ready nodes whose interest set grew: their
+        // critical-path priority may have risen (compute_initial above
+        // re-walked over newly_inserted, but a pre-existing Ready node
+        // already in the queue under its OLD priority isn't touched by
+        // that walk). Re-push so a higher-priority build's shared dep
+        // doesn't sit behind lower-priority work. ReadyQueue::push on
+        // an already-present hash with a lower priority is a no-op
+        // (higher entry pops first; dup is skipped), so this is safe
+        // for the non-raised case.
+        for hash in &merge_result.interest_added {
+            if self
+                .dag
+                .node(hash)
+                .is_some_and(|s| s.status() == DerivationStatus::Ready)
+            {
+                self.push_ready(hash.clone());
+            }
+        }
+
+        // Also handle nodes that already existed. A pre-existing Completed
+        // node counts as cached; a pre-existing Poisoned/DependencyFailed
+        // node must set first_dep_failed so handle_derivation_failure
+        // fires below. Without the failure arm, a single-node resubmit of
+        // a still-poisoned derivation (within TTL, no ClearPoison yet)
+        // leaves the build Active with completed=0, failed=0, total=1 —
+        // check_build_completion never fires.
+=======
+        // Compute critical-path priorities for newly-inserted nodes.
+        // Done AFTER cache-hit transitions so completed derivations
+        // are correctly excluded from their parents' max-child (a
+        // cached dep doesn't block anything — it's done).
+        //
+        // This sets est_duration (from estimator) + priority (bottom-up)
+        // for new nodes, and propagates to existing nodes if the new
+        // subgraph raises their priority. The ready queue reads these
+        // for BinaryHeap ordering.
+        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        phase!("6b-critical-path");
+
+        // I-047: pre-existing Completed nodes may have stale output_paths
+        // (GC deleted the output between the node's original completion and
+        // this merge). Verify outputs exist BEFORE compute_initial_states —
+        // otherwise newly-inserted dependents would be unlocked against a
+        // dep whose output is gone, and the worker fails on isValidPath.
+        // Reset stale nodes to Ready; they re-dispatch and re-complete.
+        // r[impl sched.merge.stale-completed-verify]
+        let stale_reset = self
+            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
+            .await;
+        phase!("6c-verify-preexisting");
+
+        // Compute initial states for the remaining (non-cached) newly-inserted
+        // derivations. Cached derivations above are now Completed, so their
+        // dependents will correctly be computed as Ready here.
+        let remaining_new: HashSet<DrvHash> = newly_inserted
+            .iter()
+            .filter(|h| !cached_hits.contains_key(h.as_str()) || deferred_hits.contains(*h))
+            .cloned()
+            .collect();
+        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
+        phase!("6d-seed-initial-states");
+
+        // Pre-existing Ready nodes whose interest set grew: their
+        // critical-path priority may have risen (compute_initial above
+        // re-walked over newly_inserted, but a pre-existing Ready node
+        // already in the queue under its OLD priority isn't touched by
+        // that walk). Re-push so a higher-priority build's shared dep
+        // doesn't sit behind lower-priority work. ReadyQueue::push on
+        // an already-present hash with a lower priority is a no-op
+        // (higher entry pops first; dup is skipped), so this is safe
+        // for the non-raised case.
+        for hash in &merge_result.interest_added {
+            if self
+                .dag
+                .node(hash)
+                .is_some_and(|s| s.status() == DerivationStatus::Ready)
+            {
+                self.push_ready(hash.clone());
+            }
+        }
+
+        // Also handle nodes that already existed. A pre-existing Completed
+        // node counts as cached; a pre-existing Poisoned/DependencyFailed
+        // node must set first_dep_failed so handle_derivation_failure
+        // fires below. Without the failure arm, a single-node resubmit of
+        // a still-poisoned derivation (within TTL, no ClearPoison yet)
+        // leaves the build Active with completed=0, failed=0, total=1 —
+        // check_build_completion never fires.
+>>>>>>> a2f48a56 (fix(rio-scheduler): cache-hit Completed gates on inputDrv Completion (closure race -> builder ENOENT))
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;
