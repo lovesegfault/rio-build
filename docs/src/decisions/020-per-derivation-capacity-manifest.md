@@ -3,11 +3,7 @@
 ## Status
 Rejected (2026-04: Manifest path removed; never deployed, Static remains)
 
-The Manifest sizing path described below was implemented (`GetCapacityManifest` RPC, `BuilderPool.spec.sizing` enum, manifest reconciler) but never deployed — no production helm values ever set `sizing: Manifest`. Removed in favor of keeping ADR-015 Static size-class routing as the only mode. This document is retained for history.
-
-## Status update (2026-04, prior to removal)
-
-Manifest-spawned pods are now **one-shot** like every other worker pod — they run one build and exit. Design point 4 below ("Pods are long-lived, not one-shot") and the rejected-alternative analysis of "True one-pod-per-derivation" are superseded. The concerns there (cold-start dominating short builds, FUSE cache never warming, Karpenter churn cost) are addressed by composefs (<10ms mount, zero warm upcalls), node-level FSx Lustre cache surviving pod churn, and Karpenter consolidation keeping nodes alive across pods. The per-derivation sizing mechanism (points 1–3, 5) is unchanged. `r[ctrl.pool.manifest-long-lived]` is retired.
+The Manifest sizing path described below was implemented (`GetCapacityManifest` RPC, `BuilderPool.spec.sizing` enum, manifest reconciler) but never deployed — no production helm values ever set `sizing: Manifest`. Removed in favor of keeping ADR-015 Static size-class routing as the only mode. This document is retained for history; design point 4 ("Pods are long-lived") and the "True one-pod-per-derivation" rejection were already superseded by one-shot pods before removal.
 
 ## Context
 
@@ -60,13 +56,3 @@ Key design choices:
 ## Relationship to ADR-015
 
 Supersedes ADR-015's sizing mechanism. The SITA-E insight (heavy-tailed distributions benefit from size-based routing) is preserved --- manifest pods ARE size-based routing, just with continuous sizes instead of discrete classes. The `BuilderPoolSet` CRD, `classify()` function, and `size_class` string matching become legacy under `sizing: Manifest`; they remain functional under `sizing: Static` for operators who prefer explicit bins.
-
-## Implementation Status
-
-Proposed. No code yet. Breaking into phases:
-
-- `GetCapacityManifest` RPC + scheduler-side queue-shape aggregation
-- `BuilderPool.spec.sizing` enum (Manifest mode is one build per pod by construction — P0537 made that universal)
-- Controller manifest-diff reconciler (ephemeral.rs variant with per-size spawn)
-- Scheduler resource-fit placement filter
-- Per-pod idle grace period + scale-down

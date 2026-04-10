@@ -33,13 +33,7 @@ rio-build is a build execution backend, not a CI/CD system. This page describes 
 
 ### Client-Side `nix.conf`
 
-For remote store usage, no special client configuration is needed beyond SSH access. For binary cache substitution, add:
-
-```nix
-# /etc/nix/nix.conf or flake.nix nixConfig
-substituters = https://rio-cache.example.com https://cache.nixos.org
-trusted-public-keys = rio-cache.example.com-1:AAAA... cache.nixos.org-1:BBBB...
-```
+For remote store usage, no special client configuration is needed beyond SSH access.
 
 ## Direct Use: Interactive Developer Builds
 
@@ -51,9 +45,6 @@ nix build --store ssh-ng://rio:2222 .#myPackage
 
 # Remote builder mode (per-derivation delegation, works with any Nix setup)
 nix build --builders 'ssh-ng://rio:2222 x86_64-linux' .#myPackage
-
-# Binary cache substitution (read-only, for fetching pre-built outputs)
-nix build --substituters https://rio-cache.example.com .#myPackage
 ```
 
 ## CI/CD: GitHub Actions + rio-build
@@ -130,10 +121,6 @@ nix build --store ssh-ng://rio:2222 --system aarch64-linux .#myPackage
 ```
 
 > **Note:** Cross-compilation (building aarch64 packages on x86_64 executors via `binfmt_misc` / QEMU) is not explicitly supported. Executors should run on native hardware matching their declared `system`. For cross-compilation workflows, use Nix's cross-compilation support (`crossSystem`) on matching executors.
-
-## Binary Cache as Substituter
-
-rio-store's binary cache is compatible with the standard Nix substituter protocol. Configure it alongside other caches (see [Client-Side nix.conf](#client-side-nixconf) above for the configuration snippet).
 
 ## Monitoring Integration
 

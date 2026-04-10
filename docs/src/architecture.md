@@ -41,10 +41,9 @@
 │  assignment        │  │  │ Blobs (S3-compatible)            │       │
 │  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)     │       │
 │                    │  │  │ Inline blobs for NARs < 256 KiB  │       │
-└────────┬───────────┘  │  └─────────────────────────────────┘       │
-         │              │  Binary cache HTTP server (substituter)    │
+└────────┬───────────┘  │                                             │
          │ gRPC         └──────────────┬──────────────────────────────┘
-         │  (builders stream            │ gRPC + HTTP (binary cache)
+         │  (builders stream            │ gRPC
          │   work via BuildExecution)  │
          ▼                             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -84,7 +83,7 @@ The controller is a supervisor that manages the lifecycle of all other component
 
 - **[rio-gateway](./components/gateway.md)** --- SSH server, Nix protocol frontend
 - **[rio-scheduler](./components/scheduler.md)** --- DAG-aware build scheduler
-- **[rio-store](./components/store.md)** --- Chunked CAS, binary cache server
+- **[rio-store](./components/store.md)** --- Chunked CAS
 - **[rio-builder](./components/builder.md)** --- Build executor with FUSE store
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions

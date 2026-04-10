@@ -131,16 +131,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 
 ## VM Integration Tests
 
-NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci` (needs KVM):
-
-| Test | VMs | Validates |
-|------|-----|-----------|
-| `vm-phase1a` | 2 | Read-only opcodes (store info, path-info, store ls, verify) |
-| `vm-phase1b` | 3 | Single-executor build end-to-end |
-| `vm-phase2a` | 4 | Distributed 2-executor build, FUSE assertions, metrics |
-| `vm-phase2b` | 5 | OTLP trace export (Tempo), build log forwarding, config overlay |
-| `vm-phase2c` | 5 | Size-class routing, chunked CAS, binary cache HTTP |
-| `vm-phase3a` | 3 | k3s in-cluster: BuilderPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
+NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci` (needs KVM). Tests are organized by scenario (`nix/tests/default.nix` is the source of truth): `vm-protocol-*`, `vm-scheduling-*`, `vm-lifecycle-*`, `vm-le-*` (leader-election), `vm-security-*`, `vm-dashboard-*`, `vm-observability-*`, `vm-chaos-*`, `vm-substitute-*`, `vm-ca-cutoff-*`, `vm-nixos-node`. Suffix `-standalone` runs against bare-process services in dedicated VMs; suffix `-k3s` boots a single-VM k3s cluster.
 
 ## Test Environment
 
@@ -149,7 +140,7 @@ NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgrou
 | Nix daemon | Live-daemon golden conformance tests (auto-started per test via `fresh_daemon_socket()`) |
 | PostgreSQL | Build state storage (ephemeral `initdb` per test via `rio-test-support::TestDb`; `PG_BIN` set by dev shell) |
 | MinIO | S3 backend tests (VM tests use `services.minio`; unit tests use filesystem backend) |
-| k3s | Kubernetes integration tests (bootstrapped in `vm-phase3a` VM; no external cluster needed) |
+| k3s | Kubernetes integration tests (bootstrapped in `vm-*-k3s` VMs; no external cluster needed) |
 
 r[ts.pg.server]
 `PgServer` is the process-global ephemeral postgres handle. `PgServer::get()` lazily bootstraps via `initdb` + spawn `postgres` (Unix-socket-only, `fsync=off`, `max_connections=500`) on first call and is also the public entry point `xtask regen sqlx` reuses. `gc_stale_dirs` runs before every bootstrap to reclaim `/tmp/rio-pg-*` dirs left by dead test processes (the `PG` static never drops, so `TempDir::drop` never fires); a dir is stale iff its `owner.pid` PID is dead — missing/unparseable `owner.pid` is treated as a live concurrent bootstrap and left alone. `TestDb::new_empty` creates the isolated DB without running migrations (for tests exercising the migrator itself); `TestDb::new` is `new_empty` + `migrator.run`.

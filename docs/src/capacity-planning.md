@@ -59,9 +59,9 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 - Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 40 executors.
 
 **With size-class routing:**
-- Small pool (10 executors, 8 concurrent each): handles 90% of builds (short-lived)
-- Large pool (2 executors, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
-- Better utilization: small executors aren't blocked by multi-hour builds
+- Small pool (~80 pods): handles 90% of builds (short-lived)
+- Large pool (~4 pods): handles 10% of builds (GCC, LLVM, Firefox)
+- Better utilization: small pods aren't blocked by multi-hour builds
 
 The `BuilderPoolSet` CRD wraps this: one BPS defines all size classes declaratively, spawns one child `BuilderPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
 

@@ -435,8 +435,7 @@ src/
     │   ├── mod.rs     # BuilderPool reconcile: spawn/reap Jobs + drain finalizer
     │   ├── builders.rs   # Job/ConfigMap object builders (labels, volumes, envFrom)
     │   ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
-    │   ├── ephemeral.rs  # Static-sizing Job spawn/reap (queue-depth poll, excess-Pending reap)
-    │   ├── manifest.rs   # Manifest-sizing Job spawn (per-derivation ResourceRequirements buckets)
+    │   ├── static_sizing.rs # Static-sizing Job spawn/reap (queue-depth poll, excess-Pending reap)
     │   └── tests/
     ├── builderpoolset/
     │   ├── mod.rs     # BuilderPoolSet reconcile: child BuilderPool fan-out + status aggregate
@@ -445,7 +444,7 @@ src/
     │   └── mod.rs     # ComponentScaler reconcile: learnedRatio EMA + /scale patch
     └── fetcherpool/
         ├── mod.rs     # FetcherPool reconcile: per-class Job spawn (FOD-only executors)
-        └── ephemeral.rs # Per-class spawn count from GetSizeClassStatus.fod_classes
+        └── jobs.rs    # Per-class spawn count from GetSizeClassStatus.fod_classes
 ```
 
 ### rio-test-support — Test harness
@@ -464,7 +463,6 @@ src/
 │   └── spawn.rs       # In-process tonic server spawn helpers (incl. layered + duplex)
 ├── kube_mock.rs       # Fake kube::Client via tower-test mock::pair() + scenario verifier
 ├── metrics.rs         # Test-only metrics::Recorder impls + metrics_suite! assertion helpers
-├── metrics_grep.rs    # include!()-ed by build.rs: greps src/ for metrics::*! literals + obs.md table
 └── fixtures.rs        # test_store_path, rand_store_hash, NAR/PathInfo/DAG builders, seed_store_output
 ```
 
