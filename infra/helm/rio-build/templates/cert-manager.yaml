@@ -101,15 +101,7 @@ metadata:
     app.kubernetes.io/part-of: rio-build
 spec:
   secretName: {{ $c.svc }}-tls
-  duration: 2160h
-  renewBefore: 720h
-  privateKey:
-    algorithm: ECDSA
-    size: 256
-    encoding: PKCS8
-  issuerRef:
-    kind: ClusterIssuer
-    name: rio-ca-issuer
+  {{- include "rio.leafCertSpec" . | nindent 2 }}
   dnsNames:
     - {{ $c.svc }}
     - {{ $c.svc }}.{{ $c.ns }}
@@ -145,15 +137,7 @@ metadata:
     app.kubernetes.io/part-of: rio-build
 spec:
   secretName: {{ $c.name }}
-  duration: 2160h
-  renewBefore: 720h
-  privateKey:
-    algorithm: ECDSA
-    size: 256
-    encoding: PKCS8
-  issuerRef:
-    kind: ClusterIssuer
-    name: rio-ca-issuer
+  {{- include "rio.leafCertSpec" . | nindent 2 }}
   dnsNames:
     - {{ $c.cn }}
     - "*.{{ $c.ns }}.svc.cluster.local"

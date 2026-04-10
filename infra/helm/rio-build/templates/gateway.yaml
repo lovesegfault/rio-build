@@ -40,9 +40,6 @@ spec:
           image: {{ include "rio.image" (list . $g.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           {{- include "rio.containerSecurityContext" . | nindent 10 }}
-          {{- with $g.command }}
-          command: {{ toJson . }}
-          {{- end }}
           ports:
             - name: ssh
               containerPort: 2222

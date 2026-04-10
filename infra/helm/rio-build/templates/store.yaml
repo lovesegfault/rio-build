@@ -34,9 +34,6 @@ spec:
           image: {{ include "rio.image" (list . $s.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           {{- include "rio.containerSecurityContext" . | nindent 10 }}
-          {{- with $s.command }}
-          command: {{ toJson . }}
-          {{- end }}
           ports:
             - name: grpc
               containerPort: 9002
@@ -119,42 +116,9 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "tls" "cov" "jwtVerify") "tlsSecret" "rio-store-tls") | nindent 8 }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: rio-store
-  namespace: {{ .Values.namespaces.store.name }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
-spec:
-  {{- include "rio.ipFamily" . | nindent 2 }}
-  type: ClusterIP
-  selector:
-    {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
-  ports:
-    - name: grpc
-      port: 9002
-      targetPort: grpc
----
-# Headless Service for BalancedChannel DNS resolution. Builders/
-# fetchers resolve this to pod IPs and p2c across them — a sticky
-# single-channel against the ClusterIP (above) means scaling
-# rio-store doesn't help (I-077: 60 builders all hit pod-0).
-apiVersion: v1
-kind: Service
-metadata:
-  name: rio-store-headless
-  namespace: {{ .Values.namespaces.store.name }}
-  labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
-spec:
-  {{- include "rio.ipFamily" . | nindent 2 }}
-  clusterIP: None
-  selector:
-    {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
-  ports:
-    - name: grpc
-      port: 9002
-      targetPort: grpc
+# ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
+# resolve the headless name to pod IPs and p2c across them — a sticky
+# single-channel against the ClusterIP means scaling rio-store doesn't
+# help (I-077: 60 builders all hit pod-0).
+{{ include "rio.grpcServicePair" (dict "root" . "name" "rio-store" "ns" .Values.namespaces.store.name "component" "store" "port" 9002) }}
 {{- end }}

@@ -276,3 +276,70 @@ intermittent resolution failures on large responses.
           app.kubernetes.io/name: rio-store
   ports: [{protocol: TCP, port: 9002}]
 {{- end -}}
+
+{{/*
+Shared leaf-cert spec body (cert-manager.yaml). 90d/30d, ECDSA-P256 PKCS8
+(rustls requirement — see root CA comment), rio-ca-issuer. Everything that
+varies (secretName, dnsNames) stays at the call site.
+*/}}
+{{- define "rio.leafCertSpec" -}}
+duration: 2160h
+renewBefore: 720h
+privateKey:
+  algorithm: ECDSA
+  size: 256
+  encoding: PKCS8
+issuerRef:
+  kind: ClusterIssuer
+  name: rio-ca-issuer
+{{- end -}}
+
+{{/*
+ClusterIP + headless Service pair for a gRPC component. scheduler + store
+both expose this exact pair: ClusterIP for per-call connects (controller
+reconcilers, rio-cli, tests — UNAVAILABLE-then-retry is fine off the hot
+path); headless for BalancedChannel DNS resolution (gateway, workers
+resolve pod IPs and p2c — a sticky single-channel against the ClusterIP
+means scaling replicas doesn't help, I-077). TLS: clients connect to pod
+IPs but the cert SAN is the ClusterIP name; ClientTlsConfig::domain_name()
+overrides verify domain independently of connect URI (balance.rs).
+
+Usage: {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-store" "ns" .Values.namespaces.store.name "component" "store" "port" 9002) }}
+*/}}
+{{- define "rio.grpcServicePair" -}}
+{{- $root := .root -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  namespace: {{ .ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" $root "name" .name "component" .component) | nindent 4 }}
+spec:
+  {{- include "rio.ipFamily" $root | nindent 2 }}
+  type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" .name | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .port }}
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}-headless
+  namespace: {{ .ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" $root "name" .name "component" .component) | nindent 4 }}
+spec:
+  {{- include "rio.ipFamily" $root | nindent 2 }}
+  clusterIP: None
+  selector:
+    {{- include "rio.selectorLabels" .name | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .port }}
+      targetPort: grpc
+{{- end -}}
