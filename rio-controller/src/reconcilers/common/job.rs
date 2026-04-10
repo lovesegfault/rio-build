@@ -496,7 +496,13 @@ pub(crate) async fn reap_orphan_running(
     let mut reaped = 0u32;
     for job in orphans {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
-        match jobs_api.delete(job_name, &DeleteParams::background()).await {
+        // Foreground: same job-tracking-finalizer-orphan race as
+        // reap_excess_pending (see its comment). Targets here are
+        // ready>0 so foreground blocks until the pod actually
+        // terminates, but orphans are past ORPHAN_REAP_GRACE with no
+        // scheduler assignment — there's nothing to preempt. The wait
+        // is per-reconcile-tick, not per-build.
+        match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
             Ok(_) => {
                 info!(
                     pool, class, job = %job_name,
