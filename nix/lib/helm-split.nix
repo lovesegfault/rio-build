@@ -1,6 +1,6 @@
 # Shared shell-snippet builders for splitting helm-rendered manifests
 # into k3s auto-apply ordering. Used by helm-render.nix and
-# envoy-gateway-render.nix.
+# cilium-render.nix.
 { lib }:
 rec {
   # RBAC-ish kinds that must apply before workloads. Single source of

@@ -13,7 +13,7 @@ nix-built images pushed to ECR, helm chart applied, smoke-test verified.
 | Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
 | S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
 | ECR repos | 8 (gateway/scheduler/store/controller/builder/fetcher/bootstrap/dashboard) | immutable tags, keep-last-30 lifecycle |
-| cert-manager | helm_release | issues mTLS certs for intra-cluster gRPC |
+| cilium | helm_release | CNI + WireGuard encryption + Gateway API + kube-proxy replacement |
 | aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
 | SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
 

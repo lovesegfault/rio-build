@@ -3,7 +3,7 @@
 # templates (gated on monitoring.enabled, set by xtask deploy) are
 # inert until this lands — the operator's CRDs define those types.
 #
-# helm_release here for the same reason as cert-manager/external-secrets:
+# helm_release here for the same reason as external-secrets:
 # one `tofu apply`, terraform owns the lifecycle. The chart bundles its
 # own CRDs (prometheus-operator's) via the crds/ dir — helm installs
 # those on first `helm install` and never touches them on upgrade. A

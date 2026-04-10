@@ -21,10 +21,9 @@ global:
 namespaces:
   create: true
 
-# cert-manager not preloaded (phase4c, needs its own airgap images).
-# TLS Secrets provided out-of-band via lib/pki-k8s.nix → k3s manifest.
-# Makes the fixture representative of production (mTLS on all gRPC
-# links, plaintext health port on 9101/9102/9194 for K8s probes).
+# HMAC Secrets provided out-of-band via hmacSecretsManifest → k3s
+# manifest. Plaintext gRPC; Cilium WireGuard handles transport
+# encryption (cilium-render.nix).
 
 # EKS-only (IRSA → Secrets Manager).
 externalSecrets:

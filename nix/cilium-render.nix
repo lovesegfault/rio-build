@@ -1,7 +1,7 @@
 # Render the Cilium chart for airgapped k3s VM tests.
 #
-# Same template → split → k3s-manifests pattern as the (now-deleted)
-# envoy-gateway-render.nix; shared logic in lib/helm-split.nix. Output
+# Template → split → k3s-manifests; shared logic in lib/helm-split.nix.
+# Output
 # is a directory with numbered YAML files that k3s applies in filename
 # order:
 #
