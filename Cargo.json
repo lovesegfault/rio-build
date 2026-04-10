@@ -30081,10 +30081,6 @@
           "packageId": "fastrand"
         },
         {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
           "name": "futures",
           "packageId": "futures"
         },

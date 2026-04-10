@@ -9424,7 +9424,6 @@ dependencies = [
  "either",
  "event-listener-strategy",
  "fastrand",
- "figment",
  "futures",
  "futures-channel",
  "futures-io",
