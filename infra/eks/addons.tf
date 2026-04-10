@@ -100,6 +100,22 @@ resource "helm_release" "cilium" {
       kubeProxyReplacement = true
       k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")
       k8sServicePort       = 443
+      # NodePort BPF frontends: auto-detect (nodeport-addresses empty)
+      # programs only link-local + ULA (fd00:ec2::23 from pod-id-link0),
+      # NOT the node's global-unicast IPv6. NLB target-type=instance
+      # sends to the instance's primary GUA → no LB-map entry →
+      # cil_from_netdev passes to stack → RST. Explicit VPC CIDRs force
+      # the GUA frontend. (Cross-node tests pass without this because
+      # host-netns connects are socket-LB-intercepted via [::] wildcard
+      # before hitting the physical-IP path — false positive.)
+      nodePort = {
+        addresses = [module.vpc.vpc_ipv6_cidr_block, module.vpc.vpc_cidr_block]
+      }
+      # Exclude pod-id-link0 (EKS Pod Identity veth) from device
+      # auto-detect; it's not a datapath NIC but gets spurious
+      # fd00:ec2::23 frontends. Glob covers AL2023 system nodes (eth0)
+      # and NixOS predictable-naming (ens5/enp*).
+      devices = ["eth+", "ens+", "enp+"]
 
       # r[impl sec.transport.cilium-wireguard]
       encryption = {
