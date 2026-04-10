@@ -136,6 +136,27 @@ pub enum ActorCommand {
     /// A worker's BuildExecution stream closed.
     ExecutorDisconnected { executor_id: ExecutorId },
 
+    /// Controller observed a builder/fetcher Pod's container terminate
+    /// and reports the k8s reason (OOMKilled / Evicted-DiskPressure /
+    /// etc.). `OomKilled`/`EvictedDiskPressure` → promote
+    /// `size_class_floor` for whatever drv was running at disconnect
+    /// (resolved via `recently_disconnected`). Other reasons → no-op.
+    ///
+    /// `send_unchecked`: a dropped report means a real OOM doesn't
+    /// promote → retry-storm on the same undersized class. Same
+    /// "must land under backpressure" reasoning as DrainExecutor.
+    ReportExecutorTermination {
+        executor_id: ExecutorId,
+        reason: rio_proto::types::TerminationReason,
+        /// Pod's size_class label from the controller. Fallback when
+        /// `recently_disconnected` has the entry but with `None` class
+        /// (shouldn't happen) or when the report races ahead of the
+        /// disconnect (controller observed Pod-status before the gRPC
+        /// stream broke at the scheduler).
+        size_class: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
     /// Flips `ExecutorState.warm = true` so `best_executor()` starts
     /// considering this worker on the warm-pass. Spec:
@@ -414,6 +435,7 @@ impl ActorCommand {
             Self::CancelBuild { .. } => "CancelBuild",
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
+            Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
             Self::Heartbeat(_) => "Heartbeat",
             Self::Tick => "Tick",

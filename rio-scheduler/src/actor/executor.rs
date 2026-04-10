@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::dag::DerivationDag;
@@ -20,6 +20,15 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId, ExecutorState};
 ///
 /// [`on_worker_registered`]: DagActor::on_worker_registered
 use super::{DagActor, DrainResult, HeartbeatPayload, MAX_PREFETCH_PATHS};
+
+/// How long a `recently_disconnected` entry waits for the controller's
+/// `ReportExecutorTermination` before being swept. The controller
+/// observes Pod-status + reconciles ~1-3s after the gRPC stream drops;
+/// `JOB_TTL_SECS=600` keeps the Pod around that long. 60s covers
+/// apiserver lag + one missed reconcile tick (~10s) with margin. Past
+/// this, a missed report degrades to "one OOM doesn't promote" — the
+/// next OOM on the same drv will (the floor is sticky).
+pub(super) const TERMINATION_REPORT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Initial-hint scan budget: max Ready derivations to consider. Don't
 /// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40
@@ -260,22 +269,36 @@ impl DagActor {
 
         // Reassign whatever was on this worker. The worker is gone;
         // whether it was draining or not doesn't matter now.
-        // I-173: capture size_class from the removed worker — the
-        // reassign path's FOD floor promotion can't look it up via
-        // self.executors anymore. I-197: capture last_completed too —
-        // disconnect AFTER a completion report for the running drv is
-        // the expected one-shot exit (suppress promotion); disconnect
-        // WITHOUT one is OOMKilled mid-build (promote).
+        //
+        // Disconnect does NOT promote `size_class_floor` — the
+        // controller is authoritative on termination reason
+        // (`ReportExecutorTermination` with k8s OOMKilled/DiskPressure
+        // → promote; anything else → no-op). A bare disconnect is
+        // ambiguous: pod-kill, store-replica-restart, node failure are
+        // all NOT sizing signals. Live QA: cmake went medium→large→
+        // xlarge from a pod-kill + store-replica-restart with zero
+        // builds run; floor is sticky (M_032). I-197's
+        // `last_completed` discriminator is kept ONLY to decide
+        // whether to record a `recently_disconnected` entry (expected
+        // one-shot exit → no entry; the controller will report
+        // `Completed` and we'd ignore it anyway, so skip the map
+        // churn).
         let lost_class = worker.size_class.clone();
         let lost_last_completed = worker.last_completed.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
-        self.reassign_derivations(
-            &to_reassign,
-            Some(executor_id),
-            lost_class.as_deref(),
-            lost_last_completed.as_ref(),
-        )
-        .await;
+        // Record for the controller's follow-up report. Only when the
+        // worker died MID-BUILD (last_completed != running_build) — an
+        // expected one-shot exit needs no entry.
+        if let Some(drv) = to_reassign.first()
+            && lost_last_completed.as_ref() != Some(drv)
+        {
+            self.recently_disconnected.insert(
+                executor_id.clone(),
+                (drv.clone(), lost_class, Instant::now()),
+            );
+        }
+        self.reassign_derivations(&to_reassign, Some(executor_id))
+            .await;
 
         // Dashboard: running count dropped; assigned_executors lost
         // this worker. Without emit_progress here, a quiet build shows
@@ -301,130 +324,50 @@ impl DagActor {
     /// derivations should be retried elsewhere — this is the mechanism.
     ///
     /// `reset_to_ready()` handles both Assigned → Ready and Running →
-    /// Failed → Ready (the latter increments retry_count because Running
-    /// means the build actually started — that's a failed attempt). A
-    /// derivation in any other state (Completed, Poisoned, DepFailed) is
-    /// skipped with a warn — it shouldn't be in `running_build` but
-    /// split-brain or delayed heartbeat reconcile can produce it.
+    /// Failed → Ready. A derivation in any other state (Completed,
+    /// Poisoned, DepFailed) is skipped with a warn — it shouldn't be in
+    /// `running_build` but split-brain or delayed heartbeat reconcile
+    /// can produce it.
     ///
-    /// `lost_worker`: if Some AND the drv was Running, record it in
-    /// the derivation's `failed_builders` set. This feeds:
-    /// - `best_executor()` exclusion (don't retry on the SAME broken
-    ///   worker)
-    /// - Poison detection (3 distinct failed workers → poisoned). A
-    ///   derivation that crashed 3 workers should not loop forever.
+    /// Disconnect does NOT promote `size_class_floor` and does NOT
+    /// record into `failed_builders`/`failure_count`/`retry_count`. The
+    /// controller is authoritative on termination reason: it calls
+    /// `ReportExecutorTermination` with the k8s OOMKilled/Evicted
+    /// signal ~1-3s later, and ONLY OomKilled/EvictedDiskPressure
+    /// promote. A bare disconnect is ambiguous (pod-kill, node failure,
+    /// store-replica-restart, operator delete) — none are the build's
+    /// fault, none are sizing signals. The previous I-173/I-177/I-197
+    /// disconnect-promote heuristic over-fired: live QA showed cmake
+    /// going medium→large→xlarge from a pod-kill + store-replica-
+    /// restart with zero builds run.
     ///
-    /// I-097: Assigned-but-never-Running disconnects do NOT record —
-    /// the drv was never attempted, so it can't have caused the
-    /// disconnect. Under ephemeral-fetcher churn this race is common
-    /// (assignment lands just before the one-shot Job exits); counting
-    /// it would falsely poison drvs that nothing ever tried.
+    /// Builds that genuinely fail send a `CompletionReport` BEFORE
+    /// disconnecting (worker catches the failure) → `handle_transient_
+    /// failure` / `handle_permanent_failure` records + poison-checks
+    /// there. The "drv that crashes 3 workers should poison" property
+    /// is preserved on those paths.
     ///
-    /// `lost_worker_class`: the lost worker's `size_class`, captured
-    /// by the caller before any `self.executors.remove()`. Threaded
-    /// through because `handle_executor_disconnected` removes the
-    /// executor before calling here, so a `self.executors.get()`
-    /// lookup inside would miss (I-173).
-    ///
-    /// `lost_worker_last_completed`: the lost worker's
-    /// `last_completed`, captured the same way. Floor promotion is
-    /// suppressed when the disconnect is the expected one-shot exit:
-    /// the worker already reported completion for the drv being
-    /// reassigned (`last_completed == Some(drv_hash)` — the I-188
-    /// race). A worker that disconnects WITHOUT having completed its
-    /// running drv was OOMKilled mid-build (I-197) → promote per
-    /// `r[sched.builder.size-class-reactive]`.
-    ///
-    /// `None` for callers that don't have a specific lost worker
-    /// (none currently, but keeps the signature extensible).
+    /// `lost_worker`: kept for the existing-poison-state check (3 prior
+    /// REAL failures + 1 disconnect → poison instead of dispatching a
+    /// 4th time) and for logging.
+    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+2]
     pub(super) async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
-        lost_worker_class: Option<&str>,
-        lost_worker_last_completed: Option<&DrvHash>,
     ) {
         for drv_hash in drv_hashes {
-            // I-097: only count toward poison/failed_builders if the
-            // drv was RUNNING when the worker disconnected. Assigned-
-            // but-never-started is a pure scheduling race (ephemeral
-            // fetcher exited between try_send and process) — the drv
-            // was never attempted, so it can't have caused the crash.
-            // Under ephemeral churn, 3 such races would falsely
-            // poison a drv that nothing ever tried to build.
-            //
-            // Running → worker started then died → drv may have
-            // crashed it → record + poison-check (the original
-            // rationale: a drv that crashes 3 workers should poison).
-            let was_running = self
+            // Re-read existing poison state so 3 prior REAL failures
+            // (recorded by handle_transient_failure) + this disconnect
+            // → poison instead of dispatching a 4th time. Disconnect
+            // itself never increments the count.
+            let should_poison = self
                 .dag
                 .node(drv_hash)
-                .is_some_and(|s| matches!(s.status(), DerivationStatus::Running));
-
-            // Track the lost worker (in-mem + PG) + check poison
-            // threshold BEFORE reset_to_ready — poison_and_cascade
-            // expects Assigned/Running, not Ready.
-            let mut promoted = false;
-            let should_poison = match lost_worker {
-                Some(executor_id) => {
-                    // r[impl sched.fod.size-class-reactive]
-                    // r[impl sched.builder.size-class-reactive]
-                    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+2]
-                    // I-173/I-177: promote size_class_floor on
-                    // disconnect, FOD or not, REGARDLESS of
-                    // was_running — DerivationStatus stays Assigned
-                    // for the build's whole lifetime (Running is set
-                    // only at completion via ensure_running()), so
-                    // gating on was_running would never fire in
-                    // production. Uses `lost_worker_class` captured
-                    // before executor removal — the self.executors
-                    // lookup inside record_failure_and_check_poison
-                    // misses on the disconnect path.
-                    //
-                    // I-197: suppress promotion ONLY when the worker
-                    // already reported completion for THIS drv (the
-                    // I-188 race: completion → one-shot exit,
-                    // disconnect with stale running_build). A worker
-                    // that disconnects mid-build (last_completed !=
-                    // drv_hash, typically None) was OOMKilled — that
-                    // IS a size-adequacy signal. I-188's blanket
-                    // suppress made openssl OOM-loop on `tiny` for
-                    // hours with size_class_floor empty.
-                    let expected_oneshot_exit = lost_worker_last_completed == Some(drv_hash);
-                    promoted = if expected_oneshot_exit {
-                        false
-                    } else {
-                        self.promote_size_class_floor(drv_hash, lost_worker_class)
-                            .await
-                    };
-                    if was_running {
-                        let outcome = self
-                            .record_failure_and_check_poison(drv_hash, executor_id, promoted)
-                            .await;
-                        promoted = outcome.promoted;
-                        outcome.reached_poison
-                    } else {
-                        // I-097: Assigned-only — don't record failure
-                        // (scheduling race, drv never attempted). Re-
-                        // read existing poison state so 3 prior REAL
-                        // failures + 1 disconnect still poisons
-                        // instead of dispatching a 4th time.
-                        self.dag
-                            .node(drv_hash)
-                            .map(|s| self.poison_config.is_poisoned(s))
-                            .unwrap_or(false)
-                    }
-                }
-                // No lost_worker: just re-read existing poison state.
-                None => self
-                    .dag
-                    .node(drv_hash)
-                    .map(|s| self.poison_config.is_poisoned(s))
-                    .unwrap_or(false),
-            };
+                .map(|s| self.poison_config.is_poisoned(s))
+                .unwrap_or(false);
             if should_poison {
                 info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
-                      was_running,
                       "reassign: poison threshold reached, poisoning instead of retry");
                 self.poison_and_cascade(drv_hash).await;
                 continue;
@@ -438,21 +381,92 @@ impl DagActor {
                     );
                     continue;
                 }
-                // Worker-loss mid-build is a failed attempt: count it
-                // unless it promoted the floor (`r[sched.retry.
-                // promotion-exempt]` — sizing signal, bounded by
-                // ladder length, not the retry budget).
-                if was_running && !promoted {
-                    state.retry.count += 1;
-                    if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                        error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
-                    }
-                }
                 self.persist_status(drv_hash, DerivationStatus::Ready, None)
                     .await;
                 self.push_ready(drv_hash.clone());
             }
         }
+    }
+
+    // r[impl sched.fod.size-class-reactive]
+    // r[impl sched.builder.size-class-reactive]
+    /// Controller-reported Pod termination reason. `OomKilled` /
+    /// `EvictedDiskPressure` → promote `size_class_floor` for the drv
+    /// that was running at disconnect. Other reasons → no-op (log only).
+    ///
+    /// Resolves `executor_id → drv_hash` via `recently_disconnected`
+    /// (populated by `handle_executor_disconnected` when the worker died
+    /// mid-build). The entry is `remove()`d on first report — the
+    /// controller's reconcile loop re-reports the same Pod every ~10s
+    /// for `JOB_TTL_SECS=600`; subsequent reports miss the map and
+    /// no-op. If the report races AHEAD of the disconnect (controller
+    /// observed Pod-status before the gRPC stream broke at the
+    /// scheduler — rare), fall back to the still-live executor's
+    /// `running_build`.
+    ///
+    /// `reported_class`: the controller sends the Pod's size_class
+    /// label as a fallback. Normally `recently_disconnected` already
+    /// has the class (captured at disconnect); this covers the race-
+    /// ahead case where the executor entry exists but
+    /// `recently_disconnected` doesn't.
+    pub(super) async fn handle_executor_termination(
+        &mut self,
+        executor_id: &ExecutorId,
+        reason: rio_proto::types::TerminationReason,
+        reported_class: Option<&str>,
+    ) -> bool {
+        use rio_proto::types::TerminationReason as R;
+
+        // Resolve drv + class. remove() = first-report-wins dedup.
+        let (drv_hash, class) = match self.recently_disconnected.remove(executor_id) {
+            Some((drv, class, _)) => (drv, class.or_else(|| reported_class.map(String::from))),
+            // Race-ahead: report landed before ExecutorDisconnected.
+            // Look at the still-live executor.
+            None => match self.executors.get(executor_id) {
+                Some(w) => match &w.running_build {
+                    Some(drv) => (
+                        drv.clone(),
+                        w.size_class
+                            .clone()
+                            .or_else(|| reported_class.map(String::from)),
+                    ),
+                    None => {
+                        debug!(executor_id = %executor_id, ?reason,
+                               "termination report: executor live but idle, ignoring");
+                        return false;
+                    }
+                },
+                None => {
+                    debug!(executor_id = %executor_id, ?reason,
+                           "termination report: no recently_disconnected entry \
+                            (already handled, swept, or expected one-shot exit)");
+                    return false;
+                }
+            },
+        };
+
+        let promote_reason = match reason {
+            R::OomKilled => "oom_killed",
+            R::EvictedDiskPressure => "disk_pressure",
+            R::EvictedOther | R::Completed | R::Error | R::Unknown => {
+                debug!(executor_id = %executor_id, drv_hash = %drv_hash, ?reason,
+                       "termination report: non-resource reason, no promotion");
+                return false;
+            }
+        };
+
+        self.promote_size_class_floor(&drv_hash, class.as_deref(), promote_reason)
+            .await
+    }
+
+    /// Sweep `recently_disconnected` entries older than
+    /// [`TERMINATION_REPORT_TTL`]. Called from `handle_tick`. A swept
+    /// entry means the controller's report never arrived (controller
+    /// down, Pod deleted before reconcile observed it) — degrades to
+    /// "this one OOM didn't promote".
+    pub(super) fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
+        self.recently_disconnected
+            .retain(|_, (_, _, at)| now.duration_since(*at) < TERMINATION_REPORT_TTL);
     }
 
     /// Mark a worker draining. In-flight builds continue; no new
@@ -518,8 +532,6 @@ impl DagActor {
             // know the drv_path (which needs DAG lookup).
             let to_reassign: Vec<DrvHash> = worker.running_build.take().into_iter().collect();
             let stream_tx = worker.stream_tx.clone();
-            let lost_class = worker.size_class.clone();
-            let lost_last_completed = worker.last_completed.clone();
 
             // Send CancelSignal for each in-flight build BEFORE
             // reassigning. This is the preemption hook: when the
@@ -575,18 +587,11 @@ impl DagActor {
             // That's fine — the warn documents the expected behavior).
             //
             // Pass the drained worker's ID so reassigned derivations
-            // track it in failed_builders. A force-drained worker is
-            // "failed" for these builds in the sense that it didn't
-            // finish them — exclude it from retry consideration
-            // (moot since it's draining anyway, but consistent with
-            // the disconnect path and feeds poison detection).
-            self.reassign_derivations(
-                &to_reassign,
-                Some(executor_id),
-                lost_class.as_deref(),
-                lost_last_completed.as_ref(),
-            )
-            .await;
+            // Force-drain is operator-initiated (or controller-driven
+            // preemption), NOT a sizing signal — re-queue at current
+            // floor only, same as bare disconnect.
+            self.reassign_derivations(&to_reassign, Some(executor_id))
+                .await;
 
             return DrainResult {
                 accepted: true,

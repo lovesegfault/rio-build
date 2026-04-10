@@ -776,6 +776,27 @@ pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Send `ReportExecutorTermination` and return whether the floor was
+/// promoted. Simulates the controller's follow-up after observing
+/// k8s Pod-status. Barriered.
+pub(crate) async fn report_termination(
+    handle: &ActorHandle,
+    id: &str,
+    reason: rio_proto::types::TerminationReason,
+    size_class: Option<&str>,
+) -> anyhow::Result<bool> {
+    let promoted = handle
+        .query_unchecked(|reply| ActorCommand::ReportExecutorTermination {
+            executor_id: id.into(),
+            reason,
+            size_class: size_class.map(String::from),
+            reply,
+        })
+        .await?;
+    barrier(handle).await;
+    Ok(promoted)
+}
+
 /// Build a `Vec<SizeClassConfig>` from `(name, cutoff_secs)` pairs with
 /// unbounded mem/cpu. Replaces the 25× inline 6-line struct literals
 /// scattered across `misc.rs`/`completion.rs`/`executor.rs`.

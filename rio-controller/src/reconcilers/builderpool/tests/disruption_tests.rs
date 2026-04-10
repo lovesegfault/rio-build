@@ -56,6 +56,18 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
             })
             .to_string(),
         ),
+        // Pods list (report_terminated_pods) — empty, no
+        // ReportExecutorTermination RPCs fired.
+        Scenario::ok(
+            http::Method::GET,
+            "/api/v1/namespaces/rio/pods",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "items": [],
+            })
+            .to_string(),
+        ),
         // Status patch — reconcile reports active/ceiling.
         Scenario::ok(
             http::Method::PATCH,

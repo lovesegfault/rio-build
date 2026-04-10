@@ -15,17 +15,19 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec};
+use k8s_openapi::api::core::v1::{Pod, PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
+
+use rio_proto::types::{ReportExecutorTerminationRequest, TerminationReason};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::common::PoolStatusCommon;
 
-use super::pod::UpstreamAddrs;
+use super::pod::{POOL_LABEL, UpstreamAddrs};
 
 /// Field manager for server-side apply on Job-mode pool resources
 /// (BuilderPool/FetcherPool status, owned Jobs). K8s tracks which
@@ -803,6 +805,117 @@ pub(crate) fn scheduler_unreachable_condition(
 /// returns. We want to log the name in the create-error path
 /// (409, other API errors). Generating our own suffix is the
 /// same collision math with better observability.
+/// Classify a Pod's termination reason from k8s PodStatus.
+///
+/// Precedence:
+///   1. `status.reason == "Evicted"` + message → DiskPressure or Other.
+///      Kubelet eviction sets `reason=Evicted` at the Pod level;
+///      `message` carries the resource (`"The node was low on
+///      resource: ephemeral-storage"`, `"…DiskPressure"`).
+///   2. `containerStatuses[].state.terminated.reason` → OOMKilled /
+///      Completed / Error. Only the rio-builder/rio-fetcher container
+///      matters (single-container pod), so first terminated state wins.
+///   3. Neither → Unknown (Pod still running, or status not yet
+///      populated). Caller skips Unknown.
+///
+/// `ephemeral-storage` is matched alongside `DiskPressure` because
+/// kubelet's eviction message for the per-pod ephemeral-storage limit
+/// uses that phrase, not "DiskPressure" (DiskPressure is the NODE
+/// condition; the per-pod limit eviction is the production firefox
+/// I-213 case).
+pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
+    let Some(status) = &pod.status else {
+        return TerminationReason::Unknown;
+    };
+    if status.reason.as_deref() == Some("Evicted") {
+        let msg = status.message.as_deref().unwrap_or("");
+        if msg.contains("DiskPressure") || msg.contains("ephemeral-storage") {
+            return TerminationReason::EvictedDiskPressure;
+        }
+        return TerminationReason::EvictedOther;
+    }
+    for cs in status.container_statuses.iter().flatten() {
+        if let Some(term) = cs.state.as_ref().and_then(|st| st.terminated.as_ref()) {
+            return match term.reason.as_deref() {
+                Some("OOMKilled") => TerminationReason::OomKilled,
+                Some("Completed") => TerminationReason::Completed,
+                _ => TerminationReason::Error,
+            };
+        }
+    }
+    TerminationReason::Unknown
+}
+
+/// Report each terminated Pod's k8s reason to the scheduler so it can
+/// gate `size_class_floor` promotion on actual OOMKilled/DiskPressure
+/// (not bare disconnect). Called from the Job-mode reconcilers' tick
+/// after the spawn/reap steps.
+///
+/// Lists Pods (not Jobs — JobStatus doesn't carry per-container
+/// termination reason) by `POOL_LABEL` selector. For each Pod with a
+/// terminated container or Evicted status, calls `AdminService.
+/// ReportExecutorTermination(executor_id = pod name, reason)`.
+///
+/// Idempotent: the scheduler's `recently_disconnected` map dedups
+/// (first-report-wins, `remove()` on hit), so re-reporting the same
+/// Pod every ~10s tick during `JOB_TTL_SECS=600` is a no-op past the
+/// first. `Unknown` (Pod still running / status not populated) is
+/// skipped — next tick will see the terminated state.
+///
+/// Best-effort: list error or RPC error is logged at debug/warn and
+/// the reconcile continues. A missed report degrades to "one OOM
+/// doesn't promote"; the next OOM on the same drv will (floor is
+/// sticky). Never blocks the spawn/reap loop.
+pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str, size_class: &str) {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
+    let list = match pods
+        .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool}")))
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            debug!(pool, error = %e, "report_terminated_pods: pod list failed; skipping");
+            return;
+        }
+    };
+    let mut admin = ctx.admin.clone();
+    for pod in &list.items {
+        let reason = pod_termination_reason(pod);
+        if reason == TerminationReason::Unknown {
+            continue;
+        }
+        let Some(name) = pod.metadata.name.as_deref() else {
+            continue;
+        };
+        match admin
+            .report_executor_termination(ReportExecutorTerminationRequest {
+                executor_id: name.to_owned(),
+                reason: reason.into(),
+                size_class: size_class.to_owned(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                if resp.into_inner().promoted {
+                    info!(
+                        pool, executor_id = %name, ?reason, size_class,
+                        "reported pod termination → scheduler promoted size_class_floor"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    pool, executor_id = %name, ?reason, error = %e,
+                    "ReportExecutorTermination failed; skipping (best-effort)"
+                );
+                // Scheduler unreachable → no point retrying the rest
+                // this tick. Next tick re-lists and retries.
+                return;
+            }
+        }
+    }
+}
+
 pub(crate) fn random_suffix() -> String {
     use rand::RngExt;
     // 36^6 ≈ 2.18 billion combinations. With JOB_TTL_SECS=600 and a
@@ -846,6 +959,81 @@ mod tests {
         assert_eq!(c["type"], "SchedulerUnreachable");
         assert_eq!(c["status"], "False");
         assert_eq!(c["reason"], "ClusterStatusOK");
+    }
+
+    /// `pod_termination_reason` classification. Mirrors what k8s
+    /// kubelet populates for each case.
+    #[test]
+    fn pod_termination_reason_classification() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+
+        fn pod_with_term(reason: &str) -> Pod {
+            Pod {
+                status: Some(PodStatus {
+                    container_statuses: Some(vec![ContainerStatus {
+                        state: Some(ContainerState {
+                            terminated: Some(ContainerStateTerminated {
+                                reason: Some(reason.into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        fn pod_evicted(msg: &str) -> Pod {
+            Pod {
+                status: Some(PodStatus {
+                    reason: Some("Evicted".into()),
+                    message: Some(msg.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        assert_eq!(
+            pod_termination_reason(&pod_with_term("OOMKilled")),
+            TerminationReason::OomKilled
+        );
+        assert_eq!(
+            pod_termination_reason(&pod_with_term("Completed")),
+            TerminationReason::Completed
+        );
+        assert_eq!(
+            pod_termination_reason(&pod_with_term("Error")),
+            TerminationReason::Error
+        );
+        // Kubelet's per-pod ephemeral-storage limit eviction message
+        // (the production firefox I-213 case).
+        assert_eq!(
+            pod_termination_reason(&pod_evicted(
+                "Pod ephemeral local storage usage exceeds the total limit \
+                 of containers ephemeral-storage"
+            )),
+            TerminationReason::EvictedDiskPressure
+        );
+        // Node-condition DiskPressure eviction.
+        assert_eq!(
+            pod_termination_reason(&pod_evicted("The node was low on resource: DiskPressure.")),
+            TerminationReason::EvictedDiskPressure
+        );
+        // MemoryPressure eviction (node-level, NOT a per-drv signal).
+        assert_eq!(
+            pod_termination_reason(&pod_evicted("The node was low on resource: memory.")),
+            TerminationReason::EvictedOther
+        );
+        // Still running → Unknown.
+        assert_eq!(
+            pod_termination_reason(&Pod::default()),
+            TerminationReason::Unknown
+        );
     }
 
     /// random_suffix returns valid K8s name chars. DNS-1123 subdomain

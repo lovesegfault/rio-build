@@ -126,6 +126,7 @@ impl DagActor {
 
         let now = Instant::now();
         self.tick_check_heartbeats(now).await;
+        self.tick_sweep_recently_disconnected(now);
 
         // Ordering is load-bearing: backstop-process runs before the
         // per-build-timeout check, poison-expire runs last — matches
@@ -306,20 +307,12 @@ impl DagActor {
                 worker.running_build = None;
             }
             // Reassign (same path as worker disconnect): reset_to_
-            // ready + retry++ + failed_builders.insert (in-mem AND
-            // PG via append_failed_worker) + PG status + push_ready.
-            let (lost_class, lost_last_completed) = self
-                .executors
-                .get(executor_id)
-                .map(|e| (e.size_class.clone(), e.last_completed.clone()))
-                .unwrap_or((None, None));
-            self.reassign_derivations(
-                std::slice::from_ref(drv_hash),
-                Some(executor_id),
-                lost_class.as_deref(),
-                lost_last_completed.as_ref(),
-            )
-            .await;
+            // ready + PG status + push_ready. Backstop-timeout is NOT
+            // a sizing signal — handle_timeout_failure (worker-reported
+            // TimedOut) does the floor promotion; this scheduler-side
+            // backstop is "worker hung, never reported."
+            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
+                .await;
         }
     }
 

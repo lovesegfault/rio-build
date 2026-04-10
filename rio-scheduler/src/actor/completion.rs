@@ -359,32 +359,31 @@ impl DagActor {
 
     // r[impl sched.fod.size-class-reactive]
     // r[impl sched.builder.size-class-reactive]
-    /// I-170/I-177: bump a derivation's `size_class_floor` to one
-    /// above `failed_class` so the next dispatch skips already-tried
-    /// sizes. No clean OOM signal reaches the scheduler — pod death
-    /// is a disconnect — so this fires on ANY failure path; over-
-    /// promoting is cheap (one larger pod), retry-storm on tiny is
-    /// not (poison-loop).
+    /// Bump a derivation's `size_class_floor` to one above
+    /// `failed_class` so the next dispatch skips already-tried sizes.
     ///
-    /// I-177: generalized from FOD-only. 103 tiny builders OOMKilled
-    /// on bootstrap-stage0-glibc / gnu-config / llvm-src; the
-    /// `is_fixed_output` guard meant non-FOD OOMs left floor=NULL,
-    /// and the EMA classifier (success-only samples, see
-    /// `update_build_history`) kept routing to tiny → poison.
-    /// Branches on `is_fixed_output` to pick which class list to
-    /// walk: FOD → `fetcher_size_classes` (config-order); non-FOD →
+    /// Called ONLY from explicit resource-exhaustion signals:
+    /// - `handle_executor_termination` (controller-reported k8s
+    ///   OOMKilled / Evicted-DiskPressure)
+    /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
+    ///   — build child hit cgroup memory.max while pod survived)
+    /// - `handle_timeout_failure` (worker-reported `TimedOut`)
+    ///
+    /// NOT called from bare disconnect / `TransientFailure` /
+    /// non-OOM `InfrastructureFailure`. The previous
+    /// I-170/I-173/I-177/I-199 over-broad heuristic (promote on ANY
+    /// failure path) over-fired: live QA showed cmake going medium→
+    /// large→xlarge from a pod-kill + store-replica-restart with zero
+    /// builds run, and floor is sticky (M_032) so the next submitter
+    /// paid for an oversized pod.
+    ///
+    /// I-177: branches on `is_fixed_output` to pick which class list
+    /// to walk: FOD → `fetcher_size_classes` (config-order); non-FOD →
     /// `size_classes` (cutoff-order).
     ///
-    /// I-173: extracted from [`Self::record_failure_and_check_poison`]
-    /// so the Assigned-disconnect path (`reassign_derivations`, I-097
-    /// guard) can promote WITHOUT recording a failure. An OOM'd
-    /// executor disconnects with the drv often still Assigned (Running
-    /// ack not yet processed); coupling promotion to poison-record
-    /// meant 14 live OOMs left `size_class_floor=NULL` and retry-
-    /// stormed on tiny. Takes the resolved class string (NOT
-    /// executor_id) because `handle_executor_disconnected` removes
-    /// the executor from `self.executors` before reassign — the
-    /// caller threads the captured class through.
+    /// `reason`: emitted as a label on the metric + the log line so
+    /// operators can tell `oom_killed` from `disk_pressure` from
+    /// `cgroup_oom` from `timeout` in dashboards.
     ///
     /// No-op for `failed_class=None`, largest class, unknown class,
     /// feature off (relevant class list empty), or floor already at
@@ -393,6 +392,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         failed_class: Option<&str>,
+        reason: &'static str,
     ) -> bool {
         let Some(from) = failed_class else {
             return false;
@@ -423,12 +423,13 @@ impl DagActor {
             // log spam).
             if state.sched.size_class_floor.as_deref() != Some(to.as_str()) {
                 info!(
-                    drv_hash = %drv_hash, kind, from = %from, to = %to,
-                    "transient failure: promoting size_class_floor"
+                    drv_hash = %drv_hash, kind, reason, from = %from, to = %to,
+                    "promoting size_class_floor"
                 );
                 metrics::counter!(
                     "rio_scheduler_size_class_promotions_total",
-                    "kind" => kind, "from" => from.to_owned(), "to" => to.clone()
+                    "kind" => kind, "reason" => reason,
+                    "from" => from.to_owned(), "to" => to.clone()
                 )
                 .increment(1);
                 state.sched.size_class_floor = Some(to.clone());
@@ -463,39 +464,18 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
-        // Promotion already done by the caller with a class captured
-        // BEFORE executor removal (executor.rs disconnect path). The
-        // internal promote below misses there (executor gone from
-        // `self.executors`), so the caller threads its result through.
-        // `false` for paths where the executor is still registered.
-        external_promoted: bool,
     ) -> FailureOutcome {
-        // I-170/I-173/I-177: promote size_class_floor on any recorded
-        // failure (FOD or builder). The executor lookup here covers
-        // handle_transient_failure and recovery-reconcile (executor
-        // still in self.executors). The reassign_derivations caller
-        // promotes separately with the class captured BEFORE executor
-        // removal — on the disconnect path this lookup returns None,
-        // and `external_promoted` carries the result; on drain/
-        // backstop paths both fire, idempotent.
-        let failed_class = self
-            .executors
-            .get(executor_id)
-            .and_then(|e| e.size_class.clone());
-        let promoted = external_promoted
-            || self
-                .promote_size_class_floor(drv_hash, failed_class.as_deref())
-                .await;
+        // No size_class_floor promotion here — `TransientFailure`
+        // (build script exited nonzero) is a build-determinism signal,
+        // not a sizing signal. Promotion is reserved for explicit
+        // resource-exhaustion paths (controller-reported OOMKilled/
+        // DiskPressure, worker-reported CgroupOom/TimedOut). The
+        // previous I-170/I-173/I-177 over-broad promote here meant a
+        // flaky build climbed the ladder and the next submitter paid
+        // for an oversized pod.
         // r[impl sched.retry.promotion-exempt]
-        // I-213: a failure that promoted the floor is a sizing signal.
-        // Recording it in `failed_builders`/`failure_count` would count
-        // toward `PoisonConfig.threshold` (default 3) and poison before
-        // the ladder is climbed — the production firefox case hit this
-        // via the kubelet-eviction → disconnect path, NOT
-        // `handle_transient_failure`. Skip the record so the threshold
-        // becomes "N failures that did NOT promote" (top of ladder or
-        // unclassed worker — same semantics as the retry_count gate).
-        if !promoted {
+        let promoted = false;
+        {
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 state.retry.failed_builders.insert(executor_id.clone());
                 // Unconditional (doesn't check HashSet::insert's bool) —
@@ -1692,7 +1672,7 @@ impl DagActor {
             reached_poison,
             promoted,
         } = self
-            .record_failure_and_check_poison(drv_hash, executor_id, false)
+            .record_failure_and_check_poison(drv_hash, executor_id)
             .await;
 
         // r[impl sched.retry.per-executor-budget]
@@ -1824,20 +1804,26 @@ impl DagActor {
         executor_id: &ExecutorId,
         error_msg: &str,
     ) {
-        // I-199: promote size_class_floor on InfrastructureFailure too.
-        // The dominant infra failure mode is `CgroupOom` (I-196 OOM
-        // watcher) — exactly when promotion is the right answer. Other
-        // infra failures (FUSE EIO, PutPath race) aren't size-related,
-        // but over-promoting them is bounded by `max_infra_retries`
-        // and the cost is one larger pod, not correctness. Without
-        // this, the OOM-watcher path retries on the same class until
-        // the infra cap poisons — defeating the watcher's purpose.
-        let failed_class = self
-            .executors
-            .get(executor_id)
-            .and_then(|e| e.size_class.clone());
-        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
-            .await;
+        // I-199: promote size_class_floor ONLY on the worker-reported
+        // `CgroupOom` infra failure (I-196 OOM watcher: build child
+        // hit cgroup memory.max while the pod itself survived). Other
+        // infra failures (FUSE EIO, PutPath race, store-replica-
+        // restart) are NOT size-related — the previous over-broad
+        // promote here is what made cmake go medium→large→xlarge in
+        // live QA from a store-replica-restart with zero builds run.
+        // Pod-level OOMKilled (whole pod died) is reported by the
+        // controller via `ReportExecutorTermination` instead.
+        //
+        // Substring match on the `ExecutorError::CgroupOom` Display
+        // impl ("cgroup OOM during build…").
+        if error_msg.contains("cgroup OOM") {
+            let failed_class = self
+                .executors
+                .get(executor_id)
+                .and_then(|e| e.size_class.clone());
+            self.promote_size_class_floor(drv_hash, failed_class.as_deref(), "cgroup_oom")
+                .await;
+        }
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2010,7 +1996,7 @@ impl DagActor {
             .executors
             .get(executor_id)
             .and_then(|e| e.size_class.clone());
-        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
+        self.promote_size_class_floor(drv_hash, failed_class.as_deref(), "timeout")
             .await;
 
         let Some(state) = self.dag.node_mut(drv_hash) else {

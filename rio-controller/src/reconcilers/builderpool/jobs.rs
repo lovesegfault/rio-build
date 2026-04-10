@@ -63,8 +63,8 @@ use crate::reconcilers::Ctx;
 use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
     JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
-    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running, spawn_count,
-    spawn_n,
+    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running,
+    report_terminated_pods, spawn_count, spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
@@ -237,6 +237,12 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     // Lazy ListExecutors (only fires if there ARE old Running Jobs);
     // fail-closed on RPC error.
     reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &wp.spec.size_class).await;
+
+    // ---- Report terminations ----
+    // Gate scheduler-side `size_class_floor` promotion on actual k8s
+    // OOMKilled/DiskPressure (not bare disconnect). Best-effort;
+    // scheduler-side dedup makes re-reporting every tick a no-op.
+    report_terminated_pods(ctx, &ns, &name, &wp.spec.size_class).await;
 
     // ---- Status patch ----
     // `replicas` = active Jobs; `readyReplicas` = same (a Job pod is

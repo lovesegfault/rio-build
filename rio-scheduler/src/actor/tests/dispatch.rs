@@ -1201,8 +1201,10 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 ///   (success-only) EMA classifier → poison-loop.
 ///
 /// Shape: 2 tiny + 1 small executor. Merge → first dispatch goes to
-/// tiny (floor=None) → TransientFailure (simulated OOM) → floor
+/// tiny (floor=None) → InfrastructureFailure(CgroupOom) → floor
 /// promoted → second dispatch goes to small, tiny skipped.
+/// (TransientFailure does NOT promote — that's a build-determinism
+/// signal. CgroupOom is the worker-reported sizing signal.)
 #[rstest::rstest]
 #[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod")]
 #[case::builder(rio_proto::types::ExecutorKind::Builder, false, "glibc-177")]
@@ -1246,13 +1248,13 @@ async fn size_class_floor_skips_smaller(
     assert!(first_asgn.drv_path.contains(tag));
     assert!(small.try_recv().is_err(), "floor=None: small not used");
 
-    // Simulate OOM → floor promoted tiny→small.
+    // Worker-reported CgroupOom → floor promoted tiny→small.
     complete_failure(
         &handle,
         first_exec,
         tag,
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        "simulated OOM",
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "cgroup OOM during build; promoting size class",
     )
     .await?;
     tick(&handle).await?;
@@ -1264,7 +1266,7 @@ async fn size_class_floor_skips_smaller(
             .size_class_floor
             .as_deref(),
         Some("small"),
-        "transient failure on tiny → floor promoted to small"
+        "CgroupOom on tiny → floor promoted to small"
     );
 
     // Second dispatch: floor=small. Other tiny is free but MUST be skipped.

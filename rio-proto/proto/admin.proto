@@ -36,6 +36,20 @@ service AdminService {
   // Drain an executor: stop sending new assignments, wait for running builds to complete.
   rpc DrainExecutor(rio.types.DrainExecutorRequest) returns (rio.types.DrainExecutorResponse);
 
+  // Controller reports a builder/fetcher Pod's container termination
+  // reason (k8s OOMKilled / Evicted-DiskPressure / etc.). The scheduler
+  // gates size_class_floor promotion on this — the bare-disconnect path
+  // no longer infers OOM. Live QA showed cmake going medium→large→xlarge
+  // from a pod-kill + store-replica-restart with zero builds run; floor
+  // is sticky (M_032), so the next submitter paid for an oversized pod.
+  //
+  // Timing: the gRPC disconnect lands at the scheduler ~1-3s before the
+  // controller observes Pod-status + reconciles. Disconnect re-queues at
+  // CURRENT floor; this RPC promotes; NEXT dispatch goes bigger. One
+  // extra same-size attempt worst-case — same as the FIRST OOM today.
+  rpc ReportExecutorTermination(rio.types.ReportExecutorTerminationRequest)
+      returns (rio.types.ReportExecutorTerminationResponse);
+
   // Clear a poisoned derivation so it can be retried.
   rpc ClearPoison(rio.types.ClearPoisonRequest) returns (rio.types.ClearPoisonResponse);
 

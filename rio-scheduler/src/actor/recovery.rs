@@ -860,7 +860,7 @@ impl DagActor {
         executor_id: &Option<ExecutorId>,
     ) {
         let should_poison = if let Some(w) = executor_id {
-            self.record_failure_and_check_poison(drv_hash, w, false)
+            self.record_failure_and_check_poison(drv_hash, w)
                 .await
                 .reached_poison
         } else {

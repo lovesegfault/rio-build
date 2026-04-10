@@ -742,12 +742,21 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     Ok(())
 }
 
-/// I-213: a transient failure that promotes `size_class_floor` does
-/// NOT consume `max_retries`. Promotion is a sizing signal, bounded by
-/// the ladder length; `max_retries` becomes "retries at the same size
-/// class". Regression: firefox-unwrapped climbed tiny→small→medium and
-/// poisoned at retry_count=2 with the ladder's `large`/`xlarge` never
-/// tried.
+/// I-213 + controller-reports-reason: worker-reported `CgroupOom`
+/// (build child hit cgroup memory.max while pod survived →
+/// `InfrastructureFailure` with "cgroup OOM …" message) promotes
+/// `size_class_floor` and does NOT consume `max_infra_retries` for
+/// the climb itself (each promotion is a different class). Promotion
+/// is bounded by the ladder length, not the retry budget. Regression:
+/// firefox-unwrapped climbed tiny→small→medium and poisoned at
+/// retry_count=2 with the ladder's `large`/`xlarge` never tried.
+///
+/// `TransientFailure` (build script exited nonzero) does NOT promote
+/// — that's a build-determinism signal. The previous test used
+/// TransientFailure to drive the ladder; under the controller-
+/// reports-reason design that's wrong. CgroupOom is the worker-
+/// reported sizing signal (pod-level OOMKilled is controller-
+/// reported via `ReportExecutorTermination`).
 // r[verify sched.retry.promotion-exempt]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
@@ -785,8 +794,9 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     .await?;
     let p = test_drv_path("ladder-drv");
 
-    // Walk tiny→small→medium→large: each failure promotes,
-    // retry_count stays 0.
+    // Walk tiny→small→medium→large via worker-reported CgroupOom
+    // (InfrastructureFailure with the CgroupOom error string): each
+    // promotes; retry_count (transient budget) stays 0.
     for (i, c) in classes[..4].iter().enumerate() {
         handle
             .debug_force_assign("ladder-drv", &format!("b-{c}"))
@@ -795,26 +805,45 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             &handle,
             &format!("b-{c}"),
             &p,
-            rio_proto::types::BuildResultStatus::TransientFailure,
-            "simulated OOM",
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            "cgroup OOM during build; promoting size class",
         )
         .await?;
         let s = expect_drv(&handle, "ladder-drv").await;
         assert_eq!(
             s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
-            "failure on {c} → floor promoted to {}",
+            "CgroupOom on {c} → floor promoted to {}",
             classes[i + 1]
         );
         assert_eq!(
             s.retry.count, 0,
-            "I-213: promotion-causing failure does NOT increment retry_count (after {c})"
+            "InfrastructureFailure does NOT consume transient budget (after {c})"
         );
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
 
-    // At xlarge (top of ladder): no promotion → retry_count
-    // increments. After 3 same-tier failures (max_retries=2): poison.
+    // Sanity: a non-OOM InfrastructureFailure does NOT promote
+    // (the over-broad I-199 promote is gone).
+    handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
+    complete_failure(
+        &handle,
+        "b-xlarge",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "FUSE EIO: store unreachable",
+    )
+    .await?;
+    let s = expect_drv(&handle, "ladder-drv").await;
+    assert_eq!(
+        s.sched.size_class_floor.as_deref(),
+        Some("xlarge"),
+        "non-OOM InfrastructureFailure (FUSE EIO) must NOT promote"
+    );
+
+    // At xlarge (top of ladder): TransientFailure (build script
+    // exited nonzero — build-determinism signal). After 3 (max_
+    // retries=2): poison. TransientFailure NEVER promotes.
     for attempt in 0..3 {
         handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
         complete_failure(

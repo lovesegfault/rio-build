@@ -671,25 +671,23 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     Ok(())
 }
 
-/// 3 sequential worker disconnects: poison iff the drv was Running at
-/// disconnect. I-097 narrowed "any disconnect counts" to
-/// "disconnect-while-Running counts" — Assigned-only means the drv was
-/// never attempted (ephemeral-fetcher race), so a 4th worker should
-/// still receive it.
+/// 3 sequential worker disconnects: NEVER poison, NEVER record into
+/// `failed_builders`/`failure_count`/`retry_count`. Bare disconnect is
+/// ambiguous (pod-kill, node failure, store-replica-restart) — none
+/// are the build's fault. The controller is authoritative on
+/// termination reason; only `ReportExecutorTermination(OomKilled|
+/// EvictedDiskPressure)` promotes, and even that doesn't poison.
 ///
-/// - **running**: `debug_backdate_running` before each disconnect →
-///   `was_running=true` → `record_failure_and_check_poison` → poison
-///   after 3.
-/// - **assigned_only** (I-097 regression): no Running transition →
-///   `was_running=false` → stays Ready, `failed_builders` empty.
+/// Builds that genuinely fail send a `CompletionReport` BEFORE
+/// disconnecting → `handle_transient_failure` records there.
+///
+/// Both cases (Running and Assigned-only) now behave identically:
+/// re-queue at current floor, 4th worker receives it.
 #[rstest::rstest]
-#[case::running(true, DerivationStatus::Poisoned)]
-#[case::assigned_only(false, DerivationStatus::Ready)]
+#[case::running(true)]
+#[case::assigned_only(false)]
 #[tokio::test]
-async fn test_three_disconnects_poison_iff_running(
-    #[case] mark_running: bool,
-    #[case] expect_status: DerivationStatus,
-) -> TestResult {
+async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> TestResult {
     let (_db, handle, _task) = setup().await;
     let tag = if mark_running { "x6-drv" } else { "x7-drv" };
     let _ev = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
@@ -699,7 +697,6 @@ async fn test_three_disconnects_poison_iff_running(
         let mut rx = connect_executor(&handle, &id, "x86_64-linux").await?;
         assert!(recv_assignment(&mut rx).await.drv_path.contains(tag));
         if mark_running {
-            // Assigned → Running so the disconnect counts as a failed attempt.
             assert!(handle.debug_backdate_running(tag, 0).await?);
         }
         disconnect(&handle, &id).await?;
@@ -707,32 +704,48 @@ async fn test_three_disconnects_poison_iff_running(
     }
 
     let info = expect_drv(&handle, tag).await;
-    assert_eq!(info.status, expect_status, "after 3 disconnects");
-    if !mark_running {
-        assert!(
-            info.retry.failed_builders.is_empty(),
-            "Assigned-only disconnects must not populate failed_builders; got {:?}",
-            info.retry.failed_builders
-        );
-        // Sensitivity: a 4th worker DOES get it (Ready is real).
-        let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux").await?;
-        assert!(recv_assignment(&mut rx4).await.drv_path.contains(tag));
-    }
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "bare disconnect (Running={mark_running}) never poisons; controller is \
+         authoritative on termination reason"
+    );
+    assert!(
+        info.retry.failed_builders.is_empty(),
+        "bare disconnect must not populate failed_builders; got {:?}",
+        info.retry.failed_builders
+    );
+    assert_eq!(
+        info.retry.failure_count, 0,
+        "bare disconnect must not increment failure_count"
+    );
+    assert_eq!(
+        info.retry.count, 0,
+        "bare disconnect must not increment retry_count"
+    );
+    // Sensitivity: a 4th worker DOES get it (Ready is real).
+    let mut rx4 = connect_executor(&handle, &format!("w-{tag}-3"), "x86_64-linux").await?;
+    assert!(recv_assignment(&mut rx4).await.drv_path.contains(tag));
     Ok(())
 }
 
-/// I-213: a Running-disconnect on a CLASSED worker promotes the floor;
-/// that promotion exempts the failure from `failed_builders` /
-/// `failure_count` / `retry_count`. The production firefox case is
-/// exactly this: kubelet evicts (ephemeral-storage) → SIGKILL →
-/// disconnect → reassign_derivations. Before this fix,
-/// `record_failure_and_check_poison` recorded all 3 evictions and
-/// `PoisonConfig.threshold=3` poisoned at `medium` with the ladder
-/// half-climbed. The unclassed-worker case
-/// (`test_three_running_disconnects_poisons`) is unaffected.
+/// I-213 + controller-reports-reason: the production firefox case is
+/// kubelet evicts (ephemeral-storage) → SIGKILL → gRPC disconnect →
+/// controller observes Pod-status `Evicted` + `ephemeral-storage` →
+/// `ReportExecutorTermination(EvictedDiskPressure)`. Disconnect alone
+/// re-queues at CURRENT floor; the controller's report promotes.
+/// Promotion never records into `failed_builders`/`failure_count`/
+/// `retry_count` so the ladder is bounded by class-count, not
+/// `PoisonConfig.threshold=3`.
+///
+/// At the top of the ladder, `promote_size_class_floor` returns
+/// false (no next class) → `promoted=false` from the report. The drv
+/// stays Ready: disconnect+report never poison; that requires explicit
+/// `BuildResultStatus::TransientFailure` reports from the worker.
 // r[verify sched.retry.promotion-exempt]
 #[tokio::test]
-async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> TestResult {
+async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
+    use rio_proto::types::TerminationReason;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
     let (_db, handle, _task) = setup_with_classes(&[
         ("tiny", 30.0),
@@ -751,7 +764,8 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
     )
     .await?;
 
-    // Climb tiny→small→medium→large via Running-disconnects: each
+    // Climb tiny→small→medium→large→xlarge via disconnect +
+    // ReportExecutorTermination(EvictedDiskPressure): each report
     // promotes, none recorded.
     for (i, c) in classes[..4].iter().enumerate() {
         let id = format!("b-213-{c}");
@@ -759,14 +773,24 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
         let asgn = recv_assignment(&mut rx).await;
         assert!(asgn.drv_path.contains("ladder-213"));
         assert!(handle.debug_backdate_running("ladder-213", 0).await?);
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: id.into(),
-            })
-            .await?;
-        // Tick: each connect's first-heartbeat consumes the
-        // BECAME_IDLE_INLINE_CAP budget; reset between iterations
-        // (production disconnect→reconnect spans multiple Ticks).
+        // Disconnect first (gRPC stream drops immediately).
+        disconnect(&handle, &id).await?;
+        let s = expect_drv(&handle, "ladder-213").await;
+        let prev = if i == 0 { None } else { Some(classes[i]) };
+        assert_eq!(
+            s.sched.size_class_floor.as_deref(),
+            prev,
+            "bare disconnect on {c} must NOT promote (controller is authoritative)"
+        );
+        // Controller's report ~1-3s later.
+        let promoted = report_termination(
+            &handle,
+            &id,
+            TerminationReason::EvictedDiskPressure,
+            Some(c),
+        )
+        .await?;
+        assert!(promoted, "EvictedDiskPressure on {c} → floor promoted");
         tick(&handle).await?;
         drop(rx);
 
@@ -774,41 +798,44 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
         assert_eq!(
             s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
-            "disconnect on {c} → floor promoted"
+            "ReportExecutorTermination(EvictedDiskPressure) on {c} → floor promoted"
         );
         assert_eq!(
             s.retry.failure_count, 0,
-            "I-213: promoted disconnect not recorded in failure_count (after {c})"
+            "I-213: promotion not recorded in failure_count (after {c})"
         );
         assert!(
             s.retry.failed_builders.is_empty(),
-            "I-213: promoted disconnect not recorded in failed_builders (after {c})"
+            "I-213: promotion not recorded in failed_builders (after {c})"
         );
         assert_eq!(s.retry.count, 0);
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
 
-    // Top of ladder: 3 disconnects on xlarge → recorded → poison
-    // (threshold=3, default).
-    for i in 0..3 {
-        let id = format!("b-213-xl-{i}");
-        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "xlarge").await?;
-        let asgn = recv_assignment(&mut rx).await;
-        assert!(asgn.drv_path.contains("ladder-213"));
-        assert!(handle.debug_backdate_running("ladder-213", 0).await?);
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: id.into(),
-            })
-            .await?;
-        tick(&handle).await?;
-        drop(rx);
-    }
+    // Top of ladder: disconnect+report on xlarge → no next class →
+    // promoted=false. Stays Ready (disconnect+report never poison).
+    let id = "b-213-xl";
+    let mut rx = connect_builder_classed(&handle, id, "x86_64-linux", "xlarge").await?;
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("ladder-213"));
+    assert!(handle.debug_backdate_running("ladder-213", 0).await?);
+    disconnect(&handle, id).await?;
+    let promoted = report_termination(
+        &handle,
+        id,
+        TerminationReason::EvictedDiskPressure,
+        Some("xlarge"),
+    )
+    .await?;
+    assert!(!promoted, "no class above xlarge");
+    drop(rx);
     let s = expect_drv(&handle, "ladder-213").await;
+    assert_eq!(s.sched.size_class_floor.as_deref(), Some("xlarge"));
     assert_eq!(
         s.status,
-        DerivationStatus::Poisoned,
-        "threshold applies once at top of ladder (no promotion)"
+        DerivationStatus::Ready,
+        "disconnect+report at top of ladder stays Ready (poison requires \
+         explicit TransientFailure from worker)"
     );
     Ok(())
 }
@@ -816,32 +843,34 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
 // r[verify sched.fod.size-class-reactive]
 // r[verify sched.builder.size-class-reactive]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
-/// Assigned-disconnect-without-CompletionReport → `size_class_floor`
-/// promoted tiny→small. DerivationStatus stays Assigned for the build's
-/// whole lifetime (Running is set only at completion via
-/// `ensure_running()`), so the production disconnect path is always
-/// Assigned-status. Disconnect-without-completion = unexpected death
-/// (plausibly OOM) → promote. I-097 still holds (no `failed_builders`
-/// entry, status=Ready) — promotion is decoupled from poison-record.
+/// Bare disconnect does NOT promote `size_class_floor`; the
+/// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
+/// Live QA bug: cmake went medium→large→xlarge from a pod-kill +
+/// store-replica-restart with zero builds run, because disconnect
+/// alone fired the I-173/I-177/I-197 heuristic. Floor is sticky
+/// (M_032), so the next submitter paid for an oversized pod.
+///
+/// New behavior: disconnect re-queues at CURRENT floor; the
+/// controller observes Pod-status ~1-3s later and reports the k8s
+/// reason. ONLY OomKilled/EvictedDiskPressure promote.
 ///
 /// - **fod** (I-173): FOD on a `fetcher_size_classes` tiny fetcher.
-///   Live: 14 OOMs, retry_count=0, size_class_floor=NULL.
 /// - **builder** (I-177): non-FOD on a builder `size_classes` tiny.
-///   Live: 103 tiny builders OOMKilled on bootstrap-stage0-glibc.
-/// - **ephemeral** (I-197, refines I-188 fix 1): same as builder; the
-///   I-188 blanket "one-shot disconnect → never promote" made openssl
-///   OOM-loop on tiny for hours. Converse (disconnect AFTER completion
-///   → NO promote) at `test_ephemeral_disconnect_after_completion_no_promote`.
+///
+/// Also asserts dedup: a SECOND report for the same executor_id
+/// returns `promoted=false` (entry already removed); and a non-
+/// resource reason (`Error` — pod-kill, node failure) returns
+/// `promoted=false`.
 #[rstest::rstest]
 #[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod-173")]
 #[case::builder(rio_proto::types::ExecutorKind::Builder, false, "oom-glibc-177")]
-#[case::ephemeral(rio_proto::types::ExecutorKind::Builder, false, "eph-glibc-188")]
 #[tokio::test]
-async fn test_assigned_disconnect_promotes_floor(
+async fn test_disconnect_no_promote_oom_report_promotes(
     #[case] kind: rio_proto::types::ExecutorKind,
     #[case] is_fod: bool,
     #[case] tag: &str,
 ) -> TestResult {
+    use rio_proto::types::TerminationReason;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         if is_fod {
@@ -857,7 +886,8 @@ async fn test_assigned_disconnect_promotes_floor(
     node.is_fixed_output = is_fod;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
-    // Dispatch → Assigned. Do NOT send Running ack.
+    // Dispatch → Assigned. Do NOT send Running ack (production
+    // disconnect path is always Assigned-status).
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains(tag));
     assert_eq!(
@@ -866,38 +896,99 @@ async fn test_assigned_disconnect_promotes_floor(
         "precondition: status==Assigned at disconnect"
     );
 
-    // OOM → disconnect. Status was Assigned, not Running.
+    // ── Disconnect: re-queue at CURRENT floor, no promote ──────────
     disconnect(&handle, "w-tiny").await?;
     drop(rx);
 
     let info = expect_drv(&handle, tag).await;
     assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "Assigned-disconnect-without-completion must promote floor tiny→small"
+        info.sched.size_class_floor, None,
+        "bare disconnect must NOT promote (controller is authoritative); \
+         live QA: cmake medium→large→xlarge from pod-kill"
     );
     assert!(
         info.retry.failed_builders.is_empty(),
-        "I-097: Assigned-disconnect must not record failure; got {:?}",
+        "bare disconnect must not record failure; got {:?}",
         info.retry.failed_builders
     );
     assert_eq!(info.status, DerivationStatus::Ready);
+
+    // ── Controller reports OOMKilled ~1-3s later: promote ──────────
+    let promoted = report_termination(
+        &handle,
+        "w-tiny",
+        TerminationReason::OomKilled,
+        Some("tiny"),
+    )
+    .await?;
+    assert!(
+        promoted,
+        "ReportExecutorTermination(OomKilled) must promote tiny→small"
+    );
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(
+        info.sched.size_class_floor.as_deref(),
+        Some("small"),
+        "OomKilled report promoted floor"
+    );
+
+    // ── Dedup: second report (controller re-reports every ~10s tick
+    // for JOB_TTL_SECS=600) → no-op ────────────────────────────────
+    let promoted = report_termination(
+        &handle,
+        "w-tiny",
+        TerminationReason::OomKilled,
+        Some("tiny"),
+    )
+    .await?;
+    assert!(
+        !promoted,
+        "second report for same executor_id → recently_disconnected entry \
+         already removed → no-op"
+    );
+
+    // ── Non-resource reason (Error = pod-kill / SIGKILL / node
+    // failure) on a SECOND OOM cycle → no promote ──────────────────
+    let mut rx2 =
+        connect_executor_classed(&handle, "w-small", "x86_64-linux", "small", kind).await?;
+    let asgn = recv_assignment(&mut rx2).await;
+    assert!(asgn.drv_path.contains(tag));
+    disconnect(&handle, "w-small").await?;
+    drop(rx2);
+    let promoted =
+        report_termination(&handle, "w-small", TerminationReason::Error, Some("small")).await?;
+    assert!(
+        !promoted,
+        "ReportExecutorTermination(Error) must NOT promote (pod-kill / node \
+         failure is not a sizing signal)"
+    );
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(
+        info.sched.size_class_floor.as_deref(),
+        Some("small"),
+        "floor unchanged after Error report"
+    );
     Ok(())
 }
 
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
-/// I-188 race case (the suppress that I-197 KEEPS): a builder that
-/// disconnects with `running_build == Some(X)` AFTER having sent
-/// CompletionReport(X) MUST NOT promote `size_class_floor`.
-/// `last_completed == running_build` → expected one-shot exit, not a
-/// size-adequacy signal.
+/// I-188 race case: a builder that disconnects with `running_build ==
+/// Some(X)` AFTER having sent CompletionReport(X) gets NO
+/// `recently_disconnected` entry (`last_completed == running_build` →
+/// expected one-shot exit). A subsequent
+/// `ReportExecutorTermination(OomKilled)` therefore misses the map
+/// and returns `promoted=false`. Under the controller-reports-reason
+/// design, bare disconnect never promotes anyway — this asserts the
+/// `last_completed` discriminator still suppresses the entry so a
+/// late spurious OOMKilled report (e.g., from a delayed reconcile of
+/// a since-reused pod name) doesn't promote a drv that already
+/// succeeded.
 ///
 /// Setup synthesizes the race directly: complete X (sets
 /// `last_completed=X`, clears `running_build`, sets `draining`),
 /// then a heartbeat re-reports X as running (out-of-order delivery
 /// — heartbeat snapshotted before completion landed) repopulating
-/// `running_build=X`, then disconnect. This is the narrowest
-/// surviving window where Fix 1's gate fires; Fix 2
+/// `running_build=X`, then disconnect. Fix 2
 /// (`r[sched.ephemeral.no-redispatch-after-completion]`) closes the
 /// dependent-redispatch race at the source so this is defense-in-
 /// depth.
@@ -947,18 +1038,33 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     );
 
     // Ephemeral exits → disconnect. running_build=Some(X),
-    // last_completed=Some(X) → expected one-shot exit → NO promote.
+    // last_completed=Some(X) → expected one-shot exit → NO
+    // recently_disconnected entry.
     disconnect(&handle, "b-eph2").await?;
     drop(rx);
 
     let info = expect_drv(&handle, "eph-race-188").await;
     assert_eq!(
         info.sched.size_class_floor, None,
-        "I-188: ephemeral disconnect AFTER CompletionReport for the \
-         running drv (last_completed == running_build) must NOT \
-         promote floor; got {:?}",
-        info.sched.size_class_floor
+        "bare disconnect never promotes"
     );
+
+    // A spurious OOMKilled report (delayed reconcile) misses the map
+    // (last_completed == running_build → no entry) → no promote.
+    let promoted = report_termination(
+        &handle,
+        "b-eph2",
+        rio_proto::types::TerminationReason::OomKilled,
+        Some("tiny"),
+    )
+    .await?;
+    assert!(
+        !promoted,
+        "I-188: disconnect AFTER CompletionReport → no recently_disconnected \
+         entry → spurious OOMKilled report does not promote"
+    );
+    let info = expect_drv(&handle, "eph-race-188").await;
+    assert_eq!(info.sched.size_class_floor, None);
 
     Ok(())
 }
@@ -1373,13 +1479,13 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
         other => panic!("expected CancelSignal, got {other:?}"),
     }
 
-    // Drv should be Ready (reset for retry) with retry_count bumped
-    // and the worker recorded in failed_builders. It may immediately
-    // re-dispatch to the same worker (only one available) IF
-    // best_executor doesn't exclude it — but the worker IS in
-    // failed_builders now. Either Ready (excluded) or a fresh
-    // Assigned (dispatch fired again). What matters is: NOT stuck
-    // in Running.
+    // Drv should be Ready (reset for retry). It may immediately
+    // re-dispatch to the same worker (only one available). Either
+    // Ready or a fresh Assigned (dispatch fired again). What
+    // matters is: NOT stuck in Running. Backstop reassign does NOT
+    // increment retry_count or record into failed_builders — the
+    // scheduler-side backstop is "worker hung, never reported", not
+    // a build-determinism signal.
     let post = expect_drv(&handle, "bs-drv").await;
     assert!(
         matches!(
@@ -1389,9 +1495,9 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
         "backstop should reset drv (not leave it Running); got {:?}",
         post.status
     );
-    assert!(
-        post.retry.count >= 1,
-        "retry_count should be bumped after backstop reassign"
+    assert_eq!(
+        post.retry.count, 0,
+        "backstop reassign re-queues at current floor only (no retry budget consumed)"
     );
 
     Ok(())

@@ -92,14 +92,21 @@ pub struct ExecutorState {
     /// (any terminal status). Set in `handle_completion` alongside the
     /// `running_build = None` clear. In-memory only.
     ///
-    /// I-197: discriminates expected one-shot exit from OOMKilled.
-    /// Disconnect with `running_build == Some(X)` and `last_completed
-    /// != Some(X)` means X was mid-build when the pod died (OOMKilled)
-    /// → promote `size_class_floor`. When `last_completed ==
-    /// running_build` the disconnect is the expected post-completion
-    /// one-shot exit → suppress promotion. The pre-I-197 blanket
-    /// suppress made OOMKilled `tiny` workers loop at the same class
-    /// for hours (openssl, `size_class_floor` empty).
+    /// I-197: discriminates expected one-shot exit from mid-build pod
+    /// death. Disconnect with `running_build == Some(X)` and
+    /// `last_completed != Some(X)` means X was mid-build when the pod
+    /// died → record into `recently_disconnected` so the controller's
+    /// follow-up `ReportExecutorTermination` (k8s OOMKilled/Evicted
+    /// reason) can resolve `executor_id → drv_hash` and promote
+    /// `size_class_floor` IFF the reason was OOMKilled/DiskPressure.
+    /// When `last_completed == running_build` the disconnect is the
+    /// expected post-completion one-shot exit → no entry (controller
+    /// would report `Completed` and we'd ignore it; skip the churn).
+    ///
+    /// The scheduler no longer infers OOM from bare disconnect — that
+    /// over-fired on pod-kill / store-replica-restart / node failure
+    /// (live QA: cmake medium→large→xlarge with zero builds run). The
+    /// controller is authoritative on termination reason.
     pub last_completed: Option<DrvHash>,
     /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns

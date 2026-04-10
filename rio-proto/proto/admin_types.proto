@@ -127,6 +127,52 @@ message DrainExecutorResponse {
   bool busy = 3;                         // A build is still in flight (will complete before drain)
 }
 
+// Why a builder/fetcher Pod's container terminated. Populated by the
+// controller from k8s PodStatus (containerStatuses[].state.terminated.
+// reason for OOMKilled/Completed/Error; status.reason+message for
+// Evicted). The scheduler uses OomKilled / EvictedDiskPressure to gate
+// size_class_floor promotion — bare disconnect no longer infers OOM.
+enum TerminationReason {
+  // Wire-default: controller couldn't classify (no terminated state,
+  // status not yet populated). Scheduler treats as no-op.
+  TERMINATION_REASON_UNKNOWN = 0;
+  // containerStatuses[].state.terminated.reason == "OOMKilled". Pod hit
+  // memory limit. → promote size_class_floor.
+  TERMINATION_REASON_OOM_KILLED = 1;
+  // status.reason == "Evicted" + message mentions DiskPressure /
+  // ephemeral-storage. Node ran out of disk. → promote size_class_floor
+  // (next-larger pod gets a bigger ephemeral-storage request).
+  TERMINATION_REASON_EVICTED_DISK_PRESSURE = 2;
+  // status.reason == "Evicted", other cause (MemoryPressure, PID
+  // pressure, node-shutdown). NOT a per-drv sizing signal. → no-op.
+  TERMINATION_REASON_EVICTED_OTHER = 3;
+  // Exit 0. Expected one-shot exit after CompletionReport. → no-op.
+  TERMINATION_REASON_COMPLETED = 4;
+  // Exit !=0, non-OOM (panic, SIGKILL from operator, node failure).
+  // NOT a sizing signal — pod death wasn't the build's fault. → no-op.
+  TERMINATION_REASON_ERROR = 5;
+}
+
+message ReportExecutorTerminationRequest {
+  // Pod metadata.name (== RIO_EXECUTOR_ID downward-API value the
+  // worker registered with). Scheduler resolves to the drv that was
+  // running at disconnect via its recently_disconnected map.
+  string executor_id = 1;
+  TerminationReason reason = 2;
+  // Pod's size_class label. The scheduler usually has this from the
+  // disconnect-time capture, but the controller sends it anyway so a
+  // report that races ahead of (or replaces a swept) disconnect entry
+  // can still resolve next_*_class. Empty = unclassed.
+  string size_class = 3;
+}
+
+message ReportExecutorTerminationResponse {
+  // size_class_floor was actually bumped. False for non-resource
+  // reasons, unknown executor (already swept / never had a running
+  // build at disconnect), or already at the largest class.
+  bool promoted = 1;
+}
+
 message ClearPoisonRequest {
   // Key the scheduler's DAG is keyed on — in production this is the
   // full .drv store path (e.g. `/nix/store/abc...-foo.drv`). rio-cli

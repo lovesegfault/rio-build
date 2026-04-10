@@ -144,6 +144,15 @@ pub struct DagActor {
     log_buffers: Option<Arc<crate::logs::LogBuffers>>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
+    /// Executors that disconnected mid-build, awaiting the controller's
+    /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
+    /// `(drv_hash, size_class, inserted_at)` — captured before
+    /// `self.executors.remove()`. The controller's report arrives ~1-3s
+    /// after disconnect; entries are swept on Tick after
+    /// [`executor::TERMINATION_REPORT_TTL`]. In-memory only: a lost
+    /// entry (scheduler restart) degrades to "one OOM doesn't promote"
+    /// — same as pre-I-197 behavior for one cycle.
+    recently_disconnected: HashMap<ExecutorId, (DrvHash, Option<String>, Instant)>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -317,6 +326,7 @@ impl DagActor {
             events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),
+            recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
             db,
@@ -487,6 +497,17 @@ impl DagActor {
                 }
                 ActorCommand::ExecutorDisconnected { executor_id } => {
                     self.handle_executor_disconnected(&executor_id).await;
+                }
+                ActorCommand::ReportExecutorTermination {
+                    executor_id,
+                    reason,
+                    size_class,
+                    reply,
+                } => {
+                    let promoted = self
+                        .handle_executor_termination(&executor_id, reason, size_class.as_deref())
+                        .await;
+                    let _ = reply.send(promoted);
                 }
                 ActorCommand::PrefetchComplete {
                     executor_id,

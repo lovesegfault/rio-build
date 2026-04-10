@@ -33,7 +33,8 @@ use rio_proto::types::{
     GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
     InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
     ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
-    PoisonedDerivation,
+    PoisonedDerivation, ReportExecutorTerminationRequest, ReportExecutorTerminationResponse,
+    TerminationReason,
 };
 use uuid::Uuid;
 
@@ -336,6 +337,47 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(DrainExecutorResponse {
             accepted: result.accepted,
             busy: result.busy,
+        }))
+    }
+
+    /// Controller reports a builder/fetcher Pod's k8s termination
+    /// reason. OOMKilled/DiskPressure → promote `size_class_floor`
+    /// for whatever drv was running at disconnect; other reasons →
+    /// no-op. Replaces the bare-disconnect OOM heuristic.
+    ///
+    /// Unknown executor_id → `promoted=false`, NOT an error: the
+    /// controller's reconcile loop re-reports the same Pod every
+    /// ~10s for `JOB_TTL_SECS=600`; the actor's first-report-wins
+    /// dedup means subsequent calls are expected to miss.
+    #[instrument(skip(self, request), fields(rpc = "ReportExecutorTermination"))]
+    async fn report_executor_termination(
+        &self,
+        request: Request<ReportExecutorTerminationRequest>,
+    ) -> Result<Response<ReportExecutorTerminationResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+
+        if req.executor_id.is_empty() {
+            return Err(Status::invalid_argument("executor_id is required"));
+        }
+        let reason = TerminationReason::try_from(req.reason).unwrap_or(TerminationReason::Unknown);
+        let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
+        let executor_id = req.executor_id.into();
+
+        let promoted = query_actor(&self.actor, |reply| {
+            ActorCommand::ReportExecutorTermination {
+                executor_id,
+                reason,
+                size_class,
+                reply,
+            }
+        })
+        .await?;
+
+        Ok(Response::new(ReportExecutorTerminationResponse {
+            promoted,
         }))
     }
 
