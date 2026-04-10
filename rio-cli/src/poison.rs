@@ -1,7 +1,4 @@
 //! `rio-cli poison-clear|poison-list` — poisoned-derivation inspection.
-//!
-//! Separate module (not inline in `main.rs`) — keep `main.rs` deltas to
-//! enum variant + match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;
 use rio_proto::types::ClearPoisonRequest;
@@ -10,42 +7,44 @@ use tonic::transport::Channel;
 
 use crate::{fmt_secs_ago, json, rpc};
 
+#[derive(clap::Args, Clone)]
+pub(crate) struct ClearArgs {
+    /// Full .drv store path (e.g. `/nix/store/abc...-foo.drv`).
+    /// Bare hashes are rejected — a silent no-match would look
+    /// like "not poisoned" when it's actually "wrong key format".
+    drv_path: String,
+}
+
 pub(crate) async fn run_clear(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
-    drv_path: String,
+    a: ClearArgs,
 ) -> anyhow::Result<()> {
     // Validate BEFORE the RPC. The scheduler's DAG is keyed on
     // the full store path, so a bare hash silently no-matches
     // and cleared=false looks like "not poisoned" when it's
     // actually "you gave me the wrong key".
-    if !drv_path.starts_with("/nix/store/") || !drv_path.ends_with(".drv") {
+    if !a.drv_path.starts_with("/nix/store/") || !a.drv_path.ends_with(".drv") {
         anyhow::bail!(
-            "expected full .drv store path (e.g. /nix/store/abc...-foo.drv), got '{drv_path}'.\n\
-             Run `rio-cli poison-list` to find the right path."
+            "expected full .drv store path (e.g. /nix/store/abc...-foo.drv), got '{}'.\n\
+             Run `rio-cli poison-list` to find the right path.",
+            a.drv_path
         );
     }
     let req = ClearPoisonRequest {
-        derivation_hash: drv_path.clone(),
+        derivation_hash: a.drv_path.clone(),
     };
     let resp = rpc("ClearPoison", async || {
         client.clear_poison(req.clone()).await
     })
     .await?;
     if as_json {
-        #[derive(Serialize)]
-        struct ClearedJson<'a> {
-            drv_path: &'a str,
-            cleared: bool,
-        }
-        json(&ClearedJson {
-            drv_path: &drv_path,
-            cleared: resp.cleared,
-        })?;
-    } else if resp.cleared {
-        println!("cleared poison for {drv_path}");
+        return json(&serde_json::json!({ "drv_path": a.drv_path, "cleared": resp.cleared }));
+    }
+    if resp.cleared {
+        println!("cleared poison for {}", a.drv_path);
     } else {
-        println!("{drv_path}: not poisoned (nothing to clear)");
+        println!("{}: not poisoned (nothing to clear)", a.drv_path);
     }
     Ok(())
 }
@@ -56,6 +55,8 @@ pub(crate) async fn run_list(
 ) -> anyhow::Result<()> {
     let resp = rpc("ListPoisoned", async || client.list_poisoned(()).await).await?;
     if as_json {
+        // `PoisonedDerivation` is NOT in rio-proto's Serialize allowlist
+        // (build.rs `type_attribute` loop) — project the fields we need.
         #[derive(Serialize)]
         struct Row<'a> {
             drv_path: &'a str,

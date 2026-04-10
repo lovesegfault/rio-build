@@ -16,15 +16,24 @@ use tonic::transport::Channel;
 
 use crate::RPC_TIMEOUT;
 
+#[derive(clap::Args, Clone)]
+pub(crate) struct Args {
+    /// Chunks per backend exists_batch. 0 = server default (1000).
+    #[arg(long, default_value_t = 0)]
+    batch_size: u32,
+}
+
 // r[impl cli.cmd.verify-chunks]
 pub(crate) async fn run(
     client: &mut StoreAdminServiceClient<Channel>,
-    batch_size: u32,
+    a: Args,
 ) -> anyhow::Result<()> {
     let mut stream = rio_common::grpc::with_timeout(
         "VerifyChunks",
         RPC_TIMEOUT,
-        client.verify_chunks(VerifyChunksRequest { batch_size }),
+        client.verify_chunks(VerifyChunksRequest {
+            batch_size: a.batch_size,
+        }),
     )
     .await?
     .into_inner();

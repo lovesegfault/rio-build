@@ -4,10 +4,6 @@
 //! then prints all three — summary header, per-worker one-liners,
 //! recent-build rollup. The flattened-JSON shape is what cli.nix
 //! asserts against (`jq -e '.total_executors'`).
-//!
-//! Separate module (not inline in `main.rs`) — same convention as
-//! `cutoffs.rs`/`bps.rs`: keep `main.rs` deltas to enum variant +
-//! match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{

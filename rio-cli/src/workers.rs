@@ -28,6 +28,50 @@ use crate::{json, rpc};
 
 // r[impl cli.workers.actor-diff]
 /// `--actor` path: in-memory snapshot only.
+#[derive(clap::Args, Clone)]
+pub(crate) struct Args {
+    /// Filter by worker status: "alive", "draining", or empty for all.
+    /// Ignored with `--actor`/`--diff` (those read the full map).
+    #[arg(long)]
+    status: Option<String>,
+    /// Read the scheduler actor's in-memory executor map instead of
+    /// PG. Surfaces `has_stream`/`warm`/`kind` — the dispatch
+    /// filter inputs. PG `last_seen` can't tell you if the stream
+    /// to THIS leader is dead.
+    #[arg(long, conflicts_with = "diff")]
+    actor: bool,
+    /// Join PG view (`ListExecutors`) with actor view
+    /// (`DebugListExecutors`). `⚠` marks rows where they disagree:
+    /// PG-only = stream not connected, actor-only = PG stale,
+    /// both-but-no-stream = I-048b zombie.
+    #[arg(long, conflicts_with = "actor")]
+    diff: bool,
+}
+
+#[derive(clap::Args, Clone)]
+pub(crate) struct DrainArgs {
+    /// Worker ID (as shown by `rio-cli workers`).
+    executor_id: String,
+    /// Cancel running builds on the worker (reassign elsewhere)
+    /// instead of waiting for them to complete.
+    #[arg(long)]
+    force: bool,
+}
+
+pub(crate) async fn run(
+    as_json: bool,
+    client: &mut AdminServiceClient<Channel>,
+    a: Args,
+) -> anyhow::Result<()> {
+    if a.actor {
+        run_actor(as_json, client).await
+    } else if a.diff {
+        run_diff(as_json, client).await
+    } else {
+        run_pg(as_json, client, a.status).await
+    }
+}
+
 pub(crate) async fn run_actor(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
@@ -320,9 +364,9 @@ pub(crate) async fn run_pg(
 pub(crate) async fn run_drain(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
-    executor_id: String,
-    force: bool,
+    a: DrainArgs,
 ) -> anyhow::Result<()> {
+    let DrainArgs { executor_id, force } = a;
     // Unary — rpc() helper applies. Server returns accepted=true
     // for known workers (idempotent on already-draining) and
     // accepted=false for unknown ids (per admin/tests.rs, not

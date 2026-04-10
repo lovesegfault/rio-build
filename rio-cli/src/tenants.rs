@@ -1,28 +1,40 @@
 //! `rio-cli create-tenant|list-tenants` — tenant CRUD via AdminService.
-//!
-//! Separate module (not inline in `main.rs`) — keep `main.rs` deltas to
-//! enum variant + match arm + mod decl only.
 
 use anyhow::anyhow;
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{CreateTenantRequest, TenantInfo};
 use tonic::transport::Channel;
 
-use crate::{json, rpc};
+use crate::{emit, json, rpc};
+
+#[derive(clap::Args, Clone)]
+pub(crate) struct CreateArgs {
+    /// Tenant name (unique, non-empty after trim).
+    name: String,
+    /// GC retention period in hours. Build artifacts for this tenant
+    /// are eligible for sweep after this many hours without access.
+    #[arg(long)]
+    gc_retention_hours: Option<u32>,
+    /// Storage cap in bytes. Soft limit — GC targets this tenant
+    /// more aggressively when exceeded.
+    #[arg(long)]
+    gc_max_store_bytes: Option<u64>,
+    /// Bearer token for binary-cache HTTP access. Unset = no cache
+    /// access for this tenant.
+    #[arg(long)]
+    cache_token: Option<String>,
+}
 
 pub(crate) async fn run_create(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
-    name: String,
-    gc_retention_hours: Option<u32>,
-    gc_max_store_bytes: Option<u64>,
-    cache_token: Option<String>,
+    a: CreateArgs,
 ) -> anyhow::Result<()> {
     let req = CreateTenantRequest {
-        tenant_name: name,
-        gc_retention_hours,
-        gc_max_store_bytes,
-        cache_token,
+        tenant_name: a.name,
+        gc_retention_hours: a.gc_retention_hours,
+        gc_max_store_bytes: a.gc_max_store_bytes,
+        cache_token: a.cache_token,
     };
     let resp = rpc("CreateTenant", async || {
         client.create_tenant(req.clone()).await
@@ -32,10 +44,9 @@ pub(crate) async fn run_create(
         .tenant
         .ok_or_else(|| anyhow!("CreateTenant returned no TenantInfo"))?;
     if as_json {
-        json(&t)?;
-    } else {
-        print_tenant(&t);
+        return json(&t);
     }
+    print_tenant(&t);
     Ok(())
 }
 
@@ -44,16 +55,7 @@ pub(crate) async fn run_list(
     client: &mut AdminServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let resp = rpc("ListTenants", async || client.list_tenants(()).await).await?;
-    if as_json {
-        json(&resp.tenants)?;
-    } else if resp.tenants.is_empty() {
-        println!("(no tenants)");
-    } else {
-        for t in &resp.tenants {
-            print_tenant(t);
-        }
-    }
-    Ok(())
+    emit(as_json, &resp.tenants, "(no tenants)", print_tenant)
 }
 
 fn print_tenant(t: &TenantInfo) {

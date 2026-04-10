@@ -5,10 +5,6 @@
 //! positional arg is the drv path. `--build-id` is only needed for
 //! completed builds (S3 archive lookup); active builds serve from
 //! the ring buffer by drv path alone.
-//!
-//! Separate module (not inline in `main.rs`) — same convention as
-//! `cutoffs.rs`/`bps.rs`: keep `main.rs` deltas to enum variant +
-//! match arm + mod decl only.
 
 use std::io::Write;
 
@@ -19,17 +15,23 @@ use tonic::transport::Channel;
 
 use crate::RPC_TIMEOUT;
 
+#[derive(clap::Args, Clone)]
+pub(crate) struct Args {
+    /// Full derivation store path (e.g. `/nix/store/abc-foo.drv`).
+    drv_path: String,
+    /// Build UUID. Only needed if the derivation is no longer in
+    /// the active-build ring buffer (S3 archive lookup).
+    #[arg(long)]
+    build_id: Option<String>,
+}
+
 /// Run the `logs` subcommand.
 ///
 /// `as_json` is NOT threaded here — logs are raw bytes (may be
 /// non-UTF-8 build output), and there's no structured JSON shape for
 /// an arbitrary byte stream. The global `--json` flag is ignored,
 /// same as `gc`.
-pub(crate) async fn run(
-    client: &mut AdminServiceClient<Channel>,
-    drv_path: String,
-    build_id: Option<String>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(client: &mut AdminServiceClient<Channel>, a: Args) -> anyhow::Result<()> {
     // STREAMING — NOT via rpc() helper. The helper's 30s whole-
     // call deadline is wrong for log tails (a build can run for
     // an hour). Wrap just the initial call in the timeout —
@@ -40,8 +42,8 @@ pub(crate) async fn run(
         "GetBuildLogs",
         RPC_TIMEOUT,
         client.get_build_logs(GetBuildLogsRequest {
-            build_id: build_id.unwrap_or_default(),
-            derivation_path: drv_path,
+            build_id: a.build_id.unwrap_or_default(),
+            derivation_path: a.drv_path,
             since_line: 0,
         }),
     )

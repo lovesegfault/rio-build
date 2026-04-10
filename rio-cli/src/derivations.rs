@@ -4,10 +4,6 @@
 //! queries the LIVE actor — exactly what `dispatch_ready()` sees. The
 //! I-025 diagnostic: if a derivation is `Assigned` to an executor whose
 //! stream is dead (`⚠ no-stream`), dispatch is stuck forever.
-//!
-//! Separate module (not inline in `main.rs`) — same convention as
-//! `cutoffs.rs`/`bps.rs`: keep `main.rs` deltas to enum variant +
-//! match arm + mod decl only.
 
 use anyhow::anyhow;
 use rio_proto::AdminServiceClient;
@@ -19,14 +15,35 @@ use crate::{json, rpc};
 
 // r[impl cli.cmd.derivations]
 /// Run the `derivations` subcommand.
+#[derive(clap::Args, Clone)]
+pub(crate) struct Args {
+    /// Build UUID. Required unless --all-active.
+    build_id: Option<String>,
+    /// Iterate ALL active builds (ListBuilds status=active). Useful
+    /// when you don't know WHICH build is stuck — the I-025 QA
+    /// scenario had 4 builds frozen simultaneously.
+    #[arg(long, conflicts_with = "build_id")]
+    all_active: bool,
+    /// Filter by status ("Ready", "Assigned", "Running", "Queued", ...).
+    #[arg(long)]
+    status: Option<String>,
+    /// Only show derivations assigned to dead-stream executors
+    /// (the I-025 smoking gun).
+    #[arg(long)]
+    stuck: bool,
+}
+
 pub(crate) async fn run(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
-    build_id: Option<String>,
-    all_active: bool,
-    status: Option<String>,
-    stuck: bool,
+    a: Args,
 ) -> anyhow::Result<()> {
+    let Args {
+        build_id,
+        all_active,
+        status,
+        stuck,
+    } = a;
     // Resolve build_id(s): either the one given, or all active.
     let build_ids: Vec<String> = if all_active {
         let lb_req = ListBuildsRequest {

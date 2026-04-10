@@ -1,27 +1,46 @@
 //! `rio-cli builds|cancel-build` — build listing + cancellation.
-//!
-//! Separate module (not inline in `main.rs`) — keep `main.rs` deltas to
-//! enum variant + match arm + mod decl only.
 
 use anyhow::anyhow;
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{BuildInfo, CancelBuildRequest, ListBuildsRequest};
-use serde::Serialize;
 use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
+#[derive(clap::Args, Clone)]
+pub(crate) struct ListArgs {
+    /// Filter by build status: "pending", "active", "succeeded",
+    /// "failed", "cancelled".
+    #[arg(long)]
+    status: Option<String>,
+    /// Max results (server capped).
+    #[arg(long, default_value = "50")]
+    limit: u32,
+    /// Opaque keyset cursor from a prior page's `next_cursor`.
+    /// Stable under concurrent inserts, unlike offset.
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(clap::Args, Clone)]
+pub(crate) struct CancelArgs {
+    /// Build UUID (as shown by `rio-cli builds` or `status`).
+    build_id: String,
+    /// Free-form reason (recorded in the BuildCancelled event +
+    /// scheduler logs). Defaults to "operator_request".
+    #[arg(long, default_value = "operator_request")]
+    reason: String,
+}
+
 pub(crate) async fn run_list(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
-    status: Option<String>,
-    limit: u32,
-    cursor: Option<String>,
+    a: ListArgs,
 ) -> anyhow::Result<()> {
     let req = ListBuildsRequest {
-        status_filter: status.unwrap_or_default(),
-        limit,
-        cursor,
+        status_filter: a.status.unwrap_or_default(),
+        limit: a.limit,
+        cursor: a.cursor,
         ..Default::default()
     };
     let resp = rpc("ListBuilds", async || client.list_builds(req.clone()).await).await?;
@@ -47,39 +66,31 @@ pub(crate) async fn run_list(
 pub(crate) async fn run_cancel(
     as_json: bool,
     scheduler_addr: &str,
-    build_id: String,
-    reason: String,
+    a: CancelArgs,
 ) -> anyhow::Result<()> {
     let mut sched: rio_proto::SchedulerServiceClient<_> =
         rio_proto::client::connect_single(scheduler_addr)
             .await
             .map_err(|e| anyhow!("connect to scheduler at {scheduler_addr}: {e}"))?;
     let req = CancelBuildRequest {
-        build_id: build_id.clone(),
-        reason,
+        build_id: a.build_id.clone(),
+        reason: a.reason,
     };
     let resp = rpc("CancelBuild", async || {
         sched.cancel_build(req.clone()).await
     })
     .await?;
     if as_json {
-        #[derive(Serialize)]
-        struct CancelJson<'a> {
-            build_id: &'a str,
-            cancelled: bool,
-        }
-        json(&CancelJson {
-            build_id: &build_id,
-            cancelled: resp.cancelled,
-        })?;
-    } else if resp.cancelled {
-        println!("cancelled build {build_id}");
+        return json(&serde_json::json!({ "build_id": a.build_id, "cancelled": resp.cancelled }));
+    }
+    if resp.cancelled {
+        println!("cancelled build {}", a.build_id);
     } else {
         // Server returns false for already-terminal AND
         // BuildNotFound (the latter as a tonic NotFound error,
         // which `rpc()` would have surfaced above — so false
         // here means "found but already terminal").
-        println!("{build_id}: already terminal (nothing to cancel)");
+        println!("{}: already terminal (nothing to cancel)", a.build_id);
     }
     Ok(())
 }

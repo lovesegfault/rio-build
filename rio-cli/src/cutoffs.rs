@@ -4,9 +4,6 @@
 //! `name | configured | effective | queued | running | samples`.
 //! Shows how far the SITA-E rebalancer's EMA has drifted from the
 //! static TOML config, and how much data backs each class.
-//!
-//! Separate module (not inline in `main.rs`) to keep P0236/P0237's
-//! `main.rs` deltas to the enum variant + match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;
 use rio_proto::types::GetSizeClassStatusRequest;

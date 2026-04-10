@@ -6,13 +6,8 @@
 //! (TriggerGC proxies because the scheduler populates `extra_roots`
 //! from live-build state; upstream CRUD has no scheduler state to
 //! merge).
-//!
-//! Separate module (not inline in `main.rs`) — same convention as
-//! `gc.rs`/`status.rs`/`bps.rs`: keep `main.rs` deltas to enum
-//! variant + match arm + mod decl only.
 
 use clap::Subcommand;
-use serde::Serialize;
 use tonic::transport::Channel;
 
 use rio_proto::StoreAdminServiceClient;
@@ -56,26 +51,15 @@ fn validate_pubkey_entry(entry: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::validate_pubkey_entry;
+    use rstest::rstest;
 
-    #[test]
-    fn pubkey_valid_nixos_org() {
-        validate_pubkey_entry("cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=")
-            .unwrap();
-    }
-
-    #[test]
-    fn pubkey_rejects_missing_colon() {
-        assert!(validate_pubkey_entry("cache.nixos.org-1").is_err());
-    }
-
-    #[test]
-    fn pubkey_rejects_truncated() {
-        assert!(validate_pubkey_entry("foo:6NCHdD59X431").is_err());
-    }
-
-    #[test]
-    fn pubkey_rejects_non_base64() {
-        assert!(validate_pubkey_entry("foo:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDS!jY=").is_err());
+    #[rstest]
+    #[case::valid("cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=", true)]
+    #[case::missing_colon("cache.nixos.org-1", false)]
+    #[case::truncated("foo:6NCHdD59X431", false)]
+    #[case::non_base64("foo:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDS!jY=", false)]
+    fn pubkey(#[case] s: &str, #[case] ok: bool) {
+        assert_eq!(validate_pubkey_entry(s).is_ok(), ok);
     }
 }
 
@@ -246,15 +230,7 @@ pub(crate) async fn run(
             })
             .await?;
             if as_json {
-                #[derive(Serialize)]
-                struct RemovedJson<'a> {
-                    url: &'a str,
-                    removed: bool,
-                }
-                json(&RemovedJson {
-                    url: &url,
-                    removed: true,
-                })?;
+                json(&serde_json::json!({ "url": url, "removed": true }))?;
             } else {
                 println!("removed upstream {url}");
             }

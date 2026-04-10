@@ -23,6 +23,9 @@ use rio_common::signal::Token;
 use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
 use tonic::transport::Channel;
 
+// Subcommand handlers. Each module owns its `#[derive(Args)]` struct
+// and `run*` fn so `main.rs` deltas for a new subcommand stay at enum
+// variant + match arm + mod decl.
 mod bps;
 mod builds;
 mod cutoffs;
@@ -153,10 +156,11 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Connect to the scheduler's `AdminService`. Called per-arm so a
-    /// subcommand that talks only to the store (or only to kube) never
-    /// `?`s on an unreachable scheduler — `rio-cli bps describe` must
-    /// work when the scheduler is down (e.g., to diagnose why).
+    /// Connect to the scheduler's `AdminService`. Called once for the
+    /// admin-dispatch arm of `main()`; non-admin subcommands (kube /
+    /// store / SchedulerService) are matched first so they never `?`
+    /// on an unreachable scheduler — `rio-cli bps describe` must work
+    /// when the scheduler is down (e.g., to diagnose why).
     async fn connect_admin(&self) -> anyhow::Result<AdminServiceClient<Channel>> {
         rio_proto::client::connect_single(&self.scheduler_addr)
             .await
@@ -216,22 +220,7 @@ struct CliArgs {
 enum Cmd {
     /// Create a tenant. The name maps to the SSH authorized_keys comment
     /// field — builds from keys with this comment are attributed here.
-    CreateTenant {
-        /// Tenant name (unique, non-empty after trim).
-        name: String,
-        /// GC retention period in hours. Build artifacts for this tenant
-        /// are eligible for sweep after this many hours without access.
-        #[arg(long)]
-        gc_retention_hours: Option<u32>,
-        /// Storage cap in bytes. Soft limit — GC targets this tenant
-        /// more aggressively when exceeded.
-        #[arg(long)]
-        gc_max_store_bytes: Option<u64>,
-        /// Bearer token for binary-cache HTTP access. Unset = no cache
-        /// access for this tenant.
-        #[arg(long)]
-        cache_token: Option<String>,
-    },
+    CreateTenant(tenants::CreateArgs),
     /// List all tenants.
     ListTenants,
     /// Cluster status summary: workers, builds, queue depth.
@@ -246,38 +235,9 @@ enum Cmd {
     /// unary RPC reached the new leader), actor map was empty (bidi
     /// stream stuck on TCP keepalive to old leader). `--diff` shows
     /// both side-by-side with per-row `⚠` divergence markers.
-    Workers {
-        /// Filter by worker status: "alive", "draining", or empty for all.
-        /// Ignored with `--actor`/`--diff` (those read the full map).
-        #[arg(long)]
-        status: Option<String>,
-        /// Read the scheduler actor's in-memory executor map instead of
-        /// PG. Surfaces `has_stream`/`warm`/`kind` — the dispatch
-        /// filter inputs. PG `last_seen` can't tell you if the stream
-        /// to THIS leader is dead.
-        #[arg(long, conflicts_with = "diff")]
-        actor: bool,
-        /// Join PG view (`ListExecutors`) with actor view
-        /// (`DebugListExecutors`). `⚠` marks rows where they disagree:
-        /// PG-only = stream not connected, actor-only = PG stale,
-        /// both-but-no-stream = I-048b zombie.
-        #[arg(long, conflicts_with = "actor")]
-        diff: bool,
-    },
+    Workers(workers::Args),
     /// List builds with optional filtering.
-    Builds {
-        /// Filter by build status: "pending", "active", "succeeded",
-        /// "failed", "cancelled".
-        #[arg(long)]
-        status: Option<String>,
-        /// Max results (server capped).
-        #[arg(long, default_value = "50")]
-        limit: u32,
-        /// Opaque keyset cursor from a prior page's `next_cursor`.
-        /// Stable under concurrent inserts, unlike offset.
-        #[arg(long)]
-        cursor: Option<String>,
-    },
+    Builds(builds::ListArgs),
     /// Actor in-memory DAG snapshot for a build. Unlike builds (PG
     /// summary) or GetBuildGraph (PG graph), this queries the LIVE
     /// actor — exactly what dispatch_ready() sees. The I-025
@@ -286,59 +246,23 @@ enum Cmd {
     ///
     /// Status filter: "Ready" shows queued-not-dispatched (why?),
     /// "Assigned" + ⚠ shows the freeze, "Queued" shows blocked-on-deps.
-    Derivations {
-        /// Build UUID. Required unless --all-active.
-        build_id: Option<String>,
-        /// Iterate ALL active builds (ListBuilds status=active). Useful
-        /// when you don't know WHICH build is stuck — the I-025 QA
-        /// scenario had 4 builds frozen simultaneously.
-        #[arg(long, conflicts_with = "build_id")]
-        all_active: bool,
-        /// Filter by status ("Ready", "Assigned", "Running", "Queued", ...).
-        #[arg(long)]
-        status: Option<String>,
-        /// Only show derivations assigned to dead-stream executors
-        /// (the I-025 smoking gun).
-        #[arg(long)]
-        stuck: bool,
-    },
+    Derivations(derivations::Args),
     /// Stream build logs for a derivation.
     ///
     /// The server keys its ring buffer on `derivation_path`, not
     /// `build_id` — the positional here is the drv path. `--build-id`
     /// is needed only for completed builds (S3 lookup path); for
     /// active builds the ring buffer serves logs by drv path alone.
-    Logs {
-        /// Full derivation store path (e.g. `/nix/store/abc-foo.drv`).
-        drv_path: String,
-        /// Build UUID. Only needed if the derivation is no longer in
-        /// the active-build ring buffer (S3 archive lookup).
-        #[arg(long)]
-        build_id: Option<String>,
-    },
+    Logs(logs::Args),
     /// Trigger garbage collection. Scheduler proxies to the store
     /// after populating `extra_roots` from live builds, so in-flight
     /// outputs aren't swept. Progress is streamed line-by-line.
-    Gc {
-        /// Report what would be collected without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the per-tenant retention floor for this sweep.
-        /// Paths younger than this are protected even if otherwise
-        /// unreachable. Unset = use each tenant's configured retention.
-        #[arg(long)]
-        grace_hours: Option<u32>,
-    },
+    Gc(gc::Args),
     /// Clear poison state for a derivation so it can be re-scheduled.
     /// Idempotent: exits 0 on a non-poisoned path (cleared=false),
     /// but exits nonzero on a bare hash or invalid path (server
     /// rejects — use `poison-list` to find the right path).
-    PoisonClear {
-        /// Full .drv store path (e.g. `/nix/store/abc...-foo.drv`).
-        /// Bare hashes are rejected — a silent no-match would look
-        /// like "not poisoned" when it's actually "wrong key format".
-        drv_path: String,
-    },
+    PoisonClear(poison::ClearArgs),
     /// List poisoned derivations. These are the ROOTS that cascade
     /// DependencyFailed — a single poisoned FOD can block hundreds of
     /// downstream derivations. Output shows the full .drv path (what
@@ -356,26 +280,12 @@ enum Cmd {
     /// the manual escape hatch; the scheduler's orphan-watcher sweep is
     /// the automatic one.
     // r[impl cli.cmd.cancel-build]
-    CancelBuild {
-        /// Build UUID (as shown by `rio-cli builds` or `status`).
-        build_id: String,
-        /// Free-form reason (recorded in the BuildCancelled event +
-        /// scheduler logs). Defaults to "operator_request".
-        #[arg(long, default_value = "operator_request")]
-        reason: String,
-    },
+    CancelBuild(builds::CancelArgs),
     /// Mark a worker draining. The scheduler stops dispatching new
     /// builds to it; in-flight builds complete (or, with --force, are
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
     /// this is the manual operator lever for the same path.
-    DrainExecutor {
-        /// Worker ID (as shown by `rio-cli workers`).
-        executor_id: String,
-        /// Cancel running builds on the worker (reassign elsewhere)
-        /// instead of waiting for them to complete.
-        #[arg(long)]
-        force: bool,
-    },
+    DrainExecutor(workers::DrainArgs),
     /// Size-class cutoff status: configured vs effective (post-rebalancer
     /// EMA drift), per-class queue/running counts, sample-window size.
     /// Surfaces how far SITA-E has drifted from the static TOML config
@@ -386,11 +296,7 @@ enum Cmd {
     /// `classify()` picks under current effective cutoffs. I-124
     /// diagnostic — "why is X routed to large? is its EMA plausible?".
     /// Sorted by sample_count desc (most-observed first).
-    Estimator {
-        /// Substring match on pname. Omit for all entries.
-        #[arg(long)]
-        filter: Option<String>,
-    },
+    Estimator(estimator::Args),
     /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
     /// `get` lists BPSes; `describe` joins spec classes with live
     /// child BuilderPool replica counts + effective-cutoff status —
@@ -404,11 +310,7 @@ enum Cmd {
     /// to stdout (one hex BLAKE3 per line, pipeable); progress to stderr.
     /// I-040 diagnostic — catches chunks stranded by key-format changes.
     /// Talks to StoreAdminService directly — `--store-addr` required.
-    VerifyChunks {
-        /// Chunks per backend exists_batch. 0 = server default (1000).
-        #[arg(long, default_value_t = 0)]
-        batch_size: u32,
-    },
+    VerifyChunks(verify_chunks::Args),
     /// Manage per-tenant upstream binary-cache substitution config.
     /// Talks to StoreAdminService directly (not scheduler-proxied) —
     /// `--store-addr` or `RIO_STORE_ADDR` must reach the store.
@@ -444,103 +346,42 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         // kube-only — talks to the K8s apiserver via KUBECONFIG /
         // in-cluster config; no gRPC connect at all.
-        Cmd::Bps { cmd } => bps::run(as_json, cmd).await?,
+        Cmd::Bps { cmd } => bps::run(as_json, cmd).await,
         // store-admin only — don't fail on an unreachable scheduler
         // when the operator just wants to add a cache URL or audit
         // chunk consistency.
         Cmd::Upstream { cmd } => {
             let mut sc = cfg.connect_store_admin().await?;
-            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, cmd).await?;
+            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, cmd).await
         }
-        Cmd::VerifyChunks { batch_size } => {
-            let mut sc = cfg.connect_store_admin().await?;
-            verify_chunks::run(&mut sc, batch_size).await?;
-        }
-        Cmd::CreateTenant {
-            name,
-            gc_retention_hours,
-            gc_max_store_bytes,
-            cache_token,
-        } => {
-            let mut client = cfg.connect_admin().await?;
-            tenants::run_create(
-                as_json,
-                &mut client,
-                name,
-                gc_retention_hours,
-                gc_max_store_bytes,
-                cache_token,
-            )
-            .await?;
-        }
-        Cmd::ListTenants => {
-            tenants::run_list(as_json, &mut cfg.connect_admin().await?).await?;
-        }
-        Cmd::Status => status::run(as_json, &mut cfg.connect_admin().await?).await?,
-        Cmd::Workers {
-            status,
-            actor,
-            diff,
-        } => {
-            let mut client = cfg.connect_admin().await?;
-            if actor {
-                workers::run_actor(as_json, &mut client).await?;
-            } else if diff {
-                workers::run_diff(as_json, &mut client).await?;
-            } else {
-                workers::run_pg(as_json, &mut client, status).await?;
+        Cmd::VerifyChunks(a) => verify_chunks::run(&mut cfg.connect_store_admin().await?, a).await,
+        // SchedulerService, not AdminService — same address, separate
+        // client (see `builds::run_cancel`).
+        Cmd::CancelBuild(a) => builds::run_cancel(as_json, &cfg.scheduler_addr, a).await,
+        // Everything else talks to AdminService — connect once.
+        admin => {
+            let mut c = cfg.connect_admin().await?;
+            match admin {
+                Cmd::CreateTenant(a) => tenants::run_create(as_json, &mut c, a).await,
+                Cmd::ListTenants => tenants::run_list(as_json, &mut c).await,
+                Cmd::Status => status::run(as_json, &mut c).await,
+                Cmd::Workers(a) => workers::run(as_json, &mut c, a).await,
+                Cmd::Builds(a) => builds::run_list(as_json, &mut c, a).await,
+                Cmd::Derivations(a) => derivations::run(as_json, &mut c, a).await,
+                Cmd::Logs(a) => logs::run(&mut c, a).await,
+                Cmd::Gc(a) => gc::run(&mut c, a).await,
+                Cmd::PoisonClear(a) => poison::run_clear(as_json, &mut c, a).await,
+                Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
+                Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
+                Cmd::Cutoffs => cutoffs::run(as_json, &mut c).await,
+                Cmd::Estimator(a) => estimator::run(as_json, &mut c, a).await,
+                Cmd::Bps { .. }
+                | Cmd::Upstream { .. }
+                | Cmd::VerifyChunks(_)
+                | Cmd::CancelBuild(_) => unreachable!("handled above"),
             }
         }
-        Cmd::Builds {
-            status,
-            limit,
-            cursor,
-        } => {
-            builds::run_list(
-                as_json,
-                &mut cfg.connect_admin().await?,
-                status,
-                limit,
-                cursor,
-            )
-            .await?;
-        }
-        Cmd::Derivations {
-            build_id,
-            all_active,
-            status,
-            stuck,
-        } => {
-            let mut client = cfg.connect_admin().await?;
-            derivations::run(as_json, &mut client, build_id, all_active, status, stuck).await?;
-        }
-        Cmd::Logs { drv_path, build_id } => {
-            let mut client = cfg.connect_admin().await?;
-            logs::run(&mut client, drv_path, build_id).await?;
-        }
-        Cmd::Gc {
-            dry_run,
-            grace_hours,
-        } => gc::run(&mut cfg.connect_admin().await?, dry_run, grace_hours).await?,
-        Cmd::PoisonClear { drv_path } => {
-            poison::run_clear(as_json, &mut cfg.connect_admin().await?, drv_path).await?;
-        }
-        Cmd::PoisonList => {
-            poison::run_list(as_json, &mut cfg.connect_admin().await?).await?;
-        }
-        Cmd::CancelBuild { build_id, reason } => {
-            builds::run_cancel(as_json, &cfg.scheduler_addr, build_id, reason).await?;
-        }
-        Cmd::DrainExecutor { executor_id, force } => {
-            workers::run_drain(as_json, &mut cfg.connect_admin().await?, executor_id, force)
-                .await?;
-        }
-        Cmd::Cutoffs => cutoffs::run(as_json, &mut cfg.connect_admin().await?).await?,
-        Cmd::Estimator { filter } => {
-            estimator::run(as_json, filter, &mut cfg.connect_admin().await?).await?;
-        }
     }
-    Ok(())
 }
 
 // ===========================================================================
@@ -557,8 +398,28 @@ async fn main() -> anyhow::Result<()> {
 /// Print a serde value as pretty JSON. Single emission point so all
 /// `--json` output is consistent (pretty, trailing newline, errors
 /// propagate).
-pub(crate) fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
+pub(crate) fn json<T: Serialize + ?Sized>(v: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+/// Shared `--json` / human list-output triad used by `list-tenants` and
+/// other simple list subcommands: JSON array if `as_json`, `empty`
+/// placeholder line if no items, else `each` per item.
+pub(crate) fn emit<T: Serialize>(
+    as_json: bool,
+    items: &[T],
+    empty: &str,
+    each: impl Fn(&T),
+) -> anyhow::Result<()> {
+    if as_json {
+        return json(items);
+    }
+    if items.is_empty() {
+        println!("{empty}");
+    } else {
+        items.iter().for_each(each);
+    }
     Ok(())
 }
 

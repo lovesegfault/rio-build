@@ -13,15 +13,22 @@ use rio_proto::AdminServiceClient;
 use rio_proto::types::GetEstimatorStatsRequest;
 use tonic::transport::Channel;
 
+#[derive(clap::Args, Clone)]
+pub(crate) struct Args {
+    /// Substring match on pname. Omit for all entries.
+    #[arg(long)]
+    filter: Option<String>,
+}
+
 // r[impl cli.cmd.estimator]
 /// Run the `estimator` subcommand.
 pub(crate) async fn run(
     as_json: bool,
-    filter: Option<String>,
     client: &mut AdminServiceClient<Channel>,
+    a: Args,
 ) -> anyhow::Result<()> {
     let req = GetEstimatorStatsRequest {
-        drv_name_filter: filter,
+        drv_name_filter: a.filter,
     };
     let resp = crate::rpc("GetEstimatorStats", async || {
         client.get_estimator_stats(req.clone()).await
