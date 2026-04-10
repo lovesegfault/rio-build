@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0578 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
+**Plan-number range:** P0541–P0582 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
@@ -85,6 +85,7 @@ Core-stack nixosTests consolidated on `adr-022` (commit `15a9db79`); chromium-14
 | **U3** | operator | something is wrong at 02:00 | unclear which layer | one single-flag rollback for cache tier (`store.chunkBackend.kind=s3`, instant + lossless); builder-side rollback is greenfield `down && up` from known-green commit |
 | **U4** | operator | wants to know if the new path is better | no per-file metrics | grafana: `rio_builder_digest_fuse_open_seconds` p99, `…_fetch_bytes_total{hit=node_ssd|remote}`, `rio_store_tiered_local_hit_ratio` |
 | **U5** | deployment consumer | `nix copy --from rio-store` to a **rio-aware** receiver (rio-store replica, or host running rio-gateway proxy) that already has 95% of the target closure | walks chunk-list per store path; O(all-chunks) `HasChunk` RPCs even for unchanged paths | walks Directory DAG; `HasDirectories([root_digest,…])` short-circuits unchanged subtrees in one batch RPC; fetches only changed files. **Sync bandwidth ∝ change size, not closure size.** Stock-nix clients without `HasDirectories` fall through to P0566's narinfo/NAR binary-cache surface. |
+| **U6** | operator / migrating org | PostgreSQL is unavailable, or rio-store is not yet deployed in a consumer environment | nothing substitutes — chunks in S3 are unreadable without the PG manifest index | with `binary_cache_compat` enabled, `nix copy --from s3://bucket?region=…` works directly against S3-standard with no rio process running. PG-loss is a degradation (no dedup serving, no CA-cutoff, no `FindMissingPaths`), not an outage. Migration on-ramp: existing Nix infra reads the bucket as a plain binary cache while rio rolls out. |
 
 **Sequencing rule (U3, unchanged):** every phase boundary is `.#ci` green. Phases 0-4 are deploy-safe (store-side or test-only). Phase 5 (P0560) is the hard cutover: builders REQUIRE the composefs lower from that commit forward.
 
@@ -123,7 +124,8 @@ P0552 GetNarIndex + indexer_loop  │                   │                     
    │                              │   P0553 s3-express.tf (per-AZ directory bucket) + IAM       │
    │                              │      └─► P0554 helm AZ→bucket map ──► P0555 vm:tiered-cache
    │                              │             ★ FIRST SHIPPED VALUE (U2)
-   │                              │             └─► P0566 self-describing S3 (direct write)
+   │                              │             P0579 compat config+helm ──► P0566 compat writer ──► P0580 vm:compat-substitute  ★ U6 LANDS
+   │                              │                                              └─► P0581 compat GC ──► P0582 compat reconciler
    │                              │
 ┌── Phase 4 composefs store-side (gated on Phase-0 + P0546) ──┐
 P0556 composefs-sys + encode.rs (libcomposefs FFI; nix-patched user.* + no-root-whiteouts) + golden VM
@@ -160,7 +162,7 @@ P0574 gateway substituter: Directory-DAG delta-sync client  ★ U5 LANDS
 
 | Edge | Why it's non-obvious |
 |---|---|
-| P0549 blob-API → P0566 | `ChunkBackend` trait today is `[u8;32]`-addressed only (`rio-store/src/backend/chunk.rs:91`). `narinfo/{h}` / `manifests/{h}` need string-keyed `put_blob/get_blob/delete_blob`. |
+| P0549 blob-API → P0566 | `ChunkBackend` trait today is `[u8;32]`-addressed only (`rio-store/src/backend/chunk.rs:91`). `{h}.narinfo` / `nar/{h}.nar.zst` / `nix-cache-info` need string-keyed `put_blob/get_blob/delete_blob`. |
 | P0576 (kernel.nix sentinel) → P0560 | Test-VM kernel must have the same `extraStructuredConfig` as the AMI. `kernel.nix` MUST be a standalone NixOS module importable by `nix/tests/fixtures/`. |
 | P0550 fetch.rs hoist → P0559 | `rio-builder/src/fuse/fetch.rs:20,32-33` import `fuser::Errno`, `super::NixStoreFs`, `super::cache`. **NOT a pure `git mv`** — hoist `StoreClients` + `fetch_chunks_parallel` core to `store_fetch.rs`; leave FUSE-typed wrappers in `fuse/fetch.rs` *temporarily* (P0560 deletes them with the rest of `fuse/`). ~150 LoC of actual refactor, not zero. |
 | P0544 spec-scaffold → everything with `r[impl …]` | `tracey-validate` in `.#ci` fails on dangling `r[impl X]` where `r[X]` has no spec text. Markers must be on `sprint-1` before any code phase merges. |
@@ -215,7 +217,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 | `docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md` | merge `adr-022` (refocused §2 Design / §3 Alternatives). Carries 13 markers: `r[builder.fs.{composefs-stack, userxattr-mount, stub-isize, metacopy-xattr-shape, fd-handoff-ordering, digest-fuse-open, passthrough-on-hit, passthrough-stack-depth, shared-backing-cache, file-digest-integrity, streaming-open-threshold}]` + `r[builder.mountd.{promote-verified, orphan-scan}]`. |
 | `docs/src/decisions/022-design-overview.md` | merge `adr-022`. Canonical design reference. |
 | `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one S3 Express One Zone directory bucket per AZ** is a disposable read-through cache. Both tiers are `S3ChunkBackend` instances; `put` = remote sync + local async; `get` = local → remote fallback + write-through. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3 standard, not service outage; rollback `kind=s3` is instant + lossless. Records FSx-for-Lustre as the considered alternative. Carries `r[infra.express.cache-tier]`. |
-| `docs/src/components/store.md` | append §"NAR index" (incl. `file_digest`) + §"Tiered chunk backend" + §"BlobService" |
+| `docs/src/components/store.md` | append §"NAR index" (incl. `file_digest`) + §"Tiered chunk backend" + §"BlobService" + §"Binary-cache compatibility layer" (`r[store.compat.*]`) |
 | `docs/src/components/builder.md` | **rewrite** §"FUSE Store" → §"composefs lazy lower" + §"digest-FUSE handler" + §"rio-mountd" (delete pre-ADR-022 whole-path FUSE description) |
 | `docs/src/components/gateway.md` | append `r[gw.substitute.dag-delta-sync]` spec text |
 | `docs/src/security.md` | rewrite §Boundary-3 (builder pods now unprivileged; `/dev/fuse` via fd-handoff; PSA tightens from `privileged`; mountd is the new `CAP_SYS_ADMIN` holder + integrity gate for shared cache); update §Known-Limitations |
@@ -353,9 +355,45 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 **Crate:** `nix` · **Deps:** P0548, P0554 · **Complexity:** MED
 `nix/tests/scenarios/store-tiered.nix`: two store replicas + two minio instances (one "local" Express stand-in, one shared "remote" S3-standard); subtests `cold-miss-fallback`, `put-remote-first`, `replica-warm-from-peer-write`, `local-none-passthrough`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-tiered` green; `.#ci` green.
 
-### P0566 — Self-describing S3 bucket (narinfo + manifest sidecar, direct object-store write)
-**Crate:** `rio-store` · **Deps:** P0549, P0554 · **Complexity:** LOW
-At PutPath commit, additionally write `narinfo/<hash>.narinfo` and `manifests/<hash>.json` directly to the object store via `put_blob` so the bucket is browsable/restorable without PG. **Exit:** `.#ci` green; live `aws s3 ls narinfo/` non-empty.
+### P0579 — `binary_cache_compat` config + helm
+**Crate:** `rio-store, infra` · **Deps:** P0544 · **Complexity:** LOW
+| File | Change |
+|---|---|
+| `rio-store/src/config.rs` | `pub struct BinaryCacheCompat { enabled: bool /* default true */, bucket: Option<String> /* None → chunk_backend.s3.bucket */, compression: CompatCompression /* Zstd|Xz|None, default Zstd */, write_mode: CompatWriteMode /* SyncAfterCommit only for now */ }`. `// r[impl store.compat.runtime-toggle]` |
+| `infra/helm/rio/values.yaml` | `store.binaryCacheCompat.{enabled,bucket,compression}` (default `enabled: true`) |
+| `infra/helm/rio/templates/store-deployment.yaml` | env `RIO_STORE__BINARY_CACHE_COMPAT__*` from values |
+| `docs/src/configuration.md` | rows added (P0544 also touches; serialise) |
+
+**Exit:** `.#ci` green; `helm template` renders the env block.
+
+### P0566 — binary-cache compat writer (stock-Nix `.narinfo` + `nar/*.nar.zst` to S3-standard)
+**Crate:** `rio-store` · **Deps:** P0549, P0579 · **Complexity:** MED
+| File | Change |
+|---|---|
+| `rio-store/src/compat/writer.rs` | new — `async fn write(&self, path_info: &PathInfo, manifest: &ManifestKind) -> Result<(), CompatError>`. Reassemble NAR bytes from `manifest` (chunked: `ChunkCache::get` over the just-written chunks, moka-hot; inline: read `inline_blob`). Stream through `async-compression` zstd encoder while computing `sha256(compressed)`. `put_blob("nar/{file_hash}.nar.zst", body)`. Render narinfo via the existing `rio-nix::narinfo::render` (same one the HTTP server uses) **with** `FileHash`/`FileSize`/`Compression` populated; `put_blob("{store_path_hash}.narinfo", body)`. On first-ever write, `put_blob("nix-cache-info", "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n")` if absent. `// r[impl store.compat.{nar-on-put,narinfo-on-put}]` `// r[impl obs.metric.compat]` |
+| `rio-store/src/grpc/put_path.rs` | after the PG-commit (status flips `'uploading'`→`'complete'`), if `cfg.binary_cache_compat.enabled`: `compat_writer.write(...).await` — failure logged + `rio_store_compat_write_failures_total` inc, **does not** fail the RPC. `// r[impl store.compat.write-after-commit]` |
+| `rio-store/src/lib.rs` | `pub mod compat;` + `rio_store_compat_write_seconds{result}` histogram + `rio_store_compat_write_failures_total` counter |
+| tests | unit: PutPath a 2-chunk path with compat ON → in-memory S3 backend has `{hash}.narinfo` and `nar/{filehash}.nar.zst`; round-trip narinfo via `rio-nix::narinfo::parse`; decompressed NAR sha256 == `nar_hash`. compat OFF → neither object present. `// r[verify store.compat.{nar-on-put,narinfo-on-put,write-after-commit,runtime-toggle}]` |
+
+**Exit:** `.#ci` green.
+
+### P0580 — VM test: stock-Nix substitutes from S3 with rio-store stopped  ★ U6 LANDS
+**Crate:** `nix` · **Deps:** P0566 · **Complexity:** MED
+`nix/tests/scenarios/store-compat.nix`: rio-store + minio + stock `pkgs.nix`. Subtests `stock-nix-substitute` (PutPath a 3-path closure → `systemctl stop rio-store` → `nix copy --from 's3://rio?endpoint=http://minio:9000&region=dummy' --to /tmp/out /nix/store/…` → verify all 3 paths land + `nix store verify` passes), `compat-off-no-narinfo` (compat=OFF → PutPath → `aws s3 ls` shows `chunks/` only, no `.narinfo`). Wire at `nix/tests/default.nix` `subtests = [ … ]` with `# r[verify store.compat.stock-nix-substitute]` and `# r[verify store.compat.runtime-toggle]`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-compat` green; `.#ci` green.
+
+### P0581 — compat GC integration
+**Crate:** `rio-store` · **Deps:** P0566 · **Complexity:** LOW
+| File | Change |
+|---|---|
+| `rio-store/src/gc.rs` | per-manifest sweep txn already enqueues chunk keys to `pending_s3_deletes`; extend to also enqueue `{store_path_hash}.narinfo` and `nar/{file_hash}.nar.zst` (file_hash read from the dying narinfo row's `compat_file_hash` column). Runs regardless of current `enabled` value — past compat writes are GC'd even if compat is now OFF. `// r[impl store.compat.gc-coupled]` |
+| `migrations/033_nar_index.sql` (P0551 — same migration) | `+ ALTER TABLE narinfo ADD COLUMN compat_file_hash bytea;` (nullable; populated by P0566 on successful compat write) |
+| tests | GC a path with compat objects → both keys appear in `pending_s3_deletes`. `// r[verify store.compat.gc-coupled]` |
+
+**Exit:** `.#ci` green.
+
+### P0582 — compat reconciler (deferred-priority)
+**Crate:** `rio-store` · **Deps:** P0566, P0581 · **Complexity:** LOW
+`rio-store/src/compat/reconciler.rs`: background loop, `SELECT store_path_hash FROM narinfo WHERE compat_file_hash IS NULL AND status='complete' LIMIT 64` → `compat_writer.write(...)` for each → sleep 30s if empty. Handles the crash-between-PG-commit-and-S3-write window and backfills paths ingested while compat was OFF. Spawned in `main.rs` only when `enabled`. **Exit:** `.#ci` green; unit: insert a `compat_file_hash IS NULL` row → one tick → row populated + S3 objects present.
 
 ---
 
@@ -621,7 +659,11 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":553,"title":"infra/eks/s3-express.tf per-AZ directory bucket (for_each express_az_ids) + dedicated rio-store SG/NodeClass + s3express IAM","deps":[548],"crate":"infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"per-AZ from day one; TieredChunkBackend is AZ-count-agnostic; no CSI/PVC/kmod"}
 {"plan":554,"title":"helm chunkBackend.tiered + per-AZ Express bucket env (downward-API zone → IMDS zone-id → bucket)","deps":[548,553],"crate":"infra,xtask","priority":80,"status":"UNIMPL","complexity":"LOW","note":"FIRST SHIPPED VALUE (U2)"}
 {"plan":555,"title":"VM test: tiered-backend cache semantics","deps":[548,554],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":""}
-{"plan":566,"title":"Self-describing S3 bucket (narinfo+manifests sidecar)","deps":[549,554],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":""}
+{"plan":579,"title":"binary_cache_compat config + helm (runtime toggle, default ON)","deps":[544],"crate":"rio-store,infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"U6 foundation"}
+{"plan":566,"title":"binary-cache compat writer: stock-Nix .narinfo + nar/*.nar.zst to S3-standard post-commit","deps":[549,579],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"MED","note":"reassemble from moka-hot chunks; FileHash/FileSize populated; failure non-fatal to PutPath"}
+{"plan":580,"title":"VM test: stock-Nix substitutes from S3 with rio-store stopped","deps":[566],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":"U6 LANDS"}
+{"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
+{"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
@@ -689,7 +731,13 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `obs.metric.mountd` | observability.md | bin/rio-mountd.rs (P0567) | vm-composefs-e2e (P0560§B) |
 | `builder.overlay.composefs-lower` | components/builder.md | overlay.rs (P0560§A) | vm-composefs-e2e (P0560§B) |
 | `builder.fs.parity` | components/builder.md | (verify-only) | lifecycle (P0562) |
-| `store.s3.self-describing` | components/store.md | put_path.rs (P0566) | live: `aws s3 ls narinfo/` (P0566) |
+| `store.compat.runtime-toggle` | components/store.md | config.rs (P0579) | unit + vm-store-compat `compat-off-no-narinfo` (P0566+P0580) |
+| `store.compat.nar-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
+| `store.compat.narinfo-on-put` | components/store.md | compat/writer.rs (P0566) | unit (P0566) |
+| `store.compat.write-after-commit` | components/store.md | grpc/put_path.rs (P0566) | unit (P0566) |
+| `store.compat.stock-nix-substitute` | components/store.md | (verify-only) | vm-store-compat `stock-nix-substitute` (P0580) |
+| `store.compat.gc-coupled` | components/store.md | gc.rs (P0581) | rio-store/tests/gc.rs (P0581) |
+| `obs.metric.compat` | observability.md | rio-store/lib.rs (P0566) | vm-store-compat (P0580) |
 | `obs.metric.chunk-backend-tiered` | observability.md | rio-store/lib.rs (P0548) | vm-store-tiered (P0555) |
 | `obs.metric.digest-fuse` | observability.md | rio-builder/lib.rs (P0559) | vm-composefs-e2e (P0560§B) |
 | `proto.chunk.bytes-zerocopy` | components/store.md | rio-proto/build.rs (P0568) | unit (P0568) |
@@ -699,7 +747,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `infra.express.cache-tier` | decisions/023 | infra/eks/s3-express.tf (P0553) | (live-only — runbook P0565) |
 | `infra.node.kernel-composefs` | deployment.md | nix/nixos-node/kernel.nix (prereq) | nix/checks.nix node-kernel-config (prereq) |
 
-53 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse'` → empty.
+59 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
 `config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/composefs/resolver.rs` are in scope (or adds them).
 
 ---
