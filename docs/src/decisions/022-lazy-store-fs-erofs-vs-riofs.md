@@ -246,13 +246,13 @@ The §2 stack optimizes the **read** side — inputs reach the build via per-fil
 r[store.put.chunked]
 
 ```text
-builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject ──best-effort──▶ FSx
+builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject ──best-effort──▶ S3 Express (per-AZ)
    │  (only egress)     │  (per-chunk, on arrival;             (TieredChunkBackend §9)
    │                    │   no whole-NAR buffer)
-   └── air-gapped: never reaches S3, FSx, or any network endpoint other than rio-store
+   └── air-gapped: never reaches S3, S3 Express, or any network endpoint other than rio-store
 ```
 
-**This does not widen the builder trust boundary or the FSx surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 and FSx are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ FSx cache stays read-only from the builder's perspective — chunks reach FSx via rio-store's existing `TieredChunkBackend.put` (S3-first, then best-effort FSx; [Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
+**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it via rio-store's existing `TieredChunkBackend.put` (S3-standard first, then best-effort Express; [Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
 
 ### 6.1 Builder-side fused walk
 
@@ -282,7 +282,7 @@ Commit: when every `chunk_manifest` digest is S3-durable (uploaded now or pre-ex
 
 r[store.put.narhash-async]
 
-The builder is untrusted (`r[builder.upload.references-scanned]` context: outputs are adversary-controlled bytes); rio-store signs `narinfo`. The `nar_hash` in `Begin` is therefore **claimed**, not attested. On commit, rio-store records `nar_hash_verified = false` and enqueues a background job that NAR-serializes the path from CAS chunks (via `chunk_manifest` + `Directory` tree — same machinery as `ReadBlob`, `r[store.castore.blob-read]`), computes SHA-256, and compares. The verify reads chunks from S3/FSx — never from the builder — so the wire cost stays missing-chunks-only.
+The builder is untrusted (`r[builder.upload.references-scanned]` context: outputs are adversary-controlled bytes); rio-store signs `narinfo`. The `nar_hash` in `Begin` is therefore **claimed**, not attested. On commit, rio-store records `nar_hash_verified = false` and enqueues a background job that NAR-serializes the path from CAS chunks (via `chunk_manifest` + `Directory` tree — same machinery as `ReadBlob`, `r[store.castore.blob-read]`), computes SHA-256, and compares. The verify reads chunks from S3 (standard or Express) — never from the builder — so the wire cost stays missing-chunks-only.
 
 The path is **immediately usable for chunk-addressed reads**: §2's digest-FUSE, `ReadBlob`, and delta-sync (`r[gw.substitute.dag-delta-sync]`) key on `file_digest`/`chunk_digest`, which are self-certifying. Only the legacy binary-cache surface (`narinfo` + NAR fetch) depends on `nar_hash`; serving a `narinfo` for an unverified path **blocks on the verify job** (or returns 404, configuration-dependent).
 
@@ -294,6 +294,6 @@ On mismatch the path is quarantined: manifest flips to `quarantined`, the path i
 
 ### 6.4 Prior art
 
-REAPI [`FindMissingBlobs`](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) → `HasChunks`; BuildBarn [ADR-0003 CAS decomposition](https://github.com/buildbarn/bb-adrs/blob/main/0003-cas-decomposition.md) → upload chunk granularity matches read-path chunk granularity; ostree `devino_to_csum_cache` → §6.1 input-reuse shortcut; [`mkcomposefs --digest-store`](https://man.archlinux.org/man/mkcomposefs.1.en) → walk-and-reflink-into-object-store (inapplicable directly: upper is local SSD, FSx is Lustre, no cross-FS reflink — but the walk shape is the same); Nix [#4075](https://github.com/NixOS/nix/issues/4075)/[#7527](https://github.com/NixOS/nix/issues/7527) → existence-check before serialize, and the whole-NAR-granularity pain point this section eliminates.
+REAPI [`FindMissingBlobs`](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) → `HasChunks`; BuildBarn [ADR-0003 CAS decomposition](https://github.com/buildbarn/bb-adrs/blob/main/0003-cas-decomposition.md) → upload chunk granularity matches read-path chunk granularity; ostree `devino_to_csum_cache` → §6.1 input-reuse shortcut; [`mkcomposefs --digest-store`](https://man.archlinux.org/man/mkcomposefs.1.en) → walk-and-reflink-into-object-store (inapplicable directly: upper is local SSD, cache tier is an object store, no reflink — but the walk shape is the same); Nix [#4075](https://github.com/NixOS/nix/issues/4075)/[#7527](https://github.com/NixOS/nix/issues/7527) → existence-check before serialize, and the whole-NAR-granularity pain point this section eliminates.
 
 ---

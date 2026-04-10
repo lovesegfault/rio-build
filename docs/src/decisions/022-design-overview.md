@@ -10,7 +10,7 @@ Each rio-builder presents `/nix/store` to the build sandbox as a three-layer rea
 
 This replaces the previous whole-path-granularity FUSE store (`rio-builder/src/fuse/`) with file-granularity lazy fetch, kernel-native metadata operations, and structural cross-path deduplication.
 
-On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, mode, file_digest}` computed at PutPath time), the **Directory merkle layer** (`dir_digest`/`root_digest` over the same index), and a **tiered chunk backend** (per-AZ FSx Lustre cache in front of S3).
+On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, mode, file_digest}` computed at PutPath time), the **Directory merkle layer** (`dir_digest`/`root_digest` over the same index), and a **tiered chunk backend** (per-AZ S3 Express One Zone cache in front of S3 standard).
 
 ## 2. Properties
 
@@ -24,7 +24,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 | **Minimal privileged surface** | The only privileged component is `rio-mountd`, a node-level daemon that opens `/dev/fuse` + an EROFS superblock and hands both fds to the unprivileged builder over a Unix socket. The builder mounts overlay itself inside its own user namespace. The build sandbox has zero device exposure. |
 | **Declared-input enforcement** | The digest-FUSE handler answers `lookup()` only for digests in the build's declared input closure; everything else is `ENOENT`. The build cannot read store paths it did not declare. |
 | **Delta-sync distribution** | `nix copy --from rio-store` and inter-region replication walk a Directory merkle DAG. Unchanged subtrees are skipped in one batch RPC; bandwidth scales with change size, not closure size. |
-| **Per-AZ chunk cache** | All rio-store replicas in an availability zone share an FSx Lustre read-through cache. A new replica starts warm; S3 GET cost is once per chunk per AZ, not once per replica. |
+| **Per-AZ chunk cache** | All rio-store replicas in an availability zone share an S3 Express One Zone directory bucket as a read-through cache. A new replica starts warm; S3 standard GET cost is once per chunk per AZ, not once per replica. |
 
 ## 3. Architecture
 
@@ -58,7 +58,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 │                                                                                    │
 │   GetChunks([chunk_digest]) → stream<bytes>       (batched, server-streamed)       │
 │                                                                                    │
-│   TieredChunkBackend:  FSx Lustre (per-AZ) ──read-through──► S3 (authoritative)    │
+│   TieredChunkBackend:  S3 Express (per-AZ) ──read-through──► S3 (authoritative)    │
 │                                                                                    │
 │   castore:  GetDirectory / HasDirectories / HasBlobs / ReadBlob   (delta-sync)     │
 │                                                                                    │
@@ -192,12 +192,16 @@ This layer has zero cost on the builder serving path: the mount stack and digest
 r[store.backend.tiered-get-fallback]
 r[store.backend.tiered-put-remote-first]
 
-`TieredChunkBackend` wraps the existing object-store `ChunkBackend` with a per-AZ FSx Lustre filesystem as a read-through cache:
+`TieredChunkBackend` composes two `S3ChunkBackend` instances — a per-AZ S3 Express One Zone directory bucket as `local`, the regional S3 standard bucket as `remote`:
 
-- `put(digest, bytes)` writes to S3 **synchronously first**, then best-effort to FSx. S3 is always authoritative.
-- `get(digest)` reads FSx first; on miss, reads S3 and writes through to FSx.
+- `put(digest, bytes)` writes to S3 standard **synchronously first**, then best-effort to the AZ's Express bucket. S3 standard is always authoritative.
+- `get(digest)` reads the Express bucket first; on miss, reads S3 standard and writes through to Express.
 
-One FSx Lustre filesystem is provisioned **per availability zone**; store pods mount the FSx for their own AZ. A newly-scaled replica is warm immediately; S3 GET is paid once per chunk per AZ. Any single FSx (or its AZ) becoming unavailable degrades that AZ's replicas to direct-S3 reads — slower, not down — and leaves other AZs unaffected. The cache tier is toggled by a single helm value (`store.chunkBackend.kind`), and flipping it back to `s3` is instant and lossless.
+One directory bucket is provisioned **per availability zone**; each store pod is configured with the bucket for its own AZ (resolved from the node's `topology.kubernetes.io/zone` label). A newly-scaled replica is warm immediately; S3 standard GET is paid once per chunk per AZ. Any single Express bucket (or its AZ) becoming unavailable degrades that AZ's replicas to direct S3-standard reads — slower, not down — and leaves other AZs unaffected. The cache tier is toggled by a single helm value (`store.chunkBackend.kind`), and flipping it back to `s3` is instant and lossless.
+
+**Deployment prerequisite:** S3 Express One Zone is available only in specific AZ-IDs (as of 2026-04: `use1-az4/5/6`, `use2-az1/2`, `usw2-az1/3/4`, `aps1-az1/3`, `apne1-az1/4`, `euw1-az1/3`, `eun1-az1/2/3`). EKS subnets must land in supported AZ-IDs — verify via `aws ec2 describe-availability-zones --query 'AvailabilityZones[].[ZoneName,ZoneId]'` (the letter suffix `us-east-1a` is account-randomized; the `use1-azN` ID is physical). A replica scheduled in an AZ without Express runs with `local=None` — degraded to S3-standard-only, functional.
+
+**Considered alternative — FSx for Lustre.** The original ADR-022 draft used one FSx Lustre filesystem per AZ as `local`, mounted via the aws-fsx-csi-driver. Dropped because `ChunkBackend::{get,put}(digest)` on whole 16–256 KiB blobs is an object API — FSx's POSIX surface is unused, while costing a Lustre client kernel module on the NixOS AMI (out-of-tree, kernel-version-pinned), a CSI driver, per-AZ PVC zone-pinning, and a 1.2 TiB ≈ $175/mo/AZ capacity floor. S3 Express reuses the existing `S3ChunkBackend` code path and needs only an `aws_s3_directory_bucket` per AZ. The trade is ~10× per-chunk read latency (~0.5 ms → ~5 ms p50) at L2, behind the per-replica moka L1, on a path that is already batched-parallel and already tolerates S3-standard fallback as "slower, not down"; per-request cost crosses over with FSx storage cost at roughly 4K sustained GET/s.
 
 ## 10. Privilege boundary
 
@@ -242,7 +246,7 @@ composefs's native fs-verity-in-metacopy integrity does **not** apply here. over
 | redirect target `ENOENT` | `open()` → `ENOENT` | only returned for digests outside the declared-input allowlist — correct behavior |
 | chunk integrity mismatch | n/a (userspace) | fetch aborted, `.partial` discarded, build fails infrastructure-error |
 | rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan detaches stale `objects/{build_id}` mounts |
-| FSx cache tier unavailable | n/a | `TieredChunkBackend` falls back to direct S3 reads; metric `rio_store_tiered_local_hit_ratio` drops |
+| Express cache tier unavailable | n/a | `TieredChunkBackend` falls back to direct S3-standard reads; metric `rio_store_tiered_local_hit_ratio` drops |
 | builder pod OOM-kill mid-fill | `staging/<digest>.partial` left with no `flock` holder | mountd reaps the staging dir on UDS close. A retry within the same build finds `.partial` with no lock holder → unlinks → restarts fill. |
 
 r[builder.fs.fetch-circuit]
@@ -270,7 +274,7 @@ r[obs.metric.chunk-backend-tiered]
 | `rio_builder_digest_fuse_fetch_bytes_total` | bytes fetched from rio-store on behalf of digest-FUSE, labeled `{hit}` |
 | `rio_builder_digest_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"open"\|"read"}` |
 | `rio_builder_composefs_encode_seconds` | metadata-image generation time per build |
-| `rio_store_tiered_local_hit_ratio` | FSx hits ÷ total `get()` per replica |
+| `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
 | `rio_store_nar_index_compute_seconds` | `nar_ls` + blake3 pass duration at PutPath |
 | `rio_builder_digest_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
 | `rio_builder_digest_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |
@@ -307,7 +311,7 @@ The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
 | NAR index | `store.index.file-digest` · `store.index.nar-ls-offset` · `store.index.nar-ls-streaming` · `store.index.table-cascade` · `store.index.non-authoritative` · `store.index.sync-on-miss` · `store.index.putpath-eager` · `store.index.putpath-bg-warm` · `store.index.rpc` |
 | Directory DAG | `store.index.dir-digest` · `store.castore.canonical-encoding` · `store.castore.directory-rpc` · `store.castore.blob-read` · `store.castore.gc` · `store.castore.tenant-scope` · `gw.substitute.dag-delta-sync` |
-| Tiered backend | `store.backend.tiered-get-fallback` · `store.backend.tiered-put-remote-first` · `store.backend.fs-put-idempotent` · `infra.fsx.cache-tier` |
+| Tiered backend | `store.backend.tiered-get-fallback` · `store.backend.tiered-put-remote-first` · `infra.express.cache-tier` |
 | Transport | `store.chunk.batched-stream` · `proto.chunk.bytes-zerocopy` · `store.chunk.tonic-tuned` · `builder.fetch.batched-stream` |
 | Platform | `infra.node.kernel-composefs` |
 | Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` |
