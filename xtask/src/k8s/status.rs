@@ -19,11 +19,11 @@ use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
 use tracing::{debug, info};
 
+use crate::helm;
 use crate::k8s::client as k;
 use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::{Provider, ProviderKind};
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
-use crate::{helm, ui};
 
 /// Scheduler metrics container port (scheduler.yaml `name: metrics`).
 /// The Service spec only exposes 9001 (gRPC) — must target the pod.
@@ -175,7 +175,7 @@ pub async fn run(
     let report = gather(&client, ctx, kind).await;
 
     if reap_stuck_nodes {
-        ui::suspend(|| render_human(&report));
+        render_human(&report);
         reap(&client, &report).await?;
         // Re-gather and render the post-reap state.
         let ctx = k::current_context()?;
@@ -185,7 +185,7 @@ pub async fn run(
         if json {
             println!("{}", serde_json::to_string_pretty(&after)?);
         } else {
-            ui::suspend(|| render_human(&after));
+            render_human(&after);
         }
         return Ok(());
     }
@@ -193,7 +193,7 @@ pub async fn run(
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        ui::suspend(|| render_human(&report));
+        render_human(&report);
     }
     if metrics {
         eprintln!();

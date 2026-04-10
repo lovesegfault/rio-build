@@ -53,22 +53,21 @@ pub fn init(level: LevelFilter) {
         .init();
 }
 
-/// No-op passthrough. Kept for callsite compat — previously cleared
-/// the spinner line for raw stdout writes (sh.rs, status.rs, prompts).
+/// No-op passthrough — vestige of the removed span→spinner layer.
+/// Previously cleared the spinner line for raw stdout writes.
 pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// `eprintln!` to stderr. Kept for callsite compat (sh.rs error
-/// dumps, push.rs failures).
+/// `eprintln!` to stderr. Kept so the `clippy::print_stderr` allow
+/// lives in one place instead of at every error-dump callsite.
 #[allow(clippy::print_stderr)]
 pub fn eprint(args: std::fmt::Arguments<'_>) {
     let _ = std::io::stderr().write_fmt(args);
 }
 
-/// Last-line tail / poll progress. Was the spinner message; now a
-/// debug event so `-vv` shows it. Callsites: sh.rs `tail()`,
-/// regen/sqlx.rs, tofu.rs.
+/// Debug-level progress tail. Was the spinner message; now a debug
+/// event so `-vv` shows it.
 pub fn set_message(msg: &str) {
     debug!("{msg}");
 }
@@ -98,8 +97,6 @@ fn cancel_is_no(r: Result<bool, InquireError>) -> Result<bool> {
 }
 
 /// y/N confirm. Gates on TTY (scripts can't accidentally confirm).
-/// "held" naming is callsite compat — caller previously held suspend()
-/// across a show-then-prompt sequence.
 pub fn confirm_held(msg: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Ok(false);

@@ -98,17 +98,15 @@ async fn run_inner(
         // pool and yields, same as the non-verbose tokio::process path
         // below.
         let out = tokio::task::spawn_blocking(move || {
-            ui::suspend(|| {
-                if read_stdout {
-                    std_cmd.stderr(Stdio::inherit()).output()
-                } else {
-                    std_cmd.status().map(|s| std::process::Output {
-                        status: s,
-                        stdout: vec![],
-                        stderr: vec![],
-                    })
-                }
-            })
+            if read_stdout {
+                std_cmd.stderr(Stdio::inherit()).output()
+            } else {
+                std_cmd.status().map(|s| std::process::Output {
+                    status: s,
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            }
         })
         .await??;
         if !out.status.success() {
@@ -156,7 +154,7 @@ async fn run_inner(
 pub fn run_interactive(cmd: xshell::Cmd<'_>) -> Result<()> {
     let argv = cmd.to_string();
     debug!("exec (interactive): {argv}");
-    ui::suspend(|| cmd.quiet().run().map_err(anyhow::Error::from))
+    cmd.quiet().run().map_err(anyhow::Error::from)
 }
 
 /// Blocking variant of [`run`] for sync contexts. Same verbosity
@@ -167,7 +165,7 @@ pub fn run_sync(cmd: xshell::Cmd<'_>) -> Result<()> {
     debug!("exec: {argv}");
 
     if ui::is_verbose() {
-        return ui::suspend(|| cmd.quiet().run().map_err(anyhow::Error::from));
+        return cmd.quiet().run().map_err(anyhow::Error::from);
     }
 
     let out = cmd.quiet().ignore_status().output()?;
