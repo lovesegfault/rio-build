@@ -1,9 +1,9 @@
-# ADR-022 Implementation Plan — composefs-style lazy store + per-AZ FSx chunk cache
+# ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
 **Plan-number range:** P0541–P0578 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
-**Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; FSx is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA.
+**Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
 
 ---
@@ -81,7 +81,7 @@ Core-stack nixosTests consolidated on `adr-022` (commit `15a9db79`); chromium-14
 | ID | User | Journey | Today | After |
 |---|---|---|---|---|
 | **U1** | build submitter | `nix build .#chromium`; closure 200 GB, build reads 5% | builder fetches whole touched store-paths (~per-path JIT, rev 63); warm reads via FUSE passthrough but cold = whole NAR | builder fetches **only the files the build opens**, on-demand, at file granularity; `stat`/`readdir` are kernel-native; warm reads = page-cache, zero crossings; identical files across store paths share one node-SSD copy and one page-cache copy |
-| **U2** | operator | scales `rio-store` 3→12 under load | each replica cold-misses S3 independently; 12× GET cost; 12× moka warm-up | per-AZ FSx cache tier serves all replicas in that AZ; new replica is warm; S3 GET only on first-in-AZ cold miss. Cache-tier-AZ down → cold reads from S3, not outage. |
+| **U2** | operator | scales `rio-store` 3→12 under load | each replica cold-misses S3 independently; 12× GET cost; 12× moka warm-up | per-AZ S3 Express cache tier serves all replicas in that AZ; new replica is warm; S3-standard GET only on first-in-AZ cold miss. Cache-tier-AZ down → cold reads from S3 standard, not outage. |
 | **U3** | operator | something is wrong at 02:00 | unclear which layer | one single-flag rollback for cache tier (`store.chunkBackend.kind=s3`, instant + lossless); builder-side rollback is greenfield `down && up` from known-green commit |
 | **U4** | operator | wants to know if the new path is better | no per-file metrics | grafana: `rio_builder_digest_fuse_open_seconds` p99, `…_fetch_bytes_total{hit=node_ssd|remote}`, `rio_store_tiered_local_hit_ratio` |
 | **U5** | deployment consumer | `nix copy --from rio-store` to a **rio-aware** receiver (rio-store replica, or host running rio-gateway proxy) that already has 95% of the target closure | walks chunk-list per store path; O(all-chunks) `HasChunk` RPCs even for unchanged paths | walks Directory DAG; `HasDirectories([root_digest,…])` short-circuits unchanged subtrees in one batch RPC; fetches only changed files. **Sync bandwidth ∝ change size, not closure size.** Stock-nix clients without `HasDirectories` fall through to P0566's narinfo/NAR binary-cache surface. |
@@ -105,7 +105,7 @@ P0569 spike:composefs   P0541 spike:mount-priv   P0578 spike:passthrough    P054
                                                                                                │
 ┌── Phase 1 (primitives; ≤8-way parallel) ──┐  all dep on P0544                                │
 P0545 proto    P0546 nar_ls    P0572 dir merkle  P0570 DigestResolver   P0548 Tiered    P0549 blob-API  P0550 fetch.rs hoist
-(NarIndex      (rio-nix;       (dir_digest/      (file_digest →         (local FS →     (string-keyed,  (StoreClients →
+(NarIndex      (rio-nix;       (dir_digest/      (file_digest →         (S3 Express →   (string-keyed,  (StoreClients →
  +file_digest   +blake3)        root_digest;      nar coords →           S3 fallback)    narinfo/ ns)    store_fetch.rs)
  +dir_digest)                   directories tbl)  chunk range)                                            │
                                                                                                   ▼
@@ -120,8 +120,8 @@ P0551 migration 033 ◄─────────────┼─────
 P0552 GetNarIndex + indexer_loop  │                   │                                         │
    │                              │                   ▼                                         │
    │                              │   ┌── Phase 3 cache-tier infra (parallel w/ Phase 2) ──┐    │
-   │                              │   P0553 fsx.tf (no DRA) + csi + store-SG/NodeClass          │
-   │                              │      └─► P0554 helm PVC + zone-pin ──► P0555 vm:tiered-cache
+   │                              │   P0553 s3-express.tf (per-AZ directory bucket) + IAM       │
+   │                              │      └─► P0554 helm AZ→bucket map ──► P0555 vm:tiered-cache
    │                              │             ★ FIRST SHIPPED VALUE (U2)
    │                              │             └─► P0566 self-describing S3 (direct write)
    │                              │
@@ -214,7 +214,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 |---|---|
 | `docs/src/decisions/022-lazy-store-fs-erofs-vs-riofs.md` | merge `adr-022` (refocused §2 Design / §3 Alternatives). Carries 13 markers: `r[builder.fs.{composefs-stack, userxattr-mount, stub-isize, metacopy-xattr-shape, fd-handoff-ordering, digest-fuse-open, passthrough-on-hit, passthrough-stack-depth, shared-backing-cache, file-digest-integrity, streaming-open-threshold}]` + `r[builder.mountd.{promote-verified, orphan-scan}]`. |
 | `docs/src/decisions/022-design-overview.md` | merge `adr-022`. Canonical design reference. |
-| `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one FSx-for-Lustre filesystem per AZ** is a disposable read-through cache. `put` = object-store sync + local-FS async; `get` = local-FS → object-store fallback + write-through. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3, not service outage; rollback `kind=s3` is instant + lossless. Carries `r[infra.fsx.cache-tier]`. |
+| `docs/src/decisions/023-tiered-chunk-backend.md` | new — object store (S3 today; GCS-ready via `ObjectStoreBackend` trait) is authoritative for bytes; **one S3 Express One Zone directory bucket per AZ** is a disposable read-through cache. Both tiers are `S3ChunkBackend` instances; `put` = remote sync + local async; `get` = local → remote fallback + write-through. PG `chunk_refs` is single-writer arbiter (single-region). **No DRA.** Forward-compat for cross-region: cache tier is stateless and metadata-agnostic; object-store cross-region replication + a globally-consistent metadata store would suffice, but neither is in scope here. Explicitly states: any single cache-tier-AZ outage = that AZ's replicas cold-read from S3 standard, not service outage; rollback `kind=s3` is instant + lossless. Records FSx-for-Lustre as the considered alternative. Carries `r[infra.express.cache-tier]`. |
 | `docs/src/components/store.md` | append §"NAR index" (incl. `file_digest`) + §"Tiered chunk backend" + §"BlobService" |
 | `docs/src/components/builder.md` | **rewrite** §"FUSE Store" → §"composefs lazy lower" + §"digest-FUSE handler" + §"rio-mountd" (delete pre-ADR-022 whole-path FUSE description) |
 | `docs/src/components/gateway.md` | append `r[gw.substitute.dag-delta-sync]` spec text |
@@ -222,7 +222,7 @@ Each as an independent `subtests=[...]` entry (failures isolate). `# r[verify bu
 | `docs/src/multi-tenancy.md` | append `directory_tenants` / `file_blob_tenants` rows to the tenant-scoping table |
 | `docs/src/deployment.md` | append `r[infra.node.kernel-composefs]` spec text |
 | `docs/src/observability.md` | append metric rows |
-| `.config/tracey/config.styx` | spec `include` += `decisions/023-tiered-chunk-backend.md`, `deployment.md` (so `infra.fsx.cache-tier` and `infra.node.kernel-composefs` are scannable) |
+| `.config/tracey/config.styx` | spec `include` += `decisions/023-tiered-chunk-backend.md`, `deployment.md` (so `infra.express.cache-tier` and `infra.node.kernel-composefs` are scannable) |
 
 **Exit:** `tracey query validate` 0 errors; `.#ci` green.
 
@@ -254,9 +254,9 @@ The `Read+Seek` variant is not implemented — callers that have a `Vec<u8>` wra
 
 **Exit:** `.#ci` green incl. `fuzz-nar_ls`.
 
-### P0548 — TieredChunkBackend (object-store authoritative; local-FS read-through cache)
-**Crate:** `rio-store` · **Deps:** P0544 · **Complexity:** MED
-`rio-store/src/backend/tiered.rs`: `put` = S3 sync then FSx best-effort; `get` = FSx → S3 fallback + write-through. `rio-store/src/backend/fs.rs`: idempotent file-per-chunk under `<root>/ab/<digest>`. `// r[impl store.backend.{tiered-get-fallback,tiered-put-remote-first,fs-put-idempotent}]`. **Exit:** `.#ci` green.
+### P0548 — TieredChunkBackend (object-store authoritative; S3 Express read-through cache)
+**Crate:** `rio-store` · **Deps:** P0544 · **Complexity:** LOW
+`rio-store/src/backend/tiered.rs`: `TieredChunkBackend { local: Option<S3ChunkBackend>, remote: S3ChunkBackend }`. `put` = remote sync then local best-effort; `get` = local → remote fallback + write-through; `local=None` degrades to pass-through. Both tiers are the existing `S3ChunkBackend` — **no `backend/fs.rs`**, no new put-idempotence (S3 PutObject already is). `// r[impl store.backend.{tiered-get-fallback,tiered-put-remote-first}]`. **Exit:** `.#ci` green.
 
 ### P0549 — ChunkBackend blob-API
 **Crate:** `rio-store` · **Deps:** P0544, P0548 · **Complexity:** LOW
@@ -332,26 +332,26 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 
 ## Phase 3 — Cache-tier infra (parallel with Phase 2; depends only P0548)  ★ FIRST SHIPPED VALUE (U2)
 
-### P0553 — terraform: per-AZ FSx cache tier + dedicated store SG/NodeClass + csi-driver
+### P0553 — terraform: per-AZ S3 Express directory bucket + dedicated store SG/NodeClass + IAM
 **Crate:** `infra` · **Deps:** P0548 · **Complexity:** LOW
 
-**One `aws_fsx_lustre_file_system` per AZ** (`for_each = toset(local.azs)`), each in that AZ's private subnet. Store pods mount the FSx for their own AZ via a per-AZ PVC (P0554's zone-pin already routes this). `TieredChunkBackend` is AZ-count-agnostic — each store replica sees exactly one local-FS path; the terraform just provisions N of them.
+**One `aws_s3_directory_bucket` per supported AZ-ID** (`for_each = toset(local.express_az_ids)`). Store pods address the bucket for their own AZ via env (P0554). `TieredChunkBackend` is AZ-count-agnostic — each replica sees exactly one local bucket name (or none); terraform just provisions N of them. **No CSI driver, no PVC, no Lustre kernel module.**
 
 | File | Change |
 |---|---|
-| `infra/eks/fsx.tf` | `resource "aws_fsx_lustre_file_system" "cache" { for_each = toset(local.azs); subnet_ids = [local.private_subnet_by_az[each.key]]; … }` + per-AZ SG. `// r[impl infra.fsx.cache-tier]` |
-| `infra/eks/outputs.tf` | `fsx_dns_by_az` map for helm |
-| aws-fsx-csi-driver helm sub-chart | add |
+| `infra/eks/s3-express.tf` | `resource "aws_s3_directory_bucket" "cache" { for_each = toset(local.express_az_ids); bucket = "rio-chunk-cache--${each.key}--x-s3"; location { name = each.key; type = "AvailabilityZone" } }`; IAM policy `s3express:CreateSession` + `s3express:*` attached to the store IRSA role. `// r[impl infra.express.cache-tier]` |
+| `infra/eks/outputs.tf` | `express_bucket_by_az_id` map for helm |
+| `infra/eks/variables.tf` | `express_az_ids` — intersection of subnet zone-ids with the Express-supported set; empty list → cache tier disabled cluster-wide |
 
-**Exit:** `tofu apply` creates one FSx per AZ + store SG/NodeClass; `.#ci` green.
+**Exit:** `tofu apply` creates one directory bucket per supported AZ + store SG/NodeClass; `.#ci` green.
 
-### P0554 — helm: store PVC + chunkBackend.tiered + zone-pin
-**Crate:** `infra, xtask` · **Deps:** P0548, P0553 · **Complexity:** MED
-Per-AZ PVC bound to that AZ's FSx (via `volumeBindingMode: WaitForFirstConsumer` + `nodeAffinity` zone-pin); `store.chunkBackend.kind={s3|tiered}` helm value, default `s3`. **Exit:** `helm template --set store.chunkBackend.kind=tiered` renders; `.#ci` green. ★ FIRST SHIPPED VALUE (U2)
+### P0554 — helm: chunkBackend.tiered + per-AZ Express bucket env
+**Crate:** `infra, xtask` · **Deps:** P0548, P0553 · **Complexity:** LOW
+`store.chunkBackend.kind={s3|tiered}` helm value (default `s3`); when `tiered`, `store.chunkBackend.expressBucketByAzId` populated from terraform output. Store Deployment exposes node zone via downward-API env from `topology.kubernetes.io/zone`; container resolves zone→zone-id at startup (IMDS `placement/availability-zone-id`) and selects its bucket; no match → `local=None`. `S3ChunkBackend` for `local` uses zonal endpoint `https://s3express-{az_id}.{region}.amazonaws.com`. **Exit:** `helm template --set store.chunkBackend.kind=tiered` renders; `.#ci` green. ★ FIRST SHIPPED VALUE (U2)
 
 ### P0555 — VM test: tiered-backend cache semantics
 **Crate:** `nix` · **Deps:** P0548, P0554 · **Complexity:** MED
-`nix/tests/scenarios/store-tiered.nix`: two store replicas + shared tmpfs "FSx" + minio "S3"; subtests `cold-miss-fallback`, `put-remote-first`, `replica-warm-from-peer-write`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-tiered` green; `.#ci` green.
+`nix/tests/scenarios/store-tiered.nix`: two store replicas + two minio instances (one "local" Express stand-in, one shared "remote" S3-standard); subtests `cold-miss-fallback`, `put-remote-first`, `replica-warm-from-peer-write`, `local-none-passthrough`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-tiered` green; `.#ci` green.
 
 ### P0566 — Self-describing S3 bucket (narinfo + manifest sidecar, direct object-store write)
 **Crate:** `rio-store` · **Deps:** P0549, P0554 · **Complexity:** LOW
@@ -539,7 +539,7 @@ The unprivileged builder cannot (a) loop-mount EROFS (no `FS_USERNS_MOUNT`), (b)
 | `docs/src/runbooks/mountd-crash-loop.md` | symptom: `kube_pod_container_status_restarts_total{container="rio-mountd"}` rising + node's builds `EIO`. Action: `kubectl logs -p`; if persistent, cordon node, drain builders, capture `/var/rio/{cache,staging}` listing. |
 | `docs/src/runbooks/promote-reject-nonzero.md` | symptom: `rio_mountd_promote_reject_total{reason="mismatch"} > 0` — a builder presented bytes that don't hash to the claimed digest (rio-store corruption or compromised builder). Action: identify `build_id` from mountd log; check `rio_store_integrity_fail_total`; if store clean, treat the builder pod as suspect — cordon node, preserve staging dir for forensics. |
 | `docs/src/runbooks/single-node-builds-slow.md` | triage tree: (1) `open_mode_total{mode="passthrough"} == 0` → kernel/init negotiation failed, check `dmesg`; (2) `promote_inflight` pegged → Promote backlog, check `cache_free_bytes`; (3) `mountd_request_seconds{op="backing_open"}` p99 > 1 ms → mountd CPU-starved; (4) else → upstream (`fetch_bytes_total{hit="remote"}` rate vs `rio_store_*`). |
-| `docs/src/runbooks/composefs-cutover.md` | (1) ensure FSx flip done; (2) `xtask k8s eks down && up` from a P0562-green commit (greenfield — `nar_index` populates from scratch via PutPath eager + indexer_loop); (3) `xtask stress chromium`; (4) compare `fetch_bytes_total{hit="remote"}` — expect ≥10× reduction vs whole-NAR baseline on builds that touch <10% of files; expect `objects_cache_hit_ratio` climbing on repeat builds; (5) rollback = `down && up` from pre-P0560 commit |
+| `docs/src/runbooks/composefs-cutover.md` | (1) ensure cache-tier flip done; (2) `xtask k8s eks down && up` from a P0562-green commit (greenfield — `nar_index` populates from scratch via PutPath eager + indexer_loop); (3) `xtask stress chromium`; (4) compare `fetch_bytes_total{hit="remote"}` — expect ≥10× reduction vs whole-NAR baseline on builds that touch <10% of files; expect `objects_cache_hit_ratio` climbing on repeat builds; (5) rollback = `down && up` from pre-P0560 commit |
 
 **Exit:** `.#ci` green.
 
@@ -611,28 +611,28 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":544,"title":"Spec scaffold: ADR-022 §2 + design-overview + ADR-023 (per-AZ tiered) + r[...] markers","deps":[],"crate":"docs","priority":95,"status":"UNIMPL","complexity":"LOW","note":"merges adr-022 (9 builder.fs.* markers); tracey markers MUST precede r[impl]"}
 {"plan":545,"title":"proto: NarIndex (+file_digest) / GetNarIndex","deps":[544],"crate":"rio-proto","priority":90,"status":"UNIMPL","complexity":"LOW","note":"no boot_blob"}
 {"plan":546,"title":"rio-nix streaming nar_ls (Read-only single-pass; offset-tracking + blake3-per-file) + fuzz","deps":[544,545],"crate":"rio-nix","priority":90,"status":"UNIMPL","complexity":"MED","note":"no Seek, bounded memory regardless of NAR size; blake3 streamed once; populates file_digest"}
-{"plan":548,"title":"TieredChunkBackend (S3 authoritative; local-FS read-through cache)","deps":[544],"crate":"rio-store","priority":90,"status":"UNIMPL","complexity":"MED","note":""}
+{"plan":548,"title":"TieredChunkBackend (S3 standard authoritative; S3 Express read-through cache)","deps":[544],"crate":"rio-store","priority":90,"status":"UNIMPL","complexity":"LOW","note":"both tiers are S3ChunkBackend; no backend/fs.rs"}
 {"plan":549,"title":"ChunkBackend blob-API (put_blob/get_blob/delete_blob)","deps":[544,548],"crate":"rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"serialise after 548; used by P0566 narinfo/manifests sidecar only"}
 {"plan":550,"title":"Hoist StoreClients+fetch_chunks_parallel → store_fetch.rs (NOT pure mv)","deps":[544],"crate":"rio-builder","priority":85,"status":"UNIMPL","complexity":"MED","note":"fetch.rs:20,32-33 imports fuser"}
 {"plan":568,"title":"Batched GetChunks server-stream (K_server=256) + prost .bytes() + tonic residuals + obs","deps":[545,550],"crate":"rio-proto,rio-store,rio-builder,infra","priority":85,"status":"UNIMPL","complexity":"MED","note":"spike-validated 96cfd098"}
 {"plan":570,"title":"DigestResolver: file_digest → (nar_hash, nar_offset, size) → chunk-range","deps":[544,545,550],"crate":"rio-builder","priority":85,"status":"UNIMPL","complexity":"LOW","note":"digest-FUSE open path"}
 {"plan":551,"title":"migration 033_nar_index + manifests.nar_indexed bool + queries (no 034)","deps":[545],"crate":"rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"partial-index work-queue WHERE NOT nar_indexed (precedent: 031); PG forbids cross-table predicate"}
 {"plan":552,"title":"GetNarIndex handler + indexer_loop","deps":[545,546,551],"crate":"rio-store","priority":85,"status":"UNIMPL","complexity":"MED","note":"nar_index_sync_max_bytes guard; entries carry file_digest"}
-{"plan":553,"title":"infra/eks/fsx.tf per-AZ cache tier (one FSx per AZ, for_each local.azs; no DRA) + dedicated rio-store SG/NodeClass + csi IRSA","deps":[548],"crate":"infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"per-AZ from day one; TieredChunkBackend is AZ-count-agnostic"}
-{"plan":554,"title":"helm store-pvc + chunkBackend.tiered + zone-pin to FSx AZ","deps":[548,553],"crate":"infra,xtask","priority":80,"status":"UNIMPL","complexity":"MED","note":"FIRST SHIPPED VALUE (U2)"}
+{"plan":553,"title":"infra/eks/s3-express.tf per-AZ directory bucket (for_each express_az_ids) + dedicated rio-store SG/NodeClass + s3express IAM","deps":[548],"crate":"infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"per-AZ from day one; TieredChunkBackend is AZ-count-agnostic; no CSI/PVC/kmod"}
+{"plan":554,"title":"helm chunkBackend.tiered + per-AZ Express bucket env (downward-API zone → IMDS zone-id → bucket)","deps":[548,553],"crate":"infra,xtask","priority":80,"status":"UNIMPL","complexity":"LOW","note":"FIRST SHIPPED VALUE (U2)"}
 {"plan":555,"title":"VM test: tiered-backend cache semantics","deps":[548,554],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"MED","note":""}
 {"plan":566,"title":"Self-describing S3 bucket (narinfo+manifests sidecar)","deps":[549,554],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
 {"plan":559,"title":"composefs/{digest_fuse,circuit}.rs (2-level digest dir; FOPEN_PASSTHROUGH on cache-hit via mountd broker; staging+Promote on miss)","deps":[545,550,567,568,570],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"MED","note":"~500 LoC; prototype spike_digest_fuse.rs; passthrough is steady-state, read-upcall only during P0575 fill window"}
-{"plan":571,"title":"mountd-owned /var/rio/cache LRU sweep + per-build staging + cache-hit metrics","deps":[559,567],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"cache is mountd-owned readonly (HOLE fix); flock orphan detection. FSx cluster-wide cache REJECTED — builder air-gap"}
+{"plan":571,"title":"mountd-owned /var/rio/cache LRU sweep + per-build staging + cache-hit metrics","deps":[559,567],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"LOW","note":"cache is mountd-owned readonly (HOLE fix); flock orphan detection. cluster-wide shared-FS cache REJECTED — builder air-gap"}
 {"plan":575,"title":"streaming open() for files > STREAM_THRESHOLD (during-fill KEEP_CACHE; priority-bump read; Promote on completion)","deps":[559,570,571],"crate":"rio-builder","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~80 LoC; spike 1dad4f3c proves no mode-flip; unit-level exit via tests/stream.rs"}
 {"plan":560,"title":"[ATOMIC] composefs cutover: §A mount+overlay+DELETE old-FUSE (~-4600 LoC) §B fixture kernel + vm:composefs-e2e + spike-regression cherry-pick","deps":[576,556,557,559,567,571,575],"crate":"rio-builder,nix","priority":80,"status":"UNIMPL","complexity":"HIGH","note":"hard cutover; one worktree, one PR, one .#ci gate"}
 {"plan":562,"title":"Post-cutover audit (tracey builder.fuse.* empty; grep clean incl. cachefiles/boot_blob; .#ci re-run)","deps":[560],"crate":"nix","priority":80,"status":"UNIMPL","complexity":"LOW","note":"CUTOVER GATE"}
 {"plan":563,"title":"Metrics: digest-fuse + tiered dashboards + alerts","deps":[544,548,559],"crate":"infra","priority":70,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":564,"title":"helm cleanup + mountd DS wiring + kernel assertion (drop smarter-device-manager entirely)","deps":[554,560,567],"crate":"infra,rio-controller,nix","priority":75,"status":"UNIMPL","complexity":"LOW","note":"builders privileged:false; DELETE device-plugin.yaml + both NodeOverlays + nixos-node/smarter-device-manager; kvm via hostPath CharDevice + nodeSelector + extra-sandbox-paths (vm-kvm-hostpath-spike PASS)"}
-{"plan":565,"title":"Cutover runbooks (FSx, composefs)","deps":[555,562,564],"crate":"docs","priority":65,"status":"UNIMPL","complexity":"LOW","note":""}
+{"plan":565,"title":"Cutover runbooks (cache-tier, composefs)","deps":[555,562,564],"crate":"docs","priority":65,"status":"UNIMPL","complexity":"LOW","note":""}
 {"plan":572,"title":"Directory merkle layer: dir_digest/root_digest in NarIndex + directories+file_blobs tables + bottom-up compute in nar_ls","deps":[545,546,551],"crate":"rio-proto,rio-nix,rio-store","priority":85,"status":"UNIMPL","complexity":"LOW","note":"U5 foundation; zero serving-path cost; snix castore.proto vendored (MIT); pin canonical encoding (snix #111)"}
 {"plan":573,"title":"DirectoryService RPC: GetDirectory / HasDirectories / HasBlobs (batch bitmap; I-110 lesson)","deps":[572],"crate":"rio-proto,rio-store","priority":80,"status":"UNIMPL","complexity":"MED","note":"snix-wire-compatible where overlapping"}
 {"plan":577,"title":"BlobService.Read(file_digest) server-stream (snix-compatible; file_blobs→chunk-range→GetChunks slice)","deps":[573],"crate":"rio-proto,rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"~40 LoC; completes castore surface"}
@@ -645,7 +645,6 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 
 | Marker | Spec file (P0544) | `r[impl]` (plan) | `r[verify]` site (plan) |
 |---|---|---|---|
-| `store.backend.fs-put-idempotent` | components/store.md | chunk.rs `put()` (P0548) | vm-store-tiered (P0555) |
 | `store.backend.tiered-get-fallback` | components/store.md | tiered.rs `get()` (P0548) | vm-store-tiered `cold-miss-fallback` (P0555) |
 | `store.backend.tiered-put-remote-first` | components/store.md | tiered.rs `put()` (P0548) | vm-store-tiered `put-remote-first` (P0555) |
 | `store.index.nar-ls-offset` | components/store.md | rio-nix/nar.rs (P0546) | proptest in nar.rs (P0546) |
@@ -697,10 +696,10 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `store.chunk.batched-stream` | components/store.md | rio-store/grpc/chunk.rs (P0568) | live A/B dashboard (P0568) |
 | `store.chunk.tonic-tuned` | components/store.md | rio-store/main.rs (P0568) | (config-only) |
 | `builder.fetch.batched-stream` | components/builder.md | rio-builder/store_fetch.rs (P0568) | live A/B dashboard (P0568) |
-| `infra.fsx.cache-tier` | decisions/023 | infra/eks/fsx.tf (P0553) | (live-only — runbook P0565) |
+| `infra.express.cache-tier` | decisions/023 | infra/eks/s3-express.tf (P0553) | (live-only — runbook P0565) |
 | `infra.node.kernel-composefs` | deployment.md | nix/nixos-node/kernel.nix (prereq) | nix/checks.nix node-kernel-config (prereq) |
 
-54 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse'` → empty.
+53 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse'` → empty.
 `config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/composefs/resolver.rs` are in scope (or adds them).
 
 ---
@@ -757,7 +756,7 @@ nix build .#checks.x86_64-linux.vm-spike-composefs-priv  # P0541
 nix develop -c cargo xtask measure v4-v11-v12 --closure chromium
 
 # Phase 3 cache-tier flip (FIRST SHIPPED VALUE)
-nix develop -c cargo xtask k8s -p eks tofu apply -target=aws_fsx_lustre_file_system.chunks
+nix develop -c cargo xtask k8s -p eks tofu apply -target=aws_s3_directory_bucket.cache
 nix develop -c cargo xtask k8s -p eks down && nix develop -c cargo xtask k8s -p eks up
 nix develop -c cargo xtask k8s -p eks grafana   # watch tiered_local_hit_ratio climb
 
