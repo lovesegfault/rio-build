@@ -6,6 +6,7 @@
 
 use super::*;
 use rio_common::config::ValidateConfig as _;
+use rstest::rstest;
 
 #[test]
 fn config_defaults_are_stable() {
@@ -165,63 +166,57 @@ fn test_valid_config() -> Config {
 }
 
 // r[verify sched.retry.per-executor-budget]
-/// Negative `jitter_fraction` → `random_range(-jf..=jf)` with low >
-/// high → rand panic on the FIRST retry (not at config load — hours
-/// later, inside a worker-retry codepath). validate_config catches
-/// it at startup instead.
-#[test]
-fn config_rejects_negative_jitter() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            jitter_fraction: -0.1,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
+/// Each case mutates one field of a known-valid `test_valid_config()`
+/// and asserts `validate()` fails with an error mentioning every
+/// `expected` substring (field name + bad value, so the operator can
+/// diagnose). An empty `expected` slice asserts only that `validate()`
+/// errs (NaN cases — `Display` of NaN is platform-variant).
+///
+/// Per-case comments capture WHY the misconfig is dangerous: most are
+/// silent runtime behaviors (zero backoff, no-op bump), not crashes —
+/// see P0409.
+#[rstest]
+// jitter_fraction < 0 → rand panic on first retry (random_range low>high).
+#[case::negative_jitter(|c: &mut Config| c.retry.jitter_fraction = -0.1, &["jitter_fraction", "-0.1"])]
+// jitter_fraction > 1 → negative backoff → ZERO → retry-thrash, no crash/log.
+#[case::jitter_above_one(|c: &mut Config| c.retry.jitter_fraction = 1.5, &["jitter_fraction", "1.5"])]
+// threshold=0 → is_poisoned() vacuously true → every drv poisons pre-dispatch.
+#[case::zero_poison_threshold(|c: &mut Config| c.poison.threshold = 0, &["poison.threshold", "0"])]
+// backoff_base < 0 → silently zero via .max(0.0) → retry-thrash.
+#[case::negative_backoff_base(|c: &mut Config| c.retry.backoff_base_secs = -5.0, &["backoff_base_secs", "-5"])]
+#[case::nan_backoff_base(|c: &mut Config| c.retry.backoff_base_secs = f64::NAN, &[])]
+// multiplier < 1.0 → shrinking backoff (attempt 2 waits LESS than 1).
+#[case::sub_one_multiplier(|c: &mut Config| c.retry.backoff_multiplier = 0.5, &["backoff_multiplier", ">= 1.0"])]
+#[case::nan_multiplier(|c: &mut Config| c.retry.backoff_multiplier = f64::NAN, &[])]
+// max < base → every backoff clamps to max, defeating the exponential.
+#[case::max_below_base(
+    |c: &mut Config| { c.retry.backoff_base_secs = 10.0; c.retry.backoff_max_secs = 5.0; },
+    &["backoff_max_secs", ">= backoff_base_secs"]
+)]
+// cpu_limit NaN → `c > NaN` always false → CPU-bump silently disabled (P0424).
+#[case::nan_cpu_limit_cores(
+    |c: &mut Config| c.size_classes = size_classes_with_cpu_limit(Some(f64::NAN)),
+    &["cpu_limit_cores", "finite"]
+)]
+// headroom 0.0 floors all estimates to minimum bucket.
+#[case::zero_headroom_multiplier(
+    |c: &mut Config| c.headroom_multiplier = 0.0,
+    &["headroom_multiplier must be finite and positive"]
+)]
+#[case::nan_headroom_multiplier(
+    |c: &mut Config| c.headroom_multiplier = f64::NAN,
+    &["headroom_multiplier must be finite and positive"]
+)]
+fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
+    let mut cfg = test_valid_config();
+    mutate(&mut cfg);
     let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("jitter_fraction"), "{err}");
-    assert!(
-        err.contains("-0.1"),
-        "error must echo the bad value for operator diagnosis: {err}"
-    );
-}
-
-/// `jitter_fraction > 1` → `clamped * (1 - 1.5)` = `clamped * -0.5`
-/// → negative → silently clamped to `Duration::ZERO` at
-/// `RetryPolicy::backoff_duration`. Retries become thrashing (zero backoff), not
-/// backoff. No crash, no log — the kind of misconfig that costs a
-/// week to diagnose from "scheduler hammers the store on every
-/// failure". validate_config rejects it.
-#[test]
-fn config_rejects_jitter_above_one() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            jitter_fraction: 1.5,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("jitter_fraction"), "{err}");
-    assert!(err.contains("1.5"), "{err}");
-}
-
-/// `poison.threshold = 0` → `is_poisoned()`'s `count >= 0` is
-/// vacuously true at DAG-merge time → every derivation poisons
-/// before dispatch. Cluster does nothing, no error, just poisoned
-/// rows everywhere. validate_config rejects it.
-#[test]
-fn config_rejects_zero_poison_threshold() {
-    let cfg = Config {
-        poison: rio_scheduler::PoisonConfig {
-            threshold: 0,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("poison.threshold"), "{err}");
-    assert!(err.contains("0"), "{err}");
+    for substr in expected {
+        assert!(
+            err.contains(substr),
+            "error must mention {substr:?} for operator diagnosis: {err}"
+        );
+    }
 }
 
 // r[verify sched.sizing.soft-feature-floor]
@@ -306,83 +301,6 @@ fn config_accepts_boundary_values() {
         .expect("default config should be valid");
 }
 
-// r[verify sched.retry.per-executor-budget]
-/// Negative backoff_base_secs → silently zero backoff via the
-/// `.max(0.0)` in `RetryPolicy::backoff_duration`. Same thrash-mode as jitter>1
-/// but via a different field — both guarded at config-load.
-#[test]
-fn config_rejects_negative_backoff_base() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            backoff_base_secs: -5.0,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("backoff_base_secs"), "{err}");
-    assert!(err.contains("-5"), "{err}");
-}
-
-#[test]
-fn config_rejects_nan_backoff_base() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            backoff_base_secs: f64::NAN,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    assert!(cfg.validate().is_err());
-}
-
-/// Multiplier < 1.0 → shrinking backoff (attempt=2 waits LESS than
-/// attempt=1). The math works — it's just operator-error.
-#[test]
-fn config_rejects_sub_one_multiplier() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            backoff_multiplier: 0.5,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("backoff_multiplier"), "{err}");
-    assert!(err.contains(">= 1.0"), "{err}");
-}
-
-#[test]
-fn config_rejects_nan_multiplier() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            backoff_multiplier: f64::NAN,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    assert!(cfg.validate().is_err());
-}
-
-/// max_secs < base_secs is contradictory (the "max" is below the
-/// "base" — every backoff clamps to max, which defeats the
-/// exponential). Catch at config-load with a clear message citing
-/// both values.
-#[test]
-fn config_rejects_max_below_base() {
-    let cfg = Config {
-        retry: rio_scheduler::RetryPolicy {
-            backoff_base_secs: 10.0,
-            backoff_max_secs: 5.0,
-            ..Default::default()
-        },
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("backoff_max_secs"), "{err}");
-    assert!(err.contains(">= backoff_base_secs"), "{err}");
-}
-
 /// Boundary: multiplier=1.0 (constant backoff), base=max (no growth
 /// room — every attempt waits base_secs). Both valid edge cases.
 #[test]
@@ -424,52 +342,6 @@ fn size_classes_with_cpu_limit(limit: Option<f64>) -> Vec<rio_scheduler::SizeCla
         mem_limit_bytes: 1 << 30,
         cpu_limit_cores: limit,
     }]
-}
-
-/// `cpu_limit_cores = Some(NaN)` → `c > NaN` at assignment.rs:128 is
-/// always false → CPU-bump silently disabled, builds never bump even
-/// when CPU-bound. validate_config catches it at startup (bughunt-mc238,
-/// P0424 — missed by the P0415 f64-bounds wave).
-#[test]
-fn config_rejects_nan_cpu_limit_cores() {
-    let cfg = Config {
-        size_classes: size_classes_with_cpu_limit(Some(f64::NAN)),
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("cpu_limit_cores") && err.contains("finite"),
-        "NaN cpu_limit must be rejected with clear message, got: {err}"
-    );
-}
-
-/// `cpu_limit_cores = Some(-1.0)` → `c > -1.0` at assignment.rs:128 is
-/// always true → every build bumps to next class, misroutes entire
-/// small-class queue.
-#[test]
-fn config_rejects_zero_headroom_multiplier() {
-    let cfg = Config {
-        headroom_multiplier: 0.0,
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("headroom_multiplier must be finite and positive"),
-        "0.0 headroom floors all estimates to minimum bucket, got: {err}"
-    );
-}
-
-#[test]
-fn config_rejects_nan_headroom_multiplier() {
-    let cfg = Config {
-        headroom_multiplier: f64::NAN,
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("headroom_multiplier must be finite and positive"),
-        "NaN headroom silently floors all estimates, got: {err}"
-    );
 }
 
 #[test]
