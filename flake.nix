@@ -362,11 +362,6 @@
           rio-workspace-cov = crateBuildCov.workspaceBinsCov;
           rio-crates-cov = crateBuildCov.memberBinsCov;
 
-          # Source tree for genhtml (nix/coverage.nix cd's here so
-          # genhtml can resolve repo-relative lcov paths to source
-          # lines). workspaceSrc has all rio-*/src/.
-          commonSrc = workspaceSrc;
-
           # --------------------------------------------------------------
           # Fuzz build pipeline (extracted to nix/fuzz.nix)
           # --------------------------------------------------------------
@@ -843,19 +838,21 @@
           # stripPrefix: buildRustCrate's --remap-path-prefix maps
           # sandbox → `/`, so profraws reference `/rio-store/src/...`.
           # Strip the leading slash to get repo-relative paths that
-          # genhtml can resolve against commonSrc.
+          # genhtml can resolve against workspaceSrc.
           #
           # Coverage mode uses workspaceBinsCov (not workspaceBins) —
           # same closure-scrub but skips strip so the __llvm_covfun /
           # __llvm_covmap sections llvm-cov needs stay intact.
           coverage = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             import ./nix/coverage.nix {
+              # workspaceSrc is the genhtml source root — coverage.nix
+              # cd's there so repo-relative lcov paths resolve.
               inherit
                 pkgs
                 rustStable
                 rio-workspace-cov
                 vmTestsCov
-                commonSrc
+                workspaceSrc
                 ;
               unitCoverage = crateChecks.coverage;
             }
@@ -1708,7 +1705,7 @@
             # crateChecks.coverage already emits repo-relative paths
             # (`rio-*/src/...`) — no strip needed, just genhtml.
             coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
-              cd ${commonSrc}
+              cd ${workspaceSrc}
               ${pkgs.lcov}/bin/genhtml ${crateChecks.coverage}/lcov.info \
                 --output-directory $out
             '';

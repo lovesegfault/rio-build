@@ -24,24 +24,26 @@
   rustStable,
   rio-workspace-cov,
   vmTestsCov,
-  commonSrc,
+  workspaceSrc,
   unitCoverage,
+}:
+let
+  inherit (pkgs) lib;
+
   # Source-path normalization pattern. buildRustCrate's
   # --remap-path-prefix maps the sandbox build dir to `/`, so
   # profraws reference `/rio-common/src/lib.rs`. Strip the leading
   # slash to get repo-relative paths genhtml can resolve.
-  stripPrefix ? "s|^/||",
+  stripPrefix = "s|^/||";
+
   # --ignore-filename-regex for llvm-cov export on VM-test profraws.
   # Dep paths like `/tokio-1.50.0/...` get filtered by the final
   # `lcov --extract 'rio-*'` step; this regex catches common build
   # artifacts that --extract misses. `target/.*build` covers
   # crate2nix's target/build/ (buildRustCrate puts generated proto
   # code at target/build/<crate>.out/, genhtml can't resolve it
-  # against commonSrc).
-  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build",
-}:
-let
-  inherit (pkgs) lib;
+  # against workspaceSrc).
+  ignoreRegex = "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build";
 
   # Toolchain llvm tools. rustStable is the rust-bin derivation;
   # its lib/rustlib/<target>/bin/ has llvm-profdata + llvm-cov
@@ -95,7 +97,7 @@ let
       # These warnings are expected (shared libs between binaries);
       # stderr of lcov step shows any real issues.
       # target/release/build/: generated proto code (tonic-prost-build
-      # output). Source doesn't exist in commonSrc (build artifact),
+      # output). Source doesn't exist in workspaceSrc (build artifact),
       # so genhtml would fail. These are wrapper code, not ours —
       # the real coverage signal is in rio-*/src/.
       ${sysroot}/llvm-cov export \
@@ -220,9 +222,9 @@ in
         lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $TMPDIR/extracted.lcov
         # --remove filters out generated build artifacts that
         # --extract let through (rio-proto/target/build/... matches
-        # 'rio-*' but the generated .rs doesn't exist in commonSrc).
+        # 'rio-*' but the generated .rs doesn't exist in workspaceSrc).
         # crate2nix puts tonic-prost-build output at target/build/;
-        # genhtml can't resolve it against commonSrc. unused: don't
+        # genhtml can't resolve it against workspaceSrc. unused: don't
         # error if pattern
         # doesn't match (clean unit-only runs may not have these).
         lcov --ignore-errors unused \
@@ -232,7 +234,7 @@ in
         # for the source view. --ignore-errors source: safety net
         # for any remaining build-time-generated paths that slip
         # through the regex (genhtml synthesizes a placeholder).
-        cd ${commonSrc}
+        cd ${workspaceSrc}
         genhtml $out/lcov.info --output-directory $out/html \
           --ignore-errors source --synthesize-missing
 
