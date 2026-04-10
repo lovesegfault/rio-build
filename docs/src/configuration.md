@@ -42,6 +42,10 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token verification on PutPath. Env: `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification (dev mode). |
+| `binary_cache_compat.enabled` | bool | `true` | Dual-write stock-Nix `.narinfo` + compressed NAR to S3-standard on every PutPath. ON = bucket is a self-sufficient `nix copy --from s3://…` substituter (migration on-ramp + PG-outage DR). OFF ("pure rio mode") = ~2× less S3 storage; PG required for any substitution. |
+| `binary_cache_compat.bucket` | string | (`chunk_backend.s3.bucket`) | Target bucket for compat objects. Defaults to the chunk bucket (narinfo at root, `nar/` prefix coexisting with `chunks/`). |
+| `binary_cache_compat.compression` | enum | `zstd` | `zstd` \| `xz` \| `none`. NAR compression for the compat write. |
+| `binary_cache_compat.write_mode` | enum | `sync-after-commit` | `sync-after-commit` only. `async` (background queue) is reserved. |
 
 `chunk_backend` TOML syntax (tagged enum):
 
@@ -54,6 +58,16 @@ chunk_backend = { kind = "filesystem", base_dir = "/var/rio/chunks" }
 
 # S3 (credentials from aws-sdk default chain — env vars, IRSA, instance profile)
 chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
+```
+
+`binary_cache_compat` TOML syntax:
+
+```toml
+[store.binary_cache_compat]
+enabled = true
+# bucket = "rio-chunks"       # defaults to chunk_backend.s3.bucket
+compression = "zstd"
+write_mode = "sync-after-commit"
 ```
 
 > **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).

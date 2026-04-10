@@ -10,7 +10,7 @@ Each rio-builder presents `/nix/store` to the build sandbox as a three-layer rea
 
 This replaces the previous whole-path-granularity FUSE store (`rio-builder/src/fuse/`) with file-granularity lazy fetch, kernel-native metadata operations, and structural cross-path deduplication.
 
-On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, mode, file_digest}` computed at PutPath time), the **Directory merkle layer** (`dir_digest`/`root_digest` over the same index), and a **tiered chunk backend** (per-AZ S3 Express One Zone cache in front of S3 standard).
+On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, mode, file_digest}` computed at PutPath time), the **Directory merkle layer** (`dir_digest`/`root_digest` over the same index), a **tiered chunk backend** (per-AZ S3 Express One Zone cache in front of S3 standard), and a runtime-configurable **S3 binary-cache compatibility layer** (stock-Nix `.narinfo` + compressed NAR dual-written to S3-standard so the bucket substitutes without rio running).
 
 ## 2. Properties
 
@@ -25,6 +25,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 | **Declared-input enforcement** | The digest-FUSE handler answers `lookup()` only for digests in the build's declared input closure; everything else is `ENOENT`. The build cannot read store paths it did not declare. |
 | **Delta-sync distribution** | `nix copy --from rio-store` and inter-region replication walk a Directory merkle DAG. Unchanged subtrees are skipped in one batch RPC; bandwidth scales with change size, not closure size. |
 | **Per-AZ chunk cache** | All rio-store replicas in an availability zone share an S3 Express One Zone directory bucket as a read-through cache. A new replica starts warm; S3 standard GET cost is once per chunk per AZ, not once per replica. |
+| **S3 self-sufficient (configurable)** | When `binary_cache_compat` is enabled, every `PutPath` additionally writes a stock-Nix `.narinfo` and compressed NAR to S3-standard. `nix copy --from s3://bucket` works with no rio process running; PostgreSQL becomes a performance tier, not a correctness tier. Disabled ("pure rio mode") halves S3 storage at the cost of PG being load-bearing for any substitution. |
 
 ## 3. Architecture
 
@@ -203,7 +204,40 @@ One directory bucket is provisioned **per availability zone**; each store pod is
 
 **Considered alternative — FSx for Lustre.** The original ADR-022 draft used one FSx Lustre filesystem per AZ as `local`, mounted via the aws-fsx-csi-driver. Dropped because `ChunkBackend::{get,put}(digest)` on whole 16–256 KiB blobs is an object API — FSx's POSIX surface is unused, while costing a Lustre client kernel module on the NixOS AMI (out-of-tree, kernel-version-pinned), a CSI driver, per-AZ PVC zone-pinning, and a 1.2 TiB ≈ $175/mo/AZ capacity floor. S3 Express reuses the existing `S3ChunkBackend` code path and needs only an `aws_s3_directory_bucket` per AZ. The trade is ~10× per-chunk read latency (~0.5 ms → ~5 ms p50) at L2, behind the per-replica moka L1, on a path that is already batched-parallel and already tolerates S3-standard fallback as "slower, not down"; per-request cost crosses over with FSx storage cost at roughly 4K sustained GET/s.
 
-## 10. Privilege boundary
+## 10. Storage tiers and the binary-cache compatibility layer
+
+Four tiers, by role:
+
+| Tier | Holds | Loss means |
+|---|---|---|
+| **S3 standard** (regional) | chunks (always); `{hash}.narinfo` + `nar/{filehash}.nar.zst` (when `binary_cache_compat` enabled) | unrecoverable data loss — this is the source of truth |
+| **S3 Express One Zone** (per-AZ) | chunk read-through cache | that AZ's replicas cold-read from S3 standard; nothing lost (§9) |
+| **PostgreSQL** (single-region) | narinfo, manifests, refcounts, `inline_blob`, `nar_index`, `directories`/`file_blobs`, scheduler state | with compat **enabled**: stock-Nix substitution from S3 still works; rio's gRPC surface, dedup, CA-cutoff, and `inline_blob` fast-path are down. With compat **disabled**: nothing substitutes. PG is rebuildable-in-principle from S3 when compat is enabled (every narinfo+NAR is there). |
+| **moka** (per-replica, in-memory) | hottest chunks + singleflight coalescing | one replica cold-reads its L2; nothing lost |
+
+r[store.compat.runtime-toggle]
+
+The binary-cache compatibility layer is a **runtime** config value (`store.binary_cache_compat.enabled`), not a build flag. Toggling it OFF stops new compat writes but leaves existing `.narinfo`/`nar/*.nar.zst` objects in place; toggling ON resumes for subsequent `PutPath` calls (a reconciler backfills the gap — see the implementation plan). Default is **ON** for the migration phase; operators flip to OFF once all consumers are rio-aware to reclaim ~2× S3 storage.
+
+r[store.compat.nar-on-put]
+
+When enabled, `PutPath` writes the NAR — zstd-compressed by default — to S3-standard at `nar/{FileHash}.nar.zst`, where `FileHash = sha256(compressed bytes)`. The bytes are reassembled from chunks immediately post-commit (chunks were just written and are moka-hot); inline-stored NARs are read directly from the just-committed `inline_blob` row.
+
+r[store.compat.narinfo-on-put]
+
+When enabled, `PutPath` writes a stock-Nix-format `.narinfo` to S3-standard at `{StorePathHash}.narinfo`. Unlike the HTTP server's on-the-fly narinfo (which omits `FileHash`/`FileSize`), the compat-written narinfo includes them — the compressed artifact exists, so the fields are computable. Signatures are the same ones stored in PG (signed at `PutPath` time over the standard fingerprint).
+
+r[store.compat.write-after-commit]
+
+Compat writes happen **after** the PostgreSQL transaction commits, **synchronously** within the `PutPath` handler. A crash between PG-commit and compat-write leaves a PG row with no S3 narinfo — recoverable (the reconciler re-emits from chunks). A compat-write failure is logged and metered but does **not** roll back the PG commit or fail the `PutPath` RPC: the path is durably stored and rio-servable; only the stock-Nix fallback is missing for that one path. `write_mode = "async"` (background queue, lower `PutPath` latency, larger reconciler backlog on crash) is a documented future option, not implemented in the first pass.
+
+r[store.compat.stock-nix-substitute]
+
+With compat enabled and at least one `nix-cache-info` object present at the bucket root, the S3-standard bucket is a valid `nix copy --from s3://bucket?region=…` substituter with no rio process running. This is the migration on-ramp (existing Nix infrastructure reads the bucket directly while rio is rolled out) and the disaster-recovery floor (PG outage degrades to the slower stock-Nix path instead of a total outage).
+
+**`inline_blob` durability note.** With compat enabled, every inline-stored NAR's bytes are also durably in S3 (inside the compressed NAR object). `inline_blob` becomes a pure read-latency optimization for tiny paths — its original durability rationale ("PG holds the only copy of small NARs") no longer applies. Dropping the inline path entirely is a possible future simplification (one code path, no PG byte-serving load); not in scope here.
+
+## 11. Privilege boundary
 
 r[builder.mountd.erofs-handoff]
 r[builder.fs.fd-handoff-ordering]
@@ -225,7 +259,7 @@ The builder pod runs unprivileged with no device mounts. EROFS lacks `FS_USERNS_
 
 `rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
 
-## 11. Integrity
+## 12. Integrity
 
 r[builder.fs.file-digest-integrity]
 
@@ -237,7 +271,7 @@ Per-file integrity is enforced in the digest-FUSE handler, not by the kernel:
 
 composefs's native fs-verity-in-metacopy integrity does **not** apply here. overlayfs validates it via the in-kernel `fsverity_get_digest()` API, which reads `inode->i_verity_info`; FUSE's fs-verity support (kernel ≥6.10, [`9fe2a036`](https://git.kernel.org/linus/9fe2a036a23ceeac402c4fde8ec37c02ab25f133)) is ioctl-forwarding only and never populates that — overlayfs sees no measurement on a FUSE lower. A daemon-supplied measurement would in any case be no stronger than the daemon-side blake3 above. The threat model is unchanged from the pre-ADR-022 FUSE store: the builder is the FUSE server and is already trusted not to corrupt its own build. The path to genuine kernel-side verification is making the data-only lower a real ext4/xfs hostPath with fs-verity enabled on materialized files — see the implementation plan's deferred list.
 
-## 12. Failure modes
+## 13. Failure modes
 
 | Failure | Kernel/stack behavior | rio handling |
 |---|---|---|
@@ -247,13 +281,15 @@ composefs's native fs-verity-in-metacopy integrity does **not** apply here. over
 | chunk integrity mismatch | n/a (userspace) | fetch aborted, `.partial` discarded, build fails infrastructure-error |
 | rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan detaches stale `objects/{build_id}` mounts |
 | Express cache tier unavailable | n/a | `TieredChunkBackend` falls back to direct S3-standard reads; metric `rio_store_tiered_local_hit_ratio` drops |
+| PostgreSQL unavailable | n/a | rio-store gRPC + HTTP surfaces fail (no manifests, no narinfo). With `binary_cache_compat` enabled, clients substitute directly from `s3://bucket` (stock-Nix path); with it disabled, nothing substitutes until PG recovers. |
+| compat S3 write fails post-commit | n/a | `PutPath` succeeds; `rio_store_compat_write_failures_total` increments; reconciler picks the path up on its next sweep |
 | builder pod OOM-kill mid-fill | `staging/<digest>.partial` left with no `flock` holder | mountd reaps the staging dir on UDS close. A retry within the same build finds `.partial` with no lock holder → unlinks → restarts fill. |
 
 r[builder.fs.fetch-circuit]
 
 A circuit breaker on the digest-FUSE fetch path trips on sustained rio-store unreachability and fails the build fast rather than letting every `open()` time out individually.
 
-## 13. Encoder
+## 14. Encoder
 
 r[builder.fs.composefs-encode]
 r[builder.fs.stub-isize]
@@ -263,10 +299,11 @@ The EROFS metadata image is produced in-process by [`libcomposefs`](https://gith
 
 No staging directory, no subprocess. The image is regenerable and need not be persisted; builders may cache it on node SSD keyed by closure hash.
 
-## 14. Observability
+## 15. Observability
 
 r[obs.metric.digest-fuse]
 r[obs.metric.chunk-backend-tiered]
+r[obs.metric.compat]
 
 | Metric | Meaning |
 |---|---|
@@ -275,6 +312,8 @@ r[obs.metric.chunk-backend-tiered]
 | `rio_builder_digest_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"open"\|"read"}` |
 | `rio_builder_composefs_encode_seconds` | metadata-image generation time per build |
 | `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
+| `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"err"}` |
+| `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
 | `rio_store_nar_index_compute_seconds` | `nar_ls` + blake3 pass duration at PutPath |
 | `rio_builder_digest_fuse_open_mode_total` | per-`open()` reply, labeled `{mode="passthrough"\|"keep_cache"}` — passthrough-not-negotiated visible as `passthrough`=0 |
 | `rio_builder_digest_fuse_open_case_total` | per-`open()` decision, labeled `{case="hit"\|"miss_small"\|"miss_stream"\|"wait_fetching"}` |
@@ -287,7 +326,7 @@ r[obs.metric.chunk-backend-tiered]
 
 The mount stack's hot path is page cache + overlayfs + EROFS; kernel-side latency is observable via the upstream `tracepoint:{erofs,overlayfs,fuse}:*` events without rio-specific instrumentation.
 
-## 15. Platform requirements
+## 16. Platform requirements
 
 r[infra.node.kernel-composefs]
 
@@ -298,7 +337,7 @@ r[infra.node.kernel-composefs]
 - Nix-patched `pkgs.composefs` providing `libcomposefs.so` (`nix/patches/libcomposefs-user-xattr.patch`); `bindgen` + `clang` at build time for the `-sys` crate.
 - `/dev/fuse` reachable by `rio-mountd` (host device); **not** mounted into builder pods.
 
-## 16. Normative requirements index
+## 17. Normative requirements index
 
 The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` lists them.
 
@@ -314,5 +353,5 @@ The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-
 | Tiered backend | `store.backend.tiered-get-fallback` · `store.backend.tiered-put-remote-first` · `infra.express.cache-tier` |
 | Transport | `store.chunk.batched-stream` · `proto.chunk.bytes-zerocopy` · `store.chunk.tonic-tuned` · `builder.fetch.batched-stream` |
 | Platform | `infra.node.kernel-composefs` |
-| Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` |
-| Self-describing bucket | `store.s3.self-describing` |
+| Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.compat` |
+| Binary-cache compat | `store.compat.runtime-toggle` · `store.compat.nar-on-put` · `store.compat.narinfo-on-put` · `store.compat.write-after-commit` · `store.compat.stock-nix-substitute` · `store.compat.gc-coupled` |

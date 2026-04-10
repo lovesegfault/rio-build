@@ -22,7 +22,7 @@ The S3 client MUST be configured with `RIO_S3_MAX_ATTEMPTS` (default 10) retry a
 r[store.inline.threshold]
 NARs below 256KB (`INLINE_THRESHOLD`, a compile-time constant) are stored directly in the `manifests.inline_blob` PostgreSQL `BYTEA` column, bypassing FastCDC chunking, S3, and manifest indirection entirely. This eliminates per-item overhead for the thousands of tiny `.drv` files found in nixpkgs closures.
 
-Inline blobs never touch S3 — they live entirely in PostgreSQL. The inline/chunked decision is made at `PutPath` time based on NAR size; see the "Inline vs. chunked invariant" in the schema section below.
+Inline blobs never touch the chunk backend — they live in PostgreSQL. The inline/chunked decision is made at `PutPath` time based on NAR size; see the "Inline vs. chunked invariant" in the schema section below. When the [binary-cache compatibility layer](#binary-cache-compatibility-layer) is enabled, inline NAR bytes are *also* durably in S3 inside the compressed `nar/*.nar.zst` object, so `inline_blob` is a read-latency optimization only (its durability role is gone). Dropping the inline path entirely is a possible future simplification — one code path, no PG byte-serving load — out of scope for ADR-022.
 
 ## Layer 2: Nix Metadata Store
 
@@ -70,6 +70,28 @@ Each manifest is stored as a single PostgreSQL row with a `bytea` column contain
 
 r[store.backend.filesystem]
 For dev/single-node deployments, `FilesystemChunkBackend` stores chunks on local disk under `{base_dir}/chunks/{aa}/{full-blake3-hex}` --- the same two-hex-prefix fanout as the S3 key schema (so switching backends doesn't surprise operators, and per-directory file counts stay bounded). All 256 `{aa}/` subdirs are pre-created at construction (~256 mkdir calls, ~1ms) so `put()` never check-then-mkdirs on the hot path. Writes are crash-safe via temp + `fsync` + `rename` + parent-dir-`fsync`: a crash between `put()` returning and `complete_manifest()` committing must not leave the manifest claiming a chunk that's zero-length or absent. The temp file goes in the same `{aa}/` subdir (rename atomicity needs same filesystem) with a random suffix so concurrent puts of the same content-addressed chunk don't race on the same temp name.
+
+## Binary-Cache Compatibility Layer
+
+r[store.compat.runtime-toggle]
+The compatibility layer is gated by the runtime config `store.binary_cache_compat.enabled` (default `true` for the migration phase). Toggling OFF stops new compat writes but leaves existing S3 objects in place; toggling ON resumes for subsequent `PutPath` calls.
+
+r[store.compat.nar-on-put]
+When enabled, each successful `PutPath` MUST write the NAR, compressed per `binary_cache_compat.compression` (default zstd), to the S3-standard bucket at `nar/{FileHash}.nar.{ext}` where `FileHash = sha256(compressed bytes)`. Bytes are reassembled from the just-written chunks (moka-hot) or read from the just-committed `inline_blob`.
+
+r[store.compat.narinfo-on-put]
+When enabled, each successful `PutPath` MUST write a stock-Nix `.narinfo` to S3-standard at `{StorePathHash}.narinfo`, including `URL`, `Compression`, `FileHash`, `FileSize`, `NarHash`, `NarSize`, `References`, `Deriver`, and `Sig` lines. The signature is the same one stored in PG. A `nix-cache-info` object MUST exist at the bucket root.
+
+r[store.compat.write-after-commit]
+Compat writes happen strictly AFTER the PG transaction commits, synchronously within the `PutPath` handler. A compat-write failure MUST NOT roll back the PG commit or fail the RPC; it increments `rio_store_compat_write_failures_total` and is left for the reconciler. The `narinfo.compat_file_hash` column is set on success and is the reconciler's work-queue predicate (`IS NULL`).
+
+r[store.compat.stock-nix-substitute]
+With compat enabled, the S3-standard bucket MUST be a valid `nix copy --from s3://bucket?region=…` substituter with no rio process running.
+
+r[store.compat.gc-coupled]
+The GC sweep MUST enqueue `{StorePathHash}.narinfo` and `nar/{compat_file_hash}.nar.zst` to `pending_s3_deletes` in the same transaction that deletes a manifest, regardless of the current `enabled` value (past compat writes are collected even after the toggle is flipped OFF).
+
+The HTTP server (below) and the compat layer are independent: the HTTP server reassembles on-the-fly from PG+chunks and omits `FileHash`/`FileSize`; the compat layer writes a real compressed artifact and a complete narinfo directly to S3. Clients that point at S3 read the compat objects; clients that point at rio-store's HTTP endpoint hit the on-the-fly path.
 
 ## Chunk Lifecycle
 
