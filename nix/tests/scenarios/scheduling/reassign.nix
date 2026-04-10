@@ -10,6 +10,26 @@ scope: with scope; ''
   # pattern. Proves: disconnect detection → DAG node back to Ready
   # → redispatch → completes on a different worker.
   with subtest("reassign: SIGKILL mid-build, build completes elsewhere"):
+      # Gate: prior subtests (setoptions-unreachable, cancel-timing)
+      # leave one-shot small workers in their RestartSec=1s + reconnect
+      # window. If BOTH smalls are unregistered at submit time the
+      # scheduler dispatches to wlarge immediately and the small_workers
+      # poll below never matches. workers_active==3 ⇒ wsmall1 + wsmall2
+      # + wlarge all registered. 30s budget covers RestartSec=1s +
+      # HEARTBEAT_INTERVAL=10s with slack.
+      for _ in range(30):
+          _wa = metric_value(
+              scrape_metrics(${gatewayHost}, 9091),
+              "rio_scheduler_workers_active",
+          ) or 0.0
+          if _wa >= 3:
+              break
+          _time.sleep(1)
+      else:
+          raise AssertionError(
+              f"workers_active never reached 3 within 30s (last={_wa})"
+          )
+
       disc_before = scrape_metrics(${gatewayHost}, 9091)
       promo_before = metric_value(disc_before,
           "rio_scheduler_size_class_promotions_total",
