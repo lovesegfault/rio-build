@@ -84,7 +84,7 @@ async fn read_strings_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
 
 /// Wire field type for schema-driven parsing (simple flat responses only).
 #[derive(Clone, Copy)]
-enum FieldType {
+pub enum FieldType {
     U64,
     Str,
     Strs,
@@ -101,7 +101,7 @@ impl FieldType {
 }
 
 /// Parse a flat response using a schema table (name, type) -> `Vec<ResponseField>`.
-async fn parse_schema(data: &[u8], schema: &[(&'static str, FieldType)]) -> Vec<ResponseField> {
+pub async fn parse_schema(data: &[u8], schema: &[(&'static str, FieldType)]) -> Vec<ResponseField> {
     let mut cur = Cursor::new(data.to_vec());
     let mut out = Vec::with_capacity(schema.len());
     for &(name, ty) in schema {
@@ -205,14 +205,27 @@ pub async fn parse_handshake_fields(data: &[u8]) -> Vec<ResponseField> {
     ]
 }
 
-pub async fn parse_set_options_fields(data: &[u8]) -> Vec<ResponseField> {
-    parse_schema(data, &[("stderr_last", FieldType::U64)]).await
-}
-
-pub async fn parse_is_valid_path_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(data, &[("stderr_last", U64), ("valid", U64)]).await
-}
+// Flat-response schemas for [`parse_schema`]. Opcodes whose response is a
+// fixed sequence of (name, wire-type) get a const here instead of a named
+// `parse_*_fields` wrapper. Conditional/looping responses (handshake,
+// QueryPathInfo, NarFromPath) keep dedicated parsers below.
+use FieldType::{Str, Strs, U64};
+pub const SCHEMA_SET_OPTIONS: &[(&str, FieldType)] = &[("stderr_last", U64)];
+pub const SCHEMA_IS_VALID_PATH: &[(&str, FieldType)] = &[("stderr_last", U64), ("valid", U64)];
+pub const SCHEMA_QUERY_VALID_PATHS: &[(&str, FieldType)] =
+    &[("stderr_last", U64), ("valid_paths", Strs)];
+pub const SCHEMA_ADD_TEMP_ROOT: &[(&str, FieldType)] = &[("stderr_last", U64), ("result", U64)];
+pub const SCHEMA_QUERY_MISSING: &[(&str, FieldType)] = &[
+    ("stderr_last", U64),
+    ("will_build", Strs),
+    ("will_substitute", Strs),
+    ("unknown", Strs),
+    ("download_size", U64),
+    ("nar_size", U64),
+];
+pub const SCHEMA_QUERY_PATH_FROM_HASH_PART: &[(&str, FieldType)] =
+    &[("stderr_last", U64), ("path", Str)];
+pub const SCHEMA_ADD_SIGNATURES: &[(&str, FieldType)] = &[("stderr_last", U64), ("result", U64)];
 
 /// Parse a QueryPathInfo response. Handles both found and not-found cases.
 pub async fn parse_query_path_info_fields(data: &[u8]) -> Vec<ResponseField> {
@@ -269,32 +282,6 @@ pub async fn parse_query_path_info_fields(data: &[u8]) -> Vec<ResponseField> {
     fields
 }
 
-pub async fn parse_query_valid_paths_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(data, &[("stderr_last", U64), ("valid_paths", Strs)]).await
-}
-
-pub async fn parse_add_temp_root_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(data, &[("stderr_last", U64), ("result", U64)]).await
-}
-
-pub async fn parse_query_missing_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(
-        data,
-        &[
-            ("stderr_last", U64),
-            ("will_build", Strs),
-            ("will_substitute", Strs),
-            ("unknown", Strs),
-            ("download_size", U64),
-            ("nar_size", U64),
-        ],
-    )
-    .await
-}
-
 /// Parse NarFromPath response: [activity messages...] STDERR_LAST <raw NAR bytes>.
 pub fn parse_nar_from_path_fields(
     data: &[u8],
@@ -338,16 +325,6 @@ pub fn parse_nar_from_path_fields(
             },
         ]
     })
-}
-
-pub async fn parse_query_path_from_hash_part_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(data, &[("stderr_last", U64), ("path", Str)]).await
-}
-
-pub async fn parse_add_signatures_fields(data: &[u8]) -> Vec<ResponseField> {
-    use FieldType::*;
-    parse_schema(data, &[("stderr_last", U64), ("result", U64)]).await
 }
 
 // ---------------------------------------------------------------------------

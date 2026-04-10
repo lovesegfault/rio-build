@@ -121,8 +121,8 @@ async fn run_live_conformance(
         let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
         let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
 
-        let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
-        let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
+        let daemon_so_fields = golden::parse_schema(&daemon_so, golden::SCHEMA_SET_OPTIONS).await;
+        let rio_so_fields = golden::parse_schema(&rio_so, golden::SCHEMA_SET_OPTIONS).await;
         golden::assert_fully_consumed(&daemon_so, &daemon_so_fields, "daemon SetOptions");
         golden::assert_fully_consumed(&rio_so, &rio_so_fields, "rio-gateway SetOptions");
         golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, skip);
@@ -193,7 +193,7 @@ async fn test_golden_live_is_valid_path_found() -> anyhow::Result<()> {
 
     let op = golden::build_is_valid_path_bytes(&test_path).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_is_valid_path_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_IS_VALID_PATH))
     })
     .await?;
     Ok(())
@@ -206,7 +206,7 @@ async fn test_golden_live_is_valid_path_not_found() -> anyhow::Result<()> {
 
     let op = golden::build_is_valid_path_bytes(&nonexistent).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_is_valid_path_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_IS_VALID_PATH))
     })
     .await?;
     Ok(())
@@ -256,7 +256,7 @@ async fn test_golden_live_query_valid_paths() -> anyhow::Result<()> {
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
     let op = golden::build_query_valid_paths_bytes(&[&test_path, &nonexistent], false).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_query_valid_paths_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_QUERY_VALID_PATHS))
     })
     .await?;
     Ok(())
@@ -269,7 +269,7 @@ async fn test_golden_live_add_temp_root() -> anyhow::Result<()> {
 
     let op = golden::build_add_temp_root_bytes(&test_path).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_add_temp_root_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_ADD_TEMP_ROOT))
     })
     .await?;
     Ok(())
@@ -285,7 +285,7 @@ async fn test_golden_live_query_missing() -> anyhow::Result<()> {
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
     let op = golden::build_query_missing_bytes(&[&test_path, &nonexistent]).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_query_missing_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_QUERY_MISSING))
     })
     .await?;
     Ok(())
@@ -321,8 +321,8 @@ async fn test_golden_live_nar_from_path() -> anyhow::Result<()> {
     // Compare SetOptions
     let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
     let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
-    let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
-    let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
+    let daemon_so_fields = golden::parse_schema(&daemon_so, golden::SCHEMA_SET_OPTIONS).await;
+    let rio_so_fields = golden::parse_schema(&rio_so, golden::SCHEMA_SET_OPTIONS).await;
     golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, SKIP_FIELDS);
 
     // Compare NAR content. Both sides use STDERR_LAST + raw NAR (see
@@ -355,7 +355,10 @@ async fn test_golden_live_query_path_from_hash_part_not_found() -> anyhow::Resul
 
     let op = golden::build_query_path_from_hash_part_bytes(hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+        Box::pin(golden::parse_schema(
+            data,
+            golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
+        ))
     })
     .await?;
     Ok(())
@@ -373,7 +376,10 @@ async fn test_golden_live_query_path_from_hash_part_found() -> anyhow::Result<()
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+        Box::pin(golden::parse_schema(
+            data,
+            golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
+        ))
     })
     .await?;
     Ok(())
@@ -391,7 +397,10 @@ async fn test_golden_live_query_path_from_hash_part_ca() -> anyhow::Result<()> {
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+        Box::pin(golden::parse_schema(
+            data,
+            golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
+        ))
     })
     .await?;
     Ok(())
@@ -407,7 +416,7 @@ async fn test_golden_live_add_signatures() -> anyhow::Result<()> {
     let op =
         golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
-        Box::pin(golden::parse_add_signatures_fields(data))
+        Box::pin(golden::parse_schema(data, golden::SCHEMA_ADD_SIGNATURES))
     })
     .await?;
     Ok(())
