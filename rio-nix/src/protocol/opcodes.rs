@@ -1,61 +1,31 @@
 //! Nix worker protocol opcode definitions.
 
-/// Worker protocol opcodes.
-///
-/// These values are the u64 opcode numbers sent by the Nix client
-/// after the handshake completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum WorkerOp {
-    IsValidPath = 1,
-    AddToStore = 7,
-    AddTextToStore = 8,
-    BuildPaths = 9,
-    EnsurePath = 10,
-    AddTempRoot = 11,
-    SetOptions = 19,
-    QueryPathInfo = 26,
-    QueryPathFromHashPart = 29,
-    QueryValidPaths = 31,
-    BuildDerivation = 36,
-    AddSignatures = 37,
-    NarFromPath = 38,
-    AddToStoreNar = 39,
-    QueryMissing = 40,
-    QueryDerivationOutputMap = 41,
-    RegisterDrvOutput = 42,
-    QueryRealisation = 43,
-    AddMultipleToStore = 44,
-    BuildPathsWithResults = 46,
-}
-
-impl TryFrom<u64> for WorkerOp {
-    type Error = u64;
-
-    fn try_from(v: u64) -> Result<Self, Self::Error> {
-        match v {
-            1 => Ok(WorkerOp::IsValidPath),
-            7 => Ok(WorkerOp::AddToStore),
-            8 => Ok(WorkerOp::AddTextToStore),
-            9 => Ok(WorkerOp::BuildPaths),
-            10 => Ok(WorkerOp::EnsurePath),
-            11 => Ok(WorkerOp::AddTempRoot),
-            19 => Ok(WorkerOp::SetOptions),
-            26 => Ok(WorkerOp::QueryPathInfo),
-            29 => Ok(WorkerOp::QueryPathFromHashPart),
-            31 => Ok(WorkerOp::QueryValidPaths),
-            36 => Ok(WorkerOp::BuildDerivation),
-            37 => Ok(WorkerOp::AddSignatures),
-            38 => Ok(WorkerOp::NarFromPath),
-            39 => Ok(WorkerOp::AddToStoreNar),
-            40 => Ok(WorkerOp::QueryMissing),
-            41 => Ok(WorkerOp::QueryDerivationOutputMap),
-            42 => Ok(WorkerOp::RegisterDrvOutput),
-            43 => Ok(WorkerOp::QueryRealisation),
-            44 => Ok(WorkerOp::AddMultipleToStore),
-            46 => Ok(WorkerOp::BuildPathsWithResults),
-            other => Err(other),
-        }
+wire_enum! {
+    /// Worker protocol opcodes.
+    ///
+    /// These values are the u64 opcode numbers sent by the Nix client
+    /// after the handshake completes.
+    pub enum WorkerOp {
+        IsValidPath = 1 => "wopIsValidPath",
+        AddToStore = 7 => "wopAddToStore",
+        AddTextToStore = 8 => "wopAddTextToStore",
+        BuildPaths = 9 => "wopBuildPaths",
+        EnsurePath = 10 => "wopEnsurePath",
+        AddTempRoot = 11 => "wopAddTempRoot",
+        SetOptions = 19 => "wopSetOptions",
+        QueryPathInfo = 26 => "wopQueryPathInfo",
+        QueryPathFromHashPart = 29 => "wopQueryPathFromHashPart",
+        QueryValidPaths = 31 => "wopQueryValidPaths",
+        BuildDerivation = 36 => "wopBuildDerivation",
+        AddSignatures = 37 => "wopAddSignatures",
+        NarFromPath = 38 => "wopNarFromPath",
+        AddToStoreNar = 39 => "wopAddToStoreNar",
+        QueryMissing = 40 => "wopQueryMissing",
+        QueryDerivationOutputMap = 41 => "wopQueryDerivationOutputMap",
+        RegisterDrvOutput = 42 => "wopRegisterDrvOutput",
+        QueryRealisation = 43 => "wopQueryRealisation",
+        AddMultipleToStore = 44 => "wopAddMultipleToStore",
+        BuildPathsWithResults = 46 => "wopBuildPathsWithResults",
     }
 }
 
@@ -63,32 +33,6 @@ impl WorkerOp {
     /// Try to parse a u64 opcode number into a known `WorkerOp`.
     pub fn from_u64(v: u64) -> Option<Self> {
         Self::try_from(v).ok()
-    }
-
-    /// Return the human-readable name of this opcode.
-    pub fn name(&self) -> &'static str {
-        match self {
-            WorkerOp::IsValidPath => "wopIsValidPath",
-            WorkerOp::AddToStore => "wopAddToStore",
-            WorkerOp::AddTextToStore => "wopAddTextToStore",
-            WorkerOp::EnsurePath => "wopEnsurePath",
-            WorkerOp::BuildPaths => "wopBuildPaths",
-            WorkerOp::AddTempRoot => "wopAddTempRoot",
-            WorkerOp::SetOptions => "wopSetOptions",
-            WorkerOp::QueryPathInfo => "wopQueryPathInfo",
-            WorkerOp::QueryPathFromHashPart => "wopQueryPathFromHashPart",
-            WorkerOp::QueryValidPaths => "wopQueryValidPaths",
-            WorkerOp::BuildDerivation => "wopBuildDerivation",
-            WorkerOp::AddSignatures => "wopAddSignatures",
-            WorkerOp::NarFromPath => "wopNarFromPath",
-            WorkerOp::AddToStoreNar => "wopAddToStoreNar",
-            WorkerOp::QueryMissing => "wopQueryMissing",
-            WorkerOp::QueryDerivationOutputMap => "wopQueryDerivationOutputMap",
-            WorkerOp::RegisterDrvOutput => "wopRegisterDrvOutput",
-            WorkerOp::QueryRealisation => "wopQueryRealisation",
-            WorkerOp::AddMultipleToStore => "wopAddMultipleToStore",
-            WorkerOp::BuildPathsWithResults => "wopBuildPathsWithResults",
-        }
     }
 }
 

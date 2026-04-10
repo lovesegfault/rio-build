@@ -7,71 +7,35 @@ use super::wire::{self, Result};
 use crate::derivation::{BasicDerivation, DerivationOutput};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Build mode for derivation builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum BuildMode {
-    Normal = 0,
-    Repair = 1,
-    Check = 2,
-}
-
-impl TryFrom<u64> for BuildMode {
-    type Error = u64;
-    fn try_from(v: u64) -> std::result::Result<Self, u64> {
-        match v {
-            0 => Ok(BuildMode::Normal),
-            1 => Ok(BuildMode::Repair),
-            2 => Ok(BuildMode::Check),
-            other => Err(other),
-        }
+wire_enum! {
+    /// Build mode for derivation builds.
+    pub enum BuildMode {
+        Normal = 0,
+        Repair = 1,
+        Check = 2,
     }
 }
 
-/// Build result status codes.
-///
-/// Wire values match the Nix protocol. Logically u8 range but serialized as u64 on the wire (all Nix wire integers are u64).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum BuildStatus {
-    Built = 0,
-    Substituted = 1,
-    AlreadyValid = 2,
-    PermanentFailure = 3,
-    InputRejected = 4,
-    OutputRejected = 5,
-    TransientFailure = 6,
-    CachedFailure = 7,
-    TimedOut = 8,
-    MiscFailure = 9,
-    DependencyFailed = 10,
-    LogLimitExceeded = 11,
-    NotDeterministic = 12,
-    ResolvesToAlreadyValid = 13,
-    NoSubstituters = 14,
-}
-
-impl TryFrom<u64> for BuildStatus {
-    type Error = u64;
-    fn try_from(v: u64) -> std::result::Result<Self, u64> {
-        match v {
-            0 => Ok(BuildStatus::Built),
-            1 => Ok(BuildStatus::Substituted),
-            2 => Ok(BuildStatus::AlreadyValid),
-            3 => Ok(BuildStatus::PermanentFailure),
-            4 => Ok(BuildStatus::InputRejected),
-            5 => Ok(BuildStatus::OutputRejected),
-            6 => Ok(BuildStatus::TransientFailure),
-            7 => Ok(BuildStatus::CachedFailure),
-            8 => Ok(BuildStatus::TimedOut),
-            9 => Ok(BuildStatus::MiscFailure),
-            10 => Ok(BuildStatus::DependencyFailed),
-            11 => Ok(BuildStatus::LogLimitExceeded),
-            12 => Ok(BuildStatus::NotDeterministic),
-            13 => Ok(BuildStatus::ResolvesToAlreadyValid),
-            14 => Ok(BuildStatus::NoSubstituters),
-            other => Err(other),
-        }
+wire_enum! {
+    /// Build result status codes.
+    ///
+    /// Wire values match the Nix protocol. Logically u8 range but serialized as u64 on the wire (all Nix wire integers are u64).
+    pub enum BuildStatus {
+        Built = 0,
+        Substituted = 1,
+        AlreadyValid = 2,
+        PermanentFailure = 3,
+        InputRejected = 4,
+        OutputRejected = 5,
+        TransientFailure = 6,
+        CachedFailure = 7,
+        TimedOut = 8,
+        MiscFailure = 9,
+        DependencyFailed = 10,
+        LogLimitExceeded = 11,
+        NotDeterministic = 12,
+        ResolvesToAlreadyValid = 13,
+        NoSubstituters = 14,
     }
 }
 
