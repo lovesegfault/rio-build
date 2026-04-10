@@ -29,17 +29,32 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
     spec:
       serviceAccountName: rio-gateway
-      # ≥ drainGraceSecs + sessionDrainSecs + slack. kubelet SIGKILLs at
-      # this deadline, which kills any session still open after the
-      # gateway's own session_drain timeout (a backstop, not the primary
-      # mechanism — the gateway's timeout fires first and exits cleanly).
-      terminationGracePeriodSeconds: {{ add $g.drainGraceSecs $g.sessionDrainSecs 24 }}
+      # ≥ nlbDeregisterSecs (preStop) + drainGraceSecs + sessionDrainSecs +
+      # CANCEL_GRACE(5) + slack. kubelet SIGKILLs at this deadline; the
+      # gateway's own session_drain timeout fires first and exits cleanly,
+      # so SIGKILL is a backstop for a hung process.
+      terminationGracePeriodSeconds: {{ add $g.nlbDeregisterSecs $g.drainGraceSecs $g.sessionDrainSecs 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: gateway
           image: {{ include "rio.image" (list . $g.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           {{- include "rio.containerSecurityContext" . | nindent 10 }}
+          {{- if gt (int $g.nlbDeregisterSecs) 0 }}
+          # preStop runs BEFORE SIGTERM. The pod is already Terminating
+          # (out of Endpoints), so Cilium's healthCheckNodePort starts
+          # failing for ETP=Local and the NLB begins draining this node;
+          # but the gateway is still accepting — connections the NLB
+          # routes here before its health-check round completes land on
+          # a live listener. After this sleep, SIGTERM lands and the
+          # gateway's own three-stage drain (r[gw.drain.three-stage])
+          # handles the rest. `sleep:` (KEP-3960, GA 1.30) needs no
+          # /bin/sleep in the image.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ $g.nlbDeregisterSecs }}
+          {{- end }}
           ports:
             - name: ssh
               containerPort: 2222

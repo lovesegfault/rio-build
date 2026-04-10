@@ -89,6 +89,11 @@ gateway:
   storeAddr: rio-store.rio-store:9002
   schedulerBalanceHost: rio-scheduler-headless.rio-system
   schedulerBalancePort: 9001
+  # No NLB in k3s VM (NodePort only) → skip preStop. Keep
+  # sessionDrainSecs at the old 60 so VM-test gateway rollouts stay
+  # fast; tests don't run multi-minute rsb sessions.
+  nlbDeregisterSecs: 0
+  sessionDrainSecs: 60
   service:
     # NodePort so client VM connects to k3s-server:32222. No cloud LB.
     type: NodePort

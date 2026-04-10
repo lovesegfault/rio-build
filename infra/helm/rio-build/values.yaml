@@ -383,13 +383,27 @@ gateway:
   # limit raised to 4Gi (I-134) to accommodate. Lower on memory-
   # constrained gateway pods (I-135).
   maxTransitiveInputs: 1048576
-  # I-064 graceful drain. SIGTERM → readiness=NotServing → wait
-  # drainGraceSecs (NLB target deregister) → stop accepting SSH → wait
-  # sessionDrainSecs for open sessions to close → exit.
-  # terminationGracePeriodSeconds is computed as drain+session+24
-  # (template) so kubelet's SIGKILL backstop sits behind both timeouts.
+  # I-064 graceful drain. preStop sleep nlbDeregisterSecs (NLB stops
+  # routing NEW connections) → SIGTERM → readiness=NotServing → wait
+  # drainGraceSecs → stop accepting SSH → wait sessionDrainSecs for
+  # open sessions to close → exit. terminationGracePeriodSeconds is
+  # computed as nlb+drain+session+24 (template) so kubelet's SIGKILL
+  # backstop sits behind all three.
+  #
+  # nlbDeregisterSecs covers the NLB health-check round (target-type
+  # instance + ETP=Local: NLB polls healthCheckNodePort; default 10s
+  # interval × 3 unhealthy threshold). drainGraceSecs is now belt-and-
+  # suspenders for in-cluster Endpoints propagation post-SIGTERM.
+  nlbDeregisterSecs: 30
   drainGraceSecs: 6       # readinessProbe.periodSeconds (5) + 1
-  sessionDrainSecs: 60
+  # sessionDrainSecs bounds how long a rollout waits on in-flight
+  # `nix-store --realise` sessions. 600s covers typical rsb workloads
+  # (qa medium-shallow-2x ≈ 6min). Builds longer than this still get
+  # cut, but the gateway sends CancelBuild before exit so the
+  # scheduler hears it (vs. waiting for its own session-timeout). The
+  # surge-first strategy means the new pod is already serving; cost of
+  # a long drain is only the old pod's resources, not availability.
+  sessionDrainSecs: 600
   service:
     type: LoadBalancer
     # NO AWS LB annotations here — base is cloud-agnostic. Set via

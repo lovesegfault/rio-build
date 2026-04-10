@@ -788,7 +788,7 @@ The gateway MUST track the sequence number of the first peeked `BuildEvent` and 
 
 - The gateway does not own durable state. All persistent data lives in the scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with host SSH daemons and corporate firewalls blocking port 22 for non-standard destinations.
-- Gateway pods should have a preStop hook and `terminationGracePeriodSeconds` (e.g., 600s) to allow in-flight SSH sessions to complete during rolling updates.
+- The chart sets a `preStop.sleep` of `nlbDeregisterSecs` (NLB health-check round) before SIGTERM, then the three-stage drain runs with `sessionDrainSecs` (default 600s) so in-flight SSH sessions complete during rolling updates. `terminationGracePeriodSeconds` is computed from all three.
 
 ## Key Files
 
