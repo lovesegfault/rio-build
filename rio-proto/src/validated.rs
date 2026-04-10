@@ -158,17 +158,19 @@ impl From<ValidatedPathInfo> for PathInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     const VALID_PATH: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0";
     const VALID_DRV: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv";
     const VALID_REF: &str = "/nix/store/cccccccccccccccccccccccccccccccc-glibc-2.40";
 
-    fn make_raw(store_path: &str, nar_hash: Vec<u8>) -> PathInfo {
+    /// A fully-valid baseline `PathInfo`. Tests mutate one field at a time.
+    fn make_raw() -> PathInfo {
         PathInfo {
-            store_path: store_path.into(),
+            store_path: VALID_PATH.into(),
             store_path_hash: vec![],
             deriver: String::new(),
-            nar_hash,
+            nar_hash: vec![0; 32],
             nar_size: 1024,
             references: vec![],
             registration_time: 0,
@@ -179,155 +181,93 @@ mod tests {
     }
 
     #[test]
-    fn test_tryfrom_happy_path() -> anyhow::Result<()> {
+    fn happy_path() -> anyhow::Result<()> {
         let raw = PathInfo {
             deriver: VALID_DRV.into(),
+            nar_hash: vec![0x42; 32],
             references: vec![VALID_REF.into()],
             content_address: "fixed:r:sha256:abc".into(),
-            ..make_raw(VALID_PATH, vec![0x42; 32])
+            ..make_raw()
         };
-
         let v = ValidatedPathInfo::try_from(raw)?;
         assert_eq!(v.store_path.as_str(), VALID_PATH);
         assert_eq!(v.nar_hash, [0x42; 32]);
         assert_eq!(v.deriver.as_ref().map(|d| d.as_str()), Some(VALID_DRV));
-        assert_eq!(v.references.len(), 1);
         assert_eq!(v.references[0].as_str(), VALID_REF);
         assert_eq!(v.content_address.as_deref(), Some("fixed:r:sha256:abc"));
         Ok(())
     }
 
-    #[test]
-    fn test_tryfrom_bad_store_path() {
-        let raw = make_raw("not-a-store-path", vec![0; 32]);
+    /// Hard-fail validations: each case corrupts one field of a known-good
+    /// `PathInfo`, then asserts the specific error variant AND that the
+    /// offending value surfaces in the error message.
+    #[rstest]
+    #[case::bad_store_path(
+        |p: &mut PathInfo| p.store_path = "not-a-store-path".into(),
+        "StorePath", "not-a-store-path"
+    )]
+    #[case::short_hash(|p: &mut PathInfo| p.nar_hash = vec![0; 31], "NarHashLen", "31")]
+    #[case::long_hash(|p: &mut PathInfo| p.nar_hash = vec![0; 64], "NarHashLen", "64")]
+    #[case::bad_reference(
+        |p: &mut PathInfo| p.references = vec![VALID_REF.into(), "/tmp/evil".into()],
+        "Reference", "/tmp/evil"
+    )]
+    fn rejects_invalid(
+        #[case] mutate: fn(&mut PathInfo),
+        #[case] want_variant: &str,
+        #[case] want_in_msg: &str,
+    ) {
+        let mut raw = make_raw();
+        mutate(&mut raw);
         let err = ValidatedPathInfo::try_from(raw).unwrap_err();
-        assert!(
-            matches!(err, PathInfoValidationError::StorePath { .. }),
-            "got: {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("not-a-store-path"));
+        let got = match &err {
+            PathInfoValidationError::StorePath { .. } => "StorePath",
+            PathInfoValidationError::NarHashLen(_) => "NarHashLen",
+            PathInfoValidationError::Reference { .. } => "Reference",
+        };
+        assert_eq!(got, want_variant, "got: {err:?}");
+        assert!(err.to_string().contains(want_in_msg), "got: {err}");
     }
 
-    #[test]
-    fn test_tryfrom_short_hash() {
-        let raw = make_raw(VALID_PATH, vec![0; 31]);
-        let err = ValidatedPathInfo::try_from(raw).unwrap_err();
-        assert!(matches!(err, PathInfoValidationError::NarHashLen(31)));
-    }
-
-    #[test]
-    fn test_tryfrom_long_hash() {
-        let raw = make_raw(VALID_PATH, vec![0; 64]);
-        let err = ValidatedPathInfo::try_from(raw).unwrap_err();
-        assert!(matches!(err, PathInfoValidationError::NarHashLen(64)));
-    }
-
-    #[test]
-    fn test_tryfrom_bad_reference() {
+    /// Soft-fail: `deriver` never causes `Err` — empty or unparseable
+    /// values normalize to `None`. Also covers empty `content_address`
+    /// → `None` (the baseline leaves it empty).
+    #[rstest]
+    #[case::empty("", None)]
+    #[case::invalid("garbage-not-a-path", None)]
+    #[case::valid(VALID_DRV, Some(VALID_DRV))]
+    fn deriver_softfail(#[case] deriver: &str, #[case] want: Option<&str>) {
         let raw = PathInfo {
-            references: vec![VALID_REF.into(), "/tmp/evil".into()],
-            ..make_raw(VALID_PATH, vec![0; 32])
+            deriver: deriver.into(),
+            ..make_raw()
         };
-        let err = ValidatedPathInfo::try_from(raw).unwrap_err();
-        let PathInfoValidationError::Reference { path, .. } = &err else {
-            panic!("expected Reference error, got: {err:?}");
-        };
-        assert_eq!(path, "/tmp/evil");
-    }
-
-    #[test]
-    fn test_tryfrom_empty_deriver_is_none() -> anyhow::Result<()> {
-        let raw = make_raw(VALID_PATH, vec![0; 32]); // deriver defaults to ""
-        let v = ValidatedPathInfo::try_from(raw)?;
-        assert!(v.deriver.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_tryfrom_invalid_deriver_is_none_softfail() -> anyhow::Result<()> {
-        use anyhow::Context;
-        let raw = PathInfo {
-            deriver: "garbage-not-a-path".into(),
-            ..make_raw(VALID_PATH, vec![0; 32])
-        };
-        // Must NOT return Err — soft-fail coerces to None.
-        let v = ValidatedPathInfo::try_from(raw).context("invalid deriver should soft-fail")?;
-        assert!(
-            v.deriver.is_none(),
-            "invalid deriver should be coerced to None, not propagated"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_tryfrom_empty_content_address_is_none() -> anyhow::Result<()> {
-        let raw = make_raw(VALID_PATH, vec![0; 32]);
-        let v = ValidatedPathInfo::try_from(raw)?;
+        let v = ValidatedPathInfo::try_from(raw).expect("deriver never hard-fails");
+        assert_eq!(v.deriver.as_ref().map(|d| d.as_str()), want);
         assert!(v.content_address.is_none());
-        Ok(())
     }
 
-    /// ValidatedPathInfo → PathInfo → ValidatedPathInfo is identity
-    /// (modulo Option normalization: empty → None stays None).
-    #[test]
-    fn test_roundtrip() -> anyhow::Result<()> {
-        let v1 = ValidatedPathInfo {
-            store_path: StorePath::parse(VALID_PATH)?,
-            store_path_hash: vec![0x11; 20],
-            deriver: Some(StorePath::parse(VALID_DRV)?),
-            nar_hash: [0x42; 32],
-            nar_size: 4096,
-            references: vec![StorePath::parse(VALID_REF)?],
-            registration_time: 1700000000,
-            ultimate: true,
-            signatures: vec!["sig1".into(), "sig2".into()],
-            content_address: Some("fixed:r:sha256:xyz".into()),
-        };
-
-        let raw: PathInfo = v1.clone().into();
-        let v2 = ValidatedPathInfo::try_from(raw)?;
-
-        assert_eq!(v2.store_path.as_str(), v1.store_path.as_str());
-        assert_eq!(v2.store_path_hash, v1.store_path_hash);
-        assert_eq!(
-            v2.deriver.as_ref().map(|d| d.as_str()),
-            v1.deriver.as_ref().map(|d| d.as_str())
-        );
-        assert_eq!(v2.nar_hash, v1.nar_hash);
-        assert_eq!(v2.nar_size, v1.nar_size);
-        assert_eq!(v2.references.len(), v1.references.len());
-        assert_eq!(v2.references[0].as_str(), v1.references[0].as_str());
-        assert_eq!(v2.registration_time, v1.registration_time);
-        assert_eq!(v2.ultimate, v1.ultimate);
-        assert_eq!(v2.signatures, v1.signatures);
-        assert_eq!(v2.content_address, v1.content_address);
-        Ok(())
-    }
-
-    /// Roundtrip with None deriver/CA → empty string on wire → None back.
-    #[test]
-    fn test_roundtrip_none_fields() -> anyhow::Result<()> {
-        let v1 = ValidatedPathInfo {
-            store_path: StorePath::parse(VALID_PATH)?,
-            store_path_hash: vec![],
-            deriver: None,
-            nar_hash: [0; 32],
-            nar_size: 0,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: vec![],
-            content_address: None,
-        };
-
-        let raw: PathInfo = v1.clone().into();
-        assert_eq!(raw.deriver, "");
-        assert_eq!(raw.content_address, "");
-
-        let v2 = ValidatedPathInfo::try_from(raw)?;
-        assert!(v2.deriver.is_none());
-        assert!(v2.content_address.is_none());
+    /// `Raw → Validated → Raw` is identity (prost-derived `PartialEq` on
+    /// `PathInfo`). Covers Option↔empty-string normalization both ways:
+    /// the `none_fields` case starts with empty `deriver`/`content_address`
+    /// and round-trips back to empty via `None`.
+    #[rstest]
+    #[case::full(PathInfo {
+        store_path_hash: vec![0x11; 20],
+        deriver: VALID_DRV.into(),
+        nar_hash: vec![0x42; 32],
+        nar_size: 4096,
+        references: vec![VALID_REF.into()],
+        registration_time: 1_700_000_000,
+        ultimate: true,
+        signatures: vec!["sig1".into(), "sig2".into()],
+        content_address: "fixed:r:sha256:xyz".into(),
+        ..make_raw()
+    })]
+    #[case::none_fields(make_raw())]
+    fn roundtrip(#[case] raw: PathInfo) -> anyhow::Result<()> {
+        let v = ValidatedPathInfo::try_from(raw.clone())?;
+        let raw2: PathInfo = v.into();
+        assert_eq!(raw, raw2);
         Ok(())
     }
 }

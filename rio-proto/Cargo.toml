@@ -39,6 +39,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # Interceptor roundtrip test needs a real (non-noop) tracer to get
 # non-zero trace IDs, and the W3C propagator to register.
 opentelemetry_sdk = { workspace = true }
+rstest = { workspace = true }
 # connect_with_retry tests use paused-clock time (start_paused/advance).
 tokio = { workspace = true, features = ["test-util"] }
 

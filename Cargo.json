@@ -20875,6 +20875,10 @@
           "packageId": "opentelemetry_sdk"
         },
         {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         }
