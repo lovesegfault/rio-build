@@ -18,7 +18,7 @@
 // r[impl sched.grpc.leader-guard]
 // r[impl proto.client.balanced]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -63,20 +63,17 @@ fn build_endpoint(addr: SocketAddr) -> anyhow::Result<Endpoint> {
 /// reports SERVING. All errors (connect fail, timeout, NOT_SERVING,
 /// UNKNOWN) collapse to false --- "not known good, don't route."
 ///
-/// Uses an ephemeral Channel, NOT the balanced channel. Chicken and
-/// egg: we're deciding whether to PUT this endpoint INTO the balance.
-async fn probe(addr: SocketAddr, service: &str) -> bool {
-    let endpoint = match build_endpoint(addr) {
-        Ok(e) => e,
-        Err(e) => {
-            // Should never happen (we control the URI format) but
-            // don't panic in a background loop.
-            warn!(%addr, error = %e, "probe: bad endpoint");
-            return false;
-        }
-    };
+/// Takes a (cached, lazy) `Channel` rather than connecting fresh —
+/// the channel can't be the balanced one (chicken/egg: we're
+/// deciding whether to PUT this addr INTO the balance), but it CAN
+/// be reused across ticks. The pre-cache version did
+/// `endpoint.connect()` here, i.e. one fresh TCP+TLS handshake per
+/// endpoint per 3s tick: with N store replicas × M builder pods that
+/// was the dominant builder→store connection churn observed in
+/// hubble (Q-001 — RST-after-FIN every 3.000s). The lazy channel
+/// connects once on first RPC and h2-multiplexes subsequent checks.
+async fn probe(addr: SocketAddr, ch: Channel, service: &str) -> bool {
     let fut = async {
-        let ch = endpoint.connect().await.ok()?;
         let mut hc = HealthClient::new(ch);
         let resp = hc
             .check(HealthCheckRequest {
@@ -106,11 +103,18 @@ async fn probe(addr: SocketAddr, service: &str) -> bool {
 /// One probe cycle: resolve DNS, probe all endpoints, diff against
 /// the live set, emit Change::Insert/Remove. Returns the new live
 /// set for the next cycle's diff.
+///
+/// `probe_ch` caches one lazy `Channel` per resolved addr so the
+/// Health/Check RPC reuses an existing h2 connection instead of
+/// dialing fresh every tick. Addrs that disappear from DNS are
+/// evicted; new addrs get a `connect_lazy()` channel (connects on
+/// first RPC, auto-reconnects on failure).
 async fn tick(
     host: &str,
     port: u16,
     service: &str,
     live: &HashSet<SocketAddr>,
+    probe_ch: &mut HashMap<SocketAddr, Channel>,
     tx: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
 ) -> HashSet<SocketAddr> {
     // DNS resolve. For a headless Service, CoreDNS returns ALL pod
@@ -131,13 +135,33 @@ async fn tick(
         }
     };
 
+    // Sync the probe-channel cache to the resolved set: drop addrs
+    // DNS no longer returns (pod gone → close its probe TCP), insert
+    // lazy channels for new addrs. `connect_lazy()` never blocks/fails;
+    // the actual connect happens on the first Health/Check below,
+    // bounded by PROBE_TIMEOUT.
+    probe_ch.retain(|addr, _| resolved.contains(addr));
+    for &addr in &resolved {
+        if let std::collections::hash_map::Entry::Vacant(slot) = probe_ch.entry(addr) {
+            match build_endpoint(addr) {
+                Ok(ep) => {
+                    slot.insert(ep.connect_lazy());
+                }
+                Err(e) => warn!(%addr, error = %e, "probe: bad endpoint"),
+            }
+        }
+    }
+
     // Probe all resolved addrs concurrently. Small set (2 pods
     // typically), overhead is negligible; do it in parallel so
     // a slow standby doesn't delay seeing the leader.
     let mut probes = Vec::with_capacity(resolved.len());
     for &addr in &resolved {
+        let Some(ch) = probe_ch.get(&addr).cloned() else {
+            continue;
+        };
         let service = service.to_string();
-        probes.push(async move { (addr, probe(addr, &service).await) });
+        probes.push(async move { (addr, probe(addr, ch, &service).await) });
     }
     let results: Vec<(SocketAddr, bool)> = futures_util::future::join_all(probes).await;
     let serving: HashSet<SocketAddr> = results
@@ -223,10 +247,19 @@ impl BalancedChannel {
         // discovery channel. We send at most 2×N changes per tick
         // (N = pod count, typically 2). 32 is ample.
         let (channel, tx) = Channel::balance_channel::<SocketAddr>(32);
+        let mut probe_ch = HashMap::new();
 
         // First tick: blocking, so the channel has ≥1 endpoint
         // before the caller makes an RPC.
-        let live = tick(&host, port, &health_service, &HashSet::new(), &tx).await;
+        let live = tick(
+            &host,
+            port,
+            &health_service,
+            &HashSet::new(),
+            &mut probe_ch,
+            &tx,
+        )
+        .await;
         anyhow::ensure!(
             !live.is_empty(),
             "balance: no SERVING endpoints for {host}:{port} (service={health_service}); \
@@ -241,12 +274,13 @@ impl BalancedChannel {
         // Background probe loop. Runs until dropped.
         let task = tokio::spawn(async move {
             let mut live = live;
+            let mut probe_ch = probe_ch;
             let mut interval = tokio::time::interval(probe_interval);
             // First tick fires immediately; we already did one, skip.
             interval.tick().await;
             loop {
                 interval.tick().await;
-                live = tick(&host, port, &health_service, &live, &tx).await;
+                live = tick(&host, port, &health_service, &live, &mut probe_ch, &tx).await;
             }
         });
 
@@ -329,8 +363,9 @@ mod tests {
     #[tokio::test]
     async fn probe_dead_addr_false() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let ch = build_endpoint(addr).unwrap().connect_lazy();
         let start = std::time::Instant::now();
-        assert!(!probe(addr, "x").await);
+        assert!(!probe(addr, ch, "x").await);
         // Should fail fast (connection refused), not hit the 2s
         // timeout. Give it 1s of slack for CI.
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -360,6 +395,7 @@ mod tests {
 
         // Balance discovery channel sink.
         let (tx, mut rx) = mpsc::channel(8);
+        let mut probe_ch = HashMap::new();
 
         // Tick 1: NOT_SERVING → empty live set, no Insert.
         let live = tick(
@@ -367,11 +403,13 @@ mod tests {
             addr.port(),
             "test.Service",
             &HashSet::new(),
+            &mut probe_ch,
             &tx,
         )
         .await;
         assert!(live.is_empty(), "NOT_SERVING should not be in live set");
         assert!(rx.try_recv().is_err(), "no Change should be emitted");
+        assert_eq!(probe_ch.len(), 1, "probe channel cached after first tick");
 
         // Flip to SERVING.
         reporter
@@ -379,7 +417,15 @@ mod tests {
             .await;
 
         // Tick 2: SERVING → Insert.
-        let live = tick("127.0.0.1", addr.port(), "test.Service", &live, &tx).await;
+        let live = tick(
+            "127.0.0.1",
+            addr.port(),
+            "test.Service",
+            &live,
+            &mut probe_ch,
+            &tx,
+        )
+        .await;
         assert_eq!(live.len(), 1);
         match rx.try_recv().expect("Insert should be emitted") {
             Change::Insert(a, _) => assert_eq!(a, addr),
@@ -392,7 +438,15 @@ mod tests {
             .await;
 
         // Tick 3: Remove.
-        let live = tick("127.0.0.1", addr.port(), "test.Service", &live, &tx).await;
+        let live = tick(
+            "127.0.0.1",
+            addr.port(),
+            "test.Service",
+            &live,
+            &mut probe_ch,
+            &tx,
+        )
+        .await;
         assert!(live.is_empty());
         match rx.try_recv().expect("Remove should be emitted") {
             Change::Remove(a) => assert_eq!(a, addr),
