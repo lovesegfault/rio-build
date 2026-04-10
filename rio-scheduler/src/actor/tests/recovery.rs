@@ -14,46 +14,24 @@ use super::*;
 ///
 /// This tests the core recover_from_pg path: load builds, load
 /// derivations, load edges, load build_derivations, rebuild DAG +
-/// interested_builds + ready queue.
+/// interested_builds + ready queue. RecoveryFixture::run guarantees
+/// the phase-2 actor is brand new (empty DAG before LeaderAcquired).
 #[tokio::test]
 async fn test_recover_from_pg_rebuilds_dag() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // --- Phase 1: first "leader" writes state to PG ---
-    // Use a real actor to do this (simpler than hand-crafting SQL).
     let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx = merge_chain(
+    let f = RecoveryFixture::run(async |handle, _| {
+        merge_chain(
             &handle,
             build_id,
             &["recover-child", "recover-parent"],
             PriorityClass::Scheduled,
         )
         .await?;
-        // Barrier: wait for merge + persist_merge_to_db to complete.
-        // (merge_chain itself already awaits the MergeDag reply, so
-        // this is belt-and-suspenders.)
         barrier(&handle).await;
-        // Shut down this actor (simulating scheduler death).
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // --- Phase 2: fresh actor (new leader) recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    // Initially: DAG is EMPTY. This proves we're not cheating by
-    // reusing in-mem state — the actor is brand new.
-    let info = handle.debug_query_derivation("recover-child").await?;
-    assert!(
-        info.is_none(),
-        "fresh actor should have EMPTY DAG before LeaderAcquired"
-    );
-
-    // Send LeaderAcquired → triggers recover_from_pg.
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
 
     // Child should be Ready (no dependencies). Parent should be
     // Queued (depends on child). Both should have the build in
@@ -106,17 +84,12 @@ async fn test_recover_from_pg_rebuilds_dag() -> TestResult {
 /// pending/active). Orphans have no active build → empty set → skip.
 #[tokio::test]
 async fn test_recovery_skips_orphan_transitions() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // --- Phase 1: write a 2-node chain to PG, then orphan it ---
-    // The chain shape gives us a Queued node (parent depends on
-    // child, so MergeDag leaves parent at Queued in PG). A single
-    // node would be Ready in PG and never hit the I-058 collection
-    // — wrong test surface.
     let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        let _rx = merge_chain(
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // Chain shape gives us a Queued node (parent depends on child,
+        // so MergeDag leaves parent at Queued in PG). A single node
+        // would be Ready in PG and never hit the I-058 collection.
+        merge_chain(
             &handle,
             build_id,
             &["orphan-child", "orphan-parent"],
@@ -125,34 +98,29 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
         .await?;
         barrier(&handle).await;
         drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Precondition: parent is queued in PG. If MergeDag's own
-    // compute_initial_states changed and the parent is now Ready,
-    // this test stops exercising the I-058 path and silently passes
-    // for the wrong reason.
-    let (pg_status,): (String,) =
-        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'orphan-parent'")
-            .fetch_one(&db.pool)
+        // Precondition: parent is queued in PG. If MergeDag's own
+        // compute_initial_states changed and the parent is now Ready,
+        // this test stops exercising the I-058 path and silently
+        // passes for the wrong reason.
+        let (pg_status,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'orphan-parent'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            pg_status, "queued",
+            "test precondition: parent must be Queued in PG to hit I-058 collection"
+        );
+        // Backdate: build → failed. load_nonterminal_builds (status IN
+        // pending/active) skips it; load_nonterminal_derivations still
+        // finds both nodes (their status is ready/queued, non-terminal).
+        sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
+            .bind(build_id)
+            .execute(&pool)
             .await?;
-    assert_eq!(
-        pg_status, "queued",
-        "test precondition: parent must be Queued in PG to hit I-058 collection"
-    );
-
-    // Backdate: build → failed. load_nonterminal_builds (status IN
-    // pending/active) skips it; load_nonterminal_derivations still
-    // finds both nodes (their status is ready/queued, non-terminal).
-    sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
-        .bind(build_id)
-        .execute(&db.pool)
-        .await?;
-
-    // --- Phase 2: fresh actor recovers ---
-    let (handle, _task) = setup_actor(db.pool.clone());
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
 
     // Orphan parent loaded (non-terminal in PG → load_nonterminal_
     // derivations found it) but NOT transitioned. Without the gate,
@@ -402,6 +370,50 @@ async fn merge_chain(
     Ok(rx.await??)
 }
 
+/// Phase-1 + backdate-to-Assigned for the orphan-reconcile tests:
+/// spawn an actor on `pool`, merge single `drv_hash` (with `out_path`
+/// as expected output), drop the actor, then set PG `status='assigned'`
+/// with `assigned_builder_id=dead_worker`. Returns the build_id.
+async fn seed_orphan_assigned(
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+    out_path: &str,
+    dead_worker: &str,
+) -> anyhow::Result<Uuid> {
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(pool.clone());
+        let mut node = make_node(drv_hash);
+        node.expected_output_paths = vec![out_path.into()];
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = $1 WHERE drv_hash = $2",
+    )
+    .bind(dead_worker)
+    .bind(drv_hash)
+    .execute(pool)
+    .await?;
+    Ok(build_id)
+}
+
+/// Phase-2 for orphan-reconcile tests: spawn actor on `pool` with
+/// `store` wired, send LeaderAcquired, barrier. Mirrors the tail of
+/// `RecoveryFixture::run_with_store` for tests that need an inproc
+/// store with its own TestDb (so can't use the fixture's single-db).
+async fn recover_with_store(
+    pool: sqlx::PgPool,
+    store: StoreServiceClient<Channel>,
+) -> anyhow::Result<(ActorHandle, tokio::task::JoinHandle<()>)> {
+    let (handle, task) = setup_actor_with_store(pool, Some(store));
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    Ok((handle, task))
+}
+
 /// Orphan-completion (outputs in store, worker didn't reconnect)
 /// must fire check_build_completion. Without this, if the
 /// orphan-completed drv was the LAST outstanding one, the build stays
@@ -418,45 +430,16 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
 
     let sched_db = TestDb::new(&MIGRATOR).await;
     let store_db = TestDb::new(&MIGRATOR).await;
-
-    // In-process store, pre-seeded with the output path.
     let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
     let out_path = test_store_path("orphan-out");
     put_test_path(&mut store_client, &out_path).await?;
 
-    // --- Phase 1: first "leader" writes build + drv to PG ---
-    let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(sched_db.pool.clone());
-        // Single-node DAG — the orphan-completed drv IS the whole
-        // build. This is the critical case: if check_build_completion
-        // doesn't fire, NOTHING else will (no other drv completing).
-        let mut node = make_node("orphan-drv");
-        node.expected_output_paths = vec![out_path.clone()];
-        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-        barrier(&handle).await;
-
-        // Shut down (scheduler death).
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Backdate PG: simulate "drv was dispatched to worker 'dead-w1'
-    // before scheduler died." The worker won't reconnect (we never
-    // register it on the second actor).
-    sqlx::query(
-        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'dead-w1' \
-         WHERE drv_hash = 'orphan-drv'",
-    )
-    .execute(&sched_db.pool)
-    .await?;
-
-    // --- Phase 2: fresh actor WITH store client recovers ---
-    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
-
-    // LeaderAcquired → recover_from_pg (loads Assigned drv + build).
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    // Single-node DAG — the orphan-completed drv IS the whole build.
+    // Critical case: if check_build_completion doesn't fire, NOTHING
+    // else will (no other drv completing). Backdated to Assigned by a
+    // worker that won't reconnect.
+    let build_id = seed_orphan_assigned(&sched_db.pool, "orphan-drv", &out_path, "dead-w1").await?;
+    let (handle, _task) = recover_with_store(sched_db.pool.clone(), store_client.clone()).await?;
 
     // Verify recovery found the Assigned drv.
     let pre = expect_drv(&handle, "orphan-drv").await;
@@ -511,32 +494,12 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
 
     let sched_db = TestDb::new(&MIGRATOR).await;
     let store_db = TestDb::new(&MIGRATOR).await;
-
     let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
     let out_path = test_store_path("y2-out");
     put_test_path(&mut store_client, &out_path).await?;
 
-    // --- Phase 1: first "leader" writes build + drv ---
-    let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(sched_db.pool.clone());
-        let mut node = make_node("y2-drv");
-        node.expected_output_paths = vec![out_path.clone()];
-        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-        barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Backdate: drv Assigned to dead worker (simulates "dispatched
-    // before crash"). Also seed a scheduler_live_pins row
-    // (simulates dispatch's pin_live_inputs).
-    sqlx::query(
-        "UPDATE derivations SET status = 'assigned', \
-         assigned_builder_id = 'y2-dead-worker' WHERE drv_hash = 'y2-drv'",
-    )
-    .execute(&sched_db.pool)
-    .await?;
+    let _build_id =
+        seed_orphan_assigned(&sched_db.pool, "y2-drv", &out_path, "y2-dead-worker").await?;
 
     // Seed a pin (simulating what dispatch would have done). The
     // input path doesn't need to exist in the store — scheduler_
@@ -554,11 +517,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
             .await?;
     assert_eq!(pins_before, 1, "pin should be seeded before recovery");
 
-    // --- Phase 2: fresh actor recovers + reconciles ---
-    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
-
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    let (handle, _task) = recover_with_store(sched_db.pool.clone(), store_client.clone()).await?;
 
     // After LeaderAcquired, sweep_stale_live_pins ran — but the
     // drv is Assigned (non-terminal) so the pin SURVIVES. This is
@@ -612,31 +571,30 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
 /// (store-check → Completed, or reset → Ready).
 #[tokio::test]
 async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
-    let sched_db = TestDb::new(&MIGRATOR).await;
-    let build_id = Uuid::new_v4();
-
-    // --- Phase 1: merge build, shut down ---
-    {
-        let (handle, task) = setup_actor(sched_db.pool.clone());
-        let node = make_node("phantom-drv");
-        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-        barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
     // Backdate: simulate "persist_status(Assigned) + insert_assignment
     // ran, but try_send never did" (crash between PG write and channel
     // send). Worker 'phantom-w1' WILL reconnect in phase 2.
-    sqlx::query(
-        "UPDATE derivations SET status = 'assigned', \
-         assigned_builder_id = 'phantom-w1' WHERE drv_hash = 'phantom-drv'",
-    )
-    .execute(&sched_db.pool)
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let _rx = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("phantom-drv")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'assigned', \
+             assigned_builder_id = 'phantom-w1' WHERE drv_hash = 'phantom-drv'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
     .await?;
-
-    // --- Phase 2: fresh actor, worker reconnects WITHOUT the drv ---
-    let (handle, _task) = setup_actor(sched_db.pool.clone());
+    let (sched_db, handle) = (f.db, f.handle);
 
     // Worker reconnects: BuildExecution stream + heartbeat with
     // EMPTY running_build (because it never actually got the
@@ -650,10 +608,6 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // the exhaustion case, which test_fleet_exhaustion_is_kind_aware
     // covers separately.
     let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    // LeaderAcquired → recover_from_pg loads Assigned drv.
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
 
     // Verify: drv is Assigned, worker is in self.executors, but
@@ -874,44 +828,24 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
 
     let sched_db = TestDb::new(&MIGRATOR).await;
     let store_db = TestDb::new(&MIGRATOR).await;
-
-    // In-process store (real client) — we'll break it by closing
-    // its PG pool before reconcile.
+    // In-process store (real client) — broken by closing its PG pool.
     let (store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
 
-    // --- Phase 1: first "leader" writes build + drv ---
-    let build_id = Uuid::new_v4();
-    {
-        let (handle, task) = setup_actor(sched_db.pool.clone());
-        let mut node = make_node("z4-drv");
-        // Must have expected_output_paths or the reconcile short-
-        // circuits before the store call ("No expected outputs =
-        // can't verify orphan completion. Conservative: treat as
-        // incomplete."). That's a DIFFERENT code path.
-        node.expected_output_paths = vec![test_store_path("z4-out")];
-        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-        barrier(&handle).await;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Backdate: simulate "dispatched to a worker that won't reconnect".
-    sqlx::query(
-        "UPDATE derivations SET status = 'assigned', \
-         assigned_builder_id = 'z4-dead-worker' WHERE drv_hash = 'z4-drv'",
+    // expected_output_paths must be set or reconcile short-circuits
+    // before the store call ("No expected outputs → treat as
+    // incomplete") — a DIFFERENT code path.
+    let _build_id = seed_orphan_assigned(
+        &sched_db.pool,
+        "z4-drv",
+        &test_store_path("z4-out"),
+        "z4-dead-worker",
     )
-    .execute(&sched_db.pool)
     .await?;
 
     // Break the store: close its PG pool. FindMissingPaths will
     // return an Err (sqlx::Error::PoolClosed → tonic::Status).
     store_db.pool.close().await;
-
-    // --- Phase 2: fresh actor WITH (broken) store client recovers ---
-    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client));
-
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
+    let (handle, _task) = recover_with_store(sched_db.pool.clone(), store_client).await?;
 
     // Pre-reconcile: drv should be Assigned (recovered from PG).
     let pre = expect_drv(&handle, "z4-drv").await;
@@ -1034,22 +968,10 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
 /// `check_build_completion` never fired. Hard hang.
 #[tokio::test]
 async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // Phase 1: actor A poisons a derivation.
-    {
-        let (handle, task) = setup_actor(db.pool.clone());
-        seed_poisoned(&handle, "zombie-drv").await?;
-        drop(handle);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Phase 2: fresh actor B recovers, operator clears poison, user resubmits.
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let f =
+        RecoveryFixture::run(async |handle, _| seed_poisoned(&handle, "zombie-drv").await).await?;
+    let handle = f.handle;
     let mut worker_rx = connect_executor(&handle, "zombie-w2", "x86_64-linux").await?;
-
-    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
-    barrier(&handle).await;
 
     // Precondition: recovery loaded the poisoned node.
     let recovered = expect_drv(&handle, "zombie-drv").await;
