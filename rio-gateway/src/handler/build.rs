@@ -28,43 +28,25 @@ use crate::translate;
 /// errors (scheduler connection dropped — reconnect-worthy) from
 /// stream EOF without terminal (scheduler closed gracefully but
 /// incompletely — NOT reconnect-worthy, the build state is lost).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum StreamProcessError {
     /// gRPC-level error (connection reset, timeout). Scheduler
     /// may have failed over — reconnecting via WatchBuild has
     /// a good chance of resuming.
+    #[error("build event stream error: {0}")]
     Transport(tonic::Status),
     /// Stream returned `Ok(None)` (EOF) without a Completed/
     /// Failed/Cancelled event. This IS the primary failover
     /// signature: k8s pod kill → SIGTERM → graceful shutdown →
     /// TCP FIN → clean stream close. NOT a Transport error.
     /// Reconnect-worthy for the same reason as Transport.
+    #[error("build event stream ended unexpectedly (scheduler disconnected?)")]
     EofWithoutTerminal,
     /// Error writing STDERR to the client (WireError). The Nix
     /// client disconnected or the SSH channel closed. NOT
     /// reconnect-worthy — scheduler is fine, client is gone.
-    Wire(rio_nix::protocol::wire::WireError),
-}
-
-impl From<rio_nix::protocol::wire::WireError> for StreamProcessError {
-    fn from(e: rio_nix::protocol::wire::WireError) -> Self {
-        Self::Wire(e)
-    }
-}
-
-impl std::fmt::Display for StreamProcessError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(s) => write!(f, "build event stream error: {s}"),
-            Self::EofWithoutTerminal => {
-                write!(
-                    f,
-                    "build event stream ended unexpectedly (scheduler disconnected?)"
-                )
-            }
-            Self::Wire(e) => write!(f, "client disconnected: {e}"),
-        }
-    }
+    #[error("client disconnected: {0}")]
+    Wire(#[from] rio_nix::protocol::wire::WireError),
 }
 
 /// Check the per-tenant rate limit before `SubmitBuild`. On violation:
