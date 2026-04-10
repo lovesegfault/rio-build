@@ -169,12 +169,22 @@ impl rio_common::config::ValidateConfig for Config {
         // Required-field checks that `#[serde(default)]` can't express
         // (figment's "missing field" error for `String` defaulting to `""`
         // is a silent success, not an error).
-        use rio_common::config::ensure_required_path as required_path;
+        use rio_common::config::ensure_required;
         self.scheduler
             .ensure_required("scheduler.addr", "gateway")?;
         self.store.ensure_required("store.addr", "gateway")?;
-        required_path(&self.host_key, "host_key", "gateway")?;
-        required_path(&self.authorized_keys, "authorized_keys", "gateway")?;
+        // Lossy is fine: trim-then-empty check for operator-facing
+        // error messages, not a parse. A non-UTF-8 config path would
+        // fail at file-open anyway.
+        #[allow(clippy::disallowed_methods)]
+        {
+            ensure_required(&self.host_key.to_string_lossy(), "host_key", "gateway")?;
+            ensure_required(
+                &self.authorized_keys.to_string_lossy(),
+                "authorized_keys",
+                "gateway",
+            )?;
+        }
         // jwt.required=true + key_path=None is a misconfiguration: can't
         // mint, can't degrade → every SSH connect would be rejected. Fail
         // loud at startup (clear error) instead of rejecting every

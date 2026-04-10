@@ -313,23 +313,6 @@ pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Res
     Ok(())
 }
 
-/// [`ensure_required`] for `PathBuf` fields. Same trim-then-empty
-/// check on the path's string form (via `to_string_lossy` — non-UTF-8
-/// paths are vanishingly unlikely for operator-set config, and would
-/// fail downstream anyway). The gateway's `host_key` /
-/// `authorized_keys` are the 2 `PathBuf` sites of the 10.
-pub fn ensure_required_path(
-    value: &std::path::Path,
-    field: &str,
-    component: &str,
-) -> anyhow::Result<()> {
-    // Lossy is fine here: this is a trim-then-empty check for operator-
-    // facing error messages, not a parse path. A non-UTF-8 config path
-    // would fail at file-open anyway — the empty-check is the point.
-    #[allow(clippy::disallowed_methods)]
-    ensure_required(&value.to_string_lossy(), field, component)
-}
-
 /// Startup-time bounds checks on operator-settable config fields.
 ///
 /// Each binary implements this for its `Config` struct. The validation
@@ -345,7 +328,7 @@ pub fn ensure_required_path(
 /// - check what happens at 0, negative, very-large, NaN/inf
 /// - add an `ensure!` here + a rejection test in the crate's `cfg(test)` mod
 ///
-/// Pair with [`ensure_required`] / [`ensure_required_path`] for the
+/// Pair with [`ensure_required`] for the
 /// `#[serde(default)]` string fields that have no sensible compiled
 /// default (deployment-specific addrs, paths).
 // r[impl common.helpers]
@@ -1044,29 +1027,5 @@ mod tests {
         assert!(err.contains("--database-url"), "flag derived: {err}");
         assert!(err.contains("RIO_DATABASE_URL"), "env derived: {err}");
         assert!(err.contains("store.toml"), "toml from component: {err}");
-    }
-
-    /// PathBuf variant — delegates through the string helper after
-    /// `to_string_lossy()`. Covers gateway's `host_key` /
-    /// `authorized_keys` PathBuf sites.
-    #[test]
-    fn ensure_required_path_rejects_empty_and_whitespace() {
-        // Empty PathBuf.
-        let err = ensure_required_path(std::path::Path::new(""), "host_key", "gateway")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("host_key is required"), "{err}");
-        assert!(err.contains("--host-key"), "{err}");
-        assert!(err.contains("RIO_HOST_KEY"), "{err}");
-        // Whitespace-only PathBuf — same trim-check.
-        ensure_required_path(std::path::Path::new("  "), "host_key", "gateway")
-            .expect_err("whitespace-only path must be rejected");
-        // Nonempty passes.
-        ensure_required_path(
-            std::path::Path::new("/etc/rio/host_key"),
-            "host_key",
-            "gateway",
-        )
-        .expect("real path should pass");
     }
 }
