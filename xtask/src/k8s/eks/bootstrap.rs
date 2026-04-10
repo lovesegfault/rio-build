@@ -9,7 +9,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::sh::repo_root;
+use crate::sh::{self, cmd, repo_root, shell};
 use crate::tofu::{self, Backend};
 
 const DIR: &str = "infra/eks/bootstrap";
@@ -44,10 +44,20 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
         tofu::apply(DIR, false, &vars).await?;
     } else {
         info!("no state in S3 — first-time setup (local apply → migrate)");
-        tofu::init_local(DIR)?;
+        let sh = shell()?;
+        // -backend=false: local state until the S3 bucket exists.
+        sh::run_sync(cmd!(
+            sh,
+            "tofu -chdir={DIR} init -backend=false -reconfigure -upgrade"
+        ))?;
         tofu::apply(DIR, false, &vars).await?;
         info!("bucket created — migrating local state → S3");
-        tofu::init_migrate(DIR, &backend)?;
+        // -migrate-state: move local state into the just-created S3 backend.
+        let (b, r) = (&backend.bucket, &backend.region);
+        sh::run_sync(cmd!(
+            sh,
+            "tofu -chdir={DIR} init -migrate-state -force-copy -backend-config=bucket={b} -backend-config=region={r}"
+        ))?;
         let root = repo_root();
         let _ = std::fs::remove_file(root.join(DIR).join("terraform.tfstate"));
         let _ = std::fs::remove_file(root.join(DIR).join("terraform.tfstate.backup"));

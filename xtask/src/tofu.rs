@@ -32,25 +32,6 @@ pub fn init(dir: &str, backend: &Backend) -> Result<()> {
     ))
 }
 
-/// `tofu init -backend=false` — local state, used for first-time bootstrap.
-pub fn init_local(dir: &str) -> Result<()> {
-    let sh = shell()?;
-    sh::run_sync(cmd!(
-        sh,
-        "tofu -chdir={dir} init -backend=false -reconfigure -upgrade"
-    ))
-}
-
-/// `tofu init -migrate-state` — move local state into S3 after bootstrap.
-pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
-    let sh = shell()?;
-    let (b, r) = (&backend.bucket, &backend.region);
-    sh::run_sync(cmd!(
-        sh,
-        "tofu -chdir={dir} init -migrate-state -force-copy -backend-config=bucket={b} -backend-config=region={r}"
-    ))
-}
-
 /// Plan then apply. Skips apply (and its noisy output) if the plan
 /// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
 /// no-diff, 2 for diff, 1 for error.
