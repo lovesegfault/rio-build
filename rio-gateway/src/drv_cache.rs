@@ -88,6 +88,22 @@ fn insert_drv_bounded(
     true
 }
 
+/// Map a `grpc_get_path` result to a parsed [`Derivation`]. Shared
+/// fetch→parse tail of [`resolve_derivation`] / [`resolve_derivations_batch`].
+fn parse_fetched_drv(
+    path: &StorePath,
+    fetched: Option<(rio_proto::validated::ValidatedPathInfo, Vec<u8>)>,
+) -> anyhow::Result<Derivation> {
+    let (_info, nar) = fetched.ok_or_else(|| GatewayError::DerivationNotFound(path.to_string()))?;
+    Derivation::parse_from_nar(&nar).map_err(|e| {
+        GatewayError::DerivationParse {
+            path: path.to_string(),
+            msg: e.to_string(),
+        }
+        .into()
+    })
+}
+
 /// Best-effort: if `path` is a `.drv`, parse the ATerm from NAR data and
 /// cache it. Logs and continues on parse error or cap hit — the upload
 /// itself still proceeds.
@@ -140,14 +156,10 @@ pub(crate) async fn resolve_derivation(
         return Ok(cached.clone());
     }
 
-    let (_info, nar_data) = grpc_get_path(store_client, None, drv_path.as_str())
-        .await?
-        .ok_or_else(|| GatewayError::DerivationNotFound(drv_path.to_string()))?;
-
-    let drv = Derivation::parse_from_nar(&nar_data).map_err(|e| GatewayError::DerivationParse {
-        path: drv_path.to_string(),
-        msg: e.to_string(),
-    })?;
+    let drv = parse_fetched_drv(
+        drv_path,
+        grpc_get_path(store_client, None, drv_path.as_str()).await?,
+    )?;
 
     // Bound drv_cache. resolve_derivation is called from BFS in
     // translate::reconstruct_dag — cap hit means the DAG is too large
@@ -204,15 +216,8 @@ pub(crate) async fn resolve_derivations_batch(
         .map(|sp| {
             let mut client = store_client.clone();
             async move {
-                let (_info, nar) = grpc_get_path(&mut client, None, sp.as_str())
-                    .await?
-                    .ok_or_else(|| GatewayError::DerivationNotFound(sp.to_string()))?;
-                let drv = Derivation::parse_from_nar(&nar).map_err(|e| {
-                    GatewayError::DerivationParse {
-                        path: sp.to_string(),
-                        msg: e.to_string(),
-                    }
-                })?;
+                let drv =
+                    parse_fetched_drv(&sp, grpc_get_path(&mut client, None, sp.as_str()).await?)?;
                 Ok::<_, anyhow::Error>((sp, drv))
             }
         })
