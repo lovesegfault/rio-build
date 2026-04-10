@@ -397,26 +397,13 @@ pub fn validate_dag(
     // user Nix for bootstrap derivations; NEVER allowed in a
     // multi-tenant build farm. A malicious .drv could use this
     // to exfiltrate secrets from the worker.
-    for node in nodes {
-        // drv_path is the StorePath key in drv_cache (we built
-        // nodes from the cache during BFS).
-        let Ok(sp) = StorePath::parse(&node.drv_path) else {
-            continue; // malformed path — let scheduler reject
-        };
-        let Some(drv) = drv_cache.get(&sp) else {
-            continue; // BasicDerivation fallback, no env
-        };
-        if drv
-            .env()
-            .get("__noChroot")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            return Err(format!(
-                "derivation {} requests __noChroot (sandbox escape) — not permitted",
-                node.drv_path
-            ));
-        }
+    if let Some((_, node, _)) = iter_cached_drvs(nodes, drv_cache, "validate_dag")
+        .find(|(_, _, drv)| drv.env().get("__noChroot").is_some_and(|v| v == "1"))
+    {
+        return Err(format!(
+            "derivation {} requests __noChroot (sandbox escape) — not permitted",
+            node.drv_path
+        ));
     }
 
     Ok(())
