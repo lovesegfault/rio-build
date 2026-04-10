@@ -57,6 +57,5 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }
 # Router::oneshot for health.rs tests (ServiceExt trait).
-tower = { workspace = true, features = ["util"] }
-# figment::Jail for config.rs all_subconfigs standing-guard tests.
-figment = { workspace = true, features = ["test"] }
+tower.workspace = true
+figment.workspace = true

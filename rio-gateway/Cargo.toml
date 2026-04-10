@@ -73,5 +73,4 @@ rio-store = { workspace = true, features = ["test-utils"] }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-# figment::Jail for config.rs all_subconfigs standing-guard tests.
-figment = { workspace = true, features = ["test"] }
+figment.workspace = true

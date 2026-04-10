@@ -175,9 +175,6 @@ proptest = { workspace = true }
 # substitute.rs tests spin an in-process axum server as a fake upstream
 # binary cache (`wiremock` isn't in the deptree).
 axum = { workspace = true }
-# For main.rs ChunkBackendKind TOML + env-var parsing tests. The
-# production code uses figment via rio_common::config::load. dev-dep
-# here for Toml::string + Jail (env manipulation under global mutex).
-figment = { workspace = true, features = ["test"] }
+figment.workspace = true
 # For log-assertion tests (maybe_sign warn on empty refs).
 tracing-test = { workspace = true }

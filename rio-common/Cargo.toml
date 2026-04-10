@@ -70,13 +70,12 @@ proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 # Router::oneshot for health-router unit test.
-tower = { workspace = true, features = ["util"] }
+tower.workspace = true
 # libc::raise for signal self-delivery test.
 libc = "0.2"
 # start_paused + tokio::time::advance in spawn_drain_task test.
 tokio = { workspace = true, features = ["test-util"] }
-# figment::Jail (test-only env/cwd manipulation under a global mutex)
-figment = { workspace = true, features = ["test"] }
+figment.workspace = true
 # In-memory cert generation for mTLS integration test. Generates
 # a CA + client/server leaf certs without touching disk — proves
 # the load_server_tls/load_client_tls output actually works in a

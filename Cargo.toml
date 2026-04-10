@@ -110,8 +110,12 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 
-# Configuration (phase2b: TOML + RIO_ env overlay)
-figment = { version = "0.10", features = ["toml", "env"] }
+# Configuration (phase2b: TOML + RIO_ env overlay). `test` enables
+# figment::Jail (env/cwd isolation under a global mutex) for the per-
+# binary config standing-guard tests; workspace-hack already unifies it
+# into every build, so listing it here costs nothing extra and lets
+# six crates' dev-deps say `figment.workspace = true` without overrides.
+figment = { version = "0.10", features = ["toml", "env", "test"] }
 
 # Compression (phase2b: build-log gzip before S3 flush)
 flate2 = "1"
@@ -140,15 +144,13 @@ moka = { version = "0.12", features = ["future"] }
 # stored uncompressed (chunked) for dedup; zstd only at serve time.
 zstd = "0.13"
 
-# --- phase2c: binary cache HTTP server ---
+# /healthz router (rio-common, rio-builder) + dev-dep fake upstream (rio-store).
 axum = "0.8"
-tower = "0.5"
-# narinfo signing. pkcs8 for key encode/decode; rand_core for keygen in tests.
-# Nix binary caches sign the fingerprint `1;path;narHash;narSize;refs` —
-# sigs are stored at PutPath time so the HTTP server never touches the privkey.
+# narinfo signing (rio-nix/rio-store) + JWT key material (rio-auth, gateway).
+# pkcs8 for key encode/decode; rand_core for keygen in tests.
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 
-# --- phase5: JWT tenant tokens (rio-common::jwt) ---
+# --- phase5: JWT tenant tokens (rio-auth) ---
 # EdDSA (ed25519) signing — scheduler/store/controller verify the gateway's
 # signature + expiry on every gRPC call. The signing key lives in a K8s
 # Secret; the public key is distributed via ConfigMap.
@@ -195,8 +197,8 @@ serde_yml = "0.0.12"
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.
 tonic-health = "0.14"
-# Streaming zstd for the binary-cache /nar/ endpoint. Replaces the
-# buffered encode_all (4GB peak for 4GB NAR) with O(chunk) pipeline.
+# Streaming xz/zstd decode for upstream-substituter NAR fetch
+# (rio-store::substitute). O(chunk) pipeline, never buffers whole NAR.
 async-compression = { version = "0.4", features = ["tokio", "zstd", "xz"] }
 # StreamReader: turn a Stream<Item=Bytes> into an AsyncRead. Feeds
 # async-compression's ZstdEncoder which needs AsyncBufRead.
@@ -265,6 +267,11 @@ rstest = { version = "0.26", default-features = false }
 tempfile = "3"
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"
+# Dev-only across the workspace: Router::oneshot (ServiceExt) for axum
+# handler tests + rio-test-support's in-proc duplex transport. tonic/kube
+# pull tower transitively for prod, but no rio-* crate depends on it
+# directly outside [dev-dependencies].
+tower = { version = "0.5", features = ["util"] }
 
 # Utility
 regex = "1"
