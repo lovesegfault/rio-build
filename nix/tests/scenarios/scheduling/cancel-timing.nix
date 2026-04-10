@@ -27,33 +27,7 @@ scope: with scope; ''
   with subtest("cancel-timing: CancelBuild → cgroup gone within 5s"):
       cancel_before = scrape_metrics(${gatewayHost}, 9091)
 
-      # Instantiate on client (has a local store), copy .drv to
-      # rio-store so the scheduler can find it by path.
-      drv_path = client.succeed(
-          "nix-instantiate "
-          "--arg busybox '(builtins.storePath ${common.busybox})' "
-          "'${cancelDrv}' 2>/dev/null"
-      ).strip()
-      client.succeed(
-          f"nix copy --derivation --to 'ssh-ng://${gatewayHost}' {drv_path}"
-      )
-
-      # SubmitBuild via plaintext gRPC :9001 — submit_build_grpc
-      # handles the grpcurl + `|| true` swallow-DeadlineExceeded +
-      # JSON-parse + buildId-extract boilerplate.
-      #
-      # DerivationNode: drvHash=drvPath for input-addressed (gateway
-      # translate.rs:361 does the same). system is fixture platform.
-      # outputNames=["out"] — mkTrivial's single output. No deps.
-      build_id = submit_build_grpc({
-          "nodes": [{
-              "drvPath": drv_path,
-              "drvHash": drv_path,
-              "system": "${pkgs.stdenv.hostPlatform.system}",
-              "outputNames": ["out"],
-          }],
-          "edges": [],
-      })
+      drv_path, build_id = submit_single_drv("${cancelDrv}")
       print(f"cancel-timing: submitted, build_id={build_id}")
 
       # Wait for cgroup — THIS IS the phase=Building signal (daemon

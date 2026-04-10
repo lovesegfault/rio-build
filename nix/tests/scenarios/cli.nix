@@ -18,7 +18,7 @@
   fixture,
 }:
 let
-  inherit (fixture) ns pki;
+  inherit (fixture) pki;
 
   # Store-path interpolation pulls the binary into the VM closure.
   # rio-cli is a Rust binary, linked to glibc (which the NixOS VM has).
@@ -45,19 +45,9 @@ pkgs.testers.runNixOSTest {
     ${common.mkBootstrap { inherit fixture; }}
 
     # Port-forward the scheduler leader's gRPC port (9001). Unlike
-    # lifecycle.nix's per-call port-forward, this stays up for the
-    # whole test — all CLI calls go through localhost:19001. `trap`
-    # kills it on script exit.
-    leader = leader_pod()
-    k3s_server.succeed(
-        f"k3s kubectl -n ${ns} port-forward {leader} 19001:9001 "
-        ">/tmp/pf-cli.log 2>&1 & echo $! > /tmp/pf-cli.pid"
-    )
-    # Port-forward needs a moment to bind. nc-probe (not sleep):
-    # fails fast if the pf died (scheduler crashed, port in use).
-    k3s_server.wait_until_succeeds(
-        "${pkgs.netcat}/bin/nc -z localhost 19001", timeout=10
-    )
+    # lifecycle.nix's per-call pf_exec, this stays up for the whole
+    # test — all CLI calls go through localhost:19001.
+    pf_open(leader_pod(), 19001, 9001, tag="pf-cli")
 
     # One CLI invocation. Always returns stdout+stderr (2>&1) so error
     # messages show up in the test log on failure. covShellEnv sets

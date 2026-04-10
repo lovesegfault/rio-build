@@ -72,15 +72,8 @@ pkgs.testers.runNixOSTest {
 
     # ── Port-forward to the nginx Service ─────────────────────────────
     # Service maps :80 → targetPort 8080 (nginx listens on 8080 —
-    # runAsNonRoot, no CAP_NET_BIND_SERVICE). Same pattern as the envoy
-    # port-forward in dashboard-gateway.nix.
-    k3s_server.succeed(
-        "k3s kubectl -n ${ns} port-forward svc/rio-dashboard 18081:80 "
-        ">/tmp/pf-nginx.log 2>&1 & echo $! > /tmp/pf-nginx.pid"
-    )
-    k3s_server.wait_until_succeeds(
-        "${pkgs.netcat}/bin/nc -z localhost 18081", timeout=10
-    )
+    # runAsNonRoot, no CAP_NET_BIND_SERVICE).
+    pf_open("svc/rio-dashboard", 18081, 80, tag="pf-nginx")
 
     # ── (1) SPA served: index.html has Svelte mount point ─────────────
     # rio-dashboard/index.html:9 — <div id="app"></div>. vite build

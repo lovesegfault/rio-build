@@ -29,31 +29,13 @@ scope: with scope; ''
   # the drain hadn't completed and dispatch reused it; under GHA
   # nested-virt the drain finished first.
   with subtest("build-timeout: gRPC buildTimeout < sleep → cgroup cleaned, no EEXIST"):
-      drv_path = client.succeed(
-          "nix-instantiate "
-          "--arg busybox '(builtins.storePath ${common.busybox})' "
-          "${timeoutDrv} 2>/dev/null"
-      ).strip()
-      client.succeed(
-          f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+      # buildTimeout is SubmitBuildRequest field 6 (types.proto:655,
+      # camelCase for grpcurl). max_time=3 caps the stream read well
+      # under buildTimeout so we capture the first BuildEvent before
+      # timeout races in.
+      drv_path, build_id = submit_single_drv(
+          "${timeoutDrv}", max_time=3, buildTimeout=45
       )
-
-      # SubmitBuild via gRPC — submit_build_grpc handles the
-      # port-forward + mTLS + JSON-parse + buildId-extract
-      # boilerplate. buildTimeout is SubmitBuildRequest field 6
-      # (types.proto:655, camelCase for grpcurl). max_time=3 caps
-      # the stream read well under buildTimeout so we always
-      # capture the first BuildEvent before timeout races in.
-      build_id = submit_build_grpc({
-          "nodes": [{
-              "drvPath": drv_path,
-              "drvHash": drv_path,
-              "system": "${pkgs.stdenv.hostPlatform.system}",
-              "outputNames": ["out"],
-          }],
-          "edges": [],
-          "buildTimeout": 45,
-      }, max_time=3)
       print(f"build-timeout: submitted, build_id={build_id}")
 
       # ── Assertion 1: cgroup appeared + non-empty (precondition). ──
@@ -176,15 +158,9 @@ scope: with scope; ''
       # DEPENDS ON: scheduler re-dispatching terminal-state drvs.
       # The DAG node goes terminal after TimedOut; resubmit must
       # clear and re-queue. fix-resubmit-terminal lands that path.
-      submit_build_grpc({
-          "nodes": [{
-              "drvPath": drv_path,
-              "drvHash": drv_path,
-              "system": "${pkgs.stdenv.hostPlatform.system}",
-              "outputNames": ["out"],
-          }],
-          "edges": [],
-      }, max_time=3)
+      # Re-instantiate is idempotent (same drv_path); nix copy of an
+      # already-present .drv is a no-op.
+      submit_single_drv("${timeoutDrv}", max_time=3)
       # Cgroup reappeared — concrete proof no EEXIST in
       # BuildCgroup::create. Same dirname (same drv_path → same
       # sanitize_build_id). `| grep .` so wait_until_succeeds retries.

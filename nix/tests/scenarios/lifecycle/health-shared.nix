@@ -45,10 +45,7 @@ scope: with scope; ''
       # it doesn't probe gRPC health). This probe with `-service ...`
       # AND the NOT_SERVING result together prove the named-service
       # gate.
-      k3s_server.succeed(
-          f"k3s kubectl -n ${ns} port-forward {standby} 19101:9101 "
-          f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
-      )
+      pf_open(standby, 19101, 9101, tag="pf-health")
       try:
           out = k3s_server.fail(
               "grpc-health-probe -addr localhost:19101 "
@@ -59,9 +56,7 @@ scope: with scope; ''
               f"(shared HealthReporter, lease-gated), got: {out!r}"
           )
       finally:
-          k3s_server.execute(
-              "kill $(cat /tmp/pf-health.pid) 2>/dev/null; rm -f /tmp/pf-health.pid"
-          )
+          pf_close(tag="pf-health")
 
       # ── LEADER: SERVING on named service ──────────────────────────
       # Exit 0 = SERVING. Leader acquired lease during waitReady →
@@ -71,19 +66,14 @@ scope: with scope; ''
       # ~60s, and port-forward without SO_REUSEADDR can't rebind —
       # it dies silently (stderr→/dev/null), probe gets conn-refused
       # → exit 2. sleep 2 doesn't help; TIME_WAIT outlasts it.
-      k3s_server.succeed(
-          f"k3s kubectl -n ${ns} port-forward {leader} 19102:9101 "
-          f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
-      )
+      pf_open(leader, 19102, 9101, tag="pf-health")
       try:
           k3s_server.succeed(
               "grpc-health-probe -addr localhost:19102 "
               "-service rio.scheduler.SchedulerService"
           )
       finally:
-          k3s_server.execute(
-              "kill $(cat /tmp/pf-health.pid) 2>/dev/null; rm -f /tmp/pf-health.pid"
-          )
+          pf_close(tag="pf-health")
       print("health-shared PASS: standby NOT_SERVING, leader SERVING "
             "(plaintext port shares reporter with mTLS port)")
 ''

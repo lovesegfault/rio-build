@@ -416,15 +416,10 @@ let
     # port-forward is killed by trap even if grpcurl hangs.
     def sched_grpc(payload, method):
         """TriggerGC etc. on the scheduler leader. Returns stdout+stderr."""
-        leader = leader_pod()
-        return k3s_server.succeed(
-            f"k3s kubectl -n ${ns} port-forward {leader} 19001:9001 "
-            f">/dev/null 2>&1 & pf=$!; "
-            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+        return pf_exec(leader_pod(), 9001,
             f"${grpcurl} ${grpcurlTls} -max-time 30 "
             f"-protoset ${protoset}/rio.protoset "
-            f"-d '{payload}' localhost:19001 {method} 2>&1"
-        )
+            f"-d '{payload}' localhost:__PORT__ {method}")
 
     def pin_live(out_path, tag):
         """Insert a scheduler_live_pins row for out_path so the GC mark
@@ -447,47 +442,23 @@ let
             f" WHERE store_path = '{out_path}')"
         )
 
-    # Port-allocation counter for submit_build_grpc. Each call gets
-    # a unique local port (19100, 19101, …) to sidestep TIME_WAIT
-    # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
-    # sched_grpc above uses 19001 (safe — single-call lifetime).
-    # SubmitBuild calls stack within one subtest (build-timeout does
-    # submit→timeout→retry-submit).
-    _submit_port = iter(range(19100, 19200))
-
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
         """SubmitBuild via port-forward + grpcurl. Returns buildId.
 
-        `payload` is the SubmitBuildRequest dict (json.dumps'd internally).
         `max_time` caps the stream read — build usually won't finish,
-        grpcurl exits DeadlineExceeded; `|| true` swallows. The build
-        is persisted on receipt; stream is observability only.
-
-        Raises AssertionError if no BuildEvent JSON in output (submit
-        failed before streaming) or first event lacks buildId.
-        """
-        port = next(_submit_port)
-        leader = leader_pod()
-        out = k3s_server.succeed(
-            f"k3s kubectl -n ${ns} port-forward {leader} {port}:9001 "
-            f">/dev/null 2>&1 & pf=$!; "
-            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+        grpcurl exits DeadlineExceeded; ok_nonzero swallows. The build
+        is persisted on receipt; stream is observability only. pf_exec
+        auto-allocates a fresh port (TIME_WAIT-safe — SubmitBuild calls
+        stack within one subtest, e.g. build-timeout submit→retry)."""
+        out = pf_exec(leader_pod(), 9001,
             f"${grpcurl} ${grpcurlTls} -max-time {max_time} "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{json.dumps(payload)}' "
-            f"localhost:{port} rio.scheduler.SchedulerService/SubmitBuild "
-            f"2>&1 || true"
-        )
-        brace = out.find("{")
-        assert brace >= 0, (
-            f"no JSON in SubmitBuild output — submit failed? got: {out[:500]!r}"
-        )
-        first_ev, _ = json.JSONDecoder().raw_decode(out, brace)
-        build_id = first_ev.get("buildId", "")
-        assert build_id, (
-            f"first BuildEvent missing buildId; got: {first_ev!r}"
-        )
-        return build_id
+            f"localhost:__PORT__ rio.scheduler.SchedulerService/SubmitBuild",
+            ok_nonzero=True)
+        return _parse_submit_build_id(out)
+
+    ${common.mkSubmitHelpers "k3s-server"}
 
     def grpcurl_json_stream(out: str) -> list[dict]:
         """Parse grpcurl's concatenated-JSON output (one pretty-printed

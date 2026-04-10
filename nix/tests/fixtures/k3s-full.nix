@@ -646,6 +646,45 @@ rec {
             )[1])
             raise
         return worker_pod(pool=pool, ns=ns)
+
+    # ── Port-forward helpers ──────────────────────────────────────────
+    # Long-lived: pf_open backgrounds kubectl port-forward, writes
+    # /tmp/{tag}.pid + /tmp/{tag}.log, then nc-probes (NOT sleep — fails
+    # fast if pf died: scheduler crashed, port in use). pf_close kills.
+    # Ports are caller-chosen (long-lived → no TIME_WAIT contention; pick
+    # distinct ports if you need >1 concurrent forward).
+    def pf_open(target, local, remote, ns="${ns}", tag="pf"):
+        k3s_server.succeed(
+            f"k3s kubectl -n {ns} port-forward {target} {local}:{remote} "
+            f">/tmp/{tag}.log 2>&1 & echo $! > /tmp/{tag}.pid"
+        )
+        k3s_server.wait_until_succeeds(
+            f"${pkgs.netcat}/bin/nc -z localhost {local}", timeout=10
+        )
+
+    def pf_close(tag="pf"):
+        k3s_server.execute(
+            f"kill $(cat /tmp/{tag}.pid) 2>/dev/null; rm -f /tmp/{tag}.pid"
+        )
+
+    # Per-call: auto-allocates a fresh local port (TIME_WAIT-safe —
+    # port-forward lacks SO_REUSEADDR, ~60s rebind), backgrounds with
+    # trap-kill, sleeps 2s, runs cmd (literal `__PORT__` substituted —
+    # NOT .format(): cmd is usually a JSON-bearing grpcurl line and
+    # braces would break str.format). Returns stdout+stderr. ok_nonzero
+    # appends `|| true` for swallow-DeadlineExceeded / AlreadyExists.
+    _pf_port = iter(range(19500, 19600))
+
+    def pf_exec(target, remote, cmd, ns="${ns}", ok_nonzero=False):
+        port = next(_pf_port)
+        suffix = " || true" if ok_nonzero else ""
+        return k3s_server.succeed(
+            f"k3s kubectl -n {ns} port-forward {target} {port}:{remote} "
+            f">/dev/null 2>&1 & pf=$!; "
+            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            + cmd.replace("__PORT__", str(port))
+            + f" 2>&1{suffix}"
+        )
   '';
 
   # Full bring-up: ~3-4min wall. Heavy ordering dependency chain —

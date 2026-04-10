@@ -534,6 +534,58 @@ rec {
     )
   '';
 
+  # ── gRPC SubmitBuild helpers ────────────────────────────────────────
+  # _parse_submit_build_id: shared tail of submit_build_grpc — both the
+  # k3s mTLS port-forward variant (lifecycle.nix) and the standalone
+  # plaintext variant (scheduling.nix) end with the same brace-seek +
+  # raw_decode + buildId-extract.
+  #
+  # submit_single_drv: collapses the nix-instantiate → nix copy →
+  # submit_build_grpc(single-node-DAG) sequence that cancel-cgroup-kill,
+  # build-timeout, and cancel-timing all open-coded with the same
+  # ~6-line DerivationNode-shape comment. The scenario prelude must
+  # define submit_build_grpc() FIRST (transport differs by fixture).
+  mkSubmitHelpers = gatewayHost: ''
+    def _parse_submit_build_id(out: str) -> str:
+        brace = out.find("{")
+        assert brace >= 0, (
+            f"no JSON in SubmitBuild output — submit failed? got: {out[:500]!r}"
+        )
+        first_ev, _ = json.JSONDecoder().raw_decode(out, brace)
+        build_id = first_ev.get("buildId", "")
+        assert build_id, f"first BuildEvent missing buildId; got: {first_ev!r}"
+        return build_id
+
+    def submit_single_drv(drv_file, max_time=5, **req):
+        """Instantiate drv_file on client, copy .drv to ssh-ng://${gatewayHost},
+        SubmitBuild a single-node DAG. Returns (drv_path, build_id).
+
+        DerivationNode: drvHash=drvPath (input-addressed; gateway
+        translate.rs:361 does the same), system = VM platform,
+        outputNames=["out"] (mkTrivial single output). The gateway
+        normally parses the .drv for these; gRPC-direct bypasses
+        that. **req merges into SubmitBuildRequest (e.g. buildTimeout)."""
+        drv_path = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${busybox})' "
+            f"{drv_file!r} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://${gatewayHost}' {drv_path}"
+        )
+        build_id = submit_build_grpc({
+            "nodes": [{
+                "drvPath": drv_path,
+                "drvHash": drv_path,
+                "system": "${pkgs.stdenv.hostPlatform.system}",
+                "outputNames": ["out"],
+            }],
+            "edges": [],
+            **req,
+        }, max_time=max_time)
+        return drv_path, build_id
+  '';
+
   # ── Build helper v2 ─────────────────────────────────────────────────
   #
   # Scenario build() helper. Supersedes the v1 helper which baked

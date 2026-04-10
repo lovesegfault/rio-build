@@ -163,14 +163,7 @@ pkgs.testers.runNixOSTest {
         ).strip()
         print(f"envoy data-plane pod: {pod}")
         # Port-forward to envoy admin (127.0.0.1:19000 inside pod).
-        # Same pattern as the svc port-forward below.
-        k3s_server.succeed(
-            f"k3s kubectl -n ${egNs} port-forward pod/{pod} 19000:19000 "
-            ">/tmp/pf-admin.log 2>&1 & echo $! > /tmp/pf-admin.pid"
-        )
-        k3s_server.wait_until_succeeds(
-            "${pkgs.netcat}/bin/nc -z localhost 19000", timeout=10
-        )
+        pf_open(f"pod/{pod}", 19000, 19000, ns="${egNs}", tag="pf-admin")
         # The certgen flannel-race is gated above so the controller
         # starts without secret-mount backoff — 60s here is a genuine
         # xDS-push budget, not a backoff-recovery budget. If grpc_web
@@ -227,22 +220,13 @@ pkgs.testers.runNixOSTest {
             k3s_server.copy_from_vm("/tmp/envoy-config-dump.json", "")
             raise
         finally:
-            k3s_server.execute(
-                "kill $(cat /tmp/pf-admin.pid) 2>/dev/null || true"
-            )
+            pf_close(tag="pf-admin")
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
     # Port-forward to the envoy Service (cluster DNS isn't resolvable
     # from the host netns — the test script runs on k3s_server which
-    # is OUTSIDE the pod network). Same pattern as cli.nix's scheduler
-    # port-forward.
-    k3s_server.succeed(
-        "k3s kubectl -n ${egNs} port-forward svc/rio-dashboard-envoy 18080:8080 "
-        ">/tmp/pf-envoy.log 2>&1 & echo $! > /tmp/pf-envoy.pid"
-    )
-    k3s_server.wait_until_succeeds(
-        "${pkgs.netcat}/bin/nc -z localhost 18080", timeout=10
-    )
+    # is OUTSIDE the pod network).
+    pf_open("svc/rio-dashboard-envoy", 18080, 8080, ns="${egNs}", tag="pf-envoy")
 
     # ── R1 de-risk: unary ClusterStatus via gRPC-Web ────────────────────
     # Empty proto body = 5-byte header (1 byte compression flag + 4

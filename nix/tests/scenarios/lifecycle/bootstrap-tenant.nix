@@ -50,10 +50,7 @@ scope: with scope; ''
       # returns stdout+stderr — same pattern health-shared uses
       # for the NOT_SERVING probe. Port-forward setup separate
       # (.succeed), grpcurl in .fail, cleanup in finally.
-      k3s_server.succeed(
-          f"k3s kubectl -n ${ns} port-forward {standby} 19301:9001 "
-          f">/dev/null 2>&1 & echo $! > /tmp/pf-standby.pid; sleep 2"
-      )
+      pf_open(standby, 19301, 9001, tag="pf-standby")
       try:
           standby_out = k3s_server.fail(
               "${grpcurl} ${grpcurlTls} -max-time 15 "
@@ -82,10 +79,7 @@ scope: with scope; ''
               f"not the leader-guard? out:\n{standby_out}"
           )
       finally:
-          k3s_server.execute(
-              "kill $(cat /tmp/pf-standby.pid) 2>/dev/null; "
-              "rm -f /tmp/pf-standby.pid"
-          )
+          pf_close(tag="pf-standby")
 
       # ── Lease-routed CreateTenant — 3 attempts, deterministic ─────
       # Each attempt re-queries leader_pod() → fresh Lease read →
@@ -93,25 +87,20 @@ scope: with scope; ''
       # the Lease stable (no failover during this ~15s window),
       # all 3 hit the same pod. First succeeds; 2nd/3rd return
       # AlreadyExists (db/tenants.rs: ON CONFLICT DO NOTHING →
-      # None → admin/mod.rs maps to AlreadyExists). `|| true`
+      # None → admin/mod.rs maps to AlreadyExists). ok_nonzero
       # swallows the AlreadyExists so we assert on output, not
-      # exit code. Unique port per attempt: port-forward lacks
-      # SO_REUSEADDR, TIME_WAIT takes ~60s to clear.
+      # exit code. pf_exec auto-allocates a fresh port per call
+      # (TIME_WAIT-safe).
       tenant_name = "prod-parity-test"
       attempt_outs = []
       for i in range(3):
           ldr = leader_pod()
-          port = 19310 + i
-          out = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} port-forward {ldr} {port}:9001 "
-              f">/dev/null 2>&1 & pf=$!; "
-              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+          out = pf_exec(ldr, 9001,
               f"${grpcurl} ${grpcurlTls} -max-time 15 "
               f"-protoset ${protoset}/rio.protoset "
               f"-d '{{\"tenantName\": \"{tenant_name}\"}}' "
-              f"localhost:{port} rio.admin.AdminService/CreateTenant "
-              f"2>&1 || true"
-          )
+              f"localhost:__PORT__ rio.admin.AdminService/CreateTenant",
+              ok_nonzero=True)
           attempt_outs.append(out)
           print(f"bootstrap-tenant: attempt {i+1} (leader={ldr}):\n{out}")
 
@@ -133,16 +122,10 @@ scope: with scope; ''
       # Via the same Lease-routed path. ListTenants is read-only
       # but also leader-guarded (admin reads need consistent
       # view). Response is JSON (grpcurl default output).
-      ldr = leader_pod()
-      list_out = k3s_server.succeed(
-          f"k3s kubectl -n ${ns} port-forward {ldr} 19320:9001 "
-          f">/dev/null 2>&1 & pf=$!; "
-          f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-          f"${grpcurl} ${grpcurlTls} -max-time 15 "
-          f"-protoset ${protoset}/rio.protoset "
-          f"-d '{{}}' "
-          f"localhost:19320 rio.admin.AdminService/ListTenants 2>&1"
-      )
+      list_out = pf_exec(leader_pod(), 9001,
+          "${grpcurl} ${grpcurlTls} -max-time 15 "
+          "-protoset ${protoset}/rio.protoset -d '{}' "
+          "localhost:__PORT__ rio.admin.AdminService/ListTenants")
       print(f"bootstrap-tenant: ListTenants:\n{list_out}")
       assert tenant_name in list_out, (
           f"{tenant_name!r} should appear in ListTenants after 3 "

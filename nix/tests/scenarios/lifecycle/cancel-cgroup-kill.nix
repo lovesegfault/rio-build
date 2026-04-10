@@ -20,34 +20,7 @@ scope: with scope; ''
   # surfaced to the nix client. P0289's build-timeout port inherits
   # this gRPC-direct pattern.
   with subtest("cancel-cgroup-kill: gRPC CancelBuild mid-exec → cgroup.kill"):
-      drv_path = client.succeed(
-          "nix-instantiate "
-          "--arg busybox '(builtins.storePath ${common.busybox})' "
-          "${cancelDrv} 2>/dev/null"
-      ).strip()
-      client.succeed(
-          f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
-      )
-
-      # SubmitBuild via gRPC — submit_build_grpc handles port-forward
-      # + mTLS + grpcurl + JSON-parse + buildId-extract. Port is
-      # auto-allocated from the 19100+ iterator (TIME_WAIT-safe).
-      #
-      # DerivationNode requires drvHash + system (scheduler grpc/mod.rs
-      # :379-407 validates). drvHash = drvPath for input-addressed
-      # derivations (gateway translate.rs:361 does the same). system
-      # is the VM platform. outputNames = ["out"] — mkTrivial's single
-      # output. The gateway normally parses the .drv to populate
-      # these; we're bypassing that, so we fill them statically.
-      build_id = submit_build_grpc({
-          "nodes": [{
-              "drvPath": drv_path,
-              "drvHash": drv_path,
-              "system": "${pkgs.stdenv.hostPlatform.system}",
-              "outputNames": ["out"],
-          }],
-          "edges": [],
-      })
+      drv_path, build_id = submit_single_drv("${cancelDrv}")
       print(f"cancel-cgroup-kill: submitted, build_id={build_id}")
 
       # Wait for the build's cgroup to appear — this IS the

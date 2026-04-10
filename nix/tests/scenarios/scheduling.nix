@@ -144,11 +144,8 @@ let
 
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
         """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
-
-        Standalone fixture variant — no port-forward, no mTLS.
-        Same JSON-parse + buildId-extract contract as lifecycle.nix's
-        k3s variant; same `|| true` swallow-DeadlineExceeded.
-        """
+        Standalone fixture variant — no port-forward, no mTLS. Same
+        `|| true` swallow-DeadlineExceeded as the k3s variant."""
         out = ${gatewayHost}.succeed(
             f"grpcurl -plaintext -max-time {max_time} "
             f"-protoset ${protoset}/rio.protoset "
@@ -156,16 +153,9 @@ let
             f"localhost:9001 rio.scheduler.SchedulerService/SubmitBuild "
             f"2>&1 || true"
         )
-        brace = out.find("{")
-        assert brace >= 0, (
-            f"no JSON in SubmitBuild output — submit failed?\n{out[:500]!r}"
-        )
-        first_ev, _ = json.JSONDecoder().raw_decode(out, brace)
-        build_id = first_ev.get("buildId", "")
-        assert build_id, (
-            f"first BuildEvent missing buildId; got: {first_ev!r}"
-        )
-        return build_id
+        return _parse_submit_build_id(out)
+
+    ${common.mkSubmitHelpers gatewayHost}
 
     # ── Size-class config load (precondition) ─────────────────────────
     # This gauge is set once at startup from /etc/rio/scheduler.toml.
