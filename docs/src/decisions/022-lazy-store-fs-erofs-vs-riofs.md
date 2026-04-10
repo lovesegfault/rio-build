@@ -246,13 +246,13 @@ The §2 stack optimizes the **read** side — inputs reach the build via per-fil
 r[store.put.chunked]
 
 ```text
-builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject ──best-effort──▶ S3 Express (per-AZ)
-   │  (only egress)     │  (per-chunk, on arrival;             (TieredChunkBackend §9)
+builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject (S3-standard only)
+   │  (only egress)     │  (per-chunk, on arrival;
    │                    │   no whole-NAR buffer)
    └── air-gapped: never reaches S3, S3 Express, or any network endpoint other than rio-store
 ```
 
-**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it via rio-store's existing `TieredChunkBackend.put` (S3-standard first, then best-effort Express; [Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
+**This does not widen the builder trust boundary or the cache-tier surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 standard and S3 Express are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ Express cache stays unreachable from the builder — chunks reach it only via rio-store's serve-side `TieredChunkBackend.get` read-through, not on `put` ([Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
 
 ### 6.1 Builder-side fused walk
 

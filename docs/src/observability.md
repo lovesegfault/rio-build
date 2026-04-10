@@ -171,7 +171,7 @@ r[obs.metric.store]
 |--------|------|-------------|
 | `rio_store_put_path_total` | Counter | Total PutPath operations (per store path; PutPathBatch counts each output) |
 | `rio_store_putpath_retries_total` | Counter | PutPath retriable rejections (labeled by `reason`: `serialization`/`deadlock`/`placeholder_missing`/`connection`/`resource_exhausted`/`concurrent_upload`). Client retries on `aborted`/`unavailable`. Sustained high `deadlock`/`connection` rate = PG-side problem. GC no longer blocks PutPath (I-192). |
-| `rio_store_put_path_duration_seconds` | Histogram | PutPath latency |
+| `rio_store_put_path_duration_seconds` | Histogram | PutPath latency. Labeled by `rpc` (`put_path`/`put_path_batch`/`put_path_chunked`) so server-side vs client-side chunking are separable — the trigger for revisiting the deferred ingest/serve role split (Design Overview §9) is this histogram's `rpc=put_path*` p99 under load. |
 | `rio_store_integrity_failures_total` | Counter | GetPath content integrity check failures (bitrot/corruption) |
 | `rio_store_chunk_dedup_ratio` | Gauge | Per-upload dedup ratio (1.0 - missing/total after chunking) |
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |

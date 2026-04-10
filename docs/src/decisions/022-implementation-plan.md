@@ -1,7 +1,7 @@
 # ADR-022 Implementation Plan — composefs-style lazy store + per-AZ S3 Express chunk cache
 
 **Status:** sequencing only — design is [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) + [Design Overview](./022-design-overview.md) + ADR-023.
-**Plan-number range:** P0541–P0583 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
+**Plan-number range:** P0541–P0584 (gaps at 0542/0547/0558 are abandoned numbers; do not reuse).
 **Clean-cutover constraint:** no FUSE fallback flag, no `RIO_STORE_BACKEND` selector. P0560 deletes the old FUSE module wholesale.
 **Cross-region forward-compat:** object store (S3/GCS) is authoritative for bytes; S3 Express One Zone is a per-AZ read-through cache; PG is single-region. Nothing here precludes cross-region deployment (object-store-authoritative, cache tier stateless) but it is not implemented. No DRA. **Express AZ-ID availability constrains region/AZ choice** — see [Design Overview §9](./022-design-overview.md).
 **Migration-number range:** `033_*` (last shipped: `032_derivations_size_class_floor.sql`).
@@ -127,6 +127,7 @@ P0552 GetNarIndex + indexer_loop  │                   │                     
    │                              │             P0579 compat config+helm ──► P0566 compat writer ──► P0580 vm:compat-substitute  ★ U6 LANDS
    │                              │                                              └─► P0581 compat GC ──► P0582 compat reconciler
    │                              │             P0583 drop inline_blob (one code path; chunk_backend required)
+   │                              │             P0584 builder-chunked-only auth gate (token role=builder → PutPath PERMISSION_DENIED)
    │                              │
 ┌── Phase 4 composefs store-side (gated on Phase-0 + P0546) ──┐
 P0556 composefs-sys + encode.rs (libcomposefs FFI; nix-patched user.* + no-root-whiteouts) + golden VM
@@ -259,7 +260,7 @@ The `Read+Seek` variant is not implemented — callers that have a `Vec<u8>` wra
 
 ### P0548 — TieredChunkBackend (object-store authoritative; S3 Express read-through cache)
 **Crate:** `rio-store` · **Deps:** P0544 · **Complexity:** LOW
-`rio-store/src/backend/tiered.rs`: `TieredChunkBackend { local: Option<S3ChunkBackend>, remote: S3ChunkBackend }`. `put` = remote sync then local best-effort; `get` = local → remote fallback + write-through; `local=None` degrades to pass-through. Both tiers are the existing `S3ChunkBackend` — **no `backend/fs.rs`**, no new put-idempotence (S3 PutObject already is). `// r[impl store.backend.{tiered-get-fallback,tiered-put-remote-first}]`. **Exit:** `.#ci` green.
+`rio-store/src/backend/tiered.rs`: `TieredChunkBackend { local: Option<S3ChunkBackend>, remote: S3ChunkBackend }`. `put` = **remote only** (Express filled solely via `get`'s read-through); `get` = local → remote fallback + write-through; `local=None` degrades to pass-through. Both tiers are the existing `S3ChunkBackend` — **no `backend/fs.rs`**, no new put-idempotence (S3 PutObject already is). `// r[impl store.backend.{tiered-get-fallback,tiered-put-remote-first}]`. **Exit:** `.#ci` green.
 
 ### P0549 — ChunkBackend blob-API
 **Crate:** `rio-store` · **Deps:** P0544, P0548 · **Complexity:** LOW
@@ -354,7 +355,7 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 
 ### P0555 — VM test: tiered-backend cache semantics
 **Crate:** `nix` · **Deps:** P0548, P0554 · **Complexity:** MED
-`nix/tests/scenarios/store-tiered.nix`: two store replicas + two minio instances (one "local" Express stand-in, one shared "remote" S3-standard); subtests `cold-miss-fallback`, `put-remote-first`, `replica-warm-from-peer-write`, `local-none-passthrough`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-tiered` green; `.#ci` green.
+`nix/tests/scenarios/store-tiered.nix`: two store replicas + two minio instances (one "local" Express stand-in, one shared "remote" S3-standard); subtests `cold-miss-fallback`, `put-remote-only` (assert local minio empty post-put), `replica-warm-via-read-through` (replica B's first read miss fills local; replica C's read hits local), `local-none-passthrough`. **Exit:** `nix build .#checks.x86_64-linux.vm-store-tiered` green; `.#ci` green.
 
 ### P0579 — `binary_cache_compat` config + helm
 **Crate:** `rio-store, infra` · **Deps:** P0544 · **Complexity:** LOW
@@ -413,6 +414,18 @@ Closes the subtree-merkle gap vs snix at **zero serving-path cost** — the moun
 **Dropped marker:** `r[store.inline.threshold]` — remove any `r[impl store.inline.threshold]` / `r[verify …]` annotations in code.
 **Note for P0566/P0582:** depend on this for the `chunk_list: &[ChunkRef]` signature simplification; sequence after P0583 if not already merged.
 **Exit:** `.#ci` green; `tracey query rule store.inline.threshold` reports no-such-rule.
+
+### P0584 — builder-chunked-only auth gate
+**Crate:** `rio-store, rio-scheduler, rio-common` · **Deps:** P0544 · **Blocked on:** `PutPathChunked` plan (designed at [§6](./022-lazy-store-fs-erofs-vs-riofs.md#6-extension-chunked-output-upload-putpathchunked); sequencing TBD — see follow-on note at end of this doc) · **Complexity:** LOW
+| File | Change |
+|---|---|
+| `rio-common/src/auth/token.rs` | add `role: TokenRole` field to `AssignmentClaims` (enum `Builder`/`Gateway`/`Admin`; serde-tagged) |
+| `rio-scheduler/src/dispatch.rs` | token issuance for builder assignments sets `role: TokenRole::Builder` |
+| `rio-store/src/grpc/put_path.rs` | at the existing token-verify step: if `claims.role == Builder`, return `Status::permission_denied("builders must use PutPathChunked; PutPath is gateway/admin-only")` before any buffering. Same gate in `put_path_batch.rs`. `// r[impl store.put.builder-chunked-only]` |
+| `rio-store/src/grpc/put_path_chunked.rs` | accepts `Builder` role (and `Gateway`/`Admin`); same `expected_outputs` check as today |
+| tests | unit: builder-role token → `PutPath` returns `PERMISSION_DENIED`; gateway-role token → `PutPath` proceeds; builder-role token → `PutPathChunked` proceeds. `// r[verify store.put.builder-chunked-only]` |
+| `docs/src/security.md` | assignment-token section: document `role` claim |
+**Exit:** `.#ci` green.
 
 ---
 
@@ -684,6 +697,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 {"plan":581,"title":"compat GC: enqueue narinfo+nar.zst to pending_s3_deletes on sweep; narinfo.compat_file_hash column","deps":[566],"crate":"rio-store","priority":75,"status":"UNIMPL","complexity":"LOW","note":"runs regardless of current enabled value"}
 {"plan":582,"title":"compat reconciler: backfill compat_file_hash IS NULL rows","deps":[566,581],"crate":"rio-store","priority":60,"status":"UNIMPL","complexity":"LOW","note":"crash-window + toggle-ON backfill; deferrable"}
 {"plan":583,"title":"drop inline_blob: all NARs chunked; ChunkBackendKind::Inline removed; chunk_backend required","deps":[544],"crate":"rio-store,rio-proto","priority":80,"status":"UNIMPL","complexity":"MED","note":"greenfield: ALTER TABLE manifests DROP COLUMN inline_blob in mig 033; ManifestKind collapses; chunk_cache no longer Option"}
+{"plan":584,"title":"builder-chunked-only auth gate: token role=builder rejected by PutPath/PutPathBatch","deps":[544,576],"crate":"rio-store,rio-scheduler,rio-common","priority":80,"status":"UNIMPL","complexity":"LOW","note":"AssignmentClaims.role; PERMISSION_DENIED before buffering; pushes FastCDC CPU to builders"}
 {"plan":556,"title":"libcomposefs FFI encoder (composefs-sys + encode.rs) + nix patch (user.* prefix, no-root-whiteouts) + golden VM + fuzz","deps":[569,546],"crate":"rio-builder,composefs-sys,nix","priority":85,"status":"UNIMPL","complexity":"LOW","note":"~100 LoC owned (18 build.rs + ~80 adapter) + ~25-line C patch; spike ~46ms/23k files; both flags upstreamable"}
 {"plan":557,"title":"PutPath eager nar_index compute (try_acquire-gated; no encode)","deps":[551,552],"crate":"rio-store","priority":80,"status":"UNIMPL","complexity":"LOW","note":"nar_ls+blake3 while NAR in RAM; no S3 artifact"}
 {"plan":567,"title":"rio-mountd DaemonSet (fd-handoff + BACKING_OPEN broker + Promote/PromoteChunk verify-copy + cache+chunks ownership + metrics)","deps":[576,578],"crate":"rio-builder,infra","priority":80,"status":"UNIMPL","complexity":"MED","note":"~250 LoC; tokio async per-conn, Promote on spawn_blocking+Semaphore; PromoteChunk inline sub-ms; owns mountd_proto.rs; integrity boundary for shared cache+chunks"}
@@ -708,7 +722,8 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | Marker | Spec file (P0544) | `r[impl]` (plan) | `r[verify]` site (plan) |
 |---|---|---|---|
 | `store.backend.tiered-get-fallback` | components/store.md | tiered.rs `get()` (P0548) | vm-store-tiered `cold-miss-fallback` (P0555) |
-| `store.backend.tiered-put-remote-first` | components/store.md | tiered.rs `put()` (P0548) | vm-store-tiered `put-remote-first` (P0555) |
+| `store.backend.tiered-put-remote-first` | components/store.md | tiered.rs `put()` (P0548) | vm-store-tiered `put-remote-only` (P0555) |
+| `store.put.builder-chunked-only` | components/store.md | grpc/put_path.rs token-role gate (P0584) | unit (P0584) |
 | `store.index.nar-ls-offset` | components/store.md | rio-nix/nar.rs (P0546) | proptest in nar.rs (P0546) |
 | `store.index.file-digest` | components/store.md | rio-nix/nar.rs (P0546) | proptest in nar.rs (P0546) |
 | `store.index.table-cascade` | components/store.md | metadata/queries.rs (P0551) | rio-store/tests/nar_index.rs (P0552) |
@@ -767,7 +782,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 | `infra.express.cache-tier` | decisions/023 | infra/eks/s3-express.tf (P0553) | (live-only — runbook P0565) |
 | `infra.node.kernel-composefs` | deployment.md | nix/nixos-node/kernel.nix (prereq) | nix/checks.nix node-kernel-config (prereq) |
 
-59 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
+60 markers. P0560 DELETES legacy `r[builder.fuse.*]`; P0562 audits via `tracey query uncovered | grep -E 'composefs|tiered|index|digest-fuse|compat'` → empty.
 `config.styx` `test_include`: P0544 verifies `rio-nix/src/nar.rs` and `rio-builder/src/composefs/resolver.rs` are in scope (or adds them).
 
 ---
@@ -789,7 +804,7 @@ Completes the snix-compatible castore surface: a client holding only a `file_dig
 |---|---|---|
 | `rio-store/src/backend/{chunk.rs,tiered.rs,mod.rs}` | P0548, P0549 | P0548 → P0549 (dep edge) |
 | `rio-store/src/grpc/mod.rs` | P0552, P0557 | P0552 → P0557 (dep edge) |
-| `rio-store/src/grpc/put_path.rs` | P0566, P0557, P0583 | P0583 (size-branch removal) first; P0566/P0557 append after `complete_manifest` — P0557 rebases on P0566 |
+| `rio-store/src/grpc/put_path.rs` | P0566, P0557, P0583, P0584 | P0583 (size-branch removal) first; P0584 (token-role gate, top of handler) independent of P0566/P0557 (append after `complete_manifest`) — P0557 rebases on P0566 |
 | `rio-store/src/grpc/get_path.rs` | P0583 only | — |
 | `rio-store/src/metadata/{inline.rs,chunked.rs,mod.rs}` | P0583 only | — |
 | `rio-store/src/nar_index.rs` | P0552 (create), P0572 (directories insert), P0557 (eager) | P0552 → P0572 → P0557 |
