@@ -104,45 +104,36 @@ impl NarInfo {
             let key = key.trim();
             let value = value.trim();
 
+            // Set-once helper: most fields are `Option<_>` that must appear at
+            // most once. The 1-arg form stores `value.to_string()`; the 2-arg
+            // form lets NarSize/FileSize parse first.
+            macro_rules! once {
+                ($field:ident, $name:literal) => {
+                    once!($field, $name, value.to_string())
+                };
+                ($field:ident, $name:literal, $val:expr) => {{
+                    if $field.is_some() {
+                        return Err(NarInfoError::DuplicateField($name));
+                    }
+                    $field = Some($val);
+                }};
+            }
+
             match key {
-                "StorePath" => {
-                    if store_path.is_some() {
-                        return Err(NarInfoError::DuplicateField("StorePath"));
-                    }
-                    store_path = Some(value.to_string());
-                }
-                "URL" => {
-                    if url.is_some() {
-                        return Err(NarInfoError::DuplicateField("URL"));
-                    }
-                    url = Some(value.to_string());
-                }
-                "Compression" => {
-                    if compression.is_some() {
-                        return Err(NarInfoError::DuplicateField("Compression"));
-                    }
-                    compression = Some(value.to_string());
-                }
-                "NarHash" => {
-                    if nar_hash.is_some() {
-                        return Err(NarInfoError::DuplicateField("NarHash"));
-                    }
-                    nar_hash = Some(value.to_string());
-                }
-                "NarSize" => {
-                    if nar_size.is_some() {
-                        return Err(NarInfoError::DuplicateField("NarSize"));
-                    }
-                    nar_size =
-                        Some(
-                            value
-                                .parse::<u64>()
-                                .map_err(|e| NarInfoError::InvalidNarSize {
-                                    value: value.to_string(),
-                                    source: e,
-                                })?,
-                        );
-                }
+                "StorePath" => once!(store_path, "StorePath"),
+                "URL" => once!(url, "URL"),
+                "Compression" => once!(compression, "Compression"),
+                "NarHash" => once!(nar_hash, "NarHash"),
+                "NarSize" => once!(
+                    nar_size,
+                    "NarSize",
+                    value
+                        .parse::<u64>()
+                        .map_err(|e| NarInfoError::InvalidNarSize {
+                            value: value.to_string(),
+                            source: e,
+                        })?
+                ),
                 "References" => {
                     if refs_seen {
                         return Err(NarInfoError::DuplicateField("References"));
@@ -152,39 +143,20 @@ impl NarInfo {
                         references = value.split_whitespace().map(String::from).collect();
                     }
                 }
-                "Deriver" => {
-                    if deriver.is_some() {
-                        return Err(NarInfoError::DuplicateField("Deriver"));
-                    }
-                    deriver = Some(value.to_string());
-                }
+                "Deriver" => once!(deriver, "Deriver"),
                 "Sig" => sigs.push(value.to_string()),
-                "CA" => {
-                    if ca.is_some() {
-                        return Err(NarInfoError::DuplicateField("CA"));
-                    }
-                    ca = Some(value.to_string());
-                }
-                "FileHash" => {
-                    if file_hash.is_some() {
-                        return Err(NarInfoError::DuplicateField("FileHash"));
-                    }
-                    file_hash = Some(value.to_string());
-                }
-                "FileSize" => {
-                    if file_size.is_some() {
-                        return Err(NarInfoError::DuplicateField("FileSize"));
-                    }
-                    file_size =
-                        Some(
-                            value
-                                .parse::<u64>()
-                                .map_err(|e| NarInfoError::InvalidFileSize {
-                                    value: value.to_string(),
-                                    source: e,
-                                })?,
-                        );
-                }
+                "CA" => once!(ca, "CA"),
+                "FileHash" => once!(file_hash, "FileHash"),
+                "FileSize" => once!(
+                    file_size,
+                    "FileSize",
+                    value
+                        .parse::<u64>()
+                        .map_err(|e| NarInfoError::InvalidFileSize {
+                            value: value.to_string(),
+                            source: e,
+                        })?
+                ),
                 _ => {} // Ignore unknown fields for forward compatibility
             }
         }
