@@ -1,10 +1,9 @@
 //! Mock gRPC services and server spawn helpers for tests.
 //!
 //! [`MockStore`] stores NAR bytes in-memory, records PutPath calls, and
-//! supports prefix-match QueryPathInfo (for hash-part lookups). Its
-//! fields are grouped into [`MockStoreState`] (in-memory data),
-//! [`MockStoreCalls`] (call recorders for assertions), and
-//! [`MockStoreFaults`] (fault injection knobs).
+//! supports prefix-match QueryPathInfo (for hash-part lookups). Its pub
+//! fields are grouped into `state` (in-memory data), `calls` (call
+//! recorders for assertions), and `faults` (fault injection knobs).
 //!
 //! [`MockScheduler`] has independently-configurable [`SubmitOutcome`] /
 //! [`WatchOutcome`] and records SubmitBuild + CancelBuild + WatchBuild calls.
@@ -24,4 +23,4 @@ pub use spawn::{
     dead_channel, spawn_grpc_server, spawn_grpc_server_layered, spawn_mock_store,
     spawn_mock_store_inproc, spawn_mock_store_with_client,
 };
-pub use store::{MockStore, MockStoreCalls, MockStoreFaults, MockStoreState};
+pub use store::MockStore;
