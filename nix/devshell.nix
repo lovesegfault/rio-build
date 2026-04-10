@@ -96,6 +96,8 @@ let
     skopeo # cargo xtask k8s push -p eks — docker-archive → ECR
     manifest-tool # cargo xtask k8s push -p eks — multi-arch OCI index
     kubernetes-helm
+    cilium-cli # cilium status, cilium hubble ui (port-forward)
+    hubble # hubble observe --server localhost:4245 (after port-forward to hubble-relay)
     kubeconform # ad-hoc schema validation (no pre-commit hook — fetches 300MB, sandbox blocks)
     yq-go # nix/helm-render.nix
     grpcurl # manual AdminService poking when rio-cli isn't enough
