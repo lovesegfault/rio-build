@@ -42,7 +42,9 @@ impl Provider for Eks {
         })
         .await?;
         ui::step("tofu init", || async { tofu::init(TF_DIR, &backend) }).await?;
-        tofu::apply(TF_DIR, auto, &[]).await?;
+        // hubble_ui_enabled defaults false (variables.tf); xtask-driven
+        // dev/QA clusters get the web UI for flow debugging.
+        tofu::apply(TF_DIR, auto, &[("hubble_ui_enabled", "true")]).await?;
         ui::step("kubeconfig", || async { kubeconfig() }).await
     }
 

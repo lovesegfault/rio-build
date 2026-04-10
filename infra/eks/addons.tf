@@ -138,6 +138,9 @@ resource "helm_release" "cilium" {
       hubble = {
         enabled = true
         relay   = { enabled = true }
+        # UI is dev/QA-only — xtask up passes -var hubble_ui_enabled=true;
+        # direct tofu apply leaves it off.
+        ui = { enabled = var.hubble_ui_enabled }
       }
 
       # Embedded envoy (NOT separate cilium-envoy DaemonSet). Cilium

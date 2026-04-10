@@ -32,6 +32,12 @@ variable "cilium_version" {
   type        = string
 }
 
+variable "hubble_ui_enabled" {
+  description = "Deploy the Hubble web UI. Off by default; xtask up sets this true for dev/QA clusters."
+  type        = bool
+  default     = false
+}
+
 variable "gateway_api_version" {
   description = "Gateway API CRD release tag (kubernetes-sigs/gateway-api)."
   type        = string
