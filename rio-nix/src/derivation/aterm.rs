@@ -254,26 +254,7 @@ impl Derivation {
         write_aterm_outputs(&mut out, &self.outputs, false);
         out.push(',');
 
-        // inputDrvs
-        out.push('[');
-        for (i, (drv_path, output_names)) in self.input_drvs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, drv_path);
-            out.push(',');
-            out.push('[');
-            for (j, name) in output_names.iter().enumerate() {
-                if j > 0 {
-                    out.push(',');
-                }
-                write_aterm_string(&mut out, name);
-            }
-            out.push(']');
-            out.push(')');
-        }
-        out.push(']');
+        write_aterm_input_drvs(&mut out, &self.input_drvs);
         out.push(',');
 
         write_aterm_tail(
@@ -325,26 +306,7 @@ impl Derivation {
                 .ok_or_else(|| DerivationError::InputNotFound(drv_path.clone()))?;
             replaced_inputs.insert(new_key.as_str(), output_names);
         }
-
-        out.push('[');
-        for (i, (key, output_names)) in replaced_inputs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, key);
-            out.push(',');
-            out.push('[');
-            for (j, name) in output_names.iter().enumerate() {
-                if j > 0 {
-                    out.push(',');
-                }
-                write_aterm_string(&mut out, name);
-            }
-            out.push(']');
-            out.push(')');
-        }
-        out.push(']');
+        write_aterm_input_drvs(&mut out, replaced_inputs);
         out.push(',');
 
         // mask_outputs masks env vars too — see doc comment above.
@@ -424,6 +386,35 @@ fn write_aterm_outputs(out: &mut String, outputs: &[DerivationOutput], mask_path
     out.push(']');
 }
 
+/// Write the `[inputDrvs]` section: `[(key,[name,...]),...]`. Generic over
+/// key type so [`Derivation::to_aterm`] (`&String` from `BTreeMap<String,_>`)
+/// and [`Derivation::to_aterm_modulo`] (`&str` from the rewritten map) share
+/// one body.
+fn write_aterm_input_drvs<'a, K: AsRef<str>>(
+    out: &mut String,
+    drvs: impl IntoIterator<Item = (K, &'a BTreeSet<String>)>,
+) {
+    out.push('[');
+    for (i, (key, names)) in drvs.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('(');
+        write_aterm_string(out, key.as_ref());
+        out.push(',');
+        out.push('[');
+        for (j, name) in names.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            write_aterm_string(out, name);
+        }
+        out.push(']');
+        out.push(')');
+    }
+    out.push(']');
+}
+
 /// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
 /// builder, args, env, and the closing `)`. Used by
 /// [`Derivation::to_aterm`], [`Derivation::to_aterm_modulo`], and
@@ -491,6 +482,7 @@ fn write_aterm_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn parse_simple_derivation() -> anyhow::Result<()> {
@@ -575,43 +567,22 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn roundtrip_simple() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/abc-simple"),("system","x86_64-linux")])"#;
-
+    #[rstest]
+    #[case::simple(
+        r#"Derive([("out","/nix/store/abc-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/abc-simple"),("system","x86_64-linux")])"#
+    )]
+    #[case::with_input_drvs(
+        r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#
+    )]
+    #[case::with_escapes(
+        r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#
+    )]
+    #[case::fixed_output(
+        r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("system","x86_64-linux")])"#
+    )]
+    fn roundtrip(#[case] aterm: &str) -> anyhow::Result<()> {
         let drv = Derivation::parse(aterm)?;
-        let serialized = drv.to_aterm();
-        assert_eq!(serialized, aterm);
-        Ok(())
-    }
-
-    #[test]
-    fn roundtrip_with_input_drvs() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
-
-        let drv = Derivation::parse(aterm)?;
-        let serialized = drv.to_aterm();
-        assert_eq!(serialized, aterm);
-        Ok(())
-    }
-
-    #[test]
-    fn roundtrip_with_escapes() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
-
-        let drv = Derivation::parse(aterm)?;
-        let serialized = drv.to_aterm();
-        assert_eq!(serialized, aterm);
-        Ok(())
-    }
-
-    #[test]
-    fn roundtrip_fixed_output() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("system","x86_64-linux")])"#;
-
-        let drv = Derivation::parse(aterm)?;
-        let serialized = drv.to_aterm();
-        assert_eq!(serialized, aterm);
+        assert_eq!(drv.to_aterm(), aterm);
         Ok(())
     }
 
