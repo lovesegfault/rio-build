@@ -115,8 +115,13 @@ impl<'a> ATermParser<'a> {
         }
     }
 
-    /// Parse a comma-separated list of strings inside `[...]`.
-    fn parse_string_list(&mut self) -> Result<Vec<String>, DerivationError> {
+    /// Parse a comma-separated `[item,item,...]` list, delegating per-item
+    /// parsing to `item`. Handles the empty-list fast path, the
+    /// `MAX_ATERM_LIST_ITEMS` bound, and the `,`/`]` terminator dispatch.
+    fn parse_list<T>(
+        &mut self,
+        mut item: impl FnMut(&mut Self) -> Result<T, DerivationError>,
+    ) -> Result<Vec<T>, DerivationError> {
         self.expect("[")?;
         let mut items = Vec::new();
         if self.peek() == Some(']') {
@@ -127,7 +132,7 @@ impl<'a> ATermParser<'a> {
             if items.len() >= MAX_ATERM_LIST_ITEMS {
                 return Err(DerivationError::CollectionTooLarge(items.len()));
             }
-            items.push(self.parse_string()?);
+            items.push(item(self)?);
             match self.peek() {
                 Some(',') => self.advance(),
                 Some(']') => {
@@ -139,104 +144,55 @@ impl<'a> ATermParser<'a> {
         }
     }
 
+    /// Parse a comma-separated list of strings inside `[...]`.
+    fn parse_string_list(&mut self) -> Result<Vec<String>, DerivationError> {
+        self.parse_list(Self::parse_string)
+    }
+
     /// Parse the outputs list: `[("name","path","hashAlgo","hash"), ...]`
     fn parse_outputs(&mut self) -> Result<Vec<DerivationOutput>, DerivationError> {
-        self.expect("[")?;
-        let mut outputs = Vec::new();
-        if self.peek() == Some(']') {
-            self.advance();
-            return Ok(outputs);
-        }
-        loop {
-            if outputs.len() >= MAX_ATERM_LIST_ITEMS {
-                return Err(DerivationError::CollectionTooLarge(outputs.len()));
-            }
-            self.expect("(")?;
-            let name = self.parse_string()?;
-            self.expect(",")?;
-            let path = self.parse_string()?;
-            self.expect(",")?;
-            let hash_algo = self.parse_string()?;
-            self.expect(",")?;
-            let hash = self.parse_string()?;
-            self.expect(")")?;
-
-            outputs.push(
-                DerivationOutput::new(name, path, hash_algo, hash)
-                    .map_err(|_| DerivationError::EmptyOutputName(outputs.len()))?,
-            );
-
-            match self.peek() {
-                Some(',') => self.advance(),
-                Some(']') => {
-                    self.advance();
-                    return Ok(outputs);
-                }
-                _ => return Err(DerivationError::UnexpectedEof),
-            }
-        }
+        let mut idx = 0usize;
+        self.parse_list(|p| {
+            p.expect("(")?;
+            let name = p.parse_string()?;
+            p.expect(",")?;
+            let path = p.parse_string()?;
+            p.expect(",")?;
+            let hash_algo = p.parse_string()?;
+            p.expect(",")?;
+            let hash = p.parse_string()?;
+            p.expect(")")?;
+            let i = idx;
+            idx += 1;
+            DerivationOutput::new(name, path, hash_algo, hash)
+                .map_err(|_| DerivationError::EmptyOutputName(i))
+        })
     }
 
     /// Parse inputDrvs: `[("drvPath",["out1","out2"]), ...]`
     fn parse_input_drvs(&mut self) -> Result<BTreeMap<String, BTreeSet<String>>, DerivationError> {
-        self.expect("[")?;
-        let mut drvs = BTreeMap::new();
-        if self.peek() == Some(']') {
-            self.advance();
-            return Ok(drvs);
-        }
-        loop {
-            if drvs.len() >= MAX_ATERM_LIST_ITEMS {
-                return Err(DerivationError::CollectionTooLarge(drvs.len()));
-            }
-            self.expect("(")?;
-            let drv_path = self.parse_string()?;
-            self.expect(",")?;
-            let output_names: BTreeSet<String> = self.parse_string_list()?.into_iter().collect();
-            self.expect(")")?;
-
-            drvs.insert(drv_path, output_names);
-
-            match self.peek() {
-                Some(',') => self.advance(),
-                Some(']') => {
-                    self.advance();
-                    return Ok(drvs);
-                }
-                _ => return Err(DerivationError::UnexpectedEof),
-            }
-        }
+        self.parse_list(|p| {
+            p.expect("(")?;
+            let drv_path = p.parse_string()?;
+            p.expect(",")?;
+            let names: BTreeSet<String> = p.parse_string_list()?.into_iter().collect();
+            p.expect(")")?;
+            Ok((drv_path, names))
+        })
+        .map(|v| v.into_iter().collect())
     }
 
     /// Parse environment: `[("key","value"), ...]`
     fn parse_env(&mut self) -> Result<BTreeMap<String, String>, DerivationError> {
-        self.expect("[")?;
-        let mut env = BTreeMap::new();
-        if self.peek() == Some(']') {
-            self.advance();
-            return Ok(env);
-        }
-        loop {
-            if env.len() >= MAX_ATERM_LIST_ITEMS {
-                return Err(DerivationError::CollectionTooLarge(env.len()));
-            }
-            self.expect("(")?;
-            let key = self.parse_string()?;
-            self.expect(",")?;
-            let value = self.parse_string()?;
-            self.expect(")")?;
-
-            env.insert(key, value);
-
-            match self.peek() {
-                Some(',') => self.advance(),
-                Some(']') => {
-                    self.advance();
-                    return Ok(env);
-                }
-                _ => return Err(DerivationError::UnexpectedEof),
-            }
-        }
+        self.parse_list(|p| {
+            p.expect("(")?;
+            let key = p.parse_string()?;
+            p.expect(",")?;
+            let value = p.parse_string()?;
+            p.expect(")")?;
+            Ok((key, value))
+        })
+        .map(|v| v.into_iter().collect())
     }
 
     /// Parse a full `Derive(...)` expression.
