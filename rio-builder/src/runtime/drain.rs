@@ -80,8 +80,7 @@ pub(super) fn reconnect_drain_gate(
 /// terminationGracePeriodSeconds=7200 (2h). If we exceed that,
 /// SIGKILL — builds lost. 2h is enough for ~any single build.
 pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
-    use rio_common::backoff::{Backoff, Jitter};
-    use rio_common::grpc::{RetryOpts, is_unavailable, retry_status};
+    use rio_common::backoff::{self, Backoff, Jitter, RetryError};
 
     // I-091: scheduler_addr is the k8s Service — kube-proxy picks a
     // replica per TCP connection, so ~50% land on the standby, which
@@ -90,18 +89,17 @@ pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
     // client would hit the same pod) gives kube-proxy another roll.
     // Still best-effort: two standby picks in a row falls through to
     // the warn path; heartbeat already reported draining either way.
-    const OPTS: RetryOpts = RetryOpts {
-        backoff: Backoff {
-            base: std::time::Duration::ZERO,
-            mult: 1.0,
-            cap: std::time::Duration::ZERO,
-            jitter: Jitter::None,
-        },
-        max_attempts: 2,
+    const BACKOFF: Backoff = Backoff {
+        base: std::time::Duration::ZERO,
+        mult: 1.0,
+        cap: std::time::Duration::ZERO,
+        jitter: Jitter::None,
     };
-    let result = retry_status(
-        &OPTS,
-        is_unavailable,
+    let result = backoff::retry(
+        &BACKOFF,
+        2,
+        &rio_common::signal::Token::new(),
+        |s: &tonic::Status| s.code() == tonic::Code::Unavailable,
         |_, e| tracing::debug!(error = %e, "DrainExecutor hit standby; reconnecting once"),
         async || {
             // Fresh channel each attempt — see I-091 above.
@@ -128,9 +126,10 @@ pub(super) async fn run_drain(scheduler_addr: &str, executor_id: &str) {
                 "drain acknowledged by scheduler"
             );
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
+        Err(RetryError::Exhausted { last, .. }) => {
+            tracing::warn!(error = %last, "DrainExecutor RPC failed; heartbeat already reported draining");
         }
+        Err(RetryError::Cancelled) => unreachable!("never-cancelled token"),
     }
     info!("drain complete, exiting");
 }

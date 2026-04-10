@@ -13,7 +13,6 @@
 //! base/mult/cap tuned to that RPC's latency profile. Don't add
 //! "default" backoff constants here — there is no sensible default.
 
-use std::future::Future;
 use std::time::Duration;
 
 use rand::RngExt as _;
@@ -187,17 +186,14 @@ impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RetryError<E>
 /// special-case branches) inside their retry loop and use
 /// [`Backoff::duration`] directly instead of this wrapper. That's
 /// fine — this exists for the simple cases.
-pub async fn retry<T, E, F, Fut>(
+pub async fn retry<T, E>(
     policy: &Backoff,
     max_attempts: u32,
     shutdown: &Token,
     is_retryable: impl Fn(&E) -> bool,
-    mut op: F,
-) -> Result<T, RetryError<E>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
+    mut on_retry: impl FnMut(u32, &E),
+    mut op: impl AsyncFnMut() -> Result<T, E>,
+) -> Result<T, RetryError<E>> {
     let mut attempt = 0u32;
     loop {
         if shutdown.is_cancelled() {
@@ -213,6 +209,7 @@ where
                         attempts: attempt,
                     });
                 }
+                on_retry(attempt, &e);
                 // attempt-1: attempt is now 1 after the FIRST failure;
                 // the first sleep should be `base × mult⁰ = base`.
                 let delay = policy.duration(attempt - 1);
@@ -362,34 +359,33 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retry_cancelled_during_sleep() {
         let token = Token::new();
-        let calls = Arc::new(AtomicU32::new(0));
+        let calls = AtomicU32::new(0);
 
-        let c = Arc::clone(&calls);
+        // Spawn the canceller, not the retry future — `retry`'s
+        // `impl AsyncFnMut` op param hits the HRTB-Send limitation
+        // under tokio::spawn. With `start_paused`, auto-advance stops
+        // at the 10ms canceller deadline first; the select! must then
+        // wake on the token without reaching its 1s timer.
         let t = token.clone();
-        let task = tokio::spawn(async move {
-            retry(
-                &P,
-                u32::MAX,
-                &t,
-                |_: &&str| true,
-                || {
-                    let c = Arc::clone(&c);
-                    async move {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        Err::<(), _>("nope")
-                    }
-                },
-            )
-            .await
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            t.cancel();
         });
 
-        tokio::time::advance(Duration::from_millis(10)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let r = retry(
+            &P,
+            u32::MAX,
+            &token,
+            |_: &&str| true,
+            |_, _| {},
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>("nope") }
+            },
+        )
+        .await;
 
-        token.cancel();
-        tokio::task::yield_now().await;
-        assert!(matches!(task.await.unwrap(), Err(RetryError::Cancelled)));
+        assert!(matches!(r, Err(RetryError::Cancelled)));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry after cancel");
     }
 
@@ -402,6 +398,7 @@ mod tests {
             3,
             &token,
             |_: &&str| true,
+            |_, _| {},
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async { Err("nope") }
@@ -427,6 +424,7 @@ mod tests {
             10,
             &token,
             |e: &&str| *e != "fatal",
+            |_, _| {},
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async { Err("fatal") }
@@ -447,6 +445,7 @@ mod tests {
             10,
             &token,
             |_: &&str| true,
+            |_, _| {},
             move || {
                 let c = Arc::clone(&c);
                 async move {

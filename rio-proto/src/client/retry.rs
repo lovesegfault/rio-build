@@ -18,7 +18,6 @@
 //! `shutdown.cancelled()`, and delays double (1s→2s→4s→8s→16s cap)
 //! with ±25% jitter.
 
-use std::future::Future;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -72,43 +71,25 @@ const CONNECT_BACKOFF: Backoff = Backoff {
 ///   dependency is optional and the caller can degrade gracefully
 ///   (scheduler's store client: missing → CA-cutoff disabled, not
 ///   fatal).
-pub async fn connect_with_retry<F, Fut, T, E>(
+pub async fn connect_with_retry<T, E>(
     shutdown: &CancellationToken,
-    mut op: F,
+    op: impl AsyncFnMut() -> Result<T, E>,
     max_tries: Option<u32>,
 ) -> Result<T, RetryError<E>>
 where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
     // Thin wrapper over the shared `retry` loop: every error is
-    // retryable (connect has no permanent-vs-transient distinction —
-    // the caller picked `None` precisely because "can't reach
-    // dependency" = "useless process"), and `None` maps to MAX
-    // (effectively infinite — exit via `Ok` or `Cancelled`).
-    //
-    // `AtomicU32` for `tries`: both closures capture it (`is_retryable`
-    // reads for the log line, `op` increments) so `&mut` would
-    // conflict; and the returned future must be `Send` (callers
-    // `tokio::spawn` it), which rules out `Cell`.
-    use std::sync::atomic::{AtomicU32, Ordering};
-    let tries = AtomicU32::new(0);
+    // retryable (connect has no permanent-vs-transient distinction),
+    // and `None` maps to MAX (effectively infinite — exit via `Ok`
+    // or `Cancelled`).
     rio_common::backoff::retry(
         &CONNECT_BACKOFF,
         max_tries.unwrap_or(u32::MAX),
         shutdown,
-        |e: &E| {
-            warn!(
-                error = %e, tries = tries.load(Ordering::Relaxed),
-                "connect failed; retrying (pod stays not-Ready)"
-            );
-            true
-        },
-        || {
-            tries.fetch_add(1, Ordering::Relaxed);
-            op()
-        },
+        |_: &E| true,
+        |n, e| warn!(error = %e, tries = n, "connect failed; retrying (pod stays not-Ready)"),
+        op,
     )
     .await
 }
@@ -123,10 +104,11 @@ where
 /// Exhausted => unreachable!() }` — three copies of an arm that exists
 /// only to satisfy exhaustiveness. Callers now write
 /// `let Some(x) = connect_forever(...) else { return Ok(()) };`.
-pub async fn connect_forever<F, Fut, T, E>(shutdown: &CancellationToken, op: F) -> Option<T>
+pub async fn connect_forever<T, E>(
+    shutdown: &CancellationToken,
+    op: impl AsyncFnMut() -> Result<T, E>,
+) -> Option<T>
 where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
     match connect_with_retry(shutdown, op, None).await {
@@ -150,37 +132,31 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancelled_during_sleep_returns_promptly() {
         let token = CancellationToken::new();
-        let calls = Arc::new(AtomicU32::new(0));
+        let calls = AtomicU32::new(0);
 
-        let calls2 = Arc::clone(&calls);
+        // Cancel 10ms in — mid-sleep (first backoff is ~1s). Spawn the
+        // CANCELLER, not the retry future: `connect_with_retry`'s
+        // `impl AsyncFnMut` op param hits the HRTB-Send limitation
+        // under `tokio::spawn`, and the test doesn't need the retry
+        // side to be Send. With `start_paused`, auto-advance stops at
+        // the 10ms canceller deadline first; the retry's select! must
+        // then wake on the token without reaching its ~1s timer.
         let token2 = token.clone();
-        let task = tokio::spawn(async move {
-            connect_with_retry(
-                &token2,
-                || {
-                    let c = Arc::clone(&calls2);
-                    async move {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        Err::<(), _>("nope")
-                    }
-                },
-                None,
-            )
-            .await
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            token2.cancel();
         });
 
-        // Let the first attempt fail and enter its backoff sleep.
-        tokio::time::advance(Duration::from_millis(10)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "first attempt should fire");
+        let result = connect_with_retry(
+            &token,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>("nope") }
+            },
+            None,
+        )
+        .await;
 
-        // Cancel mid-sleep. The task must resolve without advancing
-        // time to the sleep deadline — proving select! woke on the
-        // token, not the timer.
-        token.cancel();
-        tokio::task::yield_now().await;
-
-        let result = task.await.unwrap();
         assert!(matches!(result, Err(RetryError::Cancelled)));
         assert_eq!(
             calls.load(Ordering::SeqCst),

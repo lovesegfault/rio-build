@@ -17,8 +17,8 @@ use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use rio_common::backoff::{Backoff, Jitter};
-use rio_common::grpc::{RetryOpts, is_unavailable, retry_status};
+use rio_common::backoff::{self, Backoff, Jitter, RetryError};
+use rio_common::signal::Token;
 
 use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
 use tonic::transport::Channel;
@@ -63,15 +63,13 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 /// with 1s/2s backoff covers a leader-election flip without making a
 /// genuinely-down scheduler hang the CLI for minutes.
 // r[impl cli.rpc-retry]
-const RPC_RETRY: RetryOpts = RetryOpts {
-    backoff: Backoff {
-        base: Duration::from_secs(1),
-        mult: 2.0,
-        cap: Duration::from_secs(4),
-        jitter: Jitter::None,
-    },
-    max_attempts: 3,
+const RPC_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(1),
+    mult: 2.0,
+    cap: Duration::from_secs(4),
+    jitter: Jitter::None,
 };
+const RPC_MAX_ATTEMPTS: u32 = 3;
 
 /// Wrap an AdminService RPC call with timeout, `UNAVAILABLE` retry,
 /// and error context.
@@ -91,14 +89,16 @@ pub(crate) async fn rpc<T: Default>(
     what: &'static str,
     mut op: impl AsyncFnMut() -> Result<tonic::Response<T>, tonic::Status>,
 ) -> anyhow::Result<T> {
-    retry_status(
-        &RPC_RETRY,
-        is_unavailable,
+    backoff::retry(
+        &RPC_BACKOFF,
+        RPC_MAX_ATTEMPTS,
+        &Token::new(),
+        |s: &tonic::Status| s.code() == tonic::Code::Unavailable,
         |n, s| {
             eprintln!(
                 "{what}: UNAVAILABLE ({}); retry {n}/{}",
                 s.message(),
-                RPC_RETRY.max_attempts - 1
+                RPC_MAX_ATTEMPTS - 1
             );
         },
         async || {
@@ -109,7 +109,12 @@ pub(crate) async fn rpc<T: Default>(
     )
     .await
     .map(|r| r.into_inner())
-    .map_err(|s| anyhow!("{what}: {} ({:?})", s.message(), s.code()))
+    .map_err(|e| match e {
+        RetryError::Exhausted { last, .. } => {
+            anyhow!("{what}: {} ({:?})", last.message(), last.code())
+        }
+        RetryError::Cancelled => unreachable!("never-cancelled token"),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
