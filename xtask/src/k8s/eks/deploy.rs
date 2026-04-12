@@ -363,5 +363,56 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     ui::step("NLB target health", || {
         super::smoke::wait_any_target_healthy(&region)
     })
+    .await?;
+
+    if opts.wait_drift {
+        wait_drift_settled(&client).await?;
+    }
+    Ok(())
+}
+
+/// Poll until no Karpenter NodeClaim has `Drifted=True`. An AMI change
+/// drifts every Karpenter node; the disruption controller replaces them
+/// at the NodePool's budget rate. Returning early means subsequent
+/// builds may be evicted mid-run. 30min covers ~10 sequential
+/// replacements at the default `budgets:10%` × ~2-3min each.
+async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
+    let api = status::nodeclaim_api(client);
+    ui::poll(
+        "karpenter drift settled",
+        Duration::from_secs(15),
+        120,
+        move || {
+            let api = api.clone();
+            async move {
+                let claims = api.list(&Default::default()).await?;
+                let drifted: Vec<String> = claims
+                    .into_iter()
+                    .filter(|nc| {
+                        nc.data
+                            .pointer("/status/conditions")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .any(|c| {
+                                c.get("type").and_then(|v| v.as_str()) == Some("Drifted")
+                                    && c.get("status").and_then(|v| v.as_str()) == Some("True")
+                            })
+                    })
+                    .filter_map(|nc| nc.metadata.name)
+                    .collect();
+                if drifted.is_empty() {
+                    return Ok(Some(()));
+                }
+                info!(
+                    "{} drifted remaining: [{}]",
+                    drifted.len(),
+                    drifted.join(", ")
+                );
+                Ok(None)
+            }
+        },
+    )
     .await
+    .context("timed out waiting for Karpenter drift to settle (--wait-drift)")
 }

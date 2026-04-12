@@ -832,7 +832,15 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
     // sequence is identical to the single-Started case above.
     let starts: Vec<_> = frames
         .iter()
-        .filter(|m| matches!(m, StderrMessage::StartActivity { activity_type: 105, .. }))
+        .filter(|m| {
+            matches!(
+                m,
+                StderrMessage::StartActivity {
+                    activity_type: 105,
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(
         starts.len(),
@@ -841,7 +849,9 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
     );
     assert_eq!(frames.len(), 5, "frames: {frames:?}");
     let drv_id = match &frames[2] {
-        StderrMessage::StartActivity { id, activity_type, .. } => {
+        StderrMessage::StartActivity {
+            id, activity_type, ..
+        } => {
             assert_eq!(*activity_type, 105);
             *id
         }

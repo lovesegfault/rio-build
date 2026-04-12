@@ -787,7 +787,7 @@ fn parse_cilium_status(out: &str) -> (Option<String>, Option<u32>, Option<bool>)
 }
 
 /// Karpenter NodeClaim CRD via the dynamic API. Cluster-scoped.
-fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
+pub(super) fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
     let gvk = GroupVersionKind::gvk("karpenter.sh", "v1", "NodeClaim");
     let ar = ApiResource::from_gvk(&gvk);
     Api::all_with(client.clone(), &ar)

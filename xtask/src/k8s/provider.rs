@@ -26,6 +26,12 @@ pub struct DeployOpts {
     /// (smoke tests etc.) for AMI bring-up where the hook itself needs
     /// the thing being brought up.
     pub no_hooks: bool,
+    /// After deploy returns, block until Karpenter has replaced every
+    /// Drifted NodeClaim. EKS-only (k3s has no Karpenter). An AMI
+    /// change (`up --ami`) drifts every Karpenter node; without this,
+    /// builds started immediately after `up` get evicted mid-run as
+    /// the rollout proceeds.
+    pub wait_drift: bool,
 }
 
 /// Output of the nix-build portion of push. Held separately so `up`

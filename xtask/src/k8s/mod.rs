@@ -114,6 +114,12 @@ pub struct UpOpts {
     /// working nodes that don't exist yet.
     #[arg(long = "deploy-no-hooks")]
     deploy_no_hooks: bool,
+    /// After deploy, block until Karpenter has replaced all Drifted
+    /// NodeClaims (AMI rollout complete). Without this, builds started
+    /// immediately after `up` may be disrupted by node drift eviction.
+    /// EKS-only.
+    #[arg(long)]
+    wait_drift: bool,
 
     /// Skip interactive confirmation prompts (tofu apply diff).
     #[arg(long)]
@@ -179,6 +185,7 @@ impl UpOpts {
             Phase::Deploy
         );
         req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
+        req!(self.wait_drift, "--wait-drift", Phase::Deploy);
         req!(
             !matches!(self.ami_arch, AmiArch::All),
             "--ami-arch",
@@ -463,6 +470,7 @@ async fn run_up(
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
+            wait_drift: o.wait_drift,
         },
     };
     let cfg = Arc::new(cfg.clone());
