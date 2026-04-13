@@ -45,7 +45,7 @@ impl SchedulerDb {
     /// newly-inserted in-memory state (I-208) — `try_from_node` sets
     /// `floor=None`, but the DB row may pre-exist (ON CONFLICT) with a
     /// floor promoted by a prior run's failures. Without this, the FOD
-    /// snapshot buckets to `fetcher_size_classes[0]` and the controller
+    /// snapshot buckets to the smallest class and the controller
     /// re-spawns the smallest fetcher every run.
     pub(crate) async fn batch_upsert_derivations(
         tx: &mut PgConnection,

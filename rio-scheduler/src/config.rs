@@ -37,17 +37,6 @@ pub(super) struct Config {
     /// No CLI override — this is structural deploy config, not a knob
     /// you tweak per-invocation. Change it in scheduler.toml.
     pub(super) size_classes: Vec<rio_scheduler::SizeClassConfig>,
-    /// Fetcher size-class config (I-170). Empty = single-pool mode
-    /// (no class filter on FOD dispatch). A flat list of names,
-    /// ordered smallest→largest — the scheduler needs the ORDER to
-    /// compute "next larger" for reactive promotion; per-class
-    /// resources live on the controller side (`FetcherPool.spec.
-    /// classes[]`). MUST match `fetcherPoolDefaults.classes[].name`
-    /// in the helm chart (single source of truth: scheduler.yaml
-    /// renders both from `.Values.fetcherPoolDefaults.classes`;
-    /// class names are arch-agnostic). TOML:
-    ///   fetcher_size_classes = ["tiny", "small"]
-    pub(super) fetcher_size_classes: Vec<String>,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
@@ -147,7 +136,6 @@ impl Default for Config {
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
-            fetcher_size_classes: Vec::new(),
             soft_features: Vec::new(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),

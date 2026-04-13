@@ -739,7 +739,7 @@ impl DagActor {
         // preferable to a builder with internet access.
         //
         // Chain start: `size_class_floor` (set by reactive promotion
-        // on prior failure) or `fetcher_size_classes[0]` if never
+        // on prior failure) or `fetcher_classes[0]` if never
         // failed. Empty config = no class filter (original behavior).
         if drv_state.is_fixed_output {
             if self.sizing.fetcher_classes.is_empty() {

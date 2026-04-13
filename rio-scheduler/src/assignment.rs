@@ -32,6 +32,7 @@ use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
 /// calls `classify()` with a ref to the config vec, and completion.rs
 /// looks up `cutoff_for()` for misclassification detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SizeClassConfig {
     pub name: String,
     /// Max estimated duration to route here. A build estimated at 25s
@@ -61,6 +62,7 @@ pub struct SizeClassConfig {
 /// a viable tier (firefox-unwrapped: ~50GB build dir, evicted on
 /// every tier <large).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SoftFeature {
     pub name: String,
     /// Builder size-class name to use as initial `size_class_floor`

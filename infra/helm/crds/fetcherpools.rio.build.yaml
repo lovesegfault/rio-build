@@ -60,9 +60,9 @@ spec:
                 items:
                   description: "One fetcher size class. Mirrors `SizeClassSpec` minus\n\
                     `cutoff_secs` \u2014 fetchers route by reactive floor only, not\n\
-                    duration estimate. The scheduler's `[[fetcher_size_classes]]`\n\
-                    config carries just the names (for ordering); per-class\n`resources`\
-                    \ live here on the controller side."
+                    duration estimate. The scheduler derives the FOD floor-walk\n\
+                    ladder from `[[size_classes]]` (fetcher tiers ARE builder tiers);\n\
+                    per-class `resources` live here on the controller side."
                   properties:
                     maxConcurrent:
                       description: 'Concurrent-Job ceiling for this class. `None`

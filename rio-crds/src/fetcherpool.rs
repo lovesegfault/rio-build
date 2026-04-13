@@ -95,9 +95,9 @@ pub struct FetcherPoolSpec {
 
 /// One fetcher size class. Mirrors `SizeClassSpec` minus
 /// `cutoff_secs` — fetchers route by reactive floor only, not
-/// duration estimate. The scheduler's `[[fetcher_size_classes]]`
-/// config carries just the names (for ordering); per-class
-/// `resources` live here on the controller side.
+/// duration estimate. The scheduler derives the FOD floor-walk
+/// ladder from `[[size_classes]]` (fetcher tiers ARE builder tiers);
+/// per-class `resources` live here on the controller side.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherSizeClass {

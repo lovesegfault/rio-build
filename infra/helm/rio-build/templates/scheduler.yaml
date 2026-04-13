@@ -1,10 +1,9 @@
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
-{{- /* I-170: ConfigMap renders if EITHER builder size-classes or fetcher
-       classes are configured. The scheduler's classify() reads
-       [[size_classes]]; the FOD floor walk reads fetcher_size_classes.
-       size_classes is array-of-tables (can't env-encode). */ -}}
-{{- $hasClasses := or $s.sizeClasses .Values.fetcherPoolDefaults.classes -}}
+{{- /* ConfigMap renders if [[size_classes]] is configured (the FOD
+       floor walk derives from the same list — fetcher tiers ARE builder
+       tiers). size_classes is array-of-tables (can't env-encode). */ -}}
+{{- $hasClasses := $s.sizeClasses -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -197,13 +196,6 @@ data:
     {{- with .cpuLimitCores }}
     cpu_limit_cores = {{ printf "%.1f" (float64 .) }}
     {{- end }}
-    {{- end }}
-    {{- /* I-170: ordered fetcher class names for reactive promotion.
-           Single source of truth — same .Values.fetcherPoolDefaults.
-           classes that fetcherpool.yaml renders into every FetcherPool
-           CR (class names are arch-agnostic). */ -}}
-    {{- with .Values.fetcherPoolDefaults.classes }}
-    fetcher_size_classes = [{{ range $i, $c := . }}{{ if $i }}, {{ end }}{{ $c.name | quote }}{{ end }}]
     {{- end }}
 {{- end }}
 {{- end }}

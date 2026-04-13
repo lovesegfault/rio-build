@@ -377,9 +377,9 @@ impl DagActor {
     /// builds run, and floor is sticky (M_032) so the next submitter
     /// paid for an oversized pod.
     ///
-    /// I-177: branches on `is_fixed_output` to pick which class list
-    /// to walk: FOD → `fetcher_size_classes` (config-order); non-FOD →
-    /// `size_classes` (cutoff-order).
+    /// I-177: branches on `is_fixed_output` only for the metric `kind`
+    /// label; both walk `[[size_classes]]` (FOD via the cutoff-sorted
+    /// `fetcher_classes` snapshot, non-FOD via `next_builder_class`).
     ///
     /// `reason`: emitted as a label on the metric + the log line so
     /// operators can tell `oom_killed` from `disk_pressure` from

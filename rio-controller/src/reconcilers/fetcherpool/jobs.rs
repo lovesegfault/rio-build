@@ -168,8 +168,8 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
 /// `reconcile` can serve either path from one fetch.
 struct QueueSignals {
     /// Flat in-flight FOD demand (`queued_fod_derivations`). Fallback
-    /// when `fod_classes` is empty (scheduler `[[fetcher_size_classes]]`
-    /// unconfigured or out of sync) — applied to `classes[0]` only so
+    /// when `fod_classes` is empty (scheduler `[[size_classes]]`
+    /// unconfigured) — applied to `classes[0]` only so
     /// the smallest class over-spawns rather than every class
     /// duplicating the flat count.
     flat: u32,
@@ -505,7 +505,7 @@ mod tests {
         // Class the scheduler doesn't know → 0 (don't double-count).
         assert_eq!(s.queued_for("huge", 2), 0);
 
-        // Breakdown empty (scheduler [[fetcher_size_classes]] off):
+        // Breakdown empty (scheduler [[size_classes]] off):
         // smallest class falls back to flat, others get 0.
         let s = QueueSignals {
             flat: 5,

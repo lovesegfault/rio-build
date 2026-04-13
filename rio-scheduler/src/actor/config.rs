@@ -51,6 +51,13 @@ pub(crate) struct SizingConfig {
     /// walks from `DerivationState.sched.size_class_floor` upward.
     /// Plain `Vec` (not `Arc<RwLock>`): no rebalancer mutates this —
     /// it's an ordered name list, config-static after construction.
+    /// Derived via `builder_class_order(&cfg.size_classes)`: fetcher
+    /// tiers ARE builder tiers (live QA 2026-04-13: a separate
+    /// `fetcher_size_classes` TOML key was rendered after
+    /// `[[size_classes]]` → scoped to last table → empty → fetcher
+    /// OOMs never promoted). The rebalancer mutates `cutoff_secs` only
+    /// (never the class SET), so the construction-time name snapshot
+    /// stays valid.
     pub(super) fetcher_classes: Vec<String>,
     /// Static TOML cutoffs, captured once from `cfg.size_classes`
     /// BEFORE the rebalancer's first write. The rebalancer mutates
@@ -84,7 +91,7 @@ impl SizingConfig {
             .collect();
         Self {
             size_classes: Arc::new(parking_lot::RwLock::new(cfg.size_classes.clone())),
-            fetcher_classes: cfg.fetcher_size_classes.clone(),
+            fetcher_classes: crate::assignment::builder_class_order(&cfg.size_classes),
             configured_cutoffs,
             headroom_mult: cfg.headroom_mult,
             soft_features: cfg.soft_features.clone(),
@@ -134,9 +141,6 @@ pub struct DagActorConfig {
     /// initial values are also captured into `configured_cutoffs` for
     /// drift reporting.
     pub size_classes: Vec<crate::assignment::SizeClassConfig>,
-    /// Fetcher size-class names (I-170), ordered smallest→largest.
-    /// Empty = feature off (single fetcher pool, no class filter).
-    pub fetcher_size_classes: Vec<String>,
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
@@ -154,7 +158,6 @@ impl Default for DagActorConfig {
             grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             size_classes: Vec::new(),
-            fetcher_size_classes: Vec::new(),
             soft_features: Vec::new(),
             headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
         }

@@ -1595,14 +1595,14 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
 /// the node left memory) MUST come back at floor=small when re-merged.
 /// Regression: `try_from_node` set `floor=None` and the upsert's
 /// RETURNING didn't carry `size_class_floor`, so the FOD snapshot
-/// bucketed to `fetcher_size_classes[0]` and the controller re-spawned
+/// bucketed to the smallest class and the controller re-spawned
 /// `tiny` every run — chromium/firefox sources looped on 2Gi-storage
 /// tiny fetchers indefinitely.
 #[tokio::test]
 async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
+        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
     });
 
     // Pre-seed: prior run promoted this FOD to floor='small', then went

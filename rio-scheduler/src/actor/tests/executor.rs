@@ -854,7 +854,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
 /// controller observes Pod-status ~1-3s later and reports the k8s
 /// reason. ONLY OomKilled/EvictedDiskPressure promote.
 ///
-/// - **fod** (I-173): FOD on a `fetcher_size_classes` tiny fetcher.
+/// - **fod** (I-173): FOD on a tiny fetcher.
 /// - **builder** (I-177): non-FOD on a builder `size_classes` tiny.
 ///
 /// Also asserts dedup: a SECOND report for the same executor_id
@@ -873,11 +873,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     use rio_proto::types::TerminationReason;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        if is_fod {
-            c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
-        } else {
-            c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
-        }
+        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
     });
 
     let mut rx = connect_executor_classed(&handle, "w-tiny", "x86_64-linux", "tiny", kind).await?;

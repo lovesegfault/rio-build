@@ -371,7 +371,7 @@ impl DagActor {
     /// Unlike [`compute_size_class_snapshot`] there is no `classify()`
     /// forecast: FODs have no a-priori size signal (ADR-019), so the
     /// floor IS the routing decision. `floor=None` (never failed —
-    /// the cold-start majority) buckets to `fetcher_size_classes[0]`.
+    /// the cold-start majority) buckets to `fetcher_classes[0]`.
     /// An unknown floor name (config drift: scheduler restarted with
     /// fewer classes) also buckets to `[0]` — same conservative
     /// fallback as I-146 for builder classes.
@@ -385,8 +385,8 @@ impl DagActor {
     /// double-spawn for it). `running` is the Assigned+Running subset
     /// — informational for operators/dashboards.
     ///
-    /// Preserves `fetcher_size_classes` config order (smallest→largest);
-    /// no sort step (no cutoffs to sort by).
+    /// Preserves `fetcher_classes` order (smallest→largest by cutoff,
+    /// snapshotted at construction).
     ///
     /// [`compute_size_class_snapshot`]: Self::compute_size_class_snapshot
     // r[impl sched.fod.size-class-reactive]

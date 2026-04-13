@@ -1195,7 +1195,7 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 /// `size_class_floor=small` skips tiny-class executors even when free.
 /// The overflow chain starts at `max(classify(), floor)`.
 ///
-/// - **fod** (I-170): FOD branch reads `fetcher_size_classes` only.
+/// - **fod** (I-170): FOD branch walks `fetcher_classes` (= size_classes names).
 /// - **builder** (I-177): non-FOD branch ignored floor before fix → a
 ///   build that OOM'd on tiny was re-routed to tiny by the
 ///   (success-only) EMA classifier → poison-loop.
@@ -1216,11 +1216,7 @@ async fn size_class_floor_skips_smaller(
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        if is_fod {
-            c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
-        } else {
-            c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
-        }
+        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
         // Zero backoff so the retry redispatches on the next Tick.
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
@@ -1311,10 +1307,10 @@ async fn fod_size_class_floor_clamps_at_largest() -> TestResult {
 }
 
 // r[verify sched.fod.size-class-reactive]
-/// I-170 back-compat: with `fetcher_size_classes` empty (default),
-/// FOD dispatch is unchanged — no class filter, any free fetcher.
-/// `size_class_floor` stays None across failures (nothing to
-/// promote to).
+/// I-170 back-compat: with `size_classes` empty (default), FOD dispatch
+/// is unchanged — no class filter, any free fetcher. `size_class_floor`
+/// stays None across failures (nothing to promote to). Fetcher classes
+/// are derived from `size_classes`, so empty → both ladders off.
 #[tokio::test]
 async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
     let (_db, handle, _task) = setup().await;

@@ -24,23 +24,22 @@ async fn test_get_size_class_status_empty_when_unconfigured() -> anyhow::Result<
     );
     assert!(
         resp.fod_classes.is_empty(),
-        "fetcher_size_classes unconfigured → empty fod_classes"
+        "size_classes unconfigured → empty fod_classes (fetcher tiers derive from builder tiers)"
     );
     Ok(())
 }
 
 // r[verify sched.admin.sizeclass-status]
-/// P0556: `fod_classes` populated independently of builder `classes`.
-/// `[[fetcher_size_classes]]` configured → response carries the FOD
-/// breakdown even when builder size-classes are off. cutoffs/sample
-/// fields are zero (fetcher routing is reactive).
+/// P0556: `fod_classes` mirrors `[[size_classes]]` (fetcher tiers ARE
+/// builder tiers). cutoffs/sample fields are zero on the FOD side
+/// (fetcher routing is reactive — no duration estimate).
 #[tokio::test]
 async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> {
-    use crate::actor::tests::setup_actor_configured;
+    use crate::actor::tests::{setup_actor_configured, size_classes};
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
+        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),
@@ -58,11 +57,11 @@ async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> 
         .await?
         .into_inner();
 
-    assert!(
-        resp.classes.is_empty(),
-        "builder size-classes off → empty (independent of fod_classes)"
+    assert_eq!(
+        resp.fod_classes.len(),
+        2,
+        "fod_classes mirrors size_classes"
     );
-    assert_eq!(resp.fod_classes.len(), 2, "two configured fetcher classes");
     assert_eq!(resp.fod_classes[0].name, "tiny");
     assert_eq!(resp.fod_classes[0].effective_cutoff_secs, 0.0);
     assert_eq!(resp.fod_classes[0].sample_count, 0);

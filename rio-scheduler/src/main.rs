@@ -79,12 +79,6 @@ async fn main() -> anyhow::Result<()> {
             "size-class routing enabled"
         );
     }
-    if !cfg.fetcher_size_classes.is_empty() {
-        info!(
-            classes = ?cfg.fetcher_size_classes,
-            "fetcher size-class routing enabled (reactive)"
-        );
-    }
     if !cfg.soft_features.is_empty() {
         info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
     }
@@ -156,7 +150,6 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
         rio_scheduler::actor::DagActorConfig {
             size_classes: cfg.size_classes,
-            fetcher_size_classes: cfg.fetcher_size_classes,
             soft_features: cfg.soft_features,
             poison: cfg.poison,
             retry_policy: cfg.retry,

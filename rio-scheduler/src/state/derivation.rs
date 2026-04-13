@@ -386,8 +386,8 @@ pub struct SchedHint {
     /// overflow` then walks fetcher classes from this floor upward
     /// instead of starting at the smallest.
     ///
-    /// `None` = never failed → route to `fetcher_size_classes[0]`
-    /// (or no class filter if fetcher classes unconfigured).
+    /// `None` = never failed → route to the smallest class (or no
+    /// class filter if `[[size_classes]]` unconfigured).
     ///
     /// Over-promotes on ANY transient failure (node preemption,
     /// network blip), not just OOM. Acceptable: FODs rarely retry,
