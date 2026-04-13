@@ -8,12 +8,8 @@ result-*
 # Per-user env (AWS_PROFILE etc) — see .env.local.example
 .env.local
 
-# Written by `cargo xtask k8s push`, read by `k8s deploy`. Carries the
-# dirty suffix between push and deploy. NEVER committed — private ECR,
-# tags are meaningless outside one AWS account.
-.rio-image-tag
-# Same, for the NixOS node AMI (ADR-021): `xtask k8s ami push` writes
-# the tagged SHA, `k8s deploy` reads it for EC2NodeClass amiSelector.
+# NixOS node AMI handoff (ADR-021): `xtask k8s ami push` writes the
+# tagged SHA, `k8s deploy` reads it for EC2NodeClass amiSelector.
 .rio-ami-tag
 
 # Repo-local kubeconfig — `cargo xtask k8s kubeconfig` writes here

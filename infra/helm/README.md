@@ -9,7 +9,7 @@ Deployed via `helm upgrade --install` from the working tree
 |---|---|---|
 | Defaults | `values.yaml` | git (prod topology: TLS on, external PG/S3, PDBs on) |
 | Infra values | `helm upgrade --set` | xtask reads `tofu output` (ECR registry, IRSA ARNs, bucket, Aurora) |
-| Image tag | `helm upgrade --set global.image.tag=` | xtask reads `.rio-image-tag` (written by `up --push`, never git) |
+| Image tag | `helm upgrade --set global.image.tag=` | xtask computes via `git::image_tag()` (content-addressed; never git) |
 
 ## Local rendering
 

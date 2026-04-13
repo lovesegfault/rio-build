@@ -19,7 +19,7 @@ use tracing::info;
 use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::provider::BuiltImages;
-use crate::sh::{cmd, repo_root, shell};
+use crate::sh::{cmd, shell};
 use crate::{git, tofu, ui};
 
 /// Nix system → OCI arch (what k8s nodes advertise via kubernetes.io/arch).
@@ -197,8 +197,6 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
         "done — pushed {} images × 2 arches + manifest lists, tag: {tag}",
         names.len()
     );
-    // Handoff to deploy.
-    std::fs::write(repo_root().join(".rio-image-tag"), format!("{tag}\n"))?;
     Ok(())
 }
 
@@ -263,11 +261,12 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
 
 /// Deploy-time guard: bail if `rio-gateway:{tag}` isn't in ECR. Mirrors
 /// [`super::ami::assert_registered`] — `--deploy` recomputes the image
-/// tag on a fresh worktree (no `.rio-image-tag` handoff file), so the
-/// real "run --push first" signal is the registry, not the file.
-/// `rio-gateway` is the canary repo (always pushed; see `rio_images` in
-/// `infra/eks/ecr.tf`). The manifest-list tag (no `-{arch}` suffix) is
-/// what the chart pulls, so that's what's checked.
+/// tag (content-addressed via [`crate::git::image_tag`]); if the tree
+/// drifted since `--push`, the recomputed tag won't be in ECR and this
+/// fails with a clear "run --push first". `rio-gateway` is the canary
+/// repo (always pushed; see `rio_images` in `infra/eks/ecr.tf`). The
+/// manifest-list tag (no `-{arch}` suffix) is what the chart pulls, so
+/// that's what's checked.
 pub async fn assert_in_ecr(tag: &str, region: &str) -> Result<()> {
     let conf = crate::aws::config(Some(region)).await;
     let ecr = aws_sdk_ecr::Client::new(conf);

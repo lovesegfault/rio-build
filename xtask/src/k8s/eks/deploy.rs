@@ -1,8 +1,9 @@
 //! helm upgrade from the working tree.
 //!
-//! Reads infra values from tofu outputs, image tag from .rio-image-tag
-//! (written by `eks push`) or recomputed from git if absent. No git
-//! roundtrip — chart changes on a dirty tree deploy directly.
+//! Reads infra values from tofu outputs, image tag recomputed from git
+//! (content-addressed; matches what `eks push` computed for the same
+//! tree state). No git roundtrip — chart changes on a dirty tree deploy
+//! directly.
 
 use std::time::Duration;
 
@@ -15,7 +16,6 @@ use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
 use crate::k8s::provider::{DeployOpts, ProviderKind};
 use crate::k8s::{NS, ensure_namespaces, shared, status};
-use crate::sh::repo_root;
 use crate::{git, helm, tofu, ui};
 
 /// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
@@ -80,25 +80,12 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let tenant = opts.tenant.as_deref();
     let skip_preflight = opts.skip_preflight;
     let no_hooks = opts.no_hooks;
-    // Image tag: the `.rio-image-tag` handoff file if `--push` ran in
-    // THIS worktree, else recompute (same `git::image_tag` push uses —
-    // short-SHA + `-dirty-${hash}`, deterministic from tree state). A
-    // fresh worktree at the same commit yields the same tag, so a
-    // sibling worktree's `--push` satisfies it. The real "run --push
-    // first" gate is `assert_in_ecr` below — the registry is the source
-    // of truth, not the per-worktree file.
-    let tag = match std::fs::read_to_string(repo_root().join(".rio-image-tag")) {
-        Ok(s) => s.trim().to_owned(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let t = git::image_tag(&git::open()?)?;
-            info!(
-                "computed image tag {t} (no .rio-image-tag — \
-                 run `cargo xtask k8s -p eks up --push` if images aren't in ECR)"
-            );
-            t
-        }
-        Err(e) => return Err(e).context("read .rio-image-tag"),
-    };
+    // Image tag recomputed from git state — `git::image_tag()` is
+    // content-addressed (`sha256(git diff HEAD)`), so the same tree
+    // state yields the same tag push computed. Tree drift since
+    // `--push` → different tag → `assert_in_ecr` fails loudly with
+    // "run --push first" instead of silently deploying a stale tag.
+    let tag = git::image_tag(&git::open()?)?;
     let tag = tag.as_str();
 
     let tf = tofu::outputs(TF_DIR)?;
