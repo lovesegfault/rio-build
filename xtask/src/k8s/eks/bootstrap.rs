@@ -2,8 +2,9 @@
 //!
 //! Self-referential: state lives in the bucket this creates. Chicken-
 //! and-egg solved by detecting whether the state object exists in S3:
-//! if not, init with -backend=false (local state), apply to create the
-//! bucket, then migrate local → S3. Idempotent.
+//! if not, write a transient `backend_override.tf` forcing the local
+//! backend, apply to create the bucket, drop the override, then `init
+//! -migrate-state` into S3. Idempotent.
 
 use anyhow::Result;
 use tracing::info;
@@ -45,22 +46,36 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     } else {
         info!("no state in S3 — first-time setup (local apply → migrate)");
         let sh = shell()?;
-        // -backend=false: local state until the S3 bucket exists.
-        sh::run_sync(cmd!(
-            sh,
-            "tofu -chdir={DIR} init -backend=false -reconfigure -upgrade"
-        ))?;
+        let dir = repo_root().join(DIR);
+
+        // Clean slate: a previous account / crashed bootstrap may have
+        // left a backend cache or half-migrated local state behind.
+        let _ = std::fs::remove_dir_all(dir.join(".terraform"));
+        let _ = std::fs::remove_file(dir.join("terraform.tfstate"));
+        let _ = std::fs::remove_file(dir.join("terraform.tfstate.backup"));
+
+        // `init -backend=false` does NOT satisfy a declared `backend
+        // "s3" {}` — `plan` still demands backend init. An override
+        // file replaces the backend block entirely, so tofu genuinely
+        // uses local state for the create-bucket apply.
+        let override_tf = scopeguard::guard(dir.join("backend_override.tf"), |p| {
+            let _ = std::fs::remove_file(p);
+        });
+        std::fs::write(&*override_tf, "terraform {\n  backend \"local\" {}\n}\n")?;
+
+        sh::run_sync(cmd!(sh, "tofu -chdir={DIR} init -upgrade"))?;
         tofu::apply(DIR, false, &vars).await?;
+
         info!("bucket created — migrating local state → S3");
-        // -migrate-state: move local state into the just-created S3 backend.
+        // Drop override BEFORE migrate so tofu sees the s3 backend again.
+        drop(override_tf);
         let (b, r) = (&backend.bucket, &backend.region);
         sh::run_sync(cmd!(
             sh,
             "tofu -chdir={DIR} init -migrate-state -force-copy -backend-config=bucket={b} -backend-config=region={r}"
         ))?;
-        let root = repo_root();
-        let _ = std::fs::remove_file(root.join(DIR).join("terraform.tfstate"));
-        let _ = std::fs::remove_file(root.join(DIR).join("terraform.tfstate.backup"));
+        let _ = std::fs::remove_file(dir.join("terraform.tfstate"));
+        let _ = std::fs::remove_file(dir.join("terraform.tfstate.backup"));
         info!(
             "done — state at s3://{}/bootstrap/terraform.tfstate",
             backend.bucket

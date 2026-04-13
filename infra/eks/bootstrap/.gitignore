@@ -3,6 +3,7 @@
 .terraform.tfstate.lock.info
 *.tfstate
 *.tfstate.backup
+backend_override.tf
 
 # State lives in the bucket this module manages (self-referential
 # S3 backend — see main.tf header). Nothing state-like is committed.

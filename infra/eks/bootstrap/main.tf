@@ -3,10 +3,10 @@
 #
 # Chicken-and-egg solved by `cargo xtask k8s -p eks up --bootstrap`:
 # it checks whether the state object already exists in S3. If not
-# (first time), it inits with -backend=false (local state), applies
-# to create the bucket, then migrates local → S3. If yes, normal
-# init + apply. Idempotent from any machine, nothing state-like is
-# committed.
+# (first time), it writes a transient backend_override.tf forcing the
+# local backend, applies to create the bucket, removes the override,
+# then `init -migrate-state` into S3. If yes, normal init + apply.
+# Idempotent from any machine; nothing state-like is committed.
 #
 # OpenTofu ≥1.6 (and Terraform ≥1.10) support native S3 state
 # locking via the bucket's own object lock — no DynamoDB table
