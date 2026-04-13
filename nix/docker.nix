@@ -503,7 +503,11 @@ rec {
           tmp=$(mktemp -d)
           # Key name includes the bucket so narinfo `Sig:` lines identify
           # which cluster signed them. Format: name:base64-seed.
-          nix-store --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
+          # --store dummy://: nix-store opens LocalStore on startup
+          # (mkdir /nix/store/.links) → EROFS under readOnlyRootFilesystem.
+          # The dummy backend skips all filesystem store init.
+          nix-store --store dummy:// \
+            --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
             "$tmp/key.sec" "$tmp/key.pub"
           aws secretsmanager create-secret --name rio/signing-key \
             --secret-string "file://$tmp/key.sec"
