@@ -178,7 +178,7 @@ pub async fn ensure_gateway_ssh_secret(
 /// port-forward` (i.e. k8s credentials), which `grant` does not hand
 /// out.
 pub async fn grant(pubkey: &str, tenant: &str, restart: bool) -> Result<()> {
-    use super::eks::smoke::{CliCtx, step_restart_gateway, step_tenant};
+    use super::eks::smoke::{CliCtx, step_restart_gateway, step_tenant, step_upstream};
 
     // Inline key first (`ssh-ed25519 AAAA...`); if that doesn't parse,
     // treat the value as a file path. A path string never parses as a
@@ -200,7 +200,11 @@ pub async fn grant(pubkey: &str, tenant: &str, restart: bool) -> Result<()> {
 
     ui::step("create tenant", || async {
         let cli = CliCtx::open(&client, 0, 0).await?;
-        step_tenant(&cli, tenant).await
+        step_tenant(&cli, tenant).await?;
+        // Upstreams are per-tenant. Without this, a fresh tenant
+        // substitutes from nothing — every build compiles stdenv from
+        // source. Idempotent (checks `upstream list` first).
+        step_upstream(&cli, tenant).await
     })
     .await?;
 
