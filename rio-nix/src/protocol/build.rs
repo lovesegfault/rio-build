@@ -183,7 +183,7 @@ impl BuildResult {
 /// Note: the `drvPath` string is read by the calling opcode handler
 /// before this function is invoked. This reads only the BasicDerivation fields.
 ///
-/// Wire format for protocol 1.37+:
+/// Wire format for protocol 1.35+:
 /// - outputs: count + per-output (name, path, hashAlgo, hash)
 /// - inputSrcs: string collection
 /// - platform: string
@@ -290,8 +290,14 @@ async fn write_optional_i64<W: AsyncWrite + Unpin>(w: &mut W, val: Option<i64>) 
     Ok(())
 }
 
-/// Read a `BuildResult` from the wire (server → client, protocol >= 1.37).
-pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildResult> {
+/// Read a `BuildResult` from the wire (server → client).
+///
+/// `version` is the negotiated protocol version; the `cpu_user`/`cpu_system`
+/// fields were added in 1.37 and are absent on the wire below that.
+pub async fn read_build_result<R: AsyncRead + Unpin>(
+    r: &mut R,
+    version: u64,
+) -> Result<BuildResult> {
     // Status is logically u8 but serialized as u64 (all Nix wire ints are u64)
     let status_val = wire::read_u64(r).await?;
     let status = match BuildStatus::try_from(status_val) {
@@ -307,17 +313,20 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
 
     let error_msg = wire::read_string(r).await?;
 
-    // Protocol 1.29+ (always present since we target 1.37+)
+    // Protocol 1.29+ (always present since we target 1.35+)
     let times_built = wire::read_u64(r).await?;
     let is_non_deterministic = wire::read_bool(r).await?;
     let start_time = wire::read_u64(r).await?;
     let stop_time = wire::read_u64(r).await?;
 
-    // Protocol 1.37+ (always present since we target 1.37+): CPU time
-    let cpu_user = read_optional_i64(r).await?;
-    let cpu_system = read_optional_i64(r).await?;
+    // Protocol 1.37+: CPU time. Absent at 1.35/1.36 (Lix).
+    let (cpu_user, cpu_system) = if version >= super::handshake::encode_version(1, 37) {
+        (read_optional_i64(r).await?, read_optional_i64(r).await?)
+    } else {
+        (None, None)
+    };
 
-    // Protocol 1.28+ (always present since we target 1.37+): builtOutputs (DrvOutputs map)
+    // Protocol 1.28+ (always present since we target 1.35+): builtOutputs (DrvOutputs map)
     let output_count = wire::read_u64(r).await?;
     if output_count > wire::MAX_COLLECTION_COUNT {
         return Err(wire::WireError::CollectionTooLarge(output_count));
@@ -377,26 +386,32 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
     })
 }
 
-/// Write a `BuildResult` to the wire (server → client, protocol >= 1.37).
+/// Write a `BuildResult` to the wire (server → client).
+///
+/// `version` is the negotiated protocol version; the `cpu_user`/`cpu_system`
+/// fields were added in 1.37 and must be omitted below that.
 pub async fn write_build_result<W: AsyncWrite + Unpin>(
     w: &mut W,
     result: &BuildResult,
+    version: u64,
 ) -> Result<()> {
     // Status is logically u8 but serialized as u64 (all Nix wire ints are u64)
     wire::write_u64(w, result.status as u64).await?;
     wire::write_string(w, &result.error_msg).await?;
 
-    // Protocol 1.29+ (always present since we target 1.37+)
+    // Protocol 1.29+ (always present since we target 1.35+)
     wire::write_u64(w, result.times_built).await?;
     wire::write_bool(w, result.is_non_deterministic).await?;
     wire::write_u64(w, result.start_time).await?;
     wire::write_u64(w, result.stop_time).await?;
 
-    // Protocol 1.37+ (always present since we target 1.37+): CPU time
-    write_optional_i64(w, result.cpu_user).await?;
-    write_optional_i64(w, result.cpu_system).await?;
+    // Protocol 1.37+: CPU time. Omitted at 1.35/1.36 (Lix).
+    if version >= super::handshake::encode_version(1, 37) {
+        write_optional_i64(w, result.cpu_user).await?;
+        write_optional_i64(w, result.cpu_system).await?;
+    }
 
-    // Protocol 1.28+ (always present since we target 1.37+): builtOutputs (DrvOutputs map)
+    // Protocol 1.28+ (always present since we target 1.35+): builtOutputs (DrvOutputs map)
     wire::write_u64(w, result.built_outputs.len() as u64).await?;
     for output in &result.built_outputs {
         // Key: DrvOutput string
@@ -426,6 +441,7 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::handshake::{PROTOCOL_VERSION, encode_version};
     use std::io::Cursor;
 
     #[test]
@@ -471,11 +487,45 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        write_build_result(&mut buf, &result).await?;
+        write_build_result(&mut buf, &result, PROTOCOL_VERSION).await?;
 
         let mut reader = Cursor::new(buf);
-        let parsed = read_build_result(&mut reader).await?;
+        let parsed = read_build_result(&mut reader, PROTOCOL_VERSION).await?;
         assert_eq!(parsed, result);
+        Ok(())
+    }
+
+    /// At protocol 1.35 (Lix), cpu_user/cpu_system are absent on the wire.
+    /// Roundtrip must succeed and produce `None` for those fields.
+    #[tokio::test]
+    async fn build_result_roundtrip_v1_35_omits_cpu_time() -> anyhow::Result<()> {
+        let v135 = encode_version(1, 35);
+        let result = BuildResult {
+            status: BuildStatus::Built,
+            times_built: 1,
+            cpu_user: Some(12345),
+            cpu_system: Some(6789),
+            built_outputs: vec![BuiltOutput {
+                drv_output_id: "sha256:abcdef0123456789!out".to_string(),
+                out_path: "/nix/store/abc-hello".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, &result, v135).await?;
+
+        let mut reader = Cursor::new(buf);
+        let parsed = read_build_result(&mut reader, v135).await?;
+        // CPU fields dropped on the wire at 1.35; everything else roundtrips.
+        assert_eq!(
+            parsed,
+            BuildResult {
+                cpu_user: None,
+                cpu_system: None,
+                ..result
+            }
+        );
         Ok(())
     }
 
@@ -484,10 +534,10 @@ mod tests {
         let result = BuildResult::failure(BuildStatus::PermanentFailure, "build failed: exit 1");
 
         let mut buf = Vec::new();
-        write_build_result(&mut buf, &result).await?;
+        write_build_result(&mut buf, &result, PROTOCOL_VERSION).await?;
 
         let mut reader = Cursor::new(buf);
-        let parsed = read_build_result(&mut reader).await?;
+        let parsed = read_build_result(&mut reader, PROTOCOL_VERSION).await?;
         assert_eq!(parsed.status, BuildStatus::PermanentFailure);
         assert_eq!(parsed.error_msg, "build failed: exit 1");
         assert!(parsed.built_outputs.is_empty());
@@ -616,9 +666,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_build_result(&mut buf, &result).await?;
+                    write_build_result(&mut buf, &result, PROTOCOL_VERSION).await?;
                     let mut reader = Cursor::new(buf);
-                    let parsed = read_build_result(&mut reader).await?;
+                    let parsed = read_build_result(&mut reader, PROTOCOL_VERSION).await?;
                     prop_assert_eq!(parsed, result);
                     Ok(())
                 })?;

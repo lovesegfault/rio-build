@@ -38,14 +38,14 @@
 
 | Dependency | Purpose | Phase | Notes |
 |-----------|---------|-------|-------|
-| `nix` (the command-line tool) | Workers invoke `nix-daemon --stdio` for sandboxed build execution | 2 | Runtime dependency, not a Rust crate. Must be present in worker container images. Protocol version must match `rio-nix`'s target (1.37+, Nix 2.20+). |
+| `nix` (the command-line tool) | Workers invoke `nix-daemon --stdio` for sandboxed build execution | 2 | Runtime dependency, not a Rust crate. Must be present in worker container images. Protocol version must match `rio-nix`'s target (1.35+, Nix 2.18+ / Lix). |
 
 ## Gotchas
 
 - gRPC over HTTP/2 defeats L4 load balancers. Use a K8s headless Service + client-side DNS resolution, or an L7 proxy for inter-component gRPC.
 - kube-rs: status updates trigger watch events --- use conditional updates to avoid infinite reconcile loops.
 - rustls dual-provider panic: kube pulls ring, aws-sdk pulls aws-lc-rs. With both features active, rustls 0.23 can't auto-select a `CryptoProvider` and panics at first TLS use. Binaries that pull both (rio-controller) must call `rustls::crypto::aws_lc_rs::default_provider().install_default()` as the first line of `main`.
-- `rio-nix` implements the Nix protocol from scratch --- reference Snix docs, Tweag blog, and Nix C++ source for protocol details. Target protocol version 1.37+ (Nix 2.20+).
+- `rio-nix` implements the Nix protocol from scratch --- reference Snix docs, Tweag blog, and Nix C++ source for protocol details. Target protocol version 1.35+ (Nix 2.18+ / Lix).
 
 ## Risk Notes
 

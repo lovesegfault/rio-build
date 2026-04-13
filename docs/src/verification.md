@@ -22,7 +22,7 @@ The weekly run bumps `nix-unstable` and `lix` inputs before building (via `--ove
 
 Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in `rio-gateway/tests/golden/daemon.rs::VARIANT_SKIP` — each row is `(variant, test_name, reason)`. The `reason` field is load-bearing: it documents WHY so the skip can be removed once upstream converges.
 
-Known Lix divergences:
+Lix is policy-frozen at protocol 1.35 (rio's `MIN_CLIENT_VERSION`), so a Lix client negotiates to 1.35 and rio omits the 1.37+ `BuildResult.cpu_user`/`cpu_system` fields. The Lix-as-client direction is exercised end-to-end in `.#ci` by `vm-protocol-warm-lix-standalone` (same scenario as `vm-protocol-warm-standalone`, client `nix.package` set to the `inputs.lix` flake input). Known golden-conformance divergences (Lix-as-reference-daemon vs rio-as-daemon):
 - Version string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) — handled by the existing `SKIP_FIELDS` mechanism at field level
 - Daemon feature set advertised during handshake — `test_golden_live_handshake` skipped for Lix until the comparator tolerates feature-set supersets
 

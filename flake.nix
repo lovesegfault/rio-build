@@ -728,6 +728,10 @@
                   ;
                 rioModules = inputs.self.nixosModules;
                 inherit (inputs) nixhelm;
+                # Lix-client VM test (vm-protocol-warm-lix-standalone).
+                # Same `or` fallback as nix/golden-matrix.nix — Lix
+                # exposes .default today; future renames covered.
+                lixPackage = inputs.lix.packages.${system}.nix-cli or inputs.lix.packages.${system}.default;
               };
               # Per-test builder CPU hint. withMinCpu sets
               # NIXBUILDNET_MIN_CPU (numVMs × 4 + 1) to prevent
@@ -736,6 +740,7 @@
               cpuHints = {
                 # 3 VMs (control+worker+client). Control is 4-core.
                 vm-protocol-warm-standalone = 3;
+                vm-protocol-warm-lix-standalone = 3;
                 vm-protocol-cold-standalone = 3;
                 # 5 VMs: control + wsmall1/wsmall2/wlarge + client.
                 # Both scheduling splits boot the full 3-worker fixture.
@@ -825,6 +830,11 @@
               [
                 "vm-lifecycle-prod-parity-k3s"
                 "vm-nixos-node"
+                # Lix client variant: rio-side coverage is identical to
+                # vm-protocol-warm-standalone (only the client differs,
+                # and the client isn't instrumented). Excluding keeps
+                # after_n_builds stable.
+                "vm-protocol-warm-lix-standalone"
               ];
 
           # --------------------------------------------------------------

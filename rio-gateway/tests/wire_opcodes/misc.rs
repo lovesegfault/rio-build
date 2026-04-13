@@ -1,5 +1,5 @@
 // r[verify gw.compat.unknown-opcode-close]
-// r[verify gw.compat.version-range]
+// r[verify gw.compat.version-range+2]
 // r[verify gw.opcode.set-options.field-order]
 // r[verify gw.opcode.set-options.propagation+2]
 // ^ NOTE: wire unit test — hand-crafts the wopSetOptions frame directly. Proves
@@ -7,7 +7,7 @@
 //   ssh-ng unreachability clause of +2 is verified by scheduling.nix:
 //   setoptions-unreachable.
 // r[verify gw.conn.sequential]
-// r[verify gw.handshake.version-negotiation]
+// r[verify gw.handshake.version-negotiation+2]
 
 use super::*;
 
@@ -101,8 +101,8 @@ async fn test_version_too_old_sends_stderr_error() -> anyhow::Result<()> {
     // Server should now send STDERR_ERROR (version rejected before feature exchange)
     let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
-        err.message.contains("1.37+"),
-        "error should mention '1.37+', got: {}",
+        err.message.contains("1.35+"),
+        "error should mention '1.35+', got: {}",
         err.message
     );
 

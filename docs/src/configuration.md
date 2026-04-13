@@ -14,7 +14,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
 | `store_addr` | string | (required) | Store gRPC endpoint |
 
-> **Compile-time constants (not configurable):** `MIN_CLIENT_VERSION = 0x125` (1.37) --- the minimum Nix worker-protocol version accepted.
+> **Compile-time constants (not configurable):** `MIN_CLIENT_VERSION = 0x123` (1.35) --- the minimum Nix worker-protocol version accepted. 1.35 is Lix's frozen protocol version.
 
 ## Scheduler
 

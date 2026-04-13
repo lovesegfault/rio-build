@@ -517,7 +517,14 @@ where
                     "stderr reader task join failed: {e}"
                 )))
             })?;
-            rio_nix::protocol::build::read_build_result(&mut reader).await
+            // The local nix-daemon is rio's pinned CppNix from the
+            // container image, always ≥ 1.37, so PROTOCOL_VERSION here
+            // matches what was negotiated at client_handshake.
+            rio_nix::protocol::build::read_build_result(
+                &mut reader,
+                rio_nix::protocol::handshake::PROTOCOL_VERSION,
+            )
+            .await
         }
     }
 }
@@ -540,7 +547,7 @@ mod tests {
     /// Serialize a BuildResult to wire bytes.
     async fn build_result_bytes(r: &BuildResult) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        write_build_result(&mut buf, r).await?;
+        write_build_result(&mut buf, r, rio_nix::protocol::handshake::PROTOCOL_VERSION).await?;
         Ok(buf)
     }
 
@@ -1267,8 +1274,8 @@ mod tests {
         // BuildResult with PermanentFailure. Same wire format as
         // success — read_build_result reads status + errorMsg +
         // timesBuilt + isNonDet + startTime + stopTime + cpuUser +
-        // cpuSystem + builtOutputs unconditionally. builtOutputs is
-        // empty on failure (output_count=0 → loop body skipped).
+        // cpuSystem (≥1.37) + builtOutputs. builtOutputs is empty on
+        // failure (output_count=0 → loop body skipped).
         buf.extend(
             build_result_bytes(&BuildResult::failure(
                 BuildStatus::PermanentFailure,

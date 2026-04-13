@@ -16,7 +16,7 @@
   - [ADR-007: PostgreSQL for Scheduler State](./decisions/007-postgresql-scheduler-state.md)
   - [ADR-008: Custom Nix Protocol Implementation](./decisions/008-custom-nix-protocol.md)
   - [ADR-009: Predictive Cache Warming](./decisions/009-predictive-cache-warming.md)
-  - [ADR-010: Protocol Version 1.37+](./decisions/010-protocol-version.md)
+  - [ADR-010: Protocol Version 1.35+](./decisions/010-protocol-version.md)
   - [ADR-011: Streaming Builder Model](./decisions/011-streaming-builder-model.md)
   - [ADR-012: Privileged Builder Pods](./decisions/012-privileged-builder-pods.md)
   - [ADR-013: Incremental Crate Structure](./decisions/013-incremental-crate-structure.md)

@@ -100,7 +100,7 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 // r[impl gw.conn.sequential]
 // r[impl gw.conn.lifecycle]
 // r[impl gw.handshake.phases]
-// r[impl gw.compat.version-range]
+// r[impl gw.compat.version-range+2]
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
@@ -177,6 +177,7 @@ where
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
+            ctx.negotiated_version = result.negotiated_version();
             let (major, minor) = handshake::decode_version(result.negotiated_version());
             metrics::counter!("rio_gateway_handshakes_total", "result" => "success").increment(1);
             info!(
@@ -185,8 +186,8 @@ where
                 "handshake complete"
             );
         }
-        // r[impl gw.handshake.version-negotiation]
-        // handshake.rs returns VersionTooOld for client < 1.37; the session
+        // r[impl gw.handshake.version-negotiation+2]
+        // handshake.rs returns VersionTooOld for client < 1.35; the session
         // layer is responsible for converting that into STDERR_ERROR on the
         // wire before closing. The annotation in handshake.rs covers the
         // version check; this one covers the STDERR_ERROR send.
@@ -204,7 +205,7 @@ where
             stderr
                 .error(&StderrError::simple(
                     "rio-gateway",
-                    format!("rio-gateway requires Nix protocol version 1.37+, client sent {client_major}.{client_minor}"),
+                    format!("rio-gateway requires Nix protocol version 1.35+, client sent {client_major}.{client_minor}"),
                 ))
                 .await?;
             return Ok(());

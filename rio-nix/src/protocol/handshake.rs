@@ -1,7 +1,7 @@
 //! Nix worker protocol handshake.
 //!
 //! Implements the server side of the version negotiation sequence
-//! for protocol version 1.37+.
+//! for protocol version 1.35+.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -18,13 +18,16 @@ pub const WORKER_MAGIC_1: u64 = 0x6e697863;
 /// Server-to-client magic. Represents "dxio" zero-extended to u64.
 pub const WORKER_MAGIC_2: u64 = 0x6478696f;
 
-// r[impl gw.compat.version-range]
+// r[impl gw.compat.version-range+2]
 /// Our protocol version: 1.38 encoded as `(1 << 8) | 38`.
 /// We advertise 1.38 to support the feature exchange added in that version.
 pub const PROTOCOL_VERSION: u64 = 0x126;
 
 /// Minimum protocol version we accept from clients.
-pub const MIN_CLIENT_VERSION: u64 = 0x125; // 1.37
+///
+/// 1.35 is the version Lix is policy-frozen at (CppNix 2.18 fork point),
+/// so this floor is the lowest that admits Lix as a remote-builder client.
+pub const MIN_CLIENT_VERSION: u64 = 0x123; // 1.35
 
 /// Result of a successful handshake.
 #[must_use]
@@ -57,7 +60,7 @@ pub enum HandshakeError {
     InvalidMagic(u64),
 
     #[error(
-        "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.37+"
+        "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.35+"
     )]
     VersionTooOld {
         client_major: u64,
@@ -105,7 +108,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// On error, the caller should send `STDERR_ERROR` and close the connection.
 // r[impl gw.handshake.phases]
 // r[impl gw.handshake.magic]
-// r[impl gw.handshake.version-negotiation]
+// r[impl gw.handshake.version-negotiation+2]
 // r[impl gw.handshake.features]
 // r[impl gw.handshake.initial-stderr-last]
 // r[impl gw.handshake.flush-points]
@@ -237,7 +240,9 @@ mod tests {
 
     #[test]
     fn test_version_encoding() {
+        assert_eq!(encode_version(1, 35), 0x123);
         assert_eq!(encode_version(1, 37), 0x125);
+        assert_eq!(decode_version(0x123), (1, 35));
         assert_eq!(decode_version(0x125), (1, 37));
         assert_eq!(decode_version(0x120), (1, 32));
     }
@@ -280,8 +285,8 @@ mod tests {
 
         // Send correct magic
         wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
-        // Send old version (1.32)
-        wire::write_u64(&mut writer, encode_version(1, 32)).await?;
+        // Send old version (1.34 — one below MIN_CLIENT_VERSION)
+        wire::write_u64(&mut writer, encode_version(1, 34)).await?;
         writer.flush().await?;
 
         // Read server's response (MAGIC_2 + version)
@@ -294,7 +299,7 @@ mod tests {
             result,
             Err(HandshakeError::VersionTooOld {
                 client_major: 1,
-                client_minor: 32,
+                client_minor: 34,
             })
         ));
         Ok(())
@@ -381,6 +386,47 @@ mod tests {
         drop(writer);
         let result = server_handle.await??;
         assert_eq!(result.negotiated_version(), encode_version(1, 37));
+        Ok(())
+    }
+
+    // r[verify gw.compat.version-range+2]
+    /// Lix is policy-frozen at protocol 1.35; this is the floor case.
+    #[tokio::test]
+    async fn test_handshake_v1_35_accepted() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+
+        let server_handle = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server_stream);
+            let mut stream = tokio::io::join(reader, writer);
+            server_handshake(&mut stream, "rio-build 0.1.0").await
+        });
+
+        let (reader, mut writer) = tokio::io::split(client_stream);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Send correct magic + version 1.35 (MIN_CLIENT_VERSION)
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
+        wire::write_u64(&mut writer, MIN_CLIENT_VERSION).await?;
+        writer.flush().await?;
+
+        // Read server magic + version
+        let _magic2 = wire::read_u64(&mut reader).await?;
+        let _server_version = wire::read_u64(&mut reader).await?;
+
+        // NO feature exchange for v1.35 — jump straight to post-handshake
+        wire::write_u64(&mut writer, 0).await?; // CPU affinity = 0
+        wire::write_u64(&mut writer, 0).await?; // reserveSpace = 0
+        writer.flush().await?;
+
+        // Read version string + trusted + STDERR_LAST (both present at 1.35)
+        let _version_str = wire::read_string(&mut reader).await?;
+        let _trusted = wire::read_u64(&mut reader).await?;
+        let last = wire::read_u64(&mut reader).await?;
+        assert_eq!(last, crate::protocol::stderr::STDERR_LAST);
+
+        drop(writer);
+        let result = server_handle.await??;
+        assert_eq!(result.negotiated_version(), encode_version(1, 35));
         Ok(())
     }
 }

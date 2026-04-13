@@ -13,7 +13,7 @@ Key design decisions are recorded as Architecture Decision Records (ADRs). Each 
 | [ADR-007](./decisions/007-postgresql-scheduler-state.md) | PostgreSQL for scheduler state (separate schema, same cluster) | Accepted |
 | [ADR-008](./decisions/008-custom-nix-protocol.md) | Custom Nix protocol implementation in rio-nix (MIT/Apache-2.0) | Accepted |
 | [ADR-009](./decisions/009-predictive-cache-warming.md) | Predictive cache warming via scheduler prefetch hints | Accepted |
-| [ADR-010](./decisions/010-protocol-version.md) | Protocol version 1.37+ (Nix 2.20+) | Accepted |
+| [ADR-010](./decisions/010-protocol-version.md) | Protocol version 1.35+ (Nix 2.18+ / Lix) | Accepted |
 | [ADR-011](./decisions/011-streaming-builder-model.md) | Streaming builder model (bidirectional BuildExecution RPC) | Accepted |
 | [ADR-012](./decisions/012-privileged-builder-pods.md) | Privileged builder pods (CAP_SYS_ADMIN, custom seccomp) | Accepted |
 | [ADR-013](./decisions/013-incremental-crate-structure.md) | Incremental crate structure (3 crates to 9) | Historical |

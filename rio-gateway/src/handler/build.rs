@@ -828,7 +828,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     }
 }
 
-// r[impl gw.opcode.build-derivation]
+// r[impl gw.opcode.build-derivation+2]
 // r[impl gw.hook.single-node-dag]
 // r[impl gw.hook.ifd-detection+2]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
@@ -841,6 +841,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let negotiated_version = ctx.negotiated_version;
     let SessionContext {
         store_client,
         scheduler_client,
@@ -944,7 +945,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
         let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
         stderr.finish().await?;
-        write_build_result(stderr.inner_mut(), &failure).await?;
+        write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
         return Ok(());
     }
 
@@ -994,7 +995,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     );
 
     stderr.finish().await?;
-    write_build_result(stderr.inner_mut(), &build_result).await?;
+    write_build_result(stderr.inner_mut(), &build_result, negotiated_version).await?;
     Ok(())
 }
 
@@ -1362,7 +1363,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     wire::write_u64(w, results.len() as u64).await?;
     for (raw, result) in raw_paths.iter().zip(results.iter()) {
         wire::write_string(w, raw).await?;
-        write_build_result(w, result).await?;
+        write_build_result(w, result, ctx.negotiated_version).await?;
     }
 
     Ok(())

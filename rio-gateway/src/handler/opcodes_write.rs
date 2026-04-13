@@ -71,8 +71,8 @@ fn parse_reference_paths(refs: &[String], context: &str) -> Result<Vec<StorePath
         .collect()
 }
 
-// r[impl gw.opcode.add-to-store-nar]
-// r[impl gw.opcode.add-to-store-nar.framing]
+// r[impl gw.opcode.add-to-store-nar+2]
+// r[impl gw.opcode.add-to-store-nar.framing+2]
 /// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
 #[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
@@ -501,7 +501,7 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
 ///       ValidPathInfo (9 fields — see stream_one_entry)
 ///       NAR data (narSize plain bytes, NOT nested-framed)
 ///   ]
-// r[impl gw.opcode.add-multiple.batch]
+// r[impl gw.opcode.add-multiple.batch+2]
 // r[impl gw.opcode.add-multiple.unaligned-frames]
 // r[impl gw.opcode.add-multiple.dont-check-sigs-ignored]
 #[instrument(skip_all, fields(count = tracing::field::Empty))]

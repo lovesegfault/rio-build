@@ -277,6 +277,12 @@ pub struct SessionContext {
     /// fetched by one session is warm for all within the 30s TTL.
     /// See `r[store.gc.tenant-quota-enforce]`.
     pub quota_cache: QuotaCache,
+    /// Negotiated worker-protocol version (`min(client, server)`). Set
+    /// by [`crate::session::run_protocol_loop`] after handshake; defaults
+    /// to [`PROTOCOL_VERSION`](rio_nix::protocol::handshake::PROTOCOL_VERSION).
+    /// Handlers that emit version-gated wire fields (e.g.
+    /// `BuildResult.cpu_user` at ≥1.37) read this.
+    pub negotiated_version: u64,
 }
 
 impl SessionContext {
@@ -300,6 +306,7 @@ impl SessionContext {
             service_signer,
             limiter,
             quota_cache,
+            negotiated_version: rio_nix::protocol::handshake::PROTOCOL_VERSION,
         }
     }
 }

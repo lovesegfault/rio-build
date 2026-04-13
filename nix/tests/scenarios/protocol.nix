@@ -23,6 +23,7 @@
   common,
   fixture,
   cold ? false,
+  nameSuffix ? "",
 }:
 let
   inherit (fixture) gatewayHost;
@@ -122,9 +123,7 @@ let
         # `echo ok > $out` → output is exactly "ok\n" → 3 bytes → fixed
         # narSize (NAR framing adds ~100 bytes). Not asserting exact size
         # (NAR format version dependent) but >0 proves the path registered.
-        import json as _json
-        parsed = _json.loads(info)
-        assert parsed[out]["narSize"] > 0, f"narSize=0 for {out!r}: {info}"
+        assert _path_info_one(info, out)["narSize"] > 0, f"narSize=0 for {out!r}: {info}"
 
     with subtest("metric accounting (per-submit vs per-dispatch + FOD routing)"):
         # scheduler_builds_total is per-SubmitBuild RPC: one submit,
@@ -162,13 +161,12 @@ let
         )
 
         # Ground truth from client's LOCAL store.
-        import json as _json
-        local = _json.loads(client.succeed(
+        local = _path_info_one(client.succeed(
             "nix path-info --json ${common.busybox}"
-        ))["${common.busybox}"]
-        gw = _json.loads(client.succeed(
+        ), "${common.busybox}")
+        gw = _path_info_one(client.succeed(
             f"nix path-info --json --store '{store_url}' ${common.busybox}"
-        ))["${common.busybox}"]
+        ), "${common.busybox}")
         # Exact. If gateway returns a different hash/size, the
         # wopQueryPathInfo handler is corrupting data.
         assert gw["narHash"] == local["narHash"], (
@@ -246,7 +244,7 @@ let
   '';
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-${name}";
+  name = "rio-${name}${nameSuffix}";
   skipTypeCheck = true;
   # Cold: builtin:fetchurl is a real network fetch inside the sandbox
   # (FOD). ~60s boot + ~30s fetchurl + build + assertions.
@@ -262,7 +260,17 @@ pkgs.testers.runNixOSTest {
     store_url = "ssh-ng://${gatewayHost}"
 
     with subtest("ssh-ng handshake (magic exchange, version, STDERR_LAST)"):
-        client.succeed(f"nix store info --store '{store_url}'")
+        # `ping` not `info`: Lix (forked at 2.18) lacks the rename; CppNix accepts as alias.
+        client.succeed(f"nix store ping --store '{store_url}'")
+
+    import json as _json
+    def _path_info_one(json_str: str, path: str) -> dict:
+        # `nix path-info --json` schema diverged: CppNix ≥2.19 → {path: {...}},
+        # Lix / CppNix <2.19 → [{path: ..., ...}]. Normalize to dict-keyed-by-path.
+        d = _json.loads(json_str)
+        if isinstance(d, list):
+            d = {x["path"]: x for x in d}
+        return d[path]
 
     ${if cold then coldScript else warmScript}
 

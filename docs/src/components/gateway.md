@@ -56,7 +56,7 @@ The fields are sent in order, all as `u64` unless noted. The **daemon-protocol**
 10. `obsolete_printBuildTrace` (u64: 0)
 11. `buildCores` (u64)
 12. `useSubstitutes` (u64 bool)
-13. `overrides_count` (u64) followed by `overrides_count` pairs of `(key: string, value: string)` --- always present since the minimum accepted client version is 1.37
+13. `overrides_count` (u64) followed by `overrides_count` pairs of `(key: string, value: string)` --- always present since the minimum accepted client version is 1.35
 
 r[gw.opcode.set-options.propagation+2]
 **Override propagation:** The `overrides` key-value pairs contain client build settings. The gateway extracts relevant overrides and propagates them through the build pipeline: gateway -> scheduler (via gRPC) -> workers. **NOT reachable via `ssh-ng://`** --- Nix `SSHStore` overrides `RemoteStore::setOptions()` with an empty body (unchanged since 088ef8175, 2018-03-05; intentional, see NixOS/nix#1713/#1935), so `wopSetOptions` never hits the wire for ssh-ng clients. All `--option` flags are silently dropped client-side. This opcode fires only for `unix://` daemon-socket clients, which is not rio's production path. See `r[sched.timeout.per-build]` for the gRPC-only reachability of `build_timeout`. Upstream fix NixOS/nix 32827b9fb adds selective ssh-ng forwarding but requires the daemon to advertise a `set-options-map-only` protocol feature that rio-gateway does not implement.
@@ -112,8 +112,8 @@ Response (after `STDERR_LAST`) is a full `ValidPathInfo`:
 
 ### wopAddToStoreNar (39) Wire Format
 
-r[gw.opcode.add-to-store-nar]
-For protocol >= 1.25 (always present since we target 1.37+):
+r[gw.opcode.add-to-store-nar+2]
+For protocol >= 1.25 (always present since we target 1.35+):
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -129,8 +129,8 @@ For protocol >= 1.25 (always present since we target 1.37+):
 | `repair` | u64 bool | Whether to repair/overwrite existing path |
 | `dontCheckSigs` | u64 bool | Skip signature verification (read and discarded by rio-gateway; signature enforcement, if any, is delegated to rio-store) |
 
-r[gw.opcode.add-to-store-nar.framing]
-After sending the metadata fields, the NAR data is transferred as a **framed byte stream** (protocol >= 1.23, always true for 1.37+):
+r[gw.opcode.add-to-store-nar.framing+2]
+After sending the metadata fields, the NAR data is transferred as a **framed byte stream** (protocol >= 1.23, always true for 1.35+):
 
 1. Client sends framed data: sequence of `u64(chunk_len) + chunk_bytes`, terminated by `u64(0)` sentinel
 2. Chunk data is NOT padded (unlike string encoding)
@@ -140,8 +140,8 @@ After sending the metadata fields, the NAR data is transferred as a **framed byt
 
 ### wopAddMultipleToStore (44) Wire Format
 
-r[gw.opcode.add-multiple.batch]
-Added in protocol 1.32 (always present for 1.37+). This is the primary upload path for modern Nix clients, replacing per-item `wopAddToStoreNar` for source paths.
+r[gw.opcode.add-multiple.batch+2]
+Added in protocol 1.32 (always present for 1.35+). This is the primary upload path for modern Nix clients, replacing per-item `wopAddToStoreNar` for source paths.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -194,8 +194,8 @@ Both `wopBuildPaths` and `wopBuildPathsWithResults` send a `string collection` o
 
 ### wopBuildDerivation (36) -- BasicDerivation Wire Format
 
-r[gw.opcode.build-derivation]
-Sends an inline `BasicDerivation` (without `inputDrvs`). For protocol 1.37+:
+r[gw.opcode.build-derivation+2]
+Sends an inline `BasicDerivation` (without `inputDrvs`). For protocol 1.35+:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -328,7 +328,7 @@ r[gw.opcode.build-paths-with-results]
 
 #### BuildResult Wire Format
 
-For protocol 1.37+, all fields are present:
+All fields below are present for 1.35+ except `cpu_user`/`cpu_system`, which are gated on protocol >= 1.37 (Lix at 1.35 omits them):
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -421,8 +421,8 @@ r[gw.handshake.magic]
 | 3 | S -> C | Protocol version (encoded as `(major << 8) \| minor`, e.g. `0x126` = 1.38) | u64 |
 | 4 | C -> S | Client protocol version | u64 |
 
-r[gw.handshake.version-negotiation]
-The negotiated version is `min(client_version, server_version)`. If the client version < 1.37, the server should send `STDERR_ERROR` and close the connection.
+r[gw.handshake.version-negotiation+2]
+The negotiated version is `min(client_version, server_version)`. If the client version < 1.35, the server should send `STDERR_ERROR` and close the connection.
 
 r[gw.handshake.features]
 **Phase 2: Feature Exchange (protocol >= 1.38)**
@@ -694,10 +694,8 @@ r[gw.stderr.result.set-phase]
 
 ## Protocol Compatibility
 
-r[gw.compat.version-range]
-Target: protocol version **1.38+** (Nix 2.20+, advertised as `0x126`). Minimum accepted client version is 1.37. Older clients are rejected at handshake with a human-readable error.
-
-> **Correction:** rio-build advertises protocol 1.38 (not 1.37) to support the feature exchange step added in that version. The minimum accepted client version remains 1.37 for backwards compatibility.
+r[gw.compat.version-range+2]
+rio-build advertises protocol **1.38** (`0x126`) to support the feature-exchange step. Minimum accepted client version is **1.35** (`0x123`) — the version Lix is policy-frozen at (CppNix 2.18 fork point). Older clients are rejected at handshake with a human-readable error. The only field rio gates between 1.35 and 1.38 is `BuildResult.cpu_user`/`cpu_system` (added in 1.37); the feature exchange itself is already gated on >= 1.38.
 
 r[gw.compat.unknown-opcode-close]
 Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection**. This is necessary because the opcode's payload remains unread in the stream and its format is unknown, making it impossible to skip to the next opcode without corrupting the protocol. The Nix client will reconnect automatically.

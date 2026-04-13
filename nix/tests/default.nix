@@ -11,6 +11,7 @@
   nixhelm,
   system,
   coverage ? false,
+  lixPackage,
 }:
 let
   # Shared arg set for common.nix + every fixture. Fixtures take `...`
@@ -174,6 +175,38 @@ in
         worker = {
         };
       };
+    };
+    cold = false;
+  };
+
+  # r[verify gw.compat.version-range+2]
+  #   Identical to vm-protocol-warm-standalone but the client VM runs
+  #   Lix. Lix is policy-frozen at daemon protocol 1.35, so this
+  #   exercises rio's MIN_CLIENT_VERSION floor and the ≥1.37
+  #   BuildResult.cpu_* gate against a real ssh-ng client end-to-end.
+  #   Single Lix test in .#ci — wire-level Lix-as-daemon coverage lives
+  #   in the weekly .#golden-matrix.
+  vm-protocol-warm-lix-standalone = protocol {
+    inherit pkgs common;
+    nameSuffix = "-lix";
+    fixture = standalone {
+      workers = {
+        worker = {
+        };
+      };
+      clientNixPackage = lixPackage;
+      extraClientModules = [
+        {
+          # Lix rejects ca-derivations as "unknown experimental
+          # feature" at nix.conf validation. mkClientNode sets it
+          # unconditionally for ca-cutoff's benefit; protocol-warm
+          # doesn't need it.
+          nix.settings.experimental-features = pkgs.lib.mkForce [
+            "nix-command"
+            "flakes"
+          ];
+        }
+      ];
     };
     cold = false;
   };

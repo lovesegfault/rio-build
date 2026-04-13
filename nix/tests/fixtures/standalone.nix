@@ -59,6 +59,8 @@ in
   # NixOS modules merged into the client VM. protocol-cold uses this
   # for drvs.coldBootstrapServer (Python http.server serving busybox).
   extraClientModules ? [ ],
+  # Threaded to mkClientNode's nix.package. Default = nixpkgs CppNix.
+  clientNixPackage ? pkgs.nix,
 }:
 let
   hmacKeys = if withHmac then mkHmacKeys { } else null;
@@ -209,7 +211,10 @@ in
     control = controlNode;
     client = {
       imports = [
-        (common.mkClientNode { gatewayHost = "control"; })
+        (common.mkClientNode {
+          gatewayHost = "control";
+          nixPackage = clientNixPackage;
+        })
       ]
       ++ extraClientModules;
     };

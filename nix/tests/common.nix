@@ -447,10 +447,15 @@ rec {
       # uses `root`.
       gatewayUser ? "root",
       extraPackages ? [ ],
+      # Which Nix implementation the client runs. Default is the
+      # nixpkgs-pinned CppNix; vm-protocol-warm-lix-standalone overrides
+      # to Lix (protocol 1.35) to exercise the MIN_CLIENT_VERSION floor.
+      nixPackage ? pkgs.nix,
     }:
     {
       networking.hostName = "client";
 
+      nix.package = nixPackage;
       # ca-derivations: ca-cutoff.nix evaluates `__contentAddressed = true`
       # on the client (eval-side feature gate, not build-side — the build
       # goes via ssh-ng to rio-gateway which doesn't check nix.conf).

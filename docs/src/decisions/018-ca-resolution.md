@@ -108,7 +108,7 @@ In the locked nixpkgs (flake input, 37,187 `.nix` files under `pkgs/`), **3 file
 
 One standard Nix wire string: `[u64 LE len][bytes][pad-to-8]`. Content is JSON produced by `nlohmann::json(Realisation).dump()` (`src/libstore/common-protocol.cc:61-65`).
 
-rio-gateway requires protocol ≥ 1.37 (`rio-nix/src/protocol/handshake.rs:27`), so the pre-1.31 format (`DrvOutput` + `StorePath` separately, `daemon.cc:960-963`) is never seen.
+rio-gateway requires protocol ≥ 1.35 (`rio-nix/src/protocol/handshake.rs`), so the pre-1.31 format (`DrvOutput` + `StorePath` separately, `daemon.cc:960-963`) is never seen.
 
 **JSON shape** (`src/libstore/realisation.cc:99-123`):
 

@@ -15,7 +15,7 @@ References for implementation:
 - Nix C++ source code (`libstore/daemon.cc`, `libstore/remote-store.cc`).
 - Protocol specification from the Nix manual.
 
-The implementation targets protocol version 1.37+ only (see ADR-010), reducing the surface area by excluding legacy protocol paths.
+The implementation targets protocol version 1.35+ only (see ADR-010), reducing the surface area by excluding legacy protocol paths.
 
 ## Alternatives Considered
 - **Use nix-compat (GPL-3.0)**: The most complete Rust implementation of Nix protocols. Well-tested and actively maintained. However, GPL-3.0 is incompatible with the project's MIT/Apache-2.0 licensing goals --- any binary statically linking nix-compat would need to be GPL-3.0 licensed. Additionally, depending on nix-compat couples rio-build to the Tvix project's release cadence and design priorities, and limits our ability to optimize the protocol implementation for rio-build's specific needs (e.g., zero-copy NAR streaming, batch opcode handling).
@@ -26,7 +26,7 @@ The implementation targets protocol version 1.37+ only (see ADR-010), reducing t
 ## Consequences
 - **Positive**: Clean MIT/Apache-2.0 licensing with no GPL dependencies.
 - **Positive**: Full control over the protocol implementation, optimized for rio-build's specific needs.
-- **Positive**: Targeting only modern protocol versions (1.37+) significantly reduces implementation scope.
+- **Positive**: Targeting only modern protocol versions (1.35+) significantly reduces implementation scope.
 - **Negative**: Significant upfront implementation effort for protocol, NAR, derivation parsing, and store path computation.
 - **Negative**: Must track upstream Nix protocol changes independently. No shared maintenance with the Tvix/Snix ecosystem.
 - **Negative**: Risk of subtle protocol bugs that nix-compat has already found and fixed.

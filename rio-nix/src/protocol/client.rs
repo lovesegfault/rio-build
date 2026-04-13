@@ -391,6 +391,7 @@ mod tests {
                     status: BuildStatus::Built,
                     ..Default::default()
                 },
+                PROTOCOL_VERSION,
             )
             .await?;
             sw.flush().await?;
@@ -403,7 +404,7 @@ mod tests {
         let mut log_lines = Vec::new();
         let result = loop {
             match read_stderr_message(&mut cr).await? {
-                StderrMessage::Last => break read_build_result(&mut cr).await?,
+                StderrMessage::Last => break read_build_result(&mut cr, PROTOCOL_VERSION).await?,
                 StderrMessage::Error(e) => panic!("daemon error: {}", e.message),
                 StderrMessage::Next(s) => log_lines.push(s),
                 _ => {}
