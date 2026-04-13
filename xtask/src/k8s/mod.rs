@@ -1,6 +1,7 @@
 //! Unified k8s deploy. One command surface, provider flag selects
 //! k3s (local) vs eks (AWS).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -120,6 +121,12 @@ pub struct UpOpts {
     /// EKS-only.
     #[arg(long)]
     wait_drift: bool,
+    /// Allow this CIDR to reach the gateway NLB directly (internet-
+    /// facing). Repeatable. When unset, the NLB stays `internal`
+    /// (reachable only via the SSM bastion). Changing set↔unset
+    /// recreates the NLB — new DNS name. EKS-only.
+    #[arg(long = "public-cidr", value_name = "CIDR")]
+    public_cidr: Vec<String>,
 
     /// Skip interactive confirmation prompts (tofu apply diff).
     #[arg(long)]
@@ -186,6 +193,7 @@ impl UpOpts {
         );
         req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
         req!(self.wait_drift, "--wait-drift", Phase::Deploy);
+        req!(!self.public_cidr.is_empty(), "--public-cidr", Phase::Deploy);
         req!(
             !matches!(self.ami_arch, AmiArch::All),
             "--ami-arch",
@@ -299,6 +307,25 @@ pub enum K8sCmd {
     /// builds + registers; this is the maintenance side.
     #[command(subcommand)]
     Ami(AmiCmd),
+    /// Grant build access to an SSH public key under its own tenant:
+    /// creates the tenant, appends the key (with comment = tenant
+    /// name) to the rio-gateway-ssh Secret, and rolls the gateway so
+    /// the key takes effect. Idempotent — re-running for the same
+    /// key/tenant pair is a no-op. Admin (rio-cli) access is NOT
+    /// granted; the key only authenticates the ssh-ng build path.
+    Grant {
+        /// Path to the user's OpenSSH public key (id_ed25519.pub).
+        pubkey: PathBuf,
+        /// Tenant name. Becomes the authorized_keys comment, which
+        /// the gateway maps to `SubmitBuild.tenant_name`.
+        #[arg(long)]
+        tenant: String,
+        /// Skip the gateway rollout-restart. Useful when adding
+        /// several keys in a row — pass --no-restart for all but the
+        /// last (authorized_keys is read once at startup).
+        #[arg(long)]
+        no_restart: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,6 +442,11 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
+        K8sCmd::Grant {
+            pubkey,
+            tenant,
+            no_restart,
+        } => shared::grant(&pubkey, &tenant, !no_restart).await,
         K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
         K8sCmd::Ami(cmd) => {
             if !matches!(kind, ProviderKind::Eks) {
@@ -471,6 +503,7 @@ async fn run_up(
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
             wait_drift: o.wait_drift,
+            public_cidrs: o.public_cidr.clone(),
         },
     };
     let cfg = Arc::new(cfg.clone());

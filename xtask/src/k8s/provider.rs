@@ -32,6 +32,13 @@ pub struct DeployOpts {
     /// builds started immediately after `up` get evicted mid-run as
     /// the rollout proceeds.
     pub wait_drift: bool,
+    /// Source CIDRs allowed to reach the gateway NLB. Non-empty flips
+    /// the NLB to `internet-facing` and sets
+    /// `spec.loadBalancerSourceRanges`; empty (default) keeps it
+    /// `internal` (VPC-only via the SSM bastion). NLB scheme is
+    /// immutable, so changing empty↔non-empty RECREATES the load
+    /// balancer (new DNS name). EKS-only; k3s ignores it.
+    pub public_cidrs: Vec<String>,
 }
 
 /// Output of the nix-build portion of push. Held separately so `up`

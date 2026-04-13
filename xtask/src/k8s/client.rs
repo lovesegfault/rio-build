@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
@@ -143,6 +143,22 @@ pub async fn get_secret_key(
         .and_then(|s| s.data)
         .and_then(|d| d.get(key).cloned())
         .and_then(|v| String::from_utf8(v.0).ok()))
+}
+
+/// LoadBalancer ingress hostname for the gateway Service. `Err` if the
+/// Service has no `.status.loadBalancer.ingress` yet (NLB still
+/// provisioning) — caller decides whether to wait or print a
+/// placeholder.
+pub async fn gateway_lb_hostname(client: &Client, ns: &str) -> Result<String> {
+    let api: Api<Service> = Api::namespaced(client.clone(), ns);
+    api.get("rio-gateway")
+        .await?
+        .status
+        .and_then(|s| s.load_balancer)
+        .and_then(|lb| lb.ingress)
+        .and_then(|mut i| i.pop())
+        .and_then(|i| i.hostname.or(i.ip))
+        .context("rio-gateway Service has no LoadBalancer ingress yet (NLB provisioning?)")
 }
 
 /// Find the scheduler leader pod from the Lease.

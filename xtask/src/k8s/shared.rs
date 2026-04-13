@@ -160,6 +160,88 @@ pub async fn ensure_gateway_ssh_secret(
     .await
 }
 
+/// Grant build access to one SSH public key under its own tenant.
+///
+/// 1. Validate the pubkey, force its comment to `tenant` (the gateway
+///    maps comment → `SubmitBuild.tenant_name`).
+/// 2. `rio-cli create-tenant <tenant>` via the scheduler tunnel
+///    (idempotent — `AlreadyExists` is fine).
+/// 3. Merge the key into the `rio-gateway-ssh` Secret, deduping by
+///    (type, base64) so re-runs don't grow the file.
+/// 4. Rollout-restart the gateway (authorized_keys is read once at
+///    startup) unless `restart=false`.
+///
+/// Admin access is NOT granted: the key only authenticates the ssh-ng
+/// build path. `AdminService` lives on ClusterIP:9001 behind the
+/// `scheduler-ingress` CiliumNetworkPolicy and needs `kubectl
+/// port-forward` (i.e. k8s credentials), which `grant` does not hand
+/// out.
+pub async fn grant(pubkey: &std::path::Path, tenant: &str, restart: bool) -> Result<()> {
+    use super::eks::smoke::{CliCtx, step_restart_gateway, step_tenant};
+
+    let mut key = ssh_key::PublicKey::read_openssh_file(pubkey)
+        .with_context(|| format!("{}: not a valid OpenSSH public key", pubkey.display()))?;
+    key.set_comment(tenant);
+    let key_line = key.to_openssh()? + "\n";
+
+    let client = kube::client().await?;
+
+    ui::step("create tenant", || async {
+        let cli = CliCtx::open(&client, 0, 0).await?;
+        step_tenant(&cli, tenant).await
+    })
+    .await?;
+
+    ui::step("merge key into rio-gateway-ssh", || async {
+        let existing = kube::get_secret_key(&client, NS, "rio-gateway-ssh", "authorized_keys")
+            .await?
+            .unwrap_or_default();
+        // Dedup on (type, base64) — comment may legitimately change
+        // (re-granting the same key under a different tenant replaces).
+        let key_id = |l: &str| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.to_owned(), it.next()?.to_owned()))
+        };
+        let new_id = key_id(&key_line);
+        let mut merged: String = existing
+            .lines()
+            .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        merged.push_str(&key_line);
+        kube::apply_secret(
+            &client,
+            NS,
+            "rio-gateway-ssh",
+            BTreeMap::from([("authorized_keys".into(), merged)]),
+        )
+        .await
+    })
+    .await?;
+
+    if restart {
+        ui::step("rollout restart rio-gateway", || {
+            step_restart_gateway(&client)
+        })
+        .await?;
+    } else {
+        ui::step_skip(
+            "rollout restart rio-gateway",
+            "--no-restart; key takes effect after the next gateway restart",
+        );
+    }
+
+    let host = kube::gateway_lb_hostname(&client, NS)
+        .await
+        .unwrap_or_else(|_| "<gateway-lb-hostname>".into());
+    tracing::info!(
+        "granted: tenant '{tenant}' via {}\n  \
+         nix build --store 'ssh-ng://rio@{host}?ssh-key=<their-private-key>' ...",
+        pubkey.display(),
+    );
+    Ok(())
+}
+
 pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
     let pass = match kube::get_secret_key(client, NS, "rio-postgres-auth", "password").await? {
         Some(p) => p,

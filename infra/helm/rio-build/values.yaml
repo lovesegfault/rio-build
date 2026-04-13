@@ -416,6 +416,12 @@ gateway:
     # connections while the pod drains, e.g.:
     #   service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: deregistration_delay.timeout_seconds=60
     annotations: {}
+    # CIDRs allowed to reach the LoadBalancer. Empty = no restriction
+    # at the LB layer (the default `internal` scheme already scopes to
+    # the VPC). When a deployment sets this AND `aws-load-balancer-
+    # scheme: internet-facing`, the controller writes NLB SG ingress
+    # rules so only these source ranges can connect on port 22.
+    loadBalancerSourceRanges: []
   ssh:
     # Secret with key `authorized_keys`. Without it: gateway has no keys to
     # check → all SSH auth fails. Empty string → don't mount (gateway

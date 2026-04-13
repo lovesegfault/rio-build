@@ -184,10 +184,18 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // replacement handles node→pod. externalTrafficPolicy:Local in
     // gateway.yaml means only nodes hosting a gateway pod pass NLB
     // health checks (others are correctly unhealthy, not a bug).
+    // --public-cidr flips internal→internet-facing AND sets
+    // loadBalancerSourceRanges (the controller writes NLB SG ingress
+    // rules). NLB scheme is immutable, so a flip recreates the LB.
+    let scheme = if opts.public_cidrs.is_empty() {
+        "internal"
+    } else {
+        "internet-facing"
+    };
     let nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
-        "service.beta.kubernetes.io/aws-load-balancer-scheme": "internal",
+        "service.beta.kubernetes.io/aws-load-balancer-scheme": scheme,
         // dualstack: cluster is IPv6-only (no IPv4 Service CIDR), so
         // ip-address-type=ipv4 fails with "unsupported IPv6 config".
         // dualstack with target-type=instance needs the instances to
@@ -238,6 +246,10 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                 &bootstrap_arn,
             )
             .set_json("gateway.service.annotations", nlb_ann.to_string())
+            .set_json(
+                "gateway.service.loadBalancerSourceRanges",
+                json!(opts.public_cidrs).to_string(),
+            )
             .set("karpenter.enabled", "true")
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)

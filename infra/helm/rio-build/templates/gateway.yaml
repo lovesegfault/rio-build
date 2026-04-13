@@ -159,6 +159,10 @@ metadata:
 spec:
   {{- include "rio.ipFamily" . | nindent 2 }}
   type: {{ $g.service.type }}
+  {{- with $g.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- if eq $g.service.type "LoadBalancer" }}
   # Preserve client source IP for SSH audit logging. With Cilium DSR
   # (loadBalancer.dsrDispatch=geneve in addons.tf), Local works
