@@ -838,7 +838,13 @@ pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
     };
     if status.reason.as_deref() == Some("Evicted") {
         let msg = status.message.as_deref().unwrap_or("");
-        if msg.contains("DiskPressure") || msg.contains("ephemeral-storage") {
+        // kubelet's per-pod limit message is "ephemeral local storage"
+        // (spaces); the hyphenated "ephemeral-storage" is the resource
+        // NAME and only appears in node-condition messages. Match both.
+        if msg.contains("DiskPressure")
+            || msg.contains("ephemeral-storage")
+            || msg.contains("ephemeral local storage")
+        {
             return TerminationReason::EvictedDiskPressure;
         }
         return TerminationReason::EvictedOther;
@@ -1086,11 +1092,21 @@ mod tests {
             TerminationReason::Error
         );
         // Kubelet's per-pod ephemeral-storage limit eviction message
-        // (the production firefox I-213 case).
+        // (the production firefox I-213 case). VERBATIM from live
+        // cluster — ends with the limit value, NOT the resource name;
+        // the original 2acd1b32 fixture ended in "ephemeral-storage"
+        // and matched by accident.
         assert_eq!(
             pod_termination_reason(&pod_evicted(
                 "Pod ephemeral local storage usage exceeds the total limit \
-                 of containers ephemeral-storage"
+                 of containers 4Gi."
+            )),
+            TerminationReason::EvictedDiskPressure
+        );
+        // Node-condition form (resource name, hyphenated).
+        assert_eq!(
+            pod_termination_reason(&pod_evicted(
+                "The node was low on resource: ephemeral-storage."
             )),
             TerminationReason::EvictedDiskPressure
         );
