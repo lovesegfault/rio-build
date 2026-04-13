@@ -125,6 +125,12 @@ rules:
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]
+  # NodePool budget reconciler (r[ctrl.nodepoolbudget]): list governed
+  # pools by label, read .status.resources.cpu, merge-patch
+  # .spec.limits.cpu. Cluster-scoped resource → ClusterRole rule.
+  - apiGroups: [karpenter.sh]
+    resources: [nodepools]
+    verbs: [get, list, watch, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

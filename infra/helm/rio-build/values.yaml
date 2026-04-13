@@ -183,6 +183,15 @@ controller:
   # Extra env injected after base vars. Coverage mode injects
   # LLVM_PROFILE_FILE here.
   extraEnv: []
+  # Shared Karpenter NodePool vCPU budget — fills the gap from
+  # kubernetes-sigs/karpenter#1747 (no native cross-pool limit). The
+  # controller patches each governed pool's spec.limits.cpu to
+  # `used + (cpu − Σused)`; freeze (limit=used) when over budget. Set
+  # `nodePoolBudget: ~` to disable and leave limits helm-managed.
+  # `cpu` is whole cores; template ×1000 → millicores env.
+  nodePoolBudget:
+    cpu: 30000
+    selector: rio.build/karpenter-budget=shared
   # hostNetwork: CoreDNS in k3s VM tests doesn't know NixOS-test VM
   # hostnames. hostNetwork → pod uses node's /etc/hosts.
   hostNetwork: false
@@ -487,6 +496,7 @@ karpenter:
     # Worker preferred: c6a/c7a (AMD EPYC compute-optimized). Tainted so
     # ONLY builder pods (with the matching toleration) land here.
     - name: rio-builder-preferred
+      sharedBudget: true
       weight: 100
       labels:
         rio.build/node-role: builder
@@ -518,6 +528,7 @@ karpenter:
     # unavailable (rare on-demand, common for spot) Karpenter falls
     # through here.
     - name: rio-builder-fallback
+      sharedBudget: true
       weight: 10
       labels:
         rio.build/node-role: builder
@@ -556,6 +567,7 @@ karpenter:
     # (~$5-10/hr each), don't let Karpenter prefer it for non-kvm pods
     # that happen to tolerate both taints, and reap aggressively.
     - name: rio-builder-metal
+      sharedBudget: true
       weight: 1
       # I-205: x86_64 .metal SKUs reject UEFI AMIs (legacy-bios only).
       # rio-metal NodeClass selects node-ami-x86_64-bios for amd64 and
@@ -602,6 +614,7 @@ karpenter:
     # Karpenter doesn't prefer it for unrelated pods that happen to
     # tolerate the taint.
     - name: rio-fetcher
+      sharedBudget: true
       weight: 5
       labels:
         rio.build/node-role: fetcher

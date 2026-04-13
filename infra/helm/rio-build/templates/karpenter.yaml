@@ -93,6 +93,9 @@ metadata:
   name: {{ .name }}
   labels:
     app.kubernetes.io/part-of: rio-build
+    {{- if .sharedBudget }}
+    rio.build/karpenter-budget: shared
+    {{- end }}
 spec:
   weight: {{ .weight }}
   template:

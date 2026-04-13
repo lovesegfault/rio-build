@@ -20,6 +20,7 @@ pub mod common;
 pub mod componentscaler;
 pub mod fetcherpool;
 pub mod gc_schedule;
+pub mod nodepoolbudget;
 
 use std::collections::HashMap;
 use std::sync::Arc;

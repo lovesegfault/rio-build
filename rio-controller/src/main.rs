@@ -21,7 +21,10 @@ use kube::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, componentscaler, fetcherpool};
+use rio_controller::reconcilers::nodepoolbudget::NodePoolBudgetConfig;
+use rio_controller::reconcilers::{
+    Ctx, builderpool, builderpoolset, componentscaler, fetcherpool, nodepoolbudget,
+};
 use rio_controller::spawn_controller;
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::BuilderPoolSet;
@@ -56,6 +59,10 @@ struct Config {
     /// grace). `store_addr` is the connect target — StoreAdminService
     /// is hosted on the store's gRPC port alongside StoreService.
     gc_interval_hours: u64,
+    /// Shared Karpenter NodePool vCPU budget. `cpu_millicores = 0` =
+    /// reconciler not spawned. Env: `RIO_NODEPOOL_BUDGET__CPU_MILLICORES`
+    /// / `__SELECTOR`.
+    nodepool_budget: NodePoolBudgetConfig,
 }
 
 impl Default for Config {
@@ -71,6 +78,7 @@ impl Default for Config {
             // 24h: typical store growth between sweeps is a few
             // thousand paths. Lower values are fine for VM tests.
             gc_interval_hours: 24,
+            nodepool_budget: NodePoolBudgetConfig::default(),
         }
     }
 }
@@ -231,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
     // (SIGTERM drain still runs).
     rio_common::task::spawn_monitored(
         "disruption-watcher",
-        builderpool::disruption::run(client, admin, shutdown.clone()),
+        builderpool::disruption::run(client.clone(), admin, shutdown.clone()),
     );
 
     // ---- GC cron ----
@@ -261,6 +269,18 @@ async fn main() -> anyhow::Result<()> {
             store_addr_set = !cfg.store.addr.is_empty(),
             "GC cron disabled"
         );
+    }
+
+    // ---- NodePool budget ----
+    // Gated on cpu_millicores > 0 (same opt-in pattern as gc-cron).
+    // Disabled = NodePool limits stay helm-managed.
+    if cfg.nodepool_budget.cpu_millicores > 0 {
+        rio_common::task::spawn_monitored(
+            "nodepool-budget",
+            nodepoolbudget::run(client.clone(), cfg.nodepool_budget, shutdown.clone()),
+        );
+    } else {
+        info!("NodePool budget reconciler disabled (cpu_millicores=0)");
     }
 
     info!("controller running");
@@ -306,6 +326,10 @@ mod tests {
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9094");
         assert_eq!(d.health_addr.to_string(), "[::]:9194");
         assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
+        assert_eq!(
+            d.nodepool_budget.cpu_millicores, 0,
+            "NodePool budget disabled by default"
+        );
     }
 
     #[test]

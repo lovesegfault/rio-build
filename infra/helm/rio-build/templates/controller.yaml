@@ -63,6 +63,14 @@ spec:
             - name: RIO_STORE__BALANCE_PORT
               value: {{ $c.storeBalancePort | quote }}
             {{- end }}
+            {{- with $c.nodePoolBudget }}
+            # Shared Karpenter NodePool vCPU budget — see r[ctrl.nodepoolbudget].
+            # values store cores; controller config is millicores.
+            - name: RIO_NODEPOOL_BUDGET__CPU_MILLICORES
+              value: {{ mul (.cpu | int) 1000 | quote }}
+            - name: RIO_NODEPOOL_BUDGET__SELECTOR
+              value: {{ .selector | quote }}
+            {{- end }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
