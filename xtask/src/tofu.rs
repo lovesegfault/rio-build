@@ -144,7 +144,14 @@ fn resolve_bucket<F: FnOnce() -> Result<String>>(
 /// SDK so [`outputs`] can stay sync. Bucket-naming convention lives in
 /// [`resolve_bucket`].
 fn ensure_backend_init(dir: &str) -> Result<()> {
-    if sh::repo_root().join(dir).join(".terraform").is_dir() {
+    // `.terraform/` can exist without `terraform.tfstate` (the backend
+    // cache) after a partial/failed init — check for the cache file
+    // itself, not the directory.
+    if sh::repo_root()
+        .join(dir)
+        .join(".terraform/terraform.tfstate")
+        .is_file()
+    {
         return Ok(());
     }
     let cfg = XtaskConfig::load()?;

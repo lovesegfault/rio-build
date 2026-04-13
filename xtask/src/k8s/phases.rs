@@ -28,8 +28,8 @@ pub enum Phase {
 impl Phase {
     /// Canonical order for selection/validation. Execution order is the
     /// DAG induced by [`Phase::deps`] — [`run_up_phases`] runs every
-    /// phase whose dependencies are satisfied concurrently (ami ∥
-    /// bootstrap→provision; kubeconfig ∥ push after provision; deploy
+    /// phase whose dependencies are satisfied concurrently (bootstrap →
+    /// provision; ami ∥ kubeconfig ∥ push after provision; deploy
     /// waits on the join of all three).
     pub const ALL: [Phase; 6] = [
         Phase::Bootstrap,
@@ -61,14 +61,17 @@ impl Phase {
     /// test catches cycles.
     pub const fn deps(self) -> &'static [Phase] {
         match self {
-            Phase::Bootstrap | Phase::Ami => &[],
+            Phase::Bootstrap => &[],
             Phase::Provision => &[Phase::Bootstrap],
             Phase::Kubeconfig => &[Phase::Provision],
-            // ECR repo URL is a tofu output → push can't start before
-            // provision. build (the nix-build half) is folded into the
-            // push phase rather than threaded as a separate output —
-            // it's fast and local, not worth a typed-output channel.
-            Phase::Push => &[Phase::Provision],
+            // region/cluster_name (ami) and ECR repo URL (push) are
+            // tofu outputs → neither can start before provision. On a
+            // fresh account the state bucket doesn't even exist until
+            // bootstrap, so the previous `Ami => &[]` failed `tofu
+            // output` outright. build (the nix-build half of push) is
+            // folded in rather than a separate output — it's fast and
+            // local, not worth a typed-output channel.
+            Phase::Ami | Phase::Push => &[Phase::Provision],
             // deploy reads the AMI tag from EC2 (ami phase registers
             // + tags it) + image tag (push) + talks to the cluster
             // (kubeconfig).
@@ -90,13 +93,13 @@ pub(super) struct PhaseParams {
 /// Concurrent core of `up`: a ready-set DAG executor over
 /// [`Phase::deps`]. A phase spawns the moment all its (selected)
 /// dependencies have completed; independent chains run concurrently
-/// (ami ∥ bootstrap→provision; kubeconfig ∥ push after provision).
+/// (bootstrap→provision, then ami ∥ kubeconfig ∥ push).
 ///
-/// **No cancellation on error.** provision is `terraform apply` — real
-/// cloud resources mid-creation. An AMI build failure (nix eval error,
-/// S3 throttle) MUST NOT drop an in-flight provision on the floor;
-/// that would abandon a half-applied tofu plan with state drift the
-/// operator then has to untangle by hand. In-flight phases always run
+/// **No cancellation on error.** ami is a ~4 GB coldsnap upload per
+/// arch; push is a multi-arch image push. A sibling failure (push
+/// errors mid-ami-upload, or vice versa) MUST NOT drop the in-flight
+/// work — that abandons a half-uploaded snapshot the operator then
+/// has to clean up by hand. In-flight phases always run
 /// to completion. A failed phase's *dependents* are never spawned
 /// (their dep is never marked done); *siblings* on independent dep
 /// chains continue. Errors are collected and surfaced together after
@@ -269,13 +272,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use anyhow::anyhow;
     use async_trait::async_trait;
 
     use super::super::shared;
@@ -287,17 +286,15 @@ mod tests {
     type Log = Arc<Mutex<Vec<&'static str>>>;
 
     /// Records call order; per-method delays make ready-set
-    /// interleaving observable. `provision_done` is the witness for
-    /// the "ami error must not cancel provision" test; `bootstrap_at`
-    /// timestamps bootstrap completion relative to construction (for
-    /// the I-198 raw-blocking test).
+    /// interleaving observable. `bootstrap_at` timestamps bootstrap
+    /// completion relative to construction (for the I-198 raw-blocking
+    /// test).
     struct MockProvider {
         log: Log,
         provision_delay: Duration,
         kubeconfig_delay: Duration,
         push_delay: Duration,
         push_err: bool,
-        provision_done: Arc<AtomicBool>,
         t0: std::time::Instant,
         bootstrap_at: Arc<Mutex<Option<Duration>>>,
     }
@@ -310,7 +307,6 @@ mod tests {
                 kubeconfig_delay: Duration::ZERO,
                 push_delay: Duration::ZERO,
                 push_err: false,
-                provision_done: Arc::new(AtomicBool::new(false)),
                 t0: std::time::Instant::now(),
                 bootstrap_at: Arc::default(),
             }
@@ -333,7 +329,6 @@ mod tests {
         async fn provision(&self, _: &XtaskConfig, _: bool) -> Result<()> {
             tokio::time::sleep(self.provision_delay).await;
             self.record("provision");
-            self.provision_done.store(true, Ordering::SeqCst);
             Ok(())
         }
         async fn kubeconfig(&self, _: &XtaskConfig) -> Result<()> {
@@ -397,10 +392,10 @@ mod tests {
         log.iter().position(|&x| x == what).unwrap()
     }
 
-    /// All phases selected: ami runs concurrently with the infra
-    /// chain, and deploy only starts after BOTH have produced a
-    /// result. The ami branch sleeps longer than the whole infra
-    /// chain so "ami after push, deploy after ami" is observable.
+    /// All phases selected: ami, kubeconfig and push spawn together
+    /// once provision completes; deploy only starts after all three.
+    /// ami sleeps longer than push so "push before ami, deploy after
+    /// ami" proves the post-provision fan-out actually overlapped.
     #[tokio::test]
     async fn up_phases_concurrent_ordering() {
         let log: Log = Arc::default();
@@ -421,50 +416,52 @@ mod tests {
         // infra chain stays internally ordered
         assert!(pos(&log, "bootstrap") < pos(&log, "provision"));
         assert!(pos(&log, "provision") < pos(&log, "push"));
-        // ami overlapped infra: it finished AFTER push (30ms sleep vs
-        // synchronous infra chain) — proves the branches actually ran
-        // concurrently, not sequentially
+        // ami overlapped its siblings: push (instant) finished while
+        // ami (30ms) was still sleeping — proves the post-provision
+        // fan-out ran concurrently, not sequentially
         assert!(pos(&log, "push") < pos(&log, "ami"), "log: {log:?}");
         // deploy waited for the join: it's after BOTH ami and push
         assert!(pos(&log, "ami") < pos(&log, "deploy"), "log: {log:?}");
         assert!(pos(&log, "push") < pos(&log, "deploy"), "log: {log:?}");
     }
 
-    /// The critical safety property: an AMI build failure does NOT
-    /// cancel an in-flight provision. `try_join!` would drop the
-    /// infra future the moment ami errors; `join!` lets provision
-    /// run to completion (sets its flag) and surfaces the error
-    /// afterward.
+    /// The critical safety property: a push failure does NOT cancel
+    /// an in-flight ami upload (sibling, same dep). `try_join!` would
+    /// drop the ami future the moment push errors; the JoinSet drain
+    /// lets ami run to completion and surfaces both results after.
     #[tokio::test]
-    async fn up_ami_error_does_not_cancel_provision() {
+    async fn up_push_error_does_not_cancel_ami() {
         let log: Log = Arc::default();
         let mut p = MockProvider::new(log.clone());
-        p.provision_delay = Duration::from_millis(50);
-        let provision_done = p.provision_done.clone();
+        p.push_err = true;
         let p: Arc<dyn Provider> = Arc::new(p);
 
-        // ami fails immediately — well before provision's 50ms sleep
-        // completes. With try_join!, provision would be dropped here.
-        let ami = async { Err(anyhow!("ami build failed")) };
+        let ami_log = log.clone();
+        let ami = async move {
+            // push fails immediately; ami is still mid-upload here.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ami_log.lock().unwrap().push("ami");
+            Ok(())
+        };
 
         let r = run_up_phases(
             p,
             cfg(),
-            &[Phase::Bootstrap, Phase::Provision, Phase::Ami],
+            &[Phase::Provision, Phase::Push, Phase::Ami],
             pp(),
             ami,
         )
         .await;
 
-        // provision ran to completion despite ami erroring first
+        // ami ran to completion despite push erroring first
+        let log = log.lock().unwrap();
         assert!(
-            provision_done.load(Ordering::SeqCst),
-            "provision was cancelled — join! semantics broken"
+            log.contains(&"ami"),
+            "ami was cancelled — JoinSet drain semantics broken: {log:?}"
         );
-        assert!(log.lock().unwrap().contains(&"provision"));
-        // overall result is still Err, with the ami context
+        // overall result is still Err, with the push context
         let e = r.unwrap_err().to_string();
-        assert!(e.contains("ami failed"), "err: {e}");
+        assert!(e.contains("push failed"), "err: {e}");
     }
 
     /// Phase selection still gates: `up --push --deploy` runs only
