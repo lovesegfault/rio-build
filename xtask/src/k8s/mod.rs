@@ -503,7 +503,14 @@ async fn run_up(
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
             wait_drift: o.wait_drift,
-            public_cidrs: o.public_cidr.clone(),
+            // CLI > env: any --public-cidr flag wins; otherwise fall
+            // back to RIO_PUBLIC_CIDRS so a bare `up --deploy` keeps
+            // the allowlist instead of reverting the NLB to internal.
+            public_cidrs: if o.public_cidr.is_empty() {
+                cfg.public_cidrs.clone()
+            } else {
+                o.public_cidr.clone()
+            },
         },
     };
     let cfg = Arc::new(cfg.clone());

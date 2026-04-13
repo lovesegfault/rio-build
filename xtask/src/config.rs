@@ -36,6 +36,26 @@ pub struct XtaskConfig {
 
     /// Remote nix store (ssh-ng://...) for offloading docker image builds.
     pub remote_store: Option<String>,
+
+    /// Source CIDRs allowed to reach the gateway NLB directly. Non-
+    /// empty makes deploy emit `aws-load-balancer-scheme: internet-
+    /// facing` + `loadBalancerSourceRanges`. Comma-separated in
+    /// `.env.local` (`RIO_PUBLIC_CIDRS=1.2.3.4/32,5.6.7.8/32`).
+    /// Overridden by `--public-cidr` on `k8s up`.
+    #[serde(default, deserialize_with = "csv")]
+    pub public_cidrs: Vec<String>,
+}
+
+/// Deserialize a comma-separated string into `Vec<String>`. figment's
+/// Env provider hands over the raw env var as a string; this splits it
+/// so `.env.local` can express a list without JSON.
+fn csv<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(String::deserialize(d)?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 fn default_tfstate_region() -> String {
