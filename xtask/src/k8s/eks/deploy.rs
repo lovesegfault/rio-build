@@ -250,6 +250,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                 "gateway.service.loadBalancerSourceRanges",
                 json!(opts.public_cidrs).to_string(),
             )
+            .set("gateway.ssh.hostKeySecret", "rio-gateway-host-key")
             .set("karpenter.enabled", "true")
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)

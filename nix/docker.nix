@@ -519,6 +519,24 @@ rec {
           echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
           cat "$tmp/key.pub"
         fi
+
+        if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then
+          echo "[bootstrap] rio/gateway-host-key already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/gateway-host-key"
+          tmp=$(mktemp -d)
+          # OpenSSH-format ed25519 private key. -N "" (no passphrase),
+          # -C "" (no comment — the comment field in a host key is unused
+          # and would otherwise leak the build-time hostname). -f writes
+          # to $tmp (the /tmp emptyDir, writable under
+          # readOnlyRootFilesystem). russh::keys::load_secret_key reads
+          # the OpenSSH PEM format ssh-keygen emits.
+          ssh-keygen -t ed25519 -N "" -C "" -f "$tmp/host_key" </dev/null
+          aws secretsmanager create-secret --name rio/gateway-host-key \
+            --secret-string "file://$tmp/host_key"
+          echo "[bootstrap] gateway host key fingerprint (for known_hosts pinning):"
+          ssh-keygen -l -f "$tmp/host_key.pub"
+        fi
       '';
     in
     buildZstd {
@@ -531,6 +549,7 @@ rec {
         ++ [
           pkgs.awscli2
           pkgs.openssl
+          pkgs.openssh
           pkgs.nix
           pkgs.bash
           pkgs.coreutils
@@ -548,6 +567,7 @@ rec {
             lib.makeBinPath [
               pkgs.awscli2
               pkgs.openssl
+              pkgs.openssh
               pkgs.nix
               pkgs.coreutils
             ]

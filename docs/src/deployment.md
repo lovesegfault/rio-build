@@ -97,7 +97,7 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Database credentials (scheduler, store)
 - HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
-> **SSH key mounting:** The default chart values do **not** set `gateway.ssh.hostKeySecret` — the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production should set it to a Secret with a persistent key so all replicas present the same host key. `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
+> **SSH key mounting:** On EKS deploys (`xtask k8s -p eks up`), the bootstrap Job generates `rio/gateway-host-key` in AWS Secrets Manager and ESO syncs it to the `rio-gateway-host-key` Secret; deploy sets `gateway.ssh.hostKeySecret` to that name so all replicas present the same host key across restarts. On other deployments, the chart default leaves `hostKeySecret` empty — the gateway then generates an ephemeral key per pod (fine for dev; breaks `known_hosts` on reschedule and across replicas). `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 
 ## Verification
 
