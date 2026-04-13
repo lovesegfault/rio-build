@@ -385,7 +385,18 @@ async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
         move || {
             let api = api.clone();
             async move {
-                let claims = api.list(&Default::default()).await?;
+                // Right after CRD apply the apiserver returns 429
+                // "storage is (re)initializing" for a few seconds while
+                // the watch cache warms. Treat list errors as a retry
+                // tick (same as gather_stuck_nodeclaims) — the 30min
+                // poll bound caps a persistently-failing case.
+                let claims = match api.list(&Default::default()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        info!("NodeClaim list error (will retry): {e}");
+                        return Ok(None);
+                    }
+                };
                 let drifted: Vec<String> = claims
                     .into_iter()
                     .filter(|nc| {
