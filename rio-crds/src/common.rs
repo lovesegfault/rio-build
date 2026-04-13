@@ -101,9 +101,13 @@ pub struct PoolDeployKnobs {
 #[serde(rename_all = "camelCase")]
 pub struct PoolSpecCommon {
     /// Concurrent-Job ceiling. The reconciler spawns one Job per
-    /// dispatch-need up to this many active at once. Both CRDs add
-    /// a struct-level CEL `self.maxConcurrent > 0`.
-    pub max_concurrent: u32,
+    /// dispatch-need up to this many active at once. `None` = no
+    /// controller-side cap — Karpenter's NodePool `limits.cpu` (and
+    /// ultimately the AWS vCPU service quota) becomes the only gate.
+    /// Excess Jobs sit Pending until nodes provision; reap-excess-
+    /// pending trims them if demand drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 
     /// Backstop `activeDeadlineSeconds` on Jobs. `None` = per-role
     /// default (3600 for builders, 300 for fetchers).
@@ -217,13 +221,11 @@ mod tests {
 
     /// `required:` lists survive the flatten round-trip. schemars
     /// merges the inner struct's `required` into the parent — a
-    /// regression here would mean `image` / `maxConcurrent` /
-    /// `systems` silently become optional and `kubectl apply` with
-    /// an incomplete spec is accepted. All three required fields
-    /// come from PoolSpecCommon (`maxConcurrent` directly, `image`
-    /// / `systems` via the nested `PoolDeployKnobs` flatten); the
-    /// outer structs contribute none (every builder-/fetcher-only
-    /// field is optional or defaulted).
+    /// regression here would mean `image` / `systems` silently
+    /// become optional and `kubectl apply` with an incomplete spec
+    /// is accepted. Both required fields come from `PoolDeployKnobs`
+    /// via the nested flatten; the outer structs contribute none
+    /// (every builder-/fetcher-only field is optional or defaulted).
     #[test]
     fn flatten_preserves_required() {
         for crd in [
@@ -232,7 +234,7 @@ mod tests {
         ] {
             let json = serde_json::to_string(&crd).unwrap();
             assert!(
-                json.contains(r#""required":["image","maxConcurrent","systems"]"#),
+                json.contains(r#""required":["image","systems"]"#),
                 "{}: spec.required drifted — flatten dropped or added a \
                  required field",
                 crd.spec.names.kind,

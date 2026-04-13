@@ -155,7 +155,7 @@ mod tests {
 
     fn mk(max: u32) -> FetcherPool {
         let mut fp = crate::fixtures::test_fetcherpool("test");
-        fp.spec.max_concurrent = max;
+        fp.spec.max_concurrent = Some(max);
         fp
     }
 

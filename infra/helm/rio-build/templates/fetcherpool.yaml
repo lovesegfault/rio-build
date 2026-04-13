@@ -20,7 +20,9 @@ spec:
   {{- with $fp.deadlineSeconds }}
   deadlineSeconds: {{ . }}
   {{- end }}
-  maxConcurrent: {{ $fp.maxConcurrent }}
+  {{- with $fp.maxConcurrent }}
+  maxConcurrent: {{ . }}
+  {{- end }}
   systems:
     {{- toYaml $fp.systems | nindent 4 }}
   image: {{ include "rio.image" (list $root $fp.image) }}

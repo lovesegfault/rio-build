@@ -144,7 +144,7 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
         scheduler,
         store,
     } = job_reconcile_prologue(wp, ctx)?;
-    let ceiling = wp.spec.max_concurrent as i32;
+    let ceiling = wp.spec.max_concurrent.map(|c| c as i32);
 
     // ---- Poll queue depth ----
     // One ClusterStatus RPC per reconcile
@@ -208,8 +208,9 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     // are i32 (K8s replicas convention). saturating_sub handles
     // active >= ceiling can happen if max_concurrent was edited down
     // while Jobs were in flight — don't spawn more, but don't try to
-    // cancel either.
-    let headroom = ceiling.saturating_sub(active).max(0) as u32;
+    // cancel either. `ceiling = None` → uncapped: headroom = MAX, so
+    // spawn_count reduces to `queued - active`.
+    let headroom = ceiling.map_or(u32::MAX, |c| c.saturating_sub(active).max(0) as u32);
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     spawn_n(&jobs_api, to_spawn, &name, &wp.spec.size_class, || {
@@ -217,7 +218,7 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     })
     .await;
     if to_spawn == 0 {
-        debug!(pool = %name, queued, active, ceiling, "no ephemeral Jobs to spawn");
+        debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
     }
 
     // ---- Reap excess Pending ----
@@ -262,7 +263,9 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     // ---- Status patch ----
     // `replicas` = active Jobs; `readyReplicas` = same (a Job pod is
     // "ready" when it's running; we don't probe individual Job pods
-    // from here). `desiredReplicas` = ceiling. SchedulerUnreachable
+    // from here). `desiredReplicas` = ceiling, or current demand
+    // (`queued`) when uncapped — keeps `kubectl get bp` DESIRED column
+    // meaningful instead of showing i32::MAX. SchedulerUnreachable
     // condition reflects the poll above.
     patch_job_pool_status::<BuilderPool, _>(
         ctx,
@@ -271,7 +274,7 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
         &name,
         Some(active),
         active,
-        ceiling,
+        ceiling.unwrap_or(queued as i32),
         scheduler_err.as_deref(),
     )
     .await?;
@@ -397,7 +400,7 @@ mod tests {
         // out of the E0063 blast radius when BuilderPoolSpec gains
         // a field — the fixture is the single touch point.
         let mut spec = crate::fixtures::test_builderpool_spec();
-        spec.max_concurrent = 4;
+        spec.max_concurrent = Some(4);
         spec.features = vec![];
         spec.size_class = String::new();
         let mut wp = BuilderPool::new("eph-pool", spec);

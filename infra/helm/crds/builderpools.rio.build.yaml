@@ -139,14 +139,15 @@ spec:
                 nullable: true
                 type: string
               maxConcurrent:
-                description: 'Concurrent-Job ceiling. The reconciler spawns one Job
-                  per
-
-                  dispatch-need up to this many active at once. Both CRDs add
-
-                  a struct-level CEL `self.maxConcurrent > 0`.'
+                description: "Concurrent-Job ceiling. The reconciler spawns one Job\
+                  \ per\ndispatch-need up to this many active at once. `None` = no\n\
+                  controller-side cap \u2014 Karpenter's NodePool `limits.cpu` (and\n\
+                  ultimately the AWS vCPU service quota) becomes the only gate.\n\
+                  Excess Jobs sit Pending until nodes provision; reap-excess-\npending\
+                  \ trims them if demand drops."
                 format: uint32
                 minimum: 0.0
+                nullable: true
                 type: integer
               nodeSelector:
                 additionalProperties:
@@ -295,13 +296,9 @@ spec:
                 type: array
             required:
             - image
-            - maxConcurrent
             - systems
             type: object
             x-kubernetes-validations:
-            - message: "maxConcurrent must be > 0 \u2014 it is the concurrent-Job\
-                \ ceiling"
-              rule: self.maxConcurrent > 0
             - message: "systems must be non-empty \u2014 a builder pool with no target\
                 \ systems accepts no work"
               rule: size(self.systems) > 0

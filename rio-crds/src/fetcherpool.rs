@@ -40,11 +40,6 @@ use crate::common::{PoolSpecCommon, PoolStatusCommon, SizeClassCommon, impl_comm
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[x_kube(
-    validation = Rule::new("self.maxConcurrent > 0").message(
-        "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
-    )
-)]
-#[x_kube(
     validation = Rule::new("size(self.classes) > 0").message(
         "classes must be non-empty — fetcher pools are size-classed (I-170/I-208); the legacy single-size spec.resources path has been removed"
     )
@@ -186,14 +181,15 @@ mod tests {
         );
     }
 
-    /// The `maxConcurrent > 0` CEL rule renders.
+    /// `maxConcurrent` is now optional (uncapped when absent) — guard
+    /// that it does NOT reappear in the schema's `required:` list.
     #[test]
-    fn max_concurrent_cel_renders() {
+    fn max_concurrent_optional() {
         let crd = FetcherPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(
-            json.contains("self.maxConcurrent > 0"),
-            "maxConcurrent>0 CEL rule missing from schema"
+            !json.contains("self.maxConcurrent > 0"),
+            "maxConcurrent>0 CEL rule should be gone (field is now optional, None=uncapped)"
         );
     }
 }

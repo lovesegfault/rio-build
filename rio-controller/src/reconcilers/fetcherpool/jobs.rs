@@ -91,7 +91,10 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         // (per-arch) with the same class don't count each other's
         // Jobs. MUST match executor_params' pool_name derivation.
         let pool_name = format!("{name}-{}", class.name);
-        let ceiling = class.max_concurrent.unwrap_or(fp.spec.max_concurrent) as i32;
+        let ceiling = class
+            .max_concurrent
+            .or(fp.spec.max_concurrent)
+            .map(|c| c as i32);
         let queued = signals.queued_for(&class.name, idx);
 
         let jobs = jobs_api
@@ -105,7 +108,7 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
             .try_into()
             .unwrap_or(i32::MAX);
 
-        let headroom = ceiling.saturating_sub(active).max(0) as u32;
+        let headroom = ceiling.map_or(u32::MAX, |c| c.saturating_sub(active).max(0) as u32);
         let to_spawn = spawn_count(queued, active as u32, headroom);
         total_active += active;
         total_queued += queued;
@@ -146,7 +149,9 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         &name,
         None,
         total_active,
-        fp.spec.max_concurrent as i32,
+        fp.spec
+            .max_concurrent
+            .map_or(total_queued as i32, |c| c as i32),
         scheduler_err.as_deref(),
     )
     .await?;

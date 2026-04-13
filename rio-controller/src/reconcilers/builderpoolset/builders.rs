@@ -12,8 +12,6 @@ use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec};
 use rio_crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use rio_crds::common::PoolSpecCommon;
 
-const DEFAULT_MAX_CONCURRENT: u32 = 10;
-
 /// Child BuilderPool name: `{wps}-{class.name}`. The scheduler
 /// routes by `size_class` (which equals `class.name`), not pool
 /// name — so the pool name is for operator readability, not
@@ -52,9 +50,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         ));
     }
 
-    // Concurrent-Job ceiling per class.
-    let max_concurrent = class.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
-
     // EXHAUSTIVE by design: when BuilderPoolSpec gains a field,
     // E0063 here forces a decision — does PoolTemplate mirror it
     // (expose to WPS users) or hardcode a default (controller
@@ -63,7 +58,7 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     let spec = BuilderPoolSpec {
         common: PoolSpecCommon {
             // --- Per-class (SizeClassSpec) ---
-            max_concurrent,
+            max_concurrent: class.max_concurrent,
             // --- Shared (PoolTemplate) ---
             deploy: template.deploy.clone(),
             // None → build_job derives `cutoff × DEADLINE_MULTIPLIER`
@@ -286,8 +281,8 @@ pub(super) mod tests {
             .collect();
 
         // max_concurrent in the fixture: 5, 10, 15.
-        assert_eq!(children[0].spec.max_concurrent, 5);
-        assert_eq!(children[2].spec.max_concurrent, 15);
+        assert_eq!(children[0].spec.max_concurrent, Some(5));
+        assert_eq!(children[2].spec.max_concurrent, Some(15));
     }
 
     /// I-119 regression: `class.resources` propagates to the child,

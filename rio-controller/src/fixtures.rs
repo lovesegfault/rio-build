@@ -43,7 +43,7 @@ use rio_crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 pub fn test_builderpool_spec() -> BuilderPoolSpec {
     BuilderPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
-            max_concurrent: 10,
+            max_concurrent: Some(10),
             deadline_seconds: None,
             deploy: rio_crds::common::PoolDeployKnobs {
                 systems: vec!["x86_64-linux".into()],
@@ -73,7 +73,7 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
 pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
     FetcherPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
-            max_concurrent: 8,
+            max_concurrent: Some(8),
             deadline_seconds: None,
             deploy: rio_crds::common::PoolDeployKnobs {
                 systems: vec!["x86_64-linux".into()],

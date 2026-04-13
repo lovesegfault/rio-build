@@ -14,7 +14,7 @@ metadata:
   name: default
 spec:
   # ---- PoolSpecCommon (flattened — shared with FetcherPoolSpec) ----
-  maxConcurrent: 20                            # u32, required — concurrent-Job ceiling (one Job = one build)
+  maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped (Karpenter NodePool limits.cpu is the only gate)
   deadlineSeconds: 3600                        # u32?, optional — Job activeDeadlineSeconds; default 3600 (builders), 300 (fetchers)
   image: rio-builder:dev                       # string, required — container image ref
   systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
@@ -61,13 +61,15 @@ status:
 r[ctrl.pool.ephemeral]
 The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s)
 and spawns K8s Jobs when `queued_derivations > 0` and active Jobs <
-`spec.maxConcurrent`. Each Job runs one rio-builder pod whose main loop
-exits after one `CompletionReport` → pod terminates → Job goes Complete →
+`spec.maxConcurrent` (or unconditionally when `maxConcurrent` is unset).
+Each Job runs one rio-builder pod whose main loop exits after one
+`CompletionReport` → pod terminates → Job goes Complete →
 `ttlSecondsAfterFinished: 600` reaps (10min postmortem window for `kubectl
 logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
 retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is
-the concurrent-Job ceiling, not a standing set; zero queued derivations
-means zero pods.
+an optional concurrent-Job ceiling, not a standing set; when omitted, the
+Karpenter NodePool `limits.cpu` is the only fanout gate. Zero queued
+derivations means zero pods.
 
 **Isolation guarantee:** zero cross-build state. Fresh pod means fresh
 emptyDir for FUSE cache and overlayfs upper, fresh filesystem. Untrusted
@@ -252,7 +254,7 @@ r[ctrl.wps.cleanup-sweep]
 The BuilderPoolSet finalizer's `cleanup()` MUST list child BuilderPools by ownerRef UID (NOT by iterating `spec.classes`) and explicitly delete each. Spec-iteration leaks orphans when an operator removes a class from `spec.classes` then deletes the BPS before the next reconcile runs `r[ctrl.wps.prune-stale]` — the now-shortened spec never names the orphan. 404 on delete is tolerated (GC ran first / operator manually deleted / previous cleanup partially succeeded); a non-404 delete error propagates so the finalizer stays and cleanup retries — leaking a child after BPS delete is worse than retrying. ownerRef GC would eventually do this; explicit delete is deterministic for tests and produces clear `kubectl get events` output.
 
 r[ctrl.fetcherpool.classes]
-When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
+When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent` (both optional — omit for uncapped). Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
 
 r[ctrl.fetcherpool.ephemeral-per-class]
 When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxConcurrent)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[size_classes]]` unconfigured) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
@@ -345,7 +347,7 @@ status:
 |---|---|---|
 | `name` | string | Child pool name suffix and `BuilderPoolSpec.sizeClass` value. |
 | `cutoffSecs` | f64 | Required. Upper duration bound for this class; last class catches the tail. |
-| `maxConcurrent` | u32? | Per-class concurrent-Job ceiling. `None` ⇒ inherit `spec.maxConcurrent`. |
+| `maxConcurrent` | u32? | Per-class concurrent-Job ceiling. `None` ⇒ uncapped (Karpenter NodePool `limits.cpu` is the only gate). |
 | `resources` | ResourceRequirements | Required — distinct resource profiles are the point of size classes. |
 
 | `ClassStatus` field | Type | Notes |
@@ -368,7 +370,7 @@ metadata:
   name: x86-64
 spec:
   # ---- PoolSpecCommon (flattened — same fields as BuilderPool) ----
-  maxConcurrent: 16                  # u32, required
+  maxConcurrent: 16                  # u32?, optional — omit = uncapped
   deadlineSeconds: 300               # u32?, optional — Job activeDeadlineSeconds; default 300
   image: rio-builder:dev             # string, required — same binary, RIO_EXECUTOR_KIND=fetcher
   systems: [x86_64-linux]            # list<string>
@@ -625,7 +627,6 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 
 | CRD | Rule | Reject reason |
 |---|---|---|
-| BuilderPool, FetcherPool | `self.maxConcurrent > 0` | Zero ceiling means no work ever spawns. |
 | BuilderPool | `size(self.systems) > 0` | A builder pool with no target systems accepts no work. |
 | BuilderPool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
 | FetcherPool | `size(self.classes) == 0 ∨ ¬has(self.resources)` | `classes[]` and top-level `resources` are mutually exclusive. |

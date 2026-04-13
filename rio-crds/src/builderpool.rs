@@ -41,11 +41,6 @@ use crate::common::{PoolSpecCommon, PoolStatusCommon, impl_common_deref};
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-#[x_kube(
-    validation = Rule::new("self.maxConcurrent > 0").message(
-        "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
-    )
-)]
 // `systems` non-empty. Lives at struct level (not field-level on
 // `PoolSpecCommon.systems`) so the rule binds only to BuilderPool —
 // FetcherPool currently has no such constraint and adding one would
@@ -368,10 +363,6 @@ mod tests {
     fn cel_rules_in_schema() {
         let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes to JSON");
-        assert!(
-            json.contains("self.maxConcurrent > 0"),
-            "maxConcurrent>0 CEL rule missing from schema"
-        );
         assert!(
             json.contains("size(self.systems) > 0"),
             "systems non-empty CEL rule missing"

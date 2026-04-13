@@ -586,9 +586,9 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # ~26 metal hosts max at 192 vCPU each. kvm-xlarge=128 cores ×
-      # maxReplicas 10 × 2 arches = 2560 vCPU at full burst — this
-      # leaves headroom. consolidateAfter:30s reaps idle metal fast.
+      # ~26 metal hosts max at 192 vCPU each — the only fanout gate
+      # for kvm builders now that per-class maxConcurrent is gone.
+      # consolidateAfter:30s reaps idle metal fast.
       limits: {cpu: 5000}
       consolidateAfter: 30s
 
@@ -630,9 +630,9 @@ karpenter:
           operator: In
           values: [on-demand]
       # Most FODs stay tiny (2cpu); upper tiers fire on reactive
-      # promotion only. 512 vCPU = 32× tiny + headroom for the
-      # occasional medium/large outlier without queueing behind
-      # builders. Adjust alongside fetcherPoolDefaults.maxConcurrent.
+      # promotion only. This is now the ONLY fetcher fanout gate
+      # (controller-side maxConcurrent removed) — raise it to widen
+      # FOD parallelism. 512 vCPU ≈ 256 concurrent tiny fetchers.
       limits: {cpu: 512}
       consolidateAfter: 10m
 
@@ -750,35 +750,35 @@ builderPoolSetDefaults:
   # is hard-evicted at the table value. Eviction → disconnect → I-177
   # promotes → retry on next class.
   # MUST track scheduler.sizeClasses in deploy.rs SIZE_CLASSES_JSON.
+  # No per-class maxConcurrent: the controller spawns one Job per
+  # queued derivation; Karpenter NodePool `limits.cpu` (and ultimately
+  # the AWS vCPU service quota) is the only fanout gate. Excess Jobs
+  # sit Pending until nodes provision; reap-excess-pending trims them
+  # if demand drops before scheduling.
   classes:
     - name: tiny
       cutoffSecs: 30
-      maxConcurrent: 200
       resources: &res-tiny
         # I-118: hello-class builds need <500MB FUSE cache + overlay.
         requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
         limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
     - name: small
       cutoffSecs: 120
-      maxConcurrent: 200
       resources: &res-small
         requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
         limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
     - name: medium
       cutoffSecs: 600
-      maxConcurrent: 100
       resources: &res-medium
         requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
         limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
     - name: large
       cutoffSecs: 1800
-      maxConcurrent: 50
       resources: &res-large
         requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
         limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
     - name: xlarge
       cutoffSecs: 7200
-      maxConcurrent: 20
       resources: &res-xlarge
         requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
         limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
@@ -875,11 +875,8 @@ fetcherPools:
 fetcherPoolDefaults:
   enabled: false
   # deadlineSeconds: ~  # default 300
-  # Default ceiling for the smallest class (per-class maxConcurrent
-  # below overrides). Paired with karpenter rio-fetcher cpu limit.
-  # FODs spike at build start (40+ ready when chains hit FOD-phase
-  # together) but are short (~seconds).
-  maxConcurrent: 32
+  # No maxConcurrent: uncapped — one Job per queued FOD. Karpenter
+  # rio-fetcher NodePool `limits.cpu` is the only fanout gate.
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   # PLAN-PREBAKE: per-entry override with `localhost/…@sha256:<digest>`.
@@ -896,11 +893,6 @@ fetcherPoolDefaults:
   # on N+1). Out-of-disk on a tier is handled the same as OOM:
   # eviction → disconnect → I-177 floor promotion → next tier.
   #
-  # maxConcurrent tapers (most FODs stay tiny/small; upper tiers are
-  # escape valves for chromium-source-class outliers). NodePool cpu
-  # limit (rio-fetcher above) sized for the floor-promotion tail, not
-  # for sustained xlarge fanout.
-  #
   # MUST agree with scheduler.toml `[[size_classes]].name` — fetcher
   # tiers ARE builder tiers (the scheduler derives the FOD floor-walk
   # ladder from `size_classes`, not a separate key).
@@ -908,16 +900,12 @@ fetcherPoolDefaults:
     - name: tiny
       resources: *res-tiny
     - name: small
-      maxConcurrent: 16
       resources: *res-small
     - name: medium
-      maxConcurrent: 8
       resources: *res-medium
     - name: large
-      maxConcurrent: 4
       resources: *res-large
     - name: xlarge
-      maxConcurrent: 2
       resources: *res-xlarge
   tolerations:
     - key: rio.build/fetcher

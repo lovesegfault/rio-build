@@ -99,7 +99,7 @@ pub struct FpStatus {
     /// `status.desiredReplicas` — what the autoscaler last reconciled
     /// (or `spec.replicas.min` before first reconcile).
     desired: i32,
-    max: i32,
+    max: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -832,7 +832,7 @@ async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
         .await?
         .into_iter()
         .map(|fp| {
-            let max = fp.spec.max_concurrent as i32;
+            let max = fp.spec.max_concurrent.map(|c| c as i32);
             let min = 0i32;
             FpStatus {
                 name: fp.metadata.name.unwrap_or_default(),
@@ -1070,7 +1070,7 @@ fn render_human(r: &Report) {
             p.name,
             p.ready,
             p.desired,
-            p.max
+            p.max.map_or("∞".into(), |m| m.to_string())
         );
     }
 
