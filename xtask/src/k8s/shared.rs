@@ -428,7 +428,17 @@ pub async fn tunnel_grpc(
     store_port: u16,
 ) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
     let client = kube::client().await?;
-    let leader = format!("pod/{}", kube::scheduler_leader(&client, NS).await?);
+    // helm --wait returns when scheduler PODS are Ready, but leader-
+    // election runs in main() — there's a few-second window where the
+    // Lease has no holder. Poll until election settles. A stale holder
+    // (just-terminated old pod) falls through to the TCP-accept poll
+    // below, which times out at 20s; acceptable for a rare race.
+    let leader = ui::poll("scheduler lease holder", Duration::from_secs(2), 30, || {
+        let c = client.clone();
+        async move { Ok(kube::scheduler_leader(&c, NS).await.ok()) }
+    })
+    .await?;
+    let leader = format!("pod/{leader}");
     let sched = port_forward(NS, &leader, sched_port, 9001).await?;
     let store = port_forward(super::NS_STORE, "svc/rio-store", store_port, 9002).await?;
     let (sp, tp) = (sched.0, store.0);
