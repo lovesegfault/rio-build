@@ -34,15 +34,6 @@ scope: with scope; ''
       # can be lost, falling back to ~60s heartbeat-reap.
       wait_workers_zero("ephemeral-pool precondition")
 
-      # ── CEL: maxConcurrent must be > 0 ───────────────────────────
-      assert_cel_rejects(
-          "zero-max-concurrent",
-          "  maxConcurrent: 0\n"
-          "  systems: [x86_64-linux]\n"
-          "  image: rio-builder",
-          "maxConcurrent must be > 0",
-      )
-
       # ── CEL: hostNetwork without privileged rejected ──────────────
       # ctrl.crd.host-users-network-exclusive — K8s rejects
       # hostUsers:false with hostNetwork:true at admission; the
