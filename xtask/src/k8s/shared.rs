@@ -151,11 +151,39 @@ pub async fn ensure_gateway_ssh_secret(
             .and_then(crate::ssh::parse_tenant_comment),
     };
     let authorized = crate::ssh::authorized_keys(cfg, tenant.as_deref())?;
+    // MERGE, don't replace: a redeploy must not wipe keys added via
+    // `xtask k8s grant`. The operator's key is upserted (same
+    // fingerprint → comment updated; new fingerprint → appended).
+    merge_authorized_key(client, &authorized).await
+}
+
+/// Upsert one `authorized_keys` line into the `rio-gateway-ssh`
+/// Secret. Dedups on (key-type, base64) — comment may change (re-
+/// granting the same key under a different tenant replaces its line).
+/// All other existing lines are preserved.
+async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Result<()> {
+    let existing = kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
+        .await?
+        .unwrap_or_default();
+    let key_id = |l: &str| {
+        let mut it = l.split_whitespace();
+        Some((it.next()?.to_owned(), it.next()?.to_owned()))
+    };
+    let new_id = key_id(key_line);
+    let mut merged: String = existing
+        .lines()
+        .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    merged.push_str(key_line);
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
     kube::apply_secret(
         client,
         NS,
         "rio-gateway-ssh",
-        BTreeMap::from([("authorized_keys".into(), authorized)]),
+        BTreeMap::from([("authorized_keys".into(), merged)]),
     )
     .await
 }
@@ -208,30 +236,8 @@ pub async fn grant(pubkey: &str, tenant: &str, restart: bool) -> Result<()> {
     })
     .await?;
 
-    ui::step("merge key into rio-gateway-ssh", || async {
-        let existing = kube::get_secret_key(&client, NS, "rio-gateway-ssh", "authorized_keys")
-            .await?
-            .unwrap_or_default();
-        // Dedup on (type, base64) — comment may legitimately change
-        // (re-granting the same key under a different tenant replaces).
-        let key_id = |l: &str| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?.to_owned(), it.next()?.to_owned()))
-        };
-        let new_id = key_id(&key_line);
-        let mut merged: String = existing
-            .lines()
-            .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
-            .map(|l| format!("{l}\n"))
-            .collect();
-        merged.push_str(&key_line);
-        kube::apply_secret(
-            &client,
-            NS,
-            "rio-gateway-ssh",
-            BTreeMap::from([("authorized_keys".into(), merged)]),
-        )
-        .await
+    ui::step("merge key into rio-gateway-ssh", || {
+        merge_authorized_key(&client, &key_line)
     })
     .await?;
 
