@@ -168,8 +168,9 @@ pub async fn ensure_gateway_ssh_secret(
 ///    (idempotent — `AlreadyExists` is fine).
 /// 3. Merge the key into the `rio-gateway-ssh` Secret, deduping by
 ///    (type, base64) so re-runs don't grow the file.
-/// 4. Rollout-restart the gateway (authorized_keys is read once at
-///    startup) unless `restart=false`.
+/// 4. Optionally rollout-restart the gateway. The gateway hot-reloads
+///    `authorized_keys` (I-109, `r[gw.keys.hot-reload]`) within ~70s
+///    of the Secret changing, so restart is only for "need it NOW".
 ///
 /// Admin access is NOT granted: the key only authenticates the ssh-ng
 /// build path. `AdminService` lives on ClusterIP:9001 behind the
@@ -238,15 +239,16 @@ pub async fn grant(pubkey: &str, tenant: &str, restart: bool) -> Result<()> {
     } else {
         ui::step_skip(
             "rollout restart rio-gateway",
-            "--no-restart; key takes effect after the next gateway restart",
+            "gateway hot-reloads authorized_keys within ~70s (I-109); pass --restart for immediate effect",
         );
     }
 
     let host = kube::gateway_lb_hostname(&client, NS)
         .await
         .unwrap_or_else(|_| "<gateway-lb-hostname>".into());
+    let when = if restart { "now" } else { "in ~70s" };
     tracing::info!(
-        "granted: tenant '{tenant}' ({})\n  \
+        "granted: tenant '{tenant}' ({}) — active {when}\n  \
          nix build --store 'ssh-ng://rio@{host}?ssh-key=<their-private-key>' ...",
         key.fingerprint(Default::default()),
     );

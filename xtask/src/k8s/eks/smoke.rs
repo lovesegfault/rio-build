@@ -255,7 +255,10 @@ pub async fn step_install_key(client: &kube::Client) -> Result<()> {
     .await
 }
 
-/// authorized_keys is loaded once at startup — no hot-reload.
+/// I-109: authorized_keys IS hot-reloaded (~70s: kubelet Secret-
+/// refresh ~60s + gateway 10s mtime poll). The smoke test still
+/// restarts because it can't afford a 70s wait per key install; for
+/// operator key rotation, just `kubectl apply` the Secret and wait.
 pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::rollout_restart(client, NS, "rio-gateway").await?;
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await

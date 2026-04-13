@@ -322,11 +322,13 @@ pub enum K8sCmd {
         /// the gateway maps to `SubmitBuild.tenant_name`.
         #[arg(long)]
         tenant: String,
-        /// Skip the gateway rollout-restart. Useful when adding
-        /// several keys in a row — pass --no-restart for all but the
-        /// last (authorized_keys is read once at startup).
+        /// Force a gateway rollout-restart so the key takes effect
+        /// immediately. Without this, the gateway hot-reloads
+        /// authorized_keys within ~70s (kubelet Secret refresh ~60s
+        /// plus the gateway's 10s mtime poll) — no disruption to
+        /// in-flight sessions.
         #[arg(long)]
-        no_restart: bool,
+        restart: bool,
     },
 }
 
@@ -447,8 +449,8 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         K8sCmd::Grant {
             pubkey,
             tenant,
-            no_restart,
-        } => shared::grant(&pubkey, &tenant, !no_restart).await,
+            restart,
+        } => shared::grant(&pubkey, &tenant, restart).await,
         K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
         K8sCmd::Ami(cmd) => {
             if !matches!(kind, ProviderKind::Eks) {
