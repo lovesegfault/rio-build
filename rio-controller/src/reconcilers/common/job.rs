@@ -72,7 +72,16 @@ pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 /// completion report. (The role-level default in
 /// `ExecutorPodParams::termination_grace_period_seconds` is for the
 /// LONG-drain case; ephemeral pods don't drain, they finish and die.)
-const EPHEMERAL_TGPS: i64 = 30;
+pub(crate) const EPHEMERAL_TGPS: i64 = 30;
+
+/// Slack added on top of the worker's `daemon_timeout` when deriving
+/// `activeDeadlineSeconds` (`r[ctrl.ephemeral.per-class-deadline]`).
+/// Covers Job-create→build-start overhead (pod scheduling + container
+/// pull + FUSE mount + first heartbeat + dispatch) so the worker's
+/// timer fires BEFORE k8s kills the pod. Live timing showed ~36s
+/// (medium-shallow-32x, 2026-04-13); 60s gives headroom for cold-node
+/// image pull.
+pub(crate) const DEADLINE_SLACK_SECS: i64 = 60;
 
 /// The shared one-shot Job literal for executor pods. Both
 /// Job-mode reconcilers (`builderpool::jobs`,
@@ -916,6 +925,72 @@ pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str, size
     }
 }
 
+/// Job has a `Failed` condition with `reason=DeadlineExceeded` —
+/// `activeDeadlineSeconds` fired. The Job controller deletes the Pod
+/// immediately, so [`report_terminated_pods`] never observes a
+/// terminated container; this reads the Job condition instead.
+pub(crate) fn job_deadline_exceeded(job: &Job) -> bool {
+    job.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.type_ == "Failed" && c.reason.as_deref() == Some("DeadlineExceeded"))
+}
+
+/// Report each `DeadlineExceeded` Job to the scheduler so the
+/// `activeDeadlineSeconds` backstop still climbs the size-class ladder
+/// when the worker is too wedged to fire its own `daemon_timeout`
+/// (`r[ctrl.terminated.deadline-exceeded]`). Defense-in-depth behind
+/// the worker-side `BuildResultStatus::TimedOut` primary path.
+///
+/// Iterates the already-listed `jobs` (no extra apiserver call). For
+/// each Job with a `Failed/DeadlineExceeded` condition, sends
+/// `ReportExecutorTermination{executor_id = JOB name, reason =
+/// DeadlineExceeded}`. The Job controller deletes the Pod when the
+/// deadline fires, so the scheduler prefix-matches the Job name
+/// against `recently_disconnected` keys (pod name = `{job}-{5char}`).
+///
+/// Idempotent per the same dedup as [`report_terminated_pods`]. Best-
+/// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
+/// keeps the Job observable for ~60 reconcile ticks.
+// r[impl ctrl.terminated.deadline-exceeded]
+pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job], size_class: &str) {
+    let mut admin = ctx.admin.clone();
+    for job in jobs {
+        if !job_deadline_exceeded(job) {
+            continue;
+        }
+        let Some(name) = job.metadata.name.as_deref() else {
+            continue;
+        };
+        match admin
+            .report_executor_termination(ReportExecutorTerminationRequest {
+                executor_id: name.to_owned(),
+                reason: TerminationReason::DeadlineExceeded.into(),
+                size_class: size_class.to_owned(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                if resp.into_inner().promoted {
+                    info!(
+                        executor_id = %name, size_class,
+                        "reported Job DeadlineExceeded → scheduler promoted size_class_floor"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    executor_id = %name, error = %e,
+                    "ReportExecutorTermination(DeadlineExceeded) failed; skipping (best-effort)"
+                );
+                return;
+            }
+        }
+    }
+}
+
 pub(crate) fn random_suffix() -> String {
     use rand::RngExt;
     // 36^6 ≈ 2.18 billion combinations. With JOB_TTL_SECS=600 and a
@@ -1034,6 +1109,47 @@ mod tests {
             pod_termination_reason(&Pod::default()),
             TerminationReason::Unknown
         );
+    }
+
+    /// `job_deadline_exceeded` reads the `Failed/DeadlineExceeded` Job
+    /// condition. Mirrors what the k8s Job controller sets when
+    /// `activeDeadlineSeconds` fires (live: `kubectl get job -o
+    /// jsonpath` showed `cond=FailureTarget Failed/DeadlineExceeded
+    /// DeadlineExceeded`).
+    // r[verify ctrl.terminated.deadline-exceeded]
+    #[test]
+    fn job_deadline_exceeded_condition() {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+
+        fn job_with_cond(type_: &str, reason: Option<&str>) -> Job {
+            Job {
+                status: Some(JobStatus {
+                    conditions: Some(vec![JobCondition {
+                        type_: type_.into(),
+                        reason: reason.map(String::from),
+                        status: "True".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        assert!(job_deadline_exceeded(&job_with_cond(
+            "Failed",
+            Some("DeadlineExceeded")
+        )));
+        // Failed for another reason (BackoffLimitExceeded) → not a
+        // deadline kill.
+        assert!(!job_deadline_exceeded(&job_with_cond(
+            "Failed",
+            Some("BackoffLimitExceeded")
+        )));
+        // Complete → not deadline.
+        assert!(!job_deadline_exceeded(&job_with_cond("Complete", None)));
+        // No status → not deadline.
+        assert!(!job_deadline_exceeded(&Job::default()));
     }
 
     /// random_suffix returns valid K8s name chars. DNS-1123 subdomain

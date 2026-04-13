@@ -151,6 +151,13 @@ enum TerminationReason {
   // Exit !=0, non-OOM (panic, SIGKILL from operator, node failure).
   // NOT a sizing signal — pod death wasn't the build's fault. → no-op.
   TERMINATION_REASON_ERROR = 5;
+  // Job.status.conditions has type=Failed reason=DeadlineExceeded —
+  // activeDeadlineSeconds backstop fired (worker wedged past its own
+  // daemon_timeout). → promote size_class_floor + bump timeout_count
+  // (same bounded ladder as worker-reported TimedOut). Reported by JOB
+  // name (pod is already deleted by Job controller); scheduler prefix-
+  // matches recently_disconnected.
+  TERMINATION_REASON_DEADLINE_EXCEEDED = 6;
 }
 
 message ReportExecutorTerminationRequest {

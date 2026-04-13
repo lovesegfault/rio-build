@@ -350,7 +350,7 @@ impl DagActor {
     /// `lost_worker`: kept for the existing-poison-state check (3 prior
     /// REAL failures + 1 disconnect → poison instead of dispatching a
     /// 4th time) and for logging.
-    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+2]
+    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+3]
     pub(super) async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],
@@ -417,6 +417,17 @@ impl DagActor {
     ) -> bool {
         use rio_proto::types::TerminationReason as R;
 
+        // r[impl sched.termination.deadline-exceeded]
+        // DeadlineExceeded is reported by JOB name (the Job controller
+        // deletes the Pod when activeDeadlineSeconds fires, so the
+        // controller never sees a terminated container). Prefix-match
+        // recently_disconnected: pod name = `{job}-{5char}`.
+        if reason == R::DeadlineExceeded {
+            return self
+                .handle_deadline_exceeded(executor_id, reported_class)
+                .await;
+        }
+
         // Resolve drv + class. remove() = first-report-wins dedup.
         let (drv_hash, class) = match self.recently_disconnected.remove(executor_id) {
             Some((drv, class, _)) => (drv, class.or_else(|| reported_class.map(String::from))),
@@ -448,6 +459,7 @@ impl DagActor {
         let promote_reason = match reason {
             R::OomKilled => "oom_killed",
             R::EvictedDiskPressure => "disk_pressure",
+            R::DeadlineExceeded => unreachable!("handled above"),
             R::EvictedOther | R::Completed | R::Error | R::Unknown => {
                 debug!(executor_id = %executor_id, drv_hash = %drv_hash, ?reason,
                        "termination report: non-resource reason, no promotion");
@@ -457,6 +469,70 @@ impl DagActor {
 
         self.promote_size_class_floor(&drv_hash, class.as_deref(), promote_reason)
             .await
+    }
+
+    /// `activeDeadlineSeconds` backstop fired — worker was too wedged
+    /// to fire its own `daemon_timeout`. Promote `size_class_floor`
+    /// and bump `timeout_count` (same bounded-ladder semantics as
+    /// `handle_timeout_failure`, `r[sched.timeout.promote-on-exceed]`).
+    ///
+    /// `job_name` is the JOB name; the Pod is already deleted.
+    /// Prefix-match `recently_disconnected` (pod name = `{job}-{5}`).
+    /// remove() = first-report-wins dedup, same as the exact-match
+    /// path. Unlike `handle_timeout_failure`, this does NOT
+    /// `reset_to_ready` — `handle_executor_disconnected` already re-
+    /// queued, and the drv may already be re-dispatched. The cap is
+    /// observed but not enforced terminally here: at the cap the floor
+    /// is at the largest class anyway (next deadline ~10h); the
+    /// worker-side `TimedOut` (primary path) owns terminal `Cancelled`.
+    async fn handle_deadline_exceeded(
+        &mut self,
+        job_name: &ExecutorId,
+        reported_class: Option<&str>,
+    ) -> bool {
+        let prefix = format!("{job_name}-");
+        let Some(pod_name) = self
+            .recently_disconnected
+            .keys()
+            .find(|k| k.starts_with(&prefix))
+            .cloned()
+        else {
+            debug!(job_name = %job_name,
+                   "DeadlineExceeded report: no recently_disconnected entry \
+                    with prefix (already handled, swept, or worker reported \
+                    TimedOut first)");
+            return false;
+        };
+        let (drv_hash, class, _) = self
+            .recently_disconnected
+            .remove(&pod_name)
+            .expect("key found above");
+        let class = class.or_else(|| reported_class.map(String::from));
+
+        let promoted = self
+            .promote_size_class_floor(&drv_hash, class.as_deref(), "deadline_exceeded")
+            .await;
+
+        let max = self.retry_policy.max_timeout_retries;
+        if let Some(state) = self.dag.node_mut(&drv_hash) {
+            state.retry.timeout_count += 1;
+            if state.retry.timeout_count > max {
+                warn!(
+                    drv_hash = %drv_hash, job_name = %job_name,
+                    timeout_retry_count = state.retry.timeout_count, max,
+                    "DeadlineExceeded: max_timeout_retries exhausted; floor \
+                     at largest class, worker-side TimedOut owns terminal-Cancel"
+                );
+            } else {
+                info!(
+                    drv_hash = %drv_hash, job_name = %job_name,
+                    pod_name = %pod_name, failed_class = ?class,
+                    timeout_retry_count = state.retry.timeout_count, max,
+                    "DeadlineExceeded backstop fired — promoted size_class_floor"
+                );
+            }
+        }
+        promoted
     }
 
     /// Sweep `recently_disconnected` entries older than

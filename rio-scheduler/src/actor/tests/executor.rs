@@ -842,7 +842,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
 
 // r[verify sched.fod.size-class-reactive]
 // r[verify sched.builder.size-class-reactive]
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+3]
 /// Bare disconnect does NOT promote `size_class_floor`; the
 /// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
 /// Live QA bug: cmake went medium→large→xlarge from a pod-kill +
@@ -971,7 +971,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     Ok(())
 }
 
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+3]
 /// I-188 race case: a builder that disconnects with `running_build ==
 /// Some(X)` AFTER having sent CompletionReport(X) gets NO
 /// `recently_disconnected` entry (`last_completed == running_build` →
@@ -1065,6 +1065,78 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     );
     let info = expect_drv(&handle, "eph-race-188").await;
     assert_eq!(info.sched.size_class_floor, None);
+
+    Ok(())
+}
+
+// r[verify sched.termination.deadline-exceeded]
+/// `activeDeadlineSeconds` backstop fired (worker too wedged to report
+/// `TimedOut` itself). Controller reports `DeadlineExceeded` by JOB
+/// name; scheduler prefix-matches the disconnected pod, promotes
+/// `size_class_floor`, and bumps `timeout_count` so the ladder is
+/// bounded. Second report for the same Job dedups (entry removed).
+///
+/// Regression for the medium-shallow-32x infinite tiny-retry loop:
+/// 2acd1b32 made bare disconnect non-promoting, but the k8s deadline
+/// kill was bare-disconnect-only.
+#[tokio::test]
+async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
+    use rio_proto::types::TerminationReason;
+    let (_db, handle, _task) = setup_with_classes(&[("tiny", 30.0), ("small", 3600.0)]).await;
+
+    // Pod name = `{job}-{5char}` (k8s Job-controller suffix).
+    let mut rx = connect_builder_classed(
+        &handle,
+        "rio-builder-tiny-abc123-x9k4p",
+        "x86_64-linux",
+        "tiny",
+    )
+    .await?;
+    let node = make_node("python3-deadline");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("python3-deadline"));
+
+    disconnect(&handle, "rio-builder-tiny-abc123-x9k4p").await?;
+    drop(rx);
+    let info = expect_drv(&handle, "python3-deadline").await;
+    assert_eq!(
+        info.sched.size_class_floor, None,
+        "precondition: bare disconnect did NOT promote"
+    );
+    assert_eq!(info.retry.timeout_count, 0);
+
+    // Controller reports by JOB name — scheduler prefix-matches.
+    let promoted = report_termination(
+        &handle,
+        "rio-builder-tiny-abc123",
+        TerminationReason::DeadlineExceeded,
+        Some("tiny"),
+    )
+    .await?;
+    assert!(
+        promoted,
+        "DeadlineExceeded must promote tiny→small via Job-name prefix-match"
+    );
+    let info = expect_drv(&handle, "python3-deadline").await;
+    assert_eq!(info.sched.size_class_floor.as_deref(), Some("small"));
+    assert_eq!(
+        info.retry.timeout_count, 1,
+        "DeadlineExceeded bumps timeout_count (bounded ladder)"
+    );
+
+    // Second report for same Job → recently_disconnected entry already
+    // removed → no-op.
+    let promoted = report_termination(
+        &handle,
+        "rio-builder-tiny-abc123",
+        TerminationReason::DeadlineExceeded,
+        Some("tiny"),
+    )
+    .await?;
+    assert!(!promoted, "second report dedups");
+    let info = expect_drv(&handle, "python3-deadline").await;
+    assert_eq!(info.retry.timeout_count, 1, "dedup: count unchanged");
 
     Ok(())
 }

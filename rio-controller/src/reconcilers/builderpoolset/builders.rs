@@ -7,6 +7,7 @@
 use kube::{Resource, ResourceExt};
 
 use crate::error::{Error, Result};
+use crate::reconcilers::builderpool::jobs::DEADLINE_MULTIPLIER;
 use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec};
 use rio_crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use rio_crds::common::PoolSpecCommon;
@@ -95,7 +96,16 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         image_pull_policy: None,
         fuse_threads: None,
         fuse_passthrough: None,
-        daemon_timeout_secs: None,
+        // r[impl ctrl.ephemeral.per-class-deadline+2]
+        // Worker's own timer = cutoff×5. Fires BEFORE k8s
+        // `activeDeadlineSeconds` (= this + TGPS + slack, derived in
+        // `ephemeral_deadline()`) so the worker reports `TimedOut`
+        // cleanly → `r[sched.timeout.promote-on-exceed]` instead of
+        // bare-disconnecting (which 2acd1b32 made non-promoting).
+        // `.ceil().max(1)` matches `ephemeral_deadline()`'s rounding.
+        daemon_timeout_secs: Some(
+            ((class.cutoff_secs * DEADLINE_MULTIPLIER as f64).ceil() as u64).max(1),
+        ),
         termination_grace_period_seconds: None,
     };
 
@@ -227,6 +237,15 @@ pub(super) mod tests {
                 Some(class.cutoff_secs),
                 "size_class_cutoff_secs must propagate (I-200 \
                  r[ctrl.ephemeral.per-class-deadline])"
+            );
+            // I-200: daemon_timeout_secs = cutoff×5 stamped so the
+            // worker's own timer fires before k8s activeDeadline-
+            // Seconds. test_wps_with_classes sets cutoff = (i+1)*60.
+            assert_eq!(
+                child.spec.daemon_timeout_secs,
+                Some((class.cutoff_secs * DEADLINE_MULTIPLIER as f64) as u64),
+                "daemon_timeout_secs = cutoff×{DEADLINE_MULTIPLIER} so worker \
+                 reports TimedOut before k8s deadline kill"
             );
             // Namespace propagates (namespaced CRD).
             assert_eq!(

@@ -34,7 +34,7 @@ use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
     JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
     patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running,
-    report_terminated_pods, spawn_count, spawn_n,
+    report_deadline_exceeded_jobs, report_terminated_pods, spawn_count, spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, UpstreamAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
@@ -136,6 +136,7 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         // next_fetcher_class. Best-effort; scheduler-side dedup makes
         // re-reporting every tick a no-op.
         report_terminated_pods(ctx, &ns, &pool_name, &class.name).await;
+        report_deadline_exceeded_jobs(ctx, &jobs.items, &class.name).await;
     }
 
     patch_job_pool_status::<FetcherPool, _>(

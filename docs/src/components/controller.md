@@ -146,21 +146,38 @@ spawn; the spawned executor heartbeats in, never matches dispatch (wrong
 the pod at deadline, `backoffLimit: 0` marks the Job Failed,
 `ttlSecondsAfterFinished` reaps.
 
-r[ctrl.ephemeral.per-class-deadline]
+r[ctrl.ephemeral.per-class-deadline+2]
 When `BuilderPoolSpec.sizeClassCutoffSecs` is set (stamped onto every
-BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the Job's
-`activeDeadlineSeconds` MUST be `cutoffSecs * DEADLINE_MULTIPLIER` (5)
-instead of the flat 3600 default --- so a `tiny` (cutoff 30s) pod gets
-150s, `xlarge` (cutoff 7200s) gets 36000s. An explicit
-`deadlineSeconds` on the pool overrides the computed value verbatim. Rationale (I-200): with a flat 1h deadline, a tiny-class build
-that hangs holds a node for 3600s before the K8s deadline kills it ->
-`ExecutorDisconnected` -> `r[sched.reassign.no-promote-on-ephemeral-
-disconnect+2]` promotes; tying the deadline to the class cutoff makes
-the deadline a per-class hung-build detector. K8s killing the pod at
-deadline routes through the same disconnect-promotes path as an OOMKill,
-so the next dispatch lands on a larger class. `FetcherSizeClass` has no
-`cutoffSecs` (FODs route by reactive floor only) so fetcher Jobs keep
-the flat 300s default.
+BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the child also
+gets `daemonTimeoutSecs = cutoffSecs * DEADLINE_MULTIPLIER` (5) ---
+the WORKER's own `tokio::time::timeout` --- and the Job's
+`activeDeadlineSeconds = daemonTimeoutSecs + EPHEMERAL_TGPS +
+DEADLINE_SLACK_SECS` (= +90s). The worker timer fires first and
+reports `BuildResultStatus::TimedOut` -> `r[sched.timeout.promote-on-
+exceed]` promotes; the k8s deadline is a BACKSTOP that only kills a
+worker too wedged to time itself out (`r[ctrl.terminated.deadline-
+exceeded]` then promotes anyway). `tiny` (cutoff 30s): worker 150s,
+k8s 240s. `xlarge` (cutoff 7200s): worker 36000s, k8s 36090s. An
+explicit `deadlineSeconds` on the pool overrides `activeDeadlineSeconds`
+verbatim. Rationale (I-200): per-class timer makes misclassification
+self-correcting. The +90s margin is the 2acd1b32 regression fix ---
+disconnect-promote was removed, so the k8s kill alone (bare
+disconnect) looped python3 at `tiny` for 17h. `FetcherSizeClass` has
+no `cutoffSecs` so fetcher Jobs keep the flat 300s default.
+
+r[ctrl.terminated.deadline-exceeded]
+The Job-mode reconciler MUST report each Job with `status.conditions`
+containing `type=Failed, reason=DeadlineExceeded` to the scheduler via
+`AdminService.ReportExecutorTermination{executor_id = job.metadata.name,
+reason = DeadlineExceeded}`. The Job controller deletes the Pod when
+`activeDeadlineSeconds` fires, so the `report_terminated_pods` Pod-
+status scan never sees a terminated container; the Job condition is
+observable for `JOB_TTL_SECS=600` (~60 reconcile ticks). The scheduler
+prefix-matches the Job name against its `recently_disconnected` map
+(`r[sched.termination.deadline-exceeded]`). Iterates the already-listed
+`jobs.items` --- no extra apiserver call. Best-effort (RPC error
+logged, reconcile continues). Defense-in-depth behind the worker-side
+`daemon_timeout` -> `TimedOut` primary path.
 
 r[ctrl.pool.per-system-class-depth]
 For pools with `spec.sizeClass` set, the spawn/scale decision MUST

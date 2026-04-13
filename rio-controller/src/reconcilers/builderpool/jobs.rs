@@ -62,8 +62,9 @@ use crate::reconcilers::Ctx;
 #[cfg(test)]
 use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
-    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running,
+    DEADLINE_SLACK_SECS, EPHEMERAL_TGPS, JOB_REQUEUE, JobReconcilePrologue, ephemeral_job,
+    is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
+    reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
     report_terminated_pods, spawn_count, spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
@@ -82,24 +83,30 @@ use super::builders::{self, UpstreamAddrs};
 /// unclassed pools.
 const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 
-/// I-200: `activeDeadlineSeconds = class.cutoffSecs × DEADLINE_
-/// MULTIPLIER`. 5×: a build that's still going at 5× its class's
-/// upper-bound prediction is either hung or grossly misclassified —
-/// either way, K8s kills the pod → ExecutorDisconnected →
-/// `r[sched.reassign.no-promote-on-ephemeral-disconnect+2]` promotes
+/// I-200: worker-side `daemon_timeout_secs = cutoffSecs × DEADLINE_
+/// MULTIPLIER`. 5×: a build still going at 5× its class's upper-bound
+/// prediction is either hung or grossly misclassified — the worker's
+/// own `tokio::time::timeout` (stderr_loop.rs) reports `BuildStatus::
+/// TimedOut` → `r[sched.timeout.promote-on-exceed]` promotes
 /// `size_class_floor` and the next dispatch lands on the next-larger
-/// class (with a 5× longer deadline). tiny (cutoff 30s) → 150s,
-/// small (120s) → 600s, medium (600s) → 3000s, large (1800s) →
-/// 9000s, xlarge (7200s) → 36000s. NOT 2× (the misclassification-
-/// detector threshold): that would race the worker-side completion
-/// for a borderline-slow-but-legit build; 5× leaves room for cold-
-/// FUSE warmup + pod-scheduling overhead on top of the build itself.
+/// class (with a 5× longer timer). tiny (cutoff 30s) → 150s, small
+/// (120s) → 600s, medium (600s) → 3000s, large (1800s) → 9000s,
+/// xlarge (7200s) → 36000s. The k8s `activeDeadlineSeconds` BACKSTOP
+/// is this + [`EPHEMERAL_TGPS`] + [`DEADLINE_SLACK_SECS`] (=+90s) so
+/// the worker timer fires first; the k8s deadline only kills a worker
+/// too wedged to fire its own timer (`r[ctrl.terminated.deadline-
+/// exceeded]` then climbs the ladder anyway). NOT 2× (the
+/// misclassification-detector threshold): that would race a
+/// borderline-slow-but-legit build.
 pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
 
 /// `activeDeadlineSeconds` for an ephemeral Job. Precedence:
 ///   1. `ephemeral_deadline_seconds` — explicit override, verbatim.
-///   2. `size_class_cutoff_secs × DEADLINE_MULTIPLIER` — per-class
-///      (I-200, `r[ctrl.ephemeral.per-class-deadline]`).
+///   2. `size_class_cutoff_secs × DEADLINE_MULTIPLIER + TGPS + SLACK`
+///      (I-200, `r[ctrl.ephemeral.per-class-deadline]`). The worker's
+///      own `daemon_timeout = cutoff × DEADLINE_MULTIPLIER` fires
+///      first; this adds [`EPHEMERAL_TGPS`] + [`DEADLINE_SLACK_SECS`]
+///      so k8s only kills a worker too wedged to time itself out.
 ///   3. `DEFAULT_EPHEMERAL_DEADLINE_SECS` — flat 1h fallback.
 ///
 /// `ceil` so a fractional cutoff (EMA-derived) rounds UP — never
@@ -108,12 +115,15 @@ pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
 /// kills the pod immediately; clamp to 1s so the misconfiguration is
 /// at least observable (pod starts, then dies) rather than a silent
 /// no-op spawn loop.
+// r[impl ctrl.ephemeral.per-class-deadline+2]
 pub(super) fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
     if let Some(explicit) = spec.deadline_seconds {
         return i64::from(explicit);
     }
     if let Some(cutoff) = spec.size_class_cutoff_secs {
-        return ((cutoff * DEADLINE_MULTIPLIER as f64).ceil() as i64).max(1);
+        return ((cutoff * DEADLINE_MULTIPLIER as f64).ceil() as i64).max(1)
+            + EPHEMERAL_TGPS
+            + DEADLINE_SLACK_SECS;
     }
     DEFAULT_EPHEMERAL_DEADLINE_SECS
 }
@@ -243,6 +253,11 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     // OOMKilled/DiskPressure (not bare disconnect). Best-effort;
     // scheduler-side dedup makes re-reporting every tick a no-op.
     report_terminated_pods(ctx, &ns, &name, &wp.spec.size_class).await;
+    // `activeDeadlineSeconds` backstop fired (worker wedged past its
+    // own daemon_timeout). Job controller deletes the Pod, so observe
+    // the Job condition instead. Iterates `jobs.items` already listed
+    // above — no extra apiserver call.
+    report_deadline_exceeded_jobs(ctx, &jobs.items, &wp.spec.size_class).await;
 
     // ---- Status patch ----
     // `replicas` = active Jobs; `readyReplicas` = same (a Job pod is
@@ -347,7 +362,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///     reassign.
 // r[impl ctrl.pool.ephemeral]
 // r[impl ctrl.pool.ephemeral-deadline]
-// r[impl ctrl.ephemeral.per-class-deadline]
+// r[impl ctrl.ephemeral.per-class-deadline+2]
 pub(super) fn build_job(
     wp: &BuilderPool,
     oref: OwnerReference,
@@ -527,7 +542,7 @@ mod tests {
     fn ephemeral_deadline_some_propagates_to_job_spec() {
         let mut wp = test_wp();
         wp.spec.deadline_seconds = Some(7200);
-        // Cutoff also set → would compute 30×5=150 if precedence
+        // Cutoff also set → would compute 30×5+90=240 if precedence
         // were wrong. 7200 must win.
         wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = crate::fixtures::oref(&wp);
@@ -542,56 +557,62 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.per-class-deadline]
+    // r[verify ctrl.ephemeral.per-class-deadline+2]
     /// I-200: with `size_class_cutoff_secs` set and no explicit
-    /// override, `activeDeadlineSeconds = cutoff × DEADLINE_MULTIPLIER`.
-    /// tiny (cutoff=30s) → 150s, NOT the flat 3600. The deadline
-    /// becomes a per-class hung-build detector: K8s kills the pod →
-    /// disconnect → I-197 promotes `size_class_floor`.
+    /// override, `activeDeadlineSeconds = cutoff × DEADLINE_MULTIPLIER
+    /// plus `EPHEMERAL_TGPS + DEADLINE_SLACK_SECS`. The k8s deadline is
+    /// a BACKSTOP behind the worker's own `daemon_timeout = cutoff×5`:
+    /// the 90s margin lets the worker report `TimedOut` cleanly before
+    /// k8s kills it (medium-shallow-32x looped python3 at tiny for 17h
+    /// when 2acd1b32 removed disconnect-promote with no margin).
     ///
-    /// Mutation check: revert `ephemeral_deadline()` to ignore cutoff
-    /// → this fails (expects 150, gets 3600). Drop the `.ceil()` →
-    /// the fractional case fails (expects 601, gets 600).
+    /// Mutation check: revert `ephemeral_deadline()` to drop the
+    /// margin → first case fails (expects 240, gets 150). Drop
+    /// `.ceil()` → fractional case fails (expects 691, gets 690).
     #[test]
     fn per_class_deadline_from_cutoff_secs() {
+        const MARGIN: i64 = EPHEMERAL_TGPS + DEADLINE_SLACK_SECS;
         let mut wp = test_wp();
         wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(30 * DEADLINE_MULTIPLIER),
-            "cutoff=30 × DEADLINE_MULTIPLIER({DEADLINE_MULTIPLIER}) → 150, \
-             not flat DEFAULT_EPHEMERAL_DEADLINE_SECS"
+            Some(30 * DEADLINE_MULTIPLIER + MARGIN),
+            "cutoff=30 × {DEADLINE_MULTIPLIER} + {MARGIN} (TGPS+slack) → 240; \
+             k8s deadline backstops the worker's daemon_timeout=150"
         );
 
-        // xlarge: cutoff=7200 → 36000. Proves the multiplier scales
-        // (not a clamped-to-default refactor).
+        // xlarge: cutoff=7200 → 36000+90. Proves the multiplier
+        // scales (not a clamped-to-default refactor).
         wp.spec.size_class_cutoff_secs = Some(7200.0);
         let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(36000)
+            Some(36000 + MARGIN)
         );
 
         // Fractional cutoff (EMA-derived) rounds UP. 120.1 × 5 =
-        // 600.5 → 601. Floor would give 600 and shave a second off
-        // the bound — wrong direction.
+        // 600.5 → 601 → +90 = 691. Floor would give 690 and shave a
+        // second off the bound — wrong direction.
         wp.spec.size_class_cutoff_secs = Some(120.1);
         let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(601)
+            Some(601 + MARGIN)
         );
 
-        // Degenerate cutoff=0 clamps to 1s (not 0, which K8s treats
-        // as "kill immediately" → silent spawn loop).
+        // Degenerate cutoff=0 clamps the cutoff×5 term to 1s (not 0)
+        // before adding margin → 1 + 90 = 91.
         wp.spec.size_class_cutoff_secs = Some(0.0);
         let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
-        assert_eq!(job.spec.as_ref().unwrap().active_deadline_seconds, Some(1));
+        assert_eq!(
+            job.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(1 + MARGIN)
+        );
     }
 
     // scheduler_unreachable_condition_shape, random_suffix_valid_
