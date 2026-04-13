@@ -508,10 +508,10 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # I-118: 4000 vCPU — adaptive sizing (I-117) packs ~8 tiny pods
-      # per c6a.xlarge (vs ~2 medium), so the same node count serves
-      # more builders. 4000 cpu ≈ 1000 c6a.xlarge ≈ 8000 tiny builders.
-      limits: {cpu: 4000}
+      # I-118 adaptive sizing (I-117) packs ~8 tiny pods per c6a.xlarge
+      # (vs ~2 medium), so the same node count serves more builders.
+      # 20000 cpu ≈ 5000 c6a.xlarge ≈ 40000 tiny builders.
+      limits: {cpu: 20000}
       consolidateAfter: 10m
 
     # Worker fallback: m/r categories, any family. If c-capacity is
@@ -540,9 +540,10 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # Overflow capacity when c6a/c7a is unavailable. preferred (2000)
-      # + fallback (500) = 2500 vCPU total builder ceiling.
-      limits: {cpu: 2000}
+      # Overflow capacity when c6a/c7a is unavailable. preferred
+      # (20000) + fallback (20000) = 40000 vCPU non-metal builder
+      # ceiling.
+      limits: {cpu: 20000}
       consolidateAfter: 10m
 
     # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
@@ -586,10 +587,10 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # ~26 metal hosts max at 192 vCPU each — the only fanout gate
+      # ~52 metal hosts max at 192 vCPU each — the only fanout gate
       # for kvm builders now that per-class maxConcurrent is gone.
       # consolidateAfter:30s reaps idle metal fast.
-      limits: {cpu: 5000}
+      limits: {cpu: 10000}
       consolidateAfter: 30s
 
     # r[impl fetcher.node.dedicated]
@@ -632,8 +633,8 @@ karpenter:
       # Most FODs stay tiny (2cpu); upper tiers fire on reactive
       # promotion only. This is now the ONLY fetcher fanout gate
       # (controller-side maxConcurrent removed) — raise it to widen
-      # FOD parallelism. 512 vCPU ≈ 256 concurrent tiny fetchers.
-      limits: {cpu: 512}
+      # FOD parallelism. 5000 vCPU ≈ 2500 concurrent tiny fetchers.
+      limits: {cpu: 5000}
       consolidateAfter: 10m
 
     # General: untainted, for future gateway/scheduler HPA overflow.
@@ -659,7 +660,7 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      limits: {cpu: 500}
+      limits: {cpu: 1500}
       consolidateAfter: 5m
 
 # ──────────────────────────────────────────────────────────────────────────
