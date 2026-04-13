@@ -161,7 +161,7 @@ pub async fn ensure_gateway_ssh_secret(
 /// Secret. Dedups on (key-type, base64) — comment may change (re-
 /// granting the same key under a different tenant replaces its line).
 /// All other existing lines are preserved.
-async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Result<()> {
+pub async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Result<()> {
     let existing = kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
         .await?
         .unwrap_or_default();
