@@ -2,10 +2,9 @@
 //! `-dirty-${hash}` suffix if the tree has uncommitted changes.
 
 use anyhow::{Context, Result};
-use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
 
-use crate::sh;
+use crate::sh::{self, cmd, shell};
 
 pub fn open() -> Result<gix::Repository> {
     gix::open(sh::repo_root()).context("failed to open git repo")
@@ -17,35 +16,30 @@ pub fn short_sha(repo: &gix::Repository) -> Result<String> {
     Ok(head.id().to_hex_with_len(12).to_string())
 }
 
-/// Image tag: short-SHA, plus `-dirty-${hash}` if the worktree has
-/// changes (tracked or untracked) vs HEAD.
+/// Image tag: short-SHA, plus `-dirty-${hash}` if the worktree differs
+/// from HEAD.
 ///
-/// The hash is SHA-256 over the sorted list of changed paths — same
-/// determinism property as the bash's `git diff HEAD | sha256sum`:
-/// identical dirty state → identical tag → re-push is a no-op.
+/// The hash is `sha256(git diff HEAD)` — content-addressed, so
+/// identical dirty state → identical tag (recomputable across
+/// invocations / worktrees), and editing a file's CONTENT changes the
+/// tag even when the set of changed paths stays the same. The previous
+/// path-list hash gave the same tag for two different edits to the
+/// same file → second `--push` was a no-op against immutable ECR tags
+/// and silently kept stale image content.
+///
+/// Scope matches what `nix build` sees from the git fileset:
+/// `git diff HEAD` covers staged + unstaged changes to tracked files
+/// (including staged new files); untracked-unstaged files are excluded
+/// here AND invisible to the nix build, so they correctly don't affect
+/// the tag. Binary files are covered by the `index <old>..<new>` blob-
+/// SHA line in the diff header even without `--binary`.
 pub fn image_tag(repo: &gix::Repository) -> Result<String> {
     let sha = short_sha(repo)?;
-    let mut changed: Vec<Vec<u8>> = Vec::new();
-
-    let status = repo
-        .status(gix::progress::Discard)?
-        .into_iter(None)
-        .context("git status iterator")?;
-    for item in status {
-        let item = item?;
-        changed.push(item.location().to_owned().into());
-    }
-
-    if changed.is_empty() {
+    let sh = shell()?;
+    let diff = sh::read(cmd!(sh, "git diff HEAD --no-ext-diff"))?;
+    if diff.is_empty() {
         return Ok(sha);
     }
-
-    changed.sort();
-    let mut h = Sha256::new();
-    for p in &changed {
-        h.update(p.as_bstr());
-        h.update(b"\n");
-    }
-    let suffix = hex::encode(&h.finalize()[..4]);
+    let suffix = hex::encode(&Sha256::digest(diff.as_bytes())[..4]);
     Ok(format!("{sha}-dirty-{suffix}"))
 }
