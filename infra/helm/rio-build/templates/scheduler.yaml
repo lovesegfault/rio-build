@@ -1,9 +1,10 @@
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
-{{- /* ConfigMap renders if [[size_classes]] is configured (the FOD
-       floor walk derives from the same list — fetcher tiers ARE builder
-       tiers). size_classes is array-of-tables (can't env-encode). */ -}}
-{{- $hasClasses := $s.sizeClasses -}}
+{{- /* ConfigMap renders if EITHER [[size_classes]] or [[soft_features]]
+       is configured — both are array-of-tables (can't env-encode). The
+       FOD floor walk derives from [[size_classes]] (fetcher tiers ARE
+       builder tiers). */ -}}
+{{- $hasClasses := or $s.sizeClasses $s.softFeatures -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +40,7 @@ spec:
         # CM-remount alone doesn't trigger reload. Roll on any
         # ConfigMap-rendered field change (subPath mounts don't
         # live-update either way).
-        checksum/scheduler-toml: {{ list (toJson $s.sizeClasses) (toJson .Values.fetcherPoolDefaults.classes) (toJson $s.softFeatures) | join "" | sha256sum }}
+        checksum/scheduler-toml: {{ list (toJson $s.sizeClasses) (toJson $s.softFeatures) | join "" | sha256sum }}
       {{- end }}
     spec:
       serviceAccountName: rio-scheduler
