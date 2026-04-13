@@ -36,6 +36,7 @@ use super::ExecutorError;
 /// configmaps.yaml —
 /// a mismatch means K8s deployments get different behavior than VM
 /// tests (which use native NixOS modules, not this path).
+// r[impl fetcher.nixconf.hashed-mirrors]
 const WORKER_NIX_CONF: &str = "\
 builders =
 substitute = false
@@ -43,6 +44,7 @@ sandbox = true
 sandbox-fallback = false
 restrict-eval = true
 experimental-features = ca-derivations
+hashed-mirrors = http://tarballs.nixos.org/
 ";
 
 /// Path where operators can mount a nix.conf override (via the
@@ -307,6 +309,7 @@ mod tests {
         assert!(WORKER_NIX_CONF.contains("substitute = false"));
         assert!(WORKER_NIX_CONF.contains("builders ="));
         assert!(WORKER_NIX_CONF.contains("sandbox-fallback = false"));
+        assert!(WORKER_NIX_CONF.contains("hashed-mirrors = http://tarballs.nixos.org/"));
     }
 
     // r[verify builder.cores.cgroup-clamp+2]

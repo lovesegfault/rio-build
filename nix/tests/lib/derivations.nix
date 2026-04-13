@@ -57,6 +57,15 @@ rec {
   # builder-egress). One nix-build exercises both dispatch roles.
   fodConsumer = "${dir}/fod-consumer.nix";
 
+  # Flat-hash FOD with a dead origin URL. Succeeds only via the
+  # hashed-mirrors lookup ({mirror}/sha256/{hex}). Drives the
+  # fetcher-split fod-dead-origin subtest.
+  fodDeadOrigin = "${dir}/fod-dead-origin.nix";
+
+  # sha256 hex of the body fod-dead-origin.nix expects. Computed from
+  # the same literal so the served path and the FOD's outputHash agree.
+  hashedMirrorProbeHex = builtins.hashString "sha256" "rio-hashed-mirror-probe\n";
+
   # 50 parallel leaves + 1 collector. Load-test fanout for
   # scheduling.nix:load-50drv. Fanout not linear chain: 50 serial
   # builds at tick=2s ≈ 150-200s; fanout is ~40-60s and exercises

@@ -120,9 +120,10 @@ pkgs.testers.runNixOSTest {
     k3s_server.succeed(
         "ip addr add ${originIP}/24 dev eth1 && "
         "iptables -I nixos-fw -p tcp --dport 80 -j ACCEPT && "
-        "mkdir -p /srv && "
+        "mkdir -p /srv/sha256 && "
         "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
-        "echo ok > /srv/ok"
+        "echo ok > /srv/ok && "
+        "printf 'rio-hashed-mirror-probe\\n' > /srv/sha256/${drvs.hashedMirrorProbeHex}"
     )
     # /busybox is delayed 30s so the one-shot fetcher pod stays Running
     # long enough for the netns probe below. /ok and / serve immediately
@@ -344,6 +345,34 @@ pkgs.testers.runNixOSTest {
         out = client.succeed("tail -1 /tmp/split-build.log").strip()
         assert "rio-split" in out, f"build returned {out!r}"
         print("dispatch PASS: FOD→fetcher, consumer→builder")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-dead-origin — hashed-mirrors fallback for flat-hash FODs
+    # ══════════════════════════════════════════════════════════════════
+    # Origin URL is a 404 path on the TEST-NET-3 server; the ONLY way
+    # this build succeeds is via {mirror}/sha256/{hex}. CppNix
+    # builtin:fetchurl tries hashed-mirrors first for FileIngestion
+    # Method::Flat, then falls back to mainUrl. nixConf.hashedMirrors
+    # = http://203.0.113.1/ via extraValues (default.nix) → rio-nix-
+    # conf ConfigMap → fetcher pod's nix.conf. A regression (typo'd
+    # setting, ConfigMap not mounted, wrong URL format) → mirror not
+    # tried → origin 404 → build fails here.
+    with subtest("fod-dead-origin: flat FOD succeeds via hashed-mirrors"):
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodDeadOrigin} 2>&1"
+        )
+        if rc != 0:
+            print(k3s_server.execute(
+                "journalctl -u test-origin --no-pager -n 40 2>&1"
+            )[1])
+            raise AssertionError(
+                f"fod-dead-origin build failed (rc={rc}); origin URL is a "
+                f"deliberate 404 — success requires hashed-mirrors lookup "
+                f"at /sha256/${drvs.hashedMirrorProbeHex}.\n{out}"
+            )
+        assert "rio-mirror-probe" in out, f"unexpected output {out!r}"
+        print(f"fod-dead-origin PASS: {out.strip().splitlines()[-1]}")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

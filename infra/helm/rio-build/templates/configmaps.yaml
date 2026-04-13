@@ -52,5 +52,12 @@ data:
     # for content-addressed outputs (phase2c CA support);
     # nix-command for `nix store` diagnostics in the pod.
     experimental-features = nix-command ca-derivations
+
+    # Content-addressed mirror for builtin:fetchurl. Only flat-hash
+    # FODs consult it (recursive/NAR-hash FODs skip — fetchurl.cc
+    # gates on FileIngestionMethod::Flat). Builders never see FODs
+    # (sched routes them to fetchers), so the line is inert in the
+    # builder-namespace copy of this ConfigMap.
+    hashed-mirrors = {{ $.Values.nixConf.hashedMirrors }}
 {{- end }}
 {{- end }}

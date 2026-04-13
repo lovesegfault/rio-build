@@ -773,11 +773,17 @@ in
   #   = rio-fetcher-x86-64-tiny-0). Per-arch dispatch covered by
   #   the assignment.rs hard_filter unit test; second-pool e2e via
   #   EKS smoke (FETCHER_POOLS_JSON has both arches).
+  # r[verify fetcher.nixconf.hashed-mirrors]
+  #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
+  #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
+  #   points the rio-nix-conf ConfigMap at the in-VM TEST-NET-3
+  #   server (only "public" IP the fetcher netpol passes).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
       extraValues = {
         "networkPolicy.enabled" = "true";
+        "nixConf.hashedMirrors" = "http://203.0.113.1/";
       };
       # fetcherPools via values file (not --set-string) so hostUsers
       # stays bool true. --set-string would coerce to the STRING

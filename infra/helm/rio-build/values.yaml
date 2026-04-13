@@ -8,8 +8,8 @@ global:
     # Empty → bare repo names (dev: airgap-loaded images).
     # EKS: xtask passes --set global.image.registry=<ecr> from tofu output.
     registry: ""
-    # Set via `--set global.image.tag=<sha>` (xtask reads from
-    # .rio-image-tag). NEVER committed — private ECR, dev tags include
+    # Set via `--set global.image.tag=<sha>` (xtask computes via
+    # git::image_tag()). NEVER committed — private ECR, dev tags include
     # -dirty-<hash>. See infra/eks/README.md.
     tag: ""
     pullPolicy: IfNotPresent
@@ -136,6 +136,16 @@ networkPolicy:
   # AWS-specific; varies by VPC. Unset → no S3 egress rule in
   # store-egress (store uses local filesystem backend only).
   storeS3Cidr: ""
+
+# nix.conf knobs for the rio-nix-conf ConfigMap (mounted into worker
+# pods at /etc/rio/nix-conf/nix.conf; see rio-builder/src/executor/
+# sandbox.rs for the compiled-in fallback).
+nixConf:
+  # Content-addressed mirror(s) for builtin:fetchurl. When a flat-hash
+  # FOD's origin URL is dead, nix-daemon tries {mirror}/{algo}/{hex}
+  # first. Only fires for outputHashMode = "flat" — recursive (NAR-hash)
+  # FODs skip it. Space-separated list; "" disables the lookup.
+  hashedMirrors: "http://tarballs.nixos.org/"
 
 # Prometheus-operator scrape wiring. Renders ServiceMonitor + PodMonitor +
 # PrometheusRule (templates/{servicemonitor,prometheusrule}.yaml). Requires

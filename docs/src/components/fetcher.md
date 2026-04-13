@@ -32,6 +32,12 @@ The fetcher MUST verify the FOD output hash **before** initiating upload to rio-
 
 The verification uses `verify_fod_hashes()` (shared with the builder binary) against the `outputHash` the scheduler included in the assignment. The scheduler knows the expected hash before dispatch; the fetcher re-derives `is_fod` from the `.drv` itself and cross-checks (`r[builder.executor.kind-gate]`).
 
+## Hashed mirrors
+
+r[fetcher.nixconf.hashed-mirrors]
+
+The fetcher's `nix.conf` MUST set `hashed-mirrors` (default `http://tarballs.nixos.org/`). When a flat-hash FOD's origin URL is dead, `nix-daemon`'s `builtin:fetchurl` tries `{mirror}/{algo}/{hexlower-digest}` first and only falls back to the origin on miss. Only `outputHashMode = "flat"` derivations qualify — recursive (NAR-hash) FODs skip the mirror because the on-the-wire bytes don't correspond to the declared hash. The Helm chart exposes this as `.Values.nixConf.hashedMirrors` so operators can point at an internal mirror; an empty value disables the lookup.
+
 ## Specification markers
 
 The ADR-019–defined markers for this component live in [ADR-019](../decisions/019-builder-fetcher-split.md):
