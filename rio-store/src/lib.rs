@@ -253,6 +253,12 @@ pub fn describe_metrics() {
         "check_available HEAD-probe cache misses (path uncached; an upstream \
          HEAD was issued, or the batch hit the 4096-uncached cap)."
     );
+    describe_counter!(
+        "rio_store_substitute_probe_skipped_total",
+        "check_available batches that exceeded SUBSTITUTE_PROBE_MAX_PATHS and \
+         skipped HEAD probes entirely. Non-zero means large merges are not \
+         getting upstream-substitution coverage at merge time."
+    );
 
     // r[impl obs.metric.store-pg-pool]
     describe_gauge!(

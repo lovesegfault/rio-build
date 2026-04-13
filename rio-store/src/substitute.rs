@@ -748,6 +748,11 @@ impl Substituter {
             return Ok(Vec::new()); // sandbox: client build failed
         };
         let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
+        debug!(
+            n_upstreams = upstreams.len(),
+            n_paths = paths.len(),
+            "check_available"
+        );
         if upstreams.is_empty() || paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -778,18 +783,19 @@ impl Substituter {
             return Ok(hits);
         }
         if uncached.len() > SUBSTITUTE_PROBE_MAX_PATHS {
-            // Conservative skip, NOT a correctness issue:
-            // substitutable_paths is an optimization hint for the
-            // scheduler. Per-drv substitutability is rediscovered at
-            // dispatch time regardless. Skipping avoids blocking the
-            // FindMissingPaths RPC on thousands of HEADs even at
-            // bounded concurrency. Cached hits are still returned.
-            debug!(
+            // Latency guard: probing N>4096 paths even at bounded
+            // concurrency would block the originating FindMissingPaths
+            // RPC (and the scheduler's actor event loop) for too long.
+            // Cached hits are still returned. The dispatch-time
+            // re-check is intended to cover the gap — see
+            // r[sched.dispatch.fod-substitute] for the per-drv probe.
+            warn!(
                 uncached = uncached.len(),
                 max = SUBSTITUTE_PROBE_MAX_PATHS,
                 cached_hits = hits.len(),
                 "check_available: uncached batch exceeds probe cap; skipping HEAD probes"
             );
+            metrics::counter!("rio_store_substitute_probe_skipped_total").increment(1);
             return Ok(hits);
         }
 

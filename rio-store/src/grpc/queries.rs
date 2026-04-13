@@ -4,7 +4,7 @@
 //! delegates here so the trait body stays a flat list of one-liners.
 
 use tonic::{Request, Response, Status};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
@@ -204,6 +204,15 @@ impl StoreServiceImpl {
                 }),
             _ => Vec::new(),
         };
+
+        debug!(
+            n_requested = req.store_paths.len(),
+            n_missing = missing.len(),
+            n_substitutable = substitutable.len(),
+            tenant_id = ?tenant_id,
+            substituter = self.substituter.is_some(),
+            "FindMissingPaths"
+        );
 
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
