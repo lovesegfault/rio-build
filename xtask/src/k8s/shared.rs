@@ -176,11 +176,22 @@ pub async fn ensure_gateway_ssh_secret(
 /// `scheduler-ingress` CiliumNetworkPolicy and needs `kubectl
 /// port-forward` (i.e. k8s credentials), which `grant` does not hand
 /// out.
-pub async fn grant(pubkey: &std::path::Path, tenant: &str, restart: bool) -> Result<()> {
+pub async fn grant(pubkey: &str, tenant: &str, restart: bool) -> Result<()> {
     use super::eks::smoke::{CliCtx, step_restart_gateway, step_tenant};
 
-    let mut key = ssh_key::PublicKey::read_openssh_file(pubkey)
-        .with_context(|| format!("{}: not a valid OpenSSH public key", pubkey.display()))?;
+    // Inline key first (`ssh-ed25519 AAAA...`); if that doesn't parse,
+    // treat the value as a file path. A path string never parses as a
+    // key (no algorithm token), so the fallback only fires for non-key
+    // input.
+    let mut key = match ssh_key::PublicKey::from_openssh(pubkey) {
+        Ok(k) => k,
+        Err(_) => ssh_key::PublicKey::read_openssh_file(std::path::Path::new(pubkey))
+            .with_context(|| {
+                format!(
+                    "'{pubkey}' is neither an inline OpenSSH public key nor a readable .pub file"
+                )
+            })?,
+    };
     key.set_comment(tenant);
     let key_line = key.to_openssh()? + "\n";
 
@@ -235,9 +246,9 @@ pub async fn grant(pubkey: &std::path::Path, tenant: &str, restart: bool) -> Res
         .await
         .unwrap_or_else(|_| "<gateway-lb-hostname>".into());
     tracing::info!(
-        "granted: tenant '{tenant}' via {}\n  \
+        "granted: tenant '{tenant}' ({})\n  \
          nix build --store 'ssh-ng://rio@{host}?ssh-key=<their-private-key>' ...",
-        pubkey.display(),
+        key.fingerprint(Default::default()),
     );
     Ok(())
 }

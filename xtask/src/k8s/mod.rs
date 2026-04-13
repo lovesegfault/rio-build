@@ -1,7 +1,6 @@
 //! Unified k8s deploy. One command surface, provider flag selects
 //! k3s (local) vs eks (AWS).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -314,8 +313,11 @@ pub enum K8sCmd {
     /// key/tenant pair is a no-op. Admin (rio-cli) access is NOT
     /// granted; the key only authenticates the ssh-ng build path.
     Grant {
-        /// Path to the user's OpenSSH public key (id_ed25519.pub).
-        pubkey: PathBuf,
+        /// The user's OpenSSH public key — either inline
+        /// (`'ssh-ed25519 AAAA... alice@host'`) or a path to a `.pub`
+        /// file. Inline is tried first; if it doesn't parse as a key,
+        /// the value is read as a file path.
+        pubkey: String,
         /// Tenant name. Becomes the authorized_keys comment, which
         /// the gateway maps to `SubmitBuild.tenant_name`.
         #[arg(long)]
