@@ -493,6 +493,7 @@ impl DagActor {
     /// found-missing one RPC ago. Empty set on fail-open paths (no
     /// store / RPC error / timeout): the per-FOD fallback then runs as
     /// before, so the fail-open semantics are unchanged.
+    // r[impl sched.dispatch.fod-substitute]
     async fn batch_complete_cached_ready_fods(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
@@ -514,16 +515,27 @@ impl DagActor {
             return HashSet::new();
         }
 
+        // Tenant context for the upstream-substitution probe: any
+        // tenant that wants any candidate (substitution is content-
+        // addressed; whose upstream we use is irrelevant to the
+        // result). Without this the store sees tenant_id=None and
+        // substitutable_paths stays empty — the pre-fix behaviour
+        // that dispatched FODs already in cache.nixos.org.
+        let probe = self.probe_tenant_meta(candidates.iter().map(|(h, _)| h));
+        let probe_meta: Vec<(&'static str, &str)> =
+            probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
         let store_paths: Vec<String> = candidates
             .iter()
             .flat_map(|(_, p)| p.iter().cloned())
             .collect();
-        let req = tonic::Request::new(FindMissingPathsRequest { store_paths });
-        let missing: HashSet<String> =
+        let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+        Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
+        let resp =
             match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
                 .await
             {
-                Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+                Ok(Ok(r)) => r.into_inner(),
                 Ok(Err(e)) => {
                     debug!(
                         candidates = candidates.len(),
@@ -543,6 +555,32 @@ impl DagActor {
                 }
             };
 
+        // Eager-fetch substitutable paths so dependents' GetPath finds
+        // them locally. Builders' GetPath has no tenant context, so
+        // lazy try_substitute_on_miss can't fire there — the actual
+        // fetch must happen here while we still have probe_meta.
+        let fetched = Self::eager_substitute_fetch(
+            store,
+            resp.substitutable_paths,
+            &probe_meta,
+            self.grpc_timeout,
+            self.substitute_max_concurrent,
+        )
+        .await;
+        if !fetched.is_empty() {
+            debug!(
+                count = fetched.len(),
+                "dispatch-time substitute fetch completed FOD outputs"
+            );
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
+                .increment(fetched.len() as u64);
+        }
+        let missing: HashSet<String> = resp
+            .missing_paths
+            .into_iter()
+            .filter(|p| !fetched.contains(p))
+            .collect();
+
         let mut checked = HashSet::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
             if paths.iter().all(|p| !missing.contains(p)) {
@@ -551,6 +589,47 @@ impl DagActor {
             checked.insert(drv_hash);
         }
         checked
+    }
+
+    /// Mint `(x-rio-service-token, x-rio-probe-tenant-id)` metadata
+    /// for the dispatch-time store calls. Empty when no
+    /// `service_signer` (dev mode) or no candidate has a known tenant
+    /// (single-tenant mode / recovered orphan).
+    fn probe_tenant_meta<'a>(
+        &self,
+        drv_hashes: impl Iterator<Item = &'a DrvHash>,
+    ) -> Vec<(&'static str, String)> {
+        let Some(signer) = &self.service_signer else {
+            return Vec::new();
+        };
+        let Some(tid) = drv_hashes
+            .filter_map(|h| self.dag.node(h))
+            .flat_map(|s| s.interested_builds.iter())
+            .filter_map(|bid| self.builds.get(bid))
+            .find_map(|b| b.tenant_id)
+        else {
+            return Vec::new();
+        };
+        let claims = rio_auth::hmac::ServiceClaims {
+            caller: "rio-scheduler".to_string(),
+            expiry_unix: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0))
+                + 60,
+        };
+        vec![
+            (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),
+            (rio_proto::PROBE_TENANT_ID_HEADER, tid.to_string()),
+        ]
+    }
+
+    fn inject_probe_meta(md: &mut tonic::metadata::MetadataMap, meta: &[(&'static str, &str)]) {
+        for (k, v) in meta {
+            if let Ok(mv) = tonic::metadata::MetadataValue::try_from(*v) {
+                md.insert(*k, mv);
+            }
+        }
     }
 
     /// Returns `true` only when `FindMissingPaths` definitively says all
@@ -579,11 +658,31 @@ impl DagActor {
         let Some(store) = &self.store_client else {
             return false;
         };
-        let req = tonic::Request::new(FindMissingPathsRequest {
+        // r[impl sched.dispatch.fod-substitute] — same probe-tenant
+        // wiring as batch_complete_cached_ready_fods.
+        let probe = self.probe_tenant_meta(std::iter::once(drv_hash));
+        let probe_meta: Vec<(&'static str, &str)> =
+            probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: state.expected_output_paths.clone(),
         });
+        Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
         match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req)).await {
-            Ok(Ok(r)) => r.into_inner().missing_paths.is_empty(),
+            Ok(Ok(r)) => {
+                let resp = r.into_inner();
+                if resp.missing_paths.is_empty() {
+                    return true;
+                }
+                let fetched = Self::eager_substitute_fetch(
+                    store,
+                    resp.substitutable_paths,
+                    &probe_meta,
+                    self.grpc_timeout,
+                    self.substitute_max_concurrent,
+                )
+                .await;
+                resp.missing_paths.iter().all(|p| fetched.contains(p))
+            }
             Ok(Err(e)) => {
                 debug!(drv_hash = %drv_hash, error = %e,
                        "FOD store-check FindMissingPaths failed; will dispatch");

@@ -112,7 +112,7 @@ impl StoreServiceImpl {
         request: Request<GetPathRequest>,
     ) -> Result<Response<GetPathStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = Self::request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;

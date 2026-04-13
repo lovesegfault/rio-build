@@ -65,12 +65,15 @@ Families:
              (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
              jwtVerify — JwtConfig is a shared type; gateway loads it
              as SigningKey seed, scheduler/store as VerifyingKey.
-  serviceHmac  always-on. GATEWAY (signer) + STORE (verifier). Secret
-             rio-service-hmac → /etc/rio/hmac/service-hmac.key, env
-             RIO_SERVICE_HMAC_KEY_PATH. Service-identity HMAC replaced
-             mTLS CN-allowlisting when transport encryption moved to
-             Cilium WireGuard (D2). Gateway signs x-rio-service-token
-             on store PutPath; store verifies.
+  serviceHmac  always-on. GATEWAY+SCHEDULER (signers) + STORE (verifier).
+             Secret rio-service-hmac → /etc/rio/hmac/service-hmac.key,
+             env RIO_SERVICE_HMAC_KEY_PATH. Service-identity HMAC
+             replaced mTLS CN-allowlisting when transport encryption
+             moved to Cilium WireGuard (D2). Gateway signs
+             x-rio-service-token on store PutPath; scheduler signs it
+             on dispatch-time FindMissingPaths/QueryPathInfo so the
+             store honours x-rio-probe-tenant-id
+             (r[sched.dispatch.fod-substitute]); store verifies.
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT

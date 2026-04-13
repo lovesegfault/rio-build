@@ -187,6 +187,11 @@ pub struct DagActorPlumbing {
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
     /// format-string (dev mode).
     pub hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// HMAC signer for `x-rio-service-token` (SEPARATE key from
+    /// `hmac_signer`). `None` = dispatch-time substitution probe
+    /// degrades to local-presence-only —
+    /// `r[sched.dispatch.fod-substitute]`.
+    pub service_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Leader-election shared state. The lease task writes
     /// `is_leader`/`generation`; the actor reads both and writes
     /// `recovery_complete`. Non-K8s/test default is
@@ -215,6 +220,7 @@ impl Default for DagActorPlumbing {
             log_buffers: None,
             event_persist_tx: None,
             hmac_signer: None,
+            service_signer: None,
             leader: LeaderState::default(),
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]

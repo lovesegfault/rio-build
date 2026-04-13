@@ -48,6 +48,13 @@ pub(super) struct Config {
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
     pub(super) hmac_key_path: Option<std::path::PathBuf>,
+    /// HMAC key file for signing `x-rio-service-token` (SEPARATE from
+    /// `hmac_key_path`). The scheduler mints `ServiceClaims { caller:
+    /// "rio-scheduler" }` so the store honours `x-rio-probe-tenant-id`
+    /// on dispatch-time `FindMissingPaths`/`QueryPathInfo` —
+    /// `r[sched.dispatch.fod-substitute]`. Unset = dispatch-time
+    /// substitution probe disabled (falls back to local-presence-only).
+    pub(super) service_hmac_key_path: Option<std::path::PathBuf>,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).
     /// The gateway signs with the matching seed; scheduler verifies.
@@ -138,6 +145,7 @@ impl Default for Config {
             size_classes: Vec::new(),
             soft_features: Vec::new(),
             hmac_key_path: None,
+            service_hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,
             lease_namespace: None,

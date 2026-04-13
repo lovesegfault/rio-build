@@ -1150,6 +1150,53 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.dispatch.fod-substitute]
+/// Dispatch-time substitution: a Ready FOD whose output becomes
+/// substitutable AFTER merge (so merge-time `check_cached_outputs`
+/// missed it) is completed by `batch_complete_cached_ready_fods`
+/// without dispatching to a fetcher.
+///
+/// Pre-fix: the batch read only `missing_paths` (no JWT, ignored
+/// `substitutable_paths`) → FOD dispatched → fetcher hit a
+/// (potentially dead) origin URL for a path cache.nixos.org already
+/// had.
+#[tokio::test]
+async fn dispatch_time_substitutable_fod_completes() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    // Builder, not fetcher: the FOD must DEFER (not dispatch) so the
+    // next dispatch_ready's batch pre-pass is what completes it.
+    let _rx = connect_executor(&handle, "fod-sub-b", "x86_64-linux").await?;
+
+    let out = test_store_path("dispatch-sub-out");
+    let mut n = make_node("dispatch-sub-fod");
+    n.is_fixed_output = true;
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    // Merge-time saw nothing (substitutable not yet seeded) → FOD is
+    // Ready/deferred. Now seed: next dispatch_ready's batch pre-pass
+    // should pick it up.
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    send_heartbeat(&handle, "fod-sub-b", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "FOD should complete via dispatch-time substitution probe"
+    );
+    let qpi = store.calls.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&out),
+        "dispatch-time eager-fetch must call QueryPathInfo for the substitutable path; \
+         qpi_calls={qpi:?}"
+    );
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

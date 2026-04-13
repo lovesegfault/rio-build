@@ -980,10 +980,18 @@ impl DagActor {
         // check_cached_outputs); the node STAYS Completed because the
         // output is now back in rio-store. Only outputs that are
         // missing AND failed/aren't substitutable get reset to Ready.
+        let jwt_pair;
+        let jwt_meta: &[(&'static str, &str)] = match jwt_token {
+            Some(t) => {
+                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
+                &jwt_pair
+            }
+            None => &[],
+        };
         let fetched = Self::eager_substitute_fetch(
             store_client,
             resp.substitutable_paths,
-            jwt_token,
+            jwt_meta,
             self.grpc_timeout,
             self.substitute_max_concurrent,
         )
@@ -1046,21 +1054,28 @@ impl DagActor {
         reset
     }
 
-    /// Fire `QueryPathInfo` (with tenant JWT) for each path in
-    /// `substitutable_paths`; return the set of paths whose fetch
-    /// succeeded. The store's miss-handler does the actual upstream
-    /// pull (r[store.substitute.upstream]); we only care about the
-    /// side effect. A failed/NotFound path is dropped from the result
-    /// — caller treats it as truly-missing.
+    /// Fire `QueryPathInfo` (with tenant-context metadata) for each
+    /// path in `substitutable_paths`; return the set of paths whose
+    /// fetch succeeded. The store's miss-handler does the actual
+    /// upstream pull (r[store.substitute.upstream]); we only care
+    /// about the side effect. A failed/NotFound path is dropped from
+    /// the result — caller treats it as truly-missing.
+    ///
+    /// `tenant_meta` carries either the gateway-forwarded JWT
+    /// (`x-rio-tenant-token`, merge-time callers) or the
+    /// scheduler-minted service-token + `x-rio-probe-tenant-id` pair
+    /// (dispatch-time callers, `r[sched.dispatch.fod-substitute]`).
+    /// Empty slice → store sees no tenant → no upstream fetch.
     ///
     /// Associated fn (no `&self`): caller already holds a
     /// `store_client` borrow; passing the few config fields explicitly
-    /// avoids a `&mut self` conflict and lets `check_cached_outputs`
-    /// and `verify_preexisting_completed` share one implementation.
-    async fn eager_substitute_fetch(
+    /// avoids a `&mut self` conflict and lets `check_cached_outputs`,
+    /// `verify_preexisting_completed`, and the dispatch-time FOD check
+    /// share one implementation.
+    pub(super) async fn eager_substitute_fetch(
         store_client: &StoreServiceClient<Channel>,
         substitutable_paths: Vec<String>,
-        jwt_token: Option<&str>,
+        tenant_meta: &[(&'static str, &str)],
         grpc_timeout: std::time::Duration,
         substitute_max_concurrent: usize,
     ) -> HashSet<String> {
@@ -1068,21 +1083,17 @@ impl DagActor {
             return HashSet::new();
         }
         use futures_util::stream::{self, StreamExt};
-        let jwt_pair;
-        let jwt_meta: &[(&'static str, &str)] = match jwt_token {
-            Some(t) => {
-                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
-                &jwt_pair
-            }
-            None => &[],
-        };
         let mut fetches = stream::iter(substitutable_paths)
             .map(|p| {
                 let mut c = store_client.clone();
                 async move {
-                    let res =
-                        rio_proto::client::query_path_info_opt(&mut c, &p, grpc_timeout, jwt_meta)
-                            .await;
+                    let res = rio_proto::client::query_path_info_opt(
+                        &mut c,
+                        &p,
+                        grpc_timeout,
+                        tenant_meta,
+                    )
+                    .await;
                     (p, res)
                 }
             })
@@ -1362,12 +1373,20 @@ impl DagActor {
         // Substitutable paths count as present after eager-fetch (the
         // store's HEAD probe is fetch-side-effect-free; QueryPathInfo
         // with JWT does the actual fetch).
+        let jwt_pair;
+        let jwt_meta: &[(&'static str, &str)] = match jwt_token {
+            Some(t) => {
+                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
+                &jwt_pair
+            }
+            None => &[],
+        };
         let substitutable = Self::eager_substitute_fetch(
             self.store_client
                 .as_ref()
                 .expect("checked by find_missing_with_breaker"),
             resp.substitutable_paths,
-            jwt_token,
+            jwt_meta,
             self.grpc_timeout,
             self.substitute_max_concurrent,
         )

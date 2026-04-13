@@ -234,6 +234,14 @@ pub struct DagActor {
     /// Arc because assign_to_worker is hot path and cloning the
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// HMAC signer for `x-rio-service-token`. When Some, the
+    /// dispatch-time FOD store-check
+    /// ([`dispatch::DagActor::batch_complete_cached_ready_fods`]) sets
+    /// `x-rio-service-token` + `x-rio-probe-tenant-id` so the store's
+    /// upstream-substitution probe fires —
+    /// `r[sched.dispatch.fod-substitute]`. None = local-presence-only
+    /// (the pre-fix behaviour).
+    service_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Shutdown token. When cancelled (SIGTERM via `shutdown_signal`),
     /// the run loop drains `self.executors` and breaks. Dropping the
     /// worker `stream_tx` senders cascades: `build-exec-bridge` tasks
@@ -341,6 +349,7 @@ impl DagActor {
             self_tx: None,
             sizing,
             hmac_signer: plumbing.hmac_signer,
+            service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
             fod_freeze_since: None,
             builder_freeze_since: None,

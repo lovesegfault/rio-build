@@ -261,7 +261,7 @@ impl StoreServiceImpl {
             signer: None,
             hmac_verifier: None,
             service_verifier: None,
-            service_bypass_callers: vec!["rio-gateway".to_string()],
+            service_bypass_callers: vec!["rio-gateway".to_string(), "rio-scheduler".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
@@ -366,15 +366,57 @@ impl StoreServiceImpl {
         &self.nar_bytes_budget
     }
 
-    /// Extract `tenant_id` from a request's JWT-interceptor extension.
-    /// `None` when no interceptor is wired, no token was sent, or the
-    /// caller has no token. All cases skip tenant-filtering.
-    /// substitution / tenant-filtering.
-    fn request_tenant_id<T>(request: &Request<T>) -> Option<uuid::Uuid> {
-        request
+    /// Verify `x-rio-service-token` and return the allowlisted caller
+    /// name. `None` when: no verifier configured, no header present,
+    /// signature/expiry invalid, or `caller` not in
+    /// [`Self::service_bypass_callers`]. Used by both the PutPath
+    /// HMAC-bypass and the [`Self::request_tenant_id`]
+    /// `x-rio-probe-tenant-id` gate.
+    fn verified_service_caller<T>(&self, request: &Request<T>) -> Option<String> {
+        let sv = self.service_verifier.as_ref()?;
+        let tok = request
+            .metadata()
+            .get(rio_proto::SERVICE_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())?;
+        let claims = sv.verify::<rio_auth::hmac::ServiceClaims>(tok).ok()?;
+        self.service_bypass_callers
+            .iter()
+            .any(|a| a == &claims.caller)
+            .then_some(claims.caller)
+    }
+
+    /// Extract `tenant_id` for substitution / tenant-filtering.
+    ///
+    /// Precedence:
+    /// 1. JWT-interceptor extension (`x-rio-tenant-token` verified by
+    ///    `rio_auth::jwt_interceptor`) — the gateway-forwarded path.
+    /// 2. `x-rio-probe-tenant-id` header — ONLY honoured when the
+    ///    request also carries a valid `x-rio-service-token` from an
+    ///    allowlisted caller. Lets the scheduler (which can't forward a
+    ///    JWT at dispatch time — `r[sched.dispatch.fod-substitute]`)
+    ///    assert tenant context without opening an unauthenticated
+    ///    self-select gap.
+    ///
+    /// `None` when neither path applies; downstream skips tenant-scoped
+    /// behaviour (substitution probe, tenant-visibility filtering).
+    fn request_tenant_id<T>(&self, request: &Request<T>) -> Option<uuid::Uuid> {
+        if let Some(jwt) = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub)
+        {
+            return Some(jwt);
+        }
+        // r[impl sched.dispatch.fod-substitute]
+        if self.verified_service_caller(request).is_some()
+            && let Some(hdr) = request
+                .metadata()
+                .get(rio_proto::PROBE_TENANT_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+        {
+            return hdr.parse().ok();
+        }
+        None
     }
 
     // r[impl store.substitute.upstream]
@@ -566,5 +608,41 @@ mod tests {
             "non-auth error must map to Internal (retriable)"
         );
         assert_eq!(status.message(), "storage operation failed");
+    }
+
+    // r[verify sched.dispatch.fod-substitute]
+    /// `x-rio-probe-tenant-id` is honoured ONLY behind a valid
+    /// allowlisted service-token. An unauthenticated request (or one
+    /// from a non-allowlisted caller) cannot self-select a tenant.
+    #[tokio::test]
+    async fn request_tenant_id_probe_header_gated_on_service_token() {
+        use rio_auth::hmac::{HmacSigner, HmacVerifier, ServiceClaims};
+        let key = b"probe-gate-test-key-32-bytes!!!!".to_vec();
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused").unwrap();
+        let svc = StoreServiceImpl::new(pool)
+            .with_service_hmac_verifier(HmacVerifier::from_key(key.clone()));
+        let tid = uuid::Uuid::new_v4();
+        let mk = |caller: Option<&str>| {
+            let mut r = Request::new(());
+            r.metadata_mut().insert(
+                rio_proto::PROBE_TENANT_ID_HEADER,
+                tid.to_string().parse().unwrap(),
+            );
+            if let Some(c) = caller {
+                let tok = HmacSigner::from_key(key.clone()).sign(&ServiceClaims {
+                    caller: c.into(),
+                    expiry_unix: u64::MAX,
+                });
+                r.metadata_mut()
+                    .insert(rio_proto::SERVICE_TOKEN_HEADER, tok.parse().unwrap());
+            }
+            r
+        };
+        // No service-token → ignored.
+        assert_eq!(svc.request_tenant_id(&mk(None)), None);
+        // Allowlisted caller → honoured.
+        assert_eq!(svc.request_tenant_id(&mk(Some("rio-scheduler"))), Some(tid));
+        // Non-allowlisted caller → ignored.
+        assert_eq!(svc.request_tenant_id(&mk(Some("rogue"))), None);
     }
 }

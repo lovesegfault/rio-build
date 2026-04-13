@@ -48,7 +48,7 @@ impl StoreServiceImpl {
         request: Request<QueryPathInfoRequest>,
     ) -> Result<Response<PathInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = Self::request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -181,7 +181,7 @@ impl StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = Self::request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;

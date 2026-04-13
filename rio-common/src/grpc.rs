@@ -82,6 +82,13 @@ pub const SERVICE_TOKEN_HEADER: &str = "x-rio-service-token";
 /// `rio_auth::jwt_interceptor` tests fails.
 pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 
+/// Tenant UUID asserted by a trusted internal caller (scheduler) that
+/// has no JWT to forward. The store only honours this when the request
+/// ALSO carries a valid `x-rio-service-token` whose `caller` is in the
+/// allowlist — an unauthenticated request cannot self-select a tenant.
+/// See `r[sched.dispatch.fod-substitute]`.
+pub const PROBE_TENANT_ID_HEADER: &str = "x-rio-probe-tenant-id";
+
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
 ///
 /// Should be long enough for a round trip under load, short enough that a

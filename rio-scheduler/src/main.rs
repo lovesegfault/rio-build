@@ -141,6 +141,14 @@ async fn main() -> anyhow::Result<()> {
     if hmac_signer.is_some() {
         info!("HMAC assignment token signing enabled");
     }
+    // Service-identity signer (SEPARATE key). Lets the dispatch-time
+    // FOD store-check assert tenant context via x-rio-probe-tenant-id
+    // — see r[sched.dispatch.fod-substitute].
+    let service_signer = rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?;
+    if service_signer.is_some() {
+        info!("service-token signing enabled (dispatch-time substitution probe)");
+    }
 
     // Spawn the DAG actor with the shared leader state. Poison +
     // retry + size_classes come from scheduler.toml (or
@@ -163,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             log_buffers: Some(Arc::clone(&log_buffers)),
             event_persist_tx: Some(event_persist_tx),
             hmac_signer: hmac_signer.map(Arc::new),
+            service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             shutdown: shutdown.clone(),
         },
