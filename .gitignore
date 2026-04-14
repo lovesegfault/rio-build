@@ -41,6 +41,9 @@ __pycache__/
 # mdbook output
 docs/book/
 
+# Sprint-local implementation plans (artifact, not source)
+docs/plans/
+
 # Dashboard build artifacts (rio-dashboard/.gitignore also has these;
 # repo-root entries guard against `pnpm install` run from the wrong cwd).
 rio-dashboard/node_modules/
