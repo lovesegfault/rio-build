@@ -213,6 +213,12 @@ pub fn describe_metrics() {
         "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
     );
     describe_counter!(
+        "rio_scheduler_substitute_fetch_retries_total",
+        "Transient (Unavailable/Aborted/ResourceExhausted) substitute-fetch errors that \
+         triggered a backoff retry. High rate without matching failures = store load \
+         absorbed by retry; high rate WITH failures = backoff insufficient."
+    );
+    describe_counter!(
         "rio_scheduler_substitute_spawned_total",
         "Derivations transitioned to Substituting (detached upstream fetch spawned). \
          Pairs with substitute_fetch_failures_total to derive success rate."

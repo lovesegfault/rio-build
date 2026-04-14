@@ -93,6 +93,14 @@ pub struct MockStoreFaults {
     /// If true, query_path_info returns Unavailable. For worker input-fetch
     /// error-path tests (distinguishing real gRPC errors from NotFound).
     pub fail_query_path_info: Arc<AtomicBool>,
+    /// If true, query_path_info returns Internal (NOT transient per
+    /// `rio_common::grpc::is_transient`). For substitute-fetch tests
+    /// that want immediate failure without triggering the retry loop.
+    pub fail_query_path_info_permanent: Arc<AtomicBool>,
+    /// While `> 0`, query_path_info returns Unavailable and decrements.
+    /// At 0, falls through to normal behavior. For retry-then-succeed
+    /// tests (transient overload absorbed by backoff).
+    pub fail_query_path_info_n_times: Arc<std::sync::atomic::AtomicU32>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
@@ -531,6 +539,25 @@ impl StoreService for MockStore {
                 "mock: injected query_path_info failure",
             ));
         }
+        if self
+            .faults
+            .fail_query_path_info_permanent
+            .load(Ordering::SeqCst)
+        {
+            return Err(Status::internal(
+                "mock: injected query_path_info permanent failure",
+            ));
+        }
+        if self
+            .faults
+            .fail_query_path_info_n_times
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable(
+                "mock: injected query_path_info transient failure (n_times)",
+            ));
+        }
         let store_path = request.into_inner().store_path;
         let _ = rio_nix::store_path::StorePath::parse(&store_path)
             .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
@@ -578,6 +605,15 @@ impl StoreService for MockStore {
         if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
             return Err(Status::unavailable(
                 "mock: injected query_path_info failure",
+            ));
+        }
+        if self
+            .faults
+            .fail_query_path_info_permanent
+            .load(Ordering::SeqCst)
+        {
+            return Err(Status::internal(
+                "mock: injected query_path_info permanent failure",
             ));
         }
         self.calls.batch_qpi_calls.fetch_add(1, Ordering::SeqCst);

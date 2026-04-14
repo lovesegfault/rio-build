@@ -564,7 +564,7 @@ async fn test_substitutable_probe_matrix(
     if fail_qpi {
         store
             .faults
-            .fail_query_path_info
+            .fail_query_path_info_permanent
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -584,6 +584,57 @@ async fn test_substitutable_probe_matrix(
             "scheduler should eager-fetch substitutable path via QueryPathInfo; qpi_calls={qpi:?}"
         );
     }
+    Ok(())
+}
+
+/// Transient `Unavailable` from QPI is absorbed by the retry loop:
+/// 2 transient failures → 3rd attempt succeeds → SubstituteComplete
+/// `{ok=true}` → build Succeeded. Guards `SUBSTITUTE_FETCH_BACKOFF`
+/// wiring + `is_transient` arm at dispatch.rs.
+#[tokio::test]
+async fn test_substitute_fetch_transient_retry() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("transient-retry");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_query_path_info_n_times
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+
+    let mut node = make_node("transient-retry-drv");
+    node.expected_output_paths = vec![out.clone()];
+    let drv_hash = node.drv_hash.clone();
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // 2 transient failures × backoff(0..1) = 250+500ms before the
+    // 3rd attempt succeeds. Real-time wait — start_paused would
+    // also pause the ephemeral-PG actor setup.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    settle_substituting(&handle, &[&drv_hash]).await;
+
+    let remaining = store
+        .faults
+        .fail_query_path_info_n_times
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        remaining, 0,
+        "retry loop should consume both transient faults"
+    );
+    assert!(
+        store.calls.qpi_calls.read().unwrap().contains(&out),
+        "3rd attempt (success) should record qpi_calls"
+    );
+    let st = handle
+        .debug_query_derivation(&drv_hash)
+        .await?
+        .expect("drv exists");
+    assert_eq!(
+        st.status,
+        crate::state::DerivationStatus::Completed,
+        "transient failures absorbed by retry → Completed (not demoted to Ready)"
+    );
     Ok(())
 }
 
@@ -1013,7 +1064,7 @@ async fn test_preexisting_completed_gc_matrix(
                 .push(fod_out.clone());
             store
                 .faults
-                .fail_query_path_info
+                .fail_query_path_info_permanent
                 .store(true, Ordering::SeqCst);
         }
         GcState::StoreUnreachable => {

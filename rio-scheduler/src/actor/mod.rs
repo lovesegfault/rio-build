@@ -101,12 +101,30 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// of dropping the receiver (see `bridge_build_events`).
 pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 
-/// Default cap on concurrent `QueryPathInfo` calls during merge-time
-/// eager substitute fetch. 16 balances throughput against the store's
-/// S3 connection-pool ceiling (~10-20 aws-sdk default). Unbounded
-/// fan-out at ~1k paths causes "dispatch failure" → ~20% false demotes.
+/// Default cap on concurrent detached substitute-fetch tasks. Each
+/// task acquires a `DagActor.substitute_sem` permit before its
+/// `QueryPathInfo`; the store's `try_substitute` walks the runtime
+/// closure recursively, so 256 in-flight tasks share substantially
+/// fewer concurrent NAR downloads (hub paths singleflight). Per-call
+/// transient failures retry with [`SUBSTITUTE_FETCH_BACKOFF`].
 /// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
-pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 16;
+pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
+
+/// Retry policy for the detached substitute fetch's `QueryPathInfo`.
+/// Transient store errors (`Unavailable`/`Aborted`/`ResourceExhausted`
+/// per [`rio_common::grpc::is_transient`]) retry up to
+/// [`SUBSTITUTE_FETCH_MAX_ATTEMPTS`] with this curve.
+pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(250),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(30),
+    jitter: rio_common::backoff::Jitter::Proportional(0.2),
+};
+
+/// Max attempts per path for the detached substitute fetch. With
+/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s→4s ≈ 8s total
+/// retry budget per path before demoting to cache-miss.
+pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 5;
 
 /// Per-path timeout for the detached substitute fetch's
 /// `QueryPathInfo`. Separate from `grpc_timeout` (30s) because the
@@ -354,8 +372,10 @@ impl DagActor {
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
-            substitute_max_concurrent: cfg.substitute_max_concurrent,
-            substitute_sem: Arc::new(tokio::sync::Semaphore::new(cfg.substitute_max_concurrent)),
+            substitute_max_concurrent: cfg.substitute_max_concurrent.max(1),
+            substitute_sem: Arc::new(tokio::sync::Semaphore::new(
+                cfg.substitute_max_concurrent.max(1),
+            )),
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
             tick_count: 0,

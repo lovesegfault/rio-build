@@ -665,6 +665,7 @@ impl DagActor {
             let meta = tenant_meta.clone();
             let h = drv_hash.clone();
             let sem = self.substitute_sem.clone();
+            let shutdown = self.shutdown.clone();
             rio_common::task::spawn_monitored("substitute-fetch", async move {
                 // Bound in-flight QPIs across ALL spawned tasks. The
                 // task is already spawned (so the actor returned), but
@@ -674,32 +675,60 @@ impl DagActor {
                 let meta_ref: Vec<(&'static str, &str)> =
                     meta.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let mut ok = true;
-                for p in &paths {
-                    let mut c = store.clone();
-                    match rio_proto::client::query_path_info_opt(
-                        &mut c,
-                        p,
-                        super::SUBSTITUTE_FETCH_TIMEOUT,
-                        &meta_ref,
-                    )
-                    .await
-                    {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            warn!(path = %p, "detached substitute fetch: NotFound \
-                                   (upstream HEAD probe lied?); demoting to cache-miss");
-                            metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                                .increment(1);
+                'paths: for p in &paths {
+                    for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
+                        if shutdown.is_cancelled() {
                             ok = false;
+                            break 'paths;
                         }
-                        Err(e) => {
-                            warn!(path = %p, error = %e,
-                                  "detached substitute fetch failed; demoting to cache-miss");
-                            metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                                .increment(1);
-                            ok = false;
+                        let mut c = store.clone();
+                        match rio_proto::client::query_path_info_opt(
+                            &mut c,
+                            p,
+                            super::SUBSTITUTE_FETCH_TIMEOUT,
+                            &meta_ref,
+                        )
+                        .await
+                        {
+                            Ok(Some(_)) => continue 'paths,
+                            Ok(None) => {
+                                warn!(path = %p, "detached substitute fetch: NotFound \
+                                       (upstream HEAD probe lied?); demoting to cache-miss");
+                                metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                                    .increment(1);
+                                ok = false;
+                                continue 'paths;
+                            }
+                            Err(e) if rio_common::grpc::is_transient(e.code()) => {
+                                debug!(path = %p, attempt, error = %e,
+                                       "substitute fetch transient error; retrying");
+                                metrics::counter!("rio_scheduler_substitute_fetch_retries_total")
+                                    .increment(1);
+                                if attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
+                                    break;
+                                }
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => { ok = false; break 'paths; }
+                                    _ = tokio::time::sleep(
+                                        super::SUBSTITUTE_FETCH_BACKOFF.duration(attempt)
+                                    ) => {}
+                                }
+                            }
+                            Err(e) => {
+                                warn!(path = %p, error = %e,
+                                      "detached substitute fetch failed; demoting to cache-miss");
+                                metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                                    .increment(1);
+                                ok = false;
+                                continue 'paths;
+                            }
                         }
                     }
+                    // Exhausted retries on transient errors.
+                    warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
+                          "detached substitute fetch exhausted retries; demoting to cache-miss");
+                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+                    ok = false;
                 }
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx

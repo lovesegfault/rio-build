@@ -82,10 +82,9 @@ pub(super) struct Config {
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
     pub(super) retry: rio_scheduler::RetryPolicy,
-    /// Max concurrent substitute eager-fetch calls at merge time
-    /// (r[sched.merge.substitute-fetch]). Bounds the QueryPathInfo
-    /// fan-out so the store's S3 connection pool doesn't saturate.
-    /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 16.
+    /// Max concurrent detached substitute-fetch tasks
+    /// (r[sched.substitute.detached]). Sizes `DagActor.substitute_sem`.
+    /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 256.
     #[serde(default = "default_substitute_concurrency")]
     pub(super) substitute_max_concurrent: usize,
     /// ADR-020 capacity manifest headroom. EMA × this multiplier
