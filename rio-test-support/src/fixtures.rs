@@ -70,6 +70,9 @@ pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
         is_content_addressed: false,
         ca_modular_hash: Vec::new(),
         needs_resolve: false,
+        version: None,
+        enable_parallel_building: None,
+        prefer_local_build: None,
     }
 }
 

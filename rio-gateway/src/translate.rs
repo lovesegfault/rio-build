@@ -455,6 +455,15 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
             .or_else(|| env.get("name"))
             .cloned()
             .unwrap_or_default(),
+        // ADR-023 sizing attrs. Nix bool env values are "1"/"" (older
+        // stdenv) or "true"/"false" (newer). Absent stays None — for
+        // enableParallelBuilding in particular, absent ≠ false (nixpkgs
+        // is migrating to default-true; None means "unknown, explore").
+        version: env.get("version").cloned(),
+        enable_parallel_building: env
+            .get("enableParallelBuilding")
+            .map(|v| v == "1" || v == "true"),
+        prefer_local_build: env.get("preferLocalBuild").map(|v| v == "1" || v == "true"),
         system: drv.platform().to_string(),
         required_features: env
             .get("requiredSystemFeatures")
@@ -869,6 +878,56 @@ mod tests {
         let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
         assert_eq!(nodes[0].pname, "");
 
+        Ok(())
+    }
+
+    /// ADR-023 sizing attrs: version + enableParallelBuilding +
+    /// preferLocalBuild extracted from drv.env. Nix encodes bools as
+    /// "1"/"" (older stdenv) or "true"/"false" (newer) — both forms
+    /// must parse.
+    #[test]
+    fn test_extracts_adr023_attrs() -> anyhow::Result<()> {
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), "hello".into());
+        env.insert("version".into(), "2.12".into());
+        env.insert("enableParallelBuilding".into(), "1".into());
+        env.insert("preferLocalBuild".into(), "true".into());
+        let drv = make_basic_drv(env)?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(nodes[0].version.as_deref(), Some("2.12"));
+        assert_eq!(nodes[0].enable_parallel_building, Some(true));
+        assert_eq!(nodes[0].prefer_local_build, Some(true));
+
+        // Explicit false: "" and "false" both → Some(false), distinct
+        // from absent. enableParallelBuilding="" is how older stdenv
+        // spells false.
+        let mut env = BTreeMap::new();
+        env.insert("enableParallelBuilding".into(), "".into());
+        env.insert("preferLocalBuild".into(), "false".into());
+        let drv = make_basic_drv(env)?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(nodes[0].enable_parallel_building, Some(false));
+        assert_eq!(nodes[0].prefer_local_build, Some(false));
+        Ok(())
+    }
+
+    /// ADR-023: absent enableParallelBuilding is None, NOT Some(false).
+    /// Historical stdenv default was unset; nixpkgs migrating to
+    /// default-true. The SLA model treats None as "unknown — explore",
+    /// Some(false) as "fix p̄=1". Conflating them would pin every
+    /// legacy derivation to one core.
+    #[test]
+    fn test_absent_adr023_attrs_are_none_not_false() -> anyhow::Result<()> {
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), "hello".into());
+        let drv = make_basic_drv(env)?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(nodes[0].version, None);
+        assert_eq!(
+            nodes[0].enable_parallel_building, None,
+            "absent ≠ false: None means explore, Some(false) means fix p̄=1"
+        );
+        assert_eq!(nodes[0].prefer_local_build, None);
         Ok(())
     }
 

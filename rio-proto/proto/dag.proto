@@ -79,6 +79,22 @@ message DerivationNode {
   // resolve even though it's IA itself). Scheduler's maybe_resolve_ca
   // gates on this instead of is_content_addressed.
   bool needs_resolve = 13;
+
+  // ADR-023 sizing inputs — extracted from drv.env at gateway
+  // translate-time so the scheduler's SLA model can short-circuit
+  // exploration. All optional: absent ≠ false/empty.
+  //
+  // version: feeds version-distance sample weighting (closer versions
+  // of the same pname → higher weight in duration estimate).
+  optional string version = 14;
+  // enableParallelBuilding: when explicitly false → fix p̄=1 (no
+  // multi-core exploration). Absent is NOT false — historical stdenv
+  // default was unset and nixpkgs is migrating to default-true, so
+  // None means "unknown, explore".
+  optional bool enable_parallel_building = 15;
+  // preferLocalBuild: true → trivially short (writeText, symlinkJoin,
+  // etc.), skip learning entirely.
+  optional bool prefer_local_build = 16;
 }
 
 // A dependency edge in the derivation DAG.
