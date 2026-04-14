@@ -33,6 +33,7 @@ pub mod lease;
 pub mod logs;
 pub(crate) mod queue;
 pub(crate) mod rebalancer;
+pub mod sla;
 pub mod state;
 
 // Re-export for main.rs — `assignment` is pub(crate) but the config struct
