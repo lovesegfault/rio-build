@@ -177,13 +177,13 @@ impl Substituter {
         // instead of panicking. Tests that exercise HTTP inject a
         // working client via `.with_http_client()`.
         //
-        // Timeout: a hung upstream would block try_substitute forever
-        // AND wedge the moka singleflight slot (concurrent callers
-        // wait on the in-flight future). 60s covers a cold fetch of
-        // glibc-sized NARs (~40MB xz) over a slow link; anything
-        // longer is a dead upstream.
+        // connect_timeout only — NO body-read timeout. ghc-binary
+        // (2.5GB compressed) legitimately exceeds any sane fixed
+        // timeout. A hung mid-body upstream is bounded by the moka
+        // singleflight TTL + ingest's 5-min stale-placeholder reclaim,
+        // not by aborting the download here.
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .ok();
         if http.is_none() {
@@ -488,10 +488,8 @@ impl Substituter {
         }
 
         // — Step 5-6: ingest via write-ahead + sig_mode —
-        let info = self
-            .ingest(tenant_id, upstream.sig_mode, &ni, nar_bytes, expected_hash)
-            .await?;
-        Ok(Some(info))
+        self.ingest(tenant_id, upstream.sig_mode, &ni, nar_bytes, expected_hash)
+            .await
     }
 
     /// GET the NAR body and decompress. Returns the raw NAR bytes.
@@ -566,7 +564,7 @@ impl Substituter {
         ni: &NarInfo,
         nar_bytes: Bytes,
         nar_hash: [u8; 32],
-    ) -> Result<ValidatedPathInfo, SubstituteError> {
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         let mut info = narinfo_to_validated(ni, nar_hash)?;
         info.nar_size = nar_bytes.len() as u64;
 
@@ -594,21 +592,15 @@ impl Substituter {
                 // dedupes) and return it.
                 metadata::append_signatures(&self.pool, info.store_path.as_str(), &info.signatures)
                     .await?;
-                return metadata::query_path_info(&self.pool, info.store_path.as_str())
-                    .await?
-                    .ok_or_else(|| {
-                        SubstituteError::Ingest(metadata::MetadataError::PlaceholderMissing {
-                            store_path: info.store_path.to_string(),
-                        })
-                    });
+                return Ok(metadata::query_path_info(&self.pool, info.store_path.as_str()).await?);
             }
             PlaceholderClaim::Concurrent => {
-                // Live uploader holds the slot. Retriable.
-                return Err(SubstituteError::Ingest(
-                    metadata::MetadataError::PlaceholderMissing {
-                        store_path: info.store_path.to_string(),
-                    },
-                ));
+                // Another replica (or this replica via a different
+                // closure-walk) holds the placeholder. Miss for now —
+                // not an error, and trying the next upstream would just
+                // race the same slot again.
+                debug!(store_path = %info.store_path, "concurrent uploader holds placeholder");
+                return Ok(None);
             }
         }
 
@@ -636,7 +628,7 @@ impl Substituter {
             });
         }
 
-        Ok(info)
+        Ok(Some(info))
     }
 
     // r[impl store.substitute.sig-mode]
@@ -1391,10 +1383,10 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await.unwrap();
 
-        // Young placeholder → ingest returns PlaceholderMissing, which
-        // try_substitute's moka get_with swallows into None (avoids
-        // poisoning the singleflight cache with a transient error).
-        // Caller sees a miss and retries on the next request.
+        // Young placeholder → PlaceholderClaim::Concurrent → ingest
+        // returns Ok(None) directly. Caller sees a miss and retries
+        // on the next request; no spurious WARN about "placeholder
+        // missing (concurrently deleted?)".
         assert!(
             got.is_none(),
             "young placeholder should yield miss (None), got {got:?}"
