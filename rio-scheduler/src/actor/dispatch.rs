@@ -10,7 +10,6 @@ use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::estimator::Estimator;
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 use super::DagActor;
@@ -254,9 +253,10 @@ impl DagActor {
         // if size_classes unconfigured (optional feature off —
         // no filter, all workers candidates).
         //
-        // Also compute the bucketed memory estimate for the
-        // resource-fit filter (lookup_entry + bucketed_estimate
-        // + self.sizing.headroom_mult).
+        // Also compute the SLA-solved memory for the resource-fit
+        // filter (`r[sched.assign.resource-fit]`): same
+        // `solve_intent_for` the snapshot uses, so the controller
+        // spawns and dispatch accepts the SAME shape.
         //
         // `is_fixed_output` is captured into a local so the
         // `state` borrow ends here — `node_mut` below needs
@@ -277,25 +277,15 @@ impl DagActor {
                 self.estimator.peak_cpu(pname, system),
                 &classes,
             );
-            // None-chain: no pname → no lookup key → None.
-            // No history entry → None. No memory sample →
-            // bucketed_estimate returns None. All three mean
-            // "cold start" to the filter (any worker fits).
-            //
-            // Skip for FODs: MEMORY_BUCKET_BYTES (4 GiB, ADR-020
-            // compile-workload pod sizing) rounds a 22 MB fetch
-            // up to 4 GiB → resource-fit rejects 2 GiB fetchers.
-            // I-062: 5 recurrences of fod_queue=2 + fetcher_util=0
-            // before the per-clause diagnostic exposed this. FOD
-            // memory is the download buffer, not a compile heap;
-            // resource-fit is the wrong gate.
+            // Skip for FODs: probe defaults (8 GiB) would reject
+            // 2 GiB fetchers. I-062: 5 recurrences of fod_queue=2 +
+            // fetcher_util=0 before the per-clause diagnostic exposed
+            // this. FOD memory is the download buffer, not a compile
+            // heap; resource-fit is the wrong gate.
             let est_memory_bytes = if state.is_fixed_output {
                 None
             } else {
-                pname
-                    .and_then(|p| self.estimator.lookup_entry(p, system))
-                    .and_then(|e| Estimator::bucketed_estimate(&e, self.sizing.headroom_mult))
-                    .map(|b| b.memory_bytes)
+                Some(self.solve_intent_for(pname, state).1)
             };
             (
                 target_class,
@@ -1105,6 +1095,23 @@ impl DagActor {
         let Some(drv_state) = self.dag.node(drv_hash) else {
             return (None, None);
         };
+
+        // r[impl sched.sla.intent-match]
+        // ADR-023: a worker that heartbeated `intent_id == drv_hash` was
+        // spawned FOR this derivation (controller stamped the SpawnIntent
+        // on its pod resources). Prefer it over best_executor — its
+        // (cores, mem, disk) were sized by `solve_intent_for` for this
+        // exact drv. Re-check `can_build` (system/feature) so a pool
+        // misconfig doesn't bypass the airgap/feature gates; on miss
+        // (drv re-planned, scheduler restarted, intent stale) fall
+        // through to pick-from-queue.
+        if let Some(w) = self.executors.values().find(|w| {
+            w.intent_id.as_deref() == Some(drv_hash.as_ref())
+                && w.has_capacity()
+                && w.can_build(&drv_state.system, &drv_state.required_features)
+        }) {
+            return (Some(w.executor_id.clone()), w.size_class.clone());
+        }
 
         // r[impl sched.dispatch.no-fod-fallback]
         // r[impl sched.fod.size-class-reactive]

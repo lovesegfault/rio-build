@@ -230,6 +230,12 @@ pub struct DagActor {
     /// periodically on Tick. Critical-path and size-class routing read
     /// from this. Single-threaded actor owns it — no Arc/lock.
     estimator: Estimator,
+    /// ADR-023 per-`(pname, system, tenant)` fitted curves. Feeds
+    /// `compute_size_class_snapshot` (SpawnIntent population) and
+    /// dispatch's resource-fit filter via [`crate::sla::solve::intent_for`].
+    /// Internally `Arc<RwLock<…>>`; reads on the snapshot/dispatch path
+    /// are a single `.cached()` clone.
+    pub(crate) sla_estimator: crate::sla::SlaEstimator,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -400,6 +406,8 @@ impl DagActor {
             )),
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
+            // TODO(ADR-023 phase-3): halflife / ring_buffer from SlaConfig.
+            sla_estimator: crate::sla::SlaEstimator::new(7.0 * 86400.0, 32),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,

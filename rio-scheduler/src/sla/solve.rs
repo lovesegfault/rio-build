@@ -1,8 +1,32 @@
-// TODO(ADR-023): drop once Phase 2 lands
-#![allow(dead_code)]
-
 use super::fit::headroom;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
+
+// TODO(ADR-023 phase-3): from SlaConfig (scheduler.toml).
+/// Single "normal" tier with a 20-minute p90 target. Phase-3 makes the
+/// tier ladder operator-tunable; until then dispatch and the snapshot
+/// share this const so they cannot disagree.
+pub const DEFAULT_TIER_P90_SECS: f64 = 1200.0;
+
+// TODO(ADR-023 phase-3): from SlaConfig.
+pub const DEFAULT_CEILINGS: Ceilings = Ceilings {
+    max_cores: 64.0,
+    max_mem: 256 << 30,
+    max_disk: 200 << 30,
+    default_disk: 20 << 30,
+};
+
+// TODO(ADR-023 phase-3): from SlaConfig (cfg.probe.{cpu,mem,disk}).
+/// Cold-start / explore-path probe sizing. Phase-5 (Task 5.2) replaces
+/// the explore branch with `explore::next()`; until then unfitted keys
+/// dispatch at a fixed mid-range probe.
+pub const PROBE_CORES: u32 = 4;
+pub const PROBE_MEM_BYTES: u64 = 8 << 30;
+pub const PROBE_DISK_BYTES: u64 = 20 << 30;
+
+/// `prefer_local_build = true` → trivially short. Smallest pod the
+/// controller will spawn.
+const LOCAL_CORES: u32 = 1;
+const LOCAL_MEM_BYTES: u64 = 2 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Tier {
@@ -33,6 +57,76 @@ pub enum SolveResult {
         mem: MemBytes,
         disk: DiskBytes,
     },
+}
+
+impl SolveResult {
+    pub fn cores(&self) -> RawCores {
+        match self {
+            Self::Feasible { c_star, .. } => *c_star,
+            Self::BestEffort { c, .. } => *c,
+        }
+    }
+    pub fn mem(&self) -> MemBytes {
+        match self {
+            Self::Feasible { mem, .. } | Self::BestEffort { mem, .. } => *mem,
+        }
+    }
+    pub fn disk(&self) -> DiskBytes {
+        match self {
+            Self::Feasible { disk, .. } | Self::BestEffort { disk, .. } => *disk,
+        }
+    }
+}
+
+/// Derivation-declared sizing hints (from drv.env).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DrvHints {
+    pub enable_parallel_building: Option<bool>,
+    pub prefer_local_build: Option<bool>,
+}
+
+/// Per-derivation `(cores, mem, disk)` for a [`SpawnIntent`]. Wraps
+/// [`solve_mvp`] with the cold-start / drv-hint branching that the
+/// snapshot path and dispatch's resource-fit filter both need, so the
+/// two cannot diverge.
+///
+/// - `prefer_local_build = Some(true)` → minimal (1 core), no learning.
+/// - `enable_parallel_building = Some(false)` → 1 core, probe mem/disk
+///   (the build is serial by declaration; exploring c is wasted).
+/// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → probe defaults.
+///   TODO(ADR-023 phase-5): replace with `explore::next()`.
+/// - Otherwise → `solve_mvp` against [`DEFAULT_TIER_P90_SECS`] /
+///   [`DEFAULT_CEILINGS`].
+///
+/// Cores are `ceil`-ed to a whole-core `u32` (k8s `resources.requests`
+/// granularity); mem/disk are byte-exact (controller rounds at the pod
+/// template).
+///
+/// [`SpawnIntent`]: rio_proto::types::SpawnIntent
+// r[impl sched.sla.intent-from-solve]
+pub fn intent_for(fit: Option<&FittedParams>, hints: DrvHints) -> (u32, u64, u64) {
+    if hints.prefer_local_build == Some(true) {
+        return (LOCAL_CORES, LOCAL_MEM_BYTES, DEFAULT_CEILINGS.default_disk);
+    }
+    if hints.enable_parallel_building == Some(false) {
+        return (1, PROBE_MEM_BYTES, PROBE_DISK_BYTES);
+    }
+    let fit = match fit {
+        Some(f) if f.n_eff >= 3.0 && (f.span >= 4.0 || f.explore.frozen) => f,
+        // TODO(ADR-023 phase-5): explore::next() drives the probe ladder.
+        _ => return (PROBE_CORES, PROBE_MEM_BYTES, PROBE_DISK_BYTES),
+    };
+    let tiers = [Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(DEFAULT_TIER_P90_SECS),
+        p99: None,
+    }];
+    let r = solve_mvp(fit, &tiers, &DEFAULT_CEILINGS);
+    // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
+    // BestEffort.c can be fractional below 1 for degenerate fits.
+    let cores = (r.cores().0.ceil() as u32).max(1);
+    (cores, r.mem().0, r.disk().0)
 }
 
 // r[impl sched.sla.solve-citardauq]
@@ -191,5 +285,54 @@ mod tests {
             solve_mvp(&fit, &[t("t0", 300.0)], &ceil()),
             SolveResult::BestEffort { .. }
         ));
+    }
+
+    // ─── intent_for branching ───────────────────────────────────────
+
+    #[test]
+    fn intent_for_prefer_local_is_minimal() {
+        let (c, m, _) = intent_for(
+            None,
+            DrvHints {
+                prefer_local_build: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c, 1);
+        assert_eq!(m, LOCAL_MEM_BYTES);
+    }
+    #[test]
+    fn intent_for_serial_pins_one_core() {
+        // enable_parallel_building=false beats a fitted curve.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let (c, m, _) = intent_for(
+            Some(&fit),
+            DrvHints {
+                enable_parallel_building: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c, 1);
+        assert_eq!(m, PROBE_MEM_BYTES);
+    }
+    #[test]
+    fn intent_for_cold_start_is_probe() {
+        assert_eq!(
+            intent_for(None, DrvHints::default()),
+            (PROBE_CORES, PROBE_MEM_BYTES, PROBE_DISK_BYTES)
+        );
+        // n_eff < 3 → still explore/probe path.
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.n_eff = 2.0;
+        assert_eq!(intent_for(Some(&fit), DrvHints::default()).0, PROBE_CORES);
+    }
+    #[test]
+    fn intent_for_fitted_uses_solve() {
+        // r[verify sched.sla.intent-from-solve]
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let (c, _, d) = intent_for(Some(&fit), DrvHints::default());
+        // Against p90=1200: c*≈1.95 → ceil 2.
+        assert_eq!(c, 2, "ceil(solve_mvp.c_star)");
+        assert_eq!(d, 10 << 30, "disk_p90 from fit");
     }
 }

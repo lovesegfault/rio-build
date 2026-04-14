@@ -1,8 +1,5 @@
 //! ADR-023 SLA-driven per-derivation sizing.
 
-// TODO(ADR-023): drop once Phase 2 lands
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -45,6 +42,14 @@ impl SlaEstimator {
     /// back to the cold-start probe path.
     pub fn cached(&self, key: &types::ModelKey) -> Option<types::FittedParams> {
         self.cache.read().get(key).cloned()
+    }
+
+    /// Seed one entry. Test-only: bypasses the DB refit so dispatch
+    /// integration tests can assert `intent_for(cached(key))` without an
+    /// ephemeral PG round-trip.
+    #[cfg(test)]
+    pub fn seed(&self, fit: types::FittedParams) {
+        self.cache.write().insert(fit.key.clone(), fit);
     }
 
     /// Pull samples completed since the last tick, refit each touched

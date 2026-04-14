@@ -99,11 +99,9 @@ pub(super) async fn get_size_class_status(
             sample_count: samples,
             queued_by_system: s.queued_by_system,
             running_by_system: s.running_by_system,
-            // TODO(ADR-023 phase-2): populate from SlaEstimator. The
-            // controller already wires the consume side (spawn one pod
-            // per intent with stamped resources); empty here means it
-            // falls back to the scalar `queued` (Static-mode behavior).
-            spawn_intents: Vec::new(),
+            // ADR-023 phase-2: actor populates per-Ready-derivation via
+            // `solve_intent_for` in `compute_size_class_snapshot`.
+            spawn_intents: s.spawn_intents,
         })
         .collect();
 
@@ -174,6 +172,7 @@ mod tests {
             running: 0,
             queued_by_system: Default::default(),
             running_by_system: Default::default(),
+            spawn_intents: Vec::new(),
         }
     }
 

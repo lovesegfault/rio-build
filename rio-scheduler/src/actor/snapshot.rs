@@ -231,12 +231,13 @@ impl DagActor {
                     running: 0,
                     queued_by_system: HashMap::new(),
                     running_by_system: HashMap::new(),
+                    spawn_intents: Vec::new(),
                 }
             })
             .collect();
 
         // Single pass: classify or look up per derivation.
-        for (_, state) in self.dag.iter_nodes() {
+        for (drv_hash, state) in self.dag.iter_nodes() {
             match state.status() {
                 DerivationStatus::Ready => {
                     // I-146: FODs dispatch to fetchers, NOT size-class
@@ -331,6 +332,26 @@ impl DagActor {
                         .queued_by_system
                         .entry(state.system.clone())
                         .or_default() += 1;
+                    // r[impl sched.sla.intent-from-solve]
+                    // ADR-023: per-derivation SpawnIntent. intent_id is
+                    // the drv_hash itself — the controller stamps it on
+                    // the pod annotation, the builder echoes it on
+                    // heartbeat, dispatch matches `worker.intent_id ==
+                    // drv_hash` (find_executor_with_overflow). No
+                    // separate intent→drv map to keep in sync; if the
+                    // drv leaves Ready before the pod heartbeats, the
+                    // match misses and dispatch falls through to
+                    // pick-from-queue.
+                    let (cores, mem_bytes, disk_bytes) =
+                        self.solve_intent_for(state.pname.as_deref(), state);
+                    snapshots[i]
+                        .spawn_intents
+                        .push(rio_proto::types::SpawnIntent {
+                            intent_id: drv_hash.to_string(),
+                            cores,
+                            mem_bytes,
+                            disk_bytes,
+                        });
                 }
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     // Fact: what class DID we dispatch to?
@@ -361,6 +382,47 @@ impl DagActor {
         // assignment.rs:106).
         snapshots.sort_by(|a, b| a.effective_cutoff_secs.total_cmp(&b.effective_cutoff_secs));
         snapshots
+    }
+
+    /// `(cores, mem, disk)` for one queued derivation via the SLA
+    /// estimator. Shared between [`Self::compute_size_class_snapshot`]
+    /// (SpawnIntent population) and dispatch's resource-fit filter so
+    /// the controller spawns and the scheduler accepts the SAME shape.
+    ///
+    /// `pname` is taken separately so the dispatch caller (which has
+    /// already destructured `state.pname.as_deref()` for `classify()`)
+    /// can pass the borrow it already holds.
+    pub(crate) fn solve_intent_for(
+        &self,
+        pname: Option<&str>,
+        state: &crate::state::DerivationState,
+    ) -> (u32, u64, u64) {
+        use crate::sla::{solve, types::ModelKey};
+        // Tenant: same attribution as completion.rs's write_build_sample
+        // — first interested build's tenant_id, stringified, "" on
+        // None. The two MUST agree or the cache key never matches the
+        // rows that fed it.
+        let tenant = state
+            .interested_builds
+            .iter()
+            .filter_map(|id| self.builds.get(id)?.tenant_id)
+            .next()
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let fit = pname.and_then(|p| {
+            self.sla_estimator.cached(&ModelKey {
+                pname: p.to_string(),
+                system: state.system.clone(),
+                tenant,
+            })
+        });
+        solve::intent_for(
+            fit.as_ref(),
+            solve::DrvHints {
+                enable_parallel_building: state.enable_parallel_building,
+                prefer_local_build: state.prefer_local_build,
+            },
+        )
     }
 
     /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`
@@ -414,6 +476,7 @@ impl DagActor {
                     running: 0,
                     queued_by_system: HashMap::new(),
                     running_by_system: HashMap::new(),
+                    spawn_intents: Vec::new(),
                 }
             })
             .collect();

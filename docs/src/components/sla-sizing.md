@@ -41,3 +41,17 @@ r[sched.sla.override-precedence]
 r[sched.sla.cores-reach-nix-build-cores]
 
 r[sched.sla.disk-reaches-ephemeral-storage]
+
+r[sched.sla.intent-from-solve]
+
+The scheduler exposes one `SpawnIntent{intent_id, cores, mem, disk}` per
+queued non-FOD derivation in `GetSizeClassStatus`. `cores` is
+`ceil(solve_mvp(c_star))` for fitted keys, probe defaults otherwise;
+`prefer_local_build` / `enable_parallel_building=false` pin `cores=1`.
+
+r[sched.sla.intent-match]
+
+`intent_id` is the derivation's `drv_hash`. A worker heartbeating
+`intent_id == drv_hash` is preferred for that derivation over FIFO
+pick-from-queue; on miss (drv re-planned, scheduler restart) dispatch
+falls through to the regular overflow walk.

@@ -1524,3 +1524,161 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 
     Ok(())
 }
+
+// ─── ADR-023 SlaEstimator → SpawnIntent ────────────────────────────────
+
+/// `compute_size_class_snapshot` emits one SpawnIntent per Ready non-FOD,
+/// with `intent_id == drv_hash` and `cores ≈ solve_mvp(c_star)` for a
+/// fitted key. Unfitted keys (no SlaEstimator entry) get probe defaults.
+// r[verify sched.sla.intent-from-solve]
+#[tokio::test]
+async fn spawn_intent_from_sla_estimator() {
+    use crate::sla::{solve, types::*};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
+
+    // Seed a fit for ("test-pkg", x86_64-linux, ""): Amdahl s=30 p=2000.
+    // Against DEFAULT_TIER_P90_SECS=1200, β=30-e^{-0.128}·1200≈-1026 →
+    // c*=2000/1026≈1.95 → ceil → 2 cores.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "test-pkg".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        tier: None,
+    });
+
+    // "fitted" matches the seeded key; "cold" has no fit (different
+    // pname). Both Ready, both non-FOD. test_inject_ready uses the
+    // first arg verbatim as drv_hash.
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
+    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
+
+    let snap = actor.compute_size_class_snapshot(None);
+    // Both classify into "small" (est_dur=0 → smallest covering class).
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(
+        small.spawn_intents.len(),
+        2,
+        "one SpawnIntent per Ready non-FOD; queued={}",
+        small.queued
+    );
+    assert_eq!(small.spawn_intents.len() as u64, small.queued);
+
+    let fitted = small
+        .spawn_intents
+        .iter()
+        .find(|i| i.intent_id == "fitted")
+        .expect("intent_id == drv_hash");
+    assert_eq!(
+        fitted.cores, 2,
+        "solve_mvp c_star ≈ 1.95 → ceil 2 (got {})",
+        fitted.cores
+    );
+    assert_eq!(fitted.disk_bytes, 10 << 30, "disk_p90 from fit");
+    assert!(fitted.mem_bytes >= 6 << 30, "mem ≥ p90 (× headroom)");
+
+    let cold = small
+        .spawn_intents
+        .iter()
+        .find(|i| i.intent_id == "cold")
+        .unwrap();
+    assert_eq!(
+        cold.cores,
+        solve::PROBE_CORES,
+        "no SlaEstimator entry → probe defaults"
+    );
+    assert_eq!(cold.mem_bytes, solve::PROBE_MEM_BYTES);
+}
+
+/// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when
+/// it isn't FIFO-first. Proves the `find_executor_with_overflow` intent
+/// match preempts pick-from-queue. On miss (stale intent), the worker
+/// falls through to FIFO.
+// r[verify sched.sla.intent-match]
+#[tokio::test]
+async fn heartbeat_intent_id_prefers_precomputed_drv() -> TestResult {
+    let (_db, handle, _task) = setup_with_classes(&[("small", 3600.0)]).await;
+
+    // Two Ready drvs: "a" merged first (FIFO head), "b" second.
+    let _rx = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("a"), make_node("b")],
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Worker spawned for "b" (intent_id = drv_hash). Without the
+    // intent-match it would get "a" (FIFO).
+    let mut rx = connect_executor_with_intent(&handle, "w-b", "b").await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let asg = recv_assignment(&mut rx).await;
+    assert_eq!(
+        asg.drv_path,
+        test_drv_path("b"),
+        "intent_id=b → worker gets b, not FIFO-head a"
+    );
+
+    // Stale-intent fallback: worker for "gone" (no such drv) → FIFO
+    // pick-from-queue → gets "a".
+    let mut rx2 = connect_executor_with_intent(&handle, "w-stale", "gone").await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let asg2 = recv_assignment(&mut rx2).await;
+    assert_eq!(
+        asg2.drv_path,
+        test_drv_path("a"),
+        "no intent match → falls through to pick-from-queue"
+    );
+    Ok(())
+}
+
+/// Connect a size-classed builder with `intent_id` set. Local helper
+/// for the ADR-023 intent-match tests above.
+async fn connect_executor_with_intent(
+    handle: &ActorHandle,
+    executor_id: &str,
+    intent_id: &str,
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    let (tx, rx) = mpsc::channel(16);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: executor_id.into(),
+            stream_tx: tx,
+        })
+        .await?;
+    send_heartbeat_with(handle, executor_id, "x86_64-linux", |hb| {
+        hb.size_class = Some("small".into());
+        hb.intent_id = Some(intent_id.into());
+    })
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: executor_id.into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    Ok(rx)
+}

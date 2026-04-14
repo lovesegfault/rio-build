@@ -162,7 +162,6 @@ async fn main() -> anyhow::Result<()> {
             poison: cfg.poison,
             retry_policy: cfg.retry,
             substitute_max_concurrent: cfg.substitute_max_concurrent,
-            headroom_mult: cfg.headroom_multiplier,
             ..Default::default()
         },
         rio_scheduler::actor::DagActorPlumbing {

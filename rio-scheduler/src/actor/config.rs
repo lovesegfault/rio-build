@@ -67,12 +67,6 @@ pub(crate) struct SizingConfig {
     /// (matters for the RPC response which sorts by effective cutoff,
     /// but configured order is useful for logging).
     pub(super) configured_cutoffs: Vec<(String, f64)>,
-    /// ADR-020 capacity manifest headroom. Applied by both
-    /// `compute_capacity_manifest` (manifest RPC) and the
-    /// dispatch-time resource-fit filter. Config-global; per-pool
-    /// later if needed. Validated finite + positive at startup
-    /// (main.rs).
-    pub(super) headroom_mult: f64,
     /// I-204: capability-hint features stripped at DAG insertion.
     /// Re-applied by [`apply_to_dag`] on every fresh DAG (recovery
     /// replaces `DagActor.dag` on each leader transition).
@@ -93,7 +87,6 @@ impl SizingConfig {
             size_classes: Arc::new(parking_lot::RwLock::new(cfg.size_classes.clone())),
             fetcher_classes: crate::assignment::builder_class_order(&cfg.size_classes),
             configured_cutoffs,
-            headroom_mult: cfg.headroom_mult,
             soft_features: cfg.soft_features.clone(),
         }
     }
@@ -145,9 +138,6 @@ pub struct DagActorConfig {
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
     pub soft_features: Vec<crate::assignment::SoftFeature>,
-    /// ADR-020 capacity manifest headroom. Validated finite + positive
-    /// at startup (main.rs).
-    pub headroom_mult: f64,
 }
 
 impl Default for DagActorConfig {
@@ -159,7 +149,6 @@ impl Default for DagActorConfig {
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             size_classes: Vec::new(),
             soft_features: Vec::new(),
-            headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
         }
     }
 }

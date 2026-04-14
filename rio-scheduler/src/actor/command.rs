@@ -558,6 +558,11 @@ pub struct SizeClassSnapshot {
     /// Per-system breakdown of `running`. Symmetry with
     /// `queued_by_system` for operator/dashboard use.
     pub running_by_system: std::collections::HashMap<String, u64>,
+    /// ADR-023: per-derivation `(cores, mem, disk)` for each Ready
+    /// derivation that buckets into this class. `intent_id` is the
+    /// drv_hash — dispatch matches `worker.intent_id == drv_hash` so
+    /// the mapping is structural (no separate table to keep in sync).
+    pub spawn_intents: Vec<rio_proto::types::SpawnIntent>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

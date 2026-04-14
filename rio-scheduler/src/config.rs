@@ -87,12 +87,6 @@ pub(super) struct Config {
     /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 256.
     #[serde(default = "default_substitute_concurrency")]
     pub(super) substitute_max_concurrent: usize,
-    /// ADR-020 capacity manifest headroom. EMA × this multiplier
-    /// before bucketing. Start scheduler-global; per-pool later if
-    /// needed. Env: `RIO_HEADROOM_MULTIPLIER`. Default 1.25.
-    /// Validated finite + positive at startup.
-    #[serde(default = "default_headroom_multiplier")]
-    pub(super) headroom_multiplier: f64,
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
     pub(super) dashboard: DashboardConfig,
@@ -132,10 +126,6 @@ fn default_substitute_concurrency() -> usize {
     rio_scheduler::DEFAULT_SUBSTITUTE_CONCURRENCY
 }
 
-fn default_headroom_multiplier() -> f64 {
-    rio_scheduler::DEFAULT_HEADROOM_MULTIPLIER
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -156,7 +146,6 @@ impl Default for Config {
             poison: rio_scheduler::PoisonConfig::default(),
             retry: rio_scheduler::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
-            headroom_multiplier: default_headroom_multiplier(),
             dashboard: DashboardConfig::default(),
             sla: None,
         }
@@ -289,17 +278,6 @@ impl rio_common::config::ValidateConfig for Config {
          (threshold=0 means is_poisoned() is always true — \
          every derivation poisons immediately)",
             cfg.poison.threshold
-        );
-        // headroom_multiplier feeds the manifest RPC / SizingConfig.
-        // mult ≤ 0 or NaN would silently under-provision every build;
-        // inf overflows u64 in `(ema × mult) as u64`. Require finite +
-        // positive.
-        anyhow::ensure!(
-            cfg.headroom_multiplier.is_finite() && cfg.headroom_multiplier > 0.0,
-            "headroom_multiplier must be finite and positive, got {} \
-         (≤0/NaN silently floors all estimates to minimum bucket; \
-         inf overflows u64 in div_ceil×bucket)",
-            cfg.headroom_multiplier
         );
         for class in &cfg.size_classes {
             // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like

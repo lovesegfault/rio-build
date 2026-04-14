@@ -772,8 +772,9 @@ impl DagActor {
         // reflecting the most recent heartbeat is still correct (the
         // SpawnIntent match is best-effort; dispatch falls through to
         // pick-from-queue when no intent matches).
-        // TODO(ADR-023 phase-2): look up pre-computed assignment by
-        // intent_id and prefer it at dispatch time.
+        // `find_executor_with_overflow` reads this: a worker with
+        // `intent_id == drv_hash` is preferred for that drv (its pod
+        // resources were sized for it via `solve_intent_for`).
         worker.intent_id = hb.intent_id;
         // kind: overwrite unconditionally. An executor that flips kind
         // mid-life is a misconfiguration, but the scheduler should

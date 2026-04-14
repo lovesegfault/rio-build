@@ -201,15 +201,6 @@ fn test_valid_config() -> Config {
     |c: &mut Config| c.size_classes = size_classes_with_cpu_limit(Some(f64::NAN)),
     &["cpu_limit_cores", "finite"]
 )]
-// headroom 0.0 floors all estimates to minimum bucket.
-#[case::zero_headroom_multiplier(
-    |c: &mut Config| c.headroom_multiplier = 0.0,
-    &["headroom_multiplier must be finite and positive"]
-)]
-#[case::nan_headroom_multiplier(
-    |c: &mut Config| c.headroom_multiplier = f64::NAN,
-    &["headroom_multiplier must be finite and positive"]
-)]
 fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
     let mut cfg = test_valid_config();
     mutate(&mut cfg);
