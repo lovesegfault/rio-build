@@ -87,6 +87,12 @@ impl SlaEstimator {
                 .await?;
             let fit = ingest::refit(key, &rows, self.halflife_secs);
             self.cache.write().insert(key.clone(), fit);
+            // Trim AFTER refit so the fit always sees the full ring even
+            // if a previous tick's trim was skipped (PG blip). Best-effort
+            // — a failed trim is a transient leak the next tick fixes.
+            let _ = db
+                .trim_build_samples(&key.pname, &key.system, &key.tenant, self.ring_buffer)
+                .await;
         }
 
         *self.last_tick.write() = hwm;

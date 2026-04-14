@@ -410,4 +410,40 @@ impl SchedulerDb {
         rows.reverse();
         Ok(rows)
     }
+
+    /// Per-key ring-buffer trim: delete all but the `keep_n` most-recent
+    /// rows for one `(pname, system, tenant)` key. Called from
+    /// [`SlaEstimator::refresh`] after refit so the table holds at most
+    /// `ring_buffer` rows per key in steady state. Returns rows deleted.
+    ///
+    /// `NOT IN (SELECT id … ORDER BY completed_at DESC LIMIT $4)` — both
+    /// the outer scan and the subselect's top-N are covered by
+    /// `build_samples_key_idx` (migration 039: `(pname, system, tenant,
+    /// completed_at DESC)`). With ≤32 retained rows the subselect is an
+    /// index-only top-N; the outer DELETE walks the same range.
+    ///
+    /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    pub async fn trim_build_samples(
+        &self,
+        pname: &str,
+        system: &str,
+        tenant: &str,
+        keep_n: u32,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            "DELETE FROM build_samples
+             WHERE pname = $1 AND system = $2 AND tenant = $3
+               AND id NOT IN (
+                 SELECT id FROM build_samples
+                 WHERE pname = $1 AND system = $2 AND tenant = $3
+                 ORDER BY completed_at DESC LIMIT $4)",
+            pname,
+            system,
+            tenant,
+            keep_n as i64,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
 }

@@ -645,3 +645,61 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `trim_build_samples`: insert 40 rows with strictly-ascending
+/// `completed_at`, trim to 32, assert the 32 newest survive (the
+/// surviving min `completed_at` is the 9th-oldest). A different-key
+/// row in the same table is untouched.
+#[tokio::test]
+async fn test_trim_build_samples_keeps_newest_n() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Insert with explicit completed_at (write_build_sample uses now()
+    // server-side, so go raw). i seconds past epoch → strictly ascending.
+    for i in 0..40 {
+        sqlx::query(
+            "INSERT INTO build_samples
+               (pname, system, tenant, duration_secs, peak_memory_bytes, completed_at)
+             VALUES ('p', 'x86_64-linux', 't', 1.0, 0, to_timestamp($1))",
+        )
+        .bind(i as f64)
+        .execute(&test_db.pool)
+        .await?;
+    }
+    // One row for a different key — must NOT be trimmed.
+    sqlx::query(
+        "INSERT INTO build_samples
+           (pname, system, tenant, duration_secs, peak_memory_bytes, completed_at)
+         VALUES ('other', 'x86_64-linux', 't', 1.0, 0, to_timestamp(0))",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    let deleted = db.trim_build_samples("p", "x86_64-linux", "t", 32).await?;
+    assert_eq!(deleted, 8, "40 inserted → 32 kept → 8 deleted");
+
+    let (n, min_epoch): (i64, f64) = sqlx::query_as(
+        "SELECT count(*), min(EXTRACT(EPOCH FROM completed_at))::float8
+         FROM build_samples WHERE pname = 'p' AND system = 'x86_64-linux' AND tenant = 't'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(n, 32);
+    assert_eq!(
+        min_epoch, 8.0,
+        "kept the 32 newest by completed_at (i=8..39)"
+    );
+
+    let (other,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM build_samples WHERE pname = 'other'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(other, 1, "different-key row untouched");
+
+    // Idempotent: second trim is a no-op.
+    let deleted2 = db.trim_build_samples("p", "x86_64-linux", "t", 32).await?;
+    assert_eq!(deleted2, 0);
+
+    Ok(())
+}
