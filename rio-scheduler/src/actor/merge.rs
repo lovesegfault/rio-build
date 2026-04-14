@@ -190,7 +190,10 @@ impl DagActor {
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
-                debug!(elapsed = ?t_phase.elapsed(), phase = $name, "merge phase");
+                let elapsed = t_phase.elapsed();
+                metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => $name)
+                    .record(elapsed.as_secs_f64());
+                debug!(?elapsed, phase = $name, "merge phase");
                 t_phase = Instant::now();
             };
         }
@@ -456,7 +459,10 @@ impl DagActor {
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
-                debug!(elapsed = ?t_phase.elapsed(), phase = $name, "merge phase");
+                let elapsed = t_phase.elapsed();
+                metrics::histogram!("rio_scheduler_merge_phase_seconds", "phase" => $name)
+                    .record(elapsed.as_secs_f64());
+                debug!(?elapsed, phase = $name, "merge phase");
                 t_phase = Instant::now();
             };
         }
@@ -579,11 +585,9 @@ impl DagActor {
         let build_id = *build_id;
         let mut cached_count = 0u32;
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
-        // I-139: collect for one batched Completed update after the
-        // loop instead of N sequential round-trips. clear_poison and
-        // upsert_path_tenants_for stay per-hit — both are gated
-        // (Poisoned-only / tenant_id-present-only) and rare relative
-        // to cached_hits.len().
+        // I-139: collect for batched Completed-status + path_tenants
+        // updates after the loop instead of N sequential round-trips.
+        // clear_poison stays per-hit (Poisoned-only, rare).
         let mut completed_batch: Vec<DrvHash> = Vec::with_capacity(cached_hits.len());
         // Closure invariant: a cache-hit's output references ⊆ its
         // inputDrv outputs' closure (Nix referential integrity). If A
@@ -683,8 +687,8 @@ impl DagActor {
                 // r[impl sched.gc.path-tenants-upsert]
                 // Cache hit during merge: path already in store, new
                 // tenant needs attribution so GC retains under their
-                // policy. output_paths were just set above.
-                self.upsert_path_tenants_for(drv_hash).await;
+                // policy. Batched after the fixed-point loop —
+                // completed_batch already collects exactly these.
             }
             if still_pending.is_empty() || still_pending.len() == before {
                 break still_pending.into_iter().collect();
@@ -709,6 +713,7 @@ impl DagActor {
                 warn!(count = hashes.len(), error = %e,
                       "failed to persist cache-hit Completed status batch");
             }
+            self.upsert_path_tenants_for_batch(&completed_batch).await;
         }
         // I-099: advance pre-existing Queued dependents of re-probe
         // hits. Newly-inserted dependents are handled by
@@ -1188,13 +1193,23 @@ impl DagActor {
         // cost is ~100ms on tables this size, paid once per large merge.
         // Threshold 500 ≈ PG's default autovacuum_analyze_threshold +
         // 10% of a few-thousand-row table.
-        if node_rows.len() >= 500
-            && let Err(e) = sqlx::query("ANALYZE derivations, build_derivations, derivation_edges")
-                .execute(self.db.pool())
-                .await
-        {
-            warn!(error = %e, rows = node_rows.len(),
-                  "post-merge ANALYZE failed (non-fatal; autovacuum will catch up)");
+        if node_rows.len() >= 500 {
+            // Detached: ANALYZE on a grown derivations table is seconds
+            // (the "~100ms" above dates from when these tables were
+            // tiny). Best-effort/log-on-error already; spawning loses
+            // nothing and keeps the actor's mailbox draining.
+            let pool = self.db.pool().clone();
+            let n = node_rows.len();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    sqlx::query("ANALYZE derivations, build_derivations, derivation_edges")
+                        .execute(&pool)
+                        .await
+                {
+                    warn!(error = %e, rows = n,
+                          "post-merge ANALYZE failed (non-fatal; autovacuum will catch up)");
+                }
+            });
         }
 
         // r[impl sched.db.tx-commit-before-mutate]
@@ -1387,6 +1402,12 @@ impl DagActor {
         // Fixed-CA FODs have ca_modular_hash set (translate.rs:343) but
         // ALSO have a known expected_output_path — those go through the
         // path-based lane below, which checks upstream substitutability.
+        // Latent I-139 shape: was per-(node × output) serial PG awaits.
+        // Not hit by IA-heavy builds (tfc's 5298 had zero floating-CA),
+        // but a CA-heavy DAG would stall the actor here. Collect pairs,
+        // one batched lookup, then per-node assemble.
+        let mut pairs: Vec<([u8; 32], String)> = Vec::new();
+        let mut floating: Vec<(&DrvHash, [u8; 32], &Vec<String>)> = Vec::new();
         for h in probe_set {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
@@ -1399,23 +1420,33 @@ impl DagActor {
                 // path-based lane handles it (incl. substitutability).
                 continue;
             }
+            for out_name in &n.output_names {
+                pairs.push((modular_hash, out_name.clone()));
+            }
+            floating.push((h, modular_hash, &n.output_names));
+        }
+        let realised: HashMap<([u8; 32], String), String> =
+            match rio_store::realisations::query_batch(self.db.pool(), &pairs).await {
+                Ok(rs) => rs
+                    .into_iter()
+                    .map(|r| ((r.drv_hash, r.output_name), r.output_path))
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, n = pairs.len(),
+                          "CA realisation batch lookup failed; treating all as cache-miss");
+                    HashMap::new()
+                }
+            };
+        for (h, modular_hash, output_names) in floating {
             // All output_names must resolve for a full cache-hit. Collect
             // realized paths index-paired with output_names (same layout
             // as DerivationState.output_paths).
-            let mut realized = Vec::with_capacity(n.output_names.len());
+            let mut realized = Vec::with_capacity(output_names.len());
             let mut all_found = true;
-            for out_name in &n.output_names {
-                match crate::ca::resolve::query_realisation(self.db.pool(), &modular_hash, out_name)
-                    .await
-                {
-                    Ok(Some(path)) => realized.push(path),
-                    Ok(None) => {
-                        all_found = false;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(drv_hash = %h, output = %out_name, error = %e,
-                              "CA realisation lookup failed; treating as cache-miss");
+            for out_name in output_names {
+                match realised.get(&(modular_hash, out_name.clone())) {
+                    Some(path) => realized.push(path.clone()),
+                    None => {
                         all_found = false;
                         break;
                     }

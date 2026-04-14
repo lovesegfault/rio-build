@@ -193,6 +193,55 @@ impl DagActor {
         }
     }
 
+    /// Batched [`upsert_path_tenants_for`]: collect `(path_hash,
+    /// tenant_id)` pairs across many derivations, then one UNNEST
+    /// insert. Same lookup logic per-drv (output_paths from DAG state,
+    /// tenant_ids via interested_builds → builds map); same best-effort
+    /// semantics (warn on Err, never block). I-139 recurring: the per-
+    /// hit call in `apply_cached_hits` was 5281 sequential PG awaits
+    /// for tfc's 5298-node merge → ~20s of head-of-line blocking.
+    ///
+    /// [`upsert_path_tenants_for`]: Self::upsert_path_tenants_for
+    pub(super) async fn upsert_path_tenants_for_batch(&self, drv_hashes: &[DrvHash]) {
+        use sha2::Digest;
+        let mut hashes: Vec<Vec<u8>> = Vec::new();
+        let mut tids: Vec<Uuid> = Vec::new();
+        for drv_hash in drv_hashes {
+            let Some(state) = self.dag.node(drv_hash) else {
+                continue;
+            };
+            if state.output_paths.is_empty() {
+                continue;
+            }
+            let tenant_ids: Vec<Uuid> = state
+                .interested_builds
+                .iter()
+                .filter_map(|id| self.builds.get(id)?.tenant_id)
+                .collect();
+            if tenant_ids.is_empty() {
+                continue;
+            }
+            for p in &state.output_paths {
+                let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
+                for t in &tenant_ids {
+                    hashes.push(h.clone());
+                    tids.push(*t);
+                }
+            }
+        }
+        if hashes.is_empty() {
+            return;
+        }
+        if let Err(e) = self.db.upsert_path_tenants_raw(&hashes, &tids).await {
+            warn!(
+                ?e,
+                drvs = drv_hashes.len(),
+                pairs = hashes.len(),
+                "batched path_tenants upsert failed; GC retention may under-retain"
+            );
+        }
+    }
+
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
     /// discover prior output_paths for each cascade candidate via the
     /// `realisation_deps` reverse walk. Returns candidates whose

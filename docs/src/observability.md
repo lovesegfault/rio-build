@@ -90,6 +90,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_derivations_queued` | Gauge | Derivations waiting for assignment |
 | `rio_scheduler_derivations_running` | Gauge | Derivations currently building |
 | `rio_scheduler_actor_cmd_seconds` | Histogram | Per-`ActorCommand` handling latency (labeled by `cmd`). The DAG actor is single-threaded — a slow command head-of-line blocks every queued RPC. Alert on p99 > 1s sustained. |
+| `rio_scheduler_merge_phase_seconds` | Histogram | Per-phase MergeDag latency (labeled by `phase`). Decomposes `actor_cmd_seconds{cmd=MergeDag}`; a single phase >1s is the I-139 signal (N sequential PG awaits in the actor). |
 | `rio_scheduler_build_duration_seconds` | Histogram | Total build duration |
 | `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `existing`=pre-existing completed) |
 | `rio_scheduler_cache_hit_deferred_total` | Counter | Cache-hit drvs deferred to Queued because their inputDrvs are not yet Completed (closure-race guard). |

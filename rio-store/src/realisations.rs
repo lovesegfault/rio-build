@@ -106,6 +106,40 @@ pub async fn query(
         .map_err(|e| MetadataError::InvariantViolation(format!("malformed realisations row: {e}")))
 }
 
+/// Batched [`query`]: look up many `(drv_hash, output_name)` pairs in
+/// one round-trip. Returns only rows that exist — caller treats
+/// absence from the result as a cache miss. Order is unspecified.
+///
+/// Used by the scheduler's merge-time floating-CA cache check, which
+/// otherwise issues O(floating-CA-nodes × outputs) serial queries
+/// inside the actor event loop (the I-139 shape).
+pub async fn query_batch(
+    pool: &PgPool,
+    pairs: &[([u8; 32], String)],
+) -> Result<Vec<Realisation>, MetadataError> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hashes: Vec<&[u8]> = pairs.iter().map(|(h, _)| h.as_slice()).collect();
+    let names: Vec<&str> = pairs.iter().map(|(_, n)| n.as_str()).collect();
+    let rows: Vec<RealisationRow> = sqlx::query_as(
+        r#"
+        SELECT r.drv_hash, r.output_name, r.output_path, r.output_hash, r.signatures
+        FROM realisations r
+        JOIN UNNEST($1::bytea[], $2::text[]) AS k(drv_hash, output_name)
+          ON r.drv_hash = k.drv_hash AND r.output_name = k.output_name
+        "#,
+    )
+    .bind(&hashes)
+    .bind(&names)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| r.try_into_validated())
+        .collect::<Result<_, _>>()
+        .map_err(|e| MetadataError::InvariantViolation(format!("malformed realisations row: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------

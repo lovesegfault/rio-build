@@ -95,6 +95,14 @@ const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 200
 /// hits). Small-leaf closures: 1–10. Fat stdenv closures: 30–80.
 const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0];
 
+/// Histogram bucket boundaries for `rio_scheduler_merge_phase_seconds`.
+/// Spans sub-ms (in-mem phases) → minute (PG/store-RPC phases) so a
+/// per-phase regression that pushes MergeDag past the 1s actor-stall
+/// warn is visible without `RUST_LOG=debug`.
+const MERGE_PHASE_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -110,6 +118,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         CRITICAL_PATH_ACCURACY_BUCKETS,
     ),
     ("rio_scheduler_dispatch_wait_seconds", DISPATCH_WAIT_BUCKETS),
+    ("rio_scheduler_merge_phase_seconds", MERGE_PHASE_BUCKETS),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
         "rio_scheduler_warm_prefetch_paths",
@@ -138,6 +147,12 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_scheduler_derivations_running",
         "Derivations currently building"
+    );
+    describe_histogram!(
+        "rio_scheduler_merge_phase_seconds",
+        "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). \
+         Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single \
+         phase >1s is the I-139 signal — N sequential PG awaits in the actor."
     );
     describe_histogram!(
         "rio_scheduler_actor_cmd_seconds",

@@ -85,6 +85,26 @@ impl SchedulerDb {
                 tids.push(*t);
             }
         }
+        self.upsert_path_tenants_raw(&hashes, &tids).await
+    }
+
+    /// Pre-flattened variant of [`upsert_path_tenants`]: caller has
+    /// already built the parallel `(store_path_hash, tenant_id)` arrays
+    /// (no cartesian product applied here). Used by the batched
+    /// merge-time path where each drv may have a different tenant set,
+    /// so the caller flattens across drvs and issues ONE round-trip
+    /// instead of N. Same UNNEST + `ON CONFLICT DO NOTHING` semantics.
+    ///
+    /// [`upsert_path_tenants`]: Self::upsert_path_tenants
+    pub async fn upsert_path_tenants_raw(
+        &self,
+        hashes: &[Vec<u8>],
+        tids: &[Uuid],
+    ) -> Result<u64, sqlx::Error> {
+        debug_assert_eq!(hashes.len(), tids.len());
+        if hashes.is_empty() {
+            return Ok(0);
+        }
         let result = sqlx::query(
             r#"
             INSERT INTO path_tenants (store_path_hash, tenant_id)
@@ -92,8 +112,8 @@ impl SchedulerDb {
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(&hashes)
-        .bind(&tids)
+        .bind(hashes)
+        .bind(tids)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
