@@ -199,6 +199,23 @@ spec:
                 - image
                 - systems
                 type: object
+              sizing:
+                default: sla
+                description: 'How per-derivation resources are chosen. `Static` routes
+
+                  by the operator-declared `classes[]` ladder (legacy).
+
+                  `Sla` (ADR-023) computes (cores, mem, disk) per-derivation
+
+                  from observed history + tier SLA; `classes[]` is then
+
+                  advisory (used only for child-pool naming/count, not
+
+                  routing). Defaults to `Sla`.'
+                enum:
+                - static
+                - sla
+                type: string
             required:
             - classes
             - poolTemplate
