@@ -228,6 +228,13 @@ message CompletionReport {
   // No degraded-mode flag — if you see an executor pod Running, the
   // cgroup setup succeeded.
   double peak_cpu_cores = 6;
+
+  // k8s spec.nodeName the executor pod ran on (downward API →
+  // RIO_NODE_NAME). For ADR-023's hw_class join: the SLA model groups
+  // build samples by node instance type, which the scheduler resolves
+  // from this via the Node object. optional for wire-compat — old
+  // executors omit, scheduler treats absent as unknown-hw.
+  optional string node_name = 7;
 }
 
 // Result of building a single derivation.

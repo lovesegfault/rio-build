@@ -10,7 +10,7 @@ use crate::executor::{ExecutionResult, ExecutorError};
 
 /// Map a successful `ExecutionResult` to its `CompletionReport`. Resource
 /// fields flow from the executor (cgroup `memory.peak` + polled `cpu.stat`).
-pub(super) fn ok_completion(r: ExecutionResult) -> CompletionReport {
+pub(super) fn ok_completion(r: ExecutionResult, node_name: Option<String>) -> CompletionReport {
     CompletionReport {
         drv_path: r.drv_path,
         result: Some(r.result),
@@ -18,6 +18,7 @@ pub(super) fn ok_completion(r: ExecutionResult) -> CompletionReport {
         peak_memory_bytes: r.peak_memory_bytes,
         output_size_bytes: r.output_size_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
+        node_name,
     }
 }
 
@@ -44,6 +45,7 @@ pub(super) fn err_completion(
     drv_path: String,
     assignment_token: String,
     was_cancelled: bool,
+    node_name: Option<String>,
 ) -> CompletionReport {
     let status = if was_cancelled {
         tracing::info!(drv_path = %drv_path, "build cancelled (cgroup.kill)");
@@ -72,12 +74,17 @@ pub(super) fn err_completion(
         peak_memory_bytes: 0,
         output_size_bytes: 0,
         peak_cpu_cores: 0.0,
+        node_name,
     }
 }
 
 /// Build-task-panicked `CompletionReport`. Sent by the panic-catcher so
 /// the scheduler doesn't leave the derivation stuck in `Running`.
-pub(super) fn panic_completion(drv_path: String, assignment_token: String) -> CompletionReport {
+pub(super) fn panic_completion(
+    drv_path: String,
+    assignment_token: String,
+    node_name: Option<String>,
+) -> CompletionReport {
     CompletionReport {
         drv_path,
         result: Some(ProtoBuildResult {
@@ -91,6 +98,7 @@ pub(super) fn panic_completion(drv_path: String, assignment_token: String) -> Co
         peak_memory_bytes: 0,
         output_size_bytes: 0,
         peak_cpu_cores: 0.0,
+        node_name,
     }
 }
 

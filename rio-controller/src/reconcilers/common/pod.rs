@@ -465,6 +465,10 @@ fn build_executor_container(
                 // Job pods are `<job-name>-<suffix>` — unique per
                 // pod (one build, one id).
                 env_from_field("RIO_EXECUTOR_ID", "metadata.name"),
+                // ADR-023 hw_class join: CompletionReport carries
+                // spec.nodeName so the scheduler can resolve the node's
+                // instance type when recording build-history samples.
+                env_from_field("RIO_NODE_NAME", "spec.nodeName"),
                 // Role discriminator. rio-builder's `RIO_EXECUTOR_
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
                 // §Executor enforcement — a builder receiving a FOD

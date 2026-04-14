@@ -117,6 +117,10 @@ pub struct BuildSpawnContext {
     /// nar_size)` (I-178). Same value passed to
     /// [`handle_prefetch_hint`].
     pub fuse_fetch_timeout: Duration,
+    /// k8s `spec.nodeName` (from `Config.node_name`, downward API).
+    /// Attached to every `CompletionReport` for ADR-023's hw_class
+    /// join. `None` outside k8s (empty config string).
+    pub node_name: Option<String>,
 }
 
 impl BuildSpawnContext {
@@ -295,6 +299,7 @@ pub async fn spawn_build_task(
     let panic_tx = ctx.stream_tx.clone();
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
+    let panic_node_name = ctx.node_name.clone();
 
     // The spawned task needs 'static; clone the whole context once and
     // move it in. ExecutorEnv is built INSIDE the task from the owned
@@ -374,12 +379,13 @@ pub async fn spawn_build_task(
         // try_cancel_build's Release (not strictly needed, no other state
         // to synchronize, but cheap and documents the pairing).
         let completion = match result {
-            Ok(exec_result) => ok_completion(exec_result),
+            Ok(exec_result) => ok_completion(exec_result, ctx.node_name.clone()),
             Err(e) => err_completion(
                 &e,
                 drv_path,
                 assignment_token,
                 cancelled.load(std::sync::atomic::Ordering::Acquire),
+                ctx.node_name.clone(),
             ),
         };
 
@@ -410,6 +416,7 @@ pub async fn spawn_build_task(
                 msg: Some(executor_message::Msg::Completion(panic_completion(
                     panic_drv_path.clone(),
                     panic_token,
+                    panic_node_name,
                 ))),
             };
             if let Err(e) = panic_tx.send(msg).await {

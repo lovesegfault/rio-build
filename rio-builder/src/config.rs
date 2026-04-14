@@ -118,6 +118,10 @@ pub struct Config {
     /// plan 21 Batch E `cfg-builder-knobs-unreachable-in-k8s`.
     pub log_rate_limit: u64,
     pub log_size_limit: u64,
+    /// k8s `spec.nodeName` (downward API → `RIO_NODE_NAME`). Attached
+    /// to `CompletionReport` for ADR-023's hw_class join (scheduler
+    /// resolves instance type from the Node object). Empty outside k8s.
+    pub node_name: String,
     /// Size-class this builder is deployed as. Empty = unclassified.
     /// If the scheduler has size_classes configured, unclassified
     /// builders are REJECTED (misconfiguration — set this). Operator
@@ -188,6 +192,7 @@ impl Default for Config {
             // configuration.md:68-69 specs these defaults.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
+            node_name: String::new(),
             size_class: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,

@@ -262,6 +262,9 @@ pub async fn setup(
         // Base per-path fetch timeout; JIT lookup scales it with
         // nar_size (I-178). Same value the PrefetchHint handler uses.
         fuse_fetch_timeout,
+        // Empty (non-k8s / VM tests) → None: proto3 optional string
+        // semantics — absent on the wire, scheduler reads "unknown hw".
+        node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
     };
 
     Ok(Some(BuilderRuntime {
