@@ -414,15 +414,19 @@ async fn test_build_samples_insert_and_retention() -> anyhow::Result<()> {
     db.insert_build_sample("hello", "x86_64-linux", 8.0, 2_097_152)
         .await?;
 
-    // Schema check: 5 columns + 1 index.
-    // `\d build_samples` equivalent via information_schema.
+    // Schema check: migration 013 created 6 columns (id + 5 data cols);
+    // later migrations (039 telemetry) add more. Assert the 013 base
+    // shape is present — exact count is brittle to additive migrations.
     let (col_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_name = 'build_samples'",
     )
     .fetch_one(&test_db.pool)
     .await?;
-    assert_eq!(col_count, 6, "expected 6 columns (id + 5 data cols)");
+    assert!(
+        col_count >= 6,
+        "expected >=6 columns (013 base: id + 5 data cols), got {col_count}"
+    );
 
     let (idx_exists,): (bool,) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM pg_indexes

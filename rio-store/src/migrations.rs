@@ -553,6 +553,21 @@ pub const M_036: () = ();
 /// scheduler simply stops persisting it.
 pub const M_037: () = ();
 
+/// `migrations/039_sla_telemetry.sql`
+///
+/// ADR-023 phase-1 telemetry: `build_samples` gains the columns the SLA
+/// model fits on. `cpu_limit_cores`/`cpu_seconds_total`/`peak_cpu_cores`
+/// feed T(c); `peak_disk_bytes`/`peak_io_pressure_pct` feed D and
+/// storage-class bias; `version`/`tenant`/`hw_class` are key components;
+/// `enable_parallel_building`/`prefer_local_build` are drv-declared
+/// shortcuts; `outlier_excluded` is the MAD-reject flag (sample recorded
+/// but excluded from fit).
+///
+/// Two indexes: `key_idx` for per-key ring-buffer reads,
+/// `incremental_idx` for the `WHERE completed_at > $last_tick` refresh
+/// path.
+pub const M_039: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
