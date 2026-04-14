@@ -564,6 +564,45 @@ pub(crate) fn parse_cpu_max(content: &str) -> u32 {
     }
 }
 
+/// Parse cgroup v2 `cpu.max` into fractional cores (`quota / period`).
+///
+/// Same input format as [`parse_cpu_max`] but returns the un-ceilinged
+/// f64 ratio for ADR-023 SLA telemetry (`ResourceUsage.cpu_limit_cores`).
+/// `"max"` → `None` (caller substitutes host nproc); the integer
+/// [`parse_cpu_max`] keeps its nproc-fallback for the `-jN` clamp path
+/// where a definite whole number is required.
+pub(crate) fn parse_cpu_max_cores(content: &str) -> Option<f64> {
+    let mut it = content.split_whitespace();
+    match (it.next()?, it.next()?) {
+        ("max", _) => None,
+        (q, p) => {
+            let quota: f64 = q.parse().ok()?;
+            let period: f64 = p.parse().ok()?;
+            (period > 0.0).then_some(quota / period)
+        }
+    }
+}
+
+/// Parse cgroup v2 `io.pressure` for the `some avg10=` value.
+///
+/// PSI format (Documentation/accounting/psi.rst):
+/// ```text
+/// some avg10=12.34 avg60=5.67 avg300=1.23 total=123456
+/// full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+/// ```
+/// `some avg10` is the percentage of wall-clock over the last 10s during
+/// which AT LEAST ONE task in the cgroup was stalled on block I/O.
+/// Tracked as max over the poll loop → `ResourceUsage.peak_io_pressure_pct`.
+pub(crate) fn parse_io_pressure_some_avg10(content: &str) -> Option<f64> {
+    content
+        .lines()
+        .find(|l| l.starts_with("some "))?
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("avg10="))?
+        .parse()
+        .ok()
+}
+
 // r[impl builder.cores.cgroup-clamp+2]
 /// Effective core count for `build_cores` (`nix --cores`, → `make -jN`).
 ///
@@ -723,11 +762,23 @@ pub async fn utilization_reporter_loop_with_shutdown(
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
     let mem_max_path = root.join("memory.max");
+    let io_pressure_path = root.join("io.pressure");
+
+    // cpu.max is static for the pod's lifetime (k8s sets it once from
+    // resources.limits.cpu). Read once. None = "max" (unbounded) → report
+    // host nproc as the effective limit so the SLA model has a denominator.
+    let cpu_limit_cores = fs::read_to_string(root.join("cpu.max"))
+        .ok()
+        .and_then(|s| parse_cpu_max_cores(&s))
+        .or_else(|| Some(nproc() as f64));
 
     let mut last_usage_usec = fs::read_to_string(&cpu_stat_path)
         .ok()
         .and_then(|c| parse_cpu_stat_usage_usec(&c));
     let mut last_instant = std::time::Instant::now();
+    // PSI io.pressure some avg10 — track max over the loop. The 10s
+    // poll cadence matches avg10's window, so each sample is independent.
+    let mut peak_io_pressure_pct = 0.0_f64;
 
     loop {
         tokio::select! {
@@ -754,6 +805,13 @@ pub async fn utilization_reporter_loop_with_shutdown(
         });
 
         let (disk_used, disk_total) = sample_disk(&overlay_base);
+
+        if let Some(p) = fs::read_to_string(&io_pressure_path)
+            .ok()
+            .and_then(|s| parse_io_pressure_some_avg10(&s))
+        {
+            peak_io_pressure_pct = peak_io_pressure_pct.max(p);
+        }
 
         // CPU: only set the gauge if we have BOTH a previous sample and
         // a new reading. Snapshot cpu_fraction is 0.0 on the first tick
@@ -789,6 +847,13 @@ pub async fn utilization_reporter_loop_with_shutdown(
             disk_used_bytes: disk_used,
             disk_total_bytes: disk_total,
             busy: false,
+            cpu_limit_cores,
+            // Cumulative since cgroup creation (== since pod start). The
+            // SLA model wants total CPU-seconds per build; with one build
+            // per pod the post-build snapshot ≈ the build's CPU-seconds.
+            cpu_seconds_total: now_usage.map(|u| u as f64 / 1e6),
+            peak_io_pressure_pct: Some(peak_io_pressure_pct),
+            peak_disk_bytes: None,
         };
     }
 }
@@ -1038,6 +1103,32 @@ mod tests {
         assert_eq!(effective_cores(dir.path()), 1);
         // Missing cpu.max → nproc (not an error: dev/test outside k8s).
         assert_eq!(effective_cores(&dir.path().join("nope")), nproc());
+    }
+
+    /// ADR-023: fractional cpu.max for `ResourceUsage.cpu_limit_cores`.
+    /// Distinct from [`parse_cpu_max`] above — this one keeps the
+    /// fraction and returns `None` on `"max"` so the caller can
+    /// substitute nproc explicitly.
+    #[test]
+    fn parses_cpu_max_cores_fractional() {
+        assert_eq!(parse_cpu_max_cores("400000 100000"), Some(4.0));
+        assert_eq!(parse_cpu_max_cores("50000 100000\n"), Some(0.5));
+        assert_eq!(parse_cpu_max_cores("max 100000"), None);
+        assert_eq!(parse_cpu_max_cores(""), None);
+        assert_eq!(parse_cpu_max_cores("bogus 100000"), None);
+    }
+
+    #[test]
+    fn parses_io_pressure_some_avg10() {
+        let s = "some avg10=12.34 avg60=5.00 avg300=1.00 total=123456\n\
+                 full avg10=0.00 avg60=0.00 avg300=0.00 total=0";
+        assert_eq!(parse_io_pressure_some_avg10(s), Some(12.34));
+        // `full` line must not match — `some` prefix.
+        assert_eq!(
+            parse_io_pressure_some_avg10("full avg10=9.99 avg60=0 avg300=0 total=0\n"),
+            None
+        );
+        assert_eq!(parse_io_pressure_some_avg10(""), None);
     }
 
     // r[verify builder.oom.cgroup-watch]
