@@ -6523,6 +6523,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ordered-float 5.3.0",
  "parking_lot",
+ "proptest",
  "prost",
  "prost-types",
  "rio-auth",

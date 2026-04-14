@@ -21026,6 +21026,10 @@
           "packageId": "opentelemetry_sdk"
         },
         {
+          "name": "proptest",
+          "packageId": "proptest"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
