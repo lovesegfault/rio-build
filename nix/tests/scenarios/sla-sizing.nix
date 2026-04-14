@@ -147,20 +147,31 @@ let
                   "peakMemoryBytes": 1073741824,
                   "cpuLimitCores": c, "cpuSecondsTotal": t * c * 0.95,
               })
-          # Wait one estimator tick so refit runs and caches the fit.
-          import time; time.sleep(3)
+          # Structural wait for one estimator refresh so the cached fit
+          # has the 6 on-curve samples (n_eff>=5, log_residuals populated).
+          # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
+          # cadence; sleep(3) was a flake — gate on the refresh counter
+          # advancing instead.
+          base = metric_value(scrape_metrics(${gatewayHost}, 9091),
+              "rio_scheduler_estimator_refresh_total") or 0.0
+          ${gatewayHost}.wait_until_succeeds(
+              "curl -fsS localhost:9091/metrics | "
+              f"awk '/^rio_scheduler_estimator_refresh_total / {{exit !($2>{base})}}'",
+              timeout=30,
+          )
           grpcurl_admin("InjectBuildSample", {
               "pname": "synth-amdahl", "system": "x86_64-linux",
               "tenant": "", "durationSecs": 53000,
               "peakMemoryBytes": 1073741824,
               "cpuLimitCores": 4, "cpuSecondsTotal": 200000,
           })
-          # Next tick: is_outlier scores 53000 against prev fit → flag.
+          # Next refresh: is_outlier scores 53000 against prev fit → flag.
+          # One 12s cycle + TCG slack; matches the convergence timeout.
           ${gatewayHost}.wait_until_succeeds(
               "test $(sudo -u postgres psql -d rio -tAc "
               "\"SELECT COUNT(*) FROM build_samples "
               "WHERE pname='synth-amdahl' AND outlier_excluded\") -ge 1",
-              timeout=15,
+              timeout=30,
           )
           # Metric incremented (registered + emitted). The injected
           # samples carry tenant="" so the counter is labelled tenant="".
