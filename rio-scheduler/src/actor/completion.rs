@@ -1443,6 +1443,8 @@ impl DagActor {
                         // Controller backfills hw_class from the Node
                         // informer (joins on node_name) — Task 1.9.
                         hw_class: None,
+                        // Read-side only; write_build_sample uses now().
+                        completed_at: 0.0,
                     };
                     if let Err(e) = self.db.write_build_sample(&row).await {
                         warn!(?e, %pname, system = %state.system, "write_build_sample failed");

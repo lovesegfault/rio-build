@@ -516,6 +516,7 @@ async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
         node_name: Some("ip-10-0-1-42.ec2.internal".into()),
         enable_parallel_building: Some(true),
         prefer_local_build: Some(false),
+        completed_at: 0.0, // ignored on write — server-side now()
     };
     db.write_build_sample(&row).await?;
 
@@ -564,6 +565,83 @@ async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
     assert_eq!(got.7, Some(true), "enable_parallel_building");
     assert_eq!(got.8, Some(false), "prefer_local_build");
     assert!(!got.9, "outlier_excluded keeps DEFAULT FALSE");
+
+    Ok(())
+}
+
+/// `SlaEstimator::refresh`: write→incremental-read→per-key-read→refit
+/// end to end against a real PG. Seed 5 samples on a 4..64 core ladder
+/// with a clean Amdahl curve; first refresh sees them as one touched
+/// key and produces an Amdahl fit (n_eff≈5, span=16). Then prove the
+/// `last_tick` high-water-mark sticks: a second refresh with no new
+/// writes touches zero keys.
+#[tokio::test]
+async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
+    use crate::sla::{SlaEstimator, types::DurationFit, types::ModelKey};
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    for c in [4.0, 8.0, 16.0, 32.0, 64.0] {
+        db.write_build_sample(&BuildSampleRow {
+            pname: "a".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+            duration_secs: 30.0 + 2000.0 / c,
+            peak_memory_bytes: 256 << 20,
+            cpu_limit_cores: Some(c),
+            ..Default::default()
+        })
+        .await?;
+    }
+    // One outlier-flagged row for the same key — must be excluded by
+    // both reads (would push distinct_c to 6 and skew span if not).
+    db.write_build_sample(&BuildSampleRow {
+        pname: "a".into(),
+        system: "x86_64-linux".into(),
+        tenant: "t".into(),
+        duration_secs: 1.0,
+        cpu_limit_cores: Some(128.0),
+        ..Default::default()
+    })
+    .await?;
+    sqlx::query("UPDATE build_samples SET outlier_excluded = TRUE WHERE cpu_limit_cores = 128")
+        .execute(&test_db.pool)
+        .await?;
+
+    let est = SlaEstimator::new(7.0 * 86400.0, 32);
+    let n = est.refresh(&db).await?;
+    assert_eq!(n, 1, "one (pname,system,tenant) key touched");
+
+    let key = ModelKey {
+        pname: "a".into(),
+        system: "x86_64-linux".into(),
+        tenant: "t".into(),
+    };
+    let f = est.cached(&key).expect("cached after refresh");
+    assert!(f.n_eff > 4.9, "n_eff={}", f.n_eff);
+    assert!(f.span >= 16.0, "span={} (64/4)", f.span);
+    assert!(
+        matches!(f.fit, DurationFit::Amdahl { .. }),
+        "fit={:?}",
+        f.fit
+    );
+    assert_eq!(f.explore.distinct_c, 5, "outlier row excluded");
+
+    // Incremental: no new writes → high-water-mark holds → zero refits.
+    let n2 = est.refresh(&db).await?;
+    assert_eq!(n2, 0, "second refresh with no new rows is a no-op");
+
+    // read_build_samples_for_key returns ASC (oldest first → last is
+    // newest). Spot-check the order contract refit() relies on.
+    let rows = db
+        .read_build_samples_for_key("a", "x86_64-linux", "t", 32)
+        .await?;
+    assert_eq!(rows.len(), 5);
+    assert!(
+        rows.first().unwrap().completed_at <= rows.last().unwrap().completed_at,
+        "for_key must return completed_at ASC"
+    );
 
     Ok(())
 }

@@ -172,7 +172,7 @@ fn wls_loglinear(x: &[f64], y: &[f64], w: &[f64]) -> (f64, f64, f64) {
     (a, b, (ssr / sw).sqrt())
 }
 
-fn weighted_quantile(x: &[f64], w: &[f64], q: f64) -> f64 {
+pub(super) fn weighted_quantile(x: &[f64], w: &[f64], q: f64) -> f64 {
     let mut idx: Vec<usize> = (0..x.len()).collect();
     idx.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
     let total: f64 = w.iter().sum();

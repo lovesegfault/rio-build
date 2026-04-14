@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT pname, system, tenant, duration_secs, peak_memory_bytes,\n                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,\n                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,\n                   node_name, enable_parallel_building, prefer_local_build,\n                   EXTRACT(EPOCH FROM completed_at)::float8 AS \"completed_at!\"\n            FROM build_samples\n            WHERE completed_at > to_timestamp($1) AND NOT outlier_excluded\n            ORDER BY completed_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pname",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "system",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "tenant",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "duration_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "peak_memory_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "cpu_limit_cores",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "peak_cpu_cores",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "cpu_seconds_total",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "peak_disk_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "peak_io_pressure_pct",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "hw_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "node_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "enable_parallel_building",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "prefer_local_build",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "completed_at!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "0dc208e6b5a8d61601df87f5c3ccc703d62a361af5695ee8495d991426747bae"
+}

@@ -31,6 +31,12 @@ pub struct BuildSampleRow {
     pub node_name: Option<String>,
     pub enable_parallel_building: Option<bool>,
     pub prefer_local_build: Option<bool>,
+    /// Unix epoch seconds. Read via `EXTRACT(EPOCH FROM completed_at)` —
+    /// the workspace sqlx has no chrono/time feature, so TIMESTAMPTZ
+    /// round-trips as f64 epoch (matches `tenants.rs` pattern). On the
+    /// write path this field is ignored; `write_build_sample` always
+    /// uses server-side `now()`.
+    pub completed_at: f64,
 }
 
 impl SchedulerDb {
@@ -329,5 +335,79 @@ impl SchedulerDb {
         .bind(days as i32)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// All samples completed strictly after `since_epoch` (Unix seconds),
+    /// excluding MAD-flagged outliers. Feeds [`SlaEstimator::refresh`] —
+    /// the estimator only needs to know WHICH `(pname, system, tenant)`
+    /// keys were touched since the last tick; the actual fit re-reads
+    /// the per-key ring via [`Self::read_build_samples_for_key`].
+    ///
+    /// Range on `completed_at` — covered by `build_samples_incremental_idx`
+    /// (migration 039).
+    ///
+    /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    pub async fn read_build_samples_incremental(
+        &self,
+        since_epoch: f64,
+    ) -> Result<Vec<BuildSampleRow>, sqlx::Error> {
+        sqlx::query_as!(
+            BuildSampleRow,
+            r#"
+            SELECT pname, system, tenant, duration_secs, peak_memory_bytes,
+                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
+                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
+                   node_name, enable_parallel_building, prefer_local_build,
+                   EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
+            FROM build_samples
+            WHERE completed_at > to_timestamp($1) AND NOT outlier_excluded
+            ORDER BY completed_at
+            "#,
+            since_epoch,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Most-recent `limit` samples for one `(pname, system, tenant)` key,
+    /// excluding MAD-flagged outliers, returned in **completed_at ASC**
+    /// order (oldest first — `compute_vdists` walks newest→oldest by
+    /// reverse iteration, and `rows.last()` is "current" by convention).
+    ///
+    /// Equality + range on the composite — covered by
+    /// `build_samples_key_idx` (migration 039: `(pname, system, tenant,
+    /// completed_at DESC)`). The index sort matches the inner `ORDER BY
+    /// DESC LIMIT`, so this is an index-only top-N; the outer reverse is
+    /// in-memory on ≤`limit` rows.
+    pub async fn read_build_samples_for_key(
+        &self,
+        pname: &str,
+        system: &str,
+        tenant: &str,
+        limit: u32,
+    ) -> Result<Vec<BuildSampleRow>, sqlx::Error> {
+        let mut rows = sqlx::query_as!(
+            BuildSampleRow,
+            r#"
+            SELECT pname, system, tenant, duration_secs, peak_memory_bytes,
+                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
+                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
+                   node_name, enable_parallel_building, prefer_local_build,
+                   EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
+            FROM build_samples
+            WHERE pname = $1 AND system = $2 AND tenant = $3
+              AND NOT outlier_excluded
+            ORDER BY completed_at DESC
+            LIMIT $4
+            "#,
+            pname,
+            system,
+            tenant,
+            limit as i64,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
     }
 }
