@@ -190,6 +190,12 @@ pub struct DagActor {
     /// [`DEFAULT_SUBSTITUTE_CONCURRENCY`] (16). Overridable via
     /// `RIO_SUBSTITUTE_MAX_CONCURRENT` env or scheduler.toml.
     substitute_max_concurrent: usize,
+    /// Bounds in-flight detached substitute-fetch tasks. The
+    /// pre-59a6803a synchronous path used `buffer_unordered(max)`; the
+    /// detached spawn loop dropped that, so a 17k-path merge spawned
+    /// 23k unbounded QueryPathInfo's → store PG-pool/S3 saturated →
+    /// 90% failed → demoted to Ready → built from source.
+    substitute_sem: Arc<tokio::sync::Semaphore>,
     /// Circuit breaker for the cache-check FindMissingPaths call. Owned by
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
@@ -349,6 +355,7 @@ impl DagActor {
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
             substitute_max_concurrent: cfg.substitute_max_concurrent,
+            substitute_sem: Arc::new(tokio::sync::Semaphore::new(cfg.substitute_max_concurrent)),
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
             tick_count: 0,

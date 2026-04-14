@@ -664,7 +664,13 @@ impl DagActor {
             let weak_tx = weak_tx.clone();
             let meta = tenant_meta.clone();
             let h = drv_hash.clone();
+            let sem = self.substitute_sem.clone();
             rio_common::task::spawn_monitored("substitute-fetch", async move {
+                // Bound in-flight QPIs across ALL spawned tasks. The
+                // task is already spawned (so the actor returned), but
+                // it parks here until a slot is free — Substituting
+                // status keeps dependents gated meanwhile.
+                let _permit = sem.acquire_owned().await;
                 let meta_ref: Vec<(&'static str, &str)> =
                     meta.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let mut ok = true;
