@@ -10,6 +10,7 @@ pub mod grpc;
 pub mod limits;
 #[cfg(feature = "postgres")]
 pub mod migrate;
+pub mod newtype;
 pub mod observability;
 #[cfg(feature = "aws")]
 pub mod s3;
