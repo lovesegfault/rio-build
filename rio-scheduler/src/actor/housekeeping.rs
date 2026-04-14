@@ -102,6 +102,17 @@ impl DagActor {
             }
         }
 
+        // ADR-023 SLA estimator: incremental refit of touched
+        // (pname, system, tenant) keys. Same cadence + same
+        // log-and-keep-stale semantics on PG failure as the EMA
+        // estimator above; the cache holds the previous fit.
+        match self.sla_estimator.refresh(&self.db).await {
+            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
+            Err(e) => {
+                warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
+            }
+        }
+
         // Full critical-path sweep (same 60s cadence). Belt-and-
         // suspenders over the incremental update_ancestors calls: any
         // drift (float accumulation, missed edge case) corrects here.
