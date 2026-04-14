@@ -1588,6 +1588,12 @@ impl DagActor {
             generation,
             is_fixed_output: state.is_fixed_output,
             traceparent: state.traceparent.clone(),
+            // TODO: ADR-023 — populate from the size class picked by
+            // classify(). For now None → executor falls back to its
+            // cgroup cpu.max clamp (pre-ADR-023 behavior).
+            assigned_cores: None,
+            assigned_mem_bytes: None,
+            assigned_disk_bytes: None,
         })
     }
 

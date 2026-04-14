@@ -584,15 +584,29 @@ fn resolve_build_opts(
     // gets 2. Computed once in the caller (also written to nix.conf in
     // prepare_sandbox as defense-in-depth).
     let effective_cores = u64::from(effective_cores);
-    let build_cores = match opts.map(|o| o.build_cores).filter(|&c| c > 0) {
-        Some(client) => client.min(effective_cores),
-        None => effective_cores,
+    // r[impl sched.sla.cores-reach-nix-build-cores]
+    // ADR-023: scheduler-assigned cores are authoritative when set. The
+    // scheduler picked a size class with N cores and provisioned the pod
+    // accordingly; passing exactly N to wopSetOptions makes
+    // NIX_BUILD_CORES deterministic so the SLA model's
+    // cpu_seconds_total / assigned_cores ratio is meaningful. Still
+    // clamped to the cgroup ceiling — defense against scheduler/kubelet
+    // disagreeing on what was actually provisioned (the cgroup is ground
+    // truth). Absent → pre-ADR-023 fallback (client request capped at
+    // cgroup ceiling).
+    let build_cores = match assignment.assigned_cores {
+        Some(n) if n > 0 => u64::from(n).min(effective_cores),
+        _ => match opts.map(|o| o.build_cores).filter(|&c| c > 0) {
+            Some(client) => client.min(effective_cores),
+            None => effective_cores,
+        },
     };
     tracing::debug!(
         effective_cores,
         build_cores,
+        assigned = assignment.assigned_cores,
         client_requested = opts.map(|o| o.build_cores),
-        "build_cores clamped to cgroup cpu.max"
+        "build_cores resolved (assigned > client > cgroup-clamp)"
     );
     BuildOpts {
         timeout,
@@ -1052,6 +1066,67 @@ mod tests {
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_permanent());
         // is_permanent and is_daemon_transient are disjoint.
         assert!(!ExecutorError::InvalidDerivation("x".into()).is_daemon_transient());
+    }
+
+    fn test_env() -> ExecutorEnv {
+        ExecutorEnv {
+            fuse_mount_point: "/tmp".into(),
+            overlay_base_dir: "/tmp".into(),
+            executor_id: "t".into(),
+            log_limits: crate::log_stream::LogLimits::UNLIMITED,
+            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            max_silent_time: 0,
+            cgroup_parent: "/tmp".into(),
+            executor_kind: rio_proto::types::ExecutorKind::Builder,
+            fuse_cache: None,
+            fuse_fetch_timeout: Duration::from_secs(60),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    // r[verify sched.sla.cores-reach-nix-build-cores]
+    /// ADR-023: `WorkAssignment.assigned_cores` reaches
+    /// `wopSetOptions.buildCores` verbatim (clamped to cgroup ceiling).
+    /// Precedence: assigned > client-requested > cgroup ceil(cpu.max).
+    #[test]
+    fn resolve_build_opts_assigned_cores_wins() {
+        let env = test_env();
+        // Scheduler assigned 4 cores; cgroup ceiling 8 → 4 reaches the daemon.
+        let a = WorkAssignment {
+            assigned_cores: Some(4),
+            build_options: Some(rio_proto::types::BuildOptions {
+                build_cores: 64, // client over-asks; ignored when assigned set
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 4);
+
+        // assigned > cgroup ceiling → clamped (defense vs sched/kubelet drift).
+        let a = WorkAssignment {
+            assigned_cores: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
+
+        // No assigned_cores → pre-ADR-023 fallback: client capped at cgroup.
+        let a = WorkAssignment {
+            assigned_cores: None,
+            build_options: Some(rio_proto::types::BuildOptions {
+                build_cores: 64,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
+
+        // assigned_cores=0 treated as unset (proto3 optional Some(0) is
+        // possible if scheduler explicitly sends 0; never pass 0 to nix).
+        let a = WorkAssignment {
+            assigned_cores: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(resolve_build_opts(&a, &env, 8).build_cores, 8);
     }
 
     /// `resolve_inputs` fetches each inputDrv from the store, resolves

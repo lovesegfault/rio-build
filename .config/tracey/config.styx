@@ -49,6 +49,7 @@ specs (
       docs/src/components/dashboard.md
       docs/src/components/proto.md
       docs/src/components/cli.md
+      docs/src/components/sla-sizing.md
       docs/src/observability.md
       docs/src/security.md
       docs/src/deployment.md
