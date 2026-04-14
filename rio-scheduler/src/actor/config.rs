@@ -138,6 +138,11 @@ pub struct DagActorConfig {
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
     pub soft_features: Vec<crate::assignment::SoftFeature>,
+    /// ADR-023 SLA-driven sizing config (`[sla]` table). `None` =
+    /// SLA-mode unconfigured: dispatch falls back to
+    /// [`crate::sla::solve::DEFAULT_CEILINGS`] and an empty tier ladder
+    /// (`solve_mvp` returns `BestEffort` at the fitted curve's `p̄`).
+    pub sla: Option<crate::sla::config::SlaConfig>,
 }
 
 impl Default for DagActorConfig {
@@ -149,6 +154,7 @@ impl Default for DagActorConfig {
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             size_classes: Vec::new(),
             soft_features: Vec::new(),
+            sla: None,
         }
     }
 }

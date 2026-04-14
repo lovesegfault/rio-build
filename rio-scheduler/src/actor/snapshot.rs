@@ -422,6 +422,8 @@ impl DagActor {
                 enable_parallel_building: state.enable_parallel_building,
                 prefer_local_build: state.prefer_local_build,
             },
+            &self.sla_tiers,
+            &self.sla_ceilings,
         )
     }
 

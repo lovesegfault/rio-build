@@ -236,6 +236,14 @@ pub struct DagActor {
     /// Internally `Arc<RwLock<…>>`; reads on the snapshot/dispatch path
     /// are a single `.cached()` clone.
     pub(crate) sla_estimator: crate::sla::SlaEstimator,
+    /// Tier ladder from `cfg.sla.solve_tiers()` (sorted tightest-first).
+    /// Shared between the tick `refresh()` (Schmitt-trigger reassign)
+    /// and `solve_intent_for` so both see the SAME ladder. Empty when
+    /// `[sla]` is unconfigured.
+    pub(crate) sla_tiers: Vec<crate::sla::solve::Tier>,
+    /// Hard ceilings from `cfg.sla.ceilings()` (or
+    /// [`crate::sla::solve::DEFAULT_CEILINGS`]).
+    pub(crate) sla_ceilings: crate::sla::solve::Ceilings,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -406,8 +414,20 @@ impl DagActor {
             )),
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
-            // TODO(ADR-023 phase-3): halflife / ring_buffer from SlaConfig.
-            sla_estimator: crate::sla::SlaEstimator::new(7.0 * 86400.0, 32),
+            sla_estimator: crate::sla::SlaEstimator::new(
+                cfg.sla.as_ref().map_or(7.0 * 86400.0, |s| s.halflife_secs),
+                cfg.sla.as_ref().map_or(32, |s| s.ring_buffer),
+            ),
+            sla_tiers: cfg
+                .sla
+                .as_ref()
+                .map(|s| s.solve_tiers())
+                .unwrap_or_default(),
+            sla_ceilings: cfg
+                .sla
+                .as_ref()
+                .map(|s| s.ceilings())
+                .unwrap_or(crate::sla::solve::DEFAULT_CEILINGS),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,

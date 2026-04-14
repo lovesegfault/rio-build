@@ -1536,10 +1536,20 @@ async fn spawn_intent_from_sla_estimator() {
     use crate::sla::{solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
+    // cfg.sla=None → empty tier ladder → solve_mvp returns BestEffort
+    // at p̄ (=∞ for Amdahl) capped at max_cores. Seed a single tier so
+    // the test exercises the Feasible path the way a configured deploy
+    // would.
+    actor.sla_tiers = vec![solve::Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(1200.0),
+        p99: None,
+    }];
 
     // Seed a fit for ("test-pkg", x86_64-linux, ""): Amdahl s=30 p=2000.
-    // Against DEFAULT_TIER_P90_SECS=1200, β=30-e^{-0.128}·1200≈-1026 →
-    // c*=2000/1026≈1.95 → ceil → 2 cores.
+    // Against p90=1200, β=30-e^{-0.128}·1200≈-1026 → c*=2000/1026≈1.95
+    // → ceil → 2 cores.
     actor.sla_estimator.seed(FittedParams {
         key: ModelKey {
             pname: "test-pkg".into(),
