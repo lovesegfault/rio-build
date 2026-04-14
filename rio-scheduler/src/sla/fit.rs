@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use nalgebra::{DMatrix, DVector};
 
-use super::types::{DurationFit, RawCores, RefSeconds};
+use super::types::{DurationFit, MemBytes, MemFit, RawCores, RefSeconds};
 
 // r[impl sched.sla.fit-nnls]  (weights are part of the fit contract)
 pub fn sample_weight(age: Duration, halflife_secs: f64, vdist: u32) -> f64 {
@@ -143,6 +143,120 @@ pub fn headroom(n_eff: f64) -> f64 {
     1.25 + 0.7 / n_eff.max(1.0).sqrt()
 }
 
+/// Closed-form weighted least squares for `y = a + b·x`. Returns `(a, b, σ)` where σ is
+/// the weighted RMS residual. Degenerate (zero x-variance) input yields a non-finite slope.
+fn wls_loglinear(x: &[f64], y: &[f64], w: &[f64]) -> (f64, f64, f64) {
+    let sw: f64 = w.iter().sum();
+    let sx: f64 = x.iter().zip(w).map(|(xi, wi)| wi * xi).sum();
+    let sy: f64 = y.iter().zip(w).map(|(yi, wi)| wi * yi).sum();
+    let sxx: f64 = x.iter().zip(w).map(|(xi, wi)| wi * xi * xi).sum();
+    let sxy: f64 = x
+        .iter()
+        .zip(y)
+        .zip(w)
+        .map(|((xi, yi), wi)| wi * xi * yi)
+        .sum();
+    let denom = sw * sxx - sx * sx;
+    // Cauchy–Schwarz gives denom ≥ 0; near-zero ⇒ rank-deficient design (constant x).
+    if denom <= 1e-10 * (sw * sxx).max(1.0) {
+        return (sy / sw, f64::NAN, 0.0);
+    }
+    let b = (sw * sxy - sx * sy) / denom;
+    let a = (sy - b * sx) / sw;
+    let ssr: f64 = x
+        .iter()
+        .zip(y)
+        .zip(w)
+        .map(|((xi, yi), wi)| wi * (yi - (a + b * xi)).powi(2))
+        .sum();
+    (a, b, (ssr / sw).sqrt())
+}
+
+fn weighted_quantile(x: &[f64], w: &[f64], q: f64) -> f64 {
+    let mut idx: Vec<usize> = (0..x.len()).collect();
+    idx.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
+    let total: f64 = w.iter().sum();
+    let mut cum = 0.0;
+    for &i in &idx {
+        cum += w[i];
+        if cum / total >= q {
+            return x[i];
+        }
+    }
+    x[*idx.last().unwrap()]
+}
+
+/// IRLS τ-quantile regression on `y = a + b·x` with prior weights `w`. Reweights by the
+/// pinball-loss subgradient (`τ` above the line, `1−τ` below, divided by |resid|) for up
+/// to 30 iterations. Returns `(a, b, R¹)` where R¹ is the Koenker–Machado pseudo-R¹,
+/// `1 − V(τ|fit)/V(τ|intercept-only)`.
+fn irls_quantile(x: &[f64], y: &[f64], w: &[f64], tau: f64) -> (f64, f64, f64) {
+    let (mut a, mut b, _) = wls_loglinear(x, y, w);
+    for _ in 0..30 {
+        let irls_w: Vec<f64> = x
+            .iter()
+            .zip(y)
+            .zip(w)
+            .map(|((&xi, &yi), &wi)| {
+                let r = yi - (a + b * xi);
+                let asym = if r >= 0.0 { tau } else { 1.0 - tau };
+                wi * asym / r.abs().max(1e-6)
+            })
+            .collect();
+        let (na, nb, _) = wls_loglinear(x, y, &irls_w);
+        let converged = (na - a).abs() < 1e-6 && (nb - b).abs() < 1e-6;
+        a = na;
+        b = nb;
+        if converged {
+            break;
+        }
+    }
+    let pinball = |a: f64, b: f64| -> f64 {
+        x.iter()
+            .zip(y)
+            .zip(w)
+            .map(|((&xi, &yi), &wi)| {
+                let u = yi - (a + b * xi);
+                wi * u * (tau - if u < 0.0 { 1.0 } else { 0.0 })
+            })
+            .sum()
+    };
+    let v_fit = pinball(a, b);
+    let q_y = weighted_quantile(y, w, tau);
+    let v_null = pinball(q_y, 0.0);
+    let r1 = if v_null > 0.0 {
+        1.0 - v_fit / v_null
+    } else {
+        0.0
+    };
+    (a, b, r1)
+}
+
+// r[impl sched.sla.mem-coupled]
+/// Fit `log M = a + b·log c` at p90 via IRLS quantile regression. Gates on n_eff≥10 and
+/// Koenker–Machado R¹≥0.7; below either threshold falls back to plain WLS with `r1=0.0`
+/// as a small-n sentinel (caller applies a Student-t PI factor). Degenerate design
+/// (constant c → undefined slope) falls through to an independent weighted p90.
+pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> MemFit {
+    let lc: Vec<f64> = cs.iter().map(|c| c.ln()).collect();
+    let lm: Vec<f64> = ms.iter().map(|m| (*m as f64).ln()).collect();
+    if n_eff >= 10.0 {
+        let (a, b, r1) = irls_quantile(&lc, &lm, w, 0.9);
+        if r1 >= 0.7 && a.is_finite() && b.is_finite() {
+            return MemFit::Coupled { a, b, r1 };
+        }
+    }
+    let (a, b, _sig) = wls_loglinear(&lc, &lm, w);
+    if !a.is_finite() || !b.is_finite() {
+        let mf: Vec<f64> = ms.iter().map(|&m| m as f64).collect();
+        let p90 = weighted_quantile(&mf, w, 0.9);
+        return MemFit::Independent {
+            p90: MemBytes(p90 as u64),
+        };
+    }
+    MemFit::Coupled { a, b, r1: 0.0 }
+}
+
 /// Log-residual sigma: stddev of ln(obs/fit) weighted by w_i.
 pub fn sigma_resid(cs: &[f64], ts: &[f64], w: &[f64], fit: &DurationFit) -> f64 {
     let lr: Vec<f64> = cs
@@ -253,5 +367,66 @@ mod tests {
     #[test]
     fn headroom_clamps_below_1() {
         assert_eq!(headroom(0.1), headroom(1.0));
+    }
+
+    // r[verify sched.sla.mem-coupled]
+    #[test]
+    fn fit_memory_recovers_loglinear_at_n15() {
+        // True model: log M = 2.0 + 0.7·log c, ±2.5% deterministic multiplicative noise.
+        let cs: Vec<f64> = (1..=15).map(|i| (i * 2) as f64).collect();
+        let ms: Vec<u64> = cs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let noise = 1.0 + 0.05 * ((i as f64 * 2.399).sin() - 0.0);
+                ((2.0 + 0.7 * c.ln()).exp() * noise) as u64
+            })
+            .collect();
+        let w = vec![1.0; 15];
+        let MemFit::Coupled { b, r1, .. } = fit_memory(&cs, &ms, &w, 15.0) else {
+            panic!("expected Coupled")
+        };
+        assert!((b - 0.7).abs() < 0.15, "b={b}");
+        assert!(r1 >= 0.7, "r1={r1}");
+    }
+
+    #[test]
+    fn fit_memory_small_n_uses_ols() {
+        let cs = [4.0, 8.0, 16.0];
+        let ms = [1000u64, 1500, 2200];
+        let MemFit::Coupled { r1, .. } = fit_memory(&cs, &ms, &[1.0; 3], 3.0) else {
+            panic!("expected Coupled")
+        };
+        assert_eq!(r1, 0.0); // small-n sentinel
+    }
+
+    #[test]
+    fn fit_memory_degenerate_falls_back_independent() {
+        // All same c → slope undefined.
+        let cs = [4.0, 4.0, 4.0];
+        let ms = [1000u64, 1100, 1050];
+        assert!(matches!(
+            fit_memory(&cs, &ms, &[1.0; 3], 3.0),
+            MemFit::Independent { .. }
+        ));
+    }
+
+    #[test]
+    fn memfit_at_roundtrips() {
+        let f = MemFit::Coupled {
+            a: 2.0,
+            b: 0.7,
+            r1: 0.9,
+        };
+        let m = f.at(RawCores(10.0)).0 as f64;
+        let expected = (2.0 + 0.7 * 10.0_f64.ln()).exp();
+        assert!((m - expected).abs() / expected < 1e-3);
+        assert_eq!(
+            MemFit::Independent {
+                p90: MemBytes(4096)
+            }
+            .at(RawCores(64.0)),
+            MemBytes(4096)
+        );
     }
 }

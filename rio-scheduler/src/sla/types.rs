@@ -77,6 +77,15 @@ pub enum MemFit {
     Independent { p90: MemBytes },
 }
 
+impl MemFit {
+    pub fn at(&self, c: RawCores) -> MemBytes {
+        match self {
+            Self::Coupled { a, b, .. } => MemBytes((a + b * c.0.ln()).exp() as u64),
+            Self::Independent { p90 } => *p90,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExploreState {
     pub distinct_c: u8,
