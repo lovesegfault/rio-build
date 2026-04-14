@@ -99,7 +99,10 @@ let
         mem_base = 4294967296
       '';
     };
-    extraPackages = [ pkgs.postgresql ];
+    extraPackages = [
+      pkgs.postgresql
+      pkgs.grpcurl
+    ];
   };
 
   # Shared fixture for both scheduling splits — identical VM topology.

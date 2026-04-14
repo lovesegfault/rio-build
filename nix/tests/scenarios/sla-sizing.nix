@@ -41,13 +41,24 @@ let
   # sla-builder-script.toml; the body is irrelevant (fixture intercept
   # fires before nix-daemon spawn) but echoes a marker so a fixture
   # MISS (e.g. typo'd pname) is visible as a real build in the log.
-  amdahlDrv = drvs.mkCustom {
-    name = "synth-amdahl-0.1";
-    extraAttrs.pname = "synth-amdahl";
-    script = ''
-      echo synth-amdahl-fixture-miss-ran-real-build > $out
-    '';
-  };
+  #
+  # Three distinct drvs (same pname, different name → different drv-hash)
+  # so each submit is a fresh dispatch. With one drv, submit 2+3 would
+  # cache-hit on submit 1 in the scheduler and never reach the worker.
+  amdahlDrv =
+    n:
+    drvs.mkCustom {
+      name = "synth-amdahl-${toString n}";
+      extraAttrs.pname = "synth-amdahl";
+      script = ''
+        echo synth-amdahl-fixture-miss-ran-real-build > $out
+      '';
+    };
+  amdahlDrvs = builtins.map amdahlDrv [
+    0
+    1
+    2
+  ];
 
   prelude = ''
     ${common.mkBootstrap {
@@ -77,8 +88,33 @@ let
           # Three submits; fixture short-circuits each, scheduler writes
           # build_samples on completion. tickIntervalSecs=2 → estimator
           # refit within ~2s of each.
-          for i in range(3):
-              build("${amdahlDrv}", marker="synth-amdahl", timeout=60)
+          #
+          # The fixture intercept returns built_outputs=[] (no upload),
+          # so client-side nix-build fails to fetch the output back —
+          # the SCHEDULER-side completion still fires (build_samples row
+          # written). Drive via raw client.execute() so build()'s
+          # rc!=0 → dump_all_logs path doesn't flood the log on every
+          # expected client-side miss; the PG poll below is the real
+          # assertion.
+          amdahl_drvs = [
+              "${builtins.elemAt amdahlDrvs 0}",
+              "${builtins.elemAt amdahlDrvs 1}",
+              "${builtins.elemAt amdahlDrvs 2}",
+          ]
+          for drv in amdahl_drvs:
+              rc, out = client.execute(
+                  "timeout 60 nix-build --no-out-link "
+                  "--store 'ssh-ng://${gatewayHost}' "
+                  "--arg busybox '(builtins.storePath ${pkgs.pkgsStatic.busybox})' "
+                  f"{drv} 2>&1"
+              )
+              print(f"synth-amdahl submit rc={rc} (client miss expected; "
+                    "scheduler-side completion is what matters)")
+              if "fixture-miss-ran-real-build" in out:
+                  raise Exception(
+                      "RIO_BUILDER_SCRIPT intercept did NOT fire — real "
+                      f"build ran. Check worker env + pname match. out={out}"
+                  )
           ${gatewayHost}.wait_until_succeeds(
               "test $(sudo -u postgres psql -d rio -tAc "
               "\"SELECT COUNT(*) FROM build_samples WHERE pname='synth-amdahl'\") -ge 3",
@@ -126,9 +162,11 @@ let
               "WHERE pname='synth-amdahl' AND outlier_excluded\") -ge 1",
               timeout=15,
           )
-          # Metric incremented (registered + emitted).
+          # Metric incremented (registered + emitted). The injected
+          # samples carry tenant="" so the counter is labelled tenant="".
           assert_metric_ge(${gatewayHost}, 9091,
-              "rio_scheduler_sla_outlier_rejected_total", 1.0)
+              "rio_scheduler_sla_outlier_rejected_total", 1.0,
+              labels='{tenant=""}')
     '';
   };
 
