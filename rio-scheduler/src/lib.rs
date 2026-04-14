@@ -486,4 +486,5 @@ pub fn describe_metrics() {
          under sustained event burst (large DAG, many concurrent drvs \
          emitting Log lines) — gateway can't drain fast enough (I-144)."
     );
+    crate::sla::metrics::describe_all();
 }

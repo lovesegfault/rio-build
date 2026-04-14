@@ -42,5 +42,8 @@ rio_test_support::metrics_suite! {
         // the +Inf bucket is the alert, finer resolution above 10s
         // doesn't change the response.
         "rio_scheduler_actor_cmd_seconds",
+        // Unitless ratio centred on 1.0; default [0.005..10.0] covers
+        // 200×-under to 10×-over which is the full useful range.
+        "rio_scheduler_sla_prediction_ratio",
     ],
 }
