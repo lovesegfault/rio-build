@@ -50,7 +50,11 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
+use std::collections::BTreeMap;
+
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kube::api::ListParams;
@@ -74,6 +78,20 @@ use rio_proto::types::SpawnIntent;
 /// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
 /// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
 pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
+
+/// ADR-023 ephemeral-storage budget for the FUSE cache emptyDir. Added
+/// to `SpawnIntent.disk_bytes` so the kubelet's disk-pressure eviction
+/// accounts for both the build's overlay writes AND the input-closure
+/// cache. Same 8 GiB as the per-pod cache cap in the SLA model.
+const FUSE_CACHE_BUDGET_BYTES: u64 = 8 * (1 << 30);
+/// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
+/// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
+/// the daemon's own state live outside. 1 GiB headroom.
+const LOG_BUDGET_BYTES: u64 = 1 << 30;
+/// Overlay emptyDir sizeLimit headroom multiplier on `disk_bytes`.
+/// TODO(ADR-023 phase-2): replace with `headroom(n_eff)` from the SLA
+/// estimator (variance-aware). 1.5× is the phase-1 flat fallback.
+const OVERLAY_HEADROOM: f64 = 1.5;
 
 use super::builders::{self, UpstreamAddrs};
 
@@ -428,6 +446,14 @@ pub(super) fn build_job(
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
     let job_name = pod::job_name(&pool, ExecutorKind::Builder, &random_suffix());
+    let mut pod_spec = builders::build_pod_spec(wp, scheduler, store);
+    // ADR-023 Sla mode: override the per-class `spec.resources` with
+    // the scheduler-computed per-drv values. Static mode (`intent:
+    // None`) leaves the class's `wp.spec.resources` in place
+    // (set by `executor_params` → `build_executor_pod_spec`).
+    if let Some(i) = intent {
+        apply_intent_resources(&mut pod_spec, i);
+    }
     let mut job = ephemeral_job(
         job_name,
         wp.namespace(),
@@ -436,7 +462,7 @@ pub(super) fn build_job(
         // Wrong-pool-spawn backstop + per-class hung-build detector
         // (I-200). Precedence: explicit override > cutoff×5 > flat 3600.
         ephemeral_deadline(&wp.spec),
-        builders::build_pod_spec(wp, scheduler, store),
+        pod_spec,
     );
     // ADR-023 Sla mode: stamp `rio.build/intent-id` on the pod
     // template so the builder reads it via downward-API →
@@ -453,6 +479,54 @@ pub(super) fn build_job(
             .insert(INTENT_ID_ANNOTATION.into(), i.intent_id.clone());
     }
     Ok(job)
+}
+
+/// Stamp scheduler-computed `(cores, mem, disk)` onto the executor
+/// container's `resources` and the overlay emptyDir's `sizeLimit`.
+///
+/// `requests == limits` (hard caps, no burst) — ADR-023 §sizing-model.
+/// Quantities rendered as raw byte counts (no SI suffix): k8s parses
+/// bare integers as base-unit (bytes for memory/ephemeral-storage,
+/// cores for CPU) and they roundtrip exactly — no float-format
+/// ambiguity from `"{n}Gi"` strings.
+// r[impl sched.sla.disk-reaches-ephemeral-storage]
+fn apply_intent_resources(pod_spec: &mut PodSpec, i: &SpawnIntent) {
+    let ephemeral = i
+        .disk_bytes
+        .saturating_add(FUSE_CACHE_BUDGET_BYTES)
+        .saturating_add(LOG_BUDGET_BYTES);
+    let map: BTreeMap<String, Quantity> = BTreeMap::from([
+        ("cpu".into(), Quantity(i.cores.to_string())),
+        ("memory".into(), Quantity(i.mem_bytes.to_string())),
+        ("ephemeral-storage".into(), Quantity(ephemeral.to_string())),
+    ]);
+    // `build_executor_pod_spec` puts the executor container at [0]
+    // (single-container pod). expect() documents the structural
+    // invariant — if a sidecar lands first, this fails loudly in
+    // tests rather than silently sizing the wrong container.
+    let container = pod_spec
+        .containers
+        .first_mut()
+        .expect("build_executor_pod_spec emits exactly one container");
+    container.resources = Some(ResourceRequirements {
+        requests: Some(map.clone()),
+        limits: Some(map),
+        ..Default::default()
+    });
+
+    // Overlay emptyDir sizeLimit = disk_bytes × headroom. The kubelet
+    // evicts on overshoot; headroom keeps a slow-EMA estimate from
+    // killing a build that's slightly over its predicted disk peak.
+    let overlay_limit = (i.disk_bytes as f64 * OVERLAY_HEADROOM) as u64;
+    if let Some(volumes) = pod_spec.volumes.as_mut() {
+        for v in volumes.iter_mut() {
+            if v.name == "overlays"
+                && let Some(ed) = v.empty_dir.as_mut()
+            {
+                ed.size_limit = Some(Quantity(overlay_limit.to_string()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -687,4 +761,112 @@ mod tests {
     // scheduler_unreachable_condition_shape, random_suffix_valid_
     // dns1123, spawn_count_subtracts_active moved to common::job::
     // tests alongside their functions.
+
+    /// ADR-023 Sla mode: `build_job(.., Some(intent))` stamps the
+    /// scheduler-computed resources onto the executor container and
+    /// the overlay emptyDir, plus the `rio.build/intent-id` annotation.
+    ///
+    /// Pins the exact byte-count Quantity strings — k8s parses bare
+    /// integers as base-unit, so a regression to `"{n}Gi"` formatting
+    /// would silently misrequest by 1024^3.
+    // r[verify sched.sla.disk-reaches-ephemeral-storage]
+    #[test]
+    fn build_job_with_intent_computed_resources() {
+        const GI: u64 = 1 << 30;
+        let wp = test_wp();
+        let oref = crate::fixtures::oref(&wp);
+        let intent = SpawnIntent {
+            intent_id: "i-abc".into(),
+            cores: 8,
+            mem_bytes: 16 * GI,
+            disk_bytes: 40 * GI,
+        };
+        let job = build_job(
+            &wp,
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            Some(&intent),
+        )
+        .unwrap();
+
+        let tmpl = &job.spec.as_ref().unwrap().template;
+        let pod_anns = tmpl
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            pod_anns.get(INTENT_ID_ANNOTATION),
+            Some(&"i-abc".to_string()),
+            "intent_id annotation feeds RIO_INTENT_ID downward-API"
+        );
+
+        let pod_spec = tmpl.spec.as_ref().unwrap();
+        let res = pod_spec.containers[0].resources.as_ref().unwrap();
+        let req = res.requests.as_ref().unwrap();
+        assert_eq!(req["cpu"], Quantity("8".into()));
+        assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
+        // ephemeral-storage = disk + FUSE_CACHE_BUDGET (8Gi) + LOG (1Gi)
+        assert_eq!(
+            req["ephemeral-storage"],
+            Quantity(((40 + 8 + 1) * GI).to_string())
+        );
+        assert_eq!(
+            res.limits.as_ref(),
+            Some(req),
+            "limits == requests (hard caps, no burst)"
+        );
+
+        // overlay emptyDir sizeLimit = disk × 1.5 = 60Gi.
+        let overlay = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "overlays")
+            .unwrap();
+        assert_eq!(
+            overlay.empty_dir.as_ref().unwrap().size_limit,
+            Some(Quantity((60 * GI).to_string()))
+        );
+    }
+
+    /// Static mode (`intent: None`) leaves the per-class
+    /// `wp.spec.resources` untouched and sets no intent annotation.
+    #[test]
+    fn build_job_without_intent_static_resources() {
+        let mut wp = test_wp();
+        wp.spec.resources = Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([("cpu".into(), Quantity("4".into()))])),
+            ..Default::default()
+        });
+        let oref = crate::fixtures::oref(&wp);
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
+
+        let tmpl = &job.spec.as_ref().unwrap().template;
+        let pod_anns = tmpl
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .as_ref()
+            .unwrap();
+        assert!(
+            !pod_anns.contains_key(INTENT_ID_ANNOTATION),
+            "Static-mode pods carry no intent annotation"
+        );
+
+        let res = tmpl.spec.as_ref().unwrap().containers[0]
+            .resources
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            res.requests.as_ref().unwrap()["cpu"],
+            Quantity("4".into()),
+            "Static mode uses class spec.resources verbatim"
+        );
+    }
 }
