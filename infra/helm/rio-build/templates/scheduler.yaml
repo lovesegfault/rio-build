@@ -1,10 +1,10 @@
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
-{{- /* ConfigMap renders if EITHER [[size_classes]] or [[soft_features]]
-       is configured — both are array-of-tables (can't env-encode). The
+{{- /* ConfigMap renders if any of [[size_classes]] / [[soft_features]]
+       / [sla] is configured — all are structured (can't env-encode). The
        FOD floor walk derives from [[size_classes]] (fetcher tiers ARE
        builder tiers). */ -}}
-{{- $hasClasses := or $s.sizeClasses $s.softFeatures -}}
+{{- $hasClasses := or $s.sizeClasses $s.softFeatures $s.sla -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,7 +40,7 @@ spec:
         # CM-remount alone doesn't trigger reload. Roll on any
         # ConfigMap-rendered field change (subPath mounts don't
         # live-update either way).
-        checksum/scheduler-toml: {{ list (toJson $s.sizeClasses) (toJson $s.softFeatures) | join "" | sha256sum }}
+        checksum/scheduler-toml: {{ list (toJson $s.sizeClasses) (toJson $s.softFeatures) (toJson $s.sla) | join "" | sha256sum }}
       {{- end }}
     spec:
       serviceAccountName: rio-scheduler
@@ -196,6 +196,48 @@ data:
     mem_limit_bytes = {{ int64 .memLimitBytes }}
     {{- with .cpuLimitCores }}
     cpu_limit_cores = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- end }}
+    {{- /* ADR-023 [sla]: scalar block first, then nested tables, then
+           array-of-tables — TOML requires tables after the scalars of
+           their parent. p50/p90/p99 are optional per-tier. The leading
+           "" | nindent forces a newline so [sla] never glues onto the
+           last [[soft_features]] / [[size_classes]] line. */ -}}
+    {{- with $s.sla }}
+    {{- "" | nindent 4 }}
+    [sla]
+    default_tier = {{ .defaultTier | quote }}
+    max_cores = {{ printf "%.1f" (float64 .maxCores) }}
+    max_mem = {{ int64 .maxMem }}
+    max_disk = {{ int64 .maxDisk }}
+    default_disk = {{ int64 .defaultDisk }}
+    fuse_cache_budget = {{ int64 .fuseCacheBudget }}
+    log_budget = {{ int64 .logBudget }}
+
+    [sla.probe]
+    cpu = {{ printf "%.1f" (float64 .probe.cpu) }}
+    mem_per_core = {{ int64 .probe.memPerCore }}
+    mem_base = {{ int64 .probe.memBase }}
+    {{- range $feat, $p := .featureProbes }}
+
+    [sla.feature_probes.{{ $feat | quote }}]
+    cpu = {{ printf "%.1f" (float64 $p.cpu) }}
+    mem_per_core = {{ int64 $p.memPerCore }}
+    mem_base = {{ int64 $p.memBase }}
+    {{- end }}
+    {{- range .tiers }}
+
+    [[sla.tiers]]
+    name = {{ .name | quote }}
+    {{- with .p50 }}
+    p50 = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- with .p90 }}
+    p90 = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- with .p99 }}
+    p99 = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
     {{- end }}
     {{- end }}
 {{- end }}

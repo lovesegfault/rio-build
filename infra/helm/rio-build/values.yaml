@@ -369,6 +369,37 @@ scheduler:
   softFeatures:
     - {name: big-parallel, floorHint: xlarge}
     - {name: benchmark}
+  # ADR-023 SLA-driven sizing. Renders the [sla] table in scheduler.toml.
+  # Absent (sla: null) → SLA-mode disabled, scheduler uses the phase-2
+  # const-tier path. Durations in seconds, sizes in bytes (the Rust
+  # SlaConfig deserializer is plain serde — no humantime/bytesize).
+  #
+  # tiers: ladder of SLA targets. solve_mvp picks the TIGHTEST feasible
+  #   tier (sorted by p50→p90→p99); a tier with no targets is best-effort.
+  # probe: cold-start sizing for never-seen (pname,system,tenant). cpu
+  #   MUST be in [4, maxCores/4] — validated at scheduler boot.
+  # featureProbes: per-requiredSystemFeatures override (e.g. kvm builds
+  #   want a high mem floor regardless of cores).
+  # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
+  # fuseCacheBudget/logBudget: slices of the per-pod ephemeral-storage
+  #   budget reserved for rio-mountd page cache + build-log ring.
+  sla:
+    tiers:
+      - {name: fast,   p50: 180,  p90: 300,  p99: 480}
+      - {name: normal, p50: 720,  p90: 1200, p99: 2700}
+      - {name: slow,             p90: 3600}
+      - {name: best-effort}
+    defaultTier: normal
+    probe: {cpu: 4, memPerCore: 2147483648, memBase: 4294967296}
+    featureProbes:
+      kvm:        {cpu: 2, memPerCore: 1073741824, memBase: 8589934592}
+      nixos-test: {cpu: 2, memPerCore: 1073741824, memBase: 8589934592}
+    maxCores: 64
+    maxMem: 274877906944       # 256 GiB
+    maxDisk: 214748364800      # 200 GiB
+    defaultDisk: 21474836480   # 20 GiB
+    fuseCacheBudget: 8589934592  # 8 GiB
+    logBudget: 1073741824        # 1 GiB
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
