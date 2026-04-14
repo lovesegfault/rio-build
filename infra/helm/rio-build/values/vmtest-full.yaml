@@ -79,6 +79,14 @@ scheduler:
   replicas: 2
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
+  # ADR-023 [sla] block is set in chart-default values.yaml; VM tests
+  # exercise Static-mode dispatch (no per-drv SpawnIntent), so opt out.
+  # With [sla] inherited, dispatch.rs computes est_memory_bytes from the
+  # cold-start probe (12 GiB at chart defaults) → resource-fit gate
+  # rejects the 2 GiB tiny pool below — flakily, because the gate only
+  # fires once the builder's cgroup poll has populated last_resources.
+  # The sla-sizing scenario sets its own [sla] block via overlay.
+  sla: null
 
 gateway:
   enabled: true

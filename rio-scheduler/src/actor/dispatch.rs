@@ -283,22 +283,29 @@ impl DagActor {
             // this. FOD memory is the download buffer, not a compile
             // heap; resource-fit is the wrong gate.
             //
-            // Skip when `[sla]` is unconfigured: the symmetry argument
-            // ("controller spawns and dispatch accepts the SAME shape")
-            // only holds in Sla mode. In Static mode the controller
-            // spawns from fixed per-class `spec.resources` (jobs.rs
-            // `intent: None` → no `apply_intent_resources`), so a
-            // cold-start `solve_intent_for` here returns the 8 GiB
-            // fallback probe and the resource-fit gate rejects every
-            // worker smaller than that — vm-lifecycle-recovery's 2 GiB
-            // `tiny` pool never dispatched. The pre-ADR-023 path
-            // (`bucketed_estimate`) returned `None` on cold start; this
-            // restores that behavior for Static deployments.
-            let est_memory_bytes = if state.is_fixed_output || self.sla_config.is_none() {
-                None
-            } else {
-                Some(self.solve_intent_for(pname, state).1)
-            };
+            // Skip when SpawnIntent emission is inactive: the symmetry
+            // argument ("controller spawns and dispatch accepts the
+            // SAME shape") only holds when the controller actually
+            // receives intents and runs `apply_intent_resources`.
+            // `compute_size_class_snapshot` emits intents iff
+            // `size_classes non-empty ∧ sla_config.is_some()` — empty
+            // classes early-returns Vec::new() (snapshot.rs:185); the
+            // sla_config gate is 9f1f321a. With either false the
+            // controller takes the `spawn_n` path (jobs.rs:244
+            // `intents.is_empty()`) → fixed per-class `spec.resources`
+            // → a cold-start `solve_intent_for` probe (12 GiB at helm
+            // defaults) makes the resource-fit gate reject every
+            // smaller worker. vm-lifecycle-recovery / vm-le-build-k3s
+            // 2 GiB `tiny` pool flaked (not deterministic — gate passes
+            // when `w.last_resources` is still None from the cgroup-
+            // poll-vs-first-heartbeat race). The pre-ADR-023 path
+            // (`bucketed_estimate`) returned None on cold start.
+            let est_memory_bytes =
+                if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
+                    None
+                } else {
+                    Some(self.solve_intent_for(pname, state).1)
+                };
             (
                 target_class,
                 est_memory_bytes,
@@ -407,8 +414,47 @@ impl DagActor {
                 // not "scale class X builders".
                 if is_fixed_output {
                     ctx.fod_deferred += 1;
-                } else if let Some(class) = target_class {
-                    *ctx.class_deferred.entry(class).or_insert(0) += 1;
+                } else if let Some(class) = &target_class {
+                    *ctx.class_deferred.entry(class.clone()).or_insert(0) += 1;
+                }
+                // I-056-style per-clause diagnostic: when there ARE
+                // registered workers of the right kind but none
+                // eligible, the freeze detectors above don't fire
+                // (they key on stream_count==0), and the drv silently
+                // defers forever. Dump per-worker rejection_reason at
+                // INFO so `kubectl logs` names the gate. Sized for
+                // small-N flake debugging — at scale (100s of workers)
+                // the .map().collect() allocates per-tick; if that
+                // becomes a problem, gate on a counter.
+                if let Some(state) = self.dag.node(&drv_hash) {
+                    let want_kind = if is_fixed_output {
+                        rio_proto::types::ExecutorKind::Fetcher
+                    } else {
+                        rio_proto::types::ExecutorKind::Builder
+                    };
+                    let reasons: Vec<_> = self
+                        .executors
+                        .values()
+                        .filter(|w| w.kind == want_kind && w.is_registered())
+                        .map(|w| {
+                            (
+                                w.executor_id.as_ref().to_string(),
+                                crate::assignment::rejection_reason(
+                                    w,
+                                    state,
+                                    target_class.as_deref(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    if !reasons.is_empty() {
+                        tracing::info!(
+                            drv_hash = %drv_hash,
+                            target_class = ?target_class,
+                            ?reasons,
+                            "no eligible executor; per-worker rejection reasons"
+                        );
+                    }
                 }
                 ctx.deferred.push(drv_hash);
                 DispatchOutcome::NoProgress

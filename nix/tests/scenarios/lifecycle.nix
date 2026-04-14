@@ -294,15 +294,42 @@ let
     def sched_metric_wait(condition, timeout=60):
         """Wait until the leader's /metrics satisfies a bash condition.
         `condition` is a pipe-fragment appended after `... | `."""
-        k3s_server.wait_until_succeeds(
-            "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-            "  -o jsonpath='{.spec.holderIdentity}') && "
-            'test -n "$leader" && '
-            "k3s kubectl get --raw "
-            '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
-            f"| {condition}",
-            timeout=timeout,
-        )
+        try:
+            k3s_server.wait_until_succeeds(
+                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}') && "
+                'test -n "$leader" && '
+                "k3s kubectl get --raw "
+                '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
+                f"| {condition}",
+                timeout=timeout,
+            )
+        except Exception:
+            # I-056-style per-clause diagnostic: dispatch-stall flakes
+            # (builder pod Running but derivations_running stays 0) are
+            # invisible from kernel logs alone. Dump scheduler metrics,
+            # scheduler logs (executor/dispatch/rejection), and builder
+            # logs so the flake names which gate fired.
+            k3s_server.execute(
+                f"echo '=== DIAG[sched_metric_wait]: timeout={timeout}s, cond={condition!r} ===' >&2; "
+                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}'); "
+                'echo "leader=$leader" >&2; '
+                "k3s kubectl get --raw "
+                '  "/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
+                "  2>/dev/null | grep -E '^rio_scheduler_(workers_active|"
+                "derivations_queued|derivations_running|dispatch_rejected)' >&2; "
+                "k3s kubectl -n ${nsBuilders} get pods,jobs -o wide >&2 2>&1 || true; "
+                'k3s kubectl -n ${ns} logs "$leader" --since=2m '
+                "  | grep -iE 'executor|dispatch|reject|intent|heartbeat|worker|recovery' "
+                "  | grep -vE '\"level\":\"DEBUG\"' | tail -60 >&2 || true; "
+                "for p in $(k3s kubectl -n ${nsBuilders} get pods "
+                "  -l rio.build/pool -o name 2>/dev/null); do "
+                '  echo "=== builder $p ===" >&2; '
+                "  k3s kubectl -n ${nsBuilders} logs $p --since=2m 2>&1 | tail -30 >&2; "
+                "done || true"
+            )
+            raise
 
     # workers_active==0 wait, sized for the heartbeat-timeout FALLBACK
     # path. The ephemeral-pool drain has flaked at this
