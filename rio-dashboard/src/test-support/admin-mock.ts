@@ -63,6 +63,7 @@ export const adminMock = {
   getSizeClassStatus: vi.fn(),
   getEstimatorStats: vi.fn(),
   reportExecutorTermination: vi.fn(),
+  injectBuildSample: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 
