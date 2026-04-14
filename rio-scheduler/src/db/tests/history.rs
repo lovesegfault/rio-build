@@ -610,7 +610,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
         .await?;
 
     let est = SlaEstimator::new(7.0 * 86400.0, 32);
-    let n = est.refresh(&db).await?;
+    let n = est.refresh(&db, &[]).await?;
     assert_eq!(n, 1, "one (pname,system,tenant) key touched");
 
     let key = ModelKey {
@@ -629,7 +629,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
     assert_eq!(f.explore.distinct_c, 5, "outlier row excluded");
 
     // Incremental: no new writes → high-water-mark holds → zero refits.
-    let n2 = est.refresh(&db).await?;
+    let n2 = est.refresh(&db, &[]).await?;
     assert_eq!(n2, 0, "second refresh with no new rows is a no-op");
 
     // read_build_samples_for_key returns ASC (oldest first → last is

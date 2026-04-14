@@ -58,6 +58,11 @@ impl DurationFit {
             _ => RawCores(f64::INFINITY),
         }
     }
+    /// Point estimate of T_min: T evaluated at `min(p̄, c_opt)`. For Amdahl
+    /// (p̄=c_opt=∞) this is `S`; for Probe it is ∞.
+    pub fn t_min(&self) -> RefSeconds {
+        self.t_at(RawCores(self.p_bar().0.min(self.c_opt().0)))
+    }
     /// (S, P, Q) tuple for the solve; Probe returns (inf, 0, 0).
     pub fn spq(&self) -> (f64, f64, f64) {
         match self {
@@ -107,6 +112,10 @@ pub struct FittedParams {
     pub span: f64,
     pub explore: ExploreState,
     pub t_min_ci: Option<(RefSeconds, RefSeconds)>,
+    /// Unix-epoch seconds when `t_min_ci` was last bootstrapped. Feeds the
+    /// debounce in `ingest::should_recompute_ci`. `None` ⇔
+    /// `t_min_ci.is_none()`.
+    pub ci_computed_at: Option<f64>,
     pub tier: Option<String>,
 }
 

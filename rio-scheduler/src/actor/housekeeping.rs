@@ -106,7 +106,10 @@ impl DagActor {
         // (pname, system, tenant) keys. Same cadence + same
         // log-and-keep-stale semantics on PG failure as the EMA
         // estimator above; the cache holds the previous fit.
-        match self.sla_estimator.refresh(&self.db).await {
+        // TODO(ADR-023 phase-3): pass cfg.sla.solve_tiers() once SlaConfig
+        // is wired into DagActorConfig; until then tier reassignment is a
+        // no-op (empty ladder).
+        match self.sla_estimator.refresh(&self.db, &[]).await {
             Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
             Err(e) => {
                 warn!(error = %e, "sla estimator refresh failed; keeping previous fits");

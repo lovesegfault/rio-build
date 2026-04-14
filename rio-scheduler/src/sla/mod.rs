@@ -62,7 +62,11 @@ impl SlaEstimator {
     /// range scan); per-key gives the full ring including rows older
     /// than `last_tick` that the fit still needs. One refit per key per
     /// tick regardless of how many new rows landed.
-    pub async fn refresh(&self, db: &SchedulerDb) -> anyhow::Result<usize> {
+    ///
+    /// `tiers` (sorted tightest-first, as from
+    /// [`config::SlaConfig::solve_tiers`]) feeds the Schmitt-trigger tier
+    /// reassignment; empty → tier reassignment is a no-op.
+    pub async fn refresh(&self, db: &SchedulerDb, tiers: &[solve::Tier]) -> anyhow::Result<usize> {
         let since = *self.last_tick.read();
         let new_rows = db.read_build_samples_incremental(since).await?;
         // High-water mark from the rows themselves, not wall-clock now():
@@ -86,7 +90,8 @@ impl SlaEstimator {
             let rows = db
                 .read_build_samples_for_key(&key.pname, &key.system, &key.tenant, self.ring_buffer)
                 .await?;
-            let fit = ingest::refit(key, &rows, self.halflife_secs);
+            let prev = self.cache.read().get(key).cloned();
+            let fit = ingest::refit(key, &rows, self.halflife_secs, prev.as_ref(), tiers);
             self.cache.write().insert(key.clone(), fit);
             // Trim AFTER refit so the fit always sees the full ring even
             // if a previous tick's trim was skipped (PG blip). Best-effort

@@ -226,6 +226,7 @@ mod tests {
                 last_wall: WallSeconds(0.0),
             },
             t_min_ci: None,
+            ci_computed_at: None,
             tier: None,
         }
     }

@@ -54,6 +54,7 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
             last_wall: WallSeconds(0.0),
         },
         t_min_ci: None,
+        ci_computed_at: None,
         tier: None,
     }
 }
