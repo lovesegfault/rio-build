@@ -7,11 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::broadcast;
-use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use rio_proto::StoreServiceClient;
 use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash};
@@ -43,6 +41,11 @@ pub(super) struct MergeIngest {
     /// Pre-existing not-done nodes that were re-probed in step 4.
     pub existing_reprobe: HashSet<DrvHash>,
     pub cached_hits: HashMap<DrvHash, Vec<String>>,
+    /// Derivations whose outputs are upstream-substitutable but not
+    /// yet locally present. `reconcile_merged_state` spawns the
+    /// detached fetch for these after `seed_initial_states`.
+    /// r[sched.substitute.detached]
+    pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
 }
@@ -322,11 +325,11 @@ impl DagActor {
         // cascade-delete). If it ran AFTER persist, delete_build would
         // silently fail the FK constraint, leaving orphan build rows
         // that recovery would resurrect.
-        let cached_hits = match self
+        let (cached_hits, pending_substitute) = match self
             .check_cached_outputs(&probe_set, &node_index, jwt_token.as_deref())
             .await
         {
-            Ok(hits) => hits,
+            Ok(r) => r,
             Err(e) => {
                 error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
                 self.cleanup_failed_merge(build_id, &merge_result).await;
@@ -359,6 +362,7 @@ impl DagActor {
             event_rx,
             existing_reprobe,
             cached_hits,
+            pending_substitute,
             jwt_token,
         })
     }
@@ -439,6 +443,7 @@ impl DagActor {
             nodes,
             merge_result,
             cached_hits,
+            pending_substitute,
             jwt_token,
             ..
         } = ingest;
@@ -493,6 +498,22 @@ impl DagActor {
             .collect();
         let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
         phase!("6d-seed-initial-states");
+
+        // r[impl sched.substitute.detached]
+        // Upstream-substitutable nodes from check_cached_outputs: now
+        // that seed_initial_states put them at Created/Queued/Ready,
+        // spawn the detached fetch. Nodes whose transition is rejected
+        // (e.g. apply_cached_hits already completed a chain that
+        // included them) fall through to normal scheduling.
+        if !pending_substitute.is_empty() {
+            let jwt_meta: Vec<(&'static str, String)> = jwt_token
+                .as_deref()
+                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
+                .unwrap_or_default();
+            self.spawn_substitute_fetches(pending_substitute.clone(), jwt_meta)
+                .await;
+        }
+        phase!("6e-spawn-substitute");
 
         // Pre-existing Ready nodes whose interest set grew: their
         // critical-path priority may have risen (compute_initial above
@@ -976,35 +997,14 @@ impl DagActor {
         }
 
         // r[impl sched.merge.stale-substitutable]
-        // Missing-but-substitutable → eager-fetch (same as
-        // check_cached_outputs); the node STAYS Completed because the
-        // output is now back in rio-store. Only outputs that are
-        // missing AND failed/aren't substitutable get reset to Ready.
-        let jwt_pair;
-        let jwt_meta: &[(&'static str, &str)] = match jwt_token {
-            Some(t) => {
-                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
-                &jwt_pair
-            }
-            None => &[],
-        };
-        let fetched = Self::eager_substitute_fetch(
-            store_client,
-            resp.substitutable_paths,
-            jwt_meta,
-            self.grpc_timeout,
-            self.substitute_max_concurrent,
-        )
-        .await;
-        if !fetched.is_empty() {
-            metrics::counter!("rio_scheduler_stale_completed_substituted_total")
-                .increment(fetched.len() as u64);
-        }
-        let missing: HashSet<String> = resp
-            .missing_paths
-            .into_iter()
-            .filter(|p| !fetched.contains(p))
-            .collect();
+        // r[impl sched.substitute.detached]
+        // Missing-but-substitutable: instead of awaiting eager-fetch
+        // (which blocked the actor), reset Completed→Ready and spawn
+        // the detached fetch (Ready→Substituting). SubstituteComplete
+        // brings the node back to Completed. Dependents stay gated
+        // during the window — same outcome, no actor stall.
+        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
 
         if missing.is_empty() {
             return HashSet::new();
@@ -1015,6 +1015,7 @@ impl DagActor {
         // all-missing from the dependent's perspective: the build
         // needs to re-run to repopulate everything.
         let mut reset = HashSet::new();
+        let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for (drv_hash, output_paths) in candidates {
             let Some(gone) = output_paths.iter().find(|p| missing.contains(p.as_str())) else {
                 continue;
@@ -1047,82 +1048,30 @@ impl DagActor {
                        "failed to persist stale-completed Ready reset \
                         (build is Active; continuing)");
             }
-            self.push_ready(drv_hash_k);
+            // Substitutable subset: spawn the detached fetch (Ready →
+            // Substituting) instead of pushing to ready_queue. The
+            // metric above stays — output WAS gone, even if upstream
+            // can re-provide it.
+            if output_paths
+                .iter()
+                .all(|p| !missing.contains(p.as_str()) || substitutable.contains(p.as_str()))
+            {
+                metrics::counter!("rio_scheduler_stale_completed_substituted_total").increment(1);
+                to_spawn.push((drv_hash_k, output_paths));
+            } else {
+                self.push_ready(drv_hash_k);
+            }
             reset.insert(drv_hash);
         }
 
-        reset
-    }
+        if !to_spawn.is_empty() {
+            let jwt_meta: Vec<(&'static str, String)> = jwt_token
+                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
+                .unwrap_or_default();
+            self.spawn_substitute_fetches(to_spawn, jwt_meta).await;
+        }
 
-    /// Fire `QueryPathInfo` (with tenant-context metadata) for each
-    /// path in `substitutable_paths`; return the set of paths whose
-    /// fetch succeeded. The store's miss-handler does the actual
-    /// upstream pull (r[store.substitute.upstream]); we only care
-    /// about the side effect. A failed/NotFound path is dropped from
-    /// the result — caller treats it as truly-missing.
-    ///
-    /// `tenant_meta` carries either the gateway-forwarded JWT
-    /// (`x-rio-tenant-token`, merge-time callers) or the
-    /// scheduler-minted service-token + `x-rio-probe-tenant-id` pair
-    /// (dispatch-time callers, `r[sched.dispatch.fod-substitute]`).
-    /// Empty slice → store sees no tenant → no upstream fetch.
-    ///
-    /// Associated fn (no `&self`): caller already holds a
-    /// `store_client` borrow; passing the few config fields explicitly
-    /// avoids a `&mut self` conflict and lets `check_cached_outputs`,
-    /// `verify_preexisting_completed`, and the dispatch-time FOD check
-    /// share one implementation.
-    pub(super) async fn eager_substitute_fetch(
-        store_client: &StoreServiceClient<Channel>,
-        substitutable_paths: Vec<String>,
-        tenant_meta: &[(&'static str, &str)],
-        grpc_timeout: std::time::Duration,
-        substitute_max_concurrent: usize,
-    ) -> HashSet<String> {
-        if substitutable_paths.is_empty() {
-            return HashSet::new();
-        }
-        use futures_util::stream::{self, StreamExt};
-        let mut fetches = stream::iter(substitutable_paths)
-            .map(|p| {
-                let mut c = store_client.clone();
-                async move {
-                    let res = rio_proto::client::query_path_info_opt(
-                        &mut c,
-                        &p,
-                        grpc_timeout,
-                        tenant_meta,
-                    )
-                    .await;
-                    (p, res)
-                }
-            })
-            .buffer_unordered(substitute_max_concurrent);
-        let mut fetched = HashSet::new();
-        while let Some((p, res)) = fetches.next().await {
-            match res {
-                Ok(Some(_)) => {
-                    fetched.insert(p);
-                }
-                Ok(None) => {
-                    warn!(
-                        path = %p,
-                        "substitutable path NotFound on eager fetch \
-                         (upstream HEAD probe lied?); demoting to cache-miss"
-                    );
-                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-                }
-                Err(e) => {
-                    warn!(
-                        path = %p,
-                        error = %e,
-                        "substitutable path failed eager fetch; demoting to cache-miss"
-                    );
-                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-                }
-            }
-        }
-        fetched
+        reset
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge.
@@ -1341,12 +1290,13 @@ impl DagActor {
     /// `jwt_token` is forwarded as `x-rio-tenant-token` metadata so the
     /// store's per-tenant upstream probe fires and populates
     /// `substitutable_paths` — see r[sched.merge.substitute-probe].
+    #[allow(clippy::type_complexity)]
     async fn check_cached_outputs(
         &mut self,
         probe_set: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
         jwt_token: Option<&str>,
-    ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
+    ) -> Result<(HashMap<DrvHash, Vec<String>>, Vec<(DrvHash, Vec<String>)>), ActorError> {
         // Floating-CA lane: PG realisations lookup + store-existence verify.
         let mut hits = self.check_ca_realisation_hits(probe_set, node_index).await;
 
@@ -1365,54 +1315,27 @@ impl DagActor {
             .find_missing_with_breaker(check_paths.clone(), jwt_token)
             .await?
         else {
-            return Ok(hits);
+            return Ok((hits, Vec::new()));
         };
 
         // r[impl sched.merge.substitute-probe]
         // r[impl sched.merge.substitute-fetch]
-        // Substitutable paths count as present after eager-fetch (the
-        // store's HEAD probe is fetch-side-effect-free; QueryPathInfo
-        // with JWT does the actual fetch).
-        let jwt_pair;
-        let jwt_meta: &[(&'static str, &str)] = match jwt_token {
-            Some(t) => {
-                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
-                &jwt_pair
-            }
-            None => &[],
-        };
-        let substitutable = Self::eager_substitute_fetch(
-            self.store_client
-                .as_ref()
-                .expect("checked by find_missing_with_breaker"),
-            resp.substitutable_paths,
-            jwt_meta,
-            self.grpc_timeout,
-            self.substitute_max_concurrent,
-        )
-        .await;
-        if !substitutable.is_empty() {
-            debug!(
-                count = substitutable.len(),
-                "treating upstream-substitutable paths as cache hits"
-            );
-            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
-                .increment(substitutable.len() as u64);
-        }
-        let missing: HashSet<String> = resp
-            .missing_paths
-            .into_iter()
-            .filter(|p| !substitutable.contains(p))
-            .collect();
+        // r[impl sched.substitute.detached]
+        // Locally-present → cached_hits (Created→Completed inline).
+        // Upstream-substitutable → pending_substitute (caller spawns
+        // the detached fetch after seed_initial_states; the actor loop
+        // is NOT blocked on the NAR download).
+        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let present: HashSet<String> = check_paths
             .into_iter()
             .filter(|p| !missing.contains(p))
             .collect();
 
         // A derivation is cached if it has at least one non-empty
-        // expected output path AND all of them are present (locally or
-        // upstream-substitutable). Skip nodes the floating-CA lane
-        // already resolved.
+        // expected output path AND all of them are LOCALLY present.
+        // Skip nodes the floating-CA lane already resolved.
+        let mut pending_substitute: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for h in probe_set {
             if hits.contains_key(h) {
                 continue; // floating-CA — already resolved above
@@ -1420,16 +1343,24 @@ impl DagActor {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
-            if n.expected_output_paths.iter().any(|p| !p.is_empty())
-                && n.expected_output_paths
-                    .iter()
-                    .all(|p| p.is_empty() || present.contains(p))
+            if !n.expected_output_paths.iter().any(|p| !p.is_empty()) {
+                continue;
+            }
+            if n.expected_output_paths
+                .iter()
+                .all(|p| p.is_empty() || present.contains(p))
             {
                 hits.insert(h.clone(), n.expected_output_paths.clone());
+            } else if n
+                .expected_output_paths
+                .iter()
+                .all(|p| p.is_empty() || present.contains(p) || substitutable.contains(p))
+            {
+                pending_substitute.push((h.clone(), n.expected_output_paths.clone()));
             }
         }
 
-        Ok(hits)
+        Ok((hits, pending_substitute))
     }
 
     /// Floating-CA cache-check lane: query the `realisations` table by

@@ -4,6 +4,7 @@
   {"status": "ready", "terminal": false},
   {"status": "assigned", "terminal": false},
   {"status": "running", "terminal": false},
+  {"status": "substituting", "terminal": false},
   {"status": "completed", "terminal": true},
   {"status": "failed", "terminal": false},
   {"status": "poisoned", "terminal": true},

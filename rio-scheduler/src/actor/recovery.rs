@@ -402,9 +402,15 @@ impl DagActor {
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
+                // Substituting included: the spawned task is gone after
+                // restart, so re-derive Ready/Queued via the same dep-
+                // walk and let the next dispatch-time batch re-probe.
+                // r[impl sched.substitute.detached]
                 let status_matches = matches!(
                     s.status(),
-                    DerivationStatus::Created | DerivationStatus::Queued
+                    DerivationStatus::Created
+                        | DerivationStatus::Queued
+                        | DerivationStatus::Substituting
                 );
                 if status_matches && s.interested_builds.is_empty() {
                     orphans_skipped += 1;

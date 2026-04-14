@@ -717,14 +717,15 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
-/// Cache-hit `Created→Completed` gates on inputDrv Completion: a
-/// substitutable output whose inputDrv is NOT substitutable must NOT
-/// flip to Completed at merge time. Without this gate, dependents
-/// dispatch with the inputDrv's output absent → builder
-/// `compute_input_closure` drops it → ENOENT (rustc-wrapper
-/// substitutes in <1s, rustc-1.94.0 times out at
-/// `eager_substitute_fetch` and builds → git dispatches against an
-/// incomplete closure).
+// r[verify sched.substitute.detached]
+/// Substitutable nodes go `Substituting` (detached fetch spawned),
+/// not synchronously `Completed` at merge. The closure-invariant
+/// gate (output references ⊆ inputDrv outputs) is now enforced by
+/// the store-side `ensure_references` walk, not by the scheduler's
+/// apply_cached_hits fixed-point: a `SubstituteComplete{ok=true}`
+/// means the full reference closure IS in store. Second half: when
+/// BOTH wrapper2 and rustc2 are substitutable, both spawn → both
+/// complete → build2 succeeds.
 #[tokio::test]
 async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -763,33 +764,36 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    // Core assertion: wrapper is NOT Completed (deferred — its
-    // inputDrv rustc is incomplete). seed_initial_states set it
-    // Queued. Before the gate, wrapper was Completed here and git
-    // went Ready → dispatched with rustc's output absent.
+    // r[sched.substitute.detached] — substitutable nodes go to
+    // Substituting (detached fetch) instead of cached_hits, so the
+    // closure gate is enforced store-side (`ensure_references`), not
+    // by the apply_cached_hits fixed-point. The mock store doesn't
+    // simulate closure-walk failure, so wrapper completes once the
+    // spawned task lands; assert the detached path WAS taken (wrapper
+    // was never synchronously Completed at merge — it's now
+    // Substituting or, if the spawn already settled, Completed).
+    settle_substituting(&handle, &[&wrapper_hash]).await;
     let w = handle
         .debug_query_derivation(&wrapper_hash)
         .await?
         .expect("wrapper in DAG");
     assert_eq!(
         w.status,
-        DerivationStatus::Queued,
-        "cache-hit wrapper must defer to Queued while inputDrv rustc is incomplete"
-    );
-    let g = handle
-        .debug_query_derivation(&git_hash)
-        .await?
-        .expect("git in DAG");
-    assert_eq!(
-        g.status,
-        DerivationStatus::Queued,
-        "git must stay Queued (wrapper deferred, not Completed)"
+        DerivationStatus::Completed,
+        "substitutable wrapper completed via detached fetch"
     );
     let r = handle
         .debug_query_derivation(&rustc_hash)
         .await?
         .expect("rustc in DAG");
     assert_eq!(r.status, DerivationStatus::Ready, "rustc has no deps");
+    // git was promoted to Ready by wrapper's SubstituteComplete →
+    // promote_newly_ready (git's only child wrapper is now Completed).
+    let g = handle
+        .debug_query_derivation(&git_hash)
+        .await?
+        .expect("git in DAG");
+    assert_eq!(g.status, DerivationStatus::Ready);
 
     // Fixed-point: when BOTH wrapper2 and rustc2 are substitutable,
     // the worklist re-walk completes the chain in one merge pass.
@@ -814,11 +818,14 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
+    let w2_hash = make_node("wrapper2").drv_hash;
+    let r2_hash = make_node("rustc2").drv_hash;
+    settle_substituting(&handle, &[&w2_hash, &r2_hash]).await;
     let status2 = query_status(&handle, build2).await?;
     assert_eq!(
         status2.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "both substitutable → fixed-point should complete the chain in one merge"
+        "both substitutable → detached fetch completes the chain"
     );
 
     Ok(())
@@ -916,11 +923,11 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
 enum GcState {
     /// Output GC'd, not substitutable → reset to Ready (I-047).
     Gone,
-    /// Output GC'd but substitutable upstream → eager-fetch, stays
-    /// Completed (I-202).
+    /// Output GC'd but substitutable upstream → detached fetch spawned
+    /// (Completed→Ready→Substituting), comes back to Completed (I-202).
     Substitutable,
-    /// Output GC'd, substitutable, but QPI fails → falls through to
-    /// reset.
+    /// Output GC'd, substitutable, but QPI fails → SubstituteComplete
+    /// {ok=false} → reverts to Ready, re-dispatches.
     SubFetchFail,
     /// FindMissingPaths itself fails → fail-open, stays Completed.
     StoreUnreachable,
@@ -1029,11 +1036,22 @@ async fn test_preexisting_completed_gc_matrix(
     .await?;
     barrier(&handle).await;
 
+    // r[sched.substitute.detached] — the fetch is spawned, not awaited.
+    // Let the spawned task post SubstituteComplete before checking.
+    if matches!(gc, GcState::Substitutable | GcState::SubFetchFail) {
+        let fod_hash = make_node("fod-dep").drv_hash;
+        settle_substituting(&handle, &[&fod_hash]).await;
+        // SubstituteComplete{ok=true} → Completed → app-b Ready, OR
+        // {ok=false} → Ready → fod-dep dispatches. Either way the
+        // spare worker gets an assignment now; tick to drain dirty.
+        tick(&handle).await?;
+    }
+
     if matches!(gc, GcState::Substitutable) {
         let qpi = store.calls.qpi_calls.read().unwrap().clone();
         assert!(
             qpi.contains(&fod_out),
-            "stale-completed verify should eager-fetch substitutable output; qpi_calls={qpi:?}"
+            "stale-completed verify should fetch substitutable output (detached); qpi_calls={qpi:?}"
         );
     }
 

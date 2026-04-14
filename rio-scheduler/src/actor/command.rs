@@ -120,6 +120,13 @@ pub enum ActorCommand {
         peak_cpu_cores: f64,
     },
 
+    /// A detached upstream-substitute fetch (spawned by
+    /// `spawn_substitute_fetches`) has finished. `ok=true` → all
+    /// output paths now present in rio-store; handler completes the
+    /// derivation. `ok=false` → fetch failed; handler reverts to
+    /// Ready/Queued for normal scheduling. r[sched.substitute.detached]
+    SubstituteComplete { drv_hash: DrvHash, ok: bool },
+
     /// Cancel a build.
     CancelBuild {
         build_id: Uuid,
@@ -432,6 +439,7 @@ impl ActorCommand {
         match self {
             Self::MergeDag { .. } => "MergeDag",
             Self::ProcessCompletion { .. } => "ProcessCompletion",
+            Self::SubstituteComplete { .. } => "SubstituteComplete",
             Self::CancelBuild { .. } => "CancelBuild",
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",

@@ -975,7 +975,12 @@ impl DerivationDag {
                 // output to what's already in the store). Build
                 // accounting (check_build_completion) sees it as done.
                 DerivationStatus::Completed | DerivationStatus::Skipped => summary.completed += 1,
-                DerivationStatus::Running | DerivationStatus::Assigned => {
+                // Substituting counts as running (in-flight, output
+                // not yet present locally) so progress reporting and
+                // the gateway's "running/queued" counts stay accurate.
+                DerivationStatus::Running
+                | DerivationStatus::Assigned
+                | DerivationStatus::Substituting => {
                     summary.running += 1;
                     // assigned_executor is Some exactly in these two
                     // states (cleared on every terminal transition +

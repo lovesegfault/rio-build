@@ -35,6 +35,12 @@ db_str_enum! {
         Ready = "ready",
         Assigned = "assigned",
         Running = "running",
+        /// Upstream substitution in flight: a background task is doing
+        /// `QueryPathInfo` (which triggers store-side `try_substitute`)
+        /// for this derivation's outputs. Dependents stay gated (NOT
+        /// Completed/Skipped); the spawned task posts `SubstituteComplete`
+        /// when done. r[sched.substitute.detached]
+        Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
         Poisoned = "poisoned",
@@ -194,6 +200,16 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
+            // r[impl sched.substitute.detached]
+            // Detached upstream fetch: spawned from any pre-dispatch
+            // state (merge-time) or Ready (dispatch-time). Completed →
+            // fetch landed; Ready/Queued → fetch failed, fall through
+            // to normal scheduling. Cancelled → all interested builds
+            // cancelled mid-fetch (orphan task is benign — it still
+            // populates the store, the SubstituteComplete is dropped).
+            (Self::Created | Self::Queued | Self::Ready, Self::Substituting) => true,
+            (Self::Substituting, Self::Completed | Self::Ready | Self::Queued) => true,
+            (Self::Substituting, Self::Cancelled) => true,
             _ => false,
         };
 
@@ -1205,6 +1221,14 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
+            // Detached upstream fetch (r[sched.substitute.detached])
+            (Created, Substituting),
+            (Queued, Substituting),
+            (Ready, Substituting),
+            (Substituting, Completed),
+            (Substituting, Ready),
+            (Substituting, Queued),
+            (Substituting, Cancelled),
             // Terminal self-transitions (idempotent)
             (Completed, Completed),
             (Poisoned, Poisoned),
@@ -1338,15 +1362,16 @@ mod status_snapshot {
                 DerivationStatus::Ready => 2,
                 DerivationStatus::Assigned => 3,
                 DerivationStatus::Running => 4,
-                DerivationStatus::Completed => 5,
-                DerivationStatus::Failed => 6,
-                DerivationStatus::Poisoned => 7,
-                DerivationStatus::DependencyFailed => 8,
-                DerivationStatus::Cancelled => 9,
-                DerivationStatus::Skipped => 10,
+                DerivationStatus::Substituting => 5,
+                DerivationStatus::Completed => 6,
+                DerivationStatus::Failed => 7,
+                DerivationStatus::Poisoned => 8,
+                DerivationStatus::DependencyFailed => 9,
+                DerivationStatus::Cancelled => 10,
+                DerivationStatus::Skipped => 11,
             }
         }
-        assert_eq!(DerivationStatus::ALL.len(), 11);
+        assert_eq!(DerivationStatus::ALL.len(), 12);
         // Each ALL[i] round-trips through the witness at its own index.
         // Catches accidental duplicates or order drift (the golden
         // expects ALL's order).

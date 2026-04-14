@@ -979,6 +979,32 @@ pub(crate) async fn barrier(handle: &ActorHandle) {
     let _ = handle.debug_query_workers().await;
 }
 
+/// Poll until none of `hashes` is `Substituting` — i.e. every detached
+/// fetch task has posted `SubstituteComplete` and the actor handled it.
+/// Bounded (10ms × 100) so a hung task fails the test instead of
+/// hanging it. r[sched.substitute.detached]
+pub(crate) async fn settle_substituting(handle: &ActorHandle, hashes: &[&str]) {
+    use crate::state::DerivationStatus;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        barrier(handle).await;
+        let mut any = false;
+        for h in hashes {
+            if let Ok(Some(d)) = handle.debug_query_derivation(h).await
+                && d.status == DerivationStatus::Substituting
+            {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("settle_substituting: timed out waiting for SubstituteComplete on {hashes:?}");
+}
+
 // Re-export for test modules. Canonical impl moved to rio-test-support
 // (P0330) — was 3× copied with method-name drift before that.
 pub(crate) use rio_test_support::metrics::CountingRecorder;

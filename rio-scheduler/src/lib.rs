@@ -198,6 +198,11 @@ pub fn describe_metrics() {
         "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
     );
     describe_counter!(
+        "rio_scheduler_substitute_spawned_total",
+        "Derivations transitioned to Substituting (detached upstream fetch spawned). \
+         Pairs with substitute_fetch_failures_total to derive success rate."
+    );
+    describe_counter!(
         "rio_scheduler_topdown_prune_total",
         "Submissions pruned to roots-only by the top-down substitution pre-check"
     );

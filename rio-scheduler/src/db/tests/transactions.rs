@@ -27,6 +27,7 @@ fn test_terminal_statuses_match_is_terminal() {
         Ready,
         Assigned,
         Running,
+        Substituting,
         Completed,
         Failed,
         Poisoned,
@@ -38,8 +39,8 @@ fn test_terminal_statuses_match_is_terminal() {
     // Add a variant → this function stops compiling.
     for v in all {
         match v {
-            Created | Queued | Ready | Assigned | Running | Completed | Failed | Poisoned
-            | DependencyFailed | Cancelled | Skipped => {}
+            Created | Queued | Ready | Assigned | Running | Substituting | Completed | Failed
+            | Poisoned | DependencyFailed | Cancelled | Skipped => {}
         }
     }
 

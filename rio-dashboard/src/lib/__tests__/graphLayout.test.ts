@@ -193,7 +193,7 @@ describe('graphLayout', () => {
     // the full DERIVATION_STATUSES list (set equality, order-agnostic).
     const covered = new Set([
       ...['completed', 'skipped'],
-      ...['running', 'assigned'],
+      ...['running', 'assigned', 'substituting'],
       ...['failed', 'poisoned', 'dependency_failed'],
       ...['created', 'queued', 'ready', 'cancelled'],
     ]);
@@ -213,8 +213,8 @@ describe('graphLayout', () => {
     for (const s of TERMINAL) {
       expect(DERIVATION_STATUSES).toContain(s);
     }
-    // Inverse: running/assigned/failed are NOT terminal.
-    for (const s of ['running', 'assigned', 'failed', 'queued', 'ready', 'created']) {
+    // Inverse: running/assigned/failed/substituting are NOT terminal.
+    for (const s of ['running', 'assigned', 'substituting', 'failed', 'queued', 'ready', 'created']) {
       expect(TERMINAL.has(s)).toBe(false);
     }
   });
@@ -270,14 +270,14 @@ describe('graphLayout', () => {
 // motivating case — a 12th variant added to Rust without a STATUS_CLASS
 // arm now breaks THIS test, not just looks wrong on screen.
 describe('cross-language status enforcement', () => {
-  it('golden is well-formed: 11 rows, all statuses distinct', () => {
+  it('golden is well-formed: 12 rows, all statuses distinct', () => {
     // Precondition for every test below. If the golden is malformed
     // (e.g., a merge conflict left a duplicate row), the downstream
     // assertions would either under- or over-count. This pins the
-    // shape: exactly the 11 statuses, no dupes, terminal is a bool.
-    expect(goldenStatuses).toHaveLength(11);
+    // shape: exactly the 12 statuses, no dupes, terminal is a bool.
+    expect(goldenStatuses).toHaveLength(12);
     const names = new Set(goldenStatuses.map((r) => r.status));
-    expect(names.size).toBe(11);
+    expect(names.size).toBe(12);
     for (const r of goldenStatuses) {
       expect(typeof r.status).toBe('string');
       expect(typeof r.terminal).toBe('boolean');
@@ -304,7 +304,7 @@ describe('cross-language status enforcement', () => {
     // update) but NOT in this set → this test fails.
     const intended = new Set([
       'completed', 'skipped',                     // green
-      'running', 'assigned',                      // yellow
+      'running', 'assigned', 'substituting',      // yellow
       'failed', 'poisoned', 'dependency_failed',  // red
       'created', 'queued', 'ready', 'cancelled',  // gray (deliberate)
     ]);

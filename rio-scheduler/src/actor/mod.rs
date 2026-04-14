@@ -108,6 +108,14 @@ pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 /// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
 pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 16;
 
+/// Per-path timeout for the detached substitute fetch's
+/// `QueryPathInfo`. Separate from `grpc_timeout` (30s) because the
+/// store-side `try_substitute` recursively walks the runtime closure
+/// — a single ghc-9.8.4 (1.9 GB) fetch legitimately takes minutes.
+/// The fetch runs OUTSIDE the actor loop, so a long timeout here
+/// doesn't head-of-line block. r[sched.substitute.detached]
+pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Delay before cleaning up terminal build state. Allows late WatchBuild
 /// subscribers to receive the terminal event before the broadcast sender
 /// is dropped.
@@ -628,6 +636,9 @@ impl DagActor {
                 }
                 ActorCommand::ReconcileAssignments => {
                     self.handle_reconcile_assignments().await;
+                }
+                ActorCommand::SubstituteComplete { drv_hash, ok } => {
+                    self.handle_substitute_complete(&drv_hash, ok).await;
                 }
                 #[cfg(test)]
                 ActorCommand::Debug(d) => {

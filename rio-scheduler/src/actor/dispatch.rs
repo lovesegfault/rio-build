@@ -325,9 +325,8 @@ impl DagActor {
         // AFTER the batch ran) hit the per-FOD path.
         if is_fixed_output
             && !ctx.batch_checked.contains(&drv_hash)
-            && self.fod_outputs_in_store(&drv_hash).await
+            && self.fod_check_or_spawn(&drv_hash).await
         {
-            self.complete_ready_fod_from_store(&drv_hash).await;
             return DispatchOutcome::Progressed;
         }
 
@@ -555,39 +554,29 @@ impl DagActor {
                 }
             };
 
-        // Eager-fetch substitutable paths so dependents' GetPath finds
-        // them locally. Builders' GetPath has no tenant context, so
-        // lazy try_substitute_on_miss can't fire there — the actual
-        // fetch must happen here while we still have probe_meta.
-        let fetched = Self::eager_substitute_fetch(
-            store,
-            resp.substitutable_paths,
-            &probe_meta,
-            self.grpc_timeout,
-            self.substitute_max_concurrent,
-        )
-        .await;
-        if !fetched.is_empty() {
-            debug!(
-                count = fetched.len(),
-                "dispatch-time substitute fetch completed FOD outputs"
-            );
-            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
-                .increment(fetched.len() as u64);
-        }
-        let missing: HashSet<String> = resp
-            .missing_paths
-            .into_iter()
-            .filter(|p| !fetched.contains(p))
-            .collect();
-
+        // r[impl sched.substitute.detached]
+        // Partition: locally-present (not in missing_paths) → complete
+        // inline; substitutable → spawn detached fetch; truly-missing →
+        // leave Ready (dispatches normally). The detached fetch runs
+        // OUTSIDE the actor loop — before this, the awaited
+        // eager_substitute_fetch blocked MergeDag/dispatch for >100s
+        // when the closure walk pulled ghc-sized NARs.
+        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let mut checked = HashSet::with_capacity(candidates.len());
+        let mut to_spawn = Vec::new();
         for (drv_hash, paths) in candidates {
+            checked.insert(drv_hash.clone());
             if paths.iter().all(|p| !missing.contains(p)) {
                 self.complete_ready_fod_from_store(&drv_hash).await;
+            } else if paths
+                .iter()
+                .all(|p| !missing.contains(p) || substitutable.contains(p))
+            {
+                to_spawn.push((drv_hash, paths));
             }
-            checked.insert(drv_hash);
         }
+        self.spawn_substitute_fetches(to_spawn, probe).await;
         checked
     }
 
@@ -632,6 +621,148 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.substitute.detached]
+    /// Transition each candidate to `Substituting` and spawn a
+    /// background task that triggers store-side `try_substitute` (via
+    /// `QueryPathInfo`) for its output paths, then posts
+    /// [`ActorCommand::SubstituteComplete`] back into the mailbox.
+    ///
+    /// Detaches the upstream NAR fetch from the actor event loop:
+    /// before this, `eager_substitute_fetch` was awaited inline and a
+    /// single ghc-sized closure walk blocked `MergeDag` for >100s
+    /// (`"actor command exceeded 1s","cmd":"MergeDag","elapsed":"135s"`).
+    ///
+    /// Candidates whose transition is rejected (vanished, wrong status)
+    /// are skipped — they fall through to normal scheduling.
+    /// `tenant_meta` is the owned form of either the gateway-forwarded
+    /// JWT (merge-time) or the scheduler-minted service-token +
+    /// `probe-tenant-id` pair (dispatch-time).
+    pub(super) async fn spawn_substitute_fetches(
+        &mut self,
+        candidates: Vec<(DrvHash, Vec<String>)>,
+        tenant_meta: Vec<(&'static str, String)>,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(store) = self.store_client.clone() else {
+            return;
+        };
+        let Some(weak_tx) = self.self_tx.clone() else {
+            return;
+        };
+        let mut spawned: Vec<DrvHash> = Vec::with_capacity(candidates.len());
+        for (drv_hash, paths) in candidates {
+            let Some(state) = self.dag.node_mut(&drv_hash) else {
+                continue;
+            };
+            if let Err(e) = state.transition(DerivationStatus::Substituting) {
+                debug!(%drv_hash, %e, "spawn_substitute: transition rejected; falling through");
+                continue;
+            }
+            let store = store.clone();
+            let weak_tx = weak_tx.clone();
+            let meta = tenant_meta.clone();
+            let h = drv_hash.clone();
+            rio_common::task::spawn_monitored("substitute-fetch", async move {
+                let meta_ref: Vec<(&'static str, &str)> =
+                    meta.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let mut ok = true;
+                for p in &paths {
+                    let mut c = store.clone();
+                    match rio_proto::client::query_path_info_opt(
+                        &mut c,
+                        p,
+                        super::SUBSTITUTE_FETCH_TIMEOUT,
+                        &meta_ref,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            warn!(path = %p, "detached substitute fetch: NotFound \
+                                   (upstream HEAD probe lied?); demoting to cache-miss");
+                            metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                                .increment(1);
+                            ok = false;
+                        }
+                        Err(e) => {
+                            warn!(path = %p, error = %e,
+                                  "detached substitute fetch failed; demoting to cache-miss");
+                            metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                                .increment(1);
+                            ok = false;
+                        }
+                    }
+                }
+                if let Some(tx) = weak_tx.upgrade() {
+                    let _ = tx
+                        .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
+                        .await;
+                }
+            });
+            spawned.push(drv_hash);
+        }
+        if !spawned.is_empty() {
+            debug!(
+                count = spawned.len(),
+                "detached upstream substitute fetch spawned"
+            );
+            metrics::counter!("rio_scheduler_substitute_spawned_total")
+                .increment(spawned.len() as u64);
+            let hashes: Vec<&str> = spawned.iter().map(DrvHash::as_str).collect();
+            self.persist_status_batch(&hashes, DerivationStatus::Substituting)
+                .await;
+        }
+    }
+
+    // r[impl sched.substitute.detached]
+    /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
+    /// detached fetch task. `ok=true` → output now in rio-store with
+    /// its full reference closure (store-side `ensure_references`
+    /// walked it), so `Substituting → Completed` is safe even if
+    /// inputDrvs aren't yet Completed in the DAG. `ok=false` → revert
+    /// to `Ready`/`Queued` for normal scheduling.
+    pub(super) async fn handle_substitute_complete(&mut self, drv_hash: &DrvHash, ok: bool) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        if state.status() != DerivationStatus::Substituting {
+            debug!(%drv_hash, status = ?state.status(),
+                   "SubstituteComplete: not Substituting (cancelled/re-merged); dropping");
+            return;
+        }
+        if ok {
+            // complete_ready_fod_from_store does Substituting→Completed
+            // (valid transition) + the full post-completion machinery
+            // (output_paths, persist, upsert_path_tenants, promote_
+            // newly_ready, per-build events + completion check).
+            self.complete_ready_fod_from_store(drv_hash).await;
+            // promote_newly_ready pushed dependents to ready_queue;
+            // mark dirty so the next Tick dispatches them (this
+            // handler runs outside dispatch_ready's drain loop).
+            self.dispatch_dirty = true;
+            return;
+        }
+        let to = if self.dag.all_deps_completed(drv_hash) {
+            DerivationStatus::Ready
+        } else {
+            DerivationStatus::Queued
+        };
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        if let Err(e) = state.transition(to) {
+            warn!(%drv_hash, %e, "SubstituteComplete fail: revert rejected");
+            return;
+        }
+        self.persist_status(drv_hash, to, None).await;
+        if to == DerivationStatus::Ready {
+            self.push_ready(drv_hash.clone());
+            self.dispatch_dirty = true;
+        }
+    }
+
     /// Returns `true` only when `FindMissingPaths` definitively says all
     /// `expected_output_paths` are present. Any uncertainty (no paths to
     /// check, no store_client, RPC error, timeout) returns `false` so the
@@ -645,18 +776,21 @@ impl DagActor {
     /// Deferred FODs (no fetcher capacity) re-check each tick via the
     /// batch, not here; the answer can flip to `true` mid-queue (an
     /// earlier dispatch on another scheduler/build uploaded it).
-    async fn fod_outputs_in_store(&self, drv_hash: &DrvHash) -> bool {
-        let Some(state) = self.dag.node(drv_hash) else {
-            return false;
-        };
-        // Floating-CA FODs don't exist (FOD ⇒ fixed hash ⇒ IA path
-        // known); guard anyway so an empty-paths edge case can't
-        // fall through to "all present".
-        if state.expected_output_paths.is_empty() {
-            return false;
-        }
-        let Some(store) = &self.store_client else {
-            return false;
+    async fn fod_check_or_spawn(&mut self, drv_hash: &DrvHash) -> bool {
+        let (paths, mut store) = {
+            let Some(state) = self.dag.node(drv_hash) else {
+                return false;
+            };
+            // Floating-CA FODs don't exist (FOD ⇒ fixed hash ⇒ IA path
+            // known); guard anyway so an empty-paths edge case can't
+            // fall through to "all present".
+            if state.expected_output_paths.is_empty() {
+                return false;
+            }
+            let Some(store) = &self.store_client else {
+                return false;
+            };
+            (state.expected_output_paths.clone(), store.clone())
         };
         // r[impl sched.dispatch.fod-substitute] — same probe-tenant
         // wiring as batch_complete_cached_ready_fods.
@@ -664,24 +798,25 @@ impl DagActor {
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: state.expected_output_paths.clone(),
+            store_paths: paths.clone(),
         });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
-        match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req)).await {
+        match tokio::time::timeout(self.grpc_timeout, store.find_missing_paths(req)).await {
             Ok(Ok(r)) => {
                 let resp = r.into_inner();
                 if resp.missing_paths.is_empty() {
+                    self.complete_ready_fod_from_store(drv_hash).await;
                     return true;
                 }
-                let fetched = Self::eager_substitute_fetch(
-                    store,
-                    resp.substitutable_paths,
-                    &probe_meta,
-                    self.grpc_timeout,
-                    self.substitute_max_concurrent,
-                )
-                .await;
-                resp.missing_paths.iter().all(|p| fetched.contains(p))
+                // r[impl sched.substitute.detached] — spawn instead of
+                // awaiting eager_substitute_fetch in the actor loop.
+                let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+                if resp.missing_paths.iter().all(|p| sub.contains(p)) {
+                    self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], probe)
+                        .await;
+                    return true;
+                }
+                false
             }
             Ok(Err(e)) => {
                 debug!(drv_hash = %drv_hash, error = %e,
