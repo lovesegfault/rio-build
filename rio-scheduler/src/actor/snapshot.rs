@@ -342,16 +342,31 @@ impl DagActor {
                     // drv leaves Ready before the pod heartbeats, the
                     // match misses and dispatch falls through to
                     // pick-from-queue.
-                    let (cores, mem_bytes, disk_bytes) =
-                        self.solve_intent_for(state.pname.as_deref(), state);
-                    snapshots[i]
-                        .spawn_intents
-                        .push(rio_proto::types::SpawnIntent {
-                            intent_id: drv_hash.to_string(),
-                            cores,
-                            mem_bytes,
-                            disk_bytes,
-                        });
+                    //
+                    // Gated on `[sla]` configured: the controller's
+                    // `jobs.rs` reconcile branches on
+                    // `intents.is_empty()` — non-empty diverts to
+                    // `spawn_for_each` (per-drv pod resources from
+                    // `solve_intent_for`). Under Static sizing the
+                    // controller MUST stay on the `spawn_n` path (fixed
+                    // per-class `spec.resources`); emitting intents here
+                    // with `sla_config=None` sends 4-core/8-GiB fallback
+                    // probes that don't match any class shape, and the
+                    // `est_memory_bytes`/intent-reservation dispatch
+                    // gates have no symmetric spawn-side. Static mode ⇒
+                    // empty intents ⇒ exactly pre-ADR-023 behavior.
+                    if self.sla_config.is_some() {
+                        let (cores, mem_bytes, disk_bytes) =
+                            self.solve_intent_for(state.pname.as_deref(), state);
+                        snapshots[i]
+                            .spawn_intents
+                            .push(rio_proto::types::SpawnIntent {
+                                intent_id: drv_hash.to_string(),
+                                cores,
+                                mem_bytes,
+                                disk_bytes,
+                            });
+                    }
                 }
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     // Fact: what class DID we dispatch to?

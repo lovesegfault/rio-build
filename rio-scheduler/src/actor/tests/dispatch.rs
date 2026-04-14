@@ -1533,13 +1533,40 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 // r[verify sched.sla.intent-from-solve]
 #[tokio::test]
 async fn spawn_intent_from_sla_estimator() {
-    use crate::sla::{solve, types::*};
+    use crate::sla::{config, solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
-    // cfg.sla=None → empty tier ladder → solve_mvp returns BestEffort
-    // at p̄ (=∞ for Amdahl) capped at max_cores. Seed a single tier so
-    // the test exercises the Feasible path the way a configured deploy
-    // would.
+    // `sla_config.is_some()` gates spawn_intent emission (Static-mode
+    // deployments must NOT emit intents — controller branches on
+    // `intents.is_empty()`). The actor derives `sla_tiers`/`sla_ceilings`
+    // from this in `new()`; here we set the actor fields directly so the
+    // probe values below stay independent of the config struct's defaults.
+    actor.sla_config = Some(config::SlaConfig {
+        tiers: vec![config::Tier {
+            name: "normal".into(),
+            p50: None,
+            p90: Some(1200.0),
+            p99: None,
+        }],
+        default_tier: "normal".into(),
+        probe: config::ProbeShape {
+            cpu: 4.0,
+            mem_per_core: 1 << 30,
+            mem_base: 4 << 30,
+        },
+        feature_probes: Default::default(),
+        max_cores: solve::DEFAULT_CEILINGS.max_cores,
+        max_mem: solve::DEFAULT_CEILINGS.max_mem,
+        max_disk: solve::DEFAULT_CEILINGS.max_disk,
+        default_disk: solve::DEFAULT_CEILINGS.default_disk,
+        fuse_cache_budget: 0,
+        log_budget: 0,
+        ring_buffer: 32,
+        halflife_secs: 7.0 * 86400.0,
+    });
+    // Seed a single tier so the test exercises the Feasible path the way
+    // a configured deploy would (empty ladder → solve_mvp BestEffort at
+    // p̄ capped at max_cores).
     actor.sla_tiers = vec![solve::Tier {
         name: "normal".into(),
         p50: None,
