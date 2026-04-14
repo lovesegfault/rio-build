@@ -779,6 +779,10 @@ pub async fn utilization_reporter_loop_with_shutdown(
     // PSI io.pressure some avg10 — track max over the loop. The 10s
     // poll cadence matches avg10's window, so each sample is independent.
     let mut peak_io_pressure_pct = 0.0_f64;
+    // Project-quota dqb_curspace on the overlay emptyDir. Kernel-tracked
+    // allocation (includes short-lived temp files `du` would miss).
+    // None = node fs has no -o prjquota; falls back to statvfs disk_used.
+    let mut peak_disk_bytes: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -811,6 +815,10 @@ pub async fn utilization_reporter_loop_with_shutdown(
             .and_then(|s| parse_io_pressure_some_avg10(&s))
         {
             peak_io_pressure_pct = peak_io_pressure_pct.max(p);
+        }
+
+        if let Ok(Some(q)) = crate::quota::peak_bytes(&overlay_base) {
+            peak_disk_bytes = Some(peak_disk_bytes.map_or(q, |prev| prev.max(q)));
         }
 
         // CPU: only set the gauge if we have BOTH a previous sample and
@@ -853,7 +861,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
             // per pod the post-build snapshot ≈ the build's CPU-seconds.
             cpu_seconds_total: now_usage.map(|u| u as f64 / 1e6),
             peak_io_pressure_pct: Some(peak_io_pressure_pct),
-            peak_disk_bytes: None,
+            peak_disk_bytes,
         };
     }
 }

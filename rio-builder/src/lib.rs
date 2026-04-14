@@ -32,6 +32,7 @@ pub mod fuse;
 pub mod health;
 pub mod log_stream;
 pub(crate) mod overlay;
+pub mod quota;
 pub mod runtime;
 pub(crate) mod synth_db;
 pub(crate) mod upload;
