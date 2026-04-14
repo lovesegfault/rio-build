@@ -49,9 +49,10 @@ pub(crate) async fn run_list(
     } else if resp.builds.is_empty() {
         println!("(no builds — {} total matching filter)", resp.total_count);
     } else {
+        let names = crate::tenants::name_map(client).await;
         println!("{} builds ({} total):", resp.builds.len(), resp.total_count);
         for b in &resp.builds {
-            print_build(b);
+            print_build(b, names.get(&b.tenant_id).map(String::as_str));
         }
         if let Some(c) = &resp.next_cursor {
             println!("(next page: --cursor {c})");
@@ -95,7 +96,7 @@ pub(crate) async fn run_cancel(
     Ok(())
 }
 
-fn print_build(b: &BuildInfo) {
+fn print_build(b: &BuildInfo, tenant_name: Option<&str>) {
     println!(
         "  build {} [{:?}] {}/{} drv ({} cached) tenant={} prio={}",
         b.build_id,
@@ -103,7 +104,7 @@ fn print_build(b: &BuildInfo) {
         b.completed_derivations,
         b.total_derivations,
         b.cached_derivations,
-        b.tenant_id,
+        tenant_name.unwrap_or(&b.tenant_id),
         b.priority_class,
     );
     if !b.error_summary.is_empty() {

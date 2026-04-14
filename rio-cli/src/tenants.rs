@@ -58,6 +58,23 @@ pub(crate) async fn run_list(
     emit(as_json, &resp.tenants, "(no tenants)", print_tenant)
 }
 
+/// Best-effort `tenant_id → tenant_name` lookup for human-readable
+/// rendering in `builds`/`status`/etc. Returns an empty map on RPC
+/// failure so callers fall back to printing the raw UUID rather than
+/// failing the whole command on a display-only concern.
+pub(crate) async fn name_map(
+    client: &mut AdminServiceClient<Channel>,
+) -> std::collections::HashMap<String, String> {
+    match rpc("ListTenants", async || client.list_tenants(()).await).await {
+        Ok(r) => r
+            .tenants
+            .into_iter()
+            .map(|t| (t.tenant_id, t.tenant_name))
+            .collect(),
+        Err(_) => Default::default(),
+    }
+}
+
 fn print_tenant(t: &TenantInfo) {
     println!(
         "tenant {} ({})  gc_retention={}h  max_store={}  cache_token={}",
