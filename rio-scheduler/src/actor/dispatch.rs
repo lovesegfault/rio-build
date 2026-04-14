@@ -282,7 +282,19 @@ impl DagActor {
             // fetcher_util=0 before the per-clause diagnostic exposed
             // this. FOD memory is the download buffer, not a compile
             // heap; resource-fit is the wrong gate.
-            let est_memory_bytes = if state.is_fixed_output {
+            //
+            // Skip when `[sla]` is unconfigured: the symmetry argument
+            // ("controller spawns and dispatch accepts the SAME shape")
+            // only holds in Sla mode. In Static mode the controller
+            // spawns from fixed per-class `spec.resources` (jobs.rs
+            // `intent: None` → no `apply_intent_resources`), so a
+            // cold-start `solve_intent_for` here returns the 8 GiB
+            // fallback probe and the resource-fit gate rejects every
+            // worker smaller than that — vm-lifecycle-recovery's 2 GiB
+            // `tiny` pool never dispatched. The pre-ADR-023 path
+            // (`bucketed_estimate`) returned `None` on cold start; this
+            // restores that behavior for Static deployments.
+            let est_memory_bytes = if state.is_fixed_output || self.sla_config.is_none() {
                 None
             } else {
                 Some(self.solve_intent_for(pname, state).1)
