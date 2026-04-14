@@ -20920,6 +20920,10 @@
           "packageId": "prost-types"
         },
         {
+          "name": "rand",
+          "packageId": "rand 0.10.0"
+        },
+        {
           "name": "rio-auth",
           "packageId": "rio-auth"
         },

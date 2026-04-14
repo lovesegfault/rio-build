@@ -6526,6 +6526,7 @@ dependencies = [
  "proptest",
  "prost",
  "prost-types",
+ "rand 0.10.0",
  "rio-auth",
  "rio-common",
  "rio-crds",
