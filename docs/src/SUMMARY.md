@@ -38,6 +38,7 @@
   - [rio-proto](./components/proto.md)
   - [rio-dashboard](./components/dashboard.md)
   - [rio-cli](./components/cli.md)
+  - [SLA Sizing](./components/sla-sizing.md)
 - [Data Flows](./data-flows.md)
 - [Crate Structure](./crate-structure.md)
 
