@@ -21,9 +21,10 @@ use kube::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use rio_controller::reconcilers::node_informer::NodeLabelCache;
 use rio_controller::reconcilers::nodepoolbudget::NodePoolBudgetConfig;
 use rio_controller::reconcilers::{
-    Ctx, builderpool, builderpoolset, componentscaler, fetcherpool, nodepoolbudget,
+    Ctx, builderpool, builderpoolset, componentscaler, fetcherpool, node_informer, nodepoolbudget,
 };
 use rio_controller::spawn_controller;
 use rio_crds::builderpool::BuilderPool;
@@ -240,6 +241,19 @@ async fn main() -> anyhow::Result<()> {
     rio_common::task::spawn_monitored(
         "disruption-watcher",
         builderpool::disruption::run(client.clone(), admin, shutdown.clone()),
+    );
+
+    // ---- Node informer ----
+    // Caches Node labels → hw_class string for completion-ingest
+    // join (ADR-023). Builders report spec.nodeName (downward API);
+    // controller joins server-side because builders are air-gapped
+    // from apiserver.
+    // TODO: clone node_cache into the completion-ingest consumer
+    // once that lands; until then this populates but nobody reads.
+    let node_cache = NodeLabelCache::default();
+    rio_common::task::spawn_monitored(
+        "node-informer",
+        node_informer::run(client.clone(), node_cache, shutdown.clone()),
     );
 
     // ---- GC cron ----
