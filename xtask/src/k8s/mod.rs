@@ -502,7 +502,11 @@ async fn run_up(
             log_level: o
                 .deploy_log_level
                 .clone()
-                .unwrap_or_else(|| cfg.log_level.clone()),
+                .or_else(|| (!cfg.log_level.is_empty()).then(|| cfg.log_level.clone()))
+                // Empty (e.g. `RIO_LOG_LEVEL=` in env, or
+                // XtaskConfig::default()) would fall through to the
+                // chart's `info` default — losing per-crate debug.
+                .unwrap_or_else(|| crate::config::RIO_DEBUG.into()),
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
