@@ -11,8 +11,15 @@ pub mod bootstrap;
 pub mod config;
 pub mod fit;
 pub mod ingest;
+pub mod metrics;
 pub mod solve;
 pub mod types;
+
+/// cgroup poll interval (`executor::monitors`). Feeds the MAD floor in
+/// [`ingest::is_outlier`] — a 1s sampler on a 10s build is ±10% wall-
+/// clock noise; the gate's relative-granularity floor stops that being
+/// flagged.
+const DT_POLL_SECS: f64 = 1.0;
 
 /// Cache of per-`ModelKey` [`FittedParams`](types::FittedParams). The
 /// dispatch path reads via [`Self::cached`] (lock-free clone of one
@@ -87,10 +94,28 @@ impl SlaEstimator {
             .collect();
 
         for key in &touched {
+            let prev = self.cache.read().get(key).cloned();
+            // r[impl sched.sla.outlier-mad-reject]
+            // BEFORE refit: score each NEW sample for this key against
+            // the PREVIOUS fit. A 3·1.4826·MAD outlier is flagged in PG
+            // (forensics-kept, fit-excluded — both per-key reads filter
+            // `WHERE NOT outlier_excluded`). Using prev not new fit:
+            // the new fit would already be contaminated by the outlier.
+            if let Some(prev) = prev.as_ref() {
+                for r in new_rows.iter().filter(|r| {
+                    r.pname == key.pname && r.system == key.system && r.tenant == key.tenant
+                }) {
+                    if let Some(c) = r.cpu_limit_cores
+                        && ingest::is_outlier(r.duration_secs, c, prev, DT_POLL_SECS)
+                    {
+                        let _ = db.mark_outlier_excluded(r.id).await;
+                        metrics::outlier_rejected(&key.tenant);
+                    }
+                }
+            }
             let rows = db
                 .read_build_samples_for_key(&key.pname, &key.system, &key.tenant, self.ring_buffer)
                 .await?;
-            let prev = self.cache.read().get(key).cloned();
             let fit = ingest::refit(key, &rows, self.halflife_secs, prev.as_ref(), tiers);
             self.cache.write().insert(key.clone(), fit);
             // Trim AFTER refit so the fit always sees the full ring even

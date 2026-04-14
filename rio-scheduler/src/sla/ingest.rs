@@ -124,10 +124,15 @@ pub fn refit(
     let disk_p90 =
         (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64));
 
-    let sigma = if matches!(fit, DurationFit::Probe) {
-        0.2
+    let (sigma, log_residuals) = if matches!(fit, DurationFit::Probe) {
+        (0.2, Vec::new())
     } else {
-        sigma_resid(&cs, &ts, &w, &fit)
+        let lr: Vec<f64> = cs
+            .iter()
+            .zip(&ts)
+            .map(|(&c, &t)| (t / fit.t_at(RawCores(c)).0).ln())
+            .collect();
+        (sigma_resid(&cs, &ts, &w, &fit), lr)
     };
 
     // r[impl sched.sla.reassign-schmitt]
@@ -159,12 +164,64 @@ pub fn refit(
         mem,
         disk_p90,
         sigma_resid: sigma,
+        log_residuals,
         n_eff,
         span,
         explore,
         t_min_ci: ci,
         ci_computed_at: ci_at,
         tier,
+    }
+}
+
+/// MAD-based outlier gate for one new sample against the PREVIOUS fit.
+///
+/// A sample is an outlier if its absolute log-residual against `fit`'s
+/// curve exceeds `3 · 1.4826 · MAD(prev_residuals)` — the standard
+/// 3σ-equivalent under a normal-MAD scale (1.4826·MAD ≈ σ for normal
+/// data). The MAD is floored at `sigma_resid / 1.4826` (so a near-zero
+/// MAD on a tight fit doesn't reject everything) and at the relative
+/// poll-granularity `dt_poll / sample_t` (a 1s cgroup poll on a 10s
+/// build is ±10% noise on its own; don't call that an outlier).
+///
+/// Gated on `n_eff ≥ 5`: with fewer effective samples MAD is unstable
+/// and the explore ladder is still walking — rejecting then would
+/// throw away exactly the diversity the fit needs.
+// r[impl sched.sla.outlier-mad-reject]
+pub fn is_outlier(sample_t: f64, sample_c: f64, fit: &FittedParams, dt_poll: f64) -> bool {
+    if fit.n_eff < 5.0 || fit.log_residuals.is_empty() {
+        return false;
+    }
+    let predicted = fit.fit.t_at(RawCores(sample_c)).0;
+    if !predicted.is_finite() || predicted <= 0.0 || sample_t <= 0.0 {
+        return false;
+    }
+    let log_resid = (sample_t / predicted).ln().abs();
+    let mad = median_abs_dev(&fit.log_residuals);
+    let floor = (fit.sigma_resid / 1.4826).max(dt_poll / sample_t);
+    log_resid > 3.0 * 1.4826 * mad.max(floor)
+}
+
+/// Median absolute deviation: `median(|r_i - median(r)|)`. Unweighted —
+/// the residuals already came from weighted fits, and MAD's robustness
+/// is the point (one wild residual contributes one rank, not a weight).
+fn median_abs_dev(residuals: &[f64]) -> f64 {
+    let med = median(residuals);
+    let devs: Vec<f64> = residuals.iter().map(|r| (r - med).abs()).collect();
+    median(&devs)
+}
+
+fn median(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
     }
 }
 
@@ -256,6 +313,7 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
             .and_then(|r| r.peak_disk_bytes)
             .map(|b| DiskBytes(b as u64)),
         sigma_resid: 0.2,
+        log_residuals: Vec::new(),
         n_eff: 0.0,
         span: 1.0,
         explore: derive_explore_state(&[], last),
@@ -266,8 +324,12 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
 }
 
 /// Reconstruct [`ExploreState`] from observed current-version cpu_limits.
-/// `frozen` is always false here — the explore controller (Task 5.2) flips
-/// it once the ladder converges; refit only reports what was sampled.
+/// `frozen` mirrors [`super::explore::frozen`] (span≥4 ∨ max_c at
+/// ceiling ∨ min_c at floor) so `intent_for`'s `f.explore.frozen` and
+/// `explore::frozen(&f.explore, …)` agree even when the actor's
+/// `max_cores` differs from the in-ladder one — `frozen` here uses
+/// span/floor only (the ceiling check needs config the refit doesn't
+/// have; `intent_for` re-checks against `ceil.max_cores`).
 fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> ExploreState {
     let distinct: HashSet<u64> = cur_cs.iter().map(|c| c.to_bits()).collect();
     let (min_c, max_c) = cur_cs
@@ -275,6 +337,7 @@ fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> Explor
         .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &c| {
             (lo.min(c), hi.max(c))
         });
+    let min_c = if min_c.is_finite() { min_c } else { 0.0 };
     // "Saturated" = last build's mean utilisation (cpu-seconds / wall /
     // limit) exceeded 40% — i.e. the build actually used the cores it was
     // given, so probing higher is worth it.
@@ -285,11 +348,12 @@ fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> Explor
                 .map(|(secs, lim)| secs / r.duration_secs / lim > 0.4)
         })
         .unwrap_or(false);
+    let span = if min_c > 0.0 { max_c / min_c } else { 1.0 };
     ExploreState {
         distinct_c: distinct.len() as u8,
-        min_c: RawCores(if min_c.is_finite() { min_c } else { 0.0 }),
+        min_c: RawCores(min_c),
         max_c: RawCores(max_c),
-        frozen: false,
+        frozen: max_c > 0.0 && (span >= 4.0 || min_c <= 1.0),
         saturated,
         last_wall: WallSeconds(last.map(|r| r.duration_secs).unwrap_or(0.0)),
     }
@@ -519,6 +583,7 @@ mod tests {
             mem: MemFit::Independent { p90: MemBytes(0) },
             disk_p90: None,
             sigma_resid: 0.1,
+            log_residuals: Vec::new(),
             n_eff,
             span: 8.0,
             explore: ExploreState {
@@ -584,6 +649,80 @@ mod tests {
             1040.0,
             7.0 * 86400.0
         ));
+    }
+
+    // ─── Task 5.1: MAD outlier rejection ─────────────────────────────────
+
+    /// Build a fit from 6 close-to-curve samples (n_eff≈6, span=16),
+    /// then probe a 7th at `mult × predicted`.
+    fn outlier_fit() -> FittedParams {
+        // True: T = 30 + 2000/c, ±5% deterministic noise.
+        let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let noise = 1.0 + 0.05 * (i as f64 * 1.7).sin();
+                row(c, (30.0 + 2000.0 / c) * noise)
+            })
+            .collect();
+        r(&rows)
+    }
+
+    // r[verify sched.sla.outlier-mad-reject]
+    #[test]
+    fn mad_flags_10x_at_neff_6() {
+        let fit = outlier_fit();
+        assert!(fit.n_eff >= 5.0, "precondition: n_eff={}", fit.n_eff);
+        assert!(!fit.log_residuals.is_empty());
+        let pred = fit.fit.t_at(RawCores(8.0)).0;
+        // 10× predicted → ln(10)≈2.3 absolute log-resid. 5% noise gives
+        // MAD ~0.03; gate = 3·1.4826·max(MAD, σ/1.4826) ≈ 3σ ≈ 0.15.
+        assert!(is_outlier(pred * 10.0, 8.0, &fit, 1.0), "10× → flagged");
+        // 1.2× predicted → ln(1.2)≈0.18, borderline; 1.05× must pass.
+        assert!(!is_outlier(pred * 1.05, 8.0, &fit, 1.0), "5% → kept");
+    }
+
+    #[test]
+    fn mad_gated_below_neff_5() {
+        let mut fit = outlier_fit();
+        fit.n_eff = 4.0;
+        let pred = fit.fit.t_at(RawCores(8.0)).0;
+        assert!(
+            !is_outlier(pred * 10.0, 8.0, &fit, 1.0),
+            "n_eff=4 → never flag"
+        );
+        // No residuals (Probe fit) → never flag regardless of n_eff.
+        fit.n_eff = 10.0;
+        fit.log_residuals.clear();
+        assert!(!is_outlier(pred * 10.0, 8.0, &fit, 1.0));
+    }
+
+    #[test]
+    fn mad_floor_from_dt_poll() {
+        // Perfect fit (zero MAD, zero σ) → floor must come from
+        // dt_poll/sample_t. At c=8 predicted=280; dt_poll=28 → floor=0.1,
+        // gate = 3·1.4826·0.1 ≈ 0.44.
+        let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .map(|c| row(c, 30.0 + 2000.0 / c))
+            .collect();
+        let fit = r(&rows);
+        assert!(fit.sigma_resid < 1e-3, "perfect fit");
+        assert!(fit.n_eff >= 5.0, "n_eff={}", fit.n_eff);
+        let pred = fit.fit.t_at(RawCores(8.0)).0; // ≈ 280
+        // ln(1.3)≈0.26 < 0.44 → kept; ln(2)≈0.69 > 0.44 → flagged.
+        assert!(!is_outlier(pred * 1.3, 8.0, &fit, 28.0));
+        assert!(is_outlier(pred * 2.0, 8.0, &fit, 28.0));
+        // dt_poll=0 → floor 0 → near-zero gate → 1.3× IS flagged.
+        assert!(is_outlier(pred * 1.3, 8.0, &fit, 0.0));
+    }
+
+    #[test]
+    fn median_helpers() {
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(median(&[]), 0.0);
+        assert!((median_abs_dev(&[1.0, 2.0, 3.0, 4.0, 100.0]) - 1.0).abs() < 1e-9);
     }
 
     #[test]

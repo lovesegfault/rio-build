@@ -211,6 +211,7 @@ mod tests {
             },
             disk_p90: Some(DiskBytes(10 << 30)),
             sigma_resid: sigma,
+            log_residuals: Vec::new(),
             n_eff: 10.0,
             span: 8.0,
             explore: ExploreState {

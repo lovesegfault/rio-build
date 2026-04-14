@@ -16,6 +16,10 @@ use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb, TERMINAL_STATUS_SQL};
 /// ..Default::default() }` without spelling out 15 Nones.
 #[derive(Debug, Clone, Default)]
 pub struct BuildSampleRow {
+    /// `BIGSERIAL` PK. Ignored on write (server-assigned); populated on
+    /// read so the MAD outlier sweep can `mark_outlier_excluded(id)`
+    /// without re-keying on `(pname, system, tenant, completed_at)`.
+    pub id: i64,
     pub pname: String,
     pub system: String,
     pub tenant: String,
@@ -354,7 +358,7 @@ impl SchedulerDb {
         sqlx::query_as!(
             BuildSampleRow,
             r#"
-            SELECT pname, system, tenant, duration_secs, peak_memory_bytes,
+            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
                    cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                    peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
                    node_name, enable_parallel_building, prefer_local_build,
@@ -367,6 +371,20 @@ impl SchedulerDb {
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Flip `outlier_excluded = TRUE` for one row by PK. Idempotent.
+    /// The row stays for forensics; both per-key and incremental reads
+    /// already filter `WHERE NOT outlier_excluded`, so a flagged sample
+    /// drops out of the next refit without a DELETE.
+    pub async fn mark_outlier_excluded(&self, id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE build_samples SET outlier_excluded = TRUE WHERE id = $1",
+            id,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Most-recent `limit` samples for one `(pname, system, tenant)` key,
@@ -389,7 +407,7 @@ impl SchedulerDb {
         let mut rows = sqlx::query_as!(
             BuildSampleRow,
             r#"
-            SELECT pname, system, tenant, duration_secs, peak_memory_bytes,
+            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
                    cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
                    peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
                    node_name, enable_parallel_building, prefer_local_build,

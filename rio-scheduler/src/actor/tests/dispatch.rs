@@ -1565,6 +1565,7 @@ async fn spawn_intent_from_sla_estimator() {
         },
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: 0.1,
+        log_residuals: Vec::new(),
         n_eff: 10.0,
         span: 8.0,
         explore: ExploreState {

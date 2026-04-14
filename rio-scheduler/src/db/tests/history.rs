@@ -517,6 +517,7 @@ async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
         enable_parallel_building: Some(true),
         prefer_local_build: Some(false),
         completed_at: 0.0, // ignored on write — server-side now()
+        id: 0,
     };
     db.write_build_sample(&row).await?;
 

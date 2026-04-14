@@ -108,6 +108,12 @@ pub struct FittedParams {
     pub mem: MemFit,
     pub disk_p90: Option<DiskBytes>,
     pub sigma_resid: f64,
+    /// Per-sample `ln(t_obs / t_pred)` from the most-recent refit. Feeds
+    /// the MAD outlier gate (`ingest::is_outlier`) — kept on the cached
+    /// fit so the NEXT tick can score new samples against the PREVIOUS
+    /// fit's residual distribution without re-reading the ring. ≤32
+    /// entries (ring-buffer cap), so the per-key cache cost is bounded.
+    pub log_residuals: Vec<f64>,
     pub n_eff: f64,
     pub span: f64,
     pub explore: ExploreState,

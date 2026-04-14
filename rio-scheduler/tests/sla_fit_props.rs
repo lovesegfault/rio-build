@@ -43,6 +43,7 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
         },
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: sigma,
+        log_residuals: Vec::new(),
         n_eff: 10.0,
         span: 8.0,
         explore: ExploreState {

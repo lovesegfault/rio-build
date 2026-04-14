@@ -1445,6 +1445,7 @@ impl DagActor {
                         hw_class: None,
                         // Read-side only; write_build_sample uses now().
                         completed_at: 0.0,
+                        id: 0,
                     };
                     if let Err(e) = self.db.write_build_sample(&row).await {
                         warn!(?e, %pname, system = %state.system, "write_build_sample failed");
