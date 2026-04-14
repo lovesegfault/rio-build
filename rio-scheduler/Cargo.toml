@@ -85,6 +85,10 @@ hex = { workspace = true }
 # P0230: Arc<parking_lot::RwLock<Vec<SizeClassConfig>>> for rebalancer
 # writes. Sync lock — writes hourly, reads per-dispatch. Keeps classify() sync.
 parking_lot = { workspace = true }
+# ADR-023: NNLS fit + Φ/Student-t quantiles for SLA-driven size-class
+# rebalancer. See sizing/fit.rs.
+nalgebra = { workspace = true }
+statrs = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

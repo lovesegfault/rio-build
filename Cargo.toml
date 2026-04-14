@@ -253,6 +253,14 @@ arc-swap = "1"
 # Sync (no .await across guard) keeps classify() sync.
 parking_lot = "0.12"
 
+# --- ADR-023: SLA-driven sizing fit (rio-scheduler rebalancer) ---
+# Dense linear algebra for the NNLS (non-negative least squares) solver
+# that fits mem=M(cores) per size class. default-features off drops
+# rand/serde/macros — we only need DMatrix/DVector + decompositions.
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+# Normal/Student-t CDF (Φ, t.ppf) for the SLA quantile bounds.
+statrs = "0.18"
+
 # Testing
 proptest = "1"
 # Parameterized tests via #[rstest] #[case(...)]. Replaces hand-rolled

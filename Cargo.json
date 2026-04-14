@@ -513,6 +513,31 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "approx": {
+      "crateName": "approx",
+      "version": "0.5.1",
+      "edition": "2015",
+      "sha256": "1ilpv3dgd58rasslss0labarq7jawxmivk17wsh8wmkdm3q15cfa",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Brendan Zabarauskas <bjzaba@yahoo.com.au>"
+      ]
+    },
     "arc-swap": {
       "crateName": "arc-swap",
       "version": "1.9.1",
@@ -14646,6 +14671,38 @@
         "Ibraheem Ahmed <ibraheem@ibraheem.ca>"
       ]
     },
+    "matrixmultiply": {
+      "crateName": "matrixmultiply",
+      "version": "0.3.10",
+      "edition": "2018",
+      "sha256": "020sqwg3cvprfasbszqbnis9zx6c3w9vlkfidyimgblzdq0y6vd0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rawpointer",
+          "packageId": "rawpointer"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "autocfg",
+          "packageId": "autocfg"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "bluss",
+        "R. Janis Goldschmidt"
+      ]
+    },
     "maybe-async": {
       "crateName": "maybe-async",
       "version": "0.2.10",
@@ -15229,6 +15286,68 @@
         "Håvar Nøvik <havar.novik@gmail.com>"
       ]
     },
+    "nalgebra": {
+      "crateName": "nalgebra",
+      "version": "0.33.3",
+      "edition": "2018",
+      "sha256": "1zdbhacayfy7nrkapbr22qqc5cg8v63ffbnysvgqac9lrz5dshwx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "approx",
+          "packageId": "approx"
+        },
+        {
+          "name": "matrixmultiply",
+          "packageId": "matrixmultiply"
+        },
+        {
+          "name": "num-complex",
+          "packageId": "num-complex"
+        },
+        {
+          "name": "num-rational",
+          "packageId": "num-rational"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.8.5",
+          "rename": "rand_package"
+        },
+        {
+          "name": "rand_distr",
+          "packageId": "rand_distr"
+        },
+        {
+          "name": "simba",
+          "packageId": "simba"
+        },
+        {
+          "name": "typenum",
+          "packageId": "typenum"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "matrixmultiply",
+        "rand",
+        "rand-no-std",
+        "rand-package",
+        "rand_distr",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sébastien Crozet <developer@crozet.re>"
+      ]
+    },
     "nix 0.30.1": {
       "crateName": "nix",
       "version": "0.30.1",
@@ -15541,6 +15660,30 @@
         "The Rust Project Developers"
       ]
     },
+    "num-complex": {
+      "crateName": "num-complex",
+      "version": "0.4.6",
+      "edition": "2021",
+      "sha256": "15cla16mnw12xzf5g041nxbjjm9m85hdgadd5dl5d0b30w9qmy3k",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
+      ]
+    },
     "num-conv": {
       "crateName": "num-conv",
       "version": "0.2.1",
@@ -15636,7 +15779,8 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "num-bigint"
+        "num-bigint",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -15666,6 +15810,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "default",
         "i128",
         "libm",
         "std"
@@ -16812,6 +16957,19 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "paste": {
+      "crateName": "paste",
+      "version": "1.0.15",
+      "edition": "2018",
+      "sha256": "02pxffpdqkapy292harq6asfjvadgp1s005fip9ljfsn9fvxgh2p",
+      "source": {
+        "type": "crates-io"
+      },
+      "procMacro": true,
+      "authors": [
+        "David Tolnay <dtolnay@gmail.com>"
       ]
     },
     "pbkdf2 0.12.2": {
@@ -18840,6 +18998,31 @@
         "The Rust Project Developers"
       ]
     },
+    "rand_distr": {
+      "crateName": "rand_distr",
+      "version": "0.4.3",
+      "edition": "2018",
+      "sha256": "0cgfwg3z0pkqhrl0x90c77kx70r6g9z4m6fxq9v0h2ibr2dhpjrj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.8.5"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rand Project Developers"
+      ]
+    },
     "rand_xorshift": {
       "crateName": "rand_xorshift",
       "version": "0.4.0",
@@ -18902,6 +19085,21 @@
       ],
       "authors": [
         "Gerd Zellweger <mail@gerdzellweger.com>"
+      ]
+    },
+    "rawpointer": {
+      "crateName": "rawpointer",
+      "version": "0.2.1",
+      "edition": "2015",
+      "sha256": "1qy1qvj17yh957vhffnq6agq0brvylw27xgks171qrah75wmg8v0",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "bluss"
       ]
     },
     "redox_syscall 0.5.18": {
@@ -20702,6 +20900,10 @@
           "packageId": "metrics"
         },
         {
+          "name": "nalgebra",
+          "packageId": "nalgebra"
+        },
+        {
           "name": "ordered-float",
           "packageId": "ordered-float 5.3.0"
         },
@@ -20752,6 +20954,10 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
+        },
+        {
+          "name": "statrs",
+          "packageId": "statrs"
         },
         {
           "name": "thiserror",
@@ -22375,6 +22581,31 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "safe_arch": {
+      "crateName": "safe_arch",
+      "version": "0.7.4",
+      "edition": "2018",
+      "sha256": "08sk47n1kcm5w2di6bpgi2hsw8r2caz2230pwqvbdqfv5pl2vc4n",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytemuck",
+          "packageId": "bytemuck"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "bytemuck",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Lokathor <zefria@gmail.com>"
+      ]
+    },
     "salsa20": {
       "crateName": "salsa20",
       "version": "0.11.0",
@@ -23679,6 +23910,47 @@
         "RustCrypto Developers"
       ]
     },
+    "simba": {
+      "crateName": "simba",
+      "version": "0.9.1",
+      "edition": "2018",
+      "sha256": "15gxgwcm6vs2wbbc5z4x8zsi1rhjl3nvqnxpl95hjrhnnaz894n9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "approx",
+          "packageId": "approx"
+        },
+        {
+          "name": "num-complex",
+          "packageId": "num-complex"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "paste",
+          "packageId": "paste"
+        },
+        {
+          "name": "wide",
+          "packageId": "wide"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std",
+        "wide"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "sebcrozet <developer@crozet.re>"
+      ]
+    },
     "simd-adler32": {
       "crateName": "simd-adler32",
       "version": "0.3.9",
@@ -24909,6 +25181,44 @@
       ],
       "authors": [
         "Nikolai Vazquez"
+      ]
+    },
+    "statrs": {
+      "crateName": "statrs",
+      "version": "0.18.0",
+      "edition": "2021",
+      "sha256": "0pikgp74gg9a3jp2hhh5z6wdfjn96gdkahw7n1kff4k5ik1ffgra",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "approx",
+          "packageId": "approx"
+        },
+        {
+          "name": "nalgebra",
+          "packageId": "nalgebra"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.8.5"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "nalgebra",
+        "rand"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michael Ma"
       ]
     },
     "stringprep": {
@@ -28190,6 +28500,34 @@
         "lib"
       ]
     },
+    "wide": {
+      "crateName": "wide",
+      "version": "0.7.33",
+      "edition": "2018",
+      "sha256": "00yd2sg83xvfrjjlwndyk49fjx8jlmlrz8byigndig32rf7dmr8c",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytemuck",
+          "packageId": "bytemuck"
+        },
+        {
+          "name": "safe_arch",
+          "packageId": "safe_arch"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Lokathor <zefria@gmail.com>"
+      ]
+    },
     "winapi": {
       "crateName": "winapi",
       "version": "0.3.9",
@@ -30007,6 +30345,10 @@
           "packageId": "num-integer"
         },
         {
+          "name": "num-rational",
+          "packageId": "num-rational"
+        },
+        {
           "name": "num-traits",
           "packageId": "num-traits"
         },
@@ -30044,7 +30386,13 @@
         },
         {
           "name": "rand",
-          "packageId": "rand 0.9.2"
+          "packageId": "rand 0.8.5",
+          "rename": "rand_c38e5c1d305a1b54"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2",
+          "rename": "rand_274715c4dabd11b0"
         },
         {
           "name": "rand_chacha",
@@ -30404,6 +30752,11 @@
         {
           "name": "prost",
           "packageId": "prost"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.8.5",
+          "rename": "rand_c38e5c1d305a1b54"
         },
         {
           "name": "rand_core",
