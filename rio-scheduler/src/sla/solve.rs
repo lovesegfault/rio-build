@@ -1,3 +1,5 @@
+use super::config::SlaConfig;
+use super::explore;
 use super::fit::headroom;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 
@@ -10,13 +12,6 @@ pub const DEFAULT_CEILINGS: Ceilings = Ceilings {
     max_disk: 200 << 30,
     default_disk: 20 << 30,
 };
-
-// TODO(ADR-023 phase-5): from SlaConfig.probe via explore::next().
-/// Cold-start / explore-path probe sizing. Phase-5 (Task 5.2) replaces
-/// the explore branch with `explore::next()`; until then unfitted keys
-/// dispatch at a fixed mid-range probe.
-pub const PROBE_CORES: u32 = 4;
-pub const PROBE_MEM_BYTES: u64 = 8 << 30;
 
 /// `prefer_local_build = true` → trivially short. Smallest pod the
 /// controller will spawn.
@@ -73,11 +68,15 @@ impl SolveResult {
     }
 }
 
-/// Derivation-declared sizing hints (from drv.env).
-#[derive(Debug, Default, Clone, Copy)]
+/// Derivation-declared sizing hints (from drv.env / drv.system-features).
+#[derive(Debug, Default, Clone)]
 pub struct DrvHints {
     pub enable_parallel_building: Option<bool>,
     pub prefer_local_build: Option<bool>,
+    /// `requiredSystemFeatures` — drives [`super::explore::next`]'s
+    /// per-feature probe-shape override (e.g. `kvm` builds want a high
+    /// mem floor regardless of core count).
+    pub required_features: Vec<String>,
 }
 
 /// Per-derivation `(cores, mem, disk)` for a [`SpawnIntent`]. Wraps
@@ -88,12 +87,16 @@ pub struct DrvHints {
 /// - `prefer_local_build = Some(true)` → minimal (1 core), no learning.
 /// - `enable_parallel_building = Some(false)` → 1 core, probe mem/disk
 ///   (the build is serial by declaration; exploring c is wasted).
-/// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → probe defaults.
-///   TODO(ADR-023 phase-5): replace with `explore::next()` + `SlaConfig.probe`.
+/// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → [`explore::next`]
+///   drives the saturation-gated ×4/÷2 ladder from `cfg.probe`.
 /// - Otherwise → `solve_mvp` against `tiers` / `ceil`. Empty `tiers`
 ///   (`[sla]` unconfigured) → `solve_mvp` returns `BestEffort` at
 ///   `min(p̄, max_cores)`, so unconfigured deployments still get the
 ///   fitted-curve cap instead of a hardcoded tier target.
+///
+/// `cfg=None` (`[sla]` absent) keeps the explore branch on a fixed
+/// fallback probe — the actor still constructs a `Ceilings` from
+/// [`DEFAULT_CEILINGS`] so the solve branch is unaffected.
 ///
 /// Cores are `ceil`-ed to a whole-core `u32` (k8s `resources.requests`
 /// granularity); mem/disk are byte-exact (controller rounds at the pod
@@ -103,20 +106,40 @@ pub struct DrvHints {
 // r[impl sched.sla.intent-from-solve]
 pub fn intent_for(
     fit: Option<&FittedParams>,
-    hints: DrvHints,
+    hints: &DrvHints,
+    cfg: Option<&SlaConfig>,
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> (u32, u64, u64) {
     if hints.prefer_local_build == Some(true) {
         return (LOCAL_CORES, LOCAL_MEM_BYTES, ceil.default_disk);
     }
+    let probe_mem = cfg
+        .map(|c| (c.probe.cpu * c.probe.mem_per_core as f64 + c.probe.mem_base as f64) as u64)
+        .unwrap_or(8 << 30);
     if hints.enable_parallel_building == Some(false) {
-        return (1, PROBE_MEM_BYTES, ceil.default_disk);
+        return (1, probe_mem, ceil.default_disk);
     }
     let fit = match fit {
-        Some(f) if f.n_eff >= 3.0 && (f.span >= 4.0 || f.explore.frozen) => f,
-        // TODO(ADR-023 phase-5): explore::next() drives the probe ladder.
-        _ => return (PROBE_CORES, PROBE_MEM_BYTES, ceil.default_disk),
+        Some(f)
+            if f.n_eff >= 3.0 && (f.span >= 4.0 || explore::frozen(&f.explore, ceil.max_cores)) =>
+        {
+            f
+        }
+        _ => {
+            // Explore ladder. With `[sla]` unconfigured, fall back to a
+            // fixed probe shape so the snapshot path stays deterministic.
+            return match cfg {
+                Some(cfg) => {
+                    let d = explore::next(fit, cfg, hints);
+                    ((d.c.0.ceil() as u32).max(1), d.mem.0, d.disk.0)
+                }
+                None => {
+                    let p = explore::fallback_probe();
+                    (p.cpu as u32, probe_mem, ceil.default_disk)
+                }
+            };
+        }
     };
     let r = solve_mvp(fit, tiers, ceil);
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
@@ -287,15 +310,15 @@ mod tests {
 
     // ─── intent_for branching ───────────────────────────────────────
 
-    fn intent(fit: Option<&FittedParams>, hints: DrvHints) -> (u32, u64, u64) {
-        intent_for(fit, hints, &[t("normal", 1200.0)], &ceil())
+    fn intent(fit: Option<&FittedParams>, hints: &DrvHints) -> (u32, u64, u64) {
+        intent_for(fit, hints, None, &[t("normal", 1200.0)], &ceil())
     }
 
     #[test]
     fn intent_for_prefer_local_is_minimal() {
         let (c, m, _) = intent(
             None,
-            DrvHints {
+            &DrvHints {
                 prefer_local_build: Some(true),
                 ..Default::default()
             },
@@ -309,30 +332,34 @@ mod tests {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let (c, m, _) = intent(
             Some(&fit),
-            DrvHints {
+            &DrvHints {
                 enable_parallel_building: Some(false),
                 ..Default::default()
             },
         );
         assert_eq!(c, 1);
-        assert_eq!(m, PROBE_MEM_BYTES);
+        assert_eq!(m, 8 << 30); // fallback probe mem (no [sla])
     }
     #[test]
     fn intent_for_cold_start_is_probe() {
+        // No [sla] config → fixed fallback probe (4 cores, 8 GiB).
         assert_eq!(
-            intent(None, DrvHints::default()),
-            (PROBE_CORES, PROBE_MEM_BYTES, ceil().default_disk)
+            intent(None, &DrvHints::default()),
+            (4, 8 << 30, ceil().default_disk)
         );
-        // n_eff < 3 → still explore/probe path.
+        // n_eff < 3 → still explore/probe path. mk_fit's explore state
+        // is min=4/max=32 → frozen() = true (span 8) → solve gate would
+        // pass if n_eff≥3; below that, explore::next emits max_c=32 with
+        // a config or fallback 4 without one.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         fit.n_eff = 2.0;
-        assert_eq!(intent(Some(&fit), DrvHints::default()).0, PROBE_CORES);
+        assert_eq!(intent(Some(&fit), &DrvHints::default()).0, 4);
     }
     #[test]
     fn intent_for_fitted_uses_solve() {
         // r[verify sched.sla.intent-from-solve]
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        let (c, _, d) = intent(Some(&fit), DrvHints::default());
+        let (c, _, d) = intent(Some(&fit), &DrvHints::default());
         // Against p90=1200: c*≈1.95 → ceil 2.
         assert_eq!(c, 2, "ceil(solve_mvp.c_star)");
         assert_eq!(d, 10 << 30, "disk_p90 from fit");

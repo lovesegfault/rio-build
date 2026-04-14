@@ -418,10 +418,12 @@ impl DagActor {
         });
         solve::intent_for(
             fit.as_ref(),
-            solve::DrvHints {
+            &solve::DrvHints {
                 enable_parallel_building: state.enable_parallel_building,
                 prefer_local_build: state.prefer_local_build,
+                required_features: state.required_features.clone(),
             },
+            self.sla_config.as_ref(),
             &self.sla_tiers,
             &self.sla_ceilings,
         )

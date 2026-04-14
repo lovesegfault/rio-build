@@ -1616,12 +1616,9 @@ async fn spawn_intent_from_sla_estimator() {
         .iter()
         .find(|i| i.intent_id == "cold")
         .unwrap();
-    assert_eq!(
-        cold.cores,
-        solve::PROBE_CORES,
-        "no SlaEstimator entry → probe defaults"
-    );
-    assert_eq!(cold.mem_bytes, solve::PROBE_MEM_BYTES);
+    // No SlaEstimator entry + no [sla] config → fallback probe (4c, 8Gi).
+    assert_eq!(cold.cores, 4, "no fit → fallback probe cores");
+    assert_eq!(cold.mem_bytes, 8 << 30);
 }
 
 /// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when

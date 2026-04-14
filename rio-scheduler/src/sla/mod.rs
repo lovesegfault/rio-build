@@ -9,6 +9,7 @@ use crate::db::SchedulerDb;
 
 pub mod bootstrap;
 pub mod config;
+pub mod explore;
 pub mod fit;
 pub mod ingest;
 pub mod metrics;

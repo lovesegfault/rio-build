@@ -244,6 +244,10 @@ pub struct DagActor {
     /// Hard ceilings from `cfg.sla.ceilings()` (or
     /// [`crate::sla::solve::DEFAULT_CEILINGS`]).
     pub(crate) sla_ceilings: crate::sla::solve::Ceilings,
+    /// Full `[sla]` config — feeds [`crate::sla::explore::next`]'s
+    /// probe shape and feature overrides. `None` ⇔ `[sla]` absent
+    /// (explore falls back to a fixed probe).
+    pub(crate) sla_config: Option<crate::sla::config::SlaConfig>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -428,6 +432,7 @@ impl DagActor {
                 .as_ref()
                 .map(|s| s.ceilings())
                 .unwrap_or(crate::sla::solve::DEFAULT_CEILINGS),
+            sla_config: cfg.sla.clone(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
