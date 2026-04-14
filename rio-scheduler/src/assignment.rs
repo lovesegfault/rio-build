@@ -283,6 +283,20 @@ pub fn rejection_reason(
     if w.running_build.is_some() {
         return Some("at-capacity");
     }
+    // r[impl sched.sla.intent-match]
+    // ADR-023: a worker spawned for intent X (= drv_hash X) is
+    // RESERVED for X. Without this, the FIFO drain pops Y first, finds
+    // this worker via the regular overflow walk, and gives it Y — its
+    // pod resources were sized for X, so Y likely OOMs or wastes
+    // headroom. Stale intents (X not Ready) are cleared at heartbeat
+    // (`handle_heartbeat`), so a worker with `Some(intent_id)` here
+    // always has a live reservation.
+    if w.intent_id
+        .as_deref()
+        .is_some_and(|id| id != drv.drv_hash.as_ref())
+    {
+        return Some("intent-reserved");
+    }
     // can_build()'s two checks, separated.
     if !w.systems.iter().any(|s| s == &drv.system) {
         return Some("system-mismatch");

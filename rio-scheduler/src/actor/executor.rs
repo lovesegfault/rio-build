@@ -731,6 +731,16 @@ impl DagActor {
         let (reconciled, suspect, confirmed_phantoms) =
             self.reconcile_running_build(executor_id, hb.running_build);
 
+        // intent_id: DOWNGRADE to None if it doesn't point at a
+        // currently-Ready drv. Computed here (before `get_mut`) so the
+        // dag read doesn't overlap the executors borrow. See the
+        // assignment site below for rationale.
+        let intent_id = hb.intent_id.filter(|id| {
+            self.dag
+                .node(id)
+                .is_some_and(|s| s.status() == DerivationStatus::Ready)
+        });
+
         // Existence asserted at top of function (I-048b early-return).
         // get_mut not entry().or_insert: this path never creates.
         let worker = self
@@ -766,16 +776,15 @@ impl DagActor {
         // worker didn't declare one (empty string in proto) — it
         // becomes a wildcard worker that accepts any class.
         worker.size_class = hb.size_class;
-        // intent_id: overwrite unconditionally. The pod annotation is
-        // immutable post-create, so a non-None→None flip means a
-        // misconfigured worker (RIO_INTENT_ID dropped from env) — but
-        // reflecting the most recent heartbeat is still correct (the
-        // SpawnIntent match is best-effort; dispatch falls through to
-        // pick-from-queue when no intent matches).
-        // `find_executor_with_overflow` reads this: a worker with
-        // `intent_id == drv_hash` is preferred for that drv (its pod
-        // resources were sized for it via `solve_intent_for`).
-        worker.intent_id = hb.intent_id;
+        // intent_id: the pod annotation is immutable post-create, but
+        // the scheduler may re-plan (drv completed elsewhere, scheduler
+        // restarted) before this pod heartbeats. `rejection_reason()`
+        // treats `Some(X)` as an exclusive reservation for X; without
+        // the not-Ready→None downgrade above, a stale-intent worker
+        // would be rejected for everything and idle until
+        // activeDeadlineSeconds. After the downgrade it falls through
+        // to pick-from-queue like a Static-sized pod.
+        worker.intent_id = intent_id;
         // kind: overwrite unconditionally. An executor that flips kind
         // mid-life is a misconfiguration, but the scheduler should
         // reflect the most recent heartbeat (not a stale default).
