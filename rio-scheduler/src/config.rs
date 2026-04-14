@@ -96,6 +96,11 @@ pub(super) struct Config {
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
     pub(super) dashboard: DashboardConfig,
+    /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml.
+    /// `None` = SLA-mode disabled (Phase-2 const-tier path stays
+    /// active). No env override — structured config only. Validated
+    /// via [`rio_scheduler::sla::config::SlaConfig::validate`].
+    pub(super) sla: Option<rio_scheduler::sla::config::SlaConfig>,
 }
 
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
@@ -153,6 +158,7 @@ impl Default for Config {
             substitute_max_concurrent: default_substitute_concurrency(),
             headroom_multiplier: default_headroom_multiplier(),
             dashboard: DashboardConfig::default(),
+            sla: None,
         }
     }
 }
@@ -284,12 +290,10 @@ impl rio_common::config::ValidateConfig for Config {
          every derivation poisons immediately)",
             cfg.poison.threshold
         );
-        // `bucketed_estimate` (estimator.rs) computes `(ema × mult).ceil()
-        // as u64`. mult ≤ 0 or NaN → saturating cast yields 0 → `.div_ceil
-        // (...).max(1)` floors every estimate to minimum bucket (4GiB,
-        // 2 cores). Controller would under-provision EVERY build. inf
-        // → u64::MAX → `div_ceil × bucket` overflows u64 (panic in
-        // debug, wrap in release). Require finite + positive.
+        // headroom_multiplier feeds the manifest RPC / SizingConfig.
+        // mult ≤ 0 or NaN would silently under-provision every build;
+        // inf overflows u64 in `(ema × mult) as u64`. Require finite +
+        // positive.
         anyhow::ensure!(
             cfg.headroom_multiplier.is_finite() && cfg.headroom_multiplier > 0.0,
             "headroom_multiplier must be finite and positive, got {} \
@@ -345,6 +349,9 @@ impl rio_common::config::ValidateConfig for Config {
                     );
                 }
             }
+        }
+        if let Some(sla) = &cfg.sla {
+            sla.validate()?;
         }
         Ok(())
     }

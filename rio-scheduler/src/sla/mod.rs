@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 
 use crate::db::SchedulerDb;
 
+pub mod config;
 pub mod fit;
 pub mod ingest;
 pub mod solve;
