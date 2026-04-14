@@ -265,6 +265,9 @@ pub async fn setup(
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
+        // Same Arc as the heartbeat loop (above) — completion reads
+        // the snapshot the cgroup poller has been maintaining.
+        resources: resource_snapshot,
     };
 
     Ok(Some(BuilderRuntime {

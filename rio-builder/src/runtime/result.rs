@@ -4,13 +4,25 @@
 //! infrastructure status decision and the SLI outcome label live next to
 //! each other instead of inline in a 300-line spawned async block.
 
-use rio_proto::types::{BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport};
+use rio_proto::types::{
+    BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport, ResourceUsage,
+};
 
 use crate::executor::{ExecutionResult, ExecutorError};
 
+/// Per-worker fields stamped onto every `CompletionReport` regardless of
+/// outcome. Bundled so [`ok_completion`] / [`err_completion`] /
+/// [`panic_completion`] don't each grow a parameter per ADR-023 field.
+pub(super) struct CompletionStamp {
+    pub node_name: Option<String>,
+    /// Cgroup-poll snapshot at completion time. `None` only if the
+    /// caller has no `ResourceSnapshotHandle` (panic-catcher fallback).
+    pub final_resources: Option<ResourceUsage>,
+}
+
 /// Map a successful `ExecutionResult` to its `CompletionReport`. Resource
 /// fields flow from the executor (cgroup `memory.peak` + polled `cpu.stat`).
-pub(super) fn ok_completion(r: ExecutionResult, node_name: Option<String>) -> CompletionReport {
+pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> CompletionReport {
     CompletionReport {
         drv_path: r.drv_path,
         result: Some(r.result),
@@ -18,7 +30,8 @@ pub(super) fn ok_completion(r: ExecutionResult, node_name: Option<String>) -> Co
         peak_memory_bytes: r.peak_memory_bytes,
         output_size_bytes: r.output_size_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
-        node_name,
+        node_name: stamp.node_name,
+        final_resources: stamp.final_resources,
     }
 }
 
@@ -45,7 +58,7 @@ pub(super) fn err_completion(
     drv_path: String,
     assignment_token: String,
     was_cancelled: bool,
-    node_name: Option<String>,
+    stamp: CompletionStamp,
 ) -> CompletionReport {
     let status = if was_cancelled {
         tracing::info!(drv_path = %drv_path, "build cancelled (cgroup.kill)");
@@ -74,7 +87,11 @@ pub(super) fn err_completion(
         peak_memory_bytes: 0,
         output_size_bytes: 0,
         peak_cpu_cores: 0.0,
-        node_name,
+        node_name: stamp.node_name,
+        // Carry the snapshot even on executor error: cpu_seconds_total
+        // and peak_disk_bytes from a build that OOMed are exactly what
+        // the SLA model needs to NOT pick that size class again.
+        final_resources: stamp.final_resources,
     }
 }
 
@@ -83,7 +100,7 @@ pub(super) fn err_completion(
 pub(super) fn panic_completion(
     drv_path: String,
     assignment_token: String,
-    node_name: Option<String>,
+    stamp: CompletionStamp,
 ) -> CompletionReport {
     CompletionReport {
         drv_path,
@@ -98,7 +115,8 @@ pub(super) fn panic_completion(
         peak_memory_bytes: 0,
         output_size_bytes: 0,
         peak_cpu_cores: 0.0,
-        node_name,
+        node_name: stamp.node_name,
+        final_resources: stamp.final_resources,
     }
 }
 

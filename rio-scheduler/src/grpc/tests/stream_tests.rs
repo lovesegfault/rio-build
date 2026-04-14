@@ -121,6 +121,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
                     output_size_bytes: 0,
                     peak_cpu_cores: 0.0,
                     node_name: None,
+                    final_resources: None,
                 },
             )),
         })
@@ -445,6 +446,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
                     output_size_bytes: 0,
                     peak_cpu_cores: 0.0,
                     node_name: None,
+                    final_resources: None,
                 },
             )),
         })

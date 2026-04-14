@@ -122,6 +122,11 @@ pub enum ActorCommand {
         /// → `RIO_NODE_NAME` → `CompletionReport.node_name`). For
         /// ADR-023's hw_class join. `None` = old executor / non-k8s.
         node_name: Option<String>,
+        /// Builder's final cgroup-poll snapshot. Carries the ADR-023
+        /// telemetry (`cpu_limit_cores`, `cpu_seconds_total`,
+        /// `peak_io_pressure_pct`, `peak_disk_bytes`) for the
+        /// `build_samples` insert. `None` = old executor.
+        final_resources: Option<rio_proto::types::ResourceUsage>,
     },
 
     /// A detached upstream-substitute fetch (spawned by

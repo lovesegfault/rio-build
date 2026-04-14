@@ -570,6 +570,9 @@ impl DagActor {
         // CompletionReport.node_name (downward API spec.nodeName).
         // For ADR-023 build_samples.node_name → controller hw_class join.
         node_name: Option<String>,
+        // CompletionReport.final_resources — builder's last cgroup-poll
+        // snapshot. Feeds build_samples ADR-023 columns. None = old executor.
+        final_resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // Arch#13: proto→domain at the actor boundary. Status
         // normalization (raw i32 → enum, unknown → Unspecified) happens
@@ -712,6 +715,7 @@ impl DagActor {
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
                     node_name,
+                    final_resources,
                 )
                 .await;
             }
@@ -777,6 +781,7 @@ impl DagActor {
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
         node_name: Option<String>,
+        final_resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         let t_total = std::time::Instant::now();
@@ -831,6 +836,7 @@ impl DagActor {
             result,
             (peak_memory_bytes, peak_cpu_cores),
             node_name,
+            final_resources,
         )
         .await;
 
@@ -1332,7 +1338,9 @@ impl DagActor {
         result: &crate::domain::BuildResult,
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
         node_name: Option<String>,
+        final_resources: Option<rio_proto::types::ResourceUsage>,
     ) {
+        let final_res = final_resources.as_ref();
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
             && let Some(actual) = result.duration()
@@ -1415,18 +1423,18 @@ impl DagActor {
                         // peak_cpu_cores: same 0→None filter as the EMA —
                         // 0.0 means "no samples taken", not "used 0 cores".
                         peak_cpu_cores: peak_cpu,
-                        // ADR-023 cgroup telemetry (cpu_limit_cores,
-                        // cpu_seconds_total, peak_io_pressure_pct,
-                        // peak_disk_bytes) lives on ResourceUsage which is
-                        // delivered via ProgressUpdate, not CompletionReport.
-                        // TODO: thread the final ProgressUpdate.resources
-                        // through ProcessCompletion (or have the builder
-                        // attach a final ResourceUsage to CompletionReport).
-                        // The SLA fit tolerates NULLs.
-                        cpu_limit_cores: None,
-                        cpu_seconds_total: None,
-                        peak_disk_bytes: None,
-                        peak_io_pressure_pct: None,
+                        // ADR-023 cgroup telemetry: builder attaches its
+                        // final ResourceUsage snapshot to CompletionReport
+                        // (NOT the last ProgressUpdate — those are
+                        // best-effort/droppable; CompletionReport isn't).
+                        // None → old executor → NULL columns; SLA fit
+                        // tolerates them.
+                        cpu_limit_cores: final_res.and_then(|r| r.cpu_limit_cores),
+                        cpu_seconds_total: final_res.and_then(|r| r.cpu_seconds_total),
+                        peak_disk_bytes: final_res
+                            .and_then(|r| r.peak_disk_bytes)
+                            .map(|b| b.min(i64::MAX as u64) as i64),
+                        peak_io_pressure_pct: final_res.and_then(|r| r.peak_io_pressure_pct),
                         // drv-declared sizing inputs — on the dag node.
                         version: state.version.clone(),
                         enable_parallel_building: state.enable_parallel_building,

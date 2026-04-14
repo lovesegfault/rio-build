@@ -541,6 +541,7 @@ impl DagActor {
                     peak_memory_bytes,
                     peak_cpu_cores,
                     node_name,
+                    final_resources,
                 } => {
                     self.handle_completion(
                         &executor_id,
@@ -548,6 +549,7 @@ impl DagActor {
                         result,
                         (peak_memory_bytes, peak_cpu_cores),
                         node_name,
+                        final_resources,
                     )
                     .await;
                 }

@@ -29,12 +29,14 @@ use prefetch::PrefetchDeps;
 use result::{err_completion, ok_completion, outcome_label, panic_completion};
 use setup::{BalanceGuards, WorkerClient};
 
+use crate::cgroup::ResourceSnapshotHandle;
+
 // Test-only re-exports: the `mod tests` block below predates the
 // submodule split and pulls everything via `super::*`.
 #[cfg(test)]
 use {
-    crate::cgroup::ResourceSnapshotHandle, prefetch::PREFETCH_WARM_SIZE_CAP_BYTES,
-    rio_proto::types::PrefetchHint, setup::validate_host_arch, tokio::sync::Semaphore,
+    prefetch::PREFETCH_WARM_SIZE_CAP_BYTES, rio_proto::types::PrefetchHint,
+    setup::validate_host_arch, tokio::sync::Semaphore,
 };
 
 use std::future::Future;
@@ -121,6 +123,24 @@ pub struct BuildSpawnContext {
     /// Attached to every `CompletionReport` for ADR-023's hw_class
     /// join. `None` outside k8s (empty config string).
     pub node_name: Option<String>,
+    /// Shared handle to the cgroup-poll [`ResourceUsage`] snapshot
+    /// (same `Arc` as the heartbeat loop). Read once at completion
+    /// time to populate `CompletionReport.final_resources` so the
+    /// scheduler's `build_samples` writer has the ADR-023 telemetry
+    /// without depending on best-effort `ProgressUpdate` delivery.
+    pub resources: ResourceSnapshotHandle,
+}
+
+impl BuildSpawnContext {
+    /// Per-worker fields stamped onto every [`CompletionReport`]
+    /// (success, error, and panic paths). Read once at completion
+    /// time so the snapshot reflects the build's final cgroup state.
+    fn completion_stamp(&self) -> result::CompletionStamp {
+        result::CompletionStamp {
+            node_name: self.node_name.clone(),
+            final_resources: Some(*self.resources.read().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
 }
 
 impl BuildSpawnContext {
@@ -300,6 +320,7 @@ pub async fn spawn_build_task(
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
     let panic_node_name = ctx.node_name.clone();
+    let panic_resources = Arc::clone(&ctx.resources);
 
     // The spawned task needs 'static; clone the whole context once and
     // move it in. ExecutorEnv is built INSIDE the task from the owned
@@ -378,14 +399,15 @@ pub async fn spawn_build_task(
         // is read BEFORE deciding the status — Acquire pairs with
         // try_cancel_build's Release (not strictly needed, no other state
         // to synchronize, but cheap and documents the pairing).
+        let stamp = ctx.completion_stamp();
         let completion = match result {
-            Ok(exec_result) => ok_completion(exec_result, ctx.node_name.clone()),
+            Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
                 &e,
                 drv_path,
                 assignment_token,
                 cancelled.load(std::sync::atomic::Ordering::Acquire),
-                ctx.node_name.clone(),
+                stamp,
             ),
         };
 
@@ -416,7 +438,12 @@ pub async fn spawn_build_task(
                 msg: Some(executor_message::Msg::Completion(panic_completion(
                     panic_drv_path.clone(),
                     panic_token,
-                    panic_node_name,
+                    result::CompletionStamp {
+                        node_name: panic_node_name,
+                        final_resources: Some(
+                            *panic_resources.read().unwrap_or_else(|e| e.into_inner()),
+                        ),
+                    },
                 ))),
             };
             if let Err(e) = panic_tx.send(msg).await {
