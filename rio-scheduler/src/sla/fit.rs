@@ -114,8 +114,8 @@ pub fn fit_duration(
         b[i] = sw * ts[i];
     }
     let norms: Vec<f64> = (0..cols).map(|j| a.column(j).norm().max(1e-12)).collect();
-    for j in 0..cols {
-        a.column_mut(j).scale_mut(1.0 / norms[j]);
+    for (j, &norm) in norms.iter().enumerate() {
+        a.column_mut(j).scale_mut(1.0 / norm);
     }
     let x = nnls(&a, &b);
     let s = RefSeconds(x[0] / norms[0]);
@@ -136,6 +136,11 @@ pub fn fit_duration(
     } else {
         DurationFit::Amdahl { s, p }
     }
+}
+
+// r[impl sched.sla.headroom-confidence-scaled]
+pub fn headroom(n_eff: f64) -> f64 {
+    1.25 + 0.7 / n_eff.max(1.0).sqrt()
 }
 
 /// Log-residual sigma: stddev of ln(obs/fit) weighted by w_i.
@@ -233,5 +238,20 @@ mod tests {
         let w = vec![1.0; 4];
         let fit = fit_duration(&cs, &ts, &w, false, f64::INFINITY);
         assert!(sigma_resid(&cs, &ts, &w, &fit) < 1e-3);
+    }
+
+    #[test]
+    fn headroom_at_1() {
+        assert!((headroom(1.0) - 1.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn headroom_at_100() {
+        assert!((headroom(100.0) - 1.32).abs() < 1e-2);
+    }
+
+    #[test]
+    fn headroom_clamps_below_1() {
+        assert_eq!(headroom(0.1), headroom(1.0));
     }
 }
