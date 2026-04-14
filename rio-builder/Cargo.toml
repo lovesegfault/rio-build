@@ -12,6 +12,16 @@ description = "Build executor with FUSE store for rio-build"
 name = "rio-builder"
 path = "src/main.rs"
 
+[features]
+# RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
+# the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
+# cpu_seconds) keyed on (pname, cpu_limit). Runtime-gated on the env
+# var so default-on is harmless in production; default because crate2nix
+# bakes features at lock-time and the VM-test workspace package has no
+# per-crate feature override hook.
+default = ["test-fixtures"]
+test-fixtures = ["dep:toml"]
+
 [dependencies]
 rio-common = { workspace = true }
 rio-nix = { workspace = true }
@@ -44,6 +54,7 @@ futures-util = { workspace = true }
 axum = { workspace = true }
 scopeguard = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true, optional = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 regex = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

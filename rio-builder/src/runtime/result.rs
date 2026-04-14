@@ -22,6 +22,8 @@ pub(super) struct CompletionStamp {
 
 /// Map a successful `ExecutionResult` to its `CompletionReport`. Resource
 /// fields flow from the executor (cgroup `memory.peak` + polled `cpu.stat`).
+/// `r.fixture_resources` (test-fixtures only) overrides the cgroup-poll
+/// snapshot so scripted builds can inject `cpu_limit_cores`/`cpu_seconds`.
 pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> CompletionReport {
     CompletionReport {
         drv_path: r.drv_path,
@@ -31,7 +33,7 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
         output_size_bytes: r.output_size_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
         node_name: stamp.node_name,
-        final_resources: stamp.final_resources,
+        final_resources: r.fixture_resources.or(stamp.final_resources),
     }
 }
 

@@ -31,10 +31,10 @@ use rio_proto::types::{
     DrainExecutorRequest, DrainExecutorResponse, GcProgress, GcRequest, GetBuildGraphRequest,
     GetBuildGraphResponse, GetBuildLogsRequest, GetEstimatorStatsRequest,
     GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
-    PoisonedDerivation, ReportExecutorTerminationRequest, ReportExecutorTerminationResponse,
-    TerminationReason,
+    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
+    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
+    ReportExecutorTerminationResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -587,6 +587,40 @@ impl AdminService for AdminServiceImpl {
             })
             .collect();
         Ok(Response::new(DebugListExecutorsResponse { executors }))
+    }
+
+    /// VM-test fixture: write one synthetic `build_samples` row. Gated
+    /// on `RIO_ADMIN_TEST_FIXTURES` so a misrouted prod call is refused
+    /// even with admin auth — the env var is only set by the sla-sizing
+    /// VM scenario's standalone fixture.
+    #[instrument(skip(self, request), fields(rpc = "InjectBuildSample"))]
+    async fn inject_build_sample(
+        &self,
+        request: Request<InjectBuildSampleRequest>,
+    ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        if std::env::var_os("RIO_ADMIN_TEST_FIXTURES").is_none() {
+            return Err(Status::permission_denied(
+                "InjectBuildSample is a test fixture; set RIO_ADMIN_TEST_FIXTURES to enable",
+            ));
+        }
+        let r = request.into_inner();
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        db.write_build_sample(&crate::db::BuildSampleRow {
+            pname: r.pname,
+            system: r.system,
+            tenant: r.tenant,
+            duration_secs: r.duration_secs,
+            peak_memory_bytes: r.peak_memory_bytes,
+            cpu_limit_cores: r.cpu_limit_cores,
+            cpu_seconds_total: r.cpu_seconds_total,
+            version: r.version,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("write_build_sample: {e}")))?;
+        Ok(Response::new(()))
     }
 }
 

@@ -28,6 +28,8 @@
 pub mod cgroup;
 pub mod config;
 pub mod executor;
+#[cfg(feature = "test-fixtures")]
+pub mod fixture;
 pub mod fuse;
 pub mod health;
 pub mod log_stream;

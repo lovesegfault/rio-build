@@ -1,0 +1,38 @@
+# RIO_BUILDER_SCRIPT fixture for the sla-sizing VM scenario.
+#
+# Models a saturated Amdahl curve T(c) = 30 + 2000/c. cpu_seconds is
+# wall · c · 0.95 (saturated → util > 0.4 gate fires → ×4-bump path).
+# peak_mem follows the probe shape (4Gi base + 2Gi/core).
+
+[[entry]]
+pname = "synth-amdahl"
+cpu_limit = 4
+wall_secs = 530.0
+peak_cpu = 3.8
+cpu_seconds = 2014.0
+peak_mem = 12884901888
+
+[[entry]]
+pname = "synth-amdahl"
+cpu_limit = 16
+wall_secs = 155.0
+peak_cpu = 15.2
+cpu_seconds = 2356.0
+peak_mem = 38654705664
+
+[[entry]]
+pname = "synth-amdahl"
+cpu_limit = 64
+wall_secs = 61.25
+peak_cpu = 60.8
+cpu_seconds = 3724.0
+peak_mem = 141733920768
+
+# Halve-path control: unsaturated at c=4 (util 0.1 < 0.4 gate).
+[[entry]]
+pname = "synth-serial"
+cpu_limit = 4
+wall_secs = 100.0
+peak_cpu = 0.4
+cpu_seconds = 40.0
+peak_mem = 4294967296

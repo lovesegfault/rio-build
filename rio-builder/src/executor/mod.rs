@@ -280,6 +280,13 @@ pub struct ExecutionResult {
     /// usage_usec. `delta_usec / elapsed_usec`, max over build lifetime.
     /// Tree-wide. 0.0 = build failed before any sample (exited <1s).
     pub peak_cpu_cores: f64,
+    /// `RIO_BUILDER_SCRIPT` override for `CompletionReport.final_resources`.
+    /// `None` on every real build; `Some` only from
+    /// `fixture::scripted_result` (feature `test-fixtures`). When set,
+    /// `runtime::result::ok_completion` uses this instead of the cgroup-
+    /// poll snapshot so the SLA VM scenario can script
+    /// `cpu_limit_cores`/`cpu_seconds_total` deterministically.
+    pub fixture_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
 /// Execute a single build assignment.
@@ -408,6 +415,29 @@ pub async fn execute_build(
     // crate::cgroup::effective_cores.
     let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
 
+    // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
+    // short-circuit the daemon lifecycle and report scripted telemetry
+    // so the explore ladder can be driven without wall-clock minutes
+    // per probe. After overlay+input setup so the FUSE/JIT paths still
+    // exercise; before sandbox prep so no nix-daemon spawns.
+    #[cfg(feature = "test-fixtures")]
+    if let Some(pname) = drv.env().get("pname")
+        && let Some(o) = crate::fixture::lookup(pname, effective_cores)
+    {
+        tracing::info!(%pname, effective_cores, wall_secs = o.wall_secs,
+            "RIO_BUILDER_SCRIPT: short-circuiting build with scripted telemetry");
+        let r = crate::fixture::scripted_result(
+            drv_path,
+            &assignment.assignment_token,
+            effective_cores,
+            o,
+        );
+        if let Err(e) = overlay::teardown_overlay(overlay_mount) {
+            tracing::warn!(error = %e, "fixture-path overlay teardown failed");
+        }
+        return Ok(r);
+    }
+
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
     prepare_sandbox(
         &overlay_mount,
@@ -535,6 +565,7 @@ pub async fn execute_build(
         peak_memory_bytes,
         output_size_bytes,
         peak_cpu_cores,
+        fixture_resources: None,
     })
 }
 

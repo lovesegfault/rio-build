@@ -281,6 +281,10 @@ rec {
       # `environment = {...}` block — figment reads the union. Same env
       # applied to all three services (unknown vars are ignored).
       extraServiceEnv ? { },
+      # Scheduler-only systemd env. Merged on top of extraServiceEnv so
+      # scheduler-specific fixture toggles (RIO_ADMIN_TEST_FIXTURES)
+      # don't leak to store/gateway.
+      extraSchedulerEnv ? { },
     }:
     {
       imports = [
@@ -298,7 +302,7 @@ rec {
       # etc. covEnv is {} when coverage=false.
       systemd.services = {
         rio-store.environment = extraServiceEnv // covEnv;
-        rio-scheduler.environment = extraServiceEnv // covEnv;
+        rio-scheduler.environment = extraServiceEnv // extraSchedulerEnv // covEnv;
         rio-gateway.environment = extraServiceEnv // covEnv;
       };
 

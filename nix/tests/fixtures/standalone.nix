@@ -50,6 +50,9 @@ in
   extraSchedulerConfig ? { },
   extraStoreConfig ? { },
   extraPackages ? [ ],
+  # Scheduler-only systemd env (figment + fixture toggles like
+  # RIO_ADMIN_TEST_FIXTURES). Merged on top of extraServiceEnv.
+  extraSchedulerEnv ? { },
   # Gateway-only env (figment RIO_FOO__BAR=... style). substitute.nix
   # uses this to set RIO_JWT__KEY_PATH for the gateway's signing seed
   # without also applying it to store/scheduler (extraServiceEnv goes
@@ -131,7 +134,12 @@ let
       (common.mkControlNode {
         hostName = "control";
         extraServiceEnv = controlHmacEnv // otelEnv;
-        inherit extraSchedulerConfig extraStoreConfig extraPackages;
+        inherit
+          extraSchedulerConfig
+          extraStoreConfig
+          extraPackages
+          extraSchedulerEnv
+          ;
         # Metrics ports open for cross-VM scraping (scheduling fanout
         # scenario asserts worker metrics from control).
         extraFirewallPorts = [

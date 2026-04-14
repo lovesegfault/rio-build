@@ -59,7 +59,48 @@ let
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
+  sla-sizing = import ./scenarios/sla-sizing.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
+
+  # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
+  # the scripted-telemetry TOML, scheduler with [sla] configured + the
+  # InjectBuildSample fixture gate. tickIntervalSecs=2 so the estimator
+  # refit fires fast enough for wait_until_succeeds.
+  slaSizingFixture = standalone {
+    workers = {
+      worker = {
+        extraServiceEnv = {
+          RIO_BUILDER_SCRIPT = "${./fixtures/sla-builder-script.toml}";
+        };
+      };
+    };
+    extraSchedulerEnv = {
+      RIO_ADMIN_TEST_FIXTURES = "1";
+    };
+    extraSchedulerConfig = {
+      tickIntervalSecs = 2;
+      extraConfig = ''
+        [sla]
+        default_tier = "normal"
+        max_cores = 64
+        max_mem = 274877906944
+        max_disk = 214748364800
+        default_disk = 21474836480
+        fuse_cache_budget = 8589934592
+        log_budget = 1073741824
+
+        [[sla.tiers]]
+        name = "normal"
+        p90 = 1200
+
+        [sla.probe]
+        cpu = 4
+        mem_per_core = 2147483648
+        mem_base = 4294967296
+      '';
+    };
+    extraPackages = [ pkgs.postgresql ];
+  };
 
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
@@ -338,6 +379,24 @@ in
         ];
       };
     };
+
+  # ── sla-sizing (standalone fixture, scripted-telemetry worker) ───────
+  vm-sla-sizing-standalone =
+    (sla-sizing {
+      inherit pkgs common;
+      fixture = slaSizingFixture;
+    }).mkTest
+      {
+        name = "default";
+        subtests = [
+          # r[verify sched.sla.explore-x4-first-bump]
+          # r[verify sched.sla.explore-saturation-gate]
+          # r[verify sched.sla.explore-freeze]
+          "convergence"
+          # r[verify sched.sla.outlier-mad-reject]
+          "outlier"
+        ];
+      };
 
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (wsmall1/wsmall2/wlarge + size-classes) for

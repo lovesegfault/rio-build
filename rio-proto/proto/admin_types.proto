@@ -494,3 +494,20 @@ message GetEstimatorStatsResponse {
   // Sorted by sample_count desc (most-observed first).
   repeated EstimatorEntry entries = 1;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// InjectBuildSample (sla-sizing VM test fixture)
+// ───────────────────────────────────────────────────────────────────────────
+
+// One synthetic build_samples row. Mirrors the columns the SLA fit
+// reads; everything else (hw_class, node_name, …) is left NULL.
+message InjectBuildSampleRequest {
+  string pname = 1;
+  string system = 2;
+  string tenant = 3;
+  double duration_secs = 4;
+  int64 peak_memory_bytes = 5;
+  optional double cpu_limit_cores = 6;
+  optional double cpu_seconds_total = 7;
+  optional string version = 8;
+}

@@ -20014,6 +20014,10 @@
           "packageId": "tokio-stream"
         },
         {
+          "name": "toml",
+          "packageId": "toml 1.1.2+spec-1.1.0"
+        },
+        {
           "name": "tonic",
           "packageId": "tonic"
         },
@@ -20055,6 +20059,10 @@
           "name": "tower",
           "packageId": "tower"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "test-fixtures"
       ],
       "crateBin": [
         {
