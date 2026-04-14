@@ -156,5 +156,22 @@ pkgs.testers.runNixOSTest {
     # registration never succeeds, but the process stays active.
     with subtest("kubelet starts under nodeadm-written config"):
         node.wait_for_unit("kubelet.service")
+
+    with subtest("kubelet resolvConf points past systemd-resolved stub"):
+        # Without this drop-in, kubelet copies the stub (127.0.0.53) into
+        # dnsPolicy=Default pods and coredns forward-loops on itself.
+        # Assert: drop-in present, its target exists with a non-loopback
+        # nameserver, and the stub it bypasses DOES contain the loopback
+        # (so removing the drop-in would reintroduce the bug).
+        import json
+        dropin = json.loads(node.succeed(
+            "cat /etc/kubernetes/kubelet/config.json.d/10-rio-resolv-conf.conf"
+        ))
+        assert dropin["resolvConf"] == "/run/systemd/resolve/resolv.conf", dropin
+        upstream = node.succeed("cat /run/systemd/resolve/resolv.conf")
+        assert "127.0.0." not in upstream, f"upstream resolv.conf still loopback:\n{upstream}"
+        assert "nameserver " in upstream, f"upstream resolv.conf has no nameserver:\n{upstream}"
+        stub = node.succeed("cat /run/systemd/resolve/stub-resolv.conf")
+        assert "127.0.0.53" in stub, f"stub no longer loopback (precondition changed):\n{stub}"
   '';
 }

@@ -152,6 +152,18 @@ in
         registryPullQPS = 50;
         registryBurst = 100;
       };
+      # NixOS symlinks /etc/resolv.conf → systemd-resolved's stub
+      # (`nameserver 127.0.0.53`). kubelet's default is to copy that into
+      # pods with `dnsPolicy: Default` — coredns is one. Its Corefile
+      # `forward . /etc/resolv.conf` then loops to itself → plugin/loop
+      # FATAL → CrashLoopBackOff. Point kubelet at the upstream list
+      # instead (VPC resolver, `10.42.0.2`). Matches kubeadm's
+      # systemd-resolved handling.
+      "kubernetes/kubelet/config.json.d/10-rio-resolv-conf.conf".text = builtins.toJSON {
+        apiVersion = "kubelet.config.k8s.io/v1beta1";
+        kind = "KubeletConfiguration";
+        resolvConf = "/run/systemd/resolve/resolv.conf";
+      };
     };
 
     # ── networking: systemd-networkd (AL2023 parity), not dhcpcd ──────
