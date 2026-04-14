@@ -1,10 +1,14 @@
 //! Git helpers via gix. Used for the ECR image tag: short-SHA plus a
 //! `-dirty-${hash}` suffix if the tree has uncommitted changes.
 
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::sh::{self, cmd, shell};
+
+static TAG_CACHE: OnceLock<String> = OnceLock::new();
 
 pub fn open() -> Result<gix::Repository> {
     gix::open(sh::repo_root()).context("failed to open git repo")
@@ -33,13 +37,26 @@ pub fn short_sha(repo: &gix::Repository) -> Result<String> {
 /// here AND invisible to the nix build, so they correctly don't affect
 /// the tag. Binary files are covered by the `index <old>..<new>` blob-
 /// SHA line in the diff header even without `--binary`.
+///
+/// Process-cached: `up` runs Push and Ami concurrently, then Deploy.
+/// Recomputing in Deploy after Ami (or a parallel editor) touched the
+/// tree would yield a different tag than Push used → `assert_in_ecr`
+/// rejects the tag Push just uploaded. First call wins; all phases in
+/// one `xtask` invocation see the same value.
 pub fn image_tag(repo: &gix::Repository) -> Result<String> {
+    if let Some(t) = TAG_CACHE.get() {
+        return Ok(t.clone());
+    }
     let sha = short_sha(repo)?;
     let sh = shell()?;
     let diff = sh::read(cmd!(sh, "git diff HEAD --no-ext-diff"))?;
-    if diff.is_empty() {
-        return Ok(sha);
-    }
-    let suffix = hex::encode(&Sha256::digest(diff.as_bytes())[..4]);
-    Ok(format!("{sha}-dirty-{suffix}"))
+    let tag = if diff.is_empty() {
+        sha
+    } else {
+        format!(
+            "{sha}-dirty-{}",
+            hex::encode(&Sha256::digest(diff.as_bytes())[..4])
+        )
+    };
+    Ok(TAG_CACHE.get_or_init(|| tag).clone())
 }
