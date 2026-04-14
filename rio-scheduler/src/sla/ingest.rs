@@ -4,9 +4,6 @@
 //! touched key on each refresh tick; the fit itself is pure (no DB, no I/O)
 //! so it can be unit-tested against synthetic rows.
 
-// TODO(ADR-023): drop once Phase 2 lands
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::time::Duration;
 

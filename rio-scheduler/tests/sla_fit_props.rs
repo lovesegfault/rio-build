@@ -65,6 +65,7 @@ proptest! {
 
     /// USL `T(c) = S + P/c + Q·c` has `dT/dc = -P/c² + Q ≤ 0` for `c ≤ √(P/Q) = c_opt`,
     /// so `T` is monotone non-increasing on `[1, c_opt]`.
+    // r[verify sched.sla.fit-nnls]
     #[test]
     fn t_monotone_decreasing_on_1_to_copt(s in 1.0..500f64, p in 10.0..50000f64, q in 0.0..1f64) {
         let fit = DurationFit::Usl {
@@ -80,6 +81,7 @@ proptest! {
 
     /// `solve_mvp` rejects (does not clamp) `c* > cap_c`, and `cap_c ≤ max_cores`,
     /// so any `Feasible` result has `c* ≤ max_cores`.
+    // r[verify sched.sla.solve-citardauq]
     #[test]
     fn solve_never_returns_cstar_gt_maxcores(
         s in 1.0..500f64,
@@ -99,6 +101,7 @@ proptest! {
     }
 
     /// `headroom(n) = 1.25 + 0.7/√max(n,1)` is monotone non-increasing in `n ≥ 1`.
+    // r[verify sched.sla.headroom-confidence-scaled]
     #[test]
     fn headroom_monotone_decreasing_in_n(n in 1.0..100f64) {
         prop_assert!(headroom(n) >= headroom(n + 1.0));

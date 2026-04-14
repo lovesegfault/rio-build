@@ -1,6 +1,3 @@
-// TODO(ADR-023): drop once Phase 2 lands
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use nalgebra::{DMatrix, DVector};

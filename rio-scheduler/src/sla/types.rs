@@ -1,6 +1,3 @@
-// TODO(ADR-023): drop once Phase 2 lands
-#![allow(dead_code)]
-
 use rio_common::newtype;
 
 newtype!(pub RawCores(f64): Display, Add, Sub, Mul<f64>, Div<f64>, Ord);
@@ -9,6 +6,7 @@ newtype!(pub WallSeconds(f64): Display, Add, Sub, Mul<f64>, Div<f64>, Ord);
 newtype!(pub MemBytes(u64): Display, Add, Ord);
 newtype!(pub DiskBytes(u64): Display, Add, Ord);
 
+// r[impl sched.sla.model-key-tenant-scoped]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelKey {
     pub pname: String,
