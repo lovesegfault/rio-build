@@ -107,10 +107,18 @@ impl DagActor {
         // log-and-keep-stale semantics on PG failure as the EMA
         // estimator above; the cache holds the previous fit. The tier
         // ladder feeds the Schmitt-trigger reassignment inside refit.
-        match self.sla_estimator.refresh(&self.db, &self.sla_tiers).await {
-            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
-            Err(e) => {
-                warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
+        //
+        // Gated on `[sla]` configured: in Static mode the cache is
+        // never read (snapshot.rs / dispatch.rs both gate on
+        // `sla_config.is_some()`), so the per-key PG round-trips +
+        // NNLS refit are pure overhead. Keeps Static-mode tick latency
+        // identical to pre-ADR-023.
+        if self.sla_config.is_some() {
+            match self.sla_estimator.refresh(&self.db, &self.sla_tiers).await {
+                Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
+                Err(e) => {
+                    warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
+                }
             }
         }
 
