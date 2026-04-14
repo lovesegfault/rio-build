@@ -392,6 +392,12 @@ message HeartbeatRequest {
   // executor). Unset = idle. Replaces the legacy `repeated string
   // running_builds` (field 2, reserved).
   optional string running_build = 12;
+  // ADR-023: opaque SpawnIntent.intent_id this pod was spawned for.
+  // Read from the `rio.build/intent-id` pod annotation via downward-
+  // API → `RIO_INTENT_ID`. Empty = Static-sized pod (no pre-computed
+  // assignment; scheduler picks from queue as before). Scheduler maps
+  // empty → None.
+  string intent_id = 13;
 }
 
 message HeartbeatResponse {

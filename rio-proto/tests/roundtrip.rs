@@ -47,6 +47,12 @@ fn sizeclass_status_proto_roundtrip() {
                 sample_count: 142,
                 queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
                 running_by_system: [("x86_64-linux".into(), 3)].into(),
+                spawn_intents: vec![rio_proto::types::SpawnIntent {
+                    intent_id: "i-abc".into(),
+                    cores: 8,
+                    mem_bytes: 17_179_869_184,
+                    disk_bytes: 42_949_672_960,
+                }],
             },
             SizeClassStatus {
                 name: "large".into(),
@@ -57,6 +63,7 @@ fn sizeclass_status_proto_roundtrip() {
                 sample_count: 17,
                 queued_by_system: Default::default(),
                 running_by_system: [("aarch64-linux".into(), 1)].into(),
+                spawn_intents: vec![],
             },
         ],
         // P0556: same SizeClassStatus shape, cutoffs zeroed.

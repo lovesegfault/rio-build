@@ -259,6 +259,7 @@ pub(crate) struct HeartbeatFields {
     pub size_class: Option<String>,
     pub supported_features: Vec<String>,
     pub running_build: Option<String>,
+    pub intent_id: Option<String>,
 }
 
 impl Default for HeartbeatFields {
@@ -271,6 +272,7 @@ impl Default for HeartbeatFields {
             size_class: None,
             supported_features: vec![],
             running_build: None,
+            intent_id: None,
         }
     }
 }
@@ -300,6 +302,7 @@ pub(crate) async fn send_heartbeat_with(
             size_class: hb.size_class,
             supported_features: hb.supported_features,
             running_build: hb.running_build,
+            intent_id: hb.intent_id,
         }))
         .await?;
     Ok(())

@@ -59,6 +59,8 @@ pub(super) async fn get_size_class_status(
             sample_count: 0,
             queued_by_system: s.queued_by_system,
             running_by_system: s.running_by_system,
+            // FODs are reactive (size_class_floor), not SLA-estimated.
+            spawn_intents: Vec::new(),
         })
         .collect();
 
@@ -97,6 +99,11 @@ pub(super) async fn get_size_class_status(
             sample_count: samples,
             queued_by_system: s.queued_by_system,
             running_by_system: s.running_by_system,
+            // TODO(ADR-023 phase-2): populate from SlaEstimator. The
+            // controller already wires the consume side (spawn one pod
+            // per intent with stamped resources); empty here means it
+            // falls back to the scalar `queued` (Static-mode behavior).
+            spawn_intents: Vec::new(),
         })
         .collect();
 

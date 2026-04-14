@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ListExecutorsResponse",
         "ListBuildsResponse",
         "SizeClassStatus",
+        "SpawnIntent",
         "GetSizeClassStatusResponse",
         "EstimatorEntry",
         "GetEstimatorStatsResponse",

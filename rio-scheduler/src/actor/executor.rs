@@ -766,6 +766,15 @@ impl DagActor {
         // worker didn't declare one (empty string in proto) — it
         // becomes a wildcard worker that accepts any class.
         worker.size_class = hb.size_class;
+        // intent_id: overwrite unconditionally. The pod annotation is
+        // immutable post-create, so a non-None→None flip means a
+        // misconfigured worker (RIO_INTENT_ID dropped from env) — but
+        // reflecting the most recent heartbeat is still correct (the
+        // SpawnIntent match is best-effort; dispatch falls through to
+        // pick-from-queue when no intent matches).
+        // TODO(ADR-023 phase-2): look up pre-computed assignment by
+        // intent_id and prefer it at dispatch time.
+        worker.intent_id = hb.intent_id;
         // kind: overwrite unconditionally. An executor that flips kind
         // mid-life is a misconfiguration, but the scheduler should
         // reflect the most recent heartbeat (not a stale default).

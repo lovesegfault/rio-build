@@ -469,6 +469,16 @@ fn build_executor_container(
                 // spec.nodeName so the scheduler can resolve the node's
                 // instance type when recording build-history samples.
                 env_from_field("RIO_NODE_NAME", "spec.nodeName"),
+                // ADR-023 SpawnIntent match key. Reads the pod
+                // annotation set by `build_job` when spawning from a
+                // SpawnIntent (Sla mode). Static-mode pods have no
+                // annotation → kubelet resolves to "" → builder maps
+                // to None. Set unconditionally so the env list is
+                // role-agnostic.
+                env_from_field(
+                    "RIO_INTENT_ID",
+                    "metadata.annotations['rio.build/intent-id']",
+                ),
                 // Role discriminator. rio-builder's `RIO_EXECUTOR_
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
                 // §Executor enforcement — a builder receiving a FOD

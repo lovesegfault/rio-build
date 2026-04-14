@@ -65,6 +65,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             size_class: String::new(),
             store_degraded: false,
             draining: false,
+            intent_id: String::new(),
         })
         .await
         .expect("heartbeat should succeed");

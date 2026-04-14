@@ -155,6 +155,12 @@ pub struct ExecutorState {
     /// post-recovery `handle_reconcile_assignments` is the cold-start
     /// equivalent.
     pub phantom_suspect: Option<DrvHash>,
+    /// ADR-023 SpawnIntent match key from the pod's `rio.build/
+    /// intent-id` annotation (downward-API → `RIO_INTENT_ID` →
+    /// HeartbeatRequest.intent_id). `None` = Static-sized pod.
+    /// Dispatch (Phase-2) prefers the pre-computed assignment for
+    /// this intent; falls through to pick-from-queue if no match.
+    pub intent_id: Option<String>,
 }
 
 impl ExecutorState {
@@ -186,6 +192,7 @@ impl ExecutorState {
             // registration hook flips it for an empty ready-queue).
             warm: false,
             phantom_suspect: None,
+            intent_id: None,
         }
     }
 

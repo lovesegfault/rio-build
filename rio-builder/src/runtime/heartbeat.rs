@@ -36,6 +36,7 @@ pub async fn build_heartbeat_request(
     systems: &[String],
     features: &[String],
     size_class: &str,
+    intent_id: &str,
     slot: &BuildSlot,
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
@@ -82,6 +83,10 @@ pub async fn build_heartbeat_request(
         // Scheduler routes FODs to fetchers only per
         // spec sched.dispatch.fod-to-fetcher.
         kind: executor_kind as i32,
+        // ADR-023: SpawnIntent match key from `RIO_INTENT_ID`
+        // (downward-API pod annotation). Empty = Static-sized pod;
+        // scheduler maps to None and falls through to pick-from-queue.
+        intent_id: intent_id.to_string(),
     }
 }
 
@@ -93,6 +98,7 @@ pub(super) struct HeartbeatCtx {
     pub(super) systems: Vec<String>,
     pub(super) features: Vec<String>,
     pub(super) size_class: String,
+    pub(super) intent_id: String,
     pub(super) slot: Arc<BuildSlot>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
     pub(super) resources: crate::cgroup::ResourceSnapshotHandle,
@@ -115,6 +121,7 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
         systems,
         features,
         size_class,
+        intent_id,
         slot,
         ready,
         resources,
@@ -134,6 +141,7 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
                 &systems,
                 &features,
                 &size_class,
+                &intent_id,
                 &slot,
                 &resources,
                 circuit.is_open(),

@@ -358,6 +358,9 @@ impl ExecutorService for SchedulerGrpc {
         // actually-empty-named class makes no sense (operator config
         // validation would reject it), so this mapping is lossless.
         let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
+        // intent_id: same empty→None mapping. Empty = Static-sized pod
+        // (no SpawnIntent annotation on the pod template).
+        let intent_id = (!req.intent_id.is_empty()).then_some(req.intent_id);
 
         // kind: prost encodes enums as i32; decode via try_from.
         // Unknown value (future proto version) → Builder (safe default:
@@ -377,6 +380,7 @@ impl ExecutorService for SchedulerGrpc {
             store_degraded: req.store_degraded,
             draining: req.draining,
             kind,
+            intent_id,
         });
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

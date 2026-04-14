@@ -397,6 +397,31 @@ message SizeClassStatus {
   // Per-system breakdown of `running` (sum across keys == `running`).
   // Symmetry with `queued_by_system` for operator/dashboard use.
   map<string, uint64> running_by_system = 8;
+  // ADR-023 SLA-driven sizing: per-derivation spawn intents. When the
+  // pool's BuilderPoolSet has `sizing: Sla`, the scheduler pre-computes
+  // (cores, mem, disk) per queued derivation and exposes one intent per
+  // drv here; the controller spawns one pod per intent with those
+  // resources stamped in (pod resources are immutable post-create, so
+  // they must be known at spawn time, not at heartbeat-dispatch time).
+  // Empty under `sizing: Static` — controller falls back to the scalar
+  // `queued` and per-class `spec.resources`.
+  repeated SpawnIntent spawn_intents = 9;
+}
+
+// ADR-023: scheduler-computed resources for one to-be-spawned builder
+// pod. The controller stamps these into the pod's `resources.requests`
+// + `limits` and annotates the pod with `rio.build/intent-id`; the
+// builder reads the annotation via downward-API → `RIO_INTENT_ID` →
+// HeartbeatRequest.intent_id → scheduler matches the heartbeating pod
+// to its pre-computed assignment.
+message SpawnIntent {
+  // Opaque match key. Scheduler-generated; the controller passes it
+  // through verbatim as a pod annotation. NOT a drv path (the
+  // scheduler may re-plan before the pod heartbeats).
+  string intent_id = 1;
+  uint32 cores = 2;
+  uint64 mem_bytes = 3;
+  uint64 disk_bytes = 4;
 }
 
 message GetSizeClassStatusRequest {

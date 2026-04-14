@@ -65,10 +65,15 @@ use crate::reconcilers::common::job::{
     DEADLINE_SLACK_SECS, EPHEMERAL_TGPS, JOB_REQUEUE, JobReconcilePrologue, ephemeral_job,
     is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
     reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
-    report_terminated_pods, spawn_count, spawn_n,
+    report_terminated_pods, spawn_count, spawn_for_each, spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
+use rio_proto::types::SpawnIntent;
+
+/// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
+/// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
+pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
 
 use super::builders::{self, UpstreamAddrs};
 
@@ -162,19 +167,20 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     //
     // Cloning the admin client: tonic clients are cheap to clone
     // (Arc-internal). The finalizer's cleanup() does the same.
-    let (queued, scheduler_err): (u32, Option<String>) = match queued_for_pool(ctx, wp).await {
-        Ok(q) => (q, None),
-        Err(e) => {
-            warn!(
-                pool = %name, error = %e,
-                "queue-depth poll failed; treating as queued=0, will retry"
-            );
-            // Still patch status (so `kubectl get wp` shows current
-            // active count even when scheduler is down) before
-            // requeueing. Fall through with queued=0 → no spawn.
-            (0, Some(e.to_string()))
-        }
-    };
+    let (queued, intents, scheduler_err): (u32, Vec<SpawnIntent>, Option<String>) =
+        match queued_for_pool(ctx, wp).await {
+            Ok((q, intents)) => (q, intents, None),
+            Err(e) => {
+                warn!(
+                    pool = %name, error = %e,
+                    "queue-depth poll failed; treating as queued=0, will retry"
+                );
+                // Still patch status (so `kubectl get wp` shows current
+                // active count even when scheduler is down) before
+                // requeueing. Fall through with queued=0 → no spawn.
+                (0, Vec::new(), Some(e.to_string()))
+            }
+        };
 
     // ---- Count active Jobs for this pool ----
     // "Active" = not yet reached Complete/Failed. K8s Job status has
@@ -213,10 +219,31 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let headroom = ceiling.map_or(u32::MAX, |c| c.saturating_sub(active).max(0) as u32);
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
-    spawn_n(&jobs_api, to_spawn, &name, &wp.spec.size_class, || {
-        build_job(wp, oref.clone(), &scheduler, &store)
-    })
-    .await;
+    // ADR-023: when the scheduler returned per-drv SpawnIntents (Sla
+    // mode), spawn one pod per intent with that intent's resources +
+    // annotation. Else (Static mode / unclassed pool / scheduler
+    // doesn't populate intents yet) → existing scalar-count path.
+    if intents.is_empty() {
+        spawn_n(&jobs_api, to_spawn, &name, &wp.spec.size_class, || {
+            build_job(wp, oref.clone(), &scheduler, &store, None)
+        })
+        .await;
+    } else {
+        // Same `spawn_count` net (queued - active, capped by headroom)
+        // as the scalar path. The scheduler already reflects in-flight
+        // assignments in the intent list; `to_spawn` is the conservative
+        // bound so a slow tick doesn't double-spawn for the same intent.
+        // `take(to_spawn)` truncates; the remainder is picked up next
+        // tick after `active` decreases.
+        spawn_for_each(
+            &jobs_api,
+            intents.iter().take(to_spawn as usize),
+            &name,
+            &wp.spec.size_class,
+            |intent| build_job(wp, oref.clone(), &scheduler, &store, Some(intent)),
+        )
+        .await;
+    }
     if to_spawn == 0 {
         debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
     }
@@ -299,7 +326,16 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
 /// fall back to the systems-filtered cluster count. Better to
 /// over-spawn than to never spawn — the `activeDeadlineSeconds`
 /// backstop reaps wrong-class Jobs after 1h.
-async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32, tonic::Status> {
+///
+/// Returns `(queued, spawn_intents)`. ADR-023: `spawn_intents` is
+/// the matching class's per-drv intent list (empty under Static
+/// sizing or unclassed pools); `queued` is the legacy scalar for
+/// `spawn_count` and the reap comparison. Both are read from the
+/// same RPC response, so they're a coherent snapshot.
+async fn queued_for_pool(
+    ctx: &Ctx,
+    wp: &BuilderPool,
+) -> std::result::Result<(u32, Vec<SpawnIntent>), tonic::Status> {
     if !wp.spec.size_class.is_empty() {
         // I-176: pass `spec.features` so the scheduler excludes
         // derivations whose `required_features` this pool's workers
@@ -324,15 +360,29 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
             &wp.spec.systems,
             &wp.spec.features,
         ) {
+            // ADR-023: extract this class's SpawnIntents. The scheduler
+            // already buckets by class; the controller takes them
+            // verbatim. TODO(ADR-023 phase-2): per-system filter once
+            // intents carry a `system` field — for MVP the scheduler
+            // populates per-pool-features-filtered intents only.
+            let intents = resp
+                .classes
+                .into_iter()
+                .find(|c| c.name == wp.spec.size_class)
+                .map(|c| c.spawn_intents)
+                .unwrap_or_default();
             // proto field is u64; spawn_count takes u32. Saturate —
             // a queue > 4 billion derivations is pathological but
             // shouldn't wrap to 0 (would scale DOWN under extreme load).
-            return Ok(queued.min(u32::MAX as u64) as u32);
+            return Ok((queued.min(u32::MAX as u64) as u32, intents));
         }
         // Class not in response → fall through to systems filter.
     }
     let resp = ctx.admin.clone().cluster_status(()).await?.into_inner();
-    Ok(crate::scaling::queued_for_systems(&resp, &wp.spec.systems))
+    Ok((
+        crate::scaling::queued_for_systems(&resp, &wp.spec.systems),
+        Vec::new(),
+    ))
 }
 
 /// Build a K8s Job for one ephemeral worker pod.
@@ -371,13 +421,14 @@ pub(super) fn build_job(
     oref: OwnerReference,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
+    intent: Option<&SpawnIntent>,
 ) -> Result<Job> {
     let pool = wp.name_any();
     // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
     let job_name = pod::job_name(&pool, ExecutorKind::Builder, &random_suffix());
-    Ok(ephemeral_job(
+    let mut job = ephemeral_job(
         job_name,
         wp.namespace(),
         oref,
@@ -386,7 +437,22 @@ pub(super) fn build_job(
         // (I-200). Precedence: explicit override > cutoff×5 > flat 3600.
         ephemeral_deadline(&wp.spec),
         builders::build_pod_spec(wp, scheduler, store),
-    ))
+    );
+    // ADR-023 Sla mode: stamp `rio.build/intent-id` on the pod
+    // template so the builder reads it via downward-API →
+    // `RIO_INTENT_ID` → heartbeat → scheduler matches the pod to its
+    // pre-computed assignment. `ephemeral_job` always sets the
+    // template's annotations map (KARPENTER_DO_NOT_DISRUPT), so the
+    // chain is non-None; `expect`s document the structural invariant.
+    if let Some(i) = intent {
+        job.spec
+            .as_mut()
+            .and_then(|s| s.template.metadata.as_mut())
+            .and_then(|m| m.annotations.as_mut())
+            .expect("ephemeral_job sets template.metadata.annotations")
+            .insert(INTENT_ID_ANNOTATION.into(), i.intent_id.clone());
+    }
+    Ok(job)
 }
 
 #[cfg(test)]
@@ -424,7 +490,7 @@ mod tests {
     fn job_spec_load_bearing_fields() {
         let wp = test_wp();
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
 
         // ownerReference → GC on BuilderPool delete.
         let orefs = job.metadata.owner_references.as_ref().unwrap();
@@ -507,7 +573,7 @@ mod tests {
     fn job_name_format() {
         let wp = test_wp();
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
         let name = job.metadata.name.unwrap();
 
         // Precondition self-assert: test_wp names the pool "eph-pool".
@@ -549,7 +615,7 @@ mod tests {
         // were wrong. 7200 must win.
         wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
 
         let spec = job.spec.as_ref().unwrap();
         assert_eq!(
@@ -578,7 +644,7 @@ mod tests {
         let mut wp = test_wp();
         wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
             Some(30 * DEADLINE_MULTIPLIER + MARGIN),
@@ -590,7 +656,7 @@ mod tests {
         // scales (not a clamped-to-default refactor).
         wp.spec.size_class_cutoff_secs = Some(7200.0);
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
             Some(36000 + MARGIN)
@@ -601,7 +667,7 @@ mod tests {
         // second off the bound — wrong direction.
         wp.spec.size_class_cutoff_secs = Some(120.1);
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
             Some(601 + MARGIN)
@@ -611,7 +677,7 @@ mod tests {
         // before adding margin → 1 + 90 = 91.
         wp.spec.size_class_cutoff_secs = Some(0.0);
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
             Some(1 + MARGIN)

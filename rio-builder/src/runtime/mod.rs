@@ -1611,6 +1611,7 @@ mod tests {
             &["x86_64-linux".into()],
             &features,
             size_class,
+            "",
             &slot,
             &ResourceSnapshotHandle::default(),
             store_degraded,

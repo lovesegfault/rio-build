@@ -59,6 +59,12 @@ pub struct HeartbeatPayload {
     /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
     /// it; treated as builders, the safe default).
     pub kind: rio_proto::types::ExecutorKind,
+    /// ADR-023 SpawnIntent match key. `None` = Static-sized pod
+    /// (proto empty-string). Stored on ExecutorState; dispatch
+    /// (Phase-2) prefers the pre-computed assignment for this
+    /// intent_id, falling through to pick-from-queue if no match
+    /// (e.g., scheduler restarted between spawn and heartbeat).
+    pub intent_id: Option<String>,
 }
 
 /// Request payload for [`ActorCommand::MergeDag`].

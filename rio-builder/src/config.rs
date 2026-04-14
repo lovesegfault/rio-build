@@ -122,6 +122,11 @@ pub struct Config {
     /// to `CompletionReport` for ADR-023's hw_class join (scheduler
     /// resolves instance type from the Node object). Empty outside k8s.
     pub node_name: String,
+    /// ADR-023 SpawnIntent match key from the pod's `rio.build/
+    /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent
+    /// in every heartbeat so the scheduler can match this pod to its
+    /// pre-computed assignment. Empty = Static-sized pod (no intent).
+    pub intent_id: String,
     /// Size-class this builder is deployed as. Empty = unclassified.
     /// If the scheduler has size_classes configured, unclassified
     /// builders are REJECTED (misconfiguration — set this). Operator
@@ -193,6 +198,7 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             node_name: String::new(),
+            intent_id: String::new(),
             size_class: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,

@@ -690,6 +690,55 @@ pub(crate) async fn spawn_n(
     spawned
 }
 
+/// [`spawn_n`] but driven by an iterator of per-iteration data instead
+/// of a bare count. ADR-023: when the scheduler returns per-drv
+/// `SpawnIntent`s (Sla mode), the controller spawns one pod per intent
+/// with that intent's resources stamped in — the closure receives the
+/// item so `build_job(wp, Some(intent))` can read it.
+///
+/// Same warn+continue semantics as [`spawn_n`]: a spawn error never
+/// short-circuits the reconcile tick. The structural guard at
+/// `builderpool/tests/jobs_tests.rs` covers `spawn_n`; this body is
+/// mechanically identical (no `return Err`).
+pub(crate) async fn spawn_for_each<I, T>(
+    jobs_api: &Api<Job>,
+    items: I,
+    pool: &str,
+    class: &str,
+    mut build: impl FnMut(T) -> Result<Job>,
+) -> u32
+where
+    I: IntoIterator<Item = T>,
+{
+    let mut spawned = 0;
+    for item in items {
+        let job = match build(item) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(pool, class, error = %e, "build_job failed; continuing tick");
+                continue;
+            }
+        };
+        let job_name = job.metadata.name.clone().unwrap_or_default();
+        match try_spawn_job(jobs_api, &job).await {
+            SpawnOutcome::Spawned => {
+                spawned += 1;
+                info!(pool, class, job = %job_name, "spawned ephemeral Job");
+            }
+            SpawnOutcome::NameCollision => {
+                debug!(pool, class, job = %job_name, "Job name collision; will retry");
+            }
+            SpawnOutcome::Failed(e) => {
+                warn!(
+                    pool, class, job = %job_name, error = %e,
+                    "ephemeral Job spawn failed; continuing tick"
+                );
+            }
+        }
+    }
+    spawned
+}
+
 /// SSA-patch `.status.{replicas?,readyReplicas,desiredReplicas,
 /// conditions}` for a Job-mode pool CR (BuilderPool / FetcherPool).
 ///
