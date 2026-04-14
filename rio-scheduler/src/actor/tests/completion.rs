@@ -1504,6 +1504,7 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;
@@ -1571,6 +1572,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;
@@ -1619,6 +1621,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;
@@ -1706,6 +1709,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;
@@ -1810,6 +1814,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
             },
             peak_memory_bytes: 8 * 1024 * 1024,
             peak_cpu_cores: 1.5,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;
@@ -1928,6 +1933,7 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             // Unclamped cast wraps to -1i64.
             peak_memory_bytes: u64::MAX,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     barrier(&handle).await;

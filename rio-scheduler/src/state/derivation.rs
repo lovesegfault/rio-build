@@ -459,6 +459,17 @@ pub struct DerivationState {
     drv_path: rio_nix::store_path::StorePath,
     /// Package name (for duration estimation).
     pub pname: Option<String>,
+    /// Package version (drv.env `version`). ADR-023: feeds
+    /// `build_samples.version` for version-distance sample weighting.
+    /// `None` on recovery — best-effort sizing input, not persisted.
+    pub version: Option<String>,
+    /// drv.env `enableParallelBuilding`. ADR-023: when explicitly
+    /// `Some(false)` → fix p̄=1 (no multi-core exploration). `None`
+    /// means unknown (NOT false — historical stdenv default was unset).
+    pub enable_parallel_building: Option<bool>,
+    /// drv.env `preferLocalBuild`. ADR-023: `Some(true)` → trivially
+    /// short, skip learning entirely.
+    pub prefer_local_build: Option<bool>,
     /// Target system (e.g. "x86_64-linux").
     pub system: String,
     /// Required system features the building worker must support.
@@ -534,6 +545,9 @@ impl DerivationState {
             drv_hash: node.drv_hash.as_str().into(),
             drv_path,
             pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
+            version: node.version.clone(),
+            enable_parallel_building: node.enable_parallel_building,
+            prefer_local_build: node.prefer_local_build,
             system: node.system.clone(),
             required_features: node.required_features.clone(),
             output_names: node.output_names.clone(),
@@ -610,6 +624,12 @@ impl DerivationState {
             drv_hash: row.drv_hash.into(),
             drv_path,
             pname: row.pname,
+            // ADR-023 sizing inputs not persisted — best-effort, lossy on
+            // recovery (build_samples row written from a recovered build
+            // gets NULL for these; the SLA fit tolerates sparse columns).
+            version: None,
+            enable_parallel_building: None,
+            prefer_local_build: None,
             system: row.system,
             required_features: row.required_features,
             output_names: row.output_names,
@@ -691,6 +711,9 @@ impl DerivationState {
             drv_hash: row.drv_hash.into(),
             drv_path,
             pname: row.pname,
+            version: None,
+            enable_parallel_building: None,
+            prefer_local_build: None,
             system: row.system,
             required_features: Vec::new(),
             output_names: Vec::new(),

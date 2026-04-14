@@ -3,7 +3,7 @@
 use rio_test_support::TestDb;
 
 use super::insert_test_derivation;
-use crate::db::{EMA_ALPHA, SchedulerDb};
+use crate::db::{BuildSampleRow, EMA_ALPHA, SchedulerDb};
 
 // r[verify sched.estimate.ema-alpha]
 /// EMA: first insert uses the duration directly; second update blends.
@@ -409,10 +409,22 @@ async fn test_build_samples_insert_and_retention() -> anyhow::Result<()> {
     let db = SchedulerDb::new(test_db.pool.clone());
 
     // Two fresh samples.
-    db.insert_build_sample("hello", "x86_64-linux", 12.5, 4_194_304)
-        .await?;
-    db.insert_build_sample("hello", "x86_64-linux", 8.0, 2_097_152)
-        .await?;
+    db.write_build_sample(&BuildSampleRow {
+        pname: "hello".into(),
+        system: "x86_64-linux".into(),
+        duration_secs: 12.5,
+        peak_memory_bytes: 4_194_304,
+        ..Default::default()
+    })
+    .await?;
+    db.write_build_sample(&BuildSampleRow {
+        pname: "hello".into(),
+        system: "x86_64-linux".into(),
+        duration_secs: 8.0,
+        peak_memory_bytes: 2_097_152,
+        ..Default::default()
+    })
+    .await?;
 
     // Schema check: migration 013 created 6 columns (id + 5 data cols);
     // later migrations (039 telemetry) add more. Assert the 013 base
@@ -475,6 +487,83 @@ async fn test_build_samples_insert_and_retention() -> anyhow::Result<()> {
     // strictly newer than now().
     let empty = db.query_build_samples_last_days(0).await?;
     assert!(empty.is_empty(), "0-day window should be empty");
+
+    Ok(())
+}
+
+/// ADR-023: full-width `build_samples` row roundtrips every telemetry
+/// column. Proves migration 039 columns are wired through
+/// `write_build_sample` (a missed bind would compile via `query!` but
+/// land as the column DEFAULT, so assert non-default values).
+#[tokio::test]
+async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let row = BuildSampleRow {
+        pname: "hello".into(),
+        system: "x86_64-linux".into(),
+        tenant: "t1".into(),
+        duration_secs: 42.0,
+        peak_memory_bytes: 256 << 20,
+        cpu_limit_cores: Some(8.0),
+        peak_cpu_cores: Some(6.5),
+        cpu_seconds_total: Some(273.0),
+        peak_disk_bytes: Some(1 << 30),
+        peak_io_pressure_pct: Some(12.5),
+        version: Some("2.12.1".into()),
+        hw_class: None,
+        node_name: Some("ip-10-0-1-42.ec2.internal".into()),
+        enable_parallel_building: Some(true),
+        prefer_local_build: Some(false),
+    };
+    db.write_build_sample(&row).await?;
+
+    // tenant + cpu_limit_cores: spot-check the two fields most likely
+    // to be miswired (NOT NULL DEFAULT '' vs nullable Option).
+    let (cpu_limit, tenant): (Option<f64>, String) =
+        sqlx::query_as("SELECT cpu_limit_cores, tenant FROM build_samples WHERE pname = 'hello'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(cpu_limit, Some(8.0));
+    assert_eq!(tenant, "t1");
+
+    // Full-row roundtrip for the remaining 039 columns. Single
+    // row in the table → fetch_one is unambiguous.
+    #[allow(clippy::type_complexity)]
+    let got: (
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+        Option<bool>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT peak_cpu_cores, cpu_seconds_total, peak_disk_bytes,
+                peak_io_pressure_pct, version, hw_class, node_name,
+                enable_parallel_building, prefer_local_build, outlier_excluded
+         FROM build_samples WHERE pname = 'hello'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(got.0, Some(6.5), "peak_cpu_cores");
+    assert_eq!(got.1, Some(273.0), "cpu_seconds_total");
+    assert_eq!(got.2, Some(1 << 30), "peak_disk_bytes");
+    assert_eq!(got.3, Some(12.5), "peak_io_pressure_pct");
+    assert_eq!(got.4.as_deref(), Some("2.12.1"), "version");
+    assert_eq!(got.5, None, "hw_class stays NULL (controller fills)");
+    assert_eq!(
+        got.6.as_deref(),
+        Some("ip-10-0-1-42.ec2.internal"),
+        "node_name"
+    );
+    assert_eq!(got.7, Some(true), "enable_parallel_building");
+    assert_eq!(got.8, Some(false), "prefer_local_build");
+    assert!(!got.9, "outlier_excluded keeps DEFAULT FALSE");
 
     Ok(())
 }

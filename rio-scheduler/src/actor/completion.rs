@@ -567,6 +567,9 @@ impl DagActor {
         // "resource measurements from the cgroup" with identical
         // zero-means-no-signal semantics; unpacked immediately.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
+        // CompletionReport.node_name (downward API spec.nodeName).
+        // For ADR-023 build_samples.node_name → controller hw_class join.
+        node_name: Option<String>,
     ) {
         // Arch#13: proto→domain at the actor boundary. Status
         // normalization (raw i32 → enum, unknown → Unspecified) happens
@@ -708,6 +711,7 @@ impl DagActor {
                     &result,
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
+                    node_name,
                 )
                 .await;
             }
@@ -772,6 +776,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
+        node_name: Option<String>,
     ) {
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         let t_total = std::time::Instant::now();
@@ -821,8 +826,13 @@ impl DagActor {
             .await;
         self.unpin_best_effort(drv_hash).await;
 
-        self.record_build_history(drv_hash, result, (peak_memory_bytes, peak_cpu_cores))
-            .await;
+        self.record_build_history(
+            drv_hash,
+            result,
+            (peak_memory_bytes, peak_cpu_cores),
+            node_name,
+        )
+        .await;
 
         // Emit derivation completed event
         let output_paths: Vec<String> = self
@@ -1321,6 +1331,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         result: &crate::domain::BuildResult,
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
+        node_name: Option<String>,
     ) {
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
@@ -1374,24 +1385,60 @@ impl DagActor {
                 // sample point ("sub-second build, poller didn't fire").
                 // The EMA needs the filter to avoid dragging toward 0;
                 // the percentile computation doesn't.
-                if !state.is_fixed_output
-                    && let Err(e) = self
-                        .db
-                        .insert_build_sample(
-                            pname,
-                            &state.system,
-                            duration_secs,
-                            // Clamp before i64 cast. u64 > i64::MAX wraps
-                            // negative → build_samples row with negative
-                            // memory → CutoffRebalancer percentiles poisoned.
-                            // Physical RAM is well below 2^63 bytes, so this
-                            // only fires on a misbehaving worker — but it
-                            // costs nothing and prevents silent corruption.
-                            peak_memory_bytes.min(i64::MAX as u64) as i64,
-                        )
-                        .await
-                {
-                    warn!(?e, %pname, system = %state.system, "insert_build_sample failed");
+                if !state.is_fixed_output {
+                    // Tenant: first interested build's tenant_id,
+                    // stringified. A derivation shared across tenants
+                    // (dedup at merge) is attributed to whichever build
+                    // landed first — close enough for the SLA fit
+                    // (per-tenant key is a grouping dimension, not an
+                    // accounting ledger). None → "" matches the column's
+                    // NOT NULL DEFAULT ''.
+                    let tenant = state
+                        .interested_builds
+                        .iter()
+                        .filter_map(|id| self.builds.get(id)?.tenant_id)
+                        .next()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    let row = crate::db::BuildSampleRow {
+                        pname: pname.clone(),
+                        system: state.system.clone(),
+                        tenant,
+                        duration_secs,
+                        // Clamp before i64 cast. u64 > i64::MAX wraps
+                        // negative → build_samples row with negative
+                        // memory → CutoffRebalancer percentiles poisoned.
+                        // Physical RAM is well below 2^63 bytes, so this
+                        // only fires on a misbehaving worker — but it
+                        // costs nothing and prevents silent corruption.
+                        peak_memory_bytes: peak_memory_bytes.min(i64::MAX as u64) as i64,
+                        // peak_cpu_cores: same 0→None filter as the EMA —
+                        // 0.0 means "no samples taken", not "used 0 cores".
+                        peak_cpu_cores: peak_cpu,
+                        // ADR-023 cgroup telemetry (cpu_limit_cores,
+                        // cpu_seconds_total, peak_io_pressure_pct,
+                        // peak_disk_bytes) lives on ResourceUsage which is
+                        // delivered via ProgressUpdate, not CompletionReport.
+                        // TODO: thread the final ProgressUpdate.resources
+                        // through ProcessCompletion (or have the builder
+                        // attach a final ResourceUsage to CompletionReport).
+                        // The SLA fit tolerates NULLs.
+                        cpu_limit_cores: None,
+                        cpu_seconds_total: None,
+                        peak_disk_bytes: None,
+                        peak_io_pressure_pct: None,
+                        // drv-declared sizing inputs — on the dag node.
+                        version: state.version.clone(),
+                        enable_parallel_building: state.enable_parallel_building,
+                        prefer_local_build: state.prefer_local_build,
+                        node_name,
+                        // Controller backfills hw_class from the Node
+                        // informer (joins on node_name) — Task 1.9.
+                        hw_class: None,
+                    };
+                    if let Err(e) = self.db.write_build_sample(&row).await {
+                        warn!(?e, %pname, system = %state.system, "write_build_sample failed");
+                    }
                 }
 
                 // Misclassification: routed to "small" but ran like

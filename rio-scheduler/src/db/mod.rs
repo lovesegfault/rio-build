@@ -34,6 +34,8 @@ mod tests;
 // `crate::db::read_event_log` without knowing the internal layout.
 pub(crate) use recovery::read_event_log;
 
+pub use history::BuildSampleRow;
+
 // r[impl sched.db.partial-index-literal]
 /// Terminal statuses as a SQL `NOT IN` literal fragment.
 ///

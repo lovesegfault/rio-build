@@ -66,6 +66,11 @@ pub struct DerivationNode {
     /// callers branch on `Option`, not length.
     pub ca_modular_hash: Option<[u8; 32]>,
     pub needs_resolve: bool,
+    /// ADR-023 sizing inputs — gateway extracts from drv.env. All
+    /// optional: absent ≠ false/empty (see dag.proto field comments).
+    pub version: Option<String>,
+    pub enable_parallel_building: Option<bool>,
+    pub prefer_local_build: Option<bool>,
 }
 
 impl From<proto::DerivationNode> for DerivationNode {
@@ -84,6 +89,9 @@ impl From<proto::DerivationNode> for DerivationNode {
             input_srcs_nar_size: n.input_srcs_nar_size,
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,
+            version: n.version,
+            enable_parallel_building: n.enable_parallel_building,
+            prefer_local_build: n.prefer_local_build,
         }
     }
 }

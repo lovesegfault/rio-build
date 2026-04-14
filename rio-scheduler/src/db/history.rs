@@ -3,6 +3,36 @@
 
 use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb, TERMINAL_STATUS_SQL};
 
+/// One `build_samples` row. ADR-023 SLA telemetry: every successful
+/// completion appends a full-width row; the SLA fit reads these to
+/// compute per-`(pname, system, tenant)` cores-vs-duration curves.
+///
+/// All telemetry columns are `Option` — old executors / recovered
+/// derivations / non-k8s test runs leave them `None` → SQL NULL.
+/// `hw_class` is always `None` from the scheduler; the controller
+/// backfills it from the Node informer (joins on `node_name`).
+///
+/// `Default` so tests can `BuildSampleRow { pname: "x".into(),
+/// ..Default::default() }` without spelling out 15 Nones.
+#[derive(Debug, Clone, Default)]
+pub struct BuildSampleRow {
+    pub pname: String,
+    pub system: String,
+    pub tenant: String,
+    pub duration_secs: f64,
+    pub peak_memory_bytes: i64,
+    pub cpu_limit_cores: Option<f64>,
+    pub peak_cpu_cores: Option<f64>,
+    pub cpu_seconds_total: Option<f64>,
+    pub peak_disk_bytes: Option<i64>,
+    pub peak_io_pressure_pct: Option<f64>,
+    pub version: Option<String>,
+    pub hw_class: Option<String>,
+    pub node_name: Option<String>,
+    pub enable_parallel_building: Option<bool>,
+    pub prefer_local_build: Option<bool>,
+}
+
 impl SchedulerDb {
     /// Read the full build_history table for estimator refresh.
     ///
@@ -199,12 +229,47 @@ impl SchedulerDb {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Insert one raw build sample. Called from completion.rs success path
-    /// alongside the EMA update (P0228). Best-effort: caller warns on Err.
+    /// Insert one raw build sample with full ADR-023 telemetry. Called
+    /// from completion.rs success path alongside the EMA update.
+    /// Best-effort: caller warns on Err.
     ///
     /// Unlike `update_build_history` which folds into a single EMA row per
     /// `(pname, system)`, this appends every completion — the rebalancer
-    /// (P0229) needs the full distribution, not a smoothed scalar.
+    /// and the SLA fit both need the full distribution, not a smoothed
+    /// scalar. `completed_at` is server-side `now()`; `outlier_excluded`
+    /// keeps its DEFAULT FALSE (the MAD sweep flips it later).
+    pub async fn write_build_sample(&self, row: &BuildSampleRow) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "INSERT INTO build_samples
+               (pname, system, tenant, duration_secs, peak_memory_bytes,
+                cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
+                peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
+                node_name, enable_parallel_building, prefer_local_build,
+                completed_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())",
+            row.pname,
+            row.system,
+            row.tenant,
+            row.duration_secs,
+            row.peak_memory_bytes,
+            row.cpu_limit_cores,
+            row.peak_cpu_cores,
+            row.cpu_seconds_total,
+            row.peak_disk_bytes,
+            row.peak_io_pressure_pct,
+            row.version,
+            row.hw_class,
+            row.node_name,
+            row.enable_parallel_building,
+            row.prefer_local_build,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Minimal-row convenience for tests / admin probes that don't have
+    /// full telemetry to hand. Thin wrapper over [`Self::write_build_sample`].
     pub async fn insert_build_sample(
         &self,
         pname: &str,
@@ -212,17 +277,14 @@ impl SchedulerDb {
         duration_secs: f64,
         peak_memory_bytes: i64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            "INSERT INTO build_samples (pname, system, duration_secs, peak_memory_bytes)
-             VALUES ($1, $2, $3, $4)",
-            pname,
-            system,
+        self.write_build_sample(&BuildSampleRow {
+            pname: pname.into(),
+            system: system.into(),
             duration_secs,
             peak_memory_bytes,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+            ..Default::default()
+        })
+        .await
     }
 
     /// Delete samples older than `days`. Returns rows deleted.

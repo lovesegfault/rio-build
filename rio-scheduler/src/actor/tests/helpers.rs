@@ -645,6 +645,7 @@ pub(crate) async fn complete_success(
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     Ok(())
@@ -690,6 +691,7 @@ pub(crate) async fn complete_ca(
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     Ok(())
@@ -712,6 +714,7 @@ pub(crate) async fn complete_success_empty(
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     Ok(())
@@ -736,6 +739,7 @@ pub(crate) async fn complete_failure(
             },
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
+            node_name: None,
         })
         .await?;
     Ok(())

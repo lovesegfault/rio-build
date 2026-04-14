@@ -118,6 +118,10 @@ pub enum ActorCommand {
         /// Feeds `build_history.ema_peak_cpu_cores` — not used for
         /// routing yet (size-class bumps on memory only).
         peak_cpu_cores: f64,
+        /// k8s `spec.nodeName` the executor pod ran on (downward API
+        /// → `RIO_NODE_NAME` → `CompletionReport.node_name`). For
+        /// ADR-023's hw_class join. `None` = old executor / non-k8s.
+        node_name: Option<String>,
     },
 
     /// A detached upstream-substitute fetch (spawned by

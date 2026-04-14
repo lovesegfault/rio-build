@@ -174,6 +174,7 @@ impl ExecutorService for SchedulerGrpc {
                                     result,
                                     peak_memory_bytes: report.peak_memory_bytes,
                                     peak_cpu_cores: report.peak_cpu_cores,
+                                    node_name: report.node_name,
                                 })
                                 .await
                                 .is_err()
