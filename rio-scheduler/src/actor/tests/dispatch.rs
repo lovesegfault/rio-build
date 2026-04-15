@@ -1564,6 +1564,9 @@ async fn spawn_intent_from_sla_estimator() {
         ring_buffer: 32,
         halflife_secs: 7.0 * 86400.0,
         seed_corpus: None,
+        hw_cost_source: None,
+        hw_softmax_temp: 0.3,
+        hw_fallback_after_secs: 120.0,
     });
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_mvp BestEffort at

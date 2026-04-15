@@ -61,6 +61,29 @@ pub struct SlaConfig {
     /// starts empty (still fillable via `ImportSlaCorpus`).
     #[serde(default)]
     pub seed_corpus: Option<PathBuf>,
+    /// Phase-13 hw-band cost source. `None` → cost-ranking disabled
+    /// (`solve_full` falls back to `solve_mvp`'s band-agnostic path).
+    /// `Some(Static)` → seed prices only; `Some(Spot)` → live EC2
+    /// spot-price poll (lease-gated).
+    #[serde(default)]
+    pub hw_cost_source: Option<super::cost::HwCostSource>,
+    /// Softmax temperature for the per-`(band, cap)` cost pick.
+    /// Lower → greedier (always cheapest); higher → more spread. 0.3
+    /// gives ~85% mass on the cheapest when the runner-up is 1.5× the
+    /// price.
+    #[serde(default = "default_hw_softmax_temp")]
+    pub hw_softmax_temp: f64,
+    /// Seconds a spawned pod may sit Pending before its `(band, cap)`
+    /// is ICE-backed-off and the build re-solved excluding it.
+    #[serde(default = "default_hw_fallback_after_secs")]
+    pub hw_fallback_after_secs: f64,
+}
+
+fn default_hw_softmax_temp() -> f64 {
+    0.3
+}
+fn default_hw_fallback_after_secs() -> f64 {
+    120.0
 }
 
 fn default_ring_buffer() -> u32 {
@@ -196,6 +219,9 @@ mod tests {
             ring_buffer: default_ring_buffer(),
             halflife_secs: default_halflife(),
             seed_corpus: None,
+            hw_cost_source: None,
+            hw_softmax_temp: default_hw_softmax_temp(),
+            hw_fallback_after_secs: default_hw_fallback_after_secs(),
         }
     }
 

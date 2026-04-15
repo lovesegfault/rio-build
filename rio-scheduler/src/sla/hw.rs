@@ -48,6 +48,12 @@ impl HwTable {
         self.factors.get(hw_class).copied().unwrap_or(1.0)
     }
 
+    /// Iterate `(hw_class, factor)`. For [`super::cost`]'s
+    /// per-band `h_dagger` scan.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &f64)> {
+        self.factors.iter()
+    }
+
     /// Distinct hw_classes with ≥3 pod samples. For SlaStatus.
     pub fn len(&self) -> usize {
         self.factors.len()

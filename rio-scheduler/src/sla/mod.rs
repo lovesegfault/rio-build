@@ -9,6 +9,7 @@ use crate::db::{SchedulerDb, SlaOverrideRow};
 
 pub mod bootstrap;
 pub mod config;
+pub mod cost;
 pub mod dip;
 pub mod explain;
 pub mod explore;
@@ -395,6 +396,9 @@ mod tests {
             ring_buffer: 32,
             halflife_secs: 7.0 * 86400.0,
             seed_corpus: None,
+            hw_cost_source: None,
+            hw_softmax_temp: 0.3,
+            hw_fallback_after_secs: 120.0,
         }
     }
 

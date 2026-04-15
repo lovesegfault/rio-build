@@ -58,6 +58,13 @@ pub fn describe_all() {
         "fleet prior hit clamp: per-tenant fit diverged from the \
          fleet prior by more than the partial-pooling band"
     );
+    describe_gauge!(
+        "rio_scheduler_sla_hw_cost_stale_seconds",
+        Unit::Seconds,
+        "age of the hw-band $/vCPU·hr snapshot. Climbs when the \
+         lease-gated spot-price poller is failing or this replica is \
+         standby (price is PG-backed; standby reads but doesn't write)"
+    );
 }
 
 pub fn outlier_rejected(tenant: &str) {

@@ -150,6 +150,30 @@ async fn main() -> anyhow::Result<()> {
         info!("service-token signing enabled (dispatch-time substitution probe)");
     }
 
+    // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)
+    // so a restart doesn't re-warm; lease-gated poller below keeps it
+    // fresh on the leader. With `[sla].hw_cost_source` unset the
+    // default seeds are used and the poller only runs the λ refresh.
+    let hw_cost_source = cfg.sla.as_ref().and_then(|s| s.hw_cost_source);
+    let cost_table = std::sync::Arc::new(parking_lot::RwLock::new(
+        rio_scheduler::sla::cost::CostTable::load(&SchedulerDb::new(pool.clone()))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "cost-table load failed; starting from seeds");
+                rio_scheduler::sla::cost::CostTable::default()
+            }),
+    ));
+    rio_common::task::spawn_monitored(
+        "sla-cost-poller",
+        rio_scheduler::sla::cost::spot_price_poller(
+            SchedulerDb::new(pool.clone()),
+            leader.clone(),
+            std::sync::Arc::clone(&cost_table),
+            hw_cost_source,
+            shutdown.clone(),
+        ),
+    );
+
     // Spawn the DAG actor with the shared leader state. Poison +
     // retry + size_classes come from scheduler.toml (or
     // `#[serde(default)]` if absent — same behavior unless the
