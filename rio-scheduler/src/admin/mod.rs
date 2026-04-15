@@ -29,9 +29,10 @@ use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DrainExecutorRequest, DrainExecutorResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetEstimatorStatsRequest,
-    GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
+    DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse,
+    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
+    GetEstimatorStatsRequest, GetEstimatorStatsResponse, GetSizeClassStatusRequest,
+    GetSizeClassStatusResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
     InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
     ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
     ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
@@ -726,6 +727,53 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(sla::explain_to_proto(&result)))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "ExportSlaCorpus"))]
+    async fn export_sla_corpus(
+        &self,
+        request: Request<ExportSlaCorpusRequest>,
+    ) -> Result<Response<ExportSlaCorpusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let corpus = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaExportCorpus {
+                tenant: r.tenant,
+                min_n: r.min_n,
+                reply,
+            })
+        })
+        .await?;
+        let entries = corpus.entries.len() as u32;
+        let json = serde_json::to_string(&corpus)
+            .map_err(|e| Status::internal(format!("serialize corpus: {e}")))?;
+        Ok(Response::new(ExportSlaCorpusResponse { json, entries }))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ImportSlaCorpus"))]
+    async fn import_sla_corpus(
+        &self,
+        request: Request<ImportSlaCorpusRequest>,
+    ) -> Result<Response<ImportSlaCorpusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let corpus: crate::sla::prior::SeedCorpus = serde_json::from_str(&r.json)
+            .map_err(|e| Status::invalid_argument(format!("parse corpus json: {e}")))?;
+        let ref_hw_class = corpus.ref_hw_class.clone();
+        let (n, scale) = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaImportCorpus { corpus, reply })
+        })
+        .await?
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(ImportSlaCorpusResponse {
+            entries_loaded: n as u32,
+            ref_hw_class,
+            rescale_factor: scale,
+        }))
+    }
+
     /// VM-test fixture: write one synthetic `build_samples` row. Gated
     /// on `RIO_ADMIN_TEST_FIXTURES` so a misrouted prod call is refused
     /// even with admin auth — the env var is only set by the sla-sizing
@@ -753,6 +801,7 @@ impl AdminService for AdminServiceImpl {
             cpu_limit_cores: r.cpu_limit_cores,
             cpu_seconds_total: r.cpu_seconds_total,
             version: r.version,
+            hw_class: r.hw_class,
             ..Default::default()
         })
         .await

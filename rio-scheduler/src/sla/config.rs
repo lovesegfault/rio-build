@@ -10,6 +10,7 @@
 //! land the two collapse into one.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,12 @@ pub struct SlaConfig {
     /// [`super::SlaEstimator::new`].
     #[serde(default = "default_halflife")]
     pub halflife_secs: f64,
+    /// JSON [`super::prior::SeedCorpus`] loaded at startup into the
+    /// seed-prior table. ADR-023 §2.10: lets a fresh deployment skip
+    /// the cold-start probe ladder for known pnames. Unset → seed table
+    /// starts empty (still fillable via `ImportSlaCorpus`).
+    #[serde(default)]
+    pub seed_corpus: Option<PathBuf>,
 }
 
 fn default_ring_buffer() -> u32 {
@@ -188,6 +195,7 @@ mod tests {
             log_budget: 1 << 30,
             ring_buffer: default_ring_buffer(),
             halflife_secs: default_halflife(),
+            seed_corpus: None,
         }
     }
 

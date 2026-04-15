@@ -130,6 +130,20 @@ service AdminService {
   // feasible at c*=6". Same ~60s tick staleness as SlaStatus.
   rpc SlaExplain(rio.types.SlaExplainRequest) returns (rio.types.SlaExplainResponse);
 
+  // Dump every cached fit with n_eff ≥ min_n as a portable JSON corpus
+  // (one (s,p,q,p_bar,a,b,n) tuple per (pname,system)). `rio-cli sla
+  // export-corpus` writes this to a file; `import-corpus` on a fresh
+  // deployment loads it into the seed-prior table so first-dispatch of
+  // a known pname skips the cold-start probe ladder. ADR-023 §2.10.
+  rpc ExportSlaCorpus(rio.types.ExportSlaCorpusRequest) returns (rio.types.ExportSlaCorpusResponse);
+
+  // Load a corpus (from ExportSlaCorpus, possibly from another cluster)
+  // into the seed-prior table. Time-domain params are rescaled by
+  // `factor[corpus.ref_hw_class]` from the local hw table so a corpus
+  // exported on fast hardware seeds correctly on slow. In-memory only —
+  // does NOT survive scheduler restart (use `[sla].seed_corpus` for that).
+  rpc ImportSlaCorpus(rio.types.ImportSlaCorpusRequest) returns (rio.types.ImportSlaCorpusResponse);
+
   // VM-test fixture: write a synthetic build_samples row directly. Lets
   // the sla-sizing scenario inject a 100x outlier and assert the MAD
   // sweep flags it without staging a real wall-clock-hours build. Gated

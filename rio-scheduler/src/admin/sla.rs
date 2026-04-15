@@ -95,6 +95,10 @@ pub(super) fn status_from_fit(
         span: f.span,
         tier: f.tier.clone(),
         active_override: active_override.map(row_to_proto),
+        prior_source: f
+            .prior_source
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default(),
     }
 }
 

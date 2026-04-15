@@ -76,6 +76,8 @@ flate2 = { workspace = true }
 # phase2b: log ring buffer written from BuildExecution recv tasks
 dashmap = { workspace = true }
 serde = { workspace = true }
+# ADR-023 phase-11: SeedCorpus JSON load/import (sla::prior).
+serde_json = { workspace = true }
 # X9 auto-pin: SHA-256 store paths for scheduler_live_pins hashes.
 # Was dev-only; promoted to prod for db.rs pin_live_inputs.
 sha2 = { workspace = true }

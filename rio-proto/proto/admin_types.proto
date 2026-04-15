@@ -500,7 +500,7 @@ message GetEstimatorStatsResponse {
 // ───────────────────────────────────────────────────────────────────────────
 
 // One synthetic build_samples row. Mirrors the columns the SLA fit
-// reads; everything else (hw_class, node_name, …) is left NULL.
+// reads; everything else (node_name, …) is left NULL.
 message InjectBuildSampleRequest {
   string pname = 1;
   string system = 2;
@@ -510,6 +510,9 @@ message InjectBuildSampleRequest {
   optional double cpu_limit_cores = 6;
   optional double cpu_seconds_total = 7;
   optional string version = 8;
+  // hw-normalize subtest: tag the row with a synthetic hw_class so the
+  // refit's reference-second normalization can be asserted.
+  optional string hw_class = 9;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -597,6 +600,10 @@ message SlaStatusResponse {
   // rules, if any. Lets `rio-cli sla status` show "fit says X, override
   // forces Y" in one call.
   optional SlaOverride active_override = 14;
+  // "seed" / "fleet" / "operator" / "" — provenance of the prior
+  // partial-pooled into this fit (r[sched.sla.prior-partial-pool]).
+  // Empty when no prior was applied (priors disabled or pure per-key).
+  string prior_source = 15;
 }
 
 message SlaExplainRequest {
@@ -628,4 +635,37 @@ message SlaExplainResponse {
   optional string override_applied = 3;
   // One row per tier in the configured ladder (tightest-first).
   repeated SlaCandidateRow candidates = 4;
+}
+
+message ExportSlaCorpusRequest {
+  // Restrict to one tenant's fits. Unset = all tenants.
+  optional string tenant = 1;
+  // Floor on n_eff — only export keys with at least this many effective
+  // samples. Default 3 (the partial-pool n0: a fit that hasn't yet
+  // outweighed its OWN prior is a poor seed for someone else's).
+  uint32 min_n = 2;
+}
+
+message ExportSlaCorpusResponse {
+  // SeedCorpus JSON (see rio-scheduler::sla::prior::SeedCorpus). Carried
+  // as an opaque string so the wire format and the on-disk format are
+  // the same blob — `rio-cli sla export-corpus -o f.json` is just a
+  // write(response.json).
+  string json = 1;
+  uint32 entries = 2;
+}
+
+message ImportSlaCorpusRequest {
+  // SeedCorpus JSON. Same shape ExportSlaCorpus produces.
+  string json = 1;
+}
+
+message ImportSlaCorpusResponse {
+  // Entries merged into the seed-prior table (post-rescale).
+  uint32 entries_loaded = 1;
+  // The hw_class the corpus was referenced against, and the local
+  // factor it was rescaled by. `rescale_factor=1.0` ⇔ unknown
+  // ref_hw_class (passed through unscaled).
+  string ref_hw_class = 2;
+  double rescale_factor = 3;
 }

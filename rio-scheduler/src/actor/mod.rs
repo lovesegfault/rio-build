@@ -421,6 +421,7 @@ impl DagActor {
             sla_estimator: crate::sla::SlaEstimator::new(
                 cfg.sla.as_ref().map_or(7.0 * 86400.0, |s| s.halflife_secs),
                 cfg.sla.as_ref().map_or(32, |s| s.ring_buffer),
+                cfg.sla.as_ref(),
             ),
             sla_tiers: cfg
                 .sla

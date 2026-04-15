@@ -77,6 +77,16 @@ impl DagActor {
                     override_.as_ref(),
                 ));
             }
+            AdminQuery::SlaExportCorpus {
+                tenant,
+                min_n,
+                reply,
+            } => {
+                let _ = reply.send(self.sla_estimator.export_corpus(tenant.as_deref(), min_n));
+            }
+            AdminQuery::SlaImportCorpus { corpus, reply } => {
+                let _ = reply.send(self.sla_estimator.import_seed(corpus));
+            }
         }
     }
 

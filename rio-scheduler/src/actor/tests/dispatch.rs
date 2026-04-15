@@ -1563,6 +1563,7 @@ async fn spawn_intent_from_sla_estimator() {
         log_budget: 0,
         ring_buffer: 32,
         halflife_secs: 7.0 * 86400.0,
+        seed_corpus: None,
     });
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_mvp BestEffort at
@@ -1607,6 +1608,7 @@ async fn spawn_intent_from_sla_estimator() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        prior_source: None,
     });
 
     // "fitted" matches the seeded key; "cold" has no fit (different

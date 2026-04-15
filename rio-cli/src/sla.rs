@@ -1,12 +1,10 @@
 //! `rio-cli sla` — ADR-023 operator overrides + model status.
 //!
-//! `override`/`reset`/`status` call the phase-6 AdminService RPCs.
-//! `defaults` is local-only (prints the configured tier ladder via
-//! `SlaStatus` on an empty key — server returns `has_fit=false` but the
-//! CLI doesn't yet surface config; phase-7 wires `SlaConfig` proto).
-//! `explain`/`export-corpus`/`import-corpus` are phase-7/11 stubs that
-//! bail with a "not yet implemented" message so the CLI surface is
-//! stable now.
+//! `override`/`reset`/`status`/`explain`/`export-corpus`/`import-corpus`
+//! call the phase-6/7/11 AdminService RPCs. `defaults` is local-only
+//! (prints the configured tier ladder via `SlaStatus` on an empty key —
+//! server returns `has_fit=false` but the CLI doesn't yet surface
+//! config; phase-7 wires `SlaConfig` proto).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -16,8 +14,8 @@ use tonic::transport::Channel;
 
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{
-    ListSlaOverridesRequest, ResetSlaModelRequest, SetSlaOverrideRequest, SlaExplainRequest,
-    SlaOverride, SlaStatusRequest,
+    ExportSlaCorpusRequest, ImportSlaCorpusRequest, ListSlaOverridesRequest, ResetSlaModelRequest,
+    SetSlaOverrideRequest, SlaExplainRequest, SlaOverride, SlaStatusRequest,
 };
 
 #[derive(Subcommand, Clone)]
@@ -84,7 +82,10 @@ pub enum SlaCmd {
         #[arg(long, default_value = "")]
         tenant: String,
     },
-    /// Dump build_samples corpus to a file. (phase-11)
+    /// Dump every cached fit with n_eff ≥ min_n to a JSON file.
+    /// `import-corpus` on a fresh deployment loads this into the
+    /// seed-prior table so first-dispatch of a known pname skips the
+    /// cold-start probe ladder.
     ExportCorpus {
         #[arg(long)]
         tenant: Option<String>,
@@ -93,7 +94,9 @@ pub enum SlaCmd {
         #[arg(short)]
         out: PathBuf,
     },
-    /// Load a build_samples corpus from a file. (phase-11)
+    /// Load a seed corpus (from `export-corpus`, possibly another
+    /// cluster) into the seed-prior table. In-memory only — set
+    /// `[sla].seed_corpus` for restart-survival.
     ImportCorpus { path: PathBuf },
 }
 
@@ -233,11 +236,16 @@ pub(crate) async fn run(
                     fmt_bytes(resp.mem_p90_bytes as i64)
                 );
                 println!(
-                    "Stats:     n_eff={:.1} span={:.1} σ={:.3} tier={}",
+                    "Stats:     n_eff={:.1} span={:.1} σ={:.3} tier={} prior={}",
                     resp.n_eff,
                     resp.span,
                     resp.sigma_resid,
-                    resp.tier.as_deref().unwrap_or("-")
+                    resp.tier.as_deref().unwrap_or("-"),
+                    if resp.prior_source.is_empty() {
+                        "-"
+                    } else {
+                        &resp.prior_source
+                    },
                 );
             }
             if let Some(o) = &resp.active_override {
@@ -304,8 +312,42 @@ pub(crate) async fn run(
             }
             Ok(())
         }
-        SlaCmd::ExportCorpus { .. } | SlaCmd::ImportCorpus { .. } => {
-            anyhow::bail!("not yet implemented (v1.1 phase 11)")
+        SlaCmd::ExportCorpus { tenant, min_n, out } => {
+            let req = ExportSlaCorpusRequest { tenant, min_n };
+            let resp = crate::rpc("ExportSlaCorpus", async || {
+                client.export_sla_corpus(req.clone()).await
+            })
+            .await?;
+            std::fs::write(&out, &resp.json)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", out.display()))?;
+            if as_json {
+                return crate::json(&serde_json::json!({
+                    "entries": resp.entries, "out": out.display().to_string()
+                }));
+            }
+            println!("wrote {} entries to {}", resp.entries, out.display());
+            Ok(())
+        }
+        SlaCmd::ImportCorpus { path } => {
+            let json = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+            let req = ImportSlaCorpusRequest { json };
+            let resp = crate::rpc("ImportSlaCorpus", async || {
+                client.import_sla_corpus(req.clone()).await
+            })
+            .await?;
+            if as_json {
+                return crate::json(&serde_json::json!({
+                    "entries_loaded": resp.entries_loaded,
+                    "ref_hw_class": resp.ref_hw_class,
+                    "rescale_factor": resp.rescale_factor,
+                }));
+            }
+            println!(
+                "loaded {} seeds (ref={}, rescale={:.3})",
+                resp.entries_loaded, resp.ref_hw_class, resp.rescale_factor
+            );
+            Ok(())
         }
     }
 }

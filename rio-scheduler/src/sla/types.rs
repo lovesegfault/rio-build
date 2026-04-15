@@ -131,6 +131,12 @@ pub struct FittedParams {
     /// `bias[h] > 1.0` ⇔ this pname runs SLOWER on `h` than the fleet
     /// factor would imply. Default 1.0 if <3 samples on that hw_class.
     pub hw_bias: HashMap<String, f64>,
+    /// Provenance of the prior partial-pooled into this fit
+    /// ([`super::prior::partial_pool`]). `None` ⇔ priors disabled (no
+    /// `[sla]` config) or this fit was never blended (test seeds).
+    /// Surfaced via `SlaStatus.prior_source` so `rio-cli sla status`
+    /// can show "this curve is 75% your seed table".
+    pub prior_source: Option<super::prior::PriorSource>,
 }
 
 #[cfg(test)]

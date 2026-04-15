@@ -132,6 +132,7 @@ mod tests {
             log_budget: 1 << 30,
             ring_buffer: 32,
             halflife_secs: 7.0 * 86400.0,
+            seed_corpus: None,
         }
     }
 
@@ -154,6 +155,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: Default::default(),
+            prior_source: None,
         }
     }
 

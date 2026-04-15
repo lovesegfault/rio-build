@@ -7,8 +7,12 @@
 //! aggregate; this module does no DB I/O.
 
 use std::collections::HashMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use super::config::ProbeShape;
+use super::hw::HwTable;
 use super::types::ModelKey;
 
 /// (S, P, Q, a, b) flat tuple. Distinct from [`super::types::FittedParams`]
@@ -23,6 +27,78 @@ pub struct FitParams {
     pub b: f64,
 }
 
+/// Seed-map key: `(pname, system)`. Tenant-agnostic — a seed corpus is
+/// meant to be portable across deployments, and a never-seen `(pname,
+/// system)` is never-seen regardless of which tenant first asks for it.
+/// Contrast [`ModelKey`] (the cache key), which IS tenant-scoped.
+pub type SeedKey = (String, String);
+
+/// On-disk / on-wire corpus shape. `ref_hw_class` is the exporter's
+/// [`HwTable::reference`] — the hw_class whose factor is closest to 1.0
+/// in THEIR table — so an importer can rescale time-domain params via
+/// its own `factor[ref_hw_class]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedCorpus {
+    pub ref_hw_class: String,
+    pub entries: Vec<SeedEntry>,
+}
+
+/// One `(pname, system)` row. `p_bar`/`n` are informational (round-trip
+/// fidelity, operator inspection); only `(s, p, q, a, b)` feed the prior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedEntry {
+    pub pname: String,
+    pub system: String,
+    pub s: f64,
+    pub p: f64,
+    pub q: f64,
+    pub p_bar: f64,
+    pub a: f64,
+    pub b: f64,
+    pub n: u32,
+}
+
+impl SeedCorpus {
+    /// Read + parse from `path`. Called once at startup from
+    /// [`super::SlaEstimator::new`] when `[sla].seed_corpus` is set.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("read seed_corpus {}: {e}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse seed_corpus {}: {e}", path.display()))
+    }
+
+    /// Project to the seed map, rescaling time-domain params (S, P) by
+    /// `factor[self.ref_hw_class] / factor[hw.reference]`. The exporter
+    /// recorded (S, P) in THEIR reference-seconds; locally that hw_class
+    /// has some `factor` ≠ 1.0 if it's not our reference. Q (contention,
+    /// per-core) and (a, b) (memory, raw bytes) are NOT rescaled —
+    /// neither is hw-throughput-dominated.
+    ///
+    /// Unknown `ref_hw_class` → factor 1.0 (pass through unscaled). The
+    /// returned `f64` is the applied factor, for the RPC response.
+    pub fn into_seed_map(self, hw: &HwTable) -> (HashMap<SeedKey, FitParams>, f64) {
+        let scale = hw.factor(&self.ref_hw_class) / hw.factor(&hw.reference);
+        let map = self
+            .entries
+            .into_iter()
+            .map(|e| {
+                (
+                    (e.pname, e.system),
+                    FitParams {
+                        s: e.s * scale,
+                        p: e.p * scale,
+                        q: e.q,
+                        a: e.a,
+                        b: e.b,
+                    },
+                )
+            })
+            .collect();
+        (map, scale)
+    }
+}
+
 /// Provenance of a prior, surfaced in `SizingExplain` so an operator
 /// can tell "this came from your seed table" from "this is the fleet
 /// median" from "this is just the cold-start probe rephrased".
@@ -33,11 +109,22 @@ pub enum PriorSource {
     Operator,
 }
 
+impl PriorSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Fleet => "fleet",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 /// Inputs to [`prior_for`]. `seed` is the operator-curated per-key
 /// table; `fleet` is the cross-tenant aggregate ([`fleet_median`]
 /// returns `None` until enough keys have a Coupled fit).
+#[derive(Debug, Clone)]
 pub struct PriorSources {
-    pub seed: HashMap<ModelKey, FitParams>,
+    pub seed: HashMap<SeedKey, FitParams>,
     pub fleet: Option<FitParams>,
     pub operator: ProbeShape,
     pub default_tier_p90: f64,
@@ -46,11 +133,11 @@ pub struct PriorSources {
 // r[impl sched.sla.prior-partial-pool]
 /// Precedence: explicit seed → fleet median (clamped to a [0.5×, 2×]
 /// band around the operator probe) → operator probe rephrased into the
-/// (S,P,Q,a,b) basis. Seed is exact-key only — no prefix match; an
-/// operator who wants "all `ghc-*` get this" writes an override, not a
-/// seed.
+/// (S,P,Q,a,b) basis. Seed is exact-`(pname, system)` only — no prefix
+/// match, no tenant scope; an operator who wants "all `ghc-*` get this"
+/// writes an override, not a seed.
 pub fn prior_for(key: &ModelKey, src: &PriorSources) -> (FitParams, PriorSource) {
-    if let Some(s) = src.seed.get(key) {
+    if let Some(s) = src.seed.get(&(key.pname.clone(), key.system.clone())) {
         return (s.clone(), PriorSource::Seed);
     }
     if let Some(f) = &src.fleet {
@@ -263,17 +350,20 @@ mod tests {
             b: 50.0,
         };
         let mut seed = HashMap::new();
-        seed.insert(key("hello"), seeded.clone());
+        seed.insert(("hello".into(), "x86_64-linux".into()), seeded.clone());
         let src = PriorSources {
             seed,
             fleet: Some(fleet.clone()),
             operator: probe(),
             default_tier_p90: 300.0,
         };
-        // exact-key seed wins
+        // exact-(pname,system) seed wins — tenant-agnostic, so a t1 key
+        // hits the same seed.
         let (fp, prov) = prior_for(&key("hello"), &src);
         assert_eq!(prov, PriorSource::Seed);
         assert_eq!(fp, seeded);
+        let (_, prov) = prior_for(&tkey("t1", "hello"), &src);
+        assert_eq!(prov, PriorSource::Seed);
         // miss → fleet (clamped)
         let (fp, prov) = prior_for(&key("world"), &src);
         assert_eq!(prov, PriorSource::Fleet);
@@ -362,6 +452,59 @@ mod tests {
         ];
         assert!(fleet_median(&all, 20).is_none());
         assert!(fleet_median(&all, 2).is_some());
+    }
+
+    #[test]
+    fn corpus_roundtrip_rescales_time_domain() {
+        // Exporter recorded on ref="aws-6-ebs". Our hw table says that
+        // class is 1.5× our reference → S/P scale by 1.5; Q/a/b don't.
+        let corpus = SeedCorpus {
+            ref_hw_class: "aws-6-ebs".into(),
+            entries: vec![SeedEntry {
+                pname: "hello".into(),
+                system: "x86_64-linux".into(),
+                s: 10.0,
+                p: 100.0,
+                q: 0.02,
+                p_bar: 8.0,
+                a: 22.0,
+                b: 0.6,
+                n: 12,
+            }],
+        };
+        let json = serde_json::to_string(&corpus).unwrap();
+        let parsed: SeedCorpus = serde_json::from_str(&json).unwrap();
+        let mut hw = HashMap::new();
+        hw.insert("aws-5-ebs".into(), 1.0); // local reference
+        hw.insert("aws-6-ebs".into(), 1.5);
+        let (map, scale) = parsed.into_seed_map(&HwTable::from_map(hw));
+        assert!((scale - 1.5).abs() < 1e-9);
+        let fp = &map[&("hello".into(), "x86_64-linux".into())];
+        assert!((fp.s - 15.0).abs() < 1e-9);
+        assert!((fp.p - 150.0).abs() < 1e-9);
+        assert!((fp.q - 0.02).abs() < 1e-9, "q not rescaled");
+        assert!((fp.a - 22.0).abs() < 1e-9, "a (mem) not rescaled");
+    }
+
+    #[test]
+    fn corpus_unknown_ref_passes_through() {
+        let corpus = SeedCorpus {
+            ref_hw_class: "mystery-hw".into(),
+            entries: vec![SeedEntry {
+                pname: "x".into(),
+                system: "x86_64-linux".into(),
+                s: 5.0,
+                p: 50.0,
+                q: 0.0,
+                p_bar: 4.0,
+                a: 20.0,
+                b: 1.0,
+                n: 3,
+            }],
+        };
+        let (map, scale) = corpus.into_seed_map(&HwTable::default());
+        assert_eq!(scale, 1.0);
+        assert_eq!(map[&("x".into(), "x86_64-linux".into())].s, 5.0);
     }
 
     #[test]

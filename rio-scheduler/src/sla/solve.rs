@@ -301,6 +301,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: Default::default(),
+            prior_source: None,
         }
     }
     fn t(name: &str, p90: f64) -> Tier {

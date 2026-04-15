@@ -13,6 +13,7 @@ use super::fit::{
     weighted_quantile,
 };
 use super::hw::HwTable;
+use super::prior::{FitParams, PriorSources, partial_pool, prior_for};
 use super::solve::Tier;
 use super::types::{
     DiskBytes, DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
@@ -23,6 +24,11 @@ use crate::db::BuildSampleRow;
 /// Bootstrap replicates per CI recompute. 500 keeps the 80% CI stable to
 /// ~2% across reseeds while staying <1ms per key on the refit path.
 const BOOTSTRAP_REPS: usize = 500;
+
+/// Partial-pool shrinkage `n0`. ADR-023 §2.10: at `n_eff = 3` the
+/// per-key fit and the prior weigh equally; below that the prior
+/// dominates.
+const PARTIAL_POOL_N0: f64 = 3.0;
 
 /// Refit one `(pname, system, tenant)` key from its ring-buffer of recent
 /// samples (≤32 rows, completed_at-ascending — `rows.last()` is newest).
@@ -46,6 +52,7 @@ pub fn refit(
     prev: Option<&FittedParams>,
     tiers: &[Tier],
     hw: &HwTable,
+    priors: Option<&PriorSources>,
 ) -> FittedParams {
     let now = now_epoch();
     // Filter to rows that can sit on a c-axis. Everything below — vdists,
@@ -135,12 +142,28 @@ pub fn refit(
         p_bar,
         prev_usl: matches!(prev.map(|p| &p.fit), Some(DurationFit::Usl { .. })),
     };
-    let (fit, sigma) = if n_eff < 3.0 || span < 4.0 {
+    let (mut fit, sigma) = if n_eff < 3.0 || span < 4.0 {
         (DurationFit::Probe, 0.2)
     } else {
         fit_duration_staged(&cs_f, &ts_f, &w_f, &gate)
     };
-    let mem = fit_memory(&cs, &ms, &w, n_eff);
+    let mut mem = fit_memory(&cs, &ms, &w, n_eff);
+
+    // r[impl sched.sla.prior-partial-pool]
+    // Shrinkage blend: w·θ_pname + (1−w)·θ_prior with w = n_eff/(n_eff+n0).
+    // Probe fits have no θ_pname so they record provenance only (the
+    // explore path doesn't read the curve anyway). Non-Probe fits get
+    // their (S,P,Q,a,b) blended toward the prior — at n_eff=3 it's a
+    // 50/50 mix; by n_eff≈30 the prior is <10% and effectively gone.
+    let prior_source = priors.map(|src| {
+        let (theta_prior, prov) = prior_for(key, src);
+        if !matches!(fit, DurationFit::Probe) {
+            let theta_pname = extract_fit_params(&fit, &mem);
+            let pooled = partial_pool(&theta_pname, n_eff, &theta_prior, PARTIAL_POOL_N0);
+            apply_pooled(&mut fit, &mut mem, &pooled);
+        }
+        prov
+    });
 
     let disk: Vec<f64> = fit_rows
         .iter()
@@ -209,6 +232,47 @@ pub fn refit(
         t_min_ci: ci,
         ci_computed_at: ci_at,
         tier,
+        prior_source,
+    }
+}
+
+/// Project `(DurationFit, MemFit)` → flat `(S, P, Q, a, b)`. `MemFit::
+/// Independent` has no (a, b); we substitute `(ln p90, 0)` so the pooled
+/// `a` still lands somewhere sensible if the prior is Coupled (b=0 ⇔
+/// flat M(c), which is what Independent means).
+fn extract_fit_params(fit: &DurationFit, mem: &MemFit) -> FitParams {
+    let (s, p, q) = fit.spq();
+    let (a, b) = match mem {
+        MemFit::Coupled { a, b, .. } => (*a, *b),
+        MemFit::Independent { p90 } => ((p90.0.max(1) as f64).ln(), 0.0),
+    };
+    FitParams { s, p, q, a, b }
+}
+
+/// Write pooled `(S, P, Q, a, b)` back into the fit/mem variants
+/// in-place. Variant is preserved (an Amdahl fit stays Amdahl, just with
+/// shrunk S/P); `p_bar` is structural (observed saturation), not a
+/// regressed scalar, so it's left untouched.
+fn apply_pooled(fit: &mut DurationFit, mem: &mut MemFit, pooled: &FitParams) {
+    match fit {
+        DurationFit::Probe => {}
+        DurationFit::Amdahl { s, p } => {
+            *s = RefSeconds(pooled.s);
+            *p = RefSeconds(pooled.p);
+        }
+        DurationFit::Capped { s, p, .. } => {
+            *s = RefSeconds(pooled.s);
+            *p = RefSeconds(pooled.p);
+        }
+        DurationFit::Usl { s, p, q, .. } => {
+            *s = RefSeconds(pooled.s);
+            *p = RefSeconds(pooled.p);
+            *q = pooled.q;
+        }
+    }
+    if let MemFit::Coupled { a, b, .. } = mem {
+        *a = pooled.a;
+        *b = pooled.b;
     }
 }
 
@@ -433,6 +497,7 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
         ci_computed_at: None,
         tier: None,
         hw_bias: HashMap::new(),
+        prior_source: None,
     }
 }
 
@@ -506,11 +571,19 @@ mod tests {
     }
 
     fn r(rows: &[BuildSampleRow]) -> FittedParams {
-        refit(&key(), rows, 7.0 * 86400.0, None, &[], &HwTable::default())
+        refit(
+            &key(),
+            rows,
+            7.0 * 86400.0,
+            None,
+            &[],
+            &HwTable::default(),
+            None,
+        )
     }
 
     fn r_hw(rows: &[BuildSampleRow], hw: &HwTable) -> FittedParams {
-        refit(&key(), rows, 7.0 * 86400.0, None, &[], hw)
+        refit(&key(), rows, 7.0 * 86400.0, None, &[], hw, None)
     }
 
     /// Like `row` but with explicit peak_cpu and avg_cores so Capped-stage
@@ -848,6 +921,7 @@ mod tests {
             ci_computed_at: Some(at),
             tier: None,
             hw_bias: HashMap::new(),
+            prior_source: None,
         }
     }
 

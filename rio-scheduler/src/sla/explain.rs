@@ -168,7 +168,10 @@ pub fn explain(
     ExplainResult {
         key: key.clone(),
         fit_summary: summarize_fit(fit),
-        prior_source: "per-key".into(),
+        prior_source: fit
+            .prior_source
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "per-key".into()),
         override_applied: pinned.map(|t| format!("tier pinned to {t:?}")),
         candidates,
     }
@@ -236,6 +239,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: Default::default(),
+            prior_source: None,
         }
     }
     fn key() -> ModelKey {

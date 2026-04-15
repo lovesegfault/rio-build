@@ -404,6 +404,21 @@ pub enum AdminQuery {
         key: crate::sla::types::ModelKey,
         reply: oneshot::Sender<crate::sla::explain::ExplainResult>,
     },
+    /// `AdminService.ExportSlaCorpus`: dump every cached fit with
+    /// `n_eff ≥ min_n` (optionally tenant-filtered) as a portable seed
+    /// corpus. Reply is the corpus struct; the RPC handler serializes.
+    SlaExportCorpus {
+        tenant: Option<String>,
+        min_n: u32,
+        reply: oneshot::Sender<crate::sla::prior::SeedCorpus>,
+    },
+    /// `AdminService.ImportSlaCorpus`: merge a parsed corpus into the
+    /// seed-prior table. Reply is `Ok((entries, rescale_factor))` or
+    /// `Err` when `[sla]` is unconfigured.
+    SlaImportCorpus {
+        corpus: crate::sla::prior::SeedCorpus,
+        reply: oneshot::Sender<anyhow::Result<(usize, f64)>>,
+    },
 }
 
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
@@ -475,6 +490,8 @@ impl AdminQuery {
             Self::SlaStatus { .. } => "SlaStatus",
             Self::SlaEvict { .. } => "SlaEvict",
             Self::SlaExplain { .. } => "SlaExplain",
+            Self::SlaExportCorpus { .. } => "SlaExportCorpus",
+            Self::SlaImportCorpus { .. } => "SlaImportCorpus",
         }
     }
 }
