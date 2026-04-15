@@ -2,6 +2,7 @@ use super::config::SlaConfig;
 use super::explore;
 use super::fit::headroom;
 use super::r#override::ResolvedTarget;
+use super::quantile;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 
 /// Fallback ceilings when `[sla]` is unconfigured. The actor stores
@@ -200,34 +201,79 @@ pub fn intent_for(
     (cores, r.mem().0, r.disk().0)
 }
 
+// r[impl sched.sla.tier-envelope]
+/// Min `c ∈ [c_lo, cap_c]` satisfying `∀(q,bound)∈tier:
+/// quantile(q; T(c)/hw_factor, σ, p(c)) ≤ bound`, where
+/// `p(c) = 1-exp(-λ·T(c))` is the per-attempt preemption probability
+/// under Poisson rate `λ`. Returns `None` if infeasible at `cap_c`.
+///
+/// `feasible(c)` is monotone on `[c_lo, cap_c]` because callers pass
+/// `cap_c ≤ min(p̄, c_opt)` where `T(c)` is decreasing — so plain
+/// bisection finds the boundary.
+pub fn solve_envelope(
+    fit: &FittedParams,
+    tier: &Tier,
+    c_lo: f64,
+    cap_c: f64,
+    hw_factor: f64,
+    lambda: f64,
+) -> Option<RawCores> {
+    let bounds: Vec<(f64, f64)> = [(0.5, tier.p50), (0.9, tier.p90), (0.99, tier.p99)]
+        .into_iter()
+        .filter_map(|(q, b)| b.map(|b| (q, b)))
+        .collect();
+    if bounds.is_empty() {
+        return Some(RawCores(c_lo)); // best-effort tier
+    }
+    let feasible = |c: f64| -> bool {
+        let t = fit.fit.t_at(RawCores(c)).0 / hw_factor;
+        let p = if lambda > 0.0 {
+            1.0 - (-lambda * t).exp()
+        } else {
+            0.0
+        };
+        if p > 0.5 {
+            return false;
+        }
+        bounds
+            .iter()
+            .all(|&(q, bound)| quantile::quantile(q, t, fit.sigma_resid, p) <= bound)
+    };
+    if !feasible(cap_c) {
+        return None;
+    }
+    if feasible(c_lo) {
+        return Some(RawCores(c_lo.ceil()));
+    }
+    // Invariant: lo infeasible, hi feasible.
+    let (mut lo, mut hi) = (c_lo, cap_c);
+    while hi - lo > 0.5 {
+        let mid = (lo + hi) / 2.0;
+        if feasible(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(RawCores(hi.ceil()))
+}
+
 // r[impl sched.sla.solve-citardauq]
 // r[impl sched.sla.solve-reject-not-clamp]
 pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveResult {
-    let (s, p, q) = fit.fit.spq();
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
 
     for tier in tiers {
-        let Some(p90) = tier.p90 else { continue };
-        let beta = s - (-1.2816 * fit.sigma_resid).exp() * p90;
-        if beta >= 0.0 {
-            continue; // target ≤ serial floor
-        }
-        let disc = beta * beta - 4.0 * q * p;
-        if disc < 0.0 {
-            continue;
-        }
-        let denom = -0.5 * (beta + beta.signum() * disc.sqrt());
-        let c_star = if denom.abs() < 1e-12 {
-            f64::INFINITY
-        } else {
-            (p / denom).max(1.0)
-        };
-        if c_star > cap_c {
+        // hw_factor=1.0 / lambda=0.0: phase-13 wires the per-hw_class
+        // factor and per-capacity-type preemption rate; until then the
+        // envelope solve degenerates to the scalar-p90 closed form ±1
+        // core when only `p90` is set.
+        let Some(c_star) = solve_envelope(fit, tier, 1.0, cap_c, 1.0, 0.0) else {
             continue; // REJECT (not clamp)
-        }
-        let mem = (fit.mem.at(RawCores(c_star)).0 as f64 * h) as u64;
+        };
+        let mem = (fit.mem.at(c_star).0 as f64 * h) as u64;
         if mem > ceil.max_mem {
             continue;
         }
@@ -236,7 +282,7 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
         }
         return SolveResult::Feasible {
             tier: tier.name.clone(),
-            c_star: RawCores(c_star),
+            c_star,
             mem: MemBytes(mem),
             disk: DiskBytes(disk),
         };
@@ -312,6 +358,14 @@ mod tests {
             p99: None,
         }
     }
+    fn t3(p50: f64, p90: f64, p99: f64) -> Tier {
+        Tier {
+            name: "x".into(),
+            p50: Some(p50),
+            p90: Some(p90),
+            p99: Some(p99),
+        }
+    }
     fn ceil() -> Ceilings {
         Ceilings {
             max_cores: 64.0,
@@ -322,15 +376,15 @@ mod tests {
     }
 
     #[test]
-    fn citardauq_degenerates_to_amdahl_at_q0() {
+    fn envelope_degenerates_to_amdahl_at_q0() {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let SolveResult::Feasible { c_star, tier, .. } =
             solve_mvp(&fit, &[t("t0", 300.0)], &ceil())
         else {
             panic!()
         };
-        // β=30-e^{-0.128}·300≈-234 → c*=2000/234≈8.54
-        assert!((c_star.0 - 8.54).abs() < 0.3, "got {}", c_star.0);
+        // β=30-e^{-0.128}·300≈-234 → c*=2000/234≈8.54 → ceil 9
+        assert_eq!(c_star.0, 9.0, "ceil(8.54)");
         assert_eq!(tier, "t0");
     }
     #[test]
@@ -352,6 +406,74 @@ mod tests {
             SolveResult::BestEffort { .. }
         ));
     }
+    // r[verify sched.sla.tier-envelope]
+    #[test]
+    fn envelope_tight_p99_forces_higher_c() {
+        // p90=300 alone (σ=0.2): T·e^{0.2·1.2816}≤300 → T≤232.2 → c*≈9.89.
+        // Adding p99=320:       T·e^{0.2·2.3263}≤320 → T≤200.9 → c*≈11.7.
+        // (p50=250 is slack: T≤250 → c*≈9.1.) Bisection halts at
+        // hi-lo<0.5 then ceils, so allow ±1 around the analytic
+        // boundary; the load-bearing property is the inequality.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.2);
+        let c_p90 = solve_envelope(&fit, &t("x", 300.0), 1.0, 64.0, 1.0, 0.0).unwrap();
+        let c_full = solve_envelope(&fit, &t3(250.0, 300.0, 320.0), 1.0, 64.0, 1.0, 0.0).unwrap();
+        assert!((10.0..=11.0).contains(&c_p90.0), "p90-only c*={}", c_p90.0);
+        assert!((12.0..=13.0).contains(&c_full.0), "full c*={}", c_full.0);
+        assert!(
+            c_full.0 > c_p90.0,
+            "p99 must bind: full={} p90-only={}",
+            c_full.0,
+            c_p90.0
+        );
+    }
+    #[test]
+    fn envelope_loose_p99_permits_spot() {
+        // λ=0.002 (spot preemption): at c=14, T≈173 → p≈0.29; geometric
+        // tail inflates p99. Loose p99=2000 absorbs it; tight p99 doesn't.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.2);
+        let loose = solve_envelope(&fit, &t3(250.0, 300.0, 2000.0), 1.0, 64.0, 1.0, 0.002);
+        let tight = solve_envelope(&fit, &t3(250.0, 300.0, 320.0), 1.0, 64.0, 1.0, 0.002);
+        assert!(loose.is_some(), "loose p99 should be feasible under spot λ");
+        assert!(
+            tight.is_none() || tight.unwrap().0 > loose.unwrap().0,
+            "tight p99 must reject or demand more cores: tight={tight:?} loose={loose:?}"
+        );
+    }
+    #[test]
+    fn envelope_degenerate_single_bound_matches_scalar_within_1core() {
+        // tier {p90:300} only, σ=0.1, q=0, λ=0 → must agree with the
+        // closed-form citardauq scalar solve to ±1 core.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let env = solve_envelope(&fit, &t("x", 300.0), 1.0, 64.0, 1.0, 0.0).unwrap();
+        // Scalar citardauq: β = S - e^{-1.2816σ}·p90, c* = P / -β
+        let beta = 30.0 - (-1.2816f64 * 0.1).exp() * 300.0;
+        let scalar = 2000.0 / -beta;
+        assert!(
+            (env.0 - scalar).abs() <= 1.0,
+            "envelope={} scalar={scalar:.2}",
+            env.0
+        );
+    }
+    #[test]
+    fn envelope_infeasible_at_cap_is_none() {
+        let fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
+        assert!(solve_envelope(&fit, &t("x", 300.0), 1.0, 64.0, 1.0, 0.0).is_none());
+    }
+    #[test]
+    fn envelope_no_bounds_is_best_effort_floor() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let tier = Tier {
+            name: "be".into(),
+            p50: None,
+            p90: None,
+            p99: None,
+        };
+        assert_eq!(
+            solve_envelope(&fit, &tier, 1.0, 64.0, 1.0, 0.0).unwrap().0,
+            1.0
+        );
+    }
+
     #[test]
     fn beta_nonneg_rejects_tier() {
         // S=400 > target → infeasible
