@@ -479,6 +479,12 @@ fn build_executor_container(
                     "RIO_INTENT_ID",
                     "metadata.annotations['rio.build/intent-id']",
                 ),
+                // ADR-023 phase-10 hw self-calibration. Controller's
+                // node_informer pod-watcher stamps `rio.build/hw-class`
+                // once `spec.nodeName` is set; builder reads it via
+                // downward-API to key the hw_perf_samples insert.
+                // Unset → kubelet resolves to "" → bench skipped.
+                env_from_field("RIO_HW_CLASS", "metadata.annotations['rio.build/hw-class']"),
                 // Role discriminator. rio-builder's `RIO_EXECUTOR_
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
                 // §Executor enforcement — a builder receiving a FOD

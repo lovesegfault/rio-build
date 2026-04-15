@@ -24,12 +24,13 @@ use tracing::{debug, error, instrument};
 
 use rio_proto::StoreService;
 use rio_proto::types::{
-    AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
-    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, FindMissingPathsRequest,
-    FindMissingPathsResponse, GetPathRequest, PathInfo, PutPathBatchRequest, PutPathBatchResponse,
-    PutPathRequest, PutPathResponse, QueryPathFromHashPartRequest, QueryPathInfoRequest,
-    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
-    TenantQuotaRequest, TenantQuotaResponse,
+    AddSignaturesRequest, AddSignaturesResponse, AppendHwPerfSampleRequest,
+    BatchGetManifestRequest, BatchGetManifestResponse, BatchQueryPathInfoRequest,
+    BatchQueryPathInfoResponse, FindMissingPathsRequest, FindMissingPathsResponse, GetPathRequest,
+    PathInfo, PutPathBatchRequest, PutPathBatchResponse, PutPathRequest, PutPathResponse,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
+    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
+    TenantQuotaResponse,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -561,6 +562,36 @@ impl StoreService for StoreServiceImpl {
         request: Request<TenantQuotaRequest>,
     ) -> Result<Response<TenantQuotaResponse>, Status> {
         self.tenant_quota_impl(request).await
+    }
+
+    /// ADR-023 phase-10: builder appends one `hw_perf_samples` row at
+    /// init. Append-only; the `hw_perf_factors` view aggregates to
+    /// per-hw_class median. Validation is minimal (non-empty hw_class,
+    /// finite positive factor) — the builder controls all three fields,
+    /// and a garbage row from a misbehaving pod is one rank in a median.
+    // r[impl sched.sla.hw-bench-append-only]
+    #[instrument(skip(self, request), fields(rpc = "AppendHwPerfSample"))]
+    async fn append_hw_perf_sample(
+        &self,
+        request: Request<AppendHwPerfSampleRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        if req.hw_class.is_empty() || req.pod_id.is_empty() {
+            return Err(Status::invalid_argument("hw_class and pod_id required"));
+        }
+        if !req.factor.is_finite() || req.factor <= 0.0 {
+            return Err(Status::invalid_argument("factor must be finite and > 0"));
+        }
+        sqlx::query!(
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3)",
+            req.hw_class,
+            req.pod_id,
+            req.factor,
+        )
+        .execute(&self.pool)
+        .await
+        .status_internal("AppendHwPerfSample: insert")?;
+        Ok(Response::new(()))
     }
 }
 

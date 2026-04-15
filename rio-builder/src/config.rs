@@ -122,6 +122,12 @@ pub struct Config {
     /// to `CompletionReport` for ADR-023's hw_class join (scheduler
     /// resolves instance type from the Node object). Empty outside k8s.
     pub node_name: String,
+    /// ADR-023 phase-10: `rio.build/hw-class` pod annotation
+    /// (controller-stamped from the Node informer; downward-API →
+    /// `RIO_HW_CLASS`). Feeds [`crate::hw_bench::report`]'s
+    /// `hw_perf_samples` insert. Empty → bench skipped (no hw_class to
+    /// key the sample on; controller hasn't stamped yet, or non-k8s).
+    pub hw_class: String,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent
     /// in every heartbeat so the scheduler can match this pod to its
@@ -198,6 +204,7 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             node_name: String::new(),
+            hw_class: String::new(),
             intent_id: String::new(),
             size_class: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,

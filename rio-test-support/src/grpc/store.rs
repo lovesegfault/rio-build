@@ -781,4 +781,15 @@ impl StoreService for MockStore {
             None => Err(Status::not_found(format!("mock: unknown tenant: {name}"))),
         }
     }
+
+    async fn append_hw_perf_sample(
+        &self,
+        _request: Request<types::AppendHwPerfSampleRequest>,
+    ) -> Result<Response<()>, Status> {
+        // No mock state — the only caller (rio-builder hw_bench::report)
+        // is best-effort and the bench's effect is read by the
+        // SCHEDULER (HwTable::load), not anything that goes through
+        // MockStore. Accept and discard.
+        Ok(Response::new(()))
+    }
 }

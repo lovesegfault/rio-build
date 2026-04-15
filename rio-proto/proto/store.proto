@@ -97,6 +97,13 @@ service StoreService {
   // overflow is acceptable. NOT_FOUND on unknown tenant_name (gateway
   // treats as no-quota, passes through).
   rpc TenantQuota(rio.types.TenantQuotaRequest) returns (rio.types.TenantQuotaResponse);
+
+  // r[sched.sla.hw-bench-append-only]
+  // ADR-023 phase-10: builder appends one hw_perf_samples row at init.
+  // Append-only; the hw_perf_factors view aggregates to per-hw_class
+  // median. Best-effort from the builder side — a failed append degrades
+  // normalization (hw_class stays factor=1.0), not the build itself.
+  rpc AppendHwPerfSample(rio.types.AppendHwPerfSampleRequest) returns (google.protobuf.Empty);
 }
 
 // Chunk-level storage service for content-defined chunking.

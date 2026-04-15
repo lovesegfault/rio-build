@@ -32,6 +32,7 @@ pub mod executor;
 pub mod fixture;
 pub mod fuse;
 pub mod health;
+pub mod hw_bench;
 pub mod log_stream;
 pub(crate) mod overlay;
 pub mod quota;

@@ -41,6 +41,10 @@ sha2 = { workspace = true }
 # verify_fod_hashes hardcoded SHA-256.
 sha1 = { workspace = true }
 hex = { workspace = true }
+# ADR-023 phase-10 hw_bench microbench. Transitive already (flate2);
+# direct dep so the SIMD feature-detection path is the same one the
+# bench was calibrated against.
+crc32fast = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }

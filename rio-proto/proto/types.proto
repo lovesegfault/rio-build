@@ -328,6 +328,16 @@ message TenantQuotaResponse {
   optional uint64 limit_bytes = 2;  // tenants.gc_max_store_bytes. NULL in PG → absent → no limit.
 }
 
+// ADR-023 phase-10: builder-reported hw self-calibration sample.
+// One row per pod start (append-only). hw_class comes from the
+// rio.build/hw-class pod annotation (controller-stamped via Node
+// informer); pod_id is the executor_id (k8s pod name).
+message AppendHwPerfSampleRequest {
+  string hw_class = 1;
+  string pod_id = 2;
+  double factor = 3;  // REF_TIME_SECS / measured_secs
+}
+
 // StoreAdminService.GetLoad — per-replica load snapshot for the
 // ComponentScaler. The controller polls each store pod (headless-svc
 // DNS fan-out) and uses max(pg_pool_utilization) to calibrate the

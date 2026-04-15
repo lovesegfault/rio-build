@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38a87426b21797e77be91ce2d44c62e6c9a93abb1c2b0338ec3fd55113064846"
+}

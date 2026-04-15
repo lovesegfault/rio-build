@@ -28,11 +28,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::Node;
+use k8s_openapi::api::core::v1::{Node, Pod};
+use kube::api::{Patch, PatchParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
+
+/// Pod annotation the [`run_pod_annotator`] watcher stamps with the
+/// node's [`HwClass::as_string`]. Builder reads it via downward-API
+/// (`RIO_HW_CLASS`) to key its `hw_perf_samples` insert.
+pub const ANNOT_HW_CLASS: &str = "rio.build/hw-class";
 
 /// Karpenter-set: `aws`, `intel`, `amd`. Unknown if label absent
 /// (non-Karpenter node, or Karpenter < v0.33).
@@ -170,6 +176,92 @@ pub async fn run(client: Client, cache: NodeLabelCache, shutdown: rio_common::si
     }
 }
 
+/// Builder/fetcher pod label selector — same value `disruption.rs`
+/// filters on. Re-declared here (not re-exported) to keep this module
+/// dependency-free of `builderpool`.
+const POOL_LABEL: &str = "rio.build/pool";
+
+/// Pod-watcher: stamp `rio.build/hw-class` on each builder pod once
+/// `spec.nodeName` resolves.
+///
+/// ADR-023 phase-10: builders are air-gapped from the apiserver, so
+/// they can't read Node labels themselves. The builder reads the
+/// stamped annotation via downward-API (`RIO_HW_CLASS`) to key its
+/// `hw_perf_samples` microbench insert. Stamps once (skip if the
+/// annotation already exists) — pod annotations are sticky and the
+/// hw_class can't change for a scheduled pod.
+///
+/// `spawn_monitored("hw-class-annotator", run_pod_annotator(...))`
+/// from main.rs. Same degraded-not-broken contract as [`run`]: if the
+/// watcher dies, builders skip the bench (`RIO_HW_CLASS` empty) and
+/// the hw_class stays at `factor=1.0` until ≥3 pods report.
+///
+/// TODO: gate the stamp on `hw_class NOT IN (SELECT hw_class FROM
+/// hw_perf_factors)` so well-sampled classes skip the ~5s bench. Needs
+/// a PG handle here (controller is currently apiserver-only); deferred
+/// — the bench is cheap and runs concurrent with cold-start anyway.
+pub async fn run_pod_annotator(
+    client: Client,
+    cache: NodeLabelCache,
+    shutdown: rio_common::signal::Token,
+) {
+    let pods: Api<Pod> = Api::all(client.clone());
+    let cfg = watcher::Config::default().labels(POOL_LABEL);
+    let mut stream = watcher(pods, cfg)
+        .default_backoff()
+        .applied_objects()
+        .boxed();
+
+    info!("hw-class pod annotator started (label={POOL_LABEL})");
+
+    loop {
+        let pod = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                debug!("hw-class annotator: shutdown");
+                return;
+            }
+            next = stream.next() => match next {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => { warn!(error = %e, "hw-class annotator: stream error"); continue; }
+                None => { warn!("hw-class annotator: stream ended (unexpected)"); return; }
+            },
+        };
+        let Some((name, ns, hw)) = hw_class_patch_target(&pod, &cache) else {
+            continue;
+        };
+        let pods_ns: Api<Pod> = Api::namespaced(client.clone(), &ns);
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { ANNOT_HW_CLASS: hw } }
+        });
+        if let Err(e) = pods_ns
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            warn!(%name, %ns, error = %e, "hw-class annotator: patch failed");
+        }
+    }
+}
+
+/// `Some((pod_name, namespace, hw_class))` if `pod` should be stamped:
+/// it has a `spec.nodeName`, that node is in `cache`, and the
+/// annotation isn't already set. Pure for unit-testability.
+fn hw_class_patch_target(pod: &Pod, cache: &NodeLabelCache) -> Option<(String, String, String)> {
+    let already = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(ANNOT_HW_CLASS));
+    if already {
+        return None;
+    }
+    let node = pod.spec.as_ref()?.node_name.as_deref()?;
+    let hw = cache.hw_class_of(node)?;
+    let name = pod.metadata.name.clone()?;
+    let ns = pod.metadata.namespace.clone()?;
+    Some((name, ns, hw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +320,53 @@ mod tests {
         cache.delete(&n);
         assert_eq!(cache.hw_class_of("ip-10-0-1-5"), None);
         assert!(cache.is_empty());
+    }
+
+    fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {
+        let mut p = Pod::default();
+        p.metadata.name = Some(name.into());
+        p.metadata.namespace = Some(ns.into());
+        if !annots.is_empty() {
+            p.metadata.annotations = Some(
+                annots
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect(),
+            );
+        }
+        if let Some(n) = node {
+            p.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+                node_name: Some(n.into()),
+                ..Default::default()
+            });
+        }
+        p
+    }
+
+    #[test]
+    fn patch_target_stamps_once() {
+        let cache = NodeLabelCache::default();
+        cache.apply(&node("ip-10-0-1-5", &[(LABEL_STORAGE, "nvme")]));
+        // Scheduled, not yet annotated → stamp.
+        let p = pod("rb-abc", "rio", Some("ip-10-0-1-5"), &[]);
+        assert_eq!(
+            hw_class_patch_target(&p, &cache),
+            Some(("rb-abc".into(), "rio".into(), "unknown-unknown-nvme".into()))
+        );
+        // Already annotated → skip (sticky).
+        let p = pod(
+            "rb-abc",
+            "rio",
+            Some("ip-10-0-1-5"),
+            &[(ANNOT_HW_CLASS, "unknown-unknown-nvme")],
+        );
+        assert_eq!(hw_class_patch_target(&p, &cache), None);
+        // Pending (no nodeName yet) → skip.
+        let p = pod("rb-pending", "rio", None, &[]);
+        assert_eq!(hw_class_patch_target(&p, &cache), None);
+        // Node not in cache (informer race / non-Karpenter) → skip.
+        let p = pod("rb-unk", "rio", Some("ip-10-0-9-9"), &[]);
+        assert_eq!(hw_class_patch_target(&p, &cache), None);
     }
 
     #[test]

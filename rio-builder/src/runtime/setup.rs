@@ -76,6 +76,20 @@ pub async fn setup(
         "connected to gRPC services"
     );
 
+    // ADR-023 phase-10 hw self-calibration. Best-effort, fire-and-
+    // forget: a ~5s CPU-bound microbench in a blocking thread + one
+    // store RPC. Runs concurrently with FUSE mount + first heartbeat
+    // below; the bench finishes well before the first assignment can
+    // arrive (Karpenter cold-start is ~30s). Empty hw_class → skipped
+    // inside `report` (controller hasn't stamped the annotation yet,
+    // or non-k8s).
+    rio_common::task::spawn_monitored("hw-bench", {
+        let mut store = store_clients.store.clone();
+        let hw_class = cfg.hw_class.clone();
+        let pod_id = executor_id.clone();
+        async move { crate::hw_bench::report(&mut store, &hw_class, &pod_id).await }
+    });
+
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
     let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
