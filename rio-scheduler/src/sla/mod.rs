@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::db::SchedulerDb;
+use crate::db::{SchedulerDb, SlaOverrideRow};
 
 pub mod bootstrap;
 pub mod config;
@@ -13,6 +13,7 @@ pub mod explore;
 pub mod fit;
 pub mod ingest;
 pub mod metrics;
+pub mod r#override;
 pub mod solve;
 pub mod types;
 
@@ -32,6 +33,13 @@ const DT_POLL_SECS: f64 = 1.0;
 /// first refresh is a full warm: every existing sample is "new".
 pub struct SlaEstimator {
     cache: Arc<RwLock<HashMap<types::ModelKey, types::FittedParams>>>,
+    /// Non-expired `sla_overrides` rows. Full-table snapshot, refreshed
+    /// each [`Self::refresh`] tick. Dispatch reads via
+    /// [`Self::resolved_override`] (O(n) scan; n is operator-written —
+    /// tens of rows). Separate `Arc` so the admin RPC can swap it
+    /// out-of-band after `SetSlaOverride` without waiting for the next
+    /// tick (phase-7; phase-6 just re-reads on tick).
+    overrides: Arc<RwLock<Vec<SlaOverrideRow>>>,
     last_tick: RwLock<f64>,
     halflife_secs: f64,
     ring_buffer: u32,
@@ -41,6 +49,7 @@ impl SlaEstimator {
     pub fn new(halflife_secs: f64, ring_buffer: u32) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            overrides: Arc::new(RwLock::new(Vec::new())),
             last_tick: RwLock::new(0.0),
             halflife_secs,
             ring_buffer,
@@ -53,12 +62,40 @@ impl SlaEstimator {
         self.cache.read().get(key).cloned()
     }
 
+    /// Drop one cached fit. Pairs with
+    /// [`SchedulerDb::delete_build_samples_for_key`] for `ResetSlaModel`
+    /// — next dispatch falls back to the cold-start probe path. Returns
+    /// whether an entry was present.
+    pub fn evict(&self, key: &types::ModelKey) -> bool {
+        self.cache.write().remove(key).is_some()
+    }
+
+    /// Most-specific override matching `key` from the last-refreshed
+    /// snapshot. Dispatch consults this BEFORE [`solve::intent_for`]'s
+    /// fit/explore branch; `forced_cores`/`forced_mem` short-circuit the
+    /// model entirely.
+    pub fn resolved_override(&self, key: &types::ModelKey) -> Option<r#override::ResolvedTarget> {
+        r#override::resolve(key, &self.overrides.read())
+    }
+
+    /// Snapshot the override cache. For `AdminService.SlaStatus` /
+    /// `ListSlaOverrides`' actor-side view.
+    pub fn overrides(&self) -> Vec<SlaOverrideRow> {
+        self.overrides.read().clone()
+    }
+
     /// Seed one entry. Test-only: bypasses the DB refit so dispatch
     /// integration tests can assert `intent_for(cached(key))` without an
     /// ephemeral PG round-trip.
     #[cfg(test)]
     pub fn seed(&self, fit: types::FittedParams) {
         self.cache.write().insert(fit.key.clone(), fit);
+    }
+
+    /// Seed the override cache. Test-only.
+    #[cfg(test)]
+    pub fn seed_overrides(&self, rows: Vec<SlaOverrideRow>) {
+        *self.overrides.write() = rows;
     }
 
     /// Pull samples completed since the last tick, refit each touched
@@ -75,6 +112,15 @@ impl SlaEstimator {
     /// [`config::SlaConfig::solve_tiers`]) feeds the Schmitt-trigger tier
     /// reassignment; empty → tier reassignment is a no-op.
     pub async fn refresh(&self, db: &SchedulerDb, tiers: &[solve::Tier]) -> anyhow::Result<usize> {
+        // Override snapshot first: cheap (operator-written, tens of
+        // rows) and independent of the sample refit, so a PG blip on
+        // the heavier incremental query below still leaves the override
+        // cache fresh for this tick.
+        match db.read_sla_overrides(None).await {
+            Ok(rows) => *self.overrides.write() = rows,
+            Err(e) => tracing::warn!(error = %e, "sla override refresh failed; keeping previous"),
+        }
+
         let since = *self.last_tick.read();
         let new_rows = db.read_build_samples_incremental(since).await?;
         // High-water mark from the rows themselves, not wall-clock now():

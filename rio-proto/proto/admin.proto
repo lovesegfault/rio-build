@@ -97,6 +97,33 @@ service AdminService {
   // stale at worst), NOT a live PG read.
   rpc GetEstimatorStats(rio.types.GetEstimatorStatsRequest) returns (rio.types.GetEstimatorStatsResponse);
 
+  // ─── ADR-023 SLA overrides ────────────────────────────────────────
+
+  // Pin a (pname, system?, tenant?) key to a forced tier / cores / mem,
+  // bypassing the fitted-curve solve. NULL system/tenant are wildcards
+  // (r[sched.sla.override-precedence]). Returns the inserted row (with
+  // server-assigned id + created_at). Picked up by the next estimator
+  // refresh tick (~60s).
+  rpc SetSlaOverride(rio.types.SetSlaOverrideRequest) returns (rio.types.SlaOverride);
+
+  // List all non-expired overrides, optionally filtered by pname.
+  rpc ListSlaOverrides(rio.types.ListSlaOverridesRequest) returns (rio.types.ListSlaOverridesResponse);
+
+  // Delete one override by id. Idempotent — returns Empty whether or not
+  // the row existed.
+  rpc ClearSlaOverride(rio.types.ClearSlaOverrideRequest) returns (google.protobuf.Empty);
+
+  // Drop all build_samples for one (pname, system, tenant) key and evict
+  // the cached fit. Next dispatch falls back to the cold-start probe
+  // path. Operator escape hatch when a fit has converged on garbage
+  // (e.g. node-migration changed the hw_class baseline).
+  rpc ResetSlaModel(rio.types.ResetSlaModelRequest) returns (google.protobuf.Empty);
+
+  // Dump the cached FittedParams for one (pname, system, tenant) key.
+  // Reflects the actor's last refresh tick (~60s stale at worst), NOT a
+  // live PG refit. `has_fit=false` ⇔ never seen / evicted.
+  rpc SlaStatus(rio.types.SlaStatusRequest) returns (rio.types.SlaStatusResponse);
+
   // VM-test fixture: write a synthetic build_samples row directly. Lets
   // the sla-sizing scenario inject a 100x outlier and assert the MAD
   // sweep flags it without staging a real wall-clock-hours build. Gated

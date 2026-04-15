@@ -511,3 +511,90 @@ message InjectBuildSampleRequest {
   optional double cpu_seconds_total = 7;
   optional string version = 8;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// ADR-023 SLA overrides (Set/List/ClearSlaOverride, ResetSlaModel, SlaStatus)
+// ───────────────────────────────────────────────────────────────────────────
+
+// One sla_overrides row. Unset optional = NULL / wildcard. `id`/
+// `created_at_epoch` are server-populated on Set; clients leave them 0.
+message SlaOverride {
+  int64 id = 1;
+  string pname = 2;
+  // NULL system/tenant = wildcard (r[sched.sla.override-precedence]:
+  // pname+system+tenant > pname+system > pname).
+  optional string system = 3;
+  optional string tenant = 4;
+  optional string cluster = 5;
+  // Named tier from `[sla].tiers`. Mutually independent of cores/mem —
+  // a row may force a tier (solve still runs) OR force exact cores/mem
+  // (solve bypassed) OR both.
+  optional string tier = 6;
+  optional double p50_secs = 7;
+  optional double p90_secs = 8;
+  optional double p99_secs = 9;
+  optional double cores = 10;
+  optional int64 mem_bytes = 11;
+  optional string capacity_type = 12;
+  // Unix epoch seconds. Unset = never expires. Expired rows are
+  // filtered server-side (List/resolve both ignore them).
+  optional double expires_at_epoch = 13;
+  double created_at_epoch = 14;
+  optional string created_by = 15;
+}
+
+message SetSlaOverrideRequest {
+  // The override to insert. `id`/`created_at_epoch` ignored.
+  SlaOverride override = 1;
+}
+
+message ListSlaOverridesRequest {
+  // Exact-match filter on pname. Empty = all.
+  optional string pname = 1;
+}
+
+message ListSlaOverridesResponse {
+  // Non-expired overrides, ordered by created_at DESC (newest first).
+  repeated SlaOverride overrides = 1;
+}
+
+message ClearSlaOverrideRequest {
+  int64 id = 1;
+}
+
+message ResetSlaModelRequest {
+  string pname = 1;
+  string system = 2;
+  string tenant = 3;
+}
+
+message SlaStatusRequest {
+  string pname = 1;
+  string system = 2;
+  string tenant = 3;
+}
+
+// Snapshot of one cached FittedParams. Stringly-typed `fit_kind` /
+// `mem_kind` so the CLI doesn't need to track every DurationFit variant.
+message SlaStatusResponse {
+  // false ⇔ key never seen / evicted. All other fields zero-valued.
+  bool has_fit = 1;
+  // "Probe" / "Amdahl" / "Capped" / "Usl"
+  string fit_kind = 2;
+  double s = 3;
+  double p = 4;
+  double q = 5;
+  double p_bar = 6;
+  // "Coupled" / "Independent"
+  string mem_kind = 7;
+  uint64 mem_p90_bytes = 8;
+  optional uint64 disk_p90_bytes = 9;
+  double sigma_resid = 10;
+  double n_eff = 11;
+  double span = 12;
+  optional string tier = 13;
+  // Override that would apply to this key under current precedence
+  // rules, if any. Lets `rio-cli sla status` show "fit says X, override
+  // forces Y" in one call.
+  optional SlaOverride active_override = 14;
+}

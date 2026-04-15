@@ -43,6 +43,30 @@ pub struct BuildSampleRow {
     pub completed_at: f64,
 }
 
+/// One `sla_overrides` row. ADR-023 phase-6 operator pins. NULL
+/// `system`/`tenant` are wildcards — [`crate::sla::r#override::resolve`]
+/// matches most-specific first. `expires_at` is Unix-epoch f64 (same
+/// no-chrono workaround as `BuildSampleRow.completed_at`); `None` =
+/// never expires.
+#[derive(Debug, Clone, Default)]
+pub struct SlaOverrideRow {
+    pub id: i64,
+    pub pname: String,
+    pub system: Option<String>,
+    pub tenant: Option<String>,
+    pub cluster: Option<String>,
+    pub tier: Option<String>,
+    pub p50_secs: Option<f64>,
+    pub p90_secs: Option<f64>,
+    pub p99_secs: Option<f64>,
+    pub cores: Option<f64>,
+    pub mem_bytes: Option<i64>,
+    pub capacity_type: Option<String>,
+    pub expires_at: Option<f64>,
+    pub created_at: f64,
+    pub created_by: Option<String>,
+}
+
 impl SchedulerDb {
     /// Read the full build_history table for estimator refresh.
     ///
@@ -459,6 +483,119 @@ impl SchedulerDb {
             system,
             tenant,
             keep_n as i64,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ─── sla_overrides CRUD (ADR-023 phase-6) ──────────────────────────
+
+    /// All non-expired overrides, optionally filtered by exact `pname`.
+    /// Feeds both [`SlaEstimator::refresh`] (full read, `pname=None`) and
+    /// `AdminService.ListSlaOverrides`. Ordered `created_at DESC` so the
+    /// CLI shows newest first; the in-memory resolver re-sorts by
+    /// specificity anyway.
+    ///
+    /// Expired rows are filtered server-side (`expires_at IS NULL OR >
+    /// now()`) — keeps the resolver pure (no clock read) and means a
+    /// stale tick cache never resurrects a dead pin. They are NOT
+    /// deleted: phase-7's audit view wants to show "this was forced
+    /// 2026-04-01..04-08".
+    ///
+    /// `lookup_idx` (migration 040: `(pname, system, tenant)`) covers
+    /// the `pname = $1` filter; the unfiltered tick read is a full scan
+    /// — fine, the table is operator-written (tens of rows, not
+    /// thousands).
+    ///
+    /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    pub async fn read_sla_overrides(
+        &self,
+        pname: Option<&str>,
+    ) -> Result<Vec<SlaOverrideRow>, sqlx::Error> {
+        sqlx::query_as!(
+            SlaOverrideRow,
+            r#"
+            SELECT id, pname, system, tenant, cluster, tier,
+                   p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,
+                   EXTRACT(EPOCH FROM expires_at)::float8 AS "expires_at",
+                   EXTRACT(EPOCH FROM created_at)::float8 AS "created_at!",
+                   created_by
+            FROM sla_overrides
+            WHERE (expires_at IS NULL OR expires_at > now())
+              AND ($1::text IS NULL OR pname = $1)
+            ORDER BY created_at DESC
+            "#,
+            pname,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Insert one override. Returns the row with server-assigned `id` /
+    /// `created_at`. `expires_at` round-trips as epoch f64 →
+    /// `to_timestamp($n)`.
+    pub async fn insert_sla_override(
+        &self,
+        row: &SlaOverrideRow,
+    ) -> Result<SlaOverrideRow, sqlx::Error> {
+        sqlx::query_as!(
+            SlaOverrideRow,
+            r#"
+            INSERT INTO sla_overrides
+              (pname, system, tenant, cluster, tier,
+               p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,
+               expires_at, created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,to_timestamp($12),$13)
+            RETURNING id, pname, system, tenant, cluster, tier,
+                      p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,
+                      EXTRACT(EPOCH FROM expires_at)::float8 AS "expires_at",
+                      EXTRACT(EPOCH FROM created_at)::float8 AS "created_at!",
+                      created_by
+            "#,
+            row.pname,
+            row.system,
+            row.tenant,
+            row.cluster,
+            row.tier,
+            row.p50_secs,
+            row.p90_secs,
+            row.p99_secs,
+            row.cores,
+            row.mem_bytes,
+            row.capacity_type,
+            row.expires_at,
+            row.created_by,
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Delete one override by id. Idempotent — returns rows affected
+    /// (0 if already gone).
+    pub async fn delete_sla_override(&self, id: i64) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!("DELETE FROM sla_overrides WHERE id = $1", id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// `ResetSlaModel`: drop every `build_samples` row for one key. The
+    /// caller pairs this with [`SlaEstimator::evict`] so the next
+    /// dispatch falls back to the cold-start probe path.
+    ///
+    /// [`SlaEstimator::evict`]: crate::sla::SlaEstimator::evict
+    pub async fn delete_build_samples_for_key(
+        &self,
+        pname: &str,
+        system: &str,
+        tenant: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            "DELETE FROM build_samples WHERE pname = $1 AND system = $2 AND tenant = $3",
+            pname,
+            system,
+            tenant,
         )
         .execute(&self.pool)
         .await?;

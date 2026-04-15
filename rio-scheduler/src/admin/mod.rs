@@ -25,6 +25,7 @@ use tracing::instrument;
 
 use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
+use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
@@ -33,13 +34,15 @@ use rio_proto::types::{
     GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
     InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
     ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
-    ReportExecutorTerminationResponse, TerminationReason,
+    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
+    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
+    SetSlaOverrideRequest, SlaOverride, SlaStatusRequest, SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
 use crate::logs::LogBuffers;
+use crate::sla::types::ModelKey;
 
 /// `actor.query_unchecked` + `actor_error_to_status`. Every admin
 /// handler that round-trips a oneshot through the actor uses this —
@@ -63,6 +66,7 @@ mod gc;
 mod graph;
 mod logs;
 mod sizeclass;
+mod sla;
 mod tenants;
 
 pub use gc::spawn_store_size_refresh;
@@ -587,6 +591,117 @@ impl AdminService for AdminServiceImpl {
             })
             .collect();
         Ok(Response::new(DebugListExecutorsResponse { executors }))
+    }
+
+    // ─── ADR-023 SLA overrides ────────────────────────────────────────
+
+    #[instrument(skip(self, request), fields(rpc = "SetSlaOverride"))]
+    async fn set_sla_override(
+        &self,
+        request: Request<SetSlaOverrideRequest>,
+    ) -> Result<Response<SlaOverride>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let o = request
+            .into_inner()
+            .r#override
+            .ok_or_else(|| Status::invalid_argument("override is required"))?;
+        let row = sla::row_from_proto(&o)?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let inserted = db
+            .insert_sla_override(&row)
+            .await
+            .status_internal("insert_sla_override")?;
+        Ok(Response::new(sla::row_to_proto(&inserted)))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ListSlaOverrides"))]
+    async fn list_sla_overrides(
+        &self,
+        request: Request<ListSlaOverridesRequest>,
+    ) -> Result<Response<ListSlaOverridesResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let pname = request.into_inner().pname;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let rows = db
+            .read_sla_overrides(pname.as_deref())
+            .await
+            .status_internal("read_sla_overrides")?;
+        Ok(Response::new(ListSlaOverridesResponse {
+            overrides: rows.iter().map(sla::row_to_proto).collect(),
+        }))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ClearSlaOverride"))]
+    async fn clear_sla_override(
+        &self,
+        request: Request<ClearSlaOverrideRequest>,
+    ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let id = request.into_inner().id;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        db.delete_sla_override(id)
+            .await
+            .status_internal("delete_sla_override")?;
+        Ok(Response::new(()))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ResetSlaModel"))]
+    async fn reset_sla_model(
+        &self,
+        request: Request<ResetSlaModelRequest>,
+    ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let key = ModelKey {
+            pname: r.pname,
+            system: r.system,
+            tenant: r.tenant,
+        };
+        // PG first, then evict: if the DELETE fails the cache stays
+        // intact (operator retries); if evict fails the next refresh
+        // tick re-reads an empty ring and overwrites with a Probe fit
+        // anyway.
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        db.delete_build_samples_for_key(&key.pname, &key.system, &key.tenant)
+            .await
+            .status_internal("delete_build_samples_for_key")?;
+        query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaEvict {
+                key: key.clone(),
+                reply,
+            })
+        })
+        .await?;
+        Ok(Response::new(()))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "SlaStatus"))]
+    async fn sla_status(
+        &self,
+        request: Request<SlaStatusRequest>,
+    ) -> Result<Response<SlaStatusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let key = ModelKey {
+            pname: r.pname,
+            system: r.system,
+            tenant: r.tenant,
+        };
+        let (fit, active) = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaStatus { key, reply })
+        })
+        .await?;
+        Ok(Response::new(sla::status_from_fit(
+            fit.as_ref(),
+            active.as_ref(),
+        )))
     }
 
     /// VM-test fixture: write one synthetic `build_samples` row. Gated

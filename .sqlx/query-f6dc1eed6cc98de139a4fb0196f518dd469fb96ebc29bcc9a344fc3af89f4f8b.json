@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM build_samples WHERE pname = $1 AND system = $2 AND tenant = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6dc1eed6cc98de139a4fb0196f518dd469fb96ebc29bcc9a344fc3af89f4f8b"
+}

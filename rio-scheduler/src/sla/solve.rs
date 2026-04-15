@@ -1,6 +1,7 @@
 use super::config::SlaConfig;
 use super::explore;
 use super::fit::headroom;
+use super::r#override::ResolvedTarget;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 
 /// Fallback ceilings when `[sla]` is unconfigured. The actor stores
@@ -102,15 +103,44 @@ pub struct DrvHints {
 /// granularity); mem/disk are byte-exact (controller rounds at the pod
 /// template).
 ///
+/// `override_` (from [`SlaEstimator::resolved_override`]) is consulted
+/// FIRST: `forced_cores`/`forced_mem` short-circuit the model entirely
+/// — the operator pinned this key, learning is suspended. A pin with
+/// only `tier`/`capacity` set falls through to the normal branch (the
+/// tier filter happens at solve, not here; phase-7 wires it).
+///
 /// [`SpawnIntent`]: rio_proto::types::SpawnIntent
+/// [`SlaEstimator::resolved_override`]: super::SlaEstimator::resolved_override
 // r[impl sched.sla.intent-from-solve]
 pub fn intent_for(
     fit: Option<&FittedParams>,
     hints: &DrvHints,
+    override_: Option<&ResolvedTarget>,
     cfg: Option<&SlaConfig>,
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> (u32, u64, u64) {
+    // Operator override beats everything — including drv-declared hints.
+    // If the operator forced 12 cores on a `prefer_local_build` drv,
+    // they had a reason. Mem unset → fall back to the fit's M(c) at the
+    // forced core count (or probe mem if no fit).
+    if let Some(o) = override_
+        && let Some(c) = o.forced_cores
+    {
+        let cores = (c.ceil() as u32).max(1);
+        let mem = o.forced_mem.unwrap_or_else(|| {
+            fit.map(|f| f.mem.at(RawCores(c)).0).unwrap_or_else(|| {
+                cfg.map(|s| {
+                    (s.probe.cpu * s.probe.mem_per_core as f64 + s.probe.mem_base as f64) as u64
+                })
+                .unwrap_or(8 << 30)
+            })
+        });
+        let disk = fit
+            .and_then(|f| f.disk_p90)
+            .map_or(ceil.default_disk, |d| d.0);
+        return (cores, mem, disk);
+    }
     if hints.prefer_local_build == Some(true) {
         return (LOCAL_CORES, LOCAL_MEM_BYTES, ceil.default_disk);
     }
@@ -311,7 +341,61 @@ mod tests {
     // ─── intent_for branching ───────────────────────────────────────
 
     fn intent(fit: Option<&FittedParams>, hints: &DrvHints) -> (u32, u64, u64) {
-        intent_for(fit, hints, None, &[t("normal", 1200.0)], &ceil())
+        intent_for(fit, hints, None, None, &[t("normal", 1200.0)], &ceil())
+    }
+
+    // r[verify sched.sla.override-precedence]
+    #[test]
+    fn override_forced_cores_bypasses_fit() {
+        // Fitted curve says ~2 cores against p90=1200; override forces 12.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let o = ResolvedTarget {
+            forced_cores: Some(12.0),
+            forced_mem: Some(32 << 30),
+            ..Default::default()
+        };
+        let (c, m, _) = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            Some(&o),
+            None,
+            &[t("normal", 1200.0)],
+            &ceil(),
+        );
+        assert_eq!(c, 12);
+        assert_eq!(m, 32 << 30);
+    }
+    #[test]
+    fn override_beats_prefer_local() {
+        // Operator pin trumps drv-declared `prefer_local_build`.
+        let o = ResolvedTarget {
+            forced_cores: Some(12.0),
+            ..Default::default()
+        };
+        let (c, _, _) = intent_for(
+            None,
+            &DrvHints {
+                prefer_local_build: Some(true),
+                ..Default::default()
+            },
+            Some(&o),
+            None,
+            &[],
+            &ceil(),
+        );
+        assert_eq!(c, 12);
+    }
+    #[test]
+    fn override_without_cores_falls_through() {
+        // tier-only override (no forced_cores) → normal solve path.
+        let o = ResolvedTarget {
+            tier: Some("fast".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            intent_for(None, &DrvHints::default(), Some(&o), None, &[], &ceil()).0,
+            4, // fallback probe
+        );
     }
 
     #[test]

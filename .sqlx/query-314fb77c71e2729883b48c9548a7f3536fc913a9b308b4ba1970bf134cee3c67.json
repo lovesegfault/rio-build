@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, pname, system, tenant, cluster, tier,\n                   p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,\n                   EXTRACT(EPOCH FROM expires_at)::float8 AS \"expires_at\",\n                   EXTRACT(EPOCH FROM created_at)::float8 AS \"created_at!\",\n                   created_by\n            FROM sla_overrides\n            WHERE (expires_at IS NULL OR expires_at > now())\n              AND ($1::text IS NULL OR pname = $1)\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pname",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "system",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "tenant",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "cluster",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "tier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "p50_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "p90_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "p99_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "cores",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "mem_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "capacity_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "expires_at",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 14,
+        "name": "created_by",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      true
+    ]
+  },
+  "hash": "314fb77c71e2729883b48c9548a7f3536fc913a9b308b4ba1970bf134cee3c67"
+}

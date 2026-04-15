@@ -25,6 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ListUpstreamsResponse",
         "DebugExecutorState",
         "DebugListExecutorsResponse",
+        "SlaOverride",
+        "ListSlaOverridesResponse",
+        "SlaStatusResponse",
     ] {
         b = b.type_attribute(format!("rio.types.{ty}"), "#[derive(serde::Serialize)]");
     }

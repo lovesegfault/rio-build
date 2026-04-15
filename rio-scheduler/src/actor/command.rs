@@ -373,6 +373,27 @@ pub enum AdminQuery {
     DebugQueryWorkers {
         reply: oneshot::Sender<Vec<DebugExecutorInfo>>,
     },
+    /// `AdminService.SlaStatus`: snapshot one cached `FittedParams` +
+    /// the override that would apply to this key. Reflects the last
+    /// tick refresh (~60s stale at worst). Reply tuple is `(fit,
+    /// active_override_row)` — the RPC handler projects to proto.
+    SlaStatus {
+        key: crate::sla::types::ModelKey,
+        reply: oneshot::Sender<(
+            Option<crate::sla::types::FittedParams>,
+            Option<crate::db::SlaOverrideRow>,
+        )>,
+    },
+    /// `AdminService.ResetSlaModel` (cache half): drop one cached fit
+    /// so the next dispatch falls back to the cold-start probe path.
+    /// The PG `DELETE FROM build_samples` happens in the RPC handler
+    /// BEFORE this fires; reply is whether an entry was present.
+    /// Mutates via `RwLock` so still `&self`-dispatchable from
+    /// `handle_admin`.
+    SlaEvict {
+        key: crate::sla::types::ModelKey,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
@@ -441,6 +462,8 @@ impl AdminQuery {
             Self::ListExecutors { .. } => "ListExecutors",
             Self::InspectBuildDag { .. } => "InspectBuildDag",
             Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
+            Self::SlaStatus { .. } => "SlaStatus",
+            Self::SlaEvict { .. } => "SlaEvict",
         }
     }
 }

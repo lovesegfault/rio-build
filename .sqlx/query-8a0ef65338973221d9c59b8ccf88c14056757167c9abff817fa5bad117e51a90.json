@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO sla_overrides\n              (pname, system, tenant, cluster, tier,\n               p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,\n               expires_at, created_by)\n            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,to_timestamp($12),$13)\n            RETURNING id, pname, system, tenant, cluster, tier,\n                      p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,\n                      EXTRACT(EPOCH FROM expires_at)::float8 AS \"expires_at\",\n                      EXTRACT(EPOCH FROM created_at)::float8 AS \"created_at!\",\n                      created_by\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pname",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "system",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "tenant",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "cluster",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "tier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "p50_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "p90_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "p99_secs",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "cores",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "mem_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "capacity_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "expires_at",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 14,
+        "name": "created_by",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Float8",
+        "Float8",
+        "Float8",
+        "Float8",
+        "Int8",
+        "Text",
+        "Float8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      true
+    ]
+  },
+  "hash": "8a0ef65338973221d9c59b8ccf88c14056757167c9abff817fa5bad117e51a90"
+}

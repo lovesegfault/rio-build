@@ -64,6 +64,11 @@ export const adminMock = {
   getEstimatorStats: vi.fn(),
   reportExecutorTermination: vi.fn(),
   injectBuildSample: vi.fn(),
+  setSlaOverride: vi.fn(),
+  listSlaOverrides: vi.fn(),
+  clearSlaOverride: vi.fn(),
+  resetSlaModel: vi.fn(),
+  slaStatus: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 

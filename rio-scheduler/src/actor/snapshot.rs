@@ -42,6 +42,30 @@ impl DagActor {
             AdminQuery::DebugQueryWorkers { reply } => {
                 let _ = reply.send(self.handle_debug_query_workers());
             }
+            AdminQuery::SlaStatus { key, reply } => {
+                // active_override: re-run resolve so the RPC reflects
+                // exactly what dispatch would see, then surface the
+                // matching ROW (not the projected ResolvedTarget) so
+                // the CLI can show id/created_by/expires_at.
+                let rows = self.sla_estimator.overrides();
+                let active = crate::sla::r#override::resolve(&key, &rows).and_then(|_| {
+                    rows.into_iter()
+                        .filter(|r| {
+                            r.pname == key.pname
+                                && r.system.as_deref().is_none_or(|s| s == key.system)
+                                && r.tenant.as_deref().is_none_or(|t| t == key.tenant)
+                        })
+                        .max_by(|a, b| {
+                            (u8::from(a.system.is_some()) + u8::from(a.tenant.is_some()))
+                                .cmp(&(u8::from(b.system.is_some()) + u8::from(b.tenant.is_some())))
+                                .then(a.created_at.total_cmp(&b.created_at))
+                        })
+                });
+                let _ = reply.send((self.sla_estimator.cached(&key), active));
+            }
+            AdminQuery::SlaEvict { key, reply } => {
+                let _ = reply.send(self.sla_estimator.evict(&key));
+            }
         }
     }
 
@@ -424,13 +448,17 @@ impl DagActor {
             .next()
             .map(|u| u.to_string())
             .unwrap_or_default();
-        let fit = pname.and_then(|p| {
-            self.sla_estimator.cached(&ModelKey {
-                pname: p.to_string(),
-                system: state.system.clone(),
-                tenant,
-            })
+        let key = pname.map(|p| ModelKey {
+            pname: p.to_string(),
+            system: state.system.clone(),
+            tenant,
         });
+        let fit = key.as_ref().and_then(|k| self.sla_estimator.cached(k));
+        // Override resolved from the same tick snapshot the fit cache
+        // was refreshed alongside — both are ~60s stale at worst.
+        let override_ = key
+            .as_ref()
+            .and_then(|k| self.sla_estimator.resolved_override(k));
         solve::intent_for(
             fit.as_ref(),
             &solve::DrvHints {
@@ -438,6 +466,7 @@ impl DagActor {
                 prefer_local_build: state.prefer_local_build,
                 required_features: state.required_features.clone(),
             },
+            override_.as_ref(),
             self.sla_config.as_ref(),
             &self.sla_tiers,
             &self.sla_ceilings,
