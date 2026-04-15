@@ -620,7 +620,7 @@ pub const M_041: () = ();
 ///   `E[cost]` per `(band, cap)` candidate. PK is the full quad — one
 ///   row per spot-market cell, upserted each poll.
 /// - `sla_ema_state` — generic decayed-EMA persistence so the poller
-///   and the λ[h] interrupt-rate estimator survive scheduler restart
+///   and the `λ[h]` interrupt-rate estimator survive scheduler restart
 ///   without re-warming. `key` is caller-namespaced
 ///   (`spot:{type}:{az}` / `lambda:{hw_class}`); `numerator`/
 ///   `denominator` carry the running decayed sums when the EMA is a

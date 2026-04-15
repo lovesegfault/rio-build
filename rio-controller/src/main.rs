@@ -268,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         node_informer::run_pod_annotator(client.clone(), node_cache.clone(), shutdown.clone()),
     );
     // ADR-023 phase-13: SpotInterrupted Event → interrupt_samples
-    // (λ[h] numerator). Node-DELETE in the informer above writes the
+    // (λ\[h\] numerator). Node-DELETE in the informer above writes the
     // exposure denominator.
     rio_common::task::spawn_monitored(
         "spot-interrupt-watcher",

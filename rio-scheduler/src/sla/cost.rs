@@ -7,7 +7,7 @@
 //!   `DescribeSpotPriceHistory`) and persisted to `sla_ema_state` so a
 //!   restart doesn't re-warm. `expected_cost` turns a candidate
 //!   `(band, cap, c*, T(c*))` into a comparable scalar for the softmax.
-//! - λ[h]: per-hw-band Poisson interrupt rate. Computed from
+//! - λ\[h\]: per-hw-band Poisson interrupt rate. Computed from
 //!   `interrupt_samples` (controller-appended) as
 //!   `EMA(Σinterrupts) / EMA(Σnode-seconds)` with 24h halflife;
 //!   decays toward [`LAMBDA_SEED`] when exposure dries up.
@@ -98,7 +98,7 @@ pub enum HwCostSource {
 }
 
 /// Decayed EMA of a ratio: `value = numerator / denominator` where both
-/// halves are independently EMA-decayed. Used for λ[h] (interrupts ÷
+/// halves are independently EMA-decayed. Used for λ\[h\] (interrupts ÷
 /// node-seconds) so a burst of node churn doesn't spike λ — the
 /// denominator absorbs it.
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,11 +158,11 @@ const SPOT_SEED_DISCOUNT: f64 = 0.35;
 /// price-update granularity, short enough to track intra-day swings.
 const SPOT_HALFLIFE_SECS: f64 = 3.0 * 3600.0;
 
-/// λ[h] EMA halflife. 24h: spot interruption rates move on a daily
+/// λ\[h\] EMA halflife. 24h: spot interruption rates move on a daily
 /// cadence (capacity rebalancing); a 3h halflife would chase noise.
 const LAMBDA_HALFLIFE_SECS: f64 = 24.0 * 3600.0;
 
-/// After this many seconds of zero exposure, λ[h] linearly blends back
+/// After this many seconds of zero exposure, λ\[h\] linearly blends back
 /// toward [`LAMBDA_SEED`]. ADR-023: a band that hasn't been scheduled
 /// in two days shouldn't carry a stale λ from a since-resolved
 /// capacity crunch.
@@ -218,9 +218,8 @@ impl CostTable {
     }
 
     /// Per-band Poisson interrupt rate (events/sec). Decays toward
-    /// [`LAMBDA_SEED`] after [`LAMBDA_DECAY_TO_SEED_AFTER_SECS`] of no
-    /// exposure: `λ = (1-α)·λ_ema + α·seed` where `α = min(1,
-    /// (now - updated_at) / 48h)`.
+    /// [`LAMBDA_SEED`] after 48h of no exposure: `λ = (1-α)·λ_ema +
+    /// α·seed` where `α = min(1, (now - updated_at) / 48h)`.
     pub fn lambda_band(&self, band: Band) -> f64 {
         self.lambda_band_at(band, now_epoch())
     }
@@ -326,7 +325,7 @@ impl CostTable {
         Ok(())
     }
 
-    /// Recompute λ[h] from `interrupt_samples` rows newer than each
+    /// Recompute λ\[h\] from `interrupt_samples` rows newer than each
     /// band's `updated_at`. Called from the poller tick (lease-gated)
     /// — controller appends, scheduler aggregates.
     pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
@@ -425,14 +424,36 @@ fn now_epoch() -> f64 {
 }
 
 /// In-process insufficient-capacity backoff. A `(band, cap)` that left
-/// a pod Pending past `hw_fallback_after_secs` is marked here for
-/// [`ICE_TTL`]; [`super::solve::solve_full`] skips marked cells. Shared
-/// across all dispatch threads (DashMap).
+/// a pod Pending past `hw_fallback_after_secs` is marked here for 60s;
+/// [`super::solve::solve_full`] skips marked cells. Shared across all
+/// dispatch threads (DashMap).
+///
+/// # Ladder protocol
+///
+/// 1. Dispatch picks `(b₀, c₀)` via `solve_full`, records it in
+///    `attempted` (and `builds.attempted_candidates` JSONB), spawns.
+/// 2. Pending-watch sees the pod still `Pending` after
+///    `hw_fallback_after_secs` → [`Self::mark`]`(b₀, c₀)`, deletes the
+///    pod, re-runs `solve_full` (which now skips `(b₀, c₀)`).
+/// 3. Repeat up to [`Self::ladder_cap`] times. On exhaust at the
+///    terminal tier, fail with `infeasible_total{reason=
+///    capacity_exhausted}`; on exhaust at a non-terminal tier, demote
+///    one tier and reset `attempted`.
+///
+// TODO(ADR-023): step 2's Pending-watch. The controller already
+// watches builder pods (`node_informer::run_pod_annotator`); extending
+// it to fire `DrainExecutor{reason=ice}` after `hw_fallback_after_secs`
+// of `Pending` with `nodeSelector∋hw-band` is ~80 LoC but needs the
+// scheduler-side `attempted` map plumbed through `SpawnIntent` first.
+// Until wired, `IceBackoff` is populated only on explicit Karpenter
+// `InsufficientCapacity` events (none today) — the solve falls through
+// to band-agnostic BestEffort on its own when all 6 cells are
+// infeasible by envelope, so the un-wired ladder degrades gracefully.
 #[derive(Debug, Default)]
 pub struct IceBackoff(DashMap<(Band, Cap), Instant>);
 
 impl IceBackoff {
-    /// Mark `(band, cap)` infeasible for [`ICE_TTL`].
+    /// Mark `(band, cap)` infeasible for `ICE_TTL` (60s).
     pub fn mark(&self, band: Band, cap: Cap) {
         self.0.insert((band, cap), Instant::now() + ICE_TTL);
     }
@@ -464,6 +485,38 @@ impl IceBackoff {
         let now = Instant::now();
         self.0.iter().filter(|e| *e.value() > now).count()
     }
+
+    /// All 6 `(band, cap)` cells currently backed off → no candidate
+    /// can survive `solve_full`'s ICE gate. Caller should demote a
+    /// tier (or, at terminal tier, emit `infeasible_total{reason=
+    /// capacity_exhausted}` and fail).
+    pub fn exhausted(&self) -> bool {
+        Band::ALL
+            .into_iter()
+            .all(|b| Cap::ALL.into_iter().all(|c| self.is_infeasible(b, c)))
+    }
+
+    /// `attempted_candidates` JSONB encoding for one ladder run.
+    /// `[{band:"hi", cap:"spot"}, ...]` — forensics; the live state is
+    /// in-process.
+    pub fn encode_attempted(attempted: &[(Band, Cap)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            attempted
+                .iter()
+                .map(|(b, c)| serde_json::json!({"band": b.label(), "cap": c.label()}))
+                .collect(),
+        )
+    }
+}
+
+/// Emit `infeasible_total{reason=capacity_exhausted}`. Called when the
+/// ICE ladder exhausts at the terminal tier.
+pub fn capacity_exhausted() {
+    metrics::counter!(
+        "rio_scheduler_sla_infeasible_total",
+        "reason" => "capacity_exhausted"
+    )
+    .increment(1);
 }
 
 /// Lease-gated spot-price poller: every 10min, the leader pulls
@@ -624,6 +677,29 @@ mod tests {
         assert!(ice.is_infeasible(Band::Hi, Cap::Spot));
         assert!(!ice.is_infeasible(Band::Hi, Cap::OnDemand));
         assert_eq!(ice.live(), 1);
+    }
+
+    #[test]
+    fn exhausted_only_when_all_six_marked() {
+        let ice = IceBackoff::default();
+        assert!(!ice.exhausted());
+        for b in Band::ALL {
+            ice.mark(b, Cap::Spot);
+        }
+        assert!(!ice.exhausted(), "on-demand cells still open");
+        for b in Band::ALL {
+            ice.mark(b, Cap::OnDemand);
+        }
+        assert!(ice.exhausted());
+    }
+
+    #[test]
+    fn encode_attempted_roundtrips_labels() {
+        let v = IceBackoff::encode_attempted(&[(Band::Hi, Cap::Spot), (Band::Lo, Cap::OnDemand)]);
+        assert_eq!(
+            v.to_string(),
+            r#"[{"band":"hi","cap":"spot"},{"band":"lo","cap":"on-demand"}]"#
+        );
     }
 
     #[test]

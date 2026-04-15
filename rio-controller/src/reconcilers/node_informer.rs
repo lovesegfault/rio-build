@@ -110,7 +110,7 @@ impl NodeLabelCache {
     }
 
     /// `Some((hw_class, node_seconds))` for `node_name` IF it's a spot
-    /// node with a creation timestamp. Feeds the exposure half of λ[h]
+    /// node with a creation timestamp. Feeds the exposure half of λ\[h\]
     /// — on-demand nodes contribute neither numerator nor denominator
     /// (their λ is 0 by definition).
     pub fn spot_exposure(&self, node_name: &str, now_epoch: f64) -> Option<(String, f64)> {
@@ -303,7 +303,7 @@ pub async fn run_pod_annotator(
     }
 }
 
-/// ADR-023 phase-13 λ[h] self-calibration: watch `core/v1.Event` for
+/// ADR-023 phase-13 λ\[h\] self-calibration: watch `core/v1.Event` for
 /// `reason=SpotInterrupted` (Karpenter posts one on the NodeClaim when
 /// AWS sends the 2-minute spot interruption notice), resolve the
 /// referenced node's hw_class via [`NodeLabelCache`], and append
