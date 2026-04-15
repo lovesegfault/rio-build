@@ -156,7 +156,7 @@ impl DerivationStatus {
             // only checks newly_inserted, so a derivation that was
             // already in-DAG as Ready (e.g. stuck via I-062's
             // resource-fit, or reset via verify_preexisting_completed)
-            // never gets re-checked there. fod_outputs_in_store()
+            // never gets re-checked there. batch_probe_cached_ready()
             // re-checks at dispatch and short-circuits the fetch.
             (Self::Ready, Self::Completed) => true,
             // Merge-time re-probe (I-099/I-094): a node that was
@@ -510,6 +510,13 @@ pub struct DerivationState {
     /// completion/heartbeat) triggers dispatch. Empty for recovered
     /// derivations (no user trace). First submitter wins on dedup.
     pub traceparent: String,
+    /// `DagActor.probe_generation` at the time of the last dispatch-
+    /// time `FindMissingPaths` probe for this node. The batch pre-pass
+    /// skips nodes whose `probed_generation == probe_generation` so the
+    /// `truncate(DISPATCH_PROBE_BATCH_CAP)` window advances across
+    /// inline `dispatch_ready` calls instead of re-probing the head.
+    /// `probe_generation` advances once per `handle_tick` (1/s).
+    pub probed_generation: u64,
 }
 
 impl DerivationState {
@@ -564,6 +571,7 @@ impl DerivationState {
             ready_at: None,
             running_since: None,
             traceparent: String::new(),
+            probed_generation: 0,
         })
     }
 
@@ -646,6 +654,7 @@ impl DerivationState {
             // stale build running longer.
             running_since: (status == DerivationStatus::Running).then_some(now),
             traceparent: String::new(), // recovered: no user trace
+            probed_generation: 0,
         })
     }
 
@@ -704,6 +713,7 @@ impl DerivationState {
             ready_at: None,
             running_since: None,
             traceparent: String::new(),
+            probed_generation: 0,
         })
     }
 

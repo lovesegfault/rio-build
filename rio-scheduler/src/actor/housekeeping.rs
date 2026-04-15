@@ -152,6 +152,11 @@ impl DagActor {
         // its leader/recovery gates) so inline callers (MergeDag,
         // ProcessCompletion, the capped became_idle/PrefetchComplete
         // carve-out) also satisfy it.
+        //
+        // Advance probe_generation here (1/s) — NOT per dispatch_ready
+        // call — so a Ready node is FMP-probed at most once per Tick
+        // regardless of how many inline dispatches fire between Ticks.
+        self.probe_generation = self.probe_generation.wrapping_add(1);
         if self.dispatch_dirty {
             self.dispatch_ready().await;
         }

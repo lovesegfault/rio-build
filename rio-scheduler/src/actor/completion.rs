@@ -132,7 +132,7 @@ impl DagActor {
     /// `Queued` parent whose deps are now all completed-equivalent
     /// transitions to `Ready`, gets persisted, and is pushed to the
     /// ready queue. Shared by every completion-like path
-    /// (`release_downstream`, `complete_ready_fod_from_store`,
+    /// (`release_downstream`, `complete_ready_from_store`,
     /// `ca_cutoff_cascade`, recovery's `adopt_orphan_completion`).
     pub(super) async fn promote_newly_ready(&mut self, completed: &DrvHash) {
         for ready_hash in self.dag.find_newly_ready(completed) {

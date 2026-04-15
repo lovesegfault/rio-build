@@ -152,6 +152,14 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 /// "fresh ephemeral dispatches immediately" win.
 pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
 
+/// Max Ready candidates per dispatch-time `FindMissingPaths` batch.
+/// Belt-and-suspenders under the store-side `SUBSTITUTE_PROBE_MAX_PATHS`
+/// (4096): keeps the FMP RPC in the actor's ~100ms budget for very wide
+/// DAG layers. The truncated tail is picked up on the next inline
+/// `dispatch_ready` (same `probe_generation`, so the window advances
+/// rather than re-probing the head).
+pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -267,8 +275,8 @@ pub struct DagActor {
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// HMAC signer for `x-rio-service-token`. When Some, the
-    /// dispatch-time FOD store-check
-    /// ([`dispatch::DagActor::batch_complete_cached_ready_fods`]) sets
+    /// dispatch-time store-check
+    /// ([`dispatch::DagActor::batch_probe_cached_ready`]) sets
     /// `x-rio-service-token` + `x-rio-probe-tenant-id` so the store's
     /// upstream-substitution probe fires —
     /// `r[sched.dispatch.fod-substitute]`. None = local-presence-only
@@ -312,6 +320,14 @@ pub struct DagActor {
     /// candidacy).
     // r[impl sched.actor.dispatch-decoupled]
     dispatch_dirty: bool,
+    /// Advances once per `handle_tick`. The dispatch-time substitute
+    /// probe stamps each checked node's `probed_generation` with this
+    /// value and skips already-stamped nodes within the same
+    /// generation, so the [`DISPATCH_PROBE_BATCH_CAP`] truncate window
+    /// advances across inline `dispatch_ready` calls instead of
+    /// re-FMP'ing the same head. Starts at 1 so freshly-inserted nodes
+    /// (`probed_generation: 0`) are immediately eligible.
+    probe_generation: u64,
     /// Inline `dispatch_ready` calls fired from the "worker newly
     /// available" carve-out (Heartbeat `became_idle` + `PrefetchComplete`
     /// cold→warm) since the last Tick. Capped at
@@ -389,6 +405,7 @@ impl DagActor {
             fod_freeze_since: None,
             builder_freeze_since: None,
             dispatch_dirty: false,
+            probe_generation: 1,
             became_idle_inline_this_tick: 0,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]

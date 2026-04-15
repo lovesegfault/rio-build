@@ -1119,11 +1119,12 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
     Ok(())
 }
 
-/// I-163 Fix 2, fail-open edge: when the batch RPC fails, the returned
-/// checked-set is empty so the drain loop's per-FOD fallback STILL
-/// fires (same behavior as before). Guards against the batch's
-/// `return HashSet::new()` paths accidentally suppressing the
-/// fallback.
+/// I-163 Fix 2, fail-open edge: when the batch RPC fails, the per-drv
+/// fallback in the drain loop STILL fires for nodes the batch didn't
+/// stamp (cascade-promoted). Nodes the batch DID stamp this gen are
+/// `probed_generation`-gated in the per-drv path too, so a batch
+/// failure for them defers retry to the next Tick (1/s) instead of
+/// firing N sequential per-drv FMPs in the same pass.
 #[tokio::test]
 async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     use std::sync::atomic::Ordering;
@@ -1143,50 +1144,58 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
     barrier(&handle).await;
 
-    // Batch (1, fails) + per-FOD fallback (1). Both count — the
-    // counter increments before the fail-injection bail. Exactly 2
-    // proves the fallback still runs when the batch returns empty.
-    assert_eq!(store.calls.find_missing_calls.load(Ordering::SeqCst), 2);
+    // send_heartbeat → dispatch_dirty → Tick → gen++ → dispatch_ready:
+    // batch stamps the FOD (1 FMP, fails). Per-drv fallback gated by
+    // probed_generation → 0 extra. Exactly 1 proves the batch retries
+    // at Tick cadence and the per-drv path doesn't re-fire for the
+    // same node within a generation.
+    assert_eq!(store.calls.find_missing_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
 // r[verify sched.dispatch.fod-substitute]
-/// Dispatch-time substitution: a Ready FOD whose output becomes
-/// substitutable AFTER merge (so merge-time `check_cached_outputs`
-/// missed it) is completed by `batch_complete_cached_ready_fods`
-/// without dispatching to a fetcher.
+/// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
+/// whose output becomes substitutable AFTER merge (so merge-time
+/// `check_cached_outputs` missed it) is completed by
+/// `batch_probe_cached_ready` without dispatching to a worker.
 ///
-/// Pre-fix: the batch read only `missing_paths` (no JWT, ignored
-/// `substitutable_paths`) → FOD dispatched → fetcher hit a
-/// (potentially dead) origin URL for a path cache.nixos.org already
-/// had.
+/// Pre-fix: the batch was FOD-only AND read only `missing_paths` (no
+/// service-token, ignored `substitutable_paths`) → non-FODs relied on
+/// merge-time `check_available` which truncates at 4096 → an 18k-drv
+/// build's IA cache-hits dispatched to builders.
+#[rstest::rstest]
+#[case::fod(true)]
+#[case::non_fod(false)]
 #[tokio::test]
-async fn dispatch_time_substitutable_fod_completes() -> TestResult {
+async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    // Builder, not fetcher: the FOD must DEFER (not dispatch) so the
-    // next dispatch_ready's batch pre-pass is what completes it.
-    let _rx = connect_executor(&handle, "fod-sub-b", "x86_64-linux").await?;
+    // x86_64 builder; node is aarch64 → defers regardless of FOD-ness
+    // (no system match), so merge-time dispatch can't assign it.
+    let _rx = connect_executor(&handle, "sub-b", "x86_64-linux").await?;
 
     let out = test_store_path("dispatch-sub-out");
-    let mut n = make_node("dispatch-sub-fod");
-    n.is_fixed_output = true;
+    let mut n = make_node("dispatch-sub-drv");
+    n.is_fixed_output = is_fod;
+    n.system = "aarch64-linux".into();
     n.expected_output_paths = vec![out.clone()];
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![n], vec![], false).await?;
     barrier(&handle).await;
-    // Merge-time saw nothing (substitutable not yet seeded) → FOD is
-    // Ready/deferred. Now seed: next dispatch_ready's batch pre-pass
-    // should pick it up.
+    // Merge-time saw nothing (substitutable not yet seeded) → node
+    // Ready/deferred, stamped probed_generation=1. Seed; the next
+    // send_heartbeat is NOT became_idle (worker already idle) → sets
+    // dispatch_dirty → chained Tick advances probe_generation → batch
+    // re-probes → spawns substitute fetch.
     store.state.substitutable.write().unwrap().push(out.clone());
-
-    send_heartbeat(&handle, "fod-sub-b", "x86_64-linux").await?;
-    barrier(&handle).await;
+    send_heartbeat(&handle, "sub-b", "x86_64-linux").await?;
+    settle_substituting(&handle, &[&make_node("dispatch-sub-drv").drv_hash]).await;
+    tick(&handle).await?;
 
     let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "FOD should complete via dispatch-time substitution probe"
+        "is_fod={is_fod}: should complete via dispatch-time substitution probe"
     );
     let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
