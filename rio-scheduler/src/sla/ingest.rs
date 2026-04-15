@@ -81,6 +81,25 @@ pub fn refit(
         .map(|r| r.peak_memory_bytes as u64)
         .collect();
 
+    // ADR-023 §2.4 Capped stage: observed p̄ = recency-weighted p90 of
+    // avg_cores; entered once any sample is unsaturated (peak < 0.85·limit).
+    // Samples with c > p̄ are dropped from the duration fit — their basis
+    // column 1/min(c,p̄) collapses to the constant 1/p̄ (collinear with S).
+    let p_bar = observed_p_bar(&fit_rows, &w);
+    let idx: Vec<usize> = if p_bar.is_finite() {
+        let kept: Vec<usize> = (0..cs.len()).filter(|&i| cs[i] <= p_bar).collect();
+        if kept.len() >= 2 {
+            kept
+        } else {
+            (0..cs.len()).collect()
+        }
+    } else {
+        (0..cs.len()).collect()
+    };
+    let cs_f: Vec<f64> = idx.iter().map(|&i| cs[i]).collect();
+    let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
+    let w_f: Vec<f64> = idx.iter().map(|&i| w[i]).collect();
+
     // ExploreState reads only current-version (vdist==0) cpu_limits — the
     // explore ladder shouldn't count probes from a prior version toward
     // "distinct c seen".
@@ -104,7 +123,7 @@ pub fn refit(
     let fit = if n_eff < 3.0 || span < 4.0 {
         DurationFit::Probe
     } else {
-        fit_duration(&cs, &ts, &w, false, f64::INFINITY)
+        fit_duration(&cs_f, &ts_f, &w_f, false, p_bar)
     };
     let mem = fit_memory(&cs, &ms, &w, n_eff);
 
@@ -124,12 +143,12 @@ pub fn refit(
     let (sigma, log_residuals) = if matches!(fit, DurationFit::Probe) {
         (0.2, Vec::new())
     } else {
-        let lr: Vec<f64> = cs
+        let lr: Vec<f64> = cs_f
             .iter()
-            .zip(&ts)
+            .zip(&ts_f)
             .map(|(&c, &t)| (t / fit.t_at(RawCores(c)).0).ln())
             .collect();
-        (sigma_resid(&cs, &ts, &w, &fit), lr)
+        (sigma_resid(&cs_f, &ts_f, &w_f, &fit), lr)
     };
 
     // r[impl sched.sla.reassign-schmitt]
@@ -140,10 +159,10 @@ pub fn refit(
     let (ci, ci_at) = if matches!(fit, DurationFit::Probe) {
         (None, None)
     } else if should_recompute_ci(prev, &fit, n_eff, now, halflife_secs) {
-        let ws: Vec<WeightedSample> = cs
+        let ws: Vec<WeightedSample> = cs_f
             .iter()
-            .zip(&ts)
-            .zip(&w)
+            .zip(&ts_f)
+            .zip(&w_f)
             .map(|((&c, &t), &w)| WeightedSample { c, t, w })
             .collect();
         (t_min_ci(&ws, BOOTSTRAP_REPS, fit.p_bar().0), Some(now))
@@ -197,6 +216,39 @@ pub fn is_outlier(sample_t: f64, sample_c: f64, fit: &FittedParams, dt_poll: f64
     let mad = median_abs_dev(&fit.log_residuals);
     let floor = (fit.sigma_resid / 1.4826).max(dt_poll / sample_t);
     log_resid > 3.0 * 1.4826 * mad.max(floor)
+}
+
+/// Observed parallelism cap p̄: recency-weighted p90 of per-sample
+/// `avg_cores = cpu_seconds_total / duration_secs`.
+///
+/// Returns `∞` (no cap → Amdahl stage) unless at least one sample is
+/// **unsaturated** (`peak_cpu < 0.85·cpu_limit`): only an unsaturated
+/// sample is evidence the build can't soak the cores it was given. Rows
+/// missing `cpu_seconds_total` are skipped from the quantile.
+fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
+    let any_unsat = rows.iter().any(|r| {
+        matches!(
+            (r.peak_cpu_cores, r.cpu_limit_cores),
+            (Some(pk), Some(lim)) if pk < 0.85 * lim
+        )
+    });
+    if !any_unsat {
+        return f64::INFINITY;
+    }
+    let (avg, aw): (Vec<f64>, Vec<f64>) = rows
+        .iter()
+        .zip(w)
+        .filter_map(|(r, &wi)| {
+            r.cpu_seconds_total
+                .filter(|_| r.duration_secs > 0.0)
+                .map(|ct| (ct / r.duration_secs, wi))
+        })
+        .unzip();
+    if avg.is_empty() {
+        f64::INFINITY
+    } else {
+        weighted_quantile(&avg, &aw, 0.9)
+    }
 }
 
 /// Median absolute deviation: `median(|r_i - median(r)|)`. Unweighted —
@@ -393,6 +445,16 @@ mod tests {
         refit(&key(), rows, 7.0 * 86400.0, None, &[])
     }
 
+    /// Like `row` but with explicit peak_cpu and avg_cores so Capped-stage
+    /// detection (`observed_p_bar`) has data to chew on.
+    fn row_util(c: f64, t: f64, peak: f64, avg: f64) -> BuildSampleRow {
+        BuildSampleRow {
+            peak_cpu_cores: Some(peak),
+            cpu_seconds_total: Some(t * avg),
+            ..row(c, t)
+        }
+    }
+
     #[test]
     fn refit_amdahl_when_span_and_neff_sufficient() {
         let rows: Vec<_> = [4.0, 8.0, 16.0, 32.0, 64.0]
@@ -449,6 +511,60 @@ mod tests {
         assert!(matches!(f.fit, DurationFit::Probe));
         assert_eq!(f.n_eff, 0.0);
         assert_eq!(f.explore.distinct_c, 0);
+    }
+
+    // ─── Task 9.1: observed p̄ + Capped stage ─────────────────────────────
+
+    #[test]
+    fn capped_stage_enters_on_first_unsaturated() {
+        // True T(c) = 30 + 2000/min(c, 8). c∈{2,4,8} are saturated (peak ≈
+        // 0.95·c ≥ 0.85·c); c∈{16,32} cap at eff≈8 → peak≈7.6 < 0.85·limit
+        // → unsaturated → Capped stage entered.
+        // avg_cores = 0.9·min(c,8) = [1.8, 3.6, 7.2, 7.2, 7.2] → p90 = 7.2.
+        let mk = |c: f64| {
+            let eff = c.min(8.0);
+            row_util(c, 30.0 + 2000.0 / eff, eff * 0.95, eff * 0.9)
+        };
+        let rows: Vec<_> = [2.0, 4.0, 8.0, 16.0, 32.0].into_iter().map(mk).collect();
+        let f = r(&rows);
+        let DurationFit::Capped { s, p, p_bar } = f.fit else {
+            panic!("expected Capped, got {:?}", f.fit)
+        };
+        assert!((p_bar.0 - 7.2).abs() < 0.1, "p̄={}", p_bar.0);
+        assert!((s.0 - 30.0).abs() < 1.0, "s={}", s.0);
+        assert!((p.0 - 2000.0).abs() < 50.0, "p={}", p.0);
+    }
+
+    #[test]
+    fn capped_drops_samples_above_pbar() {
+        // Same setup; p̄=7.2 → samples at c∈{8,16,32} dropped (basis col
+        // 1/min(c,7.2)=const for those). log_residuals length reflects the
+        // filtered fit set.
+        let mk = |c: f64| {
+            let eff = c.min(8.0);
+            row_util(c, 30.0 + 2000.0 / eff, eff * 0.95, eff * 0.9)
+        };
+        let rows: Vec<_> = [2.0, 4.0, 8.0, 16.0, 32.0].into_iter().map(mk).collect();
+        let f = r(&rows);
+        assert!(matches!(f.fit, DurationFit::Capped { .. }));
+        assert_eq!(
+            f.log_residuals.len(),
+            2,
+            "c>{:.1} dropped → 2 of 5 kept",
+            f.fit.p_bar().0
+        );
+    }
+
+    #[test]
+    fn capped_not_entered_when_all_saturated() {
+        // peak = 0.95·c everywhere → no unsaturated sample → p̄=∞ → Amdahl.
+        let rows: Vec<_> = [2.0, 4.0, 8.0, 16.0, 32.0]
+            .into_iter()
+            .map(|c| row_util(c, 30.0 + 2000.0 / c, c * 0.95, c * 0.9))
+            .collect();
+        let f = r(&rows);
+        assert!(matches!(f.fit, DurationFit::Amdahl { .. }), "{:?}", f.fit);
+        assert_eq!(f.log_residuals.len(), 5, "no filter when p̄=∞");
     }
 
     // ─── Task 4.3: Schmitt-trigger + debounce ─────────────────────────────
