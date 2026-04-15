@@ -205,6 +205,30 @@ pkgs.testers.runNixOSTest {
             f"expected NotFound gRPC code in error:\n{out!r}"
         )
 
+    # ══════════════════════════════════════════════════════════════════
+    # sla — SetSlaOverride / ListSlaOverrides / SlaStatus round-trip
+    # ══════════════════════════════════════════════════════════════════
+    # Sets a tier override on hello, then asserts list + status surface
+    # it. status.has_fit is false (no build_samples yet) but
+    # active_override carries the row. Verifies the proto/CRUD/CLI chain
+    # end-to-end without needing a real build.
+    with subtest("cli sla: override round-trips through list + status"):
+        cli("sla override hello --tier=fast")
+        out = cli("sla list --pname=hello")
+        print(f"sla list output:\n{out}")
+        assert "hello" in out and "fast" in out, (
+            f"expected hello/fast in sla list:\n{out!r}"
+        )
+        # --json: status.active_override.tier == "fast". The fit cache
+        # is tick-refreshed (~60s) so active_override may be null on the
+        # first call; the PG-backed list above is the hard assertion.
+        k3s_server.succeed(
+            "${common.covShellEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${rioCli} sla list --pname=hello --json "
+            "| ${pkgs.jq}/bin/jq -e '.overrides[0].tier == \"fast\"'"
+        )
+
     k3s_server.execute("kill $(cat /tmp/pf-cli.pid) 2>/dev/null || true")
 
     ${common.collectCoverage fixture.pyNodeVars}

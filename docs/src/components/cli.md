@@ -60,6 +60,9 @@ r[cli.cmd.estimator]
 r[cli.cmd.verify-chunks]
 `rio-cli verify-chunks [--batch-size N]` server-streams `StoreAdminService.VerifyChunks`. Missing chunk hashes go to **stdout** (one hex BLAKE3 per line — pipeable into `xargs aws s3api head-object`); progress goes to **stderr** so `verify-chunks | tee missing.txt` captures hashes while progress scrolls. Warns on stream-closed-without-`done` (store disconnected mid-scan). I-040 diagnostic.
 
+r[cli.cmd.sla]
+`rio-cli sla {override|list|clear|reset|status}` calls the ADR-023 phase-6 `AdminService.{Set,List,Clear}SlaOverride` / `ResetSlaModel` / `SlaStatus` RPCs. `override PNAME [--system S] [--tenant T] [--tier NAME] [--cores N] [--mem 8Gi] [--ttl 7d]` pins a key (NULL system/tenant are wildcards, `r[sched.sla.override-precedence]`); `reset PNAME` drops the key's `build_samples` and evicts the cached fit so the next dispatch re-probes; `status PNAME` dumps the cached fit + any active override. `defaults`/`explain`/`export-corpus`/`import-corpus` are phase-7/11 stubs that bail with "not yet implemented".
+
 r[cli.cmd.upstream]
 `rio-cli upstream {list|add|remove} --tenant T …` is the only subcommand that talks gRPC to the store directly (`StoreAdminService`). `--tenant` accepts either a UUID (passed through, scheduler-free) or a name (resolved via `AdminService.ListTenants` — only requires scheduler reachability when the operator passes a name, I-093). `add` takes `--url`, `--priority` (default 50), repeatable `--trusted-key`, and `--sig-mode {keep|add|replace}`.
 

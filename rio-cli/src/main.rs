@@ -31,6 +31,7 @@ mod estimator;
 mod gc;
 mod logs;
 mod poison;
+mod sla;
 mod status;
 mod tenants;
 mod upstream;
@@ -299,6 +300,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: bps::BpsCmd,
     },
+    /// ADR-023 SLA-driven sizing: per-pname overrides, model reset,
+    /// cached-fit status. `override`/`reset`/`status` are live;
+    /// `explain`/`export-corpus`/`import-corpus` are phase-7/11 stubs.
+    Sla {
+        #[command(subcommand)]
+        cmd: sla::SlaCmd,
+    },
     /// PG↔backend chunk consistency audit. HeadObject every non-deleted
     /// chunk; report PG-says-exists-but-S3-says-no. Missing hashes go
     /// to stdout (one hex BLAKE3 per line, pipeable); progress to stderr.
@@ -366,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Cutoffs => cutoffs::run(as_json, &mut c).await,
                 Cmd::Estimator(a) => estimator::run(as_json, &mut c, a).await,
+                Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
                 Cmd::Bps { .. }
                 | Cmd::Upstream { .. }
                 | Cmd::VerifyChunks(_)

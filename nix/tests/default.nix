@@ -722,6 +722,7 @@ in
   # r[verify sched.admin.list-executors]
   # r[verify sched.admin.list-builds]
   # r[verify sched.admin.clear-poison]
+  # r[verify cli.cmd.sla]
   # rio-cli had 0% coverage — never invoked by any test. This runs
   # status + create-tenant + list-tenants against the live scheduler's
   # AdminService. ~5min (mostly k3s bring-up).
