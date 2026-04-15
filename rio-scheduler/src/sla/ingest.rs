@@ -4,7 +4,7 @@
 //! touched key on each refresh tick; the fit itself is pure (no DB, no I/O)
 //! so it can be unit-tested against synthetic rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use super::bootstrap::{WeightedSample, t_min_ci};
@@ -12,6 +12,7 @@ use super::fit::{
     StageGate, compute_vdists, fit_duration_staged, fit_memory, kish_n_eff, sample_weight,
     weighted_quantile,
 };
+use super::hw::HwTable;
 use super::solve::Tier;
 use super::types::{
     DiskBytes, DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
@@ -44,6 +45,7 @@ pub fn refit(
     halflife_secs: f64,
     prev: Option<&FittedParams>,
     tiers: &[Tier],
+    hw: &HwTable,
 ) -> FittedParams {
     let now = now_epoch();
     // Filter to rows that can sit on a c-axis. Everything below — vdists,
@@ -75,7 +77,14 @@ pub fn refit(
         .iter()
         .map(|r| r.cpu_limit_cores.unwrap())
         .collect();
-    let ts: Vec<f64> = fit_rows.iter().map(|r| r.duration_secs).collect();
+    // r[impl sched.sla.hw-ref-seconds]
+    // Time-domain → reference-seconds BEFORE the fit. Memory is NOT
+    // normalized (M(c) is fitted on raw bytes — peak RSS is workload-
+    // dominated, not core-throughput-dominated).
+    let ts: Vec<f64> = fit_rows
+        .iter()
+        .map(|r| hw.normalize(r.duration_secs, r.hw_class.as_deref()))
+        .collect();
     let ms: Vec<u64> = fit_rows
         .iter()
         .map(|r| r.peak_memory_bytes as u64)
@@ -85,7 +94,7 @@ pub fn refit(
     // avg_cores; entered once any sample is unsaturated (peak < 0.85·limit).
     // Samples with c > p̄ are dropped from the duration fit — their basis
     // column 1/min(c,p̄) collapses to the constant 1/p̄ (collinear with S).
-    let p_bar = observed_p_bar(&fit_rows, &w);
+    let p_bar = observed_p_bar(&fit_rows, &w, hw);
     let idx: Vec<usize> = if p_bar.is_finite() {
         let kept: Vec<usize> = (0..cs.len()).filter(|&i| cs[i] <= p_bar).collect();
         if kept.len() >= 2 {
@@ -188,6 +197,7 @@ pub fn refit(
 
     FittedParams {
         key: key.clone(),
+        hw_bias: hw_bias(&fit_rows, &cs, &ts, &fit),
         fit,
         mem,
         disk_p90,
@@ -200,6 +210,41 @@ pub fn refit(
         ci_computed_at: ci_at,
         tier,
     }
+}
+
+/// Per-hw_class residual bias for THIS key: `median(t_ref / T_ref(c))`
+/// over each hw_class's samples. Gated on ≥3 samples per class — fewer
+/// → that class is omitted (caller defaults to 1.0).
+///
+/// `ts` are ALREADY hw-normalized (reference-seconds), so a bias ≠ 1.0
+/// means this pname's scaling on that hw_class disagrees with the
+/// fleet-wide CRC32-bench factor (e.g. mem-bandwidth-bound builds see
+/// less speedup on a fast-core class than the bench predicts).
+// r[impl sched.sla.hw-ref-seconds]
+fn hw_bias(
+    rows: &[&BuildSampleRow],
+    cs: &[f64],
+    ts: &[f64],
+    fit: &DurationFit,
+) -> HashMap<String, f64> {
+    if matches!(fit, DurationFit::Probe) {
+        return HashMap::new();
+    }
+    let mut by_class: HashMap<String, Vec<f64>> = HashMap::new();
+    for ((r, &c), &t) in rows.iter().zip(cs).zip(ts) {
+        let Some(h) = r.hw_class.as_deref() else {
+            continue;
+        };
+        let pred = fit.t_at(RawCores(c)).0;
+        if pred > 0.0 && pred.is_finite() {
+            by_class.entry(h.to_owned()).or_default().push(t / pred);
+        }
+    }
+    by_class
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 3)
+        .map(|(h, v)| (h, median(&v)))
+        .collect()
 }
 
 /// MAD-based outlier gate for one new sample against the PREVIOUS fit.
@@ -237,7 +282,7 @@ pub fn is_outlier(sample_t: f64, sample_c: f64, fit: &FittedParams, dt_poll: f64
 /// **unsaturated** (`peak_cpu < 0.85·cpu_limit`): only an unsaturated
 /// sample is evidence the build can't soak the cores it was given. Rows
 /// missing `cpu_seconds_total` are skipped from the quantile.
-fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
+fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64], hw: &HwTable) -> f64 {
     let any_unsat = rows.iter().any(|r| {
         matches!(
             (r.peak_cpu_cores, r.cpu_limit_cores),
@@ -247,13 +292,19 @@ fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
     if !any_unsat {
         return f64::INFINITY;
     }
+    // avg_cores = cpu_seconds / wall is hw-invariant in principle (both
+    // numerator and denominator scale by the same factor), but normalize
+    // both for symmetry with the `ts` slice — the ratio is identical.
     let (avg, aw): (Vec<f64>, Vec<f64>) = rows
         .iter()
         .zip(w)
         .filter_map(|(r, &wi)| {
             r.cpu_seconds_total
                 .filter(|_| r.duration_secs > 0.0)
-                .map(|ct| (ct / r.duration_secs, wi))
+                .map(|ct| {
+                    let h = r.hw_class.as_deref();
+                    (hw.normalize(ct, h) / hw.normalize(r.duration_secs, h), wi)
+                })
         })
         .unzip();
     if avg.is_empty() {
@@ -381,6 +432,7 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
         t_min_ci: None,
         ci_computed_at: None,
         tier: None,
+        hw_bias: HashMap::new(),
     }
 }
 
@@ -454,7 +506,11 @@ mod tests {
     }
 
     fn r(rows: &[BuildSampleRow]) -> FittedParams {
-        refit(&key(), rows, 7.0 * 86400.0, None, &[])
+        refit(&key(), rows, 7.0 * 86400.0, None, &[], &HwTable::default())
+    }
+
+    fn r_hw(rows: &[BuildSampleRow], hw: &HwTable) -> FittedParams {
+        refit(&key(), rows, 7.0 * 86400.0, None, &[], hw)
     }
 
     /// Like `row` but with explicit peak_cpu and avg_cores so Capped-stage
@@ -523,6 +579,75 @@ mod tests {
         assert!(matches!(f.fit, DurationFit::Probe));
         assert_eq!(f.n_eff, 0.0);
         assert_eq!(f.explore.distinct_c, 0);
+    }
+
+    // ─── Task 10.3: hw normalization ─────────────────────────────────────
+
+    // r[verify sched.sla.hw-ref-seconds]
+    #[test]
+    fn refit_normalizes_mixed_hw_to_same_t() {
+        // hw_class A: factor=1.0, T(c)=30+2000/c → wall = T(c).
+        // hw_class B: factor=2.0 (twice as fast) → wall = T(c)/2.
+        // After normalize(): both map to T_ref(c) = 30+2000/c. The fit
+        // should recover (S,P) ≈ (30,2000) regardless of the hw mix.
+        let mut m = std::collections::HashMap::new();
+        m.insert("A".to_string(), 1.0);
+        m.insert("B".to_string(), 2.0);
+        let hw = HwTable::from_map(m);
+
+        let mk = |c: f64, h: &str, f: f64| BuildSampleRow {
+            hw_class: Some(h.into()),
+            duration_secs: (30.0 + 2000.0 / c) / f,
+            ..row(c, 0.0) // duration_secs overwritten above; row() filler
+        };
+        let rows = vec![
+            mk(4.0, "A", 1.0),
+            mk(8.0, "B", 2.0),
+            mk(16.0, "A", 1.0),
+            mk(32.0, "B", 2.0),
+            mk(64.0, "A", 1.0),
+        ];
+        let f = r_hw(&rows, &hw);
+        let DurationFit::Amdahl { s, p } = f.fit else {
+            panic!("expected Amdahl, got {:?}", f.fit);
+        };
+        assert!((s.0 - 30.0).abs() < 1.0, "S={s:?}");
+        assert!((p.0 - 2000.0).abs() < 5.0, "P={p:?}");
+        // hw_bias: each class has ≥3 samples? A=3, B=2 → only A reported.
+        // A's bias is median(t_ref/T_ref(c)) = 1.0 (perfect data).
+        assert!((f.hw_bias.get("A").copied().unwrap_or(0.0) - 1.0).abs() < 0.01);
+        assert!(!f.hw_bias.contains_key("B"), "<3 samples → omitted");
+    }
+
+    #[test]
+    fn refit_hw_bias_detects_per_pname_disagreement() {
+        // Fleet says B is 2× faster (factor=2.0), but THIS pname only
+        // sees 1.5× on B (mem-bandwidth-bound). After normalization,
+        // B-samples land at t_ref = wall × 2.0 = T_ref(c) × (2.0/1.5)
+        // → bias[B] ≈ 1.33.
+        let mut m = std::collections::HashMap::new();
+        m.insert("A".to_string(), 1.0);
+        m.insert("B".to_string(), 2.0);
+        let hw = HwTable::from_map(m);
+        let mk = |c: f64, h: &str, real_f: f64| BuildSampleRow {
+            hw_class: Some(h.into()),
+            duration_secs: (30.0 + 2000.0 / c) / real_f,
+            ..row(c, 0.0)
+        };
+        let rows = vec![
+            mk(4.0, "A", 1.0),
+            mk(8.0, "A", 1.0),
+            mk(16.0, "A", 1.0),
+            mk(4.0, "B", 1.5),
+            mk(32.0, "B", 1.5),
+            mk(64.0, "B", 1.5),
+        ];
+        let f = r_hw(&rows, &hw);
+        // The fit averages A (bias 1.0) and B (bias ~1.33) samples, so
+        // the absolute (S,P) is contaminated — the per-class hw_bias is
+        // exactly the corrective the solve will apply.
+        let b = f.hw_bias.get("B").copied().expect("B has 3 samples");
+        assert!(b > 1.2 && b < 1.5, "bias[B]={b} (want ~1.33)");
     }
 
     // ─── Task 9.1: observed p̄ + Capped stage ─────────────────────────────
@@ -722,6 +847,7 @@ mod tests {
             t_min_ci: Some((RefSeconds(lo), RefSeconds(hi))),
             ci_computed_at: Some(at),
             tier: None,
+            hw_bias: HashMap::new(),
         }
     }
 

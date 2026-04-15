@@ -235,6 +235,7 @@ mod tests {
             t_min_ci: None,
             ci_computed_at: None,
             tier: None,
+            hw_bias: Default::default(),
         }
     }
     fn key() -> ModelKey {

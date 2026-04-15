@@ -1606,6 +1606,7 @@ async fn spawn_intent_from_sla_estimator() {
         t_min_ci: None,
         ci_computed_at: None,
         tier: None,
+        hw_bias: Default::default(),
     });
 
     // "fitted" matches the seeded key; "cold" has no fit (different

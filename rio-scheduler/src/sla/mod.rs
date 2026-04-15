@@ -13,6 +13,7 @@ pub mod dip;
 pub mod explain;
 pub mod explore;
 pub mod fit;
+pub mod hw;
 pub mod ingest;
 pub mod metrics;
 pub mod r#override;
@@ -43,6 +44,10 @@ pub struct SlaEstimator {
     /// out-of-band after `SetSlaOverride` without waiting for the next
     /// tick (phase-7; phase-6 just re-reads on tick).
     overrides: Arc<RwLock<Vec<SlaOverrideRow>>>,
+    /// Per-hw_class median microbench factor (`hw_perf_factors` view).
+    /// Refreshed each tick alongside overrides; passed by-ref into
+    /// `ingest::refit` so wall-seconds → reference-seconds before T(c).
+    hw: Arc<RwLock<hw::HwTable>>,
     last_tick: RwLock<f64>,
     halflife_secs: f64,
     ring_buffer: u32,
@@ -53,10 +58,16 @@ impl SlaEstimator {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             overrides: Arc::new(RwLock::new(Vec::new())),
+            hw: Arc::new(RwLock::new(hw::HwTable::default())),
             last_tick: RwLock::new(0.0),
             halflife_secs,
             ring_buffer,
         }
+    }
+
+    /// Snapshot the hw normalization table. For SlaExplain.
+    pub fn hw_table(&self) -> hw::HwTable {
+        self.hw.read().clone()
     }
 
     /// Snapshot one cached fit. `None` for never-seen keys — caller falls
@@ -123,6 +134,15 @@ impl SlaEstimator {
             Ok(rows) => *self.overrides.write() = rows,
             Err(e) => tracing::warn!(error = %e, "sla override refresh failed; keeping previous"),
         }
+        // r[impl sched.sla.hw-ref-seconds]
+        // Hw factor table: same cheap-and-independent treatment as
+        // overrides (a few dozen rows from a view). Failure → keep
+        // previous; an empty table is factor=1.0 everywhere.
+        match hw::HwTable::load(db).await {
+            Ok(t) => *self.hw.write() = t,
+            Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
+        }
+        let hw_snapshot = self.hw.read().clone();
 
         let since = *self.last_tick.read();
         let new_rows = db.read_build_samples_incremental(since).await?;
@@ -166,7 +186,14 @@ impl SlaEstimator {
             let rows = db
                 .read_build_samples_for_key(&key.pname, &key.system, &key.tenant, self.ring_buffer)
                 .await?;
-            let fit = ingest::refit(key, &rows, self.halflife_secs, prev.as_ref(), tiers);
+            let fit = ingest::refit(
+                key,
+                &rows,
+                self.halflife_secs,
+                prev.as_ref(),
+                tiers,
+                &hw_snapshot,
+            );
             self.cache.write().insert(key.clone(), fit);
             // Trim AFTER refit so the fit always sees the full ring even
             // if a previous tick's trim was skipped (PG blip). Best-effort

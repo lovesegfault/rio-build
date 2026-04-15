@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rio_common::newtype;
 
 newtype!(pub RawCores(f64): Display, Add, Sub, Mul<f64>, Div<f64>, Ord);
@@ -121,6 +123,14 @@ pub struct FittedParams {
     /// `t_min_ci.is_none()`.
     pub ci_computed_at: Option<f64>,
     pub tier: Option<String>,
+    /// Per-hw_class residual bias: `median(wall_ref / T_ref(c))` over
+    /// this key's samples on each hw_class. ADR-023 phase-10: the
+    /// fleet-wide [`super::hw::HwTable`] factor is a CRC32 microbench;
+    /// some pnames scale differently (e.g. mem-bandwidth-bound builds
+    /// see less speedup on a fast-core class than the bench predicts).
+    /// `bias[h] > 1.0` ⇔ this pname runs SLOWER on `h` than the fleet
+    /// factor would imply. Default 1.0 if <3 samples on that hw_class.
+    pub hw_bias: HashMap<String, f64>,
 }
 
 #[cfg(test)]
