@@ -95,12 +95,39 @@ pub fn fit_duration(
     unfreeze_q: bool,
     p_bar: f64,
 ) -> DurationFit {
+    fit_nnls(cs, ts, w, unfreeze_q, p_bar, None)
+}
+
+/// 3-column fit with Tikhonov regularization on Q only: appends a
+/// `[0, 0, √λ]` row with target 0 to the design matrix before
+/// normalization, shrinking Q toward zero. As `λ → ∞` the fit
+/// degenerates to the 2-column Amdahl/Capped.
+pub fn fit_duration_ridge(
+    cs: &[f64],
+    ts: &[f64],
+    w: &[f64],
+    p_bar: f64,
+    lambda: f64,
+) -> DurationFit {
+    fit_nnls(cs, ts, w, true, p_bar, Some(lambda))
+}
+
+fn fit_nnls(
+    cs: &[f64],
+    ts: &[f64],
+    w: &[f64],
+    unfreeze_q: bool,
+    p_bar: f64,
+    ridge_q: Option<f64>,
+) -> DurationFit {
     debug_assert_eq!(cs.len(), ts.len());
     debug_assert_eq!(cs.len(), w.len());
+    debug_assert!(ridge_q.is_none() || unfreeze_q);
     let n = cs.len();
     let cols = if unfreeze_q { 3 } else { 2 };
-    let mut a = DMatrix::zeros(n, cols);
-    let mut b = DVector::zeros(n);
+    let rows = n + usize::from(ridge_q.is_some());
+    let mut a = DMatrix::zeros(rows, cols);
+    let mut b = DVector::zeros(rows);
     for i in 0..n {
         let sw = w[i].sqrt();
         a[(i, 0)] = sw;
@@ -109,6 +136,9 @@ pub fn fit_duration(
             a[(i, 2)] = sw * cs[i];
         }
         b[i] = sw * ts[i];
+    }
+    if let Some(lambda) = ridge_q {
+        a[(n, 2)] = lambda.sqrt();
     }
     let norms: Vec<f64> = (0..cols).map(|j| a.column(j).norm().max(1e-12)).collect();
     for (j, &norm) in norms.iter().enumerate() {
@@ -132,6 +162,59 @@ pub fn fit_duration(
         }
     } else {
         DurationFit::Amdahl { s, p }
+    }
+}
+
+/// Inputs to [`fit_duration_staged`]'s stage-selection gate. ADR-023 §2.4
+/// Table 1: USL is entered at `n_eff ≥ 10 ∧ span ≥ 8× ∧ ΔAICc < −2` and
+/// exits back to Capped/Amdahl at `n_eff < 7` (hysteresis). `prev_usl`
+/// latches the stage across refits within a version-epoch — vdist jumps
+/// reset `span` and decay `n_eff`, naturally re-entering the entry gate.
+pub struct StageGate {
+    pub n_eff: f64,
+    pub span: f64,
+    pub p_bar: f64,
+    pub prev_usl: bool,
+}
+
+/// Staged duration fit: 2-param (Amdahl / Capped) by default; unfreezes Q
+/// (USL) when the gate permits AND the 3-param fit is preferred by ΔAICc.
+/// Q is ridge-regularized with `λ = σ_amdahl² · n` so a noisy small-n fit
+/// can't run away with a large Q. Returns `(fit, σ_resid)`.
+pub fn fit_duration_staged(
+    cs: &[f64],
+    ts: &[f64],
+    w: &[f64],
+    gate: &StageGate,
+) -> (DurationFit, f64) {
+    let amdahl = fit_duration(cs, ts, w, false, gate.p_bar);
+    let sigma_a = sigma_resid(cs, ts, w, &amdahl);
+    let n = cs.len() as f64;
+    // n ≥ 5 keeps the AICc small-sample correction term finite (n−k−1 > 0
+    // for k=3); the n_eff/span gates are on the UNfiltered sample stats.
+    let try_usl = cs.len() >= 5
+        && if gate.prev_usl {
+            gate.n_eff >= 7.0
+        } else {
+            gate.n_eff >= 10.0 && gate.span >= 8.0
+        };
+    if !try_usl {
+        return (amdahl, sigma_a);
+    }
+    let usl = fit_duration_ridge(cs, ts, w, gate.p_bar, sigma_a.powi(2) * n);
+    let sigma_u = sigma_resid(cs, ts, w, &usl);
+    if gate.prev_usl {
+        return (usl, sigma_u);
+    }
+    let aicc = |k: f64, sigma: f64| {
+        let rss = (n * sigma.powi(2)).max(1e-300);
+        n * (rss / n).ln() + 2.0 * k + 2.0 * k * (k + 1.0) / (n - k - 1.0)
+    };
+    let delta = aicc(3.0, sigma_u) - aicc(2.0, sigma_a);
+    if delta < -2.0 {
+        (usl, sigma_u)
+    } else {
+        (amdahl, sigma_a)
     }
 }
 
@@ -340,6 +423,105 @@ mod tests {
             panic!()
         };
         assert!(s.0 >= 0.0);
+    }
+
+    #[test]
+    fn usl_stage_at_n12_span10x() {
+        // True USL: T = 30 + 2000/c + 0.5·c. n=12, span=20/2=10× → entry
+        // gate met. Amdahl can't capture the +0.5·c tail → ΔAICc < −2 →
+        // Usl chosen.
+        let cs = [
+            2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
+        ];
+        let ts: Vec<f64> = cs.iter().map(|c| 30.0 + 2000.0 / c + 0.5 * c).collect();
+        let w = vec![1.0; 12];
+        let gate = StageGate {
+            n_eff: 12.0,
+            span: 10.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (fit, sigma) = fit_duration_staged(&cs, &ts, &w, &gate);
+        let DurationFit::Usl { q, .. } = fit else {
+            panic!("expected Usl, got {fit:?}")
+        };
+        assert!((q - 0.5).abs() < 0.1, "q={q}");
+        assert!(sigma < 0.01, "near-perfect 3-param fit, σ={sigma}");
+    }
+
+    #[test]
+    fn usl_stays_capped_at_n8() {
+        // Same true USL data; n_eff=8 < 10 → entry gate NOT met → 2-param.
+        let cs = [2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 20.0];
+        let ts: Vec<f64> = cs.iter().map(|c| 30.0 + 2000.0 / c + 0.5 * c).collect();
+        let w = vec![1.0; 8];
+        let gate = StageGate {
+            n_eff: 8.0,
+            span: 10.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (fit, _) = fit_duration_staged(&cs, &ts, &w, &gate);
+        assert!(matches!(fit, DurationFit::Amdahl { .. }), "{fit:?}");
+        // Hysteresis: prev_usl latches → at n_eff=8 (≥7) we STAY Usl.
+        let latched = StageGate {
+            prev_usl: true,
+            ..gate
+        };
+        let (fit, _) = fit_duration_staged(&cs, &ts, &w, &latched);
+        assert!(matches!(fit, DurationFit::Usl { .. }), "latched: {fit:?}");
+        // Exit at n_eff < 7.
+        let exit = StageGate {
+            n_eff: 6.0,
+            prev_usl: true,
+            ..gate
+        };
+        let (fit, _) = fit_duration_staged(&cs, &ts, &w, &exit);
+        assert!(matches!(fit, DurationFit::Amdahl { .. }), "exit: {fit:?}");
+    }
+
+    #[test]
+    fn usl_rejected_when_aicc_prefers_amdahl() {
+        // True Amdahl (Q=0) + tiny noise. n=12, span=10× → gate met, but
+        // 3-param doesn't beat 2-param by ΔAICc < −2 → stays Amdahl.
+        let cs = [
+            2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
+        ];
+        let ts: Vec<f64> = cs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (30.0 + 2000.0 / c) * (1.0 + 0.02 * (i as f64 * 1.3).sin()))
+            .collect();
+        let w = vec![1.0; 12];
+        let gate = StageGate {
+            n_eff: 12.0,
+            span: 10.0,
+            p_bar: f64::INFINITY,
+            prev_usl: false,
+        };
+        let (fit, _) = fit_duration_staged(&cs, &ts, &w, &gate);
+        assert!(matches!(fit, DurationFit::Amdahl { .. }), "{fit:?}");
+    }
+
+    #[test]
+    fn ridge_shrinks_q_toward_zero() {
+        let cs = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+        let ts: Vec<f64> = cs.iter().map(|c| 30.0 + 2000.0 / c + 0.5 * c).collect();
+        let w = vec![1.0; 6];
+        // λ=0 → unregularized → Q≈0.5 (matches nnls_recovers_usl).
+        let DurationFit::Usl { q: q0, .. } = fit_duration_ridge(&cs, &ts, &w, f64::INFINITY, 0.0)
+        else {
+            panic!()
+        };
+        assert!((q0 - 0.5).abs() < 0.05, "q0={q0}");
+        // λ huge → Q shrunk toward 0.
+        let DurationFit::Usl { q: q_hi, .. } =
+            fit_duration_ridge(&cs, &ts, &w, f64::INFINITY, 1e12)
+        else {
+            panic!()
+        };
+        assert!(q_hi < 0.01, "q_hi={q_hi}");
+        assert!(q_hi < q0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::bootstrap::{WeightedSample, t_min_ci};
 use super::fit::{
-    compute_vdists, fit_duration, fit_memory, kish_n_eff, sample_weight, sigma_resid,
+    StageGate, compute_vdists, fit_duration_staged, fit_memory, kish_n_eff, sample_weight,
     weighted_quantile,
 };
 use super::solve::Tier;
@@ -120,10 +120,16 @@ pub fn refit(
         let min = cur_cs.iter().copied().fold(f64::INFINITY, f64::min);
         max / min
     };
-    let fit = if n_eff < 3.0 || span < 4.0 {
-        DurationFit::Probe
+    let gate = StageGate {
+        n_eff,
+        span,
+        p_bar,
+        prev_usl: matches!(prev.map(|p| &p.fit), Some(DurationFit::Usl { .. })),
+    };
+    let (fit, sigma) = if n_eff < 3.0 || span < 4.0 {
+        (DurationFit::Probe, 0.2)
     } else {
-        fit_duration(&cs_f, &ts_f, &w_f, false, p_bar)
+        fit_duration_staged(&cs_f, &ts_f, &w_f, &gate)
     };
     let mem = fit_memory(&cs, &ms, &w, n_eff);
 
@@ -140,15 +146,13 @@ pub fn refit(
     let disk_p90 =
         (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64));
 
-    let (sigma, log_residuals) = if matches!(fit, DurationFit::Probe) {
-        (0.2, Vec::new())
+    let log_residuals = if matches!(fit, DurationFit::Probe) {
+        Vec::new()
     } else {
-        let lr: Vec<f64> = cs_f
-            .iter()
+        cs_f.iter()
             .zip(&ts_f)
             .map(|(&c, &t)| (t / fit.t_at(RawCores(c)).0).ln())
-            .collect();
-        (sigma_resid(&cs_f, &ts_f, &w_f, &fit), lr)
+            .collect()
     };
 
     // r[impl sched.sla.reassign-schmitt]
