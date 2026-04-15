@@ -568,6 +568,26 @@ pub const M_037: () = ();
 /// path.
 pub const M_039: () = ();
 
+/// `migrations/040_sla_overrides.sql`
+///
+/// ADR-023 phase-6 operator overrides. One row pins a `(pname, system?,
+/// tenant?)` key to a forced tier / `(cores, mem)` / capacity_type,
+/// short-circuiting the fitted-curve solve. NULL `system`/`tenant` are
+/// wildcards — `r[sched.sla.override-precedence]` resolves most-specific
+/// first (`pname+system+tenant` > `pname+system` > `pname`). `cluster`
+/// scopes a row to one deployment so a shared multi-region DB can carry
+/// per-region pins. `expires_at NULL` = never expires; `created_by` is
+/// audit-only (rio-cli stamps `$USER`).
+///
+/// `p50/p90/p99_secs` let an override carry a custom tier target
+/// without naming a configured tier (deferred — phase-7 SlaExplain
+/// surfaces them; phase-6 only reads `tier`/`cores`/`mem_bytes`/
+/// `capacity_type`).
+///
+/// `lookup_idx` covers the hot path: `SlaEstimator::refresh` reads all
+/// non-expired rows once per tick, then resolves in-memory.
+pub const M_040: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
