@@ -14,6 +14,7 @@ pub mod fit;
 pub mod ingest;
 pub mod metrics;
 pub mod r#override;
+pub mod prior;
 pub mod solve;
 pub mod types;
 
