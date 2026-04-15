@@ -123,6 +123,51 @@ fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_p90: f64) -> FitPa
     }
 }
 
+/// Median-of-tenant-medians over the caller's fitted-key set. One vote
+/// per tenant regardless of how many `ModelKey`s that tenant has fit —
+/// a tenant with 10k builds of one package can't drag the fleet prior
+/// (Sybil-resistant in the "noisy neighbour" sense, not the crypto
+/// sense). Returns `None` below `min_keys` so an empty/cold fleet falls
+/// through to [`PriorSource::Operator`].
+///
+/// Caller is expected to pre-filter to keys whose `MemFit` is
+/// [`Coupled`](super::types::MemFit::Coupled) — `FitParams.{a,b}` are
+/// only meaningful for those.
+pub fn fleet_median(all: &[(ModelKey, FitParams)], min_keys: usize) -> Option<FitParams> {
+    if all.len() < min_keys {
+        return None;
+    }
+    let mut by_tenant: HashMap<&str, Vec<&FitParams>> = HashMap::new();
+    for (k, f) in all {
+        by_tenant.entry(k.tenant.as_str()).or_default().push(f);
+    }
+    let tenant_medians: Vec<FitParams> = by_tenant.values().map(|v| median_fitparams(v)).collect();
+    Some(median_fitparams(&tenant_medians.iter().collect::<Vec<_>>()))
+}
+
+/// Per-field median. Even-length → mean of the two straddling elements
+/// (the five fields are independent so there's no "the median row").
+fn median_fitparams(v: &[&FitParams]) -> FitParams {
+    debug_assert!(!v.is_empty());
+    let med = |proj: fn(&FitParams) -> f64| -> f64 {
+        let mut xs: Vec<f64> = v.iter().map(|f| proj(f)).collect();
+        xs.sort_by(f64::total_cmp);
+        let n = xs.len();
+        if n % 2 == 1 {
+            xs[n / 2]
+        } else {
+            (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+        }
+    };
+    FitParams {
+        s: med(|f| f.s),
+        p: med(|f| f.p),
+        q: med(|f| f.q),
+        a: med(|f| f.a),
+        b: med(|f| f.b),
+    }
+}
+
 fn clamp_field(fleet: f64, op: f64, param: &'static str) -> f64 {
     if op.abs() < f64::EPSILON {
         return fleet;
@@ -263,5 +308,93 @@ mod tests {
         assert!((clamped.s - 100.0).abs() < 1e-9);
         // q: operator basis is 0 → passed through
         assert!((clamped.q - 0.3).abs() < 1e-9);
+    }
+
+    fn fp(s: f64, p: f64, q: f64, a: f64, b: f64) -> FitParams {
+        FitParams { s, p, q, a, b }
+    }
+
+    fn tkey(tenant: &str, pname: &str) -> ModelKey {
+        ModelKey {
+            pname: pname.into(),
+            system: "x86_64-linux".into(),
+            tenant: tenant.into(),
+        }
+    }
+
+    #[test]
+    fn fleet_median_is_median_of_tenant_medians() {
+        // 60 keys across 3 tenants: t0 has 40 (all p=100), t1 has 10
+        // (all p=500), t2 has 10 (all p=900). A flat median over 60
+        // would give p=100 (t0 dominates); median-of-tenant-medians
+        // gives median{100, 500, 900} = 500.
+        let mut all = Vec::new();
+        for i in 0..40 {
+            all.push((
+                tkey("t0", &format!("a{i}")),
+                fp(10.0, 100.0, 0.0, 20.0, 1.0),
+            ));
+        }
+        for i in 0..10 {
+            all.push((
+                tkey("t1", &format!("b{i}")),
+                fp(50.0, 500.0, 0.0, 22.0, 1.0),
+            ));
+        }
+        for i in 0..10 {
+            all.push((
+                tkey("t2", &format!("c{i}")),
+                fp(90.0, 900.0, 0.0, 24.0, 1.0),
+            ));
+        }
+        assert_eq!(all.len(), 60);
+        let m = fleet_median(&all, 20).expect("60 ≥ 20");
+        assert!((m.p - 500.0).abs() < 1e-9, "got {}", m.p);
+        assert!((m.s - 50.0).abs() < 1e-9);
+        assert!((m.a - 22.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fleet_median_none_below_min_keys() {
+        let all = vec![
+            (tkey("t0", "a"), fp(1.0, 1.0, 0.0, 1.0, 1.0)),
+            (tkey("t1", "b"), fp(2.0, 2.0, 0.0, 2.0, 1.0)),
+        ];
+        assert!(fleet_median(&all, 20).is_none());
+        assert!(fleet_median(&all, 2).is_some());
+    }
+
+    #[test]
+    fn fleet_median_per_field_median_even() {
+        // Two tenants, one key each → tenant_medians has 2 entries →
+        // even-length per-field median = mean.
+        let all = vec![
+            (tkey("t0", "a"), fp(10.0, 100.0, 0.0, 20.0, 0.8)),
+            (tkey("t1", "b"), fp(30.0, 300.0, 0.2, 24.0, 1.2)),
+        ];
+        let m = fleet_median(&all, 2).unwrap();
+        assert!((m.s - 20.0).abs() < 1e-9);
+        assert!((m.p - 200.0).abs() < 1e-9);
+        assert!((m.q - 0.1).abs() < 1e-9);
+        assert!((m.b - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fleet_prior_clamped_and_divergence_path() {
+        // Fleet says p=5000; operator basis at p90=300, cpu=4 gives
+        // p=600 → clamps to 1200. The divergence gauge is emitted as a
+        // side effect (not asserted here — no recorder); we assert the
+        // clamp itself, which is the gate that triggers emission.
+        let src = PriorSources {
+            seed: HashMap::new(),
+            fleet: Some(fp(112.5, 5000.0, 0.0, 22.0, 1.0)),
+            operator: probe(),
+            default_tier_p90: 300.0,
+        };
+        let (got, prov) = prior_for(&key("anything"), &src);
+        assert_eq!(prov, PriorSource::Fleet);
+        assert!((got.p - 1200.0).abs() < 1e-9, "p clamped to 2×600");
+        // a=22 is within [0.5×ln(6Gi), 2×ln(6Gi)] ≈ [11.3, 45.2] → pass
+        assert!((got.a - 22.0).abs() < 1e-9);
     }
 }
