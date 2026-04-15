@@ -778,17 +778,19 @@ impl Substituter {
             // Latency guard: probing N>4096 paths even at bounded
             // concurrency would block the originating FindMissingPaths
             // RPC (and the scheduler's actor event loop) for too long.
-            // Cached hits are still returned. The dispatch-time
-            // re-check is intended to cover the gap — see
-            // r[sched.dispatch.fod-substitute] for the per-drv probe.
+            // Probe the FIRST 4096 (not zero) — the 1h probe_cache
+            // means a retry/subsequent merge sees those as cached,
+            // leaving fewer uncached → eventually full coverage. The
+            // dispatch-time re-check (r[sched.dispatch.fod-substitute])
+            // covers FODs in the truncated tail per-tick.
             warn!(
                 uncached = uncached.len(),
                 max = SUBSTITUTE_PROBE_MAX_PATHS,
                 cached_hits = hits.len(),
-                "check_available: uncached batch exceeds probe cap; skipping HEAD probes"
+                "check_available: uncached batch exceeds probe cap; truncating to first {SUBSTITUTE_PROBE_MAX_PATHS}"
             );
             metrics::counter!("rio_store_substitute_probe_skipped_total").increment(1);
-            return Ok(hits);
+            uncached.truncate(SUBSTITUTE_PROBE_MAX_PATHS);
         }
 
         let bases: Vec<String> = upstreams
@@ -1210,21 +1212,23 @@ mod tests {
 
     // r[verify store.substitute.probe-bounded]
     /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
-    /// any HTTP. No fake upstream is spawned; the registered upstream
-    /// URL is unroutable (TEST-NET-1), so if the cap were ignored the
-    /// test would stall on thousands of connect timeouts at 128
-    /// concurrency instead of returning instantly.
+    /// to 4096 (not skipped to zero). Uses a local fake upstream that
+    /// 404s everything except its one seeded path → 4096 instant HEADs
+    /// at WantMassQuery=128 concurrency. The 4097th path is never
+    /// probed → its `probe_cache` entry stays absent.
     #[tokio::test]
-    async fn check_available_skips_oversized_batch() {
+    async fn check_available_truncates_oversized_batch() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-head-cap").await;
+        let (dummy, nar) = make_path();
+        let fake = spawn_fake_upstream(&dummy, nar, "cache.cap-test").await;
 
         metadata::upstreams::insert(
             &db.pool,
             tid,
-            "http://192.0.2.1",
+            &fake.url,
             50,
-            &["cache.unused:abcd".into()],
+            &[fake.trusted_key.clone()],
             SigMode::Keep,
         )
         .await
@@ -1240,10 +1244,24 @@ mod tests {
             .collect();
 
         let sub = test_substituter(db.pool.clone());
-        let available = sub.check_available(tid, &paths).await.unwrap();
+        let available = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sub.check_available(tid, &paths),
+        )
+        .await
+        .expect("4096 local-404 HEADs at 128 conc should complete in ~100ms")
+        .unwrap();
         assert!(
             available.is_empty(),
-            "oversized batch must skip probing entirely"
+            "fake upstream 404s all generated paths → 0 substitutable"
+        );
+        assert!(
+            sub.probe_cache.get(&paths[0]).await.is_some(),
+            "head of batch must be probed and cached"
+        );
+        assert!(
+            sub.probe_cache.get(paths.last().unwrap()).await.is_none(),
+            "tail past truncation point must NOT be probed"
         );
     }
 
