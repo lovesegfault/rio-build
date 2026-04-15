@@ -36,7 +36,8 @@ use rio_proto::types::{
     ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
     ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
     ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaOverride, SlaStatusRequest, SlaStatusResponse, TerminationReason,
+    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
+    SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -702,6 +703,27 @@ impl AdminService for AdminServiceImpl {
             fit.as_ref(),
             active.as_ref(),
         )))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "SlaExplain"))]
+    async fn sla_explain(
+        &self,
+        request: Request<SlaExplainRequest>,
+    ) -> Result<Response<SlaExplainResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let r = request.into_inner();
+        let key = ModelKey {
+            pname: r.pname,
+            system: r.system,
+            tenant: r.tenant,
+        };
+        let result = query_actor(&self.actor, |reply| {
+            ActorCommand::Admin(AdminQuery::SlaExplain { key, reply })
+        })
+        .await?;
+        Ok(Response::new(sla::explain_to_proto(&result)))
     }
 
     /// VM-test fixture: write one synthetic `build_samples` row. Gated

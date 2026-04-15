@@ -394,6 +394,16 @@ pub enum AdminQuery {
         key: crate::sla::types::ModelKey,
         reply: oneshot::Sender<bool>,
     },
+    /// `AdminService.SlaExplain`: re-run the tier walk for one key in
+    /// dry-run mode. Reply is the full [`ExplainResult`] — the RPC
+    /// handler projects to proto. Same ~60s tick staleness as
+    /// `SlaStatus`.
+    ///
+    /// [`ExplainResult`]: crate::sla::explain::ExplainResult
+    SlaExplain {
+        key: crate::sla::types::ModelKey,
+        reply: oneshot::Sender<crate::sla::explain::ExplainResult>,
+    },
 }
 
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
@@ -464,6 +474,7 @@ impl AdminQuery {
             Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
             Self::SlaStatus { .. } => "SlaStatus",
             Self::SlaEvict { .. } => "SlaEvict",
+            Self::SlaExplain { .. } => "SlaExplain",
         }
     }
 }

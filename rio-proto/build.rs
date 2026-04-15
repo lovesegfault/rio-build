@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SlaOverride",
         "ListSlaOverridesResponse",
         "SlaStatusResponse",
+        "SlaCandidateRow",
+        "SlaExplainResponse",
     ] {
         b = b.type_attribute(format!("rio.types.{ty}"), "#[derive(serde::Serialize)]");
     }

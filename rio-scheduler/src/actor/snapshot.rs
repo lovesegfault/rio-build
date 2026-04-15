@@ -66,6 +66,17 @@ impl DagActor {
             AdminQuery::SlaEvict { key, reply } => {
                 let _ = reply.send(self.sla_estimator.evict(&key));
             }
+            AdminQuery::SlaExplain { key, reply } => {
+                let fit = self.sla_estimator.cached(&key);
+                let override_ = self.sla_estimator.resolved_override(&key);
+                let _ = reply.send(crate::sla::explain::explain(
+                    &key,
+                    fit.as_ref(),
+                    &self.sla_tiers,
+                    &self.sla_ceilings,
+                    override_.as_ref(),
+                ));
+            }
         }
     }
 

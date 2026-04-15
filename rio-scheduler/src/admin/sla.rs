@@ -3,9 +3,10 @@
 
 use tonic::Status;
 
-use rio_proto::types::{SlaOverride, SlaStatusResponse};
+use rio_proto::types::{SlaCandidateRow, SlaExplainResponse, SlaOverride, SlaStatusResponse};
 
 use crate::db::SlaOverrideRow;
+use crate::sla::explain::ExplainResult;
 use crate::sla::types::{DurationFit, FittedParams, MemFit};
 
 /// proto → row. `id`/`created_at` are server-assigned; ignore the
@@ -94,5 +95,26 @@ pub(super) fn status_from_fit(
         span: f.span,
         tier: f.tier.clone(),
         active_override: active_override.map(row_to_proto),
+    }
+}
+
+/// [`ExplainResult`] → proto. The CLI renders the candidate table; the
+/// dashboard (phase-8) gets the same shape over gRPC-Web.
+pub(super) fn explain_to_proto(r: &ExplainResult) -> SlaExplainResponse {
+    SlaExplainResponse {
+        fit_summary: r.fit_summary.clone(),
+        prior_source: r.prior_source.clone(),
+        override_applied: r.override_applied.clone(),
+        candidates: r
+            .candidates
+            .iter()
+            .map(|c| SlaCandidateRow {
+                tier: c.tier.clone(),
+                c_star: c.c_star,
+                mem_bytes: c.mem,
+                binding_constraint: c.binding_constraint.clone(),
+                feasible: c.feasible,
+            })
+            .collect(),
     }
 }

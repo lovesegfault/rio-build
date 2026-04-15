@@ -16,8 +16,8 @@ use tonic::transport::Channel;
 
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{
-    ListSlaOverridesRequest, ResetSlaModelRequest, SetSlaOverrideRequest, SlaOverride,
-    SlaStatusRequest,
+    ListSlaOverridesRequest, ResetSlaModelRequest, SetSlaOverrideRequest, SlaExplainRequest,
+    SlaOverride, SlaStatusRequest,
 };
 
 #[derive(Subcommand, Clone)]
@@ -74,8 +74,16 @@ pub enum SlaCmd {
     },
     /// Print the configured tier ladder + probe shape.
     Defaults,
-    /// Per-derivation solve trace. (phase-7)
-    Explain { pname: String },
+    /// Per-derivation solve trace: re-runs the tier walk in dry-run
+    /// mode and prints a candidate table showing why each tier was
+    /// accepted or rejected.
+    Explain {
+        pname: String,
+        #[arg(long, default_value = "x86_64-linux")]
+        system: String,
+        #[arg(long, default_value = "")]
+        tenant: String,
+    },
     /// Dump build_samples corpus to a file. (phase-11)
     ExportCorpus {
         #[arg(long)]
@@ -252,8 +260,52 @@ pub(crate) async fn run(
                 "not yet implemented (v1.1 phase 7); inspect scheduler.toml [sla] directly"
             )
         }
-        SlaCmd::Explain { .. } | SlaCmd::ExportCorpus { .. } | SlaCmd::ImportCorpus { .. } => {
-            anyhow::bail!("not yet implemented (v1.1 phase 7/11)")
+        SlaCmd::Explain {
+            pname,
+            system,
+            tenant,
+        } => {
+            let req = SlaExplainRequest {
+                pname: pname.clone(),
+                system: system.clone(),
+                tenant,
+            };
+            let resp =
+                crate::rpc("SlaExplain", async || client.sla_explain(req.clone()).await).await?;
+            if as_json {
+                return crate::json(&resp);
+            }
+            println!("Key:       {pname} ({system})");
+            println!("Fit:       {}", resp.fit_summary);
+            println!("Prior:     {}", resp.prior_source);
+            if let Some(o) = &resp.override_applied {
+                println!("Override:  {o}");
+            }
+            if resp.candidates.is_empty() {
+                println!("(no candidates — cold start, dispatch uses probe path)");
+                return Ok(());
+            }
+            println!();
+            println!(
+                "{:<12} {:>8} {:>10} {:<16} {}",
+                "TIER", "C*", "MEM", "CONSTRAINT", "FEASIBLE"
+            );
+            for c in &resp.candidates {
+                println!(
+                    "{:<12} {:>8} {:>10} {:<16} {}",
+                    c.tier,
+                    c.c_star
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "-".into()),
+                    c.mem_bytes.map(fmt_bytes_u).unwrap_or_else(|| "-".into()),
+                    c.binding_constraint,
+                    if c.feasible { "yes" } else { "no" },
+                );
+            }
+            Ok(())
+        }
+        SlaCmd::ExportCorpus { .. } | SlaCmd::ImportCorpus { .. } => {
+            anyhow::bail!("not yet implemented (v1.1 phase 11)")
         }
     }
 }
@@ -299,6 +351,10 @@ fn parse_ttl(s: &str) -> anyhow::Result<f64> {
         .unwrap_or(Duration::ZERO)
         .as_secs_f64();
     Ok(now + (n * mult) as f64)
+}
+
+fn fmt_bytes_u(b: u64) -> String {
+    fmt_bytes(b.min(i64::MAX as u64) as i64)
 }
 
 fn fmt_bytes(b: i64) -> String {

@@ -124,6 +124,12 @@ service AdminService {
   // live PG refit. `has_fit=false` ⇔ never seen / evicted.
   rpc SlaStatus(rio.types.SlaStatusRequest) returns (rio.types.SlaStatusResponse);
 
+  // Per-derivation solve trace: re-runs the tier walk for one key in
+  // dry-run mode, recording every reject reason. Feeds `rio-cli sla
+  // explain`'s candidate table — "fast rejected: c*=18 > p̄=12; normal
+  // feasible at c*=6". Same ~60s tick staleness as SlaStatus.
+  rpc SlaExplain(rio.types.SlaExplainRequest) returns (rio.types.SlaExplainResponse);
+
   // VM-test fixture: write a synthetic build_samples row directly. Lets
   // the sla-sizing scenario inject a 100x outlier and assert the MAD
   // sweep flags it without staging a real wall-clock-hours build. Gated

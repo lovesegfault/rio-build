@@ -69,6 +69,7 @@ export const adminMock = {
   clearSlaOverride: vi.fn(),
   resetSlaModel: vi.fn(),
   slaStatus: vi.fn(),
+  slaExplain: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 
