@@ -422,6 +422,11 @@ message SpawnIntent {
   uint32 cores = 2;
   uint64 mem_bytes = 3;
   uint64 disk_bytes = 4;
+  // ADR-023 phase-13: per-(band, cap) targeting. Merged into the
+  // pod's nodeSelector by the controller (apply_intent_resources).
+  // Empty under hw_cost_source=None — pod lands wherever Karpenter
+  // bin-packs cheapest.
+  map<string, string> node_selector = 5;
 }
 
 message GetSizeClassStatusRequest {

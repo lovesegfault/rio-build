@@ -1,6 +1,12 @@
+use std::collections::BTreeMap;
+
+use rand::{Rng, RngExt};
+
 use super::config::SlaConfig;
+use super::cost::{Band, Cap, CostTable, IceBackoff};
 use super::explore;
 use super::fit::headroom;
+use super::hw::HwTable;
 use super::r#override::ResolvedTarget;
 use super::quantile;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
@@ -43,11 +49,16 @@ pub enum SolveResult {
         c_star: RawCores,
         mem: MemBytes,
         disk: DiskBytes,
+        /// `rio.build/hw-band` + `karpenter.sh/capacity-type` (+
+        /// optionally `rio.build/storage`). `None` under
+        /// `hw_cost_source = None` (band-agnostic [`solve_mvp`]).
+        node_selector: Option<BTreeMap<String, String>>,
     },
     BestEffort {
         c: RawCores,
         mem: MemBytes,
         disk: DiskBytes,
+        node_selector: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -67,6 +78,36 @@ impl SolveResult {
         match self {
             Self::Feasible { disk, .. } | Self::BestEffort { disk, .. } => *disk,
         }
+    }
+    pub fn node_selector(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::Feasible { node_selector, .. } | Self::BestEffort { node_selector, .. } => {
+                node_selector.as_ref()
+            }
+        }
+    }
+}
+
+/// One feasible `(band, cap)` cell from [`solve_full`]'s inner loop.
+/// `e_cost` is the comparable scalar for [`softmax_pick`].
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub band: Band,
+    pub cap: Cap,
+    pub c_star: RawCores,
+    pub mem: MemBytes,
+    pub e_cost: f64,
+}
+
+impl Candidate {
+    /// Pod nodeSelector for this `(band, cap)`. Storage is left to the
+    /// controller's per-pool `rio.build/storage` selector (the solve
+    /// doesn't yet bias storage; phase-14 wires `disk_p90` → nvme).
+    pub fn selector(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("rio.build/hw-band".into(), self.band.label().into()),
+            ("karpenter.sh/capacity-type".into(), self.cap.label().into()),
+        ])
     }
 }
 
@@ -285,6 +326,7 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
             c_star,
             mem: MemBytes(mem),
             disk: DiskBytes(disk),
+            node_selector: None,
         };
     }
     let c = fit.fit.p_bar().0.min(ceil.max_cores);
@@ -293,7 +335,165 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
         c: RawCores(c),
         mem: MemBytes(mem),
         disk: DiskBytes(disk),
+        node_selector: None,
     }
+}
+
+/// `c` such that `λ · T(c)/factor = ln 2` — the core count where the
+/// per-attempt preemption probability hits 50%. Used as the floor of
+/// the spot-envelope search: below `c_λ`, spot is rejected outright
+/// (`p > 0.5` gate), so there's no point bisecting there.
+fn c_lambda(fit: &FittedParams, lambda: f64, factor: f64) -> f64 {
+    // T(c) ≤ ln2·factor/λ. With T(c)=S+P/c (Amdahl on [1, p̄]):
+    // c ≥ P / (ln2·factor/λ - S). Non-positive denom ⇒ infeasible at
+    // any c (S alone breaches) — return ∞ so the cap_c gate rejects.
+    let (s, p, _) = fit.fit.spq();
+    let target = std::f64::consts::LN_2 * factor / lambda;
+    if target <= s {
+        return f64::INFINITY;
+    }
+    (p / (target - s)).max(1.0)
+}
+
+// r[impl sched.sla.solve-per-band-cap]
+/// Algorithm 4: per-`(band, cap)` envelope solve + cost softmax.
+///
+/// For each tier (tightest-first), enumerate all 6 `(band, cap)`
+/// cells, skip ICE-backed-off ones, run [`solve_envelope`] with that
+/// cell's `(h†_factor, λ)`, gate on `p(C) ≤ 0.5` for spot, gate on
+/// mem/disk ceilings, compute `E[cost]`. If ≥1 candidate survives,
+/// [`softmax_pick`] one and return `Feasible` with its nodeSelector.
+/// If no tier yields a candidate, fall through to band-agnostic
+/// `BestEffort`.
+///
+/// `temp` is the softmax temperature — `0.0` = greedy
+/// argmin, higher = more spread.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_full(
+    fit: &FittedParams,
+    tiers: &[Tier],
+    hw: &HwTable,
+    cost: &CostTable,
+    ceil: &Ceilings,
+    ice: &IceBackoff,
+    temp: f64,
+    rng: &mut impl Rng,
+) -> SolveResult {
+    let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
+    let h = headroom(fit.n_eff);
+    let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
+
+    for tier in tiers {
+        let mut candidates = Vec::with_capacity(6);
+        for band in Band::ALL {
+            for cap in Cap::ALL {
+                if ice.is_infeasible(band, cap) {
+                    continue;
+                }
+                let (_, factor) = hw.h_dagger(&fit.key.pname, band, &fit.hw_bias);
+                let lambda = match cap {
+                    Cap::Spot => cost.lambda_band(band),
+                    Cap::OnDemand => 0.0,
+                };
+                // p(cap_c) > 0.5 ⇒ spot infeasible regardless of c
+                // (the geometric retry tail blows every quantile).
+                if cap == Cap::Spot {
+                    let t_cap = fit.fit.t_at(RawCores(cap_c)).0 / factor;
+                    let p_at_cap = 1.0 - (-lambda * t_cap).exp();
+                    if p_at_cap > 0.5 {
+                        continue;
+                    }
+                }
+                let c_lo = if cap == Cap::Spot {
+                    c_lambda(fit, lambda, factor).ceil()
+                } else {
+                    1.0
+                };
+                if c_lo > cap_c {
+                    continue;
+                }
+                let Some(c_star) = solve_envelope(fit, tier, c_lo, cap_c, factor, lambda) else {
+                    continue;
+                };
+                let mem = (fit.mem.at(c_star).0 as f64 * h) as u64;
+                if mem > ceil.max_mem || disk > ceil.max_disk {
+                    continue;
+                }
+                let e_cost = cost.expected_cost(band, cap, c_star, mem, fit, factor, lambda);
+                candidates.push(Candidate {
+                    band,
+                    cap,
+                    c_star,
+                    mem: MemBytes(mem),
+                    e_cost,
+                });
+            }
+        }
+        if let Some(chosen) = softmax_pick(&candidates, temp, rng) {
+            return SolveResult::Feasible {
+                tier: tier.name.clone(),
+                c_star: chosen.c_star,
+                mem: chosen.mem,
+                disk: DiskBytes(disk),
+                node_selector: Some(chosen.selector()),
+            };
+        }
+    }
+    let c = fit.fit.p_bar().0.min(ceil.max_cores);
+    let mem = (fit.mem.at(RawCores(c)).0 as f64 * h) as u64;
+    SolveResult::BestEffort {
+        c: RawCores(c),
+        mem: MemBytes(mem),
+        disk: DiskBytes(disk),
+        node_selector: None,
+    }
+}
+
+/// Weighted-random pick over `candidates` by `exp(-e_cost/min/temp)`.
+/// `temp ≤ 0` or `len()==1` → argmin. `None` for empty input.
+///
+/// Normalizing by `min(e_cost)` makes the softmax scale-free: a 2×
+/// price ratio gets the same weight split whether the absolute costs
+/// are $0.01 or $10. The exponent is clamped to avoid `inf` on
+/// degenerate inputs.
+pub fn softmax_pick<'a>(
+    candidates: &'a [Candidate],
+    temp: f64,
+    rng: &mut impl Rng,
+) -> Option<&'a Candidate> {
+    match candidates {
+        [] => return None,
+        [only] => return Some(only),
+        _ => {}
+    }
+    let min = candidates
+        .iter()
+        .map(|c| c.e_cost)
+        .fold(f64::INFINITY, f64::min)
+        .max(f64::EPSILON);
+    if temp <= 0.0 {
+        return candidates
+            .iter()
+            .min_by(|a, b| a.e_cost.partial_cmp(&b.e_cost).unwrap());
+    }
+    let weights: Vec<f64> = candidates
+        .iter()
+        .map(|c| ((-c.e_cost / min) / temp).clamp(-700.0, 0.0).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 || !total.is_finite() {
+        return candidates
+            .iter()
+            .min_by(|a, b| a.e_cost.partial_cmp(&b.e_cost).unwrap());
+    }
+    let mut r = rng.random::<f64>() * total;
+    for (c, w) in candidates.iter().zip(&weights) {
+        r -= w;
+        if r <= 0.0 {
+            return Some(c);
+        }
+    }
+    candidates.last()
 }
 
 #[cfg(test)]
@@ -585,6 +785,185 @@ mod tests {
         fit.n_eff = 2.0;
         assert_eq!(intent(Some(&fit), &DrvHints::default()).0, 4);
     }
+    // ─── solve_full / softmax (Algorithm 4) ─────────────────────────
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::collections::HashMap;
+
+    fn hw_mid_only() -> HwTable {
+        // Only mid-band has bench data; hi/lo fall back to factor=1.0
+        // (the empty-band h_dagger path).
+        let mut m = HashMap::new();
+        m.insert("aws-7-ebs".into(), 1.0);
+        m.insert("aws-7-nvme".into(), 1.2);
+        HwTable::from_map(m)
+    }
+
+    fn cand(band: Band, cap: Cap, e_cost: f64) -> Candidate {
+        Candidate {
+            band,
+            cap,
+            c_star: RawCores(4.0),
+            mem: MemBytes(2 << 30),
+            e_cost,
+        }
+    }
+
+    // r[verify sched.sla.solve-per-band-cap]
+    #[test]
+    fn picks_cheapest_feasible_band_cap() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let cost = CostTable::default(); // seed: spot < on-demand
+        let mut rng = StdRng::seed_from_u64(0);
+        let r = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_mid_only(),
+            &cost,
+            &ceil(),
+            &IceBackoff::default(),
+            0.0, // greedy
+            &mut rng,
+        );
+        let SolveResult::Feasible { node_selector, .. } = r else {
+            panic!("expected Feasible")
+        };
+        let ns = node_selector.expect("solve_full sets selector");
+        // Greedy + seed prices ⇒ spot. Band depends on h_dagger; with
+        // mid-only hw table, all bands solve at factor≤1.0 so cheapest
+        // $/vCPU·hr (lo-band spot) wins.
+        assert_eq!(ns.get("karpenter.sh/capacity-type").unwrap(), "spot");
+        assert_eq!(ns.get("rio.build/hw-band").unwrap(), "lo");
+    }
+
+    #[test]
+    fn spot_infeasible_when_p_gt_half() {
+        // λ huge ⇒ p(cap_c) > 0.5 for every band ⇒ spot rejected,
+        // on-demand survives. Fix temp=0 (greedy) so the pick is
+        // deterministic.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let mut lambda = HashMap::new();
+        for b in Band::ALL {
+            lambda.insert(
+                b,
+                super::super::cost::RatioEma {
+                    numerator: 1.0,
+                    denominator: 1.0, // λ=1/s — absurd
+                    updated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                },
+            );
+        }
+        let cost = CostTable::from_parts(HashMap::new(), lambda);
+        let mut rng = StdRng::seed_from_u64(0);
+        let r = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_mid_only(),
+            &cost,
+            &ceil(),
+            &IceBackoff::default(),
+            0.0,
+            &mut rng,
+        );
+        let SolveResult::Feasible { node_selector, .. } = r else {
+            panic!()
+        };
+        assert_eq!(
+            node_selector.unwrap().get("karpenter.sh/capacity-type"),
+            Some(&"on-demand".to_string()),
+            "spot must be rejected when p>0.5"
+        );
+    }
+
+    #[test]
+    fn h_dagger_is_per_pname_effective_slowest() {
+        // Two mid-band classes: ebs factor=1.0, nvme factor=1.2.
+        // With no bias, h† = ebs (slowest = lowest factor). With this
+        // pname biased 1.5× SLOWER on nvme (bias>1 = under-performs
+        // the bench), nvme's effective factor 1.2/1.5=0.8 < ebs's
+        // 1.0/1.0 → h† flips to nvme.
+        let hw = hw_mid_only();
+        let no_bias = HashMap::new();
+        let (h, f) = hw.h_dagger("foo", Band::Mid, &no_bias);
+        assert_eq!(h, "aws-7-ebs");
+        assert!((f - 1.0).abs() < 1e-9);
+
+        let mut bias = HashMap::new();
+        bias.insert("aws-7-nvme".into(), 1.5);
+        let (h, f) = hw.h_dagger("foo", Band::Mid, &bias);
+        assert_eq!(h, "aws-7-nvme", "per-pname bias flips effective-slowest");
+        assert!((f - 0.8).abs() < 1e-9);
+
+        // Band with no hw_classes → ("", 1.0).
+        let (h, f) = hw.h_dagger("foo", Band::Hi, &no_bias);
+        assert_eq!(h, "");
+        assert!((f - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn softmax_spreads_at_temp03() {
+        // Two candidates at 1.0 vs 1.5 cost. At temp=0.3, the cheap
+        // one should win clearly (>70%) but not always (<98%).
+        let cands = [
+            cand(Band::Lo, Cap::Spot, 1.0),
+            cand(Band::Hi, Cap::OnDemand, 1.5),
+        ];
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut cheap = 0;
+        for _ in 0..10_000 {
+            if softmax_pick(&cands, 0.3, &mut rng).unwrap().e_cost == 1.0 {
+                cheap += 1;
+            }
+        }
+        let frac = cheap as f64 / 10_000.0;
+        assert!(
+            (0.70..0.98).contains(&frac),
+            "temp=0.3 should spread but favor cheapest; got {frac}"
+        );
+        // temp=0 → greedy: always cheapest.
+        for _ in 0..100 {
+            assert_eq!(softmax_pick(&cands, 0.0, &mut rng).unwrap().e_cost, 1.0);
+        }
+        // Single candidate → that one.
+        assert_eq!(
+            softmax_pick(&cands[..1], 0.3, &mut rng).unwrap().band,
+            Band::Lo
+        );
+        assert!(softmax_pick(&[], 0.3, &mut rng).is_none());
+    }
+
+    #[test]
+    fn ice_backoff_excludes_cell() {
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let ice = IceBackoff::default();
+        // Mark every spot cell infeasible.
+        for b in Band::ALL {
+            ice.mark(b, Cap::Spot);
+        }
+        let mut rng = StdRng::seed_from_u64(0);
+        let r = solve_full(
+            &fit,
+            &[t("normal", 1200.0)],
+            &hw_mid_only(),
+            &CostTable::default(),
+            &ceil(),
+            &ice,
+            0.0,
+            &mut rng,
+        );
+        let SolveResult::Feasible { node_selector, .. } = r else {
+            panic!()
+        };
+        assert_eq!(
+            node_selector.unwrap().get("karpenter.sh/capacity-type"),
+            Some(&"on-demand".to_string())
+        );
+    }
+
     #[test]
     fn intent_for_fitted_uses_solve() {
         // r[verify sched.sla.intent-from-solve]

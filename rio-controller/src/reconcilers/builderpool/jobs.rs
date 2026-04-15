@@ -514,6 +514,17 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, i: &SpawnIntent) {
         ..Default::default()
     });
 
+    // ADR-023 phase-13: per-(band, cap) targeting. Merge into the
+    // existing nodeSelector (which already carries kubernetes.io/arch
+    // from `build_executor_pod_spec`); intent keys win on collision —
+    // the scheduler's solve is authoritative for hw-band/capacity-type.
+    if !i.node_selector.is_empty() {
+        let ns = pod_spec.node_selector.get_or_insert_with(BTreeMap::new);
+        for (k, v) in &i.node_selector {
+            ns.insert(k.clone(), v.clone());
+        }
+    }
+
     // Overlay emptyDir sizeLimit = disk_bytes × headroom. The kubelet
     // evicts on overshoot; headroom keeps a slow-EMA estimate from
     // killing a build that's slightly over its predicted disk peak.
@@ -780,6 +791,11 @@ mod tests {
             cores: 8,
             mem_bytes: 16 * GI,
             disk_bytes: 40 * GI,
+            node_selector: [
+                ("rio.build/hw-band".into(), "mid".into()),
+                ("karpenter.sh/capacity-type".into(), "spot".into()),
+            ]
+            .into(),
         };
         let job = build_job(
             &wp,

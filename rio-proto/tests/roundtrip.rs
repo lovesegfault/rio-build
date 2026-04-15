@@ -52,6 +52,7 @@ fn sizeclass_status_proto_roundtrip() {
                     cores: 8,
                     mem_bytes: 17_179_869_184,
                     disk_bytes: 42_949_672_960,
+                    node_selector: [("rio.build/hw-band".into(), "mid".into())].into(),
                 }],
             },
             SizeClassStatus {

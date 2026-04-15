@@ -240,6 +240,7 @@ impl CostTable {
     /// retries under preemption probability `p = 1 - e^{-λT}`.
     /// Memory contributes via the same per-vCPU-hr proxy (memory
     /// scales with cores in the c/m/r families the NodePools admit).
+    #[allow(clippy::too_many_arguments)]
     pub fn expected_cost(
         &self,
         band: Band,
@@ -263,8 +264,9 @@ impl CostTable {
     /// Load persisted EMAs from `sla_ema_state`. Called once at
     /// startup so a scheduler restart doesn't re-warm.
     pub async fn load(db: &SchedulerDb) -> anyhow::Result<Self> {
+        type Row = (String, f64, Option<f64>, Option<f64>, f64);
         let mut t = Self::default();
-        let rows: Vec<(String, f64, Option<f64>, Option<f64>, f64)> = sqlx::query_as(
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT key, value, numerator, denominator, \
              EXTRACT(EPOCH FROM updated_at) FROM sla_ema_state",
         )

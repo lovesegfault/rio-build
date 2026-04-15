@@ -410,6 +410,7 @@ impl DagActor {
                                 cores,
                                 mem_bytes,
                                 disk_bytes,
+                                node_selector: Default::default(),
                             });
                     }
                 }
