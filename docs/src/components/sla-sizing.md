@@ -4,6 +4,8 @@ See ADR-023 for design rationale. This document is the normative spec.
 
 r[sched.sla.tier-envelope]
 
+r[sched.sla.solve-per-band-cap]
+
 r[sched.sla.model-key-tenant-scoped]
 
 r[sched.sla.fit-nnls]
