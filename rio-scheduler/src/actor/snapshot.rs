@@ -391,7 +391,7 @@ impl DagActor {
                     // gates have no symmetric spawn-side. Static mode ⇒
                     // empty intents ⇒ exactly pre-ADR-023 behavior.
                     if self.sla_config.is_some() {
-                        let (cores, mem_bytes, disk_bytes) =
+                        let (cores, mem_bytes, disk_bytes, _) =
                             self.solve_intent_for(state.pname.as_deref(), state);
                         snapshots[i]
                             .spawn_intents
@@ -446,8 +446,11 @@ impl DagActor {
         &self,
         pname: Option<&str>,
         state: &crate::state::DerivationState,
-    ) -> (u32, u64, u64) {
-        use crate::sla::{solve, types::ModelKey};
+    ) -> (u32, u64, u64, Option<crate::sla::solve::SlaPrediction>) {
+        use crate::sla::{
+            solve,
+            types::{ModelKey, RawCores},
+        };
         // Tenant: same attribution as completion.rs's write_build_sample
         // — first interested build's tenant_id, stringified, "" on
         // None. The two MUST agree or the cache key never matches the
@@ -470,7 +473,7 @@ impl DagActor {
         let override_ = key
             .as_ref()
             .and_then(|k| self.sla_estimator.resolved_override(k));
-        solve::intent_for(
+        let (cores, mem, disk) = solve::intent_for(
             fit.as_ref(),
             &solve::DrvHints {
                 enable_parallel_building: state.enable_parallel_building,
@@ -481,7 +484,32 @@ impl DagActor {
             self.sla_config.as_ref(),
             &self.sla_tiers,
             &self.sla_ceilings,
-        )
+        );
+        // Dispatch-time prediction snapshot for completion's
+        // actual-vs-predicted scoring. Only meaningful when there's a
+        // fitted curve to evaluate `T(c)` against — cold-start probes
+        // and forced-cores overrides leave `wall_secs=None` so the
+        // prediction-ratio histogram isn't poisoned by guesses.
+        let predicted = fit.as_ref().map(|f| {
+            let solved = solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings);
+            let (tier, tier_p90) = match &solved {
+                solve::SolveResult::Feasible { tier, .. } => (
+                    Some(tier.clone()),
+                    self.sla_tiers
+                        .iter()
+                        .find(|t| t.name == *tier)
+                        .and_then(|t| t.p90),
+                ),
+                solve::SolveResult::BestEffort { .. } => (None, None),
+            };
+            solve::SlaPrediction {
+                wall_secs: Some(f.fit.t_at(RawCores(f64::from(cores))).0),
+                mem_bytes: mem,
+                tier,
+                tier_p90,
+            }
+        });
+        (cores, mem, disk, predicted)
     }
 
     /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`

@@ -69,6 +69,28 @@ impl SolveResult {
     }
 }
 
+/// Dispatch-time prediction snapshot. Stored on
+/// [`SchedHint::sla_predicted`] when the derivation is dispatched so
+/// completion can score actual-vs-predicted without re-reading the
+/// estimator (which may have refit on a different curve by then).
+///
+/// [`SchedHint::sla_predicted`]: crate::state::SchedHint::sla_predicted
+#[derive(Debug, Clone, Default)]
+pub struct SlaPrediction {
+    /// `T(c)` at the dispatched core count. `None` for cold-start /
+    /// override / drv-hint paths where there is no fitted curve.
+    pub wall_secs: Option<f64>,
+    /// `M(c)` (post-headroom) the controller was asked to reserve.
+    pub mem_bytes: u64,
+    /// Tier the solve picked (`SolveResult::Feasible.tier`). `None` for
+    /// `BestEffort` / probe / override.
+    pub tier: Option<String>,
+    /// p90 target of `tier` at dispatch time. Captured here so
+    /// completion's hit/miss check is robust to the tier ladder being
+    /// reconfigured mid-build.
+    pub tier_p90: Option<f64>,
+}
+
 /// Derivation-declared sizing hints (from drv.env / drv.system-features).
 #[derive(Debug, Default, Clone)]
 pub struct DrvHints {

@@ -1450,6 +1450,22 @@ impl DagActor {
                     if let Err(e) = self.db.write_build_sample(&row).await {
                         warn!(?e, %pname, system = %state.system, "write_build_sample failed");
                     }
+                    // ADR-023 phase-7: actual-vs-predicted scoring.
+                    // `sla_predicted` was snapshotted at dispatch time
+                    // (the SAME `solve_intent_for` call that produced
+                    // `est_memory_bytes`), so the ratio reflects the
+                    // curve we sized against, not whatever the
+                    // estimator has refit to since. None on cold-
+                    // start / FOD / recovery — the histogram only
+                    // sees model-backed dispatches.
+                    if let Some(pred) = &state.sched.sla_predicted {
+                        let score = crate::sla::metrics::score_completion(
+                            duration_secs,
+                            peak_memory_bytes,
+                            pred,
+                        );
+                        crate::sla::metrics::emit_completion_score(&score);
+                    }
                 }
 
                 // Misclassification: routed to "small" but ran like

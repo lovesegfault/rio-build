@@ -424,6 +424,13 @@ pub struct SchedHint {
     /// cold start (no `build_history` row, no `pname`, or no memory
     /// sample); filter treats `None` as "any worker fits".
     pub est_memory_bytes: Option<u64>,
+    /// ADR-023 phase-7: dispatch-time SLA prediction snapshot. Set
+    /// alongside `est_memory_bytes` (same `solve_intent_for` call);
+    /// `record_build_history` reads it back to emit
+    /// `rio_scheduler_sla_prediction_ratio` / `_envelope_result_total`
+    /// without re-consulting the estimator (which may have refit on a
+    /// different curve by then). In-memory only — zero on recovery.
+    pub sla_predicted: Option<crate::sla::solve::SlaPrediction>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;
     /// stale is fine (a build taking longer than estimated doesn't

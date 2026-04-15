@@ -267,7 +267,7 @@ impl DagActor {
         // guards aren't `Send`; the await point would be a
         // compile error anyway, but keeping the scope tight
         // is defensive.
-        let (target_class, est_memory_bytes, is_fixed_output, system) = {
+        let (target_class, est_memory_bytes, sla_predicted, is_fixed_output, system) = {
             let pname = state.pname.as_deref();
             let system = &state.system;
             let classes = self.sizing.size_classes.read();
@@ -300,15 +300,17 @@ impl DagActor {
             // when `w.last_resources` is still None from the cgroup-
             // poll-vs-first-heartbeat race). The pre-ADR-023 path
             // (`bucketed_estimate`) returned None on cold start.
-            let est_memory_bytes =
+            let (est_memory_bytes, sla_predicted) =
                 if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
-                    None
+                    (None, None)
                 } else {
-                    Some(self.solve_intent_for(pname, state).1)
+                    let (_, mem, _, pred) = self.solve_intent_for(pname, state);
+                    (Some(mem), pred)
                 };
             (
                 target_class,
                 est_memory_bytes,
+                sla_predicted,
                 state.is_fixed_output,
                 system.clone(),
             )
@@ -320,6 +322,11 @@ impl DagActor {
         // dispatch pass — picks up estimator Tick updates.
         if let Some(state) = self.dag.node_mut(&drv_hash) {
             state.sched.est_memory_bytes = est_memory_bytes;
+            // ADR-023 phase-7: capture the dispatch-time prediction so
+            // completion can score actual-vs-predicted on the SAME
+            // curve we sized against (the estimator may have refit by
+            // then).
+            state.sched.sla_predicted = sla_predicted;
         }
 
         // I-067: a Ready FOD whose output already exists in
