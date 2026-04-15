@@ -588,6 +588,28 @@ pub const M_039: () = ();
 /// non-expired rows once per tick, then resolves in-memory.
 pub const M_040: () = ();
 
+/// `migrations/041_hw_perf.sql`
+///
+/// ADR-023 §Hardware heterogeneity, phase-10 normalization. Three objects:
+///
+/// - `hw_perf_samples` — append-only: each builder pod runs a ~5s
+///   single-threaded CRC32 microbench at init and inserts `(hw_class,
+///   pod_id, factor)` where `factor = REF_TIME / measured`. `pod_id` is
+///   the executor_id (k8s pod name) so the view's `count(DISTINCT
+///   pod_id)` floor isn't satisfied by one pod retrying.
+/// - `interrupt_samples` — append-only spot-interrupt / preemption
+///   telemetry per hw_class (phase-10.5 capacity-type bias; written by
+///   the controller's disruption watcher, read by the SLA solve).
+/// - `hw_perf_factors` view — per-hw_class median factor, gated on ≥3
+///   distinct pods. The scheduler's `HwTable::load` reads this to map
+///   wall-seconds → reference-seconds before fitting T(c). Median (not
+///   mean) so one cold-neighbour outlier doesn't skew the class.
+///
+/// Append-only by design: no UPDATE/DELETE path, no retention sweep.
+/// Volume is bounded by pod churn (one row per pod start), and keeping
+/// the full history lets the view's median converge as the fleet grows.
+pub const M_041: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
