@@ -42,7 +42,7 @@ impl HwTable {
     }
 
     /// Factor for `hw_class`, or 1.0 if unknown / <3 distinct pods.
-    /// Exposed for [`super::ingest::hw_bias`]'s per-(pname, hw_class)
+    /// Exposed for `ingest::hw_bias`'s per-(pname, hw_class)
     /// residual computation.
     pub fn factor(&self, hw_class: &str) -> f64 {
         self.factors.get(hw_class).copied().unwrap_or(1.0)

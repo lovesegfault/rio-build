@@ -44,7 +44,7 @@ pub struct BuildSampleRow {
 }
 
 /// One `sla_overrides` row. ADR-023 phase-6 operator pins. NULL
-/// `system`/`tenant` are wildcards — [`crate::sla::r#override::resolve`]
+/// `system`/`tenant` are wildcards — `sla::override::resolve`
 /// matches most-specific first. `expires_at` is Unix-epoch f64 (same
 /// no-chrono workaround as `BuildSampleRow.completed_at`); `None` =
 /// never expires.

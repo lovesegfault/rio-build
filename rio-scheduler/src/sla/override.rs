@@ -55,7 +55,7 @@ fn specificity(r: &SlaOverrideRow) -> u8 {
 /// ([`SchedulerDb::read_sla_overrides`]); this function does not read
 /// the clock.
 ///
-/// Precedence: highest [`specificity`] wins. Ties (e.g. two
+/// Precedence: highest `specificity` wins. Ties (e.g. two
 /// `pname`-only rows) break on `created_at` — newest wins, so a fresh
 /// `rio-cli sla override` shadows a stale one without the operator
 /// having to `clear` first.
