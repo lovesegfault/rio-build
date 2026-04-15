@@ -68,6 +68,14 @@ impl types::DerivationEvent {
             ..Default::default()
         }
     }
+    pub fn substituting(derivation_path: String, output_paths: Vec<String>) -> Self {
+        Self {
+            derivation_path,
+            kind: types::DerivationEventKind::Substituting as i32,
+            output_paths,
+            ..Default::default()
+        }
+    }
     pub fn failed(
         derivation_path: String,
         error_message: String,

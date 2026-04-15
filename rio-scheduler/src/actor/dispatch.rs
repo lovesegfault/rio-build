@@ -4,6 +4,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use uuid::Uuid;
+
 use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
@@ -511,9 +513,10 @@ impl DagActor {
         if candidates.is_empty() {
             return HashSet::new();
         }
-        // Belt under the store-side 4096 cap. The truncated tail has
-        // probed_generation < probe_gen still, so the next inline
-        // dispatch_ready (same gen) advances the window.
+        // Belt under the store-side 4096 cap. The truncated tail keeps
+        // probed_generation < probe_gen, so the per-drv
+        // ready_check_or_spawn fallback (same drain loop) still probes
+        // them — sequentially, but bounded to one FMP each.
         candidates.truncate(super::DISPATCH_PROBE_BATCH_CAP);
         for (h, _) in &candidates {
             if let Some(s) = self.dag.node_mut(h) {
@@ -658,7 +661,13 @@ impl DagActor {
         let Some(weak_tx) = self.self_tx.clone() else {
             return;
         };
-        let mut spawned: Vec<DrvHash> = Vec::with_capacity(candidates.len());
+        struct Spawned {
+            hash: DrvHash,
+            drv_path: String,
+            output_paths: Vec<String>,
+            interested: HashSet<Uuid>,
+        }
+        let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
             let Some(state) = self.dag.node_mut(&drv_hash) else {
                 continue;
@@ -667,6 +676,9 @@ impl DagActor {
                 debug!(%drv_hash, %e, "spawn_substitute: transition rejected; falling through");
                 continue;
             }
+            let drv_path = state.drv_path().to_string();
+            let interested = state.interested_builds.clone();
+            let output_paths = paths.clone();
             let store = store.clone();
             let weak_tx = weak_tx.clone();
             let meta = tenant_meta.clone();
@@ -743,7 +755,12 @@ impl DagActor {
                         .await;
                 }
             });
-            spawned.push(drv_hash);
+            spawned.push(Spawned {
+                hash: drv_hash,
+                drv_path,
+                output_paths,
+                interested,
+            });
         }
         if !spawned.is_empty() {
             debug!(
@@ -752,9 +769,20 @@ impl DagActor {
             );
             metrics::counter!("rio_scheduler_substitute_spawned_total")
                 .increment(spawned.len() as u64);
-            let hashes: Vec<&str> = spawned.iter().map(DrvHash::as_str).collect();
+            let hashes: Vec<&str> = spawned.iter().map(|s| s.hash.as_str()).collect();
             self.persist_status_batch(&hashes, DerivationStatus::Substituting)
                 .await;
+            for s in &spawned {
+                let event = rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent::substituting(
+                        s.drv_path.clone(),
+                        s.output_paths.clone(),
+                    ),
+                );
+                for &build_id in &s.interested {
+                    self.events.emit(build_id, event.clone());
+                }
+            }
         }
     }
 

@@ -170,6 +170,10 @@ struct BuildActivityState {
     /// Per-derivation activity IDs (for `actBuild` start/stop and for
     /// attaching `BuildLogLine`/`SetPhase` results to the right build).
     drv: HashMap<String, u64>,
+    /// Per-derivation `actSubstitute` activity IDs. Started by
+    /// `DerivationEventKind::Substituting`, stopped by `Cached`
+    /// (success) or `Started` (fetch failed → fell through to build).
+    subst: HashMap<String, u64>,
     /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
     /// arrives. `Progress`/`SetExpected` results attach here.
     builds_root: Option<u64>,
@@ -183,6 +187,7 @@ impl Default for BuildActivityState {
     fn default() -> Self {
         Self {
             drv: HashMap::default(),
+            subst: HashMap::default(),
             builds_root: None,
             machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
         }
@@ -236,7 +241,41 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
     drv_event: types::DerivationEvent,
 ) -> Result<(), StreamProcessError> {
     match drv_event.kind() {
+        types::DerivationEventKind::Substituting => {
+            if act.subst.contains_key(&drv_event.derivation_path) {
+                return Ok(());
+            }
+            // actSubstitute fields per upstream
+            // `substitution-goal.cc`: [storePath, substituterUri].
+            // The store picks the upstream — the scheduler doesn't
+            // know which, so the URI is empty (nom omits the
+            // "from <uri>" suffix when fields[1] is empty).
+            let out = drv_event
+                .output_paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| drv_event.derivation_path.clone());
+            let aid = stderr
+                .start_activity(
+                    ActivityType::Substitute,
+                    &format!("substituting '{out}'"),
+                    verbosity::INFO,
+                    act.builds_root.unwrap_or(0),
+                    &[
+                        ResultField::String(out.clone()),
+                        ResultField::String(String::new()),
+                    ],
+                )
+                .await?;
+            act.subst.insert(drv_event.derivation_path.clone(), aid);
+        }
         types::DerivationEventKind::Started => {
+            // A failed substitute fetch reverts to Ready → may later
+            // dispatch as a build. Close the dangling actSubstitute so
+            // nom doesn't show it stuck forever.
+            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            }
             // Re-dispatch (in-connection reassign, or replay after a
             // gateway↔scheduler reconnect) sends Started again for a
             // drv we already track. The existing aid is still valid on
@@ -320,8 +359,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 ))
                 .await?;
         }
-        // Cached / Queued: no activity to start/stop, no STDERR.
-        types::DerivationEventKind::Cached | types::DerivationEventKind::Queued => {}
+        types::DerivationEventKind::Cached => {
+            // Substituting → Cached: close the actSubstitute. Merge-
+            // time cache hits never went Substituting → no aid → no-op.
+            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            }
+        }
+        // Queued: no activity to start/stop, no STDERR.
+        types::DerivationEventKind::Queued => {}
     }
     Ok(())
 }
@@ -1367,4 +1413,134 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_nix::protocol::stderr::{STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+
+    fn ev(kind: types::DerivationEventKind, drv: &str, outs: &[&str]) -> types::DerivationEvent {
+        types::DerivationEvent {
+            derivation_path: drv.into(),
+            kind: kind as i32,
+            output_paths: outs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// Substituting → start_activity(actSubstitute, [out, ""]); Cached →
+    /// stop_activity(same aid). A merge-time Cached (no preceding
+    /// Substituting) writes nothing.
+    #[tokio::test]
+    async fn relay_substituting_then_cached_renders_act_substitute() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo.drv";
+        let out = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-foo";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[out]))
+            .await
+            .unwrap();
+        let aid = *act.subst.get(drv).expect("subst aid tracked");
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[out]))
+            .await
+            .unwrap();
+        assert!(act.subst.is_empty(), "Cached must remove subst aid");
+
+        // Wire: START(Substitute) + fields[out, ""], then STOP(aid).
+        let mut r = std::io::Cursor::new(buf);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
+        let got_aid = wire::read_u64(&mut r).await.unwrap();
+        assert_eq!(got_aid, aid);
+        let _level = wire::read_u64(&mut r).await.unwrap();
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ActivityType::Substitute as u64
+        );
+        let text = wire::read_string(&mut r).await.unwrap();
+        assert!(text.contains(out), "text should name the output path");
+        // fields: 2 strings — [out, ""]
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 1); // type=string
+        assert_eq!(wire::read_string(&mut r).await.unwrap(), out);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 1);
+        assert_eq!(wire::read_string(&mut r).await.unwrap(), "");
+        let _parent = wire::read_u64(&mut r).await.unwrap();
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), aid);
+
+        // Merge-time Cached (no preceding Substituting) writes nothing.
+        let mut buf2 = Vec::new();
+        let mut w2 = &mut buf2;
+        let mut stderr2 = StderrWriter::new(&mut w2);
+        let mut act2 = BuildActivityState::default();
+        relay_derivation_status(&mut stderr2, &mut act2, ev(Cached, drv, &[out]))
+            .await
+            .unwrap();
+        assert!(
+            buf2.is_empty(),
+            "Cached without prior Substituting is silent"
+        );
+    }
+
+    /// A failed substitute fetch reverts to Ready → eventually
+    /// dispatches as a build → Started must close the dangling
+    /// actSubstitute before opening actBuild.
+    #[tokio::test]
+    async fn relay_started_after_substituting_stops_subst_first() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/cccccccccccccccccccccccccccccccc-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let subst_aid = *act.subst.get(drv).unwrap();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        assert!(act.subst.is_empty(), "Started must clear subst aid");
+        assert!(act.drv.contains_key(drv), "Started must track build aid");
+
+        // Wire order: START(Substitute), STOP(subst_aid), START(Build).
+        let mut r = std::io::Cursor::new(buf);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
+        let _ = wire::read_u64(&mut r).await.unwrap(); // aid
+        let _ = wire::read_u64(&mut r).await.unwrap(); // level
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ActivityType::Substitute as u64
+        );
+        // skip text + fields(2 strings) + parent
+        let _ = wire::read_string(&mut r).await.unwrap();
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
+        for _ in 0..2 {
+            let _ = wire::read_u64(&mut r).await.unwrap();
+            let _ = wire::read_string(&mut r).await.unwrap();
+        }
+        let _ = wire::read_u64(&mut r).await.unwrap();
+
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), subst_aid);
+
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
+        let _ = wire::read_u64(&mut r).await.unwrap();
+        let _ = wire::read_u64(&mut r).await.unwrap();
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ActivityType::Build as u64
+        );
+    }
 }

@@ -101,7 +101,7 @@ message DerivationEvent {
   string derivation_path = 1;
   DerivationEventKind kind = 2;
   string executor_id = 3;                   // STARTED only
-  repeated string output_paths = 4;         // COMPLETED, CACHED only
+  repeated string output_paths = 4;         // COMPLETED, CACHED, SUBSTITUTING only
   string error_message = 5;                 // FAILED only
   BuildResultStatus failure_status = 6;     // FAILED only (types.proto)
 }
@@ -112,6 +112,9 @@ enum DerivationEventKind {
   DERIVATION_EVENT_KIND_COMPLETED = 2;
   DERIVATION_EVENT_KIND_CACHED = 3;
   DERIVATION_EVENT_KIND_FAILED = 4;
+  // Detached upstream substitute fetch spawned (r[sched.substitute.detached]).
+  // Gateway renders as actSubstitute; pairs with CACHED on success.
+  DERIVATION_EVENT_KIND_SUBSTITUTING = 5;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

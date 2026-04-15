@@ -1178,8 +1178,9 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
     n.is_fixed_output = is_fod;
     n.system = "aarch64-linux".into();
     n.expected_output_paths = vec![out.clone()];
+    let drv_path = n.drv_path.clone();
     let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    let mut ev_rx = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
     barrier(&handle).await;
     // Merge-time saw nothing (substitutable not yet seeded) → node
     // Ready/deferred, stamped probed_generation=1. Seed; the next
@@ -1202,6 +1203,30 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
         qpi.contains(&out),
         "dispatch-time eager-fetch must call QueryPathInfo for the substitutable path; \
          qpi_calls={qpi:?}"
+    );
+
+    // Gateway visibility: both Substituting and Cached events must
+    // reach interested builds (order is structurally guaranteed by
+    // the actor — emit-after-transition + mailbox-ordered
+    // SubstituteComplete — so this asserts presence only).
+    use rio_proto::types::{DerivationEventKind, build_event::Event};
+    let (mut got_substituting, mut got_cached) = (None, None);
+    while let Ok(be) = ev_rx.try_recv() {
+        if let Some(Event::Derivation(d)) = be.event
+            && d.derivation_path == drv_path
+        {
+            match d.kind() {
+                DerivationEventKind::Substituting => got_substituting = Some(d.clone()),
+                DerivationEventKind::Cached => got_cached = Some(d.clone()),
+                _ => {}
+            }
+        }
+    }
+    let s = got_substituting.expect("Substituting event must be emitted to interested builds");
+    assert_eq!(s.output_paths, vec![out.clone()], "carries output paths");
+    assert!(
+        got_cached.is_some(),
+        "Cached event (existing) must still arrive after substitution completes"
     );
     Ok(())
 }
