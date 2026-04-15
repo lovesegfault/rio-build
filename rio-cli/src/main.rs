@@ -301,8 +301,7 @@ enum Cmd {
         cmd: bps::BpsCmd,
     },
     /// ADR-023 SLA-driven sizing: per-pname overrides, model reset,
-    /// cached-fit status. `override`/`reset`/`status` are live;
-    /// `explain`/`export-corpus`/`import-corpus` are phase-7/11 stubs.
+    /// cached-fit status, candidate-table explain, seed-corpus export/import.
     Sla {
         #[command(subcommand)]
         cmd: sla::SlaCmd,
