@@ -610,6 +610,32 @@ pub const M_040: () = ();
 /// the full history lets the view's median converge as the fleet grows.
 pub const M_041: () = ();
 
+/// `migrations/042_hw_cost.sql`
+///
+/// ADR-023 phase-13 hw-band + capacity-type targeting. Three objects:
+///
+/// - `hw_cost_factors` — cluster-local price snapshot. The lease-gated
+///   spot-price poller writes EMA-smoothed `$/vCPU·hr` per `(region,
+///   az, instance_type, capacity_type)`; `solve_full` joins to compute
+///   `E[cost]` per `(band, cap)` candidate. PK is the full quad — one
+///   row per spot-market cell, upserted each poll.
+/// - `sla_ema_state` — generic decayed-EMA persistence so the poller
+///   and the λ[h] interrupt-rate estimator survive scheduler restart
+///   without re-warming. `key` is caller-namespaced
+///   (`spot:{type}:{az}` / `lambda:{hw_class}`); `numerator`/
+///   `denominator` carry the running decayed sums when the EMA is a
+///   ratio (interrupts ÷ node-seconds).
+/// - `builds.attempted_candidates JSONB` — ICE-backoff ladder
+///   provenance: which `(band, cap)` pairs were tried before the
+///   dispatched one. Forensics-only; the in-process `IceBackoff` map
+///   is the live state.
+///
+/// `hw_cost_factors` is cluster-local (one scheduler deployment per
+/// region) so `region`/`az` are denormalized into the key rather than
+/// joined from a fleet table — the multi-region forward-compat work
+/// (ADR-019) isn't load-bearing yet.
+pub const M_042: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
