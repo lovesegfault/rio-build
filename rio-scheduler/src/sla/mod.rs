@@ -9,6 +9,7 @@ use crate::db::{SchedulerDb, SlaOverrideRow};
 
 pub mod bootstrap;
 pub mod config;
+pub mod dip;
 pub mod explain;
 pub mod explore;
 pub mod fit;

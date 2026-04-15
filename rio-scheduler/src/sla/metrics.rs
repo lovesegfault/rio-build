@@ -47,6 +47,12 @@ pub fn describe_all() {
         "M(c) Koenker-Machado pseudo-R1<0.7 fallback to independent \
          p90 (labeled tenant)"
     );
+    describe_counter!(
+        "rio_scheduler_sla_residual_multimodal_total",
+        "Hartigan dip test rejected unimodality (p<0.05) on a key's \
+         log-residuals (labeled tenant). The single-curve T(c) model \
+         is wrong — likely two workloads sharing a pname."
+    );
     describe_gauge!(
         "rio_scheduler_sla_prior_divergence",
         "fleet prior hit clamp: per-tenant fit diverged from the \
@@ -66,6 +72,11 @@ pub fn suspicious_scaling(tenant: &str) {
 
 pub fn mem_fit_weak(tenant: &str) {
     counter!("rio_scheduler_sla_mem_fit_weak_total", "tenant" => tenant.to_string()).increment(1);
+}
+
+pub fn residual_multimodal(tenant: &str) {
+    counter!("rio_scheduler_sla_residual_multimodal_total", "tenant" => tenant.to_string())
+        .increment(1);
 }
 
 pub fn prediction_ratio(dim: &'static str, ratio: f64) {

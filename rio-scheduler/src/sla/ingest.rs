@@ -146,7 +146,7 @@ pub fn refit(
     let disk_p90 =
         (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64));
 
-    let log_residuals = if matches!(fit, DurationFit::Probe) {
+    let log_residuals: Vec<f64> = if matches!(fit, DurationFit::Probe) {
         Vec::new()
     } else {
         cs_f.iter()
@@ -154,6 +154,14 @@ pub fn refit(
             .map(|(&c, &t)| (t / fit.t_at(RawCores(c)).0).ln())
             .collect()
     };
+    // Hartigan dip on the residual distribution. Multimodal ⇔ the
+    // single-curve model is structurally wrong for this key (two
+    // workloads sharing a pname). Emitted per-refit, not per-sample —
+    // it's a property of the ring as a whole. ≤32 points → O(n²) dip
+    // is <10µs; the metric is the operator signal, not a hard gate.
+    if super::dip::is_multimodal(&log_residuals) {
+        super::metrics::residual_multimodal(&key.tenant);
+    }
 
     // r[impl sched.sla.reassign-schmitt]
     // Bootstrap CI is the expensive bit (~500 NNLS refits). Debounce so a

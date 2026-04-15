@@ -287,8 +287,8 @@ pub(crate) async fn run(
             }
             println!();
             println!(
-                "{:<12} {:>8} {:>10} {:<16} {}",
-                "TIER", "C*", "MEM", "CONSTRAINT", "FEASIBLE"
+                "{:<12} {:>8} {:>10} {:<16} FEASIBLE",
+                "TIER", "C*", "MEM", "CONSTRAINT"
             );
             for c in &resp.candidates {
                 println!(
