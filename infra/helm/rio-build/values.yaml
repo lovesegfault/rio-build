@@ -416,13 +416,14 @@ gateway:
   nlbDeregisterSecs: 30
   drainGraceSecs: 6       # readinessProbe.periodSeconds (5) + 1
   # sessionDrainSecs bounds how long a rollout waits on in-flight
-  # `nix-store --realise` sessions. 600s covers typical rsb workloads
-  # (qa medium-shallow-2x ≈ 6min). Builds longer than this still get
-  # cut, but the gateway sends CancelBuild before exit so the
-  # scheduler hears it (vs. waiting for its own session-timeout). The
-  # surge-first strategy means the new pod is already serving; cost of
-  # a long drain is only the old pod's resources, not availability.
-  sessionDrainSecs: 600
+  # `nix-store --realise` sessions. SLA: deploys may interrupt builds
+  # running >1h on the evicted gateway replica — covers the `large`
+  # size-class cutoff (1800s) with margin. Builds past this still get
+  # CancelBuild before exit so the scheduler hears it (vs. waiting
+  # for its own session-timeout). Surge-first means the new pod is
+  # already serving; cost of a long drain is only the old pod's
+  # resources, not availability.
+  sessionDrainSecs: 3600
   service:
     type: LoadBalancer
     # NO AWS LB annotations here — base is cloud-agnostic. Set via
@@ -685,6 +686,17 @@ karpenter:
           values: [on-demand]
       limits: {cpu: 1500}
       consolidateAfter: 5m
+      # Control-plane pods are connection-stateful (SSH sessions, gRPC
+      # streams). Karpenter's default 10% Drifted budget evicted them
+      # mid-session on every AMI change despite PDB minAvailable:1.
+      # Budget=0 means rio-general nodes stay Drifted=True until the
+      # operator runs `xtask k8s rotate-general` during a quiet
+      # window. Builder/fetcher pools keep the default 10% (builders
+      # carry karpenter.sh/do-not-disrupt per I-126, so Karpenter
+      # waits for the build to finish anyway).
+      budgets:
+        - nodes: "0"
+          reasons: [Drifted]
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-dashboard (Cilium Gateway API)

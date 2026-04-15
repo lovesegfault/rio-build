@@ -9,7 +9,7 @@ use crate::{sh, tofu, ui};
 
 pub mod ami;
 mod bootstrap;
-mod deploy;
+pub(super) mod deploy;
 mod destroy;
 mod push;
 // pub so k3s/smoke.rs can reuse the provider-agnostic chaos helpers

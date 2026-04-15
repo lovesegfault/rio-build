@@ -602,6 +602,14 @@ process exit Drops the proto tasks mid-flight and the scheduler never
 hears `CancelBuild`. `terminationGracePeriodSeconds` in helm must be ≥
 `drain_grace_secs + session_drain_secs + CANCEL_GRACE` + slack.
 
+The deployed `session_drain_secs` (3600 s) is the operator SLA: a deploy
+may interrupt builds running >1 h on the evicted gateway replica.
+Karpenter is held off the control-plane NodePool entirely
+(`disruption.budgets: nodes=0, reasons=[Drifted]` on `rio-general`), so
+AMI drift never auto-evicts gateway pods; the operator runs `cargo xtask
+k8s rotate-general` during a quiet window to roll those nodes onto a new
+AMI under the same 1 h drain budget.
+
 ## STDERR Message Types
 
 r[gw.stderr.message-types]

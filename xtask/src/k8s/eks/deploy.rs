@@ -366,17 +366,28 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     .await?;
 
     if opts.wait_drift {
-        wait_drift_settled(&client).await?;
+        wait_drift_settled(&client, DRIFT_SKIP_NODEPOOLS).await?;
     }
     Ok(())
 }
+
+/// NodePools whose NodeClaims `--wait-drift` ignores. `rio-general`
+/// has `disruption.budgets: [{nodes:"0", reasons:[Drifted]}]` so its
+/// claims stay `Drifted=True` by design until `xtask k8s
+/// rotate-general` — waiting on them would block forever.
+pub(crate) const DRIFT_SKIP_NODEPOOLS: &[&str] = &["rio-general"];
 
 /// Poll until no Karpenter NodeClaim has `Drifted=True`. An AMI change
 /// drifts every Karpenter node; the disruption controller replaces them
 /// at the NodePool's budget rate. Returning early means subsequent
 /// builds may be evicted mid-run. 30min covers ~10 sequential
 /// replacements at the default `budgets:10%` × ~2-3min each.
-async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
+///
+/// `skip_pools`: NodePools to exclude from the wait — see
+/// [`DRIFT_SKIP_NODEPOOLS`]. Pass `&[]` to wait on all pools (used by
+/// `rotate-general` after deleting the held-back claims).
+pub(crate) async fn wait_drift_settled(client: &kube::Client, skip_pools: &[&str]) -> Result<()> {
+    let skip: Vec<String> = skip_pools.iter().map(|s| s.to_string()).collect();
     let api = status::nodeclaim_api(client);
     ui::poll(
         "karpenter drift settled",
@@ -384,6 +395,7 @@ async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
         120,
         move || {
             let api = api.clone();
+            let skip = skip.clone();
             async move {
                 // Right after CRD apply the apiserver returns 429
                 // "storage is (re)initializing" for a few seconds while
@@ -399,6 +411,13 @@ async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
                 };
                 let drifted: Vec<String> = claims
                     .into_iter()
+                    .filter(|nc| {
+                        !nc.metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("karpenter.sh/nodepool"))
+                            .is_some_and(|p| skip.iter().any(|s| s == p))
+                    })
                     .filter(|nc| {
                         nc.data
                             .pointer("/status/conditions")
@@ -426,4 +445,29 @@ async fn wait_drift_settled(client: &kube::Client) -> Result<()> {
     )
     .await
     .context("timed out waiting for Karpenter drift to settle (--wait-drift)")
+}
+
+/// Delete `rio-general` NodeClaims so Karpenter re-provisions them on
+/// the current AMI, then wait for drift to settle (including
+/// rio-general). See [`DRIFT_SKIP_NODEPOOLS`] for why this is manual.
+pub async fn rotate_general() -> Result<()> {
+    let client = kube::client().await?;
+    let api = status::nodeclaim_api(&client);
+    let lp = ::kube::api::ListParams::default().labels("karpenter.sh/nodepool=rio-general");
+    let claims = api.list(&lp).await?;
+    if claims.items.is_empty() {
+        info!("no rio-general NodeClaims found; nothing to rotate");
+        return Ok(());
+    }
+    for nc in &claims.items {
+        let name = nc.metadata.name.as_deref().unwrap_or("?");
+        info!("deleting NodeClaim {name}");
+        api.delete(name, &Default::default()).await?;
+    }
+    info!(
+        "rio-general nodes rotating ({} claims); gateway sessions on \
+         draining nodes have up to sessionDrainSecs (1h) to finish",
+        claims.items.len()
+    );
+    wait_drift_settled(&client, &[]).await
 }

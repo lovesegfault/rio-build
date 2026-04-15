@@ -330,6 +330,15 @@ pub enum K8sCmd {
         #[arg(long)]
         restart: bool,
     },
+    /// Rotate `rio-general` Karpenter nodes onto the current AMI.
+    /// EKS-only. The rio-general NodePool has `budgets:0/Drifted`, so
+    /// AMI changes leave its NodeClaims at `Drifted=True` indefinitely
+    /// (control-plane pods are connection-stateful — auto-disruption
+    /// would cut SSH sessions). This deletes those NodeClaims so
+    /// Karpenter re-provisions on the new AMI, then waits for drift
+    /// to settle. Run during a quiet window: gateway sessions on the
+    /// drained nodes have up to `sessionDrainSecs` (1h) to finish.
+    RotateGeneral,
 }
 
 #[derive(Subcommand)]
@@ -462,6 +471,12 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                     no_dry_run,
                 } => eks::ami::gc(older_than_days, !no_dry_run).await,
             }
+        }
+        K8sCmd::RotateGeneral => {
+            if !matches!(kind, ProviderKind::Eks) {
+                bail!("`rotate-general` is EKS-only (Karpenter NodeClaims); pass -p eks");
+            }
+            eks::deploy::rotate_general().await
         }
     }
 }

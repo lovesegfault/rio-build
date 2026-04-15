@@ -123,5 +123,9 @@ spec:
     # build. Metal pools override shorter (expensive idle).
     consolidationPolicy: WhenEmpty
     consolidateAfter: {{ .consolidateAfter | default "10m" }}
+    {{- with .budgets }}
+    budgets:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 {{- end }}
 {{- end }}
