@@ -647,6 +647,74 @@ karpenter:
       limits: {cpu: 10000}
       consolidateAfter: 30s
 
+    # ADR-023 phase-10: instance-store NVMe builders. rio-nvme
+    # NodeClass sets instanceStorePolicy=RAID0 (Karpenter mdadm-stripes
+    # all NVMe → /dev/md0); the AMI's rio-nvme-mount.service mkfs.xfs +
+    # mounts it at /var/lib/kubelet -o prjquota. rio.build/storage:
+    # nvme feeds NodeLabelCache → hw_class = "*-*-nvme" so the SLA
+    # model's hw_bias separates ebs-throttled from nvme-unthrottled
+    # samples. Two pools (per-arch) so I-098's per-pod kubernetes.io/
+    # arch nodeSelector matches without a runtime requirement merge.
+    - name: rio-builder-nvme-x86
+      sharedBudget: true
+      weight: 50
+      nodeClass: rio-nvme
+      labels:
+        rio.build/node-role: builder
+        rio.build/storage: nvme
+      taints:
+        - key: rio.build/builder
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+        - key: karpenter.k8s.aws/instance-local-nvme
+          operator: Gt
+          values: ["0"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 10000}
+      consolidateAfter: 10m
+
+    - name: rio-builder-nvme-aarch64
+      sharedBudget: true
+      weight: 50
+      nodeClass: rio-nvme
+      labels:
+        rio.build/node-role: builder
+        rio.build/storage: nvme
+      taints:
+        - key: rio.build/builder
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+        - key: karpenter.k8s.aws/instance-local-nvme
+          operator: Gt
+          values: ["0"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [arm64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 10000}
+      consolidateAfter: 10m
+
     # r[impl fetcher.node.dedicated]
     #
     # Fetcher: dedicated NodePool with rio.build/fetcher taint. Keeps

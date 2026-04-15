@@ -29,7 +29,7 @@
 # for arm64 (Graviton .metal requires UEFI). Spec is otherwise identical
 # to rio-default; only the rio-builder-metal NodePool references rio-metal,
 # virtualized pools stay on rio-default (UEFI/UKI).
-{{- range $nc := list (dict "name" "rio-default" "amd64Boot" "uefi") (dict "name" "rio-metal" "amd64Boot" "legacy-bios") }}
+{{- range $nc := list (dict "name" "rio-default" "amd64Boot" "uefi") (dict "name" "rio-metal" "amd64Boot" "legacy-bios") (dict "name" "rio-nvme" "amd64Boot" "uefi" "instanceStorePolicy" "RAID0") }}
 ---
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
@@ -66,6 +66,14 @@ spec:
     httpEndpoint: enabled
     httpTokens: required
     httpPutResponseHopLimit: 2
+  {{- with $nc.instanceStorePolicy }}
+  # ADR-023 phase-10: rio-nvme — Karpenter mdadm-RAID0s all instance-
+  # store NVMe devices into /dev/md0. The AMI's rio-nvme-mount.service
+  # mounts it at /var/lib/kubelet with prjquota so per-pod ephemeral-
+  # storage limits are enforced via XFS project quotas (kubelet's
+  # default du-walk is unusable at NVMe write rates).
+  instanceStorePolicy: {{ . }}
+  {{- end }}
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:

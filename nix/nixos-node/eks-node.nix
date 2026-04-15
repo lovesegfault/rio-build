@@ -310,6 +310,50 @@ in
           };
         };
 
+        # ── rio-nvme-mount: oneshot, before kubelet ──────────────────
+        # ADR-023 phase-10: rio-nvme EC2NodeClass sets
+        # instanceStorePolicy=RAID0 → Karpenter's userData has nodeadm
+        # mdadm-stripe all instance-store NVMe into /dev/md0. THIS unit
+        # mkfs.xfs (instance store is ephemeral — fresh fs every boot)
+        # and mounts at /var/lib/kubelet with prjquota so kubelet's
+        # per-pod ephemeral-storage limit is enforced via XFS project
+        # quotas (the default du-walk is unusable at NVMe write rates).
+        #
+        # ConditionPathExists gates on /dev/md0: ebs-only nodes (rio-
+        # default NodeClass) skip cleanly. Baked into the AMI because
+        # nodeadm only consumes the NodeConfig MIME part — there is no
+        # shell userData on this image (ADR-021).
+        rio-nvme-mount = {
+          description = "Mount instance-store NVMe RAID0 at /var/lib/kubelet (prjquota)";
+          wantedBy = [ "multi-user.target" ];
+          before = [ "kubelet.service" ];
+          # nodeadm-init assembles /dev/md0 (instanceStorePolicy=RAID0
+          # → nodeadm's local-disks step). Order-after so the device
+          # exists when ConditionPathExists is evaluated.
+          after = [
+            "nodeadm-init.service"
+            "local-fs.target"
+          ];
+          unitConfig.ConditionPathExists = "/dev/md0";
+          path = [
+            pkgs.xfsprogs
+            pkgs.util-linux
+          ];
+          script = ''
+            set -euo pipefail
+            # Instance store is wiped on stop/terminate → always fresh.
+            # -K: don't TRIM (instance-store NVMe is pre-zeroed; mkfs
+            # discard adds ~30s on multi-TB stripes for nothing).
+            mkfs.xfs -K -f /dev/md0
+            mkdir -p /var/lib/kubelet
+            mount -o prjquota,noatime /dev/md0 /var/lib/kubelet
+          '';
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+        };
+
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
         # `init --skip run --daemon kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
