@@ -93,6 +93,65 @@ spec:
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
 {{- end }}
+{{- /* ADR-023 phase-13: 12 builder NodePools = band × storage × arch.
+       Each carries rio.build/hw-band + rio.build/storage labels and an
+       instance-generation In [...] requirement; each admits both spot
+       AND on-demand (the scheduler's per-(band,cap) solve picks via
+       karpenter.sh/capacity-type nodeSelector on the pod). */ -}}
+{{- range $band := $k.builderBands }}
+{{- range $stor := $k.builderStorages }}
+{{- range $arch := $k.builderArchs }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: rio-builder-{{ $band.name }}-{{ $stor.name }}-{{ $arch.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    rio.build/karpenter-budget: shared
+spec:
+  weight: 50
+  template:
+    metadata:
+      labels:
+        rio.build/node-role: builder
+        rio.build/hw-band: {{ $band.name }}
+        rio.build/storage: {{ $stor.name }}
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: {{ $stor.nodeClass }}
+      taints:
+        - key: rio.build/builder
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: In
+          values: [{{ $band.generation | quote }}]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [{{ $arch.k8s }}]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot, on-demand]
+        {{- if $stor.nvme }}
+        - key: karpenter.k8s.aws/instance-local-nvme
+          operator: Gt
+          values: ["0"]
+        {{- end }}
+  limits:
+    cpu: {{ $k.builderPoolCpuLimit }}
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 10m
+{{- end }}
+{{- end }}
+{{- end }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1

@@ -529,76 +529,39 @@ karpenter:
   dataVolumeIops: 16000
   dataVolumeThroughputMiBps: 1000
 
-  # Five NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
-  # high-weight first, falls through if pod doesn't fit or capacity is
-  # unavailable. BuilderPoolSet creates pools with different resources →
-  # Karpenter bin-packs across the size range the NodePool requirements
-  # allow.
+  # ADR-023 phase-13: 12 builder NodePools — `rio-builder-{hi,mid,lo}-
+  # {ebs,nvme}-{x86,aarch64}` — plus metal/fetcher/general. Each carries
+  # a static `rio.build/hw-band` label and an `instance-generation In
+  # [...]` requirement (hi=gen8, mid=gen7, lo=gen6); each admits BOTH
+  # `capacity-type In [spot, on-demand]` so the scheduler's per-(band,
+  # cap) solve selects via `karpenter.sh/capacity-type` nodeSelector.
+  #
+  # `weight` is uniform within a `(storage, arch)` pair: the SCHEDULER
+  # picks the band (cost-softmax), not Karpenter. Karpenter only
+  # disambiguates when a pod has no `rio.build/hw-band` selector
+  # (probe path / `[sla].hw_cost_source` unset) — it then prefers
+  # whichever is cheapest at the time.
+  #
+  # `builderBands` is the cartesian source; templates/karpenter.yaml
+  # ranges over `band × storage × arch` and emits one NodePool each.
+  # Adding a band = one entry here (requirements/common labels live in
+  # the template).
+  builderBands:
+    - {name: hi, generation: "8"}
+    - {name: mid, generation: "7"}
+    - {name: lo, generation: "6"}
+  builderStorages:
+    - {name: ebs, nodeClass: rio-default, nvme: false}
+    - {name: nvme, nodeClass: rio-nvme, nvme: true}
+  builderArchs:
+    - {name: x86, k8s: amd64}
+    - {name: aarch64, k8s: arm64}
+  # Per-pool vCPU limit. 12 pools × 8000 = 96000 vCPU ceiling (vs
+  # 40000 under the old preferred+fallback split) — the shared
+  # nodepool-budget reconciler caps the SUM, so this is per-cell
+  # headroom not aggregate.
+  builderPoolCpuLimit: 8000
   nodePools:
-    # Worker preferred: c6a/c7a (AMD EPYC compute-optimized). Tainted so
-    # ONLY builder pods (with the matching toleration) land here.
-    - name: rio-builder-preferred
-      sharedBudget: true
-      weight: 100
-      labels:
-        rio.build/node-role: builder
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          # I-118: any c/m/r gen6+ — karpenter picks the cheapest
-          # available. I-098 puts kubernetes.io/arch on each pod, so
-          # arm64 lands on *g families, x86 on *a/*i. Adaptive sizing
-          # (I-117) means tiny pods bin-pack onto whatever's cheapest.
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["5"]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-      # I-118 adaptive sizing (I-117) packs ~8 tiny pods per c6a.xlarge
-      # (vs ~2 medium), so the same node count serves more builders.
-      # 20000 cpu ≈ 5000 c6a.xlarge ≈ 40000 tiny builders.
-      limits: {cpu: 20000}
-      consolidateAfter: 10m
-
-    # Worker fallback: m/r categories, any family. If c-capacity is
-    # unavailable (rare on-demand, common for spot) Karpenter falls
-    # through here.
-    - name: rio-builder-fallback
-      sharedBudget: true
-      weight: 10
-      labels:
-        rio.build/node-role: builder
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        # No arch constraint: rio images are multi-arch (x86_64 + aarch64
-        # via OCI manifest list, see xtask push). m6g/m7g/
-        # r6g/r7g Graviton nodes are now eligible — containerd pulls the
-        # arm64 image, pod runs natively. Re-add `kubernetes.io/arch In
-        # [amd64]` only if an arch-specific regression surfaces.
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["4"]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-      # Overflow capacity when c6a/c7a is unavailable. preferred
-      # (20000) + fallback (20000) = 40000 vCPU non-metal builder
-      # ceiling.
-      limits: {cpu: 20000}
-      consolidateAfter: 10m
-
     # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
     # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =
     # ["kvm"]). Tainted rio.build/kvm so ONLY pools with features:[kvm]
@@ -646,74 +609,6 @@ karpenter:
       # consolidateAfter:30s reaps idle metal fast.
       limits: {cpu: 10000}
       consolidateAfter: 30s
-
-    # ADR-023 phase-10: instance-store NVMe builders. rio-nvme
-    # NodeClass sets instanceStorePolicy=RAID0 (Karpenter mdadm-stripes
-    # all NVMe → /dev/md0); the AMI's rio-nvme-mount.service mkfs.xfs +
-    # mounts it at /var/lib/kubelet -o prjquota. rio.build/storage:
-    # nvme feeds NodeLabelCache → hw_class = "*-*-nvme" so the SLA
-    # model's hw_bias separates ebs-throttled from nvme-unthrottled
-    # samples. Two pools (per-arch) so I-098's per-pod kubernetes.io/
-    # arch nodeSelector matches without a runtime requirement merge.
-    - name: rio-builder-nvme-x86
-      sharedBudget: true
-      weight: 50
-      nodeClass: rio-nvme
-      labels:
-        rio.build/node-role: builder
-        rio.build/storage: nvme
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["5"]
-        - key: karpenter.k8s.aws/instance-local-nvme
-          operator: Gt
-          values: ["0"]
-        - key: kubernetes.io/arch
-          operator: In
-          values: [amd64]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-      limits: {cpu: 10000}
-      consolidateAfter: 10m
-
-    - name: rio-builder-nvme-aarch64
-      sharedBudget: true
-      weight: 50
-      nodeClass: rio-nvme
-      labels:
-        rio.build/node-role: builder
-        rio.build/storage: nvme
-      taints:
-        - key: rio.build/builder
-          value: "true"
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["5"]
-        - key: karpenter.k8s.aws/instance-local-nvme
-          operator: Gt
-          values: ["0"]
-        - key: kubernetes.io/arch
-          operator: In
-          values: [arm64]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-      limits: {cpu: 10000}
-      consolidateAfter: 10m
 
     # r[impl fetcher.node.dedicated]
     #
