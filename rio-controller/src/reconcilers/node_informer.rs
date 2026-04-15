@@ -28,11 +28,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use parking_lot::RwLock;
+use rio_proto::AdminServiceClient;
+use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
@@ -50,6 +52,10 @@ const LABEL_GENERATION: &str = "karpenter.k8s.aws/instance-generation";
 /// Node labels. `ebs` (gp3 root) or `nvme` (instance-store).
 const LABEL_STORAGE: &str = "rio.build/storage";
 
+/// `karpenter.sh/capacity-type` — `spot` or `on-demand`. Cached so the
+/// spot-interrupt watcher can skip on-demand nodes without re-fetching.
+const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
+
 /// Three labels that determine build-performance equivalence class.
 /// Formatted as `"{manufacturer}-{generation}-{storage}"` for the
 /// completion-sample `hw_class` column.
@@ -58,6 +64,17 @@ pub struct HwClass {
     pub manufacturer: String,
     pub generation: String,
     pub storage: String,
+}
+
+/// Per-node cache value: `HwClass` + the bits the spot-interrupt
+/// watcher needs (capacity type, creation epoch for node-seconds).
+#[derive(Debug, Clone)]
+struct NodeMeta {
+    hw: HwClass,
+    capacity_type: Option<String>,
+    /// Unix-epoch seconds from `metadata.creationTimestamp`. `None` for
+    /// nodes with no timestamp (shouldn't happen post-Create).
+    created_at: Option<f64>,
 }
 
 impl HwClass {
@@ -83,13 +100,27 @@ impl HwClass {
 /// Node-name → `HwClass` cache. Cheap to clone (`Arc`); share one
 /// instance between the informer task and consumers.
 #[derive(Clone, Default)]
-pub struct NodeLabelCache(Arc<RwLock<HashMap<String, HwClass>>>);
+pub struct NodeLabelCache(Arc<RwLock<HashMap<String, NodeMeta>>>);
 
 impl NodeLabelCache {
     /// Formatted `hw_class` string for `node_name`, or `None` if the
     /// node is not (or no longer) in the cache.
     pub fn hw_class_of(&self, node_name: &str) -> Option<String> {
-        self.0.read().get(node_name).map(HwClass::as_string)
+        self.0.read().get(node_name).map(|m| m.hw.as_string())
+    }
+
+    /// `Some((hw_class, node_seconds))` for `node_name` IF it's a spot
+    /// node with a creation timestamp. Feeds the exposure half of λ[h]
+    /// — on-demand nodes contribute neither numerator nor denominator
+    /// (their λ is 0 by definition).
+    pub fn spot_exposure(&self, node_name: &str, now_epoch: f64) -> Option<(String, f64)> {
+        let g = self.0.read();
+        let m = g.get(node_name)?;
+        if m.capacity_type.as_deref() != Some("spot") {
+            return None;
+        }
+        let secs = (now_epoch - m.created_at?).max(0.0);
+        Some((m.hw.as_string(), secs))
     }
 
     /// Current cache size. For the `rio_controller_node_cache_size`
@@ -107,14 +138,24 @@ impl NodeLabelCache {
         let Some(name) = node.metadata.name.clone() else {
             return;
         };
-        let hw = HwClass::from_node(node);
-        self.0.write().insert(name, hw);
+        let labels = node.metadata.labels.as_ref();
+        let meta = NodeMeta {
+            hw: HwClass::from_node(node),
+            capacity_type: labels.and_then(|l| l.get(LABEL_CAPACITY_TYPE)).cloned(),
+            created_at: node
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.as_second() as f64),
+        };
+        self.0.write().insert(name, meta);
     }
 
-    fn delete(&self, node: &Node) {
-        if let Some(name) = &node.metadata.name {
-            self.0.write().remove(name);
-        }
+    fn delete(&self, node: &Node) -> Option<NodeMeta> {
+        node.metadata
+            .name
+            .as_ref()
+            .and_then(|n| self.0.write().remove(n))
     }
 }
 
@@ -126,7 +167,12 @@ impl NodeLabelCache {
 /// are logged; the controller keeps reconciling. Consumers see an
 /// empty/stale cache → `hw_class_of` returns `None` → samples ingest
 /// with NULL `hw_class` (degraded, not broken).
-pub async fn run(client: Client, cache: NodeLabelCache, shutdown: rio_common::signal::Token) {
+pub async fn run(
+    client: Client,
+    cache: NodeLabelCache,
+    mut admin: AdminServiceClient<Channel>,
+    shutdown: rio_common::signal::Token,
+) {
     let nodes: Api<Node> = Api::all(client);
 
     // Raw event stream (not `.applied_objects()`): we need Delete to
@@ -169,11 +215,25 @@ pub async fn run(client: Client, cache: NodeLabelCache, shutdown: rio_common::si
                 cache.apply(&node);
             }
             watcher::Event::Delete(node) => {
+                // ADR-023 phase-13: spot-node lifetime → λ denominator.
+                // Compute BEFORE delete (cache still has created_at).
+                if let Some(name) = &node.metadata.name
+                    && let Some((hw, secs)) = cache.spot_exposure(name, now_epoch())
+                {
+                    report_exposure(&mut admin, hw, secs).await;
+                }
                 cache.delete(&node);
             }
             watcher::Event::Init | watcher::Event::InitDone => {}
         }
     }
+}
+
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Builder/fetcher pod label selector — same value `disruption.rs`
@@ -240,6 +300,89 @@ pub async fn run_pod_annotator(
         {
             warn!(%name, %ns, error = %e, "hw-class annotator: patch failed");
         }
+    }
+}
+
+/// ADR-023 phase-13 λ[h] self-calibration: watch `core/v1.Event` for
+/// `reason=SpotInterrupted` (Karpenter posts one on the NodeClaim when
+/// AWS sends the 2-minute spot interruption notice), resolve the
+/// referenced node's hw_class via [`NodeLabelCache`], and append
+/// `interrupt_samples(hw_class, kind='interrupt', value=1)` via
+/// `AdminService.AppendInterruptSample`.
+///
+/// The exposure half (`kind='exposure', value=node_seconds`) is
+/// emitted from [`run`]'s Node-DELETE arm — every spot-node teardown
+/// (interrupted or not) contributes its lifetime to the denominator.
+///
+/// `field_selector` narrows the watch server-side so we don't churn
+/// on the cluster's full event firehose. Karpenter's event is on the
+/// NodeClaim object; `involvedObject.kind=NodeClaim` + `reason=
+/// SpotInterrupted` is the tightest filter the apiserver supports.
+pub async fn run_spot_interrupt_watcher(
+    client: Client,
+    cache: NodeLabelCache,
+    mut admin: AdminServiceClient<Channel>,
+    shutdown: rio_common::signal::Token,
+) {
+    let events: Api<Event> = Api::all(client);
+    let cfg =
+        watcher::Config::default().fields("reason=SpotInterrupted,involvedObject.kind=NodeClaim");
+    let mut stream = watcher(events, cfg)
+        .default_backoff()
+        .applied_objects()
+        .boxed();
+
+    info!("spot-interrupt watcher started");
+
+    loop {
+        let ev = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            next = stream.next() => match next {
+                Some(Ok(e)) => e,
+                Some(Err(e)) => { warn!(error = %e, "spot-interrupt: stream error"); continue; }
+                None => { warn!("spot-interrupt: stream ended (unexpected)"); return; }
+            },
+        };
+        // NodeClaim → Node: Karpenter sets the NodeClaim's
+        // `status.nodeName` once the node registers; the Event's
+        // `involvedObject.name` IS the NodeClaim name, which Karpenter
+        // also uses as the Node name. Fall back to a direct cache
+        // lookup by that name.
+        let Some(node) = ev.involved_object.name else {
+            continue;
+        };
+        let Some(hw_class) = cache.hw_class_of(&node) else {
+            debug!(%node, "spot-interrupt: node not in cache; skipping");
+            continue;
+        };
+        let r = admin
+            .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+                hw_class: hw_class.clone(),
+                kind: "interrupt".into(),
+                value: 1.0,
+            })
+            .await;
+        match r {
+            Ok(_) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
+            Err(e) => warn!(%node, error = %e, "spot-interrupt: append failed"),
+        }
+    }
+}
+
+/// Append `kind='exposure'` for a deleted spot node. Best-effort: a
+/// failed RPC drops one denominator sample (λ reads slightly high
+/// until the next exposure lands).
+async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: String, secs: f64) {
+    if let Err(e) = admin
+        .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+            hw_class,
+            kind: "exposure".into(),
+            value: secs,
+        })
+        .await
+    {
+        warn!(error = %e, "spot-exposure: append failed");
     }
 }
 
@@ -320,6 +463,30 @@ mod tests {
         cache.delete(&n);
         assert_eq!(cache.hw_class_of("ip-10-0-1-5"), None);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn spot_exposure_gates_on_capacity_type() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+        let cache = NodeLabelCache::default();
+        let mut spot = node(
+            "spot-n",
+            &[(LABEL_CAPACITY_TYPE, "spot"), (LABEL_GENERATION, "7")],
+        );
+        spot.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
+        cache.apply(&spot);
+        let mut od = node("od-n", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
+        od.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
+        cache.apply(&od);
+        // Spot node → exposure with hw_class + uptime.
+        let (hw, secs) = cache.spot_exposure("spot-n", 1100.0).unwrap();
+        assert_eq!(hw, "unknown-7-ebs");
+        assert!((secs - 100.0).abs() < 1e-6);
+        // On-demand → no exposure (λ=0 by definition).
+        assert!(cache.spot_exposure("od-n", 1100.0).is_none());
+        // Unknown node → None.
+        assert!(cache.spot_exposure("missing", 1100.0).is_none());
     }
 
     fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {

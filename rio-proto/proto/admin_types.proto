@@ -515,6 +515,17 @@ message InjectBuildSampleRequest {
   optional string hw_class = 9;
 }
 
+// ADR-023 phase-13: one interrupt_samples row. kind="interrupt"
+// (value=1, on a SpotInterrupted Event) or kind="exposure" (value=
+// node-uptime seconds, on Node DELETE). hw_class is the controller's
+// NodeLabelCache join — same "{mfr}-{gen}-{storage}" string the
+// hw_perf_samples path uses.
+message AppendInterruptSampleRequest {
+  string hw_class = 1;
+  string kind = 2;
+  double value = 3;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // ADR-023 SLA overrides (Set/List/ClearSlaOverride, ResetSlaModel, SlaStatus)
 // ───────────────────────────────────────────────────────────────────────────

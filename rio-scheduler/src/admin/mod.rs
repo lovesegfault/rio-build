@@ -27,15 +27,16 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
-    BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse,
-    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
-    GetEstimatorStatsRequest, GetEstimatorStatsResponse, GetSizeClassStatusRequest,
-    GetSizeClassStatusResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
-    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
-    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
+    AppendInterruptSampleRequest, BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse,
+    ClusterStatusResponse, CreateTenantRequest, CreateTenantResponse, DebugExecutorState,
+    DebugListExecutorsResponse, DrainExecutorRequest, DrainExecutorResponse,
+    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetEstimatorStatsRequest,
+    GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
+    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
+    ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
     ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
     SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
     SlaStatusResponse, TerminationReason,
@@ -806,6 +807,28 @@ impl AdminService for AdminServiceImpl {
         })
         .await
         .map_err(|e| Status::internal(format!("write_build_sample: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    /// ADR-023 phase-13: append one `interrupt_samples` row. Called by
+    /// the controller's spot-interrupt watcher (no test-fixture gate —
+    /// this is a production write path). NOT leader-gated: the
+    /// controller's balanced channel routes to the leader anyway, and
+    /// the table is append-only so a stray standby write is harmless.
+    #[instrument(skip(self, request), fields(rpc = "AppendInterruptSample"))]
+    async fn append_interrupt_sample(
+        &self,
+        request: Request<AppendInterruptSampleRequest>,
+    ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let r = request.into_inner();
+        sqlx::query("INSERT INTO interrupt_samples (hw_class, kind, value) VALUES ($1, $2, $3)")
+            .bind(&r.hw_class)
+            .bind(&r.kind)
+            .bind(r.value)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Status::internal(format!("append_interrupt_sample: {e}")))?;
         Ok(Response::new(()))
     }
 }

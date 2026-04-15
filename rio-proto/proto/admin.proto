@@ -150,6 +150,13 @@ service AdminService {
   // on test-auth (the scheduler refuses unless RIO_ADMIN_TEST_FIXTURES
   // is set); not exposed via rio-cli.
   rpc InjectBuildSample(rio.types.InjectBuildSampleRequest) returns (google.protobuf.Empty);
+
+  // ADR-023 phase-13: append one interrupt_samples row. Called by the
+  // controller's spot-interrupt watcher (kind="interrupt", value=1 on
+  // a SpotInterrupted Event) and Node-DELETE handler (kind="exposure",
+  // value=node_seconds). Append-only; the scheduler's lease-gated
+  // poller aggregates into λ[h].
+  rpc AppendInterruptSample(rio.types.AppendInterruptSampleRequest) returns (google.protobuf.Empty);
 }
 
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the

@@ -240,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
     // (SIGTERM drain still runs).
     rio_common::task::spawn_monitored(
         "disruption-watcher",
-        builderpool::disruption::run(client.clone(), admin, shutdown.clone()),
+        builderpool::disruption::run(client.clone(), admin.clone(), shutdown.clone()),
     );
 
     // ---- Node informer ----
@@ -253,14 +253,31 @@ async fn main() -> anyhow::Result<()> {
     let node_cache = NodeLabelCache::default();
     rio_common::task::spawn_monitored(
         "node-informer",
-        node_informer::run(client.clone(), node_cache.clone(), shutdown.clone()),
+        node_informer::run(
+            client.clone(),
+            node_cache.clone(),
+            admin.clone(),
+            shutdown.clone(),
+        ),
     );
     // ADR-023 phase-10: stamp `rio.build/hw-class` on each builder
     // pod once `spec.nodeName` resolves. Builder reads it via
     // downward-API to key its `hw_perf_samples` microbench insert.
     rio_common::task::spawn_monitored(
         "hw-class-annotator",
-        node_informer::run_pod_annotator(client.clone(), node_cache, shutdown.clone()),
+        node_informer::run_pod_annotator(client.clone(), node_cache.clone(), shutdown.clone()),
+    );
+    // ADR-023 phase-13: SpotInterrupted Event → interrupt_samples
+    // (λ[h] numerator). Node-DELETE in the informer above writes the
+    // exposure denominator.
+    rio_common::task::spawn_monitored(
+        "spot-interrupt-watcher",
+        node_informer::run_spot_interrupt_watcher(
+            client.clone(),
+            node_cache,
+            admin.clone(),
+            shutdown.clone(),
+        ),
     );
 
     // ---- GC cron ----
