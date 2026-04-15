@@ -99,6 +99,10 @@ pub struct ExecutorEnv {
     /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
     /// defense-in-depth against scheduler misroutes (ADR-019).
     pub executor_kind: rio_proto::types::ExecutorKind,
+    /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
+    /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
+    /// stays consistent with what the heartbeat advertises.
+    pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. The executor calls
     /// `register_inputs` (JIT allowlist, I-043 redesign) and
     /// `prefetch_manifests` (I-110c PG-skip hints) on it after
@@ -412,6 +416,7 @@ pub async fn execute_build(
         input_metadata,
         is_fod,
         effective_cores,
+        &env.systems,
     )
     .await?;
 

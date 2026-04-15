@@ -36,6 +36,10 @@ struct DispatchTickCtx {
     /// FOD deferral count. Separate from `class_deferred` — fetchers
     /// aren't size-classed (ADR-019).
     fod_deferred: u64,
+    /// Ready drvs whose `system` is advertised by ZERO registered
+    /// executors of the matching kind. Per-system count → gauge + a
+    /// single WARN on first observation (operator action: add a pool).
+    unroutable_systems: HashMap<String, u64>,
     /// Successful assign_to_worker calls (for the >1s debug log).
     n_assigned: u64,
 }
@@ -200,7 +204,7 @@ impl DagActor {
         }
         phase!("1-drain-loop");
 
-        self.publish_dispatch_gauges(ctx.class_deferred, ctx.fod_deferred);
+        self.publish_dispatch_gauges(ctx.class_deferred, ctx.fod_deferred, ctx.unroutable_systems);
         phase!("2-gauges");
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -263,7 +267,7 @@ impl DagActor {
         // guards aren't `Send`; the await point would be a
         // compile error anyway, but keeping the scope tight
         // is defensive.
-        let (target_class, est_memory_bytes, is_fixed_output) = {
+        let (target_class, est_memory_bytes, is_fixed_output, system) = {
             let pname = state.pname.as_deref();
             let system = &state.system;
             let classes = self.sizing.size_classes.read();
@@ -293,7 +297,12 @@ impl DagActor {
                     .and_then(|e| Estimator::bucketed_estimate(&e, self.sizing.headroom_mult))
                     .map(|b| b.memory_bytes)
             };
-            (target_class, est_memory_bytes, state.is_fixed_output)
+            (
+                target_class,
+                est_memory_bytes,
+                state.is_fixed_output,
+                system.clone(),
+            )
         };
 
         // Write the estimate onto the state BEFORE placement
@@ -381,6 +390,14 @@ impl DagActor {
                     self.poison_and_cascade(&drv_hash).await;
                     return DispatchOutcome::NoProgress;
                 }
+                // I-056: distinguish "no capacity right now" (defer,
+                // autoscaler handles it) from "no pool advertises this
+                // system at all" (operator action — add the pool or
+                // its `systems` entry). The latter sat silently Ready
+                // for hours; surface it via gauge + a one-shot WARN.
+                if !self.any_executor_advertises_system(&system, is_fixed_output) {
+                    *ctx.unroutable_systems.entry(system).or_insert(0) += 1;
+                }
                 // Defer and track by TARGET class (not chosen —
                 // chosen is None when there's no eligible).
                 // FODs tracked separately: they have no class,
@@ -404,7 +421,13 @@ impl DagActor {
     /// class that was backed up (gauge=50) then cleared would stay at
     /// 50 forever otherwise.
     // r[impl sched.freeze-detector]
-    fn publish_dispatch_gauges(&mut self, class_deferred: HashMap<String, u64>, fod_deferred: u64) {
+    // r[impl sched.dispatch.unroutable-system]
+    fn publish_dispatch_gauges(
+        &mut self,
+        class_deferred: HashMap<String, u64>,
+        fod_deferred: u64,
+        unroutable_systems: HashMap<String, u64>,
+    ) {
         for sc in self.sizing.size_classes.read().iter() {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
@@ -463,6 +486,46 @@ impl DagActor {
             class_total,
             builder_stream_count,
         );
+
+        // Unroutable-system gauge + edge-triggered WARN. Zero stale
+        // labels first (same persist-until-overwritten reason as
+        // class_queue_depth above), then set this pass's counts.
+        for sys in self.unroutable_warned.iter() {
+            metrics::gauge!("rio_scheduler_unroutable_ready", "system" => sys.clone()).set(0.0);
+        }
+        for (sys, count) in &unroutable_systems {
+            metrics::gauge!("rio_scheduler_unroutable_ready", "system" => sys.clone())
+                .set(*count as f64);
+            if !self.unroutable_warned.contains(sys) {
+                warn!(
+                    system = %sys, ready = count,
+                    "no registered executor advertises this system; Ready drvs \
+                     unroutable until a pool with `systems` containing it exists"
+                );
+            }
+        }
+        // Retain only systems still unroutable so the WARN re-arms once
+        // a system becomes routable and later regresses, AND so the
+        // zeroing loop above stops emitting for long-gone systems.
+        self.unroutable_warned
+            .retain(|s| unroutable_systems.contains_key(s));
+        self.unroutable_warned
+            .extend(unroutable_systems.into_keys());
+    }
+
+    /// Any registered executor of the matching kind advertises
+    /// `system`. Ignores busy/warm/class — distinguishes "no capacity
+    /// right now" (transient, autoscaler handles it) from "no such
+    /// pool exists" (operator action; the I-056 silent-stuck case).
+    fn any_executor_advertises_system(&self, system: &str, is_fixed_output: bool) -> bool {
+        let want_kind = if is_fixed_output {
+            rio_proto::types::ExecutorKind::Fetcher
+        } else {
+            rio_proto::types::ExecutorKind::Builder
+        };
+        self.executors.values().any(|w| {
+            w.kind == want_kind && w.is_registered() && w.systems.iter().any(|s| s == system)
+        })
     }
 
     /// I-067: best-effort store check for a Ready IA derivation's

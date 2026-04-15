@@ -103,6 +103,11 @@ pub struct BuildSpawnContext {
     /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
     /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
     pub executor_kind: rio_proto::types::ExecutorKind,
+    /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
+    /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
+    /// matches what the heartbeat told the scheduler — a drv routed for
+    /// `i686-linux` is then accepted by the x86_64 daemon.
+    pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
     /// the executor can `register_inputs` (JIT allowlist) and
     /// `prefetch_manifests` (I-110c) before daemon spawn.
@@ -132,6 +137,7 @@ impl BuildSpawnContext {
             max_silent_time: self.max_silent_time,
             cgroup_parent: self.cgroup_parent.clone(),
             executor_kind: self.executor_kind,
+            systems: Arc::clone(&self.systems),
             fuse_cache: Some(Arc::clone(&self.fuse_cache)),
             fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,

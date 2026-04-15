@@ -75,6 +75,7 @@ pub(super) async fn prepare_sandbox(
     synth_paths: Vec<ValidatedPathInfo>,
     is_fod: bool,
     effective_cores: u32,
+    systems: &[String],
 ) -> Result<(), ExecutorError> {
     // Generate synthetic DB from caller-supplied metadata (I-106:
     // captured during compute_input_closure's BFS, no second QPI pass).
@@ -102,7 +103,7 @@ pub(super) async fn prepare_sandbox(
     synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
 
     // Set up nix.conf in overlay
-    setup_nix_conf(&overlay_mount.upper_nix_conf(), effective_cores)?;
+    setup_nix_conf(&overlay_mount.upper_nix_conf(), effective_cores, systems)?;
 
     // Whiteout declared output paths in the overlay upper layer.
     //
@@ -249,7 +250,17 @@ pub(super) async fn prepare_sandbox(
 /// `wopSetOptions.build_cores`, which is the primary path. Writing
 /// it to nix.conf catches an upstream `wopSetOptions` regression
 /// (the daemon would otherwise fall back to nix.conf → host nproc).
-fn setup_nix_conf(upper_nix_conf: &Path, effective_cores: u32) -> Result<(), ExecutorError> {
+///
+/// `systems` is the resolved `RIO_SYSTEMS` list. Non-`builtin`
+/// entries become the daemon's `extra-platforms` so a drv routed for
+/// any advertised system is accepted (e.g. `i686-linux` on an x86_64
+/// host). The host system being in the list is a no-op.
+// r[impl builder.platform.i686]
+fn setup_nix_conf(
+    upper_nix_conf: &Path,
+    effective_cores: u32,
+    systems: &[String],
+) -> Result<(), ExecutorError> {
     std::fs::create_dir_all(upper_nix_conf).map_err(ExecutorError::NixConf)?;
 
     // Try the override first. `read` (not `read_to_string`) —
@@ -294,6 +305,14 @@ fn setup_nix_conf(upper_nix_conf: &Path, effective_cores: u32) -> Result<(), Exe
     content.extend_from_slice(
         format!("max-jobs = 1\ncores = {}\n", effective_cores.max(1)).as_bytes(),
     );
+    let extra: Vec<&str> = systems
+        .iter()
+        .map(String::as_str)
+        .filter(|s| *s != "builtin")
+        .collect();
+    if !extra.is_empty() {
+        content.extend_from_slice(format!("extra-platforms = {}\n", extra.join(" ")).as_bytes());
+    }
 
     std::fs::write(upper_nix_conf.join("nix.conf"), content).map_err(ExecutorError::NixConf)?;
     Ok(())
@@ -313,11 +332,13 @@ mod tests {
     }
 
     // r[verify builder.cores.cgroup-clamp+2]
+    // r[verify builder.platform.i686]
     #[test]
     fn test_setup_nix_conf() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let conf_dir = dir.path().join("etc/nix");
-        setup_nix_conf(&conf_dir, 2)?;
+        let sys = ["x86_64-linux".into(), "i686-linux".into(), "builtin".into()];
+        setup_nix_conf(&conf_dir, 2, &sys)?;
 
         let conf_path = conf_dir.join("nix.conf");
         assert!(conf_path.exists());
@@ -334,11 +355,24 @@ mod tests {
             "cores= appended after base content so it wins over any \
              override; got:\n{content}"
         );
+        // r[builder.platform.i686]: advertised systems → extra-platforms.
+        assert!(
+            content.contains("extra-platforms = x86_64-linux i686-linux\n"),
+            "non-builtin systems become extra-platforms; got:\n{content}"
+        );
+        assert!(
+            !content.contains("builtin"),
+            "`builtin` is a routing pseudo-system, not a nix platform"
+        );
         // Never `cores = 0` (daemon resolves 0 → nproc, the I-196 bug).
-        setup_nix_conf(&conf_dir, 0)?;
+        setup_nix_conf(&conf_dir, 0, &[])?;
         let content = std::fs::read_to_string(&conf_path)?;
         assert!(content.contains("cores = 1\n"), "0 clamped to 1");
         assert!(!content.contains("cores = 0"));
+        assert!(
+            !content.contains("extra-platforms"),
+            "empty systems → no extra-platforms line"
+        );
         Ok(())
     }
 }

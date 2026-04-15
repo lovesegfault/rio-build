@@ -202,6 +202,9 @@ The merge-time `FindMissingPaths` cache check goes through a circuit breaker tha
 r[sched.freeze-detector]
 `dispatch_ready` WARNs once per minute when `fod_deferred > 0 && fetcher_streams == 0` (or `class_deferred > 0 && builder_streams == 0`) holds for ≥60s. The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
 
+r[sched.dispatch.unroutable-system]
+When a Ready derivation's `system` is advertised by zero registered executors of the matching kind, dispatch defers it (same as no-capacity) but additionally counts it under `rio_scheduler_unroutable_ready{system=…}` and WARNs once when the system first becomes unroutable. The WARN re-arms after the system has been observed routable. This distinguishes "no capacity right now" (autoscaler resolves) from "no pool exists" (operator action: add the system to a Builder/FetcherPool's `systems` list, e.g. `i686-linux` on an x86_64 pool per `r[builder.platform.i686]`).
+
 ## Multi-Build DAG Merging
 
 r[sched.merge.dedup]

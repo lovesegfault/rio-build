@@ -758,7 +758,11 @@ builderPoolSets:
   # `{name}-{class.name}` (e.g., `x86-64-tiny`). RFC 1123 — combined
   # length ≤ 63 chars (controller validates).
   - name: x86-64
-    systems: [x86_64-linux]
+    # r[builder.platform.i686]: x86_64 hosts run i686 natively. The
+    # builder appends `extra-platforms = <systems>` to the daemon's
+    # nix.conf, so advertising i686-linux here is the only knob —
+    # routing (scheduler) and acceptance (daemon) follow.
+    systems: [x86_64-linux, i686-linux]
   # Multi-arch: add a second entry (EKS deploy.rs does this via
   # --set-json):
   #   - name: aarch64
@@ -896,7 +900,7 @@ builderPoolDefaults:
 # reconciler default — include `rio.build/node-role: fetcher` too.
 fetcherPools:
   - name: x86-64
-    systems: [x86_64-linux, builtin]
+    systems: [x86_64-linux, i686-linux, builtin]
     nodeSelector:
       rio.build/node-role: fetcher
       kubernetes.io/arch: amd64

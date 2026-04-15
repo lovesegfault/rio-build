@@ -48,9 +48,9 @@ const SIZE_CLASSES_JSON: &str = r#"[
 /// provisions a `.metal` node (nodeSelector); pod gets `/dev/kvm` via
 /// containerd base_runtime_spec.
 const BUILDER_POOL_SETS_JSON: &str = r#"[
-  {"name":"x86-64","systems":["x86_64-linux"]},
+  {"name":"x86-64","systems":["x86_64-linux","i686-linux"]},
   {"name":"aarch64","systems":["aarch64-linux"]},
-  {"name":"x86-64-kvm","systems":["x86_64-linux"],
+  {"name":"x86-64-kvm","systems":["x86_64-linux","i686-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxConcurrent":10,
      "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
@@ -69,7 +69,7 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
 /// from `fetcherPoolDefaults.image` (PLAN-PREBAKE: layer-cache-warm,
 /// not digest-pin).
 const FETCHER_POOLS_JSON: &str = r#"[
-  {"name":"x86-64","systems":["x86_64-linux","builtin"],
+  {"name":"x86-64","systems":["x86_64-linux","i686-linux","builtin"],
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"amd64"}},
   {"name":"aarch64","systems":["aarch64-linux","builtin"],
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}

@@ -306,6 +306,12 @@ pub struct DagActor {
     /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
     /// with zero ERROR/WARN while fod_queue_depth=41 and fetcher streams=0.
     fod_freeze_since: Option<Instant>,
+    /// Systems already WARNed as unroutable. Edge-triggers the
+    /// `r[sched.dispatch.unroutable-system]` log: WARN once when a
+    /// system first has Ready drvs but zero advertising executors;
+    /// re-armed when the system becomes routable again. Also the set
+    /// the gauge zeroing loop iterates so stale labels don't persist.
+    unroutable_warned: HashSet<String>,
     /// Same pattern for non-FOD derivations stuck with zero builder streams.
     /// Tracks `class_deferred.values().sum() > 0 && builder_streams == 0`.
     builder_freeze_since: Option<Instant>,
@@ -403,6 +409,7 @@ impl DagActor {
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
             fod_freeze_since: None,
+            unroutable_warned: HashSet::new(),
             builder_freeze_since: None,
             dispatch_dirty: false,
             probe_generation: 1,

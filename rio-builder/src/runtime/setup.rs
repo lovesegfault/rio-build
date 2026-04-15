@@ -214,12 +214,14 @@ pub async fn setup(
     // this is a fence against a DIFFERENT process's stale writes, not a
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(AtomicU64::new(0));
+    // Shared with BuildSpawnContext below so the per-build daemon's
+    // `extra-platforms` matches what the heartbeat advertises.
+    let systems: std::sync::Arc<[String]> = systems.into();
     let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
         executor_id: executor_id.clone(),
         executor_kind: cfg.executor_kind,
-        // move (not clone): owned Vecs, used only by the heartbeat
-        // loop. setup() has no further use for them.
-        systems,
+        systems: systems.to_vec(),
+        // move: setup() has no further use for features.
         features,
         size_class: cfg.size_class.clone(),
         slot: Arc::clone(&slot),
@@ -252,6 +254,7 @@ pub async fn setup(
         max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,
         executor_kind: cfg.executor_kind,
+        systems,
         // I-110c: same Arc as prefetch_cache / the FUSE mount —
         // executor primes manifest hints + JIT allowlist, FUSE threads
         // consume them.

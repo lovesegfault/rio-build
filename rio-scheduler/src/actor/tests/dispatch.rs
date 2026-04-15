@@ -1449,3 +1449,57 @@ fn next_builder_class_cutoff_ordered() {
     assert_eq!(next_builder_class("unknown", &classes), None);
     assert_eq!(next_builder_class("tiny", &[]), None, "feature off");
 }
+
+// r[verify sched.dispatch.unroutable-system]
+/// Ready drv whose `system` is advertised by zero registered executors:
+/// stays Ready (deferred), WARN fires once (edge-triggered, not per
+/// tick). Connecting a matching executor dispatches it.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Only an x86_64 builder registered.
+    let _w = connect_executor(&handle, "x86-b1", "x86_64-linux").await?;
+
+    // riscv drv has no advertising pool.
+    let riscv = make_test_node("rv-unroutable", "riscv64-linux");
+    let rv_hash = riscv.drv_hash.clone();
+    // Hold the event receiver so the orphan-watcher doesn't auto-cancel.
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![riscv], vec![], false).await?;
+    tick(&handle).await?;
+
+    let d = expect_drv(&handle, &rv_hash).await;
+    assert_eq!(
+        d.status,
+        DerivationStatus::Ready,
+        "unroutable drv defers (not poisoned/failed)"
+    );
+    assert!(
+        logs_contain("no registered executor advertises this system")
+            && logs_contain("riscv64-linux"),
+        "WARN fires when system first becomes unroutable"
+    );
+
+    // Edge-triggered: a second tick must NOT re-WARN.
+    tick(&handle).await?;
+    logs_assert(|lines| {
+        let n = lines
+            .iter()
+            .filter(|l| l.contains("no registered executor advertises this system"))
+            .count();
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(format!("WARN must fire once across both ticks; got {n}"))
+        }
+    });
+
+    // Connect a riscv builder → next tick dispatches.
+    let mut rv_rx = connect_executor(&handle, "rv-b1", "riscv64-linux").await?;
+    tick(&handle).await?;
+    let assn = recv_assignment(&mut rv_rx).await;
+    assert!(assn.drv_path.contains("rv-unroutable"));
+
+    Ok(())
+}
