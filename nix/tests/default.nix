@@ -398,6 +398,12 @@ in
           "convergence"
           # r[verify sched.sla.outlier-mad-reject]
           "outlier"
+          # r[verify sched.sla.override-precedence]
+          "override-precedence"
+          # r[verify sched.sla.hw-ref-seconds]
+          "hw-normalize"
+          # r[verify sched.sla.prior-partial-pool]
+          "seed-corpus"
         ];
       };
 

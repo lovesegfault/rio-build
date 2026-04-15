@@ -1,4 +1,5 @@
-# SLA-sizing scenario: explore-ladder convergence + MAD outlier reject.
+# SLA-sizing scenario: explore-ladder convergence, MAD outlier reject,
+# v1.1 override / hw-normalize / seed-corpus.
 #
 # Uses the standalone fixture with one worker carrying RIO_BUILDER_SCRIPT
 # (rio-builder feature `test-fixtures`) so each "build" reports scripted
@@ -19,6 +20,18 @@
 #   one estimator tick and asserts outlier_excluded=TRUE on that row in
 #   PG. Covers sched.sla.outlier-mad-reject.
 #
+# override-precedence — rio-cli sla override --cores=12 then asserts
+#   SlaExplain shows the override short-circuit (single c_star=12 row).
+#   Covers sched.sla.override-precedence.
+#
+# hw-normalize — seeds two synthetic hw_classes (factor 1.0 / 2.0),
+#   injects the same T(c) curve on both at scaled wall-clock, asserts
+#   the refit recovers P~2000 ref-seconds. Covers sched.sla.hw-ref-seconds.
+#
+# seed-corpus — export-corpus -> reset model -> import-corpus -> inject
+#   one sample -> SlaStatus.prior_source == "seed". Covers
+#   sched.sla.prior-partial-pool.
+#
 # CAVEAT: standalone-fixture workers read effective_cores from the host
 # cgroup, NOT from a per-dispatch SpawnIntent (no controller). The
 # convergence subtest therefore asserts the SAMPLES landed (proving the
@@ -36,6 +49,7 @@ let
   inherit (fixture) gatewayHost;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
+  rioCli = "${common.rio-workspace}/bin/rio-cli";
 
   # Scripted-telemetry drv. pname must match an [[entry]] in
   # sla-builder-script.toml; the body is irrelevant (fixture intercept
@@ -78,6 +92,25 @@ let
             f"grpcurl -plaintext -protoset ${protoset}/rio.protoset "
             f"-d '{json.dumps(payload)}' "
             f"localhost:9001 rio.admin.AdminService/{method}"
+        )
+
+    def cli(args: str) -> str:
+        return ${gatewayHost}.succeed(
+            "${common.covShellEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:9001 "
+            f"${rioCli} {args} 2>&1"
+        )
+
+    def wait_estimator_tick() -> None:
+        # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
+        # cadence; gate on the refresh-counter advancing rather than
+        # sleeping a fixed amount (TCG variance).
+        base = metric_value(scrape_metrics(${gatewayHost}, 9091),
+            "rio_scheduler_estimator_refresh_total") or 0.0
+        ${gatewayHost}.wait_until_succeeds(
+            "curl -fsS localhost:9091/metrics | "
+            f"awk '/^rio_scheduler_estimator_refresh_total / {{exit !($2>{base})}}'",
+            timeout=30,
         )
 
   '';
@@ -149,16 +182,7 @@ let
               })
           # Structural wait for one estimator refresh so the cached fit
           # has the 6 on-curve samples (n_eff>=5, log_residuals populated).
-          # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
-          # cadence; sleep(3) was a flake — gate on the refresh counter
-          # advancing instead.
-          base = metric_value(scrape_metrics(${gatewayHost}, 9091),
-              "rio_scheduler_estimator_refresh_total") or 0.0
-          ${gatewayHost}.wait_until_succeeds(
-              "curl -fsS localhost:9091/metrics | "
-              f"awk '/^rio_scheduler_estimator_refresh_total / {{exit !($2>{base})}}'",
-              timeout=30,
-          )
+          wait_estimator_tick()
           grpcurl_admin("InjectBuildSample", {
               "pname": "synth-amdahl", "system": "x86_64-linux",
               "tenant": "", "durationSecs": 53000,
@@ -179,6 +203,113 @@ let
               "rio_scheduler_sla_outlier_rejected_total", 1.0,
               labels='{tenant=""}')
     '';
+
+    override-precedence = ''
+      with subtest("override-precedence: forced cores short-circuits solve"):
+          # SetSlaOverride goes to PG; resolved on the next refresh tick.
+          out = cli("sla override synth-amdahl --cores=12")
+          print(out)
+          assert "set for synth-amdahl" in out, out
+          wait_estimator_tick()
+          # SlaExplain re-runs the same intent_for() dispatch uses; a
+          # forced-cores override short-circuits to a single synthetic
+          # row with c_star=12 — proving the next SpawnIntent for this
+          # key would request 12 cores. The standalone fixture has no
+          # controller, so we assert the solve trace not the pod spec.
+          ex = json.loads(grpcurl_admin("SlaExplain", {
+              "pname": "synth-amdahl", "system": "x86_64-linux", "tenant": "",
+          }))
+          assert "cores=12" in ex.get("overrideApplied", ""), ex
+          cands = ex.get("candidates", [])
+          assert len(cands) == 1 and cands[0].get("cStar") == 12.0, cands
+          # And SlaStatus surfaces the resolved row so an operator can
+          # see id/created_by.
+          st = json.loads(grpcurl_admin("SlaStatus", {
+              "pname": "synth-amdahl", "system": "x86_64-linux", "tenant": "",
+          }))
+          assert st.get("activeOverride", {}).get("cores") == 12.0, st
+          # Cleanup so later subtests see the model.
+          oid = st["activeOverride"]["id"]
+          cli(f"sla clear {oid}")
+    '';
+
+    hw-normalize = ''
+      with subtest("hw-normalize: mixed hw_class samples refit to same ref-seconds"):
+          # Two synthetic hw_classes with a 2x throughput gap. The
+          # hw_perf_factors view needs >=3 distinct pod_ids per class
+          # before it admits the class; seed those directly so the
+          # HwTable that the refit reads has factor[slow]=1.0,
+          # factor[fast]=2.0.
+          for hw, factor in [("synth-slow", 1.0), ("synth-fast", 2.0)]:
+              for i in range(3):
+                  ${gatewayHost}.succeed(
+                      "sudo -u postgres psql -d rio -c \""
+                      "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
+                      f"VALUES ('{hw}', 'pod-{hw}-{i}', {factor})\""
+                  )
+          # Same true T(c) curve (S=30, P=2000) sampled on both: fast
+          # hw reports half the wall-clock. After hw normalization both
+          # land on the same ref-seconds, so a single Amdahl fit covers
+          # them with low residual.
+          for c, t_ref in [(4, 530), (8, 280), (16, 155), (32, 92.5), (64, 61.25)]:
+              for hw, k in [("synth-slow", 1.0), ("synth-fast", 0.5)]:
+                  grpcurl_admin("InjectBuildSample", {
+                      "pname": "synth-hw", "system": "x86_64-linux",
+                      "tenant": "", "durationSecs": t_ref * k,
+                      "peakMemoryBytes": 1073741824,
+                      "cpuLimitCores": c, "cpuSecondsTotal": t_ref * k * c * 0.9,
+                      "hwClass": hw,
+                  })
+          wait_estimator_tick()
+          st = json.loads(grpcurl_admin("SlaStatus", {
+              "pname": "synth-hw", "system": "x86_64-linux", "tenant": "",
+          }))
+          assert st.get("hasFit"), f"no fit: {st}"
+          # If normalization worked, S~30 P~2000 (the ref-seconds curve);
+          # if it did NOT, the fast samples at half-wall pull P toward
+          # ~1500. 10% band tolerates NNLS + partial-pool shrinkage.
+          assert 1800 < st["p"] < 2200, f"P={st['p']} (norm failed?)"
+          assert st["sigmaResid"] < 0.2, f"sigma={st['sigmaResid']}"
+    '';
+
+    seed-corpus = ''
+      with subtest("seed-corpus: export -> reset -> import seeds prior"):
+          # The convergence/outlier subtests left synth-amdahl with a
+          # fitted curve. Export it (min_n=1 so the test corpus is
+          # non-empty even if n_eff is small under TCG).
+          out = cli("sla export-corpus --min-n 1 -o /tmp/corpus.json")
+          print(out)
+          ${gatewayHost}.succeed("test -s /tmp/corpus.json")
+          body = ${gatewayHost}.succeed("cat /tmp/corpus.json")
+          parsed = json.loads(body)
+          assert "ref_hw_class" in parsed and "entries" in parsed, body
+          n_exported = len(parsed["entries"])
+          # Wipe synth-amdahl's samples + cached fit so the next refit
+          # has no per-key theta to lean on. --tenant defaults to "".
+          cli("sla reset synth-amdahl")
+          # Import the corpus; seed map now has synth-amdahl.
+          out = cli("sla import-corpus /tmp/corpus.json")
+          print(out)
+          assert ("loaded %d seeds" % n_exported) in out, out
+          # Inject one fresh on-curve sample so a refit fires for this
+          # key (priors are blended INTO a refit, not surfaced for a
+          # never-seen key). With n_eff~1 the prior dominates (w<0.25)
+          # and prior_source records Seed.
+          grpcurl_admin("InjectBuildSample", {
+              "pname": "synth-amdahl", "system": "x86_64-linux",
+              "tenant": "", "durationSecs": 530,
+              "peakMemoryBytes": 1073741824,
+              "cpuLimitCores": 4, "cpuSecondsTotal": 2000,
+          })
+          wait_estimator_tick()
+          st = json.loads(grpcurl_admin("SlaStatus", {
+              "pname": "synth-amdahl", "system": "x86_64-linux", "tenant": "",
+          }))
+          assert st.get("hasFit"), st
+          assert st.get("priorSource") == "seed", (
+              f"expected seed-sourced prior, got {st.get('priorSource')!r}: {st}"
+          )
+    '';
   };
 
   mkTest = common.mkFragmentTest {
@@ -190,6 +321,16 @@ let
         before = "convergence";
         after = "outlier";
         msg = "outlier needs convergence's samples for n_eff>=5";
+      }
+      {
+        before = "outlier";
+        after = "override-precedence";
+        msg = "override-precedence asserts SlaExplain on the synth-amdahl fit";
+      }
+      {
+        before = "override-precedence";
+        after = "seed-corpus";
+        msg = "seed-corpus exports synth-amdahl then resets it";
       }
     ];
   };
