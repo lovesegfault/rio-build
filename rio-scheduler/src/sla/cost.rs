@@ -535,6 +535,17 @@ pub async fn spot_price_poller(
     source: Option<HwCostSource>,
     shutdown: rio_common::signal::Token,
 ) {
+    // EC2 client built once. Same `from_env()` chain as
+    // `rio_common::s3::default_client` — IRSA in-cluster, profile/env
+    // locally. None when source≠Spot so non-live deploys don't pay the
+    // credential-chain probe.
+    let ec2 = if matches!(source, Some(HwCostSource::Spot)) {
+        Some(aws_sdk_ec2::Client::new(
+            &aws_config::from_env().load().await,
+        ))
+    } else {
+        None
+    };
     let mut tick = tokio::time::interval(Duration::from_secs(600));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -550,8 +561,8 @@ pub async fn spot_price_poller(
         // no await while holding one. CostTable is two small maps;
         // clone is cheap.
         let mut snap = cost.read().clone();
-        if matches!(source, Some(HwCostSource::Spot)) {
-            match poll_spot_once().await {
+        if let Some(ec2) = &ec2 {
+            match poll_spot_once(ec2).await {
                 Ok(obs) if !obs.is_empty() => snap.fold_prices(&obs, now_epoch()),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "spot-price poll failed; keeping previous"),
@@ -569,18 +580,126 @@ pub async fn spot_price_poller(
     }
 }
 
+/// Representative instance types per band for the spot-price poll. The
+/// 12-NodePool topology admits c/m/r families across gen 6-8; querying a
+/// few c+m `.large` shapes per band and taking the median gives a stable
+/// `$/vCPU·hr` (the per-vCPU price is near-flat across sizes within a
+/// family). Graviton + x86 are both included so a band-wide ARM
+/// discount (or x86 premium) shows up in the EMA.
+const BAND_INSTANCE_TYPES: &[&str] = &[
+    // Hi (gen8)
+    "c8g.large",
+    "m8g.large",
+    // Mid (gen7)
+    "c7a.large",
+    "c7g.large",
+    "m7a.large",
+    "m7g.large",
+    // Lo (gen6)
+    "c6a.large",
+    "c6g.large",
+    "m6a.large",
+    "m6g.large",
+];
+
+/// Map an EC2 instance type (`c7a.large`) to its [`Band`] via the
+/// generation digit in the family prefix. `None` for types outside gen
+/// 6-8 or unparseable shapes.
+fn band_of_instance_type(t: &str) -> Option<Band> {
+    let family = t.split('.').next()?;
+    let g = family.chars().find(|c| c.is_ascii_digit())?;
+    let g = &g.to_string()[..];
+    Band::ALL.into_iter().find(|b| b.generations().contains(&g))
+}
+
 /// One `DescribeSpotPriceHistory` round. Returns vCPU-normalized
 /// `$/vCPU·hr` per `(band, Cap::Spot)`.
 ///
-// TODO(ADR-023): live aws-sdk-ec2 wiring. The IRSA role + sdk client
-// builder mirror `rio_common::s3::default_client`; the call is
-// `describe_spot_price_history().instance_types([...]).product_
-// descriptions("Linux/UNIX")` filtered to the last hour, then
-// `price / vcpu_count` per type → median per band. Stubbed empty so
-// `source = Some(Spot)` degrades to seed prices until wired (the
-// solve still ranks; only the absolute $ is off).
-async fn poll_spot_once() -> anyhow::Result<HashMap<(Band, Cap), f64>> {
-    Ok(HashMap::new())
+/// Queries the last hour of `Linux/UNIX` spot-price history for
+/// [`BAND_INSTANCE_TYPES`], normalizes each row by its vCPU count
+/// (from `DescribeInstanceTypes`, cached for the process lifetime),
+/// then takes the per-band median. Median not mean: a single AZ's
+/// spot spike for one type shouldn't drag the whole band. On-demand
+/// prices stay seed-backed (no public on-demand API without
+/// `pricing:GetProducts`).
+async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Band, Cap), f64>> {
+    use aws_sdk_ec2::types::InstanceType;
+
+    // vCPU-count cache. Process-lifetime static: instance-type vCPU
+    // counts are immutable. One DescribeInstanceTypes round-trip on
+    // first poll, then never again.
+    static VCPU: tokio::sync::OnceCell<HashMap<String, f64>> = tokio::sync::OnceCell::const_new();
+    let vcpu = VCPU
+        .get_or_try_init(|| async {
+            let r = ec2
+                .describe_instance_types()
+                .set_instance_types(Some(
+                    BAND_INSTANCE_TYPES
+                        .iter()
+                        .map(|t| InstanceType::from(*t))
+                        .collect(),
+                ))
+                .send()
+                .await?;
+            anyhow::Ok(
+                r.instance_types()
+                    .iter()
+                    .filter_map(|it| {
+                        Some((
+                            it.instance_type()?.as_str().to_owned(),
+                            f64::from(it.v_cpu_info()?.default_v_cpus()?),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .await?;
+
+    // Spot history, last hour, all configured types, paginated. AWS
+    // returns one row per (type, AZ, price-change); a quiet hour can
+    // be empty for some types — those just drop out of the median.
+    let start = aws_sdk_ec2::primitives::DateTime::from_secs((now_epoch() - 3600.0) as i64);
+    let mut per_band: HashMap<Band, Vec<f64>> = HashMap::new();
+    let mut pages = ec2
+        .describe_spot_price_history()
+        .set_instance_types(Some(
+            BAND_INSTANCE_TYPES
+                .iter()
+                .map(|t| InstanceType::from(*t))
+                .collect(),
+        ))
+        .product_descriptions("Linux/UNIX")
+        .start_time(start)
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.try_next().await? {
+        for row in page.spot_price_history() {
+            let Some(t) = row.instance_type().map(|t| t.as_str()) else {
+                continue;
+            };
+            let Some(band) = band_of_instance_type(t) else {
+                continue;
+            };
+            let Some(v) = vcpu.get(t).copied().filter(|v| *v > 0.0) else {
+                continue;
+            };
+            let Some(price) = row.spot_price().and_then(|p| p.parse::<f64>().ok()) else {
+                continue;
+            };
+            per_band.entry(band).or_default().push(price / v);
+        }
+    }
+
+    Ok(per_band
+        .into_iter()
+        .filter_map(|(b, mut xs)| {
+            if xs.is_empty() {
+                return None;
+            }
+            xs.sort_by(|a, b| a.total_cmp(b));
+            Some(((b, Cap::Spot), xs[xs.len() / 2]))
+        })
+        .collect())
 }
 
 impl HwTable {
@@ -656,6 +775,70 @@ mod tests {
         assert_eq!(band_of_hw_class("amd-6-ebs"), Some(Band::Lo));
         assert_eq!(band_of_hw_class("aws-5-ebs"), None);
         assert_eq!(band_of_hw_class("unknown-unknown-ebs"), None);
+    }
+
+    #[test]
+    fn band_of_instance_type_parses_generation() {
+        assert_eq!(band_of_instance_type("c8g.large"), Some(Band::Hi));
+        assert_eq!(band_of_instance_type("m7a.2xlarge"), Some(Band::Mid));
+        assert_eq!(band_of_instance_type("c6i.large"), Some(Band::Lo));
+        assert_eq!(band_of_instance_type("c5.large"), None);
+        assert_eq!(band_of_instance_type("garbage"), None);
+        // Every configured type maps to a band.
+        for t in BAND_INSTANCE_TYPES {
+            assert!(band_of_instance_type(t).is_some(), "{t} unmapped");
+        }
+    }
+
+    /// `poll_spot_once`: per-band median of `price/vCPU` over the
+    /// returned history. Mock both EC2 calls; assert the median pick
+    /// (not mean — the 0.10 outlier for Mid is ignored).
+    #[tokio::test]
+    async fn poll_spot_once_median_per_band() {
+        use aws_sdk_ec2::types::{InstanceTypeInfo, SpotPrice, VCpuInfo};
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        type Ec2 = aws_sdk_ec2::Client;
+
+        let it = |name: &str, vcpu: i32| {
+            InstanceTypeInfo::builder()
+                .instance_type(name.into())
+                .v_cpu_info(VCpuInfo::builder().default_v_cpus(vcpu).build())
+                .build()
+        };
+        let sp = |name: &str, price: &str| {
+            SpotPrice::builder()
+                .instance_type(name.into())
+                .spot_price(price)
+                .build()
+        };
+        let types = mock!(Ec2::describe_instance_types).then_output(move || {
+            aws_sdk_ec2::operation::describe_instance_types::DescribeInstanceTypesOutput::builder()
+                .instance_types(it("c8g.large", 2))
+                .instance_types(it("c7a.large", 2))
+                .instance_types(it("m7a.large", 4))
+                .build()
+        });
+        let history = mock!(Ec2::describe_spot_price_history).then_output(move || {
+            aws_sdk_ec2::operation::describe_spot_price_history::DescribeSpotPriceHistoryOutput::builder()
+                // Hi: one sample → 0.04/2 = 0.02.
+                .spot_price_history(sp("c8g.large", "0.0400"))
+                // Mid: three samples → median of [0.03/2, 0.05/2, 0.40/4]
+                // = median of [0.015, 0.025, 0.10] = 0.025.
+                .spot_price_history(sp("c7a.large", "0.0300"))
+                .spot_price_history(sp("c7a.large", "0.0500"))
+                .spot_price_history(sp("m7a.large", "0.4000"))
+                // Unparseable price + unknown type: dropped.
+                .spot_price_history(sp("c7a.large", "n/a"))
+                .spot_price_history(sp("c5.large", "0.0100"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, &[&types, &history]);
+
+        let obs = poll_spot_once(&client).await.unwrap();
+        assert_eq!(obs.len(), 2, "Lo had no rows → absent");
+        assert!((obs[&(Band::Hi, Cap::Spot)] - 0.02).abs() < 1e-9);
+        assert!((obs[&(Band::Mid, Cap::Spot)] - 0.025).abs() < 1e-9);
+        assert!(!obs.contains_key(&(Band::Lo, Cap::Spot)));
     }
 
     #[test]

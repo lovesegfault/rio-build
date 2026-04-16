@@ -1339,7 +1339,8 @@
         "default",
         "default-https-client",
         "rt-tokio",
-        "rustls"
+        "rustls",
+        "test-util"
       ],
       "libCrateTypes": [
         "lib"
@@ -20868,6 +20869,14 @@
           "packageId": "anyhow"
         },
         {
+          "name": "aws-config",
+          "packageId": "aws-config"
+        },
+        {
+          "name": "aws-sdk-ec2",
+          "packageId": "aws-sdk-ec2"
+        },
+        {
           "name": "aws-sdk-s3",
           "packageId": "aws-sdk-s3"
         },
@@ -21021,6 +21030,10 @@
         }
       ],
       "devDependencies": [
+        {
+          "name": "aws-sdk-ec2",
+          "packageId": "aws-sdk-ec2"
+        },
         {
           "name": "aws-sdk-s3",
           "packageId": "aws-sdk-s3"
@@ -30116,6 +30129,10 @@
         {
           "name": "aws-lc-rs",
           "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "aws-sdk-ec2",
+          "packageId": "aws-sdk-ec2"
         },
         {
           "name": "aws-sdk-s3",

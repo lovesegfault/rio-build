@@ -6507,6 +6507,8 @@ name = "rio-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-ec2",
  "aws-sdk-s3",
  "aws-smithy-mocks",
  "base64",
@@ -9447,6 +9449,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "aws-lc-rs",
+ "aws-sdk-ec2",
  "aws-sdk-s3",
  "aws-sdk-sts",
  "aws-smithy-http-client",
