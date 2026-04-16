@@ -460,83 +460,60 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Size-class snapshot
+// Spawn-intent snapshot (D5)
 // ---------------------------------------------------------------------------
 
-/// `compute_size_class_snapshot` returns configured cutoffs from the
-/// initial `with_size_classes()` call, even after a rebalancer-style
-/// mutation to `size_classes.cutoff_secs`. Drift visibility is the
-/// whole point of `configured_cutoff_secs` — without it, operators
-/// can't tell if the rebalancer converged or drifted.
-#[tokio::test]
-async fn size_class_snapshot_preserves_configured_after_rebalance() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 1800.0)]);
+use crate::actor::SpawnIntentsRequest;
 
-    // Simulate a rebalancer pass: mutate effective cutoffs in-place.
-    {
-        let mut g = actor.sizing.size_classes.write();
-        g[0].cutoff_secs = 75.3;
-        g[1].cutoff_secs = 2100.0;
+fn req_features(f: Option<&[&str]>) -> SpawnIntentsRequest {
+    SpawnIntentsRequest {
+        features: f.map(|v| v.iter().map(|s| s.to_string()).collect()),
+        ..Default::default()
     }
-
-    let snap = actor.compute_size_class_snapshot(None);
-    assert_eq!(snap.len(), 2);
-
-    // Sorted by effective cutoff ascending.
-    assert_eq!(snap[0].name, "small");
-    assert_eq!(snap[0].effective_cutoff_secs, 75.3);
-    assert_eq!(
-        snap[0].configured_cutoff_secs, 60.0,
-        "configured must survive rebalancer mutation"
-    );
-    assert_eq!(snap[1].name, "large");
-    assert_eq!(snap[1].effective_cutoff_secs, 2100.0);
-    assert_eq!(snap[1].configured_cutoff_secs, 1800.0);
-
-    // Empty DAG → all counts zero.
-    assert_eq!(snap[0].queued, 0);
-    assert_eq!(snap[0].running, 0);
-    assert_eq!(snap[1].queued, 0);
-    assert_eq!(snap[1].running, 0);
 }
 
-/// Feature off: `with_size_classes(vec![])` → snapshot is empty Vec.
-/// The admin handler maps this to an empty response (not an error).
+/// Static-mode gate: `[sla]` absent → `intents` is empty (the
+/// controller stays on the scalar `spawn_n` path), but
+/// `queued_by_system` is still populated (the ComponentScaler reads
+/// it).
 #[tokio::test]
-async fn size_class_snapshot_empty_when_unconfigured() {
+async fn spawn_intents_empty_when_sla_unconfigured() {
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = bare_actor(db.pool.clone());
-    let snap = actor.compute_size_class_snapshot(None);
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("a", None, "x86_64-linux");
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
     assert!(
-        snap.is_empty(),
-        "unconfigured size-classes → empty snapshot"
+        snap.intents.is_empty(),
+        "[sla] absent → empty intents (Static-mode gate)"
+    );
+    assert_eq!(
+        snap.queued_by_system.get("x86_64-linux"),
+        Some(&1),
+        "queued_by_system populated regardless"
     );
 }
 
-/// I-176: `pool_features` filters Ready derivations by
-/// `required_features ⊆ pool_features` — the same subset check
-/// `rejection_reason()` applies. A kvm derivation classified as `tiny`
-/// (trivial runCommand wrapper) MUST count toward the kvm pool's view
-/// and MUST NOT count toward a featureless pool's view, regardless of
-/// which class `classify()` puts it in. Without this, the featureless
-/// pool spawns a builder that hard_filter rejects (`feature-missing`),
-/// and the kvm pool reads `queued{its_class}=0` and never spawns —
-/// deadlock.
+/// I-176: `features` filters Ready derivations by
+/// `required_features ⊆ features` — the same subset check
+/// `rejection_reason()` applies. A kvm derivation MUST appear in the
+/// kvm pool's view and MUST NOT appear in a featureless pool's view.
+/// Without this, the featureless pool spawns a builder that
+/// hard_filter rejects (`feature-missing`), and the kvm pool sees
+/// nothing and never spawns — deadlock.
 ///
 /// I-181: feature-gated pools (`pf ≠ ∅`) additionally exclude
 /// ∅-feature derivations. ∅ ⊆ anything is vacuously true, so the
 /// subset check alone would have the kvm pool spawn for `hello` —
 /// dispatch routes it to the cheap featureless pool, the kvm builder
 /// idles until activeDeadlineSeconds.
-// r[verify sched.sizeclass.feature-filter+2]
+// r[verify sched.admin.spawn-intents.feature-filter]
+// r[verify ctrl.pool.per-feature-class-depth]
 #[tokio::test]
-async fn size_class_snapshot_feature_filter() {
+async fn spawn_intents_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("tiny", 60.0), ("xlarge", 3600.0)]);
+    let mut actor = bare_actor_sla(db.pool.clone());
 
-    // 3 Ready derivations, all classify as `tiny` (no estimator
-    // samples → est_duration=None → smallest class):
+    // 3 Ready derivations:
     //   a: required_features=[]             — featureless work
     //   b: required_features=["kvm"]        — needs kvm
     //   c: required_features=["kvm","nixos-test"] — the I-176 trigger
@@ -544,25 +521,27 @@ async fn size_class_snapshot_feature_filter() {
     actor.test_inject_ready_with_features("b", None, "x86_64-linux", &["kvm"]);
     actor.test_inject_ready_with_features("c", None, "x86_64-linux", &["kvm", "nixos-test"]);
 
-    // --- Unfiltered (None): backward compat — counts all 3. ---
-    let snap = actor.compute_size_class_snapshot(None);
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
-    assert_eq!(tiny.queued, 3, "unfiltered: all 3 Ready in tiny");
+    // --- Unfiltered (None): backward compat — emits all 3. ---
+    let snap = actor.compute_spawn_intents(&req_features(None));
+    assert_eq!(snap.intents.len(), 3, "unfiltered: all 3 Ready emitted");
     assert_eq!(
-        tiny.queued_by_system.get("x86_64-linux").copied(),
-        Some(3),
-        "per-system breakdown matches scalar"
+        snap.queued_by_system.get("x86_64-linux"),
+        Some(&3),
+        "queued_by_system unfiltered"
     );
 
     // --- Featureless pool (Some([])): only `a` passes. ---
     // `[] ⊆ []` ✓; `["kvm"] ⊆ []` ✗; `["kvm","nixos-test"] ⊆ []` ✗.
-    let snap = actor.compute_size_class_snapshot(Some(&[]));
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let snap = actor.compute_spawn_intents(&req_features(Some(&[])));
     assert_eq!(
-        tiny.queued, 1,
+        snap.intents.len(),
+        1,
         "featureless pool: kvm derivations excluded → no wasted spawn"
     );
-    assert_eq!(tiny.queued_by_system.get("x86_64-linux").copied(), Some(1));
+    assert_eq!(snap.intents[0].intent_id, "a");
+    assert!(snap.intents[0].required_features.is_empty());
+    // queued_by_system is filter-independent (ComponentScaler reads it).
+    assert_eq!(snap.queued_by_system.get("x86_64-linux"), Some(&3));
 
     // --- kvm pool (Some(["kvm","nixos-test","big-parallel"])): b+c. ---
     // I-181: `a` (∅-feature) is EXCLUDED — featureless pool owns it.
@@ -570,14 +549,13 @@ async fn size_class_snapshot_feature_filter() {
     // The load-bearing assertion: `b`+`c` are visible — without this
     // the kvm pool never spawns (I-176). `a` invisible — without THAT
     // the kvm pool spawns a phantom .metal builder for `hello` (I-181).
-    let kvm_pf: Vec<String> = ["kvm", "nixos-test", "big-parallel"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-    let snap = actor.compute_size_class_snapshot(Some(&kvm_pf));
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let snap =
+        actor.compute_spawn_intents(&req_features(Some(&["kvm", "nixos-test", "big-parallel"])));
+    let ids: std::collections::HashSet<_> =
+        snap.intents.iter().map(|i| i.intent_id.as_str()).collect();
     assert_eq!(
-        tiny.queued, 2,
+        ids,
+        ["b", "c"].into(),
         "I-181: kvm pool counts feature-required work only (b+c, NOT a)"
     );
 
@@ -586,60 +564,49 @@ async fn size_class_snapshot_feature_filter() {
     // (`["kvm","nixos-test"] ⊆ ["kvm"]` is false — `nixos-test`
     // missing). Mirrors hard_filter exactly: a kvm-only worker can't
     // build a derivation that also needs nixos-test.
-    let kvm_only: Vec<String> = vec!["kvm".into()];
-    let snap = actor.compute_size_class_snapshot(Some(&kvm_only));
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let snap = actor.compute_spawn_intents(&req_features(Some(&["kvm"])));
     assert_eq!(
-        tiny.queued, 1,
+        snap.intents.len(),
+        1,
         "kvm-only pool: ∅-feature (I-181) and nixos-test (I-176) both excluded"
     );
-
-    // xlarge stays 0 in all views — feature filtering doesn't move
-    // derivations between classes (classify() is feature-blind by
-    // design; the controller's cross-class sum handles overflow).
-    let xlarge = snap.iter().find(|s| s.name == "xlarge").unwrap();
-    assert_eq!(xlarge.queued, 0);
+    assert_eq!(snap.intents[0].intent_id, "b");
 }
 
 /// I-181 isolation: ONE ∅-feature derivation Ready. kvm pool's view
-/// MUST be 0 (featureless pool owns it); featureless pool's view MUST
-/// be 1. Regression: `rsb hello-shallow` (no required_features) spawned
-/// both `x86-64-medium` AND `x86-64-kvm-xlarge` — the subset check
-/// `∅ ⊆ ["kvm",...]` is vacuously true → kvm pool counted it →
-/// controller spawned a .metal instance that idled until deadline.
-// r[verify sched.sizeclass.feature-filter+2]
+/// MUST be empty (featureless pool owns it); featureless pool's view
+/// MUST contain it. Regression: `rsb hello-shallow` (no
+/// required_features) spawned both `x86-64-medium` AND
+/// `x86-64-kvm-xlarge` — the subset check `∅ ⊆ ["kvm",...]` is
+/// vacuously true → kvm pool counted it → controller spawned a .metal
+/// instance that idled until deadline.
+// r[verify sched.admin.spawn-intents.feature-filter]
 #[tokio::test]
-async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
+async fn spawn_intents_kvm_pool_excludes_featureless_work() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("medium", 600.0)]);
+    let mut actor = bare_actor_sla(db.pool.clone());
 
     // Single Ready derivation, required_features = ∅ (e.g., hello).
     actor.test_inject_ready("hello", None, "x86_64-linux");
 
-    // kvm pool query → 0. The bug: pre-I-181 this was 1.
-    let kvm: Vec<String> = vec!["kvm".into()];
-    let snap = actor.compute_size_class_snapshot(Some(&kvm));
-    assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
-        0,
+    // kvm pool query → empty. The bug: pre-I-181 this was 1.
+    let snap = actor.compute_spawn_intents(&req_features(Some(&["kvm"])));
+    assert!(
+        snap.intents.is_empty(),
         "I-181: feature-gated pool MUST NOT count ∅-feature work"
     );
 
     // Featureless pool query → 1. The featureless pool owns it.
-    let snap = actor.compute_size_class_snapshot(Some(&[]));
+    let snap = actor.compute_spawn_intents(&req_features(Some(&[])));
     assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        snap.intents.len(),
         1,
         "featureless pool owns ∅-feature work"
     );
 
     // Unfiltered (None) → 1. CLI/status display still sees everything.
-    let snap = actor.compute_size_class_snapshot(None);
-    assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
-        1,
-        "None = no filter (CLI back-compat)"
-    );
+    let snap = actor.compute_spawn_intents(&req_features(None));
+    assert_eq!(snap.intents.len(), 1, "None = no filter (CLI back-compat)");
 }
 
 /// I-204: `soft_features` strips capability-hint features at DAG
@@ -653,12 +620,12 @@ async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
 /// derivation enters the DAG as ∅-feature and I-181 fires.
 // r[verify sched.dispatch.soft-features]
 #[tokio::test]
-async fn size_class_snapshot_soft_features_strip() {
+async fn spawn_intents_soft_features_strip() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            size_classes: size_classes(&[("medium", 600.0)]),
+            sla: Some(test_sla_config()),
             soft_features: vec![crate::assignment::SoftFeature {
                 name: "big-parallel".into(),
                 floor_hint: None,
@@ -670,22 +637,28 @@ async fn size_class_snapshot_soft_features_strip() {
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     actor.test_inject_ready_with_features("vm", None, "x86_64-linux", &["kvm", "big-parallel"]);
 
-    // Featureless pool: counts ff (stripped → ∅), NOT vm (stripped →
+    // Featureless pool: emits ff (stripped → ∅), NOT vm (stripped →
     // {kvm}, fails subset check vs []).
-    let snap = actor.compute_size_class_snapshot(Some(&[]));
+    let snap = actor.compute_spawn_intents(&req_features(Some(&[])));
     assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
-        1,
+        snap.intents
+            .iter()
+            .map(|i| &i.intent_id)
+            .collect::<Vec<_>>(),
+        vec!["ff"],
         "I-204: featureless pool owns big-parallel-only work after strip"
     );
 
-    // kvm pool: counts vm (stripped → {kvm} ⊆ pf), NOT ff (stripped → ∅,
+    // kvm pool: emits vm (stripped → {kvm} ⊆ pf), NOT ff (stripped → ∅,
     // I-181 ∅-guard fires).
-    let kvm: Vec<String> = vec!["kvm".into(), "nixos-test".into(), "big-parallel".into()];
-    let snap = actor.compute_size_class_snapshot(Some(&kvm));
+    let kvm = req_features(Some(&["kvm", "nixos-test", "big-parallel"]));
+    let snap = actor.compute_spawn_intents(&kvm);
     assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
-        1,
+        snap.intents
+            .iter()
+            .map(|i| &i.intent_id)
+            .collect::<Vec<_>>(),
+        vec!["vm"],
         "I-204: kvm pool excludes big-parallel-only work, keeps kvm work"
     );
 
@@ -695,10 +668,9 @@ async fn size_class_snapshot_soft_features_strip() {
     // DerivationDag::new()` reset it to empty before the first merge.
     actor.clear_persisted_state();
     actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
-    let snap = actor.compute_size_class_snapshot(Some(&kvm));
-    assert_eq!(
-        snap.iter().find(|s| s.name == "medium").unwrap().queued,
-        0,
+    let snap = actor.compute_spawn_intents(&kvm);
+    assert!(
+        snap.intents.is_empty(),
         "I-204: soft_features survives clear_persisted_state (leader transition)"
     );
 }
@@ -861,192 +833,150 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
-/// P0556 (D4 transitional): `compute_fod_size_class_snapshot` buckets
-/// all in-flight FODs to the smallest class (class-name floor removed).
-/// Σ queued == `queued_fod_derivations` so the per-class signal and
-/// the flat signal agree. Phase 6 deletes this snapshot.
+/// D2/D5: FODs and non-FODs go through the SAME `compute_spawn_intents`
+/// path; `intent.kind` carries the ADR-019 boundary. `kind=Builder`
+/// excludes FODs; `kind=Fetcher` excludes non-FODs; unfiltered emits
+/// both. I-143: `systems` filter excludes other-arch derivations.
+// r[verify sched.admin.spawn-intents.feature-filter]
+// r[verify ctrl.pool.per-system-class-depth]
+// r[verify ctrl.fetcherpool.spawn-builtin]
 #[tokio::test]
-async fn fod_size_class_snapshot_buckets_to_smallest() {
+async fn spawn_intents_kind_and_system_filter() {
+    use rio_proto::types::ExecutorKind;
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: size_classes(&[("tiny", 30.0), ("small", 3600.0)]),
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor_sla(db.pool.clone());
 
-    // D4: class-name floor removed; all FODs bucket to smallest until
-    // Phase 6 (D2/D5) deletes this snapshot entirely.
-    for h in ["f1", "f2", "f3", "f4", "f5", "f6"] {
-        actor.test_inject_ready_fod(h, "x86_64-linux");
-    }
-    // Non-FOD: ignored.
-    actor.test_inject_ready("nonfod", None, "x86_64-linux");
+    actor.test_inject_ready("build-x86", None, "x86_64-linux");
+    actor.test_inject_ready("build-arm", None, "aarch64-linux");
+    actor.test_inject_ready_fod("fod-x86", "x86_64-linux");
+    actor.test_inject_ready_fod("fod-builtin", "builtin");
 
-    let fod = actor.compute_fod_size_class_snapshot();
-    assert_eq!(fod.len(), 2);
-    assert_eq!(fod[0].name, "tiny", "config order preserved");
-    assert_eq!(fod[0].queued, 6, "D4: all FODs bucket to smallest");
-    assert_eq!(fod[0].queued_by_system.get("x86_64-linux"), Some(&6));
-    assert_eq!(fod[1].name, "small");
-    assert_eq!(fod[1].queued, 0);
-    assert_eq!(fod[0].running, 0);
+    let ids = |s: &crate::actor::SpawnIntentsSnapshot| -> std::collections::HashSet<String> {
+        s.intents.iter().map(|i| i.intent_id.clone()).collect()
+    };
 
-    // Σ across classes == flat queued_fod_derivations (the invariant
-    // the controller's flat-fallback relies on).
-    let cluster = actor.compute_cluster_snapshot();
+    // Unfiltered: all four. Kinds tagged.
+    let all = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
     assert_eq!(
-        fod.iter().map(|s| s.queued).sum::<u64>(),
-        cluster.queued_fod_derivations as u64
+        all.intents.len(),
+        4,
+        "D2: FOD and non-FOD both emit intents"
+    );
+    assert_eq!(
+        all.intents
+            .iter()
+            .find(|i| i.intent_id == "fod-x86")
+            .map(|i| i.kind),
+        Some(ExecutorKind::Fetcher.into())
+    );
+    assert_eq!(
+        all.intents
+            .iter()
+            .find(|i| i.intent_id == "build-x86")
+            .map(|i| i.kind),
+        Some(ExecutorKind::Builder.into())
     );
 
-    // Feature off → empty.
-    let actor = bare_actor(db.pool.clone());
-    assert!(actor.compute_fod_size_class_snapshot().is_empty());
+    // kind=Builder → builds only.
+    let b = actor.compute_spawn_intents(&SpawnIntentsRequest {
+        kind: Some(ExecutorKind::Builder),
+        ..Default::default()
+    });
+    assert_eq!(ids(&b), ["build-x86".into(), "build-arm".into()].into());
+
+    // kind=Fetcher + systems=[x86_64-linux, builtin] → fod-x86 +
+    // fod-builtin (the controller always appends `builtin`).
+    let f = actor.compute_spawn_intents(&SpawnIntentsRequest {
+        kind: Some(ExecutorKind::Fetcher),
+        systems: vec!["x86_64-linux".into(), "builtin".into()],
+        ..Default::default()
+    });
+    assert_eq!(ids(&f), ["fod-x86".into(), "fod-builtin".into()].into());
+
+    // I-143: systems=[aarch64-linux] → build-arm only (kind unfiltered;
+    // FODs are x86/builtin so excluded).
+    let arm = actor.compute_spawn_intents(&SpawnIntentsRequest {
+        systems: vec!["aarch64-linux".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        ids(&arm),
+        ["build-arm".into()].into(),
+        "I-143: x86 pool doesn't see aarch64 backlog and vice-versa"
+    );
+    // queued_by_system is filter-independent.
+    assert_eq!(arm.queued_by_system.get("x86_64-linux"), Some(&2));
+    assert_eq!(arm.queued_by_system.get("aarch64-linux"), Some(&1));
+    assert_eq!(arm.queued_by_system.get("builtin"), Some(&1));
 }
 
-/// `queued` counts Ready-status derivations that classify() into each
-/// class; `running` counts Assigned/Running by `assigned_size_class`.
-/// Verifies the full end-to-end actor path (merge → Ready → queued
-/// shows up; dispatch → Assigned → running shows up, queued drops).
+/// End-to-end actor path: merge → Ready → intent shows up; dispatch →
+/// Assigned → intent drops (only Ready emits intents). Also covers
+/// `solve_intent_for`'s `deadline_secs` clamp:
+/// `min(max(computed, floor.deadline), DEADLINE_CAP_SECS)`.
+// r[verify sched.admin.spawn-intents]
 #[tokio::test]
-async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
-    // est_duration defaults to 60.0 (DEFAULT_DURATION_SECS; unfitted
-    // SLA key) → classify() routes to the smallest class = small.
-    let (_db, handle, _task) = setup_with_classes(&[("small", 60.0), ("large", 3600.0)]).await;
+async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
+    let (_db, handle, _task) = setup_with_sla().await;
 
     // Merge 3 single-node DAGs. All three → Ready immediately (no
-    // deps). No workers connected yet → they stay queued.
+    // deps). No workers connected yet → all 3 emit intents.
     for tag in ["a", "b", "c"] {
         let _rx = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
     }
 
-    // Snapshot before dispatch: 3 queued in small (est_dur=0 →
-    // smallest covering class), 0 running.
-    let (snap, _fod) = handle
+    let snap = handle
         .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
-                pool_features: None,
+            ActorCommand::Admin(AdminQuery::GetSpawnIntents {
+                req: SpawnIntentsRequest::default(),
                 reply,
             })
         })
         .await?;
-    assert_eq!(snap.len(), 2);
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
-    assert_eq!(small.queued, 3, "three merged-and-ready derivations");
-    assert_eq!(small.running, 0);
-    // I-143: per-system breakdown sums to scalar (all 3 are x86_64
-    // via merge_single_node).
-    assert_eq!(small.queued_by_system.get("x86_64-linux"), Some(&3));
-    assert_eq!(small.queued_by_system.values().sum::<u64>(), small.queued);
-    assert!(small.running_by_system.is_empty());
-    let large = snap.iter().find(|s| s.name == "large").unwrap();
-    assert_eq!(large.queued, 0);
-    assert_eq!(large.running, 0);
+    assert_eq!(snap.intents.len(), 3, "three merged-and-ready derivations");
+    assert_eq!(snap.queued_by_system.get("x86_64-linux"), Some(&3));
+    // O3: deadline_secs = min(max(computed, floor.deadline_secs),
+    // DEADLINE_CAP_SECS). Unfitted (no SlaEstimator entry) ⇒
+    // computed = `[sla].probe.deadline_secs`; floor=0 (never bumped);
+    // cap = 86400. Result == probe default.
+    let probe = crate::sla::config::default_probe_deadline_secs();
+    for i in &snap.intents {
+        assert_eq!(
+            i.deadline_secs, probe,
+            "unfitted ⇒ deadline_secs == probe default; cap not engaged"
+        );
+        assert!(i.deadline_secs <= crate::actor::floor::DEADLINE_CAP_SECS);
+    }
 
-    // Connect a small worker. Heartbeat triggers dispatch_ready →
-    // one derivation moves to Assigned (one build per pod).
+    // Connect a worker. Heartbeat triggers dispatch_ready → one
+    // derivation moves to Assigned (one build per pod) → drops out of
+    // the intent stream.
     let (tx, mut rx) = mpsc::channel(16);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: "w-small".into(),
+            executor_id: "w0".into(),
             stream_tx: tx,
         })
         .await?;
-    send_heartbeat_with(&handle, "w-small", "x86_64-linux", |hb| {
-        hb.size_class = Some("small".into());
-    })
-    .await?;
-    // I-163: Heartbeat sets dispatch_dirty; Tick drains it.
+    send_heartbeat_with(&handle, "w0", "x86_64-linux", |_| {}).await?;
     handle.send_unchecked(ActorCommand::Tick).await?;
-
-    // Drain the one assignment the worker receives (serializes with
-    // the actor loop so the snapshot below sees the post-dispatch
-    // state).
     let _assignment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("assignment within 5s")
         .expect("assignment not dropped");
 
-    let (snap, _fod) = handle
+    let snap = handle
         .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
-                pool_features: None,
+            ActorCommand::Admin(AdminQuery::GetSpawnIntents {
+                req: SpawnIntentsRequest::default(),
                 reply,
             })
         })
         .await?;
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
     assert_eq!(
-        small.queued, 2,
-        "one dispatched → two still Ready (one build per pod)"
-    );
-    assert_eq!(small.running, 1, "one Assigned to w-small");
-    assert_eq!(small.running_by_system.get("x86_64-linux"), Some(&1));
-    assert_eq!(small.running_by_system.values().sum::<u64>(), small.running);
-
-    Ok(())
-}
-
-/// I-146: a Ready derivation with NO estimator data (cold-start —
-/// pname not in build_history, peak_mem/cpu=None) MUST count in the
-/// smallest size-class's `queued`, never vanish. If it vanishes the
-/// controller sees queued=0 across all pools → scales every pool to 0
-/// → 1870 cold-start drvs sit in ready_queue with no workers and
-/// dispatch deadlocks. Also: FODs are NOT counted in any size-class
-/// (they dispatch to fetchers, not size-class builders — ADR-019).
-#[tokio::test]
-async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> TestResult {
-    // Classes deliberately UNSORTED so the smallest-class fallback
-    // can't accidentally rely on index 0 being smallest.
-    let (_db, handle, _task) = setup_with_classes(&[("large", 3600.0), ("tiny", 60.0)]).await;
-
-    // Two non-FOD nodes with pnames the (empty) SLA cache has never
-    // seen → est_duration falls back to DEFAULT_DURATION_SECS (60s)
-    // → classify() picks smallest covering class = tiny. One FOD
-    // node → must NOT appear in any size-class queued.
-    let mut fod = make_node("cold-fod");
-    fod.is_fixed_output = true;
-    let _rx = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("cold-a"), make_node("cold-b"), fod],
-        vec![],
-        false,
-    )
-    .await?;
-
-    let (snap, _fod) = handle
-        .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
-                pool_features: None,
-                reply,
-            })
-        })
-        .await?;
-    assert_eq!(snap.len(), 2);
-
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
-    let large = snap.iter().find(|s| s.name == "large").unwrap();
-
-    // Cold-start non-FODs land in the smallest class. FOD excluded.
-    assert_eq!(
-        tiny.queued, 2,
-        "cold-start non-FOD drvs must count in the smallest class \
-         (controller needs non-zero queued to spawn workers)"
-    );
-    assert_eq!(tiny.queued_by_system.get("x86_64-linux"), Some(&2));
-    assert_eq!(large.queued, 0);
-
-    // Invariant: every Ready non-FOD is counted in exactly one class
-    // — sum across classes == Ready non-FOD count (2). The FOD (1) is
-    // NOT in any class's queued.
-    let total_queued: u64 = snap.iter().map(|s| s.queued).sum();
-    assert_eq!(
-        total_queued, 2,
-        "FOD must not be counted in size-class queued (goes to fetchers); \
-         every Ready non-FOD must be counted in exactly one class"
+        snap.intents.len(),
+        2,
+        "one dispatched → two still Ready (only Ready emits intents)"
     );
 
     Ok(())

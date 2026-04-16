@@ -98,7 +98,6 @@
         <th>kind</th>
         <th>status</th>
         <th>load</th>
-        <th>size class</th>
         <th>heartbeat</th>
         <th></th>
       </tr>
@@ -122,7 +121,6 @@
               data-testid="load-pill">{isBusy(e) ? 'busy' : 'idle'}</span
             >
           </td>
-          <td>{e.sizeClass || '—'}</td>
           <td class:stale data-testid="heartbeat-cell"
             >{fmtTsRel(e.lastHeartbeat, now)}</td
           >

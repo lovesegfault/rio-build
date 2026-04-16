@@ -1,7 +1,7 @@
 //! ComponentScaler reconciler: predictive store autoscaling with a
 //! learned `builders_per_replica` ratio.
 //!
-//! Reconcile (10s tick): poll scheduler `GetSizeClassStatus` →
+//! Reconcile (10s tick): poll scheduler `GetSpawnIntents` →
 //! `Σ(queued+running)` builders; poll each `loadEndpoint` pod's
 //! `StoreAdminService.GetLoad` → max `pg_pool_utilization`; feed
 //! both into `crate::scaling::component::decide`; patch the target
@@ -70,28 +70,21 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // ── Predictive: total builders (queued + running) ────────────
     let builders = match spec.signal {
         Signal::SchedulerBuilders => {
-            let resp = ctx.size_class_status().await.map_err(|e| {
+            let resp = ctx.spawn_intents().await.map_err(|e| {
                 Error::InvalidSpec(format!(
-                    "GetSizeClassStatus failed: {e}; check schedulerAddr / scheduler readiness"
+                    "GetSpawnIntents failed: {e}; check schedulerAddr / scheduler readiness"
                 ))
             })?;
-            // Empty classes = scheduler.sizeClasses not configured.
-            // Fall back to ClusterStatus.queued+running so a
-            // ComponentScaler on a single-class cluster still
-            // scales (rather than silently pinning at min). EKS
-            // always has sizeClasses (xtask deploy sets it); the
-            // fallback covers VM tests + bare deployments.
-            if resp.classes.is_empty() {
-                let cs = ctx.admin.clone().cluster_status(()).await.map_err(|e| {
-                    Error::InvalidSpec(format!(
-                        "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
-                    ))
-                })?;
-                let cs = cs.into_inner();
-                u64::from(cs.queued_derivations) + u64::from(cs.running_derivations)
-            } else {
-                component::total_builders(&resp)
-            }
+            // `queued_by_system` is Ready-only; add running so a
+            // builder mid-compile still weighs as a store-load source
+            // (FUSE reads, output PutPath).
+            let cs = ctx.admin.clone().cluster_status(()).await.map_err(|e| {
+                Error::InvalidSpec(format!(
+                    "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
+                ))
+            })?;
+            component::total_builders(&resp)
+                .saturating_add(u64::from(cs.into_inner().running_derivations))
         }
     };
 

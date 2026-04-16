@@ -407,15 +407,10 @@ impl DagActor {
     /// observed Pod-status before the gRPC stream broke at the
     /// scheduler — rare), fall back to the still-live executor's
     /// `running_build`.
-    ///
-    /// `_reported_class` is now unused (D4: floor is per-dimension
-    /// bytes, not class names) but kept in the wire shape until the
-    /// controller stops sending it (Phase 7).
     pub(super) async fn handle_executor_termination(
         &mut self,
         executor_id: &ExecutorId,
         reason: rio_proto::types::TerminationReason,
-        _reported_class: Option<&str>,
     ) -> bool {
         use rio_proto::types::TerminationReason as R;
 

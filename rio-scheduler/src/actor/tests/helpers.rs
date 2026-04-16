@@ -794,18 +794,51 @@ pub(crate) async fn report_termination(
     handle: &ActorHandle,
     id: &str,
     reason: rio_proto::types::TerminationReason,
-    size_class: Option<&str>,
 ) -> anyhow::Result<bool> {
     let promoted = handle
         .query_unchecked(|reply| ActorCommand::ReportExecutorTermination {
             executor_id: id.into(),
             reason,
-            size_class: size_class.map(String::from),
             reply,
         })
         .await?;
     barrier(handle).await;
     Ok(promoted)
+}
+
+/// Minimal `[sla]` config for tests that need `compute_spawn_intents`
+/// to emit (gated on `sla_config.is_some()`). One tier, probe = 4c.
+pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
+    use crate::sla::{config, solve};
+    config::SlaConfig {
+        tiers: vec![config::Tier {
+            name: "normal".into(),
+            p50: None,
+            p90: Some(1200.0),
+            p99: None,
+        }],
+        default_tier: "normal".into(),
+        probe: config::ProbeShape {
+            cpu: 4.0,
+            mem_per_core: 1 << 30,
+            mem_base: 4 << 30,
+            deadline_secs: 3600,
+        },
+        feature_probes: Default::default(),
+        max_cores: solve::DEFAULT_CEILINGS.max_cores,
+        max_mem: solve::DEFAULT_CEILINGS.max_mem,
+        max_disk: solve::DEFAULT_CEILINGS.max_disk,
+        default_disk: solve::DEFAULT_CEILINGS.default_disk,
+        fuse_cache_budget: 0,
+        log_budget: 0,
+        ring_buffer: 32,
+        halflife_secs: 7.0 * 86400.0,
+        seed_corpus: None,
+        hw_cost_source: None,
+        hw_softmax_temp: 0.0,
+        hw_fallback_after_secs: 120.0,
+        cluster: String::new(),
+    }
 }
 
 /// Build a `Vec<SizeClassConfig>` from `(name, cutoff_secs)` pairs with
@@ -838,7 +871,7 @@ pub(crate) async fn setup_with_classes(
 }
 
 /// Bare (unspawned) actor with builder size_classes. For snapshot tests
-/// that exercise `compute_size_class_snapshot` / `compute_capacity_manifest`
+/// that exercise `compute_spawn_intents` / `compute_capacity_manifest`
 /// directly via `&self`. Replaces 8× `bare_actor_cfg(pool,
 /// DagActorConfig{ size_classes: vec![...20 lines...], ..Default })`.
 pub(crate) fn bare_actor_classed(pool: sqlx::PgPool, pairs: &[(&str, f64)]) -> DagActor {
@@ -849,6 +882,29 @@ pub(crate) fn bare_actor_classed(pool: sqlx::PgPool, pairs: &[(&str, f64)]) -> D
             ..Default::default()
         },
     )
+}
+
+/// Bare (unspawned) actor with `[sla]` configured (default config).
+/// For `compute_spawn_intents` tests — intent emission is gated on
+/// `sla_config.is_some()`.
+pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
+    bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            sla: Some(test_sla_config()),
+            ..Default::default()
+        },
+    )
+}
+
+/// Bootstrap PG + spawned actor with `[sla]` configured. For
+/// end-to-end `GetSpawnIntents` tests via [`ActorHandle`].
+pub(crate) async fn setup_with_sla() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.sla = Some(test_sla_config())
+    });
+    (db, handle, task)
 }
 
 /// Recovery test fixture. Absorbs the 19× phase-1/phase-2 boilerplate

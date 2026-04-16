@@ -1,7 +1,7 @@
 //! BuilderPool reconciler: spawn/reap one-shot rio-builder Jobs.
 //!
 //! Reconcile flow:
-//! 1. Poll `ClusterStatus`/`GetSizeClassStatus` for queued depth.
+//! 1. Poll `GetSpawnIntents` for per-drv intents (or `ClusterStatus` under Static mode).
 //! 2. Spawn Jobs up to `spec.maxConcurrent` (see `jobs.rs`).
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch BuilderPool.status from active Job count.

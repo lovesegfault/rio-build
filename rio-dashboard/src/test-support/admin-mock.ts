@@ -60,7 +60,7 @@ export const adminMock = {
   getBuildGraph: vi
     .fn()
     .mockResolvedValue({ nodes: [], edges: [], truncated: false, totalNodes: 0 }),
-  getSizeClassStatus: vi.fn(),
+  getSpawnIntents: vi.fn(),
   reportExecutorTermination: vi.fn(),
   injectBuildSample: vi.fn(),
   setSlaOverride: vi.fn(),

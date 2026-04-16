@@ -1,28 +1,26 @@
 //! Read-only snapshot/inspect handlers on [`DagActor`]. All methods
 //! here are `&self` over the in-memory DAG/executors and back the admin
-//! RPCs (ClusterStatus, GetSizeClassStatus, InspectBuildDag,
+//! RPCs (ClusterStatus, GetSpawnIntents, InspectBuildDag,
 //! DebugListExecutors).
 
 use std::collections::HashMap;
 
+use rio_proto::types::ExecutorKind;
 use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus};
 
-use super::{AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SizeClassSnapshot, command};
+use super::{
+    AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
+    SpawnIntentsSnapshot, command,
+};
 
 impl DagActor {
     /// Dispatch a read-only [`AdminQuery`].
     pub(super) fn handle_admin(&self, q: AdminQuery) {
         match q {
-            AdminQuery::GetSizeClassSnapshot {
-                pool_features,
-                reply,
-            } => {
-                let _ = reply.send((
-                    self.compute_size_class_snapshot(pool_features.as_deref()),
-                    self.compute_fod_size_class_snapshot(),
-                ));
+            AdminQuery::GetSpawnIntents { req, reply } => {
+                let _ = reply.send(self.compute_spawn_intents(&req));
             }
             AdminQuery::GcRoots { reply } => {
                 let _ = reply.send(self.handle_gc_roots());
@@ -130,26 +128,12 @@ impl DagActor {
         // Running = Assigned | Running. Both mean "a worker slot is taken."
         // Assigned hasn't acked yet but the slot is reserved; for "how
         // busy are workers" they're equivalent.
-        //
-        // Queued-FOD: total in-flight FOD demand (Ready | Assigned |
-        // Running). This is the FetcherPool autoscaler signal. Ready-only
-        // (the pre-P0541 definition) undercounts: with N fetchers, the
-        // first N FODs go Ready→Assigned within one dispatch tick (~10s),
-        // so a 30s controller poll sees Ready=0 and never scales past N.
-        // Including Assigned+Running makes the signal match "pods I want"
-        // — same shape as `queued_derivations + running_derivations` for
-        // the BuilderPool scaler. The DAG iteration is the source —
-        // `ready_queue` is hash+priority only, no FOD bit.
         let mut running_derivations = 0u32;
-        let mut queued_fod_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
         for (_, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     running_derivations += 1;
-                    if s.is_fixed_output {
-                        queued_fod_derivations += 1;
-                    }
                 }
                 DerivationStatus::Ready => {
                     // I-107: per-system queued breakdown so per-arch
@@ -157,9 +141,6 @@ impl DagActor {
                     // to match `queued_derivations` (= ready_queue.len())
                     // semantics — sum across keys equals the scalar.
                     *queued_by_system.entry(s.system.clone()).or_default() += 1;
-                    if s.is_fixed_output {
-                        queued_fod_derivations += 1;
-                    }
                 }
                 _ => {}
             }
@@ -173,290 +154,143 @@ impl DagActor {
             active_builds,
             queued_derivations: self.ready_queue.len() as u32,
             running_derivations,
-            queued_fod_derivations,
             queued_by_system,
         }
     }
 
-    /// Compute per-size-class snapshot for `GetSizeClassStatus`.
+    /// Compute the flat per-derivation spawn-intent stream for
+    /// `AdminService.GetSpawnIntents` (D5).
     ///
-    /// Three passes:
-    /// 1. `size_classes.read()` → effective cutoffs (post-rebalancer)
-    /// 2. `configured_cutoffs` lookup → static TOML cutoffs
-    /// 3. Single `iter_nodes()` pass: for each derivation, increment
-    ///    the appropriate class's `queued` or `running` counter.
+    /// Single `iter_nodes()` pass: for each Ready derivation that
+    /// passes the request filter, run `solve_intent_for` and push one
+    /// `SpawnIntent`. FODs and non-FODs go through the SAME path (D2)
+    /// — `intent.kind` carries the ADR-019 boundary so the controller
+    /// can filter per-pool.
     ///
-    /// For **queued**: Ready-status derivations. They haven't been
-    /// dispatched yet so `assigned_size_class` is None. We call
-    /// `classify()` with the SAME inputs dispatch would use:
-    /// est_duration only — peaks stubbed `None` until Phase 6 deletes
-    /// classify(). This is a forecast, not a fact; acceptable for an
-    /// operator view.
+    /// O(dag_nodes) per call. Same cost order as
+    /// [`compute_cluster_snapshot`]; the autoscaler polls every ~10s so
+    /// even 10k Ready derivations is sub-ms.
     ///
-    /// For **running**: Assigned/Running derivations. Use
-    /// `assigned_size_class` directly — that's the class we ACTUALLY
-    /// routed to (may be larger than classify() would give if we
-    /// overflowed due to no capacity in the target class).
+    /// Intent emission is gated on `[sla]` configured: the controller's
+    /// `jobs.rs` branches on `intents.is_empty()` — Static mode ⇒
+    /// empty intents ⇒ the `spawn_n` scalar path stays in force.
     ///
-    /// O(dag_nodes + n_classes) per call. The classify() inside the
-    /// loop is O(n_classes) but n_classes is ~3-5. Total cost is
-    /// dominated by the node iteration, same as `compute_cluster_snapshot`.
+    /// `queued_by_system` is populated regardless of the
+    /// kind/feature filters (it's the same population as
+    /// `ClusterSnapshot.queued_by_system`) so the ComponentScaler reads
+    /// a coherent snapshot from the same RPC.
     ///
-    /// `pool_features`: I-176 feature filter. `None` = unfiltered.
-    /// `Some(f)` = only count Ready derivations whose
-    /// `required_features ⊆ f` — the same subset check
-    /// `rejection_reason()`'s `feature-missing` clause applies. The
-    /// controller passes `BuilderPool.spec.features` here so each
-    /// pool's spawn decision sees only derivations its workers could
-    /// accept.
-    // pub(crate) for the configured-vs-effective test (tests/misc.rs)
-    // which exercises it on a bare (unspawned) actor so it can mutate
-    // size_classes directly to simulate a rebalancer pass.
-    pub(crate) fn compute_size_class_snapshot(
-        &self,
-        pool_features: Option<&[String]>,
-    ) -> Vec<SizeClassSnapshot> {
-        // Take a read lock for the whole computation. Rebalancer
-        // writes hourly; contention is near-zero. Dropped at end of
-        // scope (no await in this fn).
-        let classes = self.sizing.size_classes.read();
-        if classes.is_empty() {
-            // Feature off — return empty. Handler maps to empty
-            // response which the CLI can render as "size-class
-            // routing disabled."
-            return Vec::new();
-        }
+    /// [`compute_cluster_snapshot`]: Self::compute_cluster_snapshot
+    // pub(crate) for the feature-filter tests (tests/misc.rs) which
+    // exercise it on a bare (unspawned) actor.
+    pub(crate) fn compute_spawn_intents(&self, req: &SpawnIntentsRequest) -> SpawnIntentsSnapshot {
+        let mut intents = Vec::new();
+        let mut queued_by_system: HashMap<String, u64> = HashMap::new();
+        let sla_on = self.sla_config.is_some();
 
-        // name → index into `snapshots`. classify() and
-        // assigned_size_class both return names, not indices.
-        let mut index: HashMap<String, usize> = HashMap::with_capacity(classes.len());
-        // I-146: index of the smallest-cutoff class. Fallback bucket
-        // for any Ready non-FOD that classify() somehow doesn't place
-        // — every dispatchable derivation MUST count in some class so
-        // the controller never sees queued=0 across all pools while
-        // ready_queue is non-empty (which would scale every pool to 0
-        // and deadlock dispatch). With the current classify() contract
-        // (always Some when classes non-empty) the fallback is
-        // unreachable; it's defensive against future classify changes
-        // and makes the "sum(queued) == Ready non-FOD count" invariant
-        // structural rather than incidental.
-        let mut smallest_idx = 0usize;
-        let mut snapshots: Vec<SizeClassSnapshot> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                index.insert(c.name.clone(), i);
-                if c.cutoff_secs < classes[smallest_idx].cutoff_secs {
-                    smallest_idx = i;
-                }
-                // configured_cutoffs lookup: linear scan is fine for
-                // ~3-5 classes. Falls back to effective if not found
-                // (shouldn't happen — both populated from the same
-                // config in DagActor::new, but defensive against a
-                // future config-reload path that forgets one).
-                let configured = self
-                    .sizing
-                    .configured_cutoffs
-                    .iter()
-                    .find(|(n, _)| n == &c.name)
-                    .map(|(_, cut)| *cut)
-                    .unwrap_or(c.cutoff_secs);
-                SizeClassSnapshot {
-                    name: c.name.clone(),
-                    effective_cutoff_secs: c.cutoff_secs,
-                    configured_cutoff_secs: configured,
-                    queued: 0,
-                    running: 0,
-                    queued_by_system: HashMap::new(),
-                    running_by_system: HashMap::new(),
-                    spawn_intents: Vec::new(),
-                }
-            })
-            .collect();
-
-        // Single pass: classify or look up per derivation.
         for (drv_hash, state) in self.dag.iter_nodes() {
-            match state.status() {
-                DerivationStatus::Ready => {
-                    // I-146: FODs dispatch to fetchers, NOT size-class
-                    // builders (find_executor_with_overflow skips the
-                    // overflow chain entirely for is_fixed_output —
-                    // ADR-019). Counting them here would inflate
-                    // builder-pool demand for work those builders will
-                    // never receive. The Running arm already excludes
-                    // FODs implicitly (assigned_size_class=None for FOD
-                    // dispatch); this makes Ready symmetric. FOD demand
-                    // is reported via ClusterSnapshot.queued_fod_
-                    // derivations → FetcherPool autoscaler.
-                    if state.is_fixed_output {
-                        continue;
-                    }
-                    // r[impl sched.sizeclass.feature-filter+2]
-                    // I-176: skip derivations a worker with
-                    // `pool_features` couldn't build. Mirrors the
-                    // `feature-missing` clause in rejection_reason()
-                    // — a kvm derivation never counts toward a
-                    // featureless pool's spawn decision (it would
-                    // spawn a builder that hard_filter rejects), and
-                    // a kvm pool sees kvm-required work even when
-                    // classify() buckets it into a class no kvm pool
-                    // owns. `None` = no filter (CLI, status display).
-                    if let Some(pf) = pool_features {
-                        // I-181: feature-gated pools (non-empty pf)
-                        // don't count featureless work — ∅ ⊆ anything
-                        // would over-spawn; the featureless pool owns
-                        // it. dispatch_ready's overflow walk tries the
-                        // cheapest pool first, so a kvm builder spawned
-                        // for ∅-feature work would idle until
-                        // activeDeadlineSeconds.
-                        if !pf.is_empty() && state.required_features.is_empty() {
-                            continue;
-                        }
-                        // I-176: subset check. Derivation needs a
-                        // feature this pool lacks → skip. ∅-pf
-                        // (featureless pool) passes only ∅-feature
-                        // derivations (all() over empty is vacuously
-                        // true, contains() over non-empty fails).
-                        if !state.required_features.iter().all(|f| pf.contains(f)) {
-                            continue;
-                        }
-                    }
-                    // Forecast: what class WOULD dispatch pick?
-                    // Same inputs as dispatch.rs — est_duration stored
-                    // on the state at merge time; peak_memory /
-                    // peak_cpu from the estimator. classify() is
-                    // contractually Some when classes is non-empty
-                    // (checked above), so the .and_then chain resolves;
-                    // .unwrap_or(smallest_idx) is the I-146 belt: if a
-                    // future classify() change introduces a None path,
-                    // the derivation lands in the smallest class
-                    // (matching dispatch's "any worker" semantics for
-                    // target_class=None) rather than vanishing from
-                    // every pool's queued count.
-                    let classify_idx = crate::assignment::classify(
-                        state.sched.est_duration,
-                        // Phase 6 deletes classify(); (None, None) degrades
-                        // to duration-only until then.
-                        None,
-                        None,
-                        &classes,
-                    )
-                    .and_then(|c| index.get(&c).copied())
-                    .unwrap_or(smallest_idx);
-                    // D4: class-name floor clamp removed; the reactive
-                    // `resource_floor` lives in `solve_intent_for`'s
-                    // mem/disk output below. Phase 6 deletes this
-                    // per-class snapshot path entirely (D5).
-                    let i = classify_idx;
-                    snapshots[i].queued += 1;
-                    // I-143: per-system breakdown so per-arch
-                    // size-class pools scale on their own backlog.
-                    *snapshots[i]
-                        .queued_by_system
-                        .entry(state.system.clone())
-                        .or_default() += 1;
-                    // r[impl sched.sla.intent-from-solve]
-                    // ADR-023: per-derivation SpawnIntent. intent_id is
-                    // the drv_hash itself — the controller stamps it on
-                    // the pod annotation, the builder echoes it on
-                    // heartbeat, dispatch matches `worker.intent_id ==
-                    // drv_hash` (find_executor_with_overflow). No
-                    // separate intent→drv map to keep in sync; if the
-                    // drv leaves Ready before the pod heartbeats, the
-                    // match misses and dispatch falls through to
-                    // pick-from-queue.
-                    //
-                    // Gated on `[sla]` configured: the controller's
-                    // `jobs.rs` reconcile branches on
-                    // `intents.is_empty()` — non-empty diverts to
-                    // `spawn_for_each` (per-drv pod resources from
-                    // `solve_intent_for`). Under Static sizing the
-                    // controller MUST stay on the `spawn_n` path (fixed
-                    // per-class `spec.resources`); emitting intents here
-                    // with `sla_config=None` sends 4-core/8-GiB fallback
-                    // probes that don't match any class shape, and the
-                    // `est_memory_bytes`/intent-reservation dispatch
-                    // gates have no symmetric spawn-side. Static mode ⇒
-                    // empty intents ⇒ exactly pre-ADR-023 behavior.
-                    if self.sla_config.is_some() {
-                        let (cores, mem_bytes, disk_bytes, deadline_secs, _, node_selector) =
-                            self.solve_intent_for(state.pname.as_deref(), state);
-                        // ADR-023 §2.8: arm the Pending-watch the FIRST
-                        // time a band-targeted selector is emitted for
-                        // this drv. or_insert keeps the original
-                        // timestamp across re-emits (snapshot runs each
-                        // tick). Band-agnostic intents don't enter the
-                        // ladder.
-                        if let Some((band, cap)) = crate::sla::cost::parse_selector(&node_selector)
-                        {
-                            self.pending_intents.entry(drv_hash.into()).or_insert((
-                                band,
-                                cap,
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        snapshots[i]
-                            .spawn_intents
-                            .push(rio_proto::types::SpawnIntent {
-                                intent_id: drv_hash.to_string(),
-                                cores,
-                                mem_bytes,
-                                disk_bytes,
-                                node_selector: node_selector.into_iter().collect(),
-                                // D5/D7 (Phase 4): per-intent
-                                // routing keys + deadline. The
-                                // per-class wrapper stays until
-                                // Phase 5 flattens; controller-side
-                                // consumers of these fields land
-                                // alongside the flatten.
-                                kind: if state.is_fixed_output {
-                                    rio_proto::types::ExecutorKind::Fetcher
-                                } else {
-                                    rio_proto::types::ExecutorKind::Builder
-                                }
-                                .into(),
-                                system: state.system.clone(),
-                                required_features: state.required_features.clone(),
-                                deadline_secs,
-                            });
-                    }
-                }
-                DerivationStatus::Assigned | DerivationStatus::Running => {
-                    // Fact: what class DID we dispatch to?
-                    // assigned_size_class reflects overflow — if the
-                    // target was "small" but only "large" had
-                    // capacity, this says "large". That's the
-                    // operator-relevant answer for "where are my
-                    // workers busy?"
-                    if let Some(class) = &state.sched.assigned_size_class
-                        && let Some(&i) = index.get(class)
-                    {
-                        snapshots[i].running += 1;
-                        *snapshots[i]
-                            .running_by_system
-                            .entry(state.system.clone())
-                            .or_default() += 1;
-                    }
-                }
-                // Terminal + pre-Ready: neither queued nor running.
-                _ => {}
+            if state.status() != DerivationStatus::Ready {
+                continue;
             }
+            // Per-system aggregate: counted BEFORE the kind/feature
+            // filters so it matches `ClusterSnapshot.queued_by_system`
+            // (the ComponentScaler reads this independent of which
+            // pool asked).
+            *queued_by_system.entry(state.system.clone()).or_default() += 1;
+
+            let kind = if state.is_fixed_output {
+                ExecutorKind::Fetcher
+            } else {
+                ExecutorKind::Builder
+            };
+            // r[impl sched.admin.spawn-intents.feature-filter]
+            // ── request filter ────────────────────────────────────
+            // kind: Unknown (None) = unfiltered. Otherwise must match
+            // — the ADR-019 airgap boundary (FOD ⇔ Fetcher) means a
+            // BuilderPool never sees a Fetcher intent and vice-versa.
+            if req.kind.is_some_and(|k| k != kind) {
+                continue;
+            }
+            // systems: empty = unfiltered. I-107/I-143 per-arch
+            // intersection so an x86-64 pool doesn't spawn for an
+            // aarch64-only backlog.
+            if !req.systems.is_empty() && !req.systems.iter().any(|s| s == &state.system) {
+                continue;
+            }
+            // features: I-176 subset check + I-181 ∅-guard. `None` =
+            // unfiltered (CLI, status display). `Some([])` = a
+            // featureless pool — only emits intents with empty
+            // `required_features`. `Some(pf)` with `pf ≠ ∅` = a
+            // feature-gated pool — emits intents whose
+            // `required_features ⊆ pf` AND `required_features ≠ ∅`
+            // (∅-feature work belongs to the featureless pool;
+            // dispatch's overflow walk tries cheapest first, so a
+            // kvm builder spawned for ∅-feature work would idle until
+            // activeDeadlineSeconds).
+            if let Some(pf) = req.features.as_deref() {
+                if !pf.is_empty() && state.required_features.is_empty() {
+                    continue;
+                }
+                if !state.required_features.iter().all(|f| pf.contains(f)) {
+                    continue;
+                }
+            }
+
+            // Static-mode gate: with `[sla]` absent the controller
+            // MUST stay on the scalar `spawn_n` path (fixed
+            // `spec.resources`); emitting fallback-probe intents here
+            // would divert it to `spawn_for_each` with shapes that
+            // don't match any class.
+            if !sla_on {
+                continue;
+            }
+
+            // r[impl sched.sla.intent-from-solve]
+            // ADR-023: per-derivation SpawnIntent. intent_id is the
+            // drv_hash itself — the controller stamps it on the pod
+            // annotation, the builder echoes it on heartbeat, dispatch
+            // matches `worker.intent_id == drv_hash`. No separate
+            // intent→drv map to keep in sync; if the drv leaves Ready
+            // before the pod heartbeats, the match misses and dispatch
+            // falls through to pick-from-queue.
+            let (cores, mem_bytes, disk_bytes, deadline_secs, _, node_selector) =
+                self.solve_intent_for(state.pname.as_deref(), state);
+            // ADR-023 §2.8: arm the Pending-watch the FIRST time a
+            // band-targeted selector is emitted for this drv.
+            // or_insert keeps the original timestamp across re-emits
+            // (snapshot runs each tick). Band-agnostic intents don't
+            // enter the ladder.
+            if let Some((band, cap)) = crate::sla::cost::parse_selector(&node_selector) {
+                self.pending_intents.entry(drv_hash.into()).or_insert((
+                    band,
+                    cap,
+                    std::time::Instant::now(),
+                ));
+            }
+            intents.push(rio_proto::types::SpawnIntent {
+                intent_id: drv_hash.to_string(),
+                cores,
+                mem_bytes,
+                disk_bytes,
+                node_selector: node_selector.into_iter().collect(),
+                kind: kind.into(),
+                system: state.system.clone(),
+                required_features: state.required_features.clone(),
+                deadline_secs,
+            });
         }
 
-        // Sort by effective cutoff ascending — smallest class first.
-        // The proto doc says "sorted by effective_cutoff_secs";
-        // consumers (P0236's CLI table, P0234's autoscaler) can rely
-        // on this order. total_cmp for NaN-safety (same defense as
-        // assignment.rs:106).
-        snapshots.sort_by(|a, b| a.effective_cutoff_secs.total_cmp(&b.effective_cutoff_secs));
-        snapshots
+        SpawnIntentsSnapshot {
+            intents,
+            queued_by_system,
+        }
     }
 
     /// `(cores, mem, disk, predicted, node_selector)` for one queued
     /// derivation via the SLA estimator. Shared between
-    /// [`Self::compute_size_class_snapshot`] (SpawnIntent population)
-    /// and dispatch's resource-fit filter so the controller spawns and
-    /// the scheduler accepts the SAME shape.
+    /// [`Self::compute_spawn_intents`] (SpawnIntent population) and
+    /// dispatch's resource-fit filter so the controller spawns and the
+    /// scheduler accepts the SAME shape.
     ///
     /// When `[sla].hw_cost_source` is set AND the hw-factor table is
     /// populated, the fitted-key branch routes through
@@ -467,9 +301,8 @@ impl DagActor {
     /// [`solve::intent_for`] (band-agnostic `solve_mvp`) and returns
     /// an empty selector.
     ///
-    /// `pname` is taken separately so the dispatch caller (which has
-    /// already destructured `state.pname.as_deref()` for `classify()`)
-    /// can pass the borrow it already holds.
+    /// `pname` is taken separately so the dispatch caller can pass the
+    /// borrow it already holds.
     pub(crate) fn solve_intent_for(
         &self,
         pname: Option<&str>,
@@ -597,7 +430,9 @@ impl DagActor {
                 (quantile::quantile(0.99, t, f.sigma_resid, 0.0) * 5.0) as u32
             })
             .unwrap_or(probe_deadline);
-        let deadline_secs = computed.max(floor.deadline_secs).min(86400);
+        let deadline_secs = computed
+            .max(floor.deadline_secs)
+            .min(crate::actor::floor::DEADLINE_CAP_SECS);
         // Dispatch-time prediction snapshot for completion's
         // actual-vs-predicted scoring. Only meaningful when there's a
         // fitted curve to evaluate `T(c)` against — cold-start probes
@@ -628,97 +463,6 @@ impl DagActor {
         (cores, mem, disk, deadline_secs, predicted, node_selector)
     }
 
-    /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`
-    /// (P0556). Buckets in-flight FODs by `size_class_floor` so the
-    /// ephemeral FetcherPool reconciler can spawn per-class Jobs
-    /// instead of stamping the smallest class only.
-    ///
-    /// Unlike [`compute_size_class_snapshot`] there is no `classify()`
-    /// forecast: FODs have no a-priori size signal (ADR-019), so the
-    /// floor IS the routing decision. `floor=None` (never failed —
-    /// the cold-start majority) buckets to `fetcher_classes[0]`.
-    /// An unknown floor name (config drift: scheduler restarted with
-    /// fewer classes) also buckets to `[0]` — same conservative
-    /// fallback as I-146 for builder classes.
-    ///
-    /// `queued` here is **in-flight demand** (Ready+Assigned+Running),
-    /// matching [`ClusterSnapshot::queued_fod_derivations`] semantics
-    /// so `Σ fod_classes[i].queued == queued_fod_derivations`. The
-    /// controller's `spawn_count(queued, active, headroom)` subtracts
-    /// per-class active Jobs, so including Assigned/Running is the
-    /// right shape (an Assigned FOD has a Job; spawn_count won't
-    /// double-spawn for it). `running` is the Assigned+Running subset
-    /// — informational for operators/dashboards.
-    ///
-    /// Preserves `fetcher_classes` order (smallest→largest by cutoff,
-    /// snapshotted at construction).
-    ///
-    /// [`compute_size_class_snapshot`]: Self::compute_size_class_snapshot
-    // r[impl sched.fod.size-class-reactive]
-    pub(crate) fn compute_fod_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
-        if self.sizing.fetcher_classes.is_empty() {
-            return Vec::new();
-        }
-        let mut index: HashMap<String, usize> =
-            HashMap::with_capacity(self.sizing.fetcher_classes.len());
-        let mut snapshots: Vec<SizeClassSnapshot> = self
-            .sizing
-            .fetcher_classes
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                index.insert(name.clone(), i);
-                SizeClassSnapshot {
-                    name: name.clone(),
-                    // No duration cutoffs for fetcher classes — routing
-                    // is reactive-only. Zeroed; proto consumers ignore
-                    // these for fod_classes.
-                    effective_cutoff_secs: 0.0,
-                    configured_cutoff_secs: 0.0,
-                    queued: 0,
-                    running: 0,
-                    queued_by_system: HashMap::new(),
-                    running_by_system: HashMap::new(),
-                    spawn_intents: Vec::new(),
-                }
-            })
-            .collect();
-
-        for (_, state) in self.dag.iter_nodes() {
-            if !state.is_fixed_output {
-                continue;
-            }
-            let in_flight = matches!(
-                state.status(),
-                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-            );
-            if !in_flight {
-                continue;
-            }
-            // D4: class-name floor removed; all FODs bucket to
-            // smallest. Phase 6 (D2/D5) deletes this whole function —
-            // FODs go through the same per-drv SpawnIntent path as
-            // builds.
-            let i = 0;
-            snapshots[i].queued += 1;
-            *snapshots[i]
-                .queued_by_system
-                .entry(state.system.clone())
-                .or_default() += 1;
-            if matches!(
-                state.status(),
-                DerivationStatus::Assigned | DerivationStatus::Running
-            ) {
-                snapshots[i].running += 1;
-                *snapshots[i]
-                    .running_by_system
-                    .entry(state.system.clone())
-                    .or_default() += 1;
-            }
-        }
-        snapshots
-    }
-
     pub(super) fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {
         self.executors
             .values()
@@ -730,7 +474,6 @@ impl DagActor {
                 busy: w.running_build.is_some(),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
-                size_class: w.size_class.clone(),
                 connected_since: w.connected_since,
                 last_heartbeat: w.last_heartbeat,
                 last_resources: w.last_resources,

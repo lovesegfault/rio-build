@@ -9,7 +9,7 @@
 //!   3. Finalizer-wrapped cleanup explicitly deletes children.
 //!
 //! Status refresh (per-class `effective_cutoff_secs` + `queued` →
-//! WPS status) joins the `GetSizeClassStatus` admin RPC (scheduler-
+//! WPS status) joins the `GetSpawnIntents` admin RPC (scheduler-
 //! side EMA-smoothed cutoffs + live queue depths) with the observed
 //! child BuilderPool status (replicas / readyReplicas). The unit
 //! tests here cover the SSA patch-body shape; P0239's VM lifecycle
@@ -45,7 +45,7 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, ResourceExt};
 use tracing::{debug, info, warn};
 
-use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
+use rio_proto::types::{GetSpawnIntentsRequest, GetSpawnIntentsResponse};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{
@@ -147,10 +147,10 @@ async fn apply(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
 
     // r[impl ctrl.wps.cutoff-status]
     // ---- Status refresh ----
-    // Call GetSizeClassStatus, write per-class `effective_cutoff_secs`
-    // + `queued` to WPS status via SSA patch. The SSA body MUST
-    // include `apiVersion` + `kind` — without them the apiserver
-    // returns 400 "apiVersion must be set" (3a bug, see lang-gotchas).
+    // Call GetSpawnIntents, write per-class `queued` to WPS status
+    // via SSA patch. The SSA body MUST include `apiVersion` + `kind`
+    // — without them the apiserver returns 400 "apiVersion must be
+    // set" (3a bug, see lang-gotchas).
     //
     // Best-effort: if the scheduler is unavailable, log + skip
     // status (the child-apply loop above already succeeded; status
@@ -159,7 +159,7 @@ async fn apply(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     match ctx
         .admin
         .clone()
-        .get_size_class_status(GetSizeClassStatusRequest::default())
+        .get_spawn_intents(GetSpawnIntentsRequest::default())
         .await
     {
         Ok(resp) => {
@@ -178,7 +178,7 @@ async fn apply(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
             warn!(
                 wps = %wps.name_any(),
                 error = %e,
-                "GetSizeClassStatus unavailable; skipping status refresh (will retry next reconcile)"
+                "GetSpawnIntents unavailable; skipping status refresh (will retry next reconcile)"
             );
         }
     }
@@ -270,28 +270,32 @@ async fn prune_stale_children(wps: &BuilderPoolSet, wp_api: &Api<BuilderPool>) {
 }
 
 /// Build per-class `ClassStatus` entries: join the WPS spec
-/// classes with the `GetSizeClassStatus` RPC response and the
+/// classes with the `GetSpawnIntents` RPC response and the
 /// observed child BuilderPool status (replicas / readyReplicas).
 ///
-/// Missing RPC class (scheduler doesn't know this class) →
-/// fall through to the spec's `cutoff_secs` for
-/// `effective_cutoff_secs` and 0 for `queued`. The operator
-/// sees "configured but not yet observed" — usually transient
-/// (scheduler restarting, or the WPS class name doesn't match
-/// the scheduler's configured size_classes).
+/// D5: there is no per-class scheduler signal anymore — `queued`
+/// is the count of intents matching this class's child pool's
+/// `spec.systems`. `effective_cutoff_secs` mirrors the spec value
+/// (the rebalancer is part of the legacy sizer being removed;
+/// Phase 6 deletes the field from the CRD).
 ///
 /// Missing child BuilderPool (create failed, or not yet applied)
 /// → 0 replicas. The `kubectl get wps` Ready column reads 0/0
 /// which correctly surfaces "child doesn't exist yet."
 async fn build_class_statuses(
     wps: &BuilderPoolSet,
-    resp: &GetSizeClassStatusResponse,
+    resp: &GetSpawnIntentsResponse,
     wp_api: &Api<BuilderPool>,
 ) -> Vec<ClassStatus> {
+    // D5: per-class queued is no longer a scheduler-side concept;
+    // every class sees the same Ready backlog (intent routing is by
+    // resource shape, not class). Report `len(intents)` for each —
+    // observability only (the spawn loop reads `queued_for_pool`, not
+    // this status field). Phase 6 reworks the WPS status shape.
+    let queued = resp.intents.len() as u64;
     let mut out = Vec::with_capacity(wps.spec.classes.len());
     for class in &wps.spec.classes {
         let child = child_name(wps, class);
-        let rpc_class = resp.classes.iter().find(|c| c.name == class.name);
 
         // Child BuilderPool status lookup. get_opt: 404 → None
         // (child not yet created, or was just deleted). Treat
@@ -313,10 +317,10 @@ async fn build_class_statuses(
 
         out.push(ClassStatus {
             name: class.name.clone(),
-            effective_cutoff_secs: rpc_class
-                .map(|c| c.effective_cutoff_secs)
-                .unwrap_or(class.cutoff_secs),
-            queued: rpc_class.map(|c| c.queued).unwrap_or(0),
+            // D5: rebalancer removed; effective == configured until
+            // Phase 6 deletes the field.
+            effective_cutoff_secs: class.cutoff_secs,
+            queued,
             child_pool: child,
             replicas,
             ready_replicas,

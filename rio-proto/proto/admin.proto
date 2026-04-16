@@ -37,16 +37,20 @@ service AdminService {
   rpc DrainExecutor(rio.types.DrainExecutorRequest) returns (rio.types.DrainExecutorResponse);
 
   // Controller reports a builder/fetcher Pod's container termination
-  // reason (k8s OOMKilled / Evicted-DiskPressure / etc.). The scheduler
-  // gates size_class_floor promotion on this — the bare-disconnect path
-  // no longer infers OOM. Live QA showed cmake going medium→large→xlarge
-  // from a pod-kill + store-replica-restart with zero builds run; floor
-  // is sticky (M_032), so the next submitter paid for an oversized pod.
+  // reason (k8s OOMKilled / Evicted-DiskPressure / DeadlineExceeded /
+  // etc.). The scheduler gates `resource_floor` bump on this — the
+  // bare-disconnect path no longer infers OOM. On a resource-driven
+  // termination the scheduler doubles the relevant floor dimension
+  // (mem/disk/deadline) for whatever drv was running at disconnect;
+  // the NEXT `solve_intent_for` clamps to the bumped floor. Live QA
+  // showed cmake doubling from a pod-kill + store-replica-restart
+  // with zero builds run; floor is sticky (M_032), so the next
+  // submitter paid for an oversized pod.
   //
   // Timing: the gRPC disconnect lands at the scheduler ~1-3s before the
   // controller observes Pod-status + reconciles. Disconnect re-queues at
-  // CURRENT floor; this RPC promotes; NEXT dispatch goes bigger. One
-  // extra same-size attempt worst-case — same as the FIRST OOM today.
+  // CURRENT floor; this RPC bumps; NEXT dispatch goes bigger. One extra
+  // same-size attempt worst-case — same as the FIRST OOM today.
   rpc ReportExecutorTermination(rio.types.ReportExecutorTerminationRequest)
       returns (rio.types.ReportExecutorTerminationResponse);
 
@@ -84,12 +88,12 @@ service AdminService {
   // builds have no actor state, but PG persists the full graph.
   rpc GetBuildGraph(rio.types.GetBuildGraphRequest) returns (rio.types.GetBuildGraphResponse);
 
-  // SITA-E size-class status snapshot: effective vs configured cutoffs,
-  // per-class queued/running counts, sample counts in the rebalancer
-  // window. HUB for P0234 (WPS autoscaler), P0236 (CLI cutoffs table),
-  // P0237 (CLI WPS describe). Returns empty classes list if size-class
-  // routing is disabled.
-  rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
+  // ADR-023 spawn-intent stream: one SpawnIntent per Ready derivation
+  // (FOD and non-FOD alike), pre-filtered server-side by
+  // {kind, systems, features}. Replaces the per-class GetSizeClassStatus
+  // — controller pool reconcilers spawn one Job per intent; the
+  // ComponentScaler reads `queued_by_system`.
+  rpc GetSpawnIntents(rio.types.GetSpawnIntentsRequest) returns (rio.types.GetSpawnIntentsResponse);
 
   // ─── ADR-023 SLA overrides ────────────────────────────────────────
 

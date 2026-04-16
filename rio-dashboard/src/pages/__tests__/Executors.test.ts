@@ -38,7 +38,6 @@ describe('Executors page', () => {
       busy: true,
       status,
       lastHeartbeat: timestampFromMs(now - ageSeconds * 1000),
-      sizeClass: 'medium',
       kind,
     };
   }

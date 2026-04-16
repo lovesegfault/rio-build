@@ -108,7 +108,7 @@ service AdminService {
   rpc ListTenants(Empty) returns (ListTenantsResponse);
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
   rpc GetBuildGraph(GetBuildGraphRequest) returns (GetBuildGraphResponse);  // PG-backed DAG + live status colors (dashboard polls 5s)
-  rpc GetSizeClassStatus(GetSizeClassStatusRequest) returns (GetSizeClassStatusResponse);  // SITA-E cutoffs + per-class queued/running
+  rpc GetSpawnIntents(GetSpawnIntentsRequest) returns (GetSpawnIntentsResponse);  // ADR-023 per-drv spawn intents, kind/system/feature filtered
   rpc ListPoisoned(Empty) returns (ListPoisonedResponse);
   rpc InspectBuildDag(InspectBuildDagRequest) returns (InspectBuildDagResponse);  // actor in-memory DAG snapshot (I-025 diag)
   rpc DebugListExecutors(Empty) returns (DebugListExecutorsResponse);             // actor in-memory executor map (I-048b/c diag)
@@ -333,7 +333,7 @@ message WatchBuildRequest {
 | `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BuildResultStatus`, `ExecutorKind`, store/chunk/GC/realisation RPC messages |
 | `dag.proto` | DAG wire types: `DerivationNode`/`Edge`/`Event*`, `GraphNode`/`Edge`, `GetBuildGraph*` |
 | `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `ExecutorMessage`/`SchedulerMessage` bidi-stream types, `BuildPhase`, `Heartbeat*` |
-| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListExecutors*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainExecutor*`, `ClearPoison*` |
+| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListExecutors*`/`Builds*`/`Tenants*`, `SpawnIntent`/`GetSpawnIntents*`, `DrainExecutor*`, `ClearPoison*` |
 
 > **File layout vs. Rust module:** the four data-type `.proto` files all declare `package rio.types;`, so prost merges them into a single generated `rio.types.rs`. Rust callers see everything at `rio_proto::types::*` regardless of which source file a message lives in. The file split is for proto-file review locality only; there is no corresponding Rust namespace split.
 

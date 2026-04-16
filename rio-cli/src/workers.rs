@@ -419,9 +419,6 @@ fn print_worker(w: &ExecutorInfo) {
     if !w.supported_features.is_empty() {
         println!("  features: {}", w.supported_features.join(", "));
     }
-    if !w.size_class.is_empty() {
-        println!("  size:     {}", w.size_class);
-    }
     if let Some(r) = &w.resources {
         println!(
             "  cpu={:.2}  mem={}/{}  disk={}/{}",

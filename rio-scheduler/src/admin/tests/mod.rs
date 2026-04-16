@@ -18,7 +18,7 @@ mod builds_tests;
 mod gc_tests;
 mod graph_tests;
 mod logs_tests;
-mod sizeclass_tests;
+mod spawn_intents_tests;
 mod tenants_tests;
 mod workers_tests;
 
@@ -190,7 +190,6 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
     assert_eq!(resp.active_builds, 0);
     assert_eq!(resp.queued_derivations, 0);
     assert_eq!(resp.running_derivations, 0);
-    assert_eq!(resp.queued_fod_derivations, 0);
     assert_eq!(
         resp.store_size_bytes, 0,
         "store_size bg refresh not spawned in tests → stays at initial 0"
@@ -288,94 +287,6 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     assert_eq!(
         resp.running_derivations, 1,
         "first drv is Assigned → counts as running (slot reserved)"
-    );
-    assert_eq!(
-        resp.queued_fod_derivations, 0,
-        "neither drv is FOD (merge_single_node default is_fixed_output=false)"
-    );
-    Ok(())
-}
-
-/// `queued_fod_derivations` counts in-flight FOD demand (Ready |
-/// Assigned | Running) + is_fixed_output. The FetcherPool autoscaler
-/// scales on this. Test BOTH the kind discriminator (non-FOD doesn't
-/// count) AND the status inclusion (Assigned counts, not just Ready).
-#[tokio::test]
-async fn cluster_status_counts_queued_fod_separately() -> anyhow::Result<()> {
-    use crate::actor::tests::{make_node, merge_dag};
-
-    let (svc, actor, _task, _db) = setup_svc_default().await;
-
-    // No worker connected → both nodes stay queued (no dispatch
-    // capacity). Clean discriminator test: queue contents only.
-    let mut fod = make_node("fod-q");
-    fod.is_fixed_output = true;
-    let nonfod = make_node("nonfod-q");
-
-    // Separate builds (no edges → both root → both Ready post-merge).
-    merge_dag(&actor, uuid::Uuid::new_v4(), vec![fod], vec![], false).await?;
-    merge_dag(&actor, uuid::Uuid::new_v4(), vec![nonfod], vec![], false).await?;
-
-    let resp = cluster_status_now(&svc, &actor).await?;
-
-    assert_eq!(
-        resp.queued_derivations, 2,
-        "both Ready, no worker → both in queue"
-    );
-    assert_eq!(
-        resp.queued_fod_derivations, 1,
-        "FOD subset: only the is_fixed_output node. Non-FOD does NOT \
-         contribute to FetcherPool scaling — fetchers refuse non-FODs."
-    );
-    Ok(())
-}
-
-/// P0541: Assigned/Running FODs count toward `queued_fod_derivations`.
-/// Ready-only undercounts: with N fetchers the first N FODs go Ready→
-/// Assigned in one dispatch tick; a 30s controller poll sees Ready=0
-/// and never scales past N. Including Assigned makes the signal match
-/// "fetcher pods I want."
-#[tokio::test]
-async fn cluster_status_queued_fod_includes_assigned() -> anyhow::Result<()> {
-    use crate::actor::ActorCommand;
-    use crate::actor::tests::{
-        connect_executor_no_ack_kind, make_node, merge_dag, recv_assignment,
-    };
-
-    let (svc, actor, _task, _db) = setup_svc_default().await;
-
-    // One fetcher (kind=Fetcher). Two FOD roots → one dispatches
-    // (Assigned), one stays Ready. Pre-P0541: queued_fod=1. Post: 2.
-    let mut rx = connect_executor_no_ack_kind(
-        &actor,
-        "f0",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-    actor
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: "f0".into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    let mut a = make_node("fod-a");
-    a.is_fixed_output = true;
-    let mut b = make_node("fod-b");
-    b.is_fixed_output = true;
-    merge_dag(&actor, uuid::Uuid::new_v4(), vec![a], vec![], false).await?;
-    merge_dag(&actor, uuid::Uuid::new_v4(), vec![b], vec![], false).await?;
-
-    // Drain one assignment so the actor's running_build is set.
-    let _ = recv_assignment(&mut rx).await;
-
-    let resp = cluster_status_now(&svc, &actor).await?;
-    assert_eq!(resp.running_derivations, 1, "one Assigned to f0");
-    assert_eq!(resp.queued_derivations, 1, "one still Ready (no capacity)");
-    assert_eq!(
-        resp.queued_fod_derivations, 2,
-        "BOTH count: Ready + Assigned. The FetcherPool scaler should \
-         want 2 pods, not 1."
     );
     Ok(())
 }

@@ -776,7 +776,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
         );
         // Controller's report ~1-3s later.
         let promoted =
-            report_termination(&handle, &id, TerminationReason::EvictedDiskPressure, None).await?;
+            report_termination(&handle, &id, TerminationReason::EvictedDiskPressure).await?;
         assert!(promoted, "EvictedDiskPressure cycle {i} → floor bumped");
         tick(&handle).await?;
         drop(rx);
@@ -848,7 +848,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "b-cap-0").await?;
     drop(rx);
-    let promoted = report_termination(&handle, "b-cap-0", R::OomKilled, None).await?;
+    let promoted = report_termination(&handle, "b-cap-0", R::OomKilled).await?;
     assert!(!promoted, "floor at ceiling → promoted=false");
     let s = expect_drv(&handle, "cap-mem").await;
     assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
@@ -899,7 +899,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "rio-b-dl-abc-x9k4p").await?;
     drop(rx);
-    let promoted = report_termination(&handle, "rio-b-dl-abc", R::DeadlineExceeded, None).await?;
+    let promoted = report_termination(&handle, "rio-b-dl-abc", R::DeadlineExceeded).await?;
     assert!(!promoted, "deadline at 24h cap → promoted=false");
     let s = expect_drv(&handle, "cap-dl").await;
     assert_eq!(
@@ -1085,8 +1085,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
         .await?;
 
     // ── Controller reports OOMKilled ~1-3s later: bump ─────────────
-    let promoted =
-        report_termination(&handle, "w-tiny", TerminationReason::OomKilled, None).await?;
+    let promoted = report_termination(&handle, "w-tiny", TerminationReason::OomKilled).await?;
     assert!(
         promoted,
         "ReportExecutorTermination(OomKilled) must double mem floor"
@@ -1100,8 +1099,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
 
     // ── Dedup: second report (controller re-reports every ~10s tick
     // for JOB_TTL_SECS=600) → no-op ────────────────────────────────
-    let promoted =
-        report_termination(&handle, "w-tiny", TerminationReason::OomKilled, None).await?;
+    let promoted = report_termination(&handle, "w-tiny", TerminationReason::OomKilled).await?;
     assert!(
         !promoted,
         "second report for same executor_id → recently_disconnected entry \
@@ -1116,7 +1114,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     assert!(asgn.drv_path.contains(tag));
     disconnect(&handle, "w-small").await?;
     drop(rx2);
-    let promoted = report_termination(&handle, "w-small", TerminationReason::Error, None).await?;
+    let promoted = report_termination(&handle, "w-small", TerminationReason::Error).await?;
     assert!(
         !promoted,
         "ReportExecutorTermination(Error) must NOT bump (pod-kill / node \
@@ -1216,7 +1214,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
         &handle,
         "b-eph2",
         rio_proto::types::TerminationReason::OomKilled,
-        None,
     )
     .await?;
     assert!(
@@ -1276,7 +1273,6 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
         &handle,
         "rio-builder-tiny-abc123",
         TerminationReason::DeadlineExceeded,
-        None,
     )
     .await?;
     assert!(
@@ -1300,7 +1296,6 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
         &handle,
         "rio-builder-tiny-abc123",
         TerminationReason::DeadlineExceeded,
-        None,
     )
     .await?;
     assert!(!promoted, "second report dedups");

@@ -68,9 +68,8 @@ rules:
   #   builderpoolsets — aggregating CRD; one WPS spawns one child
   #     BuilderPool per size class. No create/delete (operators
   #     `kubectl apply` the WPS); reconciler reads it + patches
-  #     metadata.finalizers and per-class status (effective_cutoff_secs
-  #     + queued from scheduler's GetSizeClassStatus joined with child
-  #     WP replicas).
+  #     metadata.finalizers and per-class status (queued from
+  #     scheduler's GetSpawnIntents joined with child WP replicas).
   #   componentscalers — predictive store autoscaling. No create/delete
   #     (operators apply the CR via this chart); reconciler reads spec,
   #     writes status (learnedRatio persists across restarts), patches

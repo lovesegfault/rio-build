@@ -182,7 +182,7 @@ impl DagActor {
     /// older than `hw_fallback_after_secs` (jittered ±20% per-entry,
     /// derived from drv_hash so the threshold is stable across ticks)
     /// → mark `(band, cap)` ICE-infeasible for 60s and drop the entry.
-    /// Next `compute_size_class_snapshot` re-runs `solve_full` for that
+    /// Next `compute_spawn_intents` re-runs `solve_full` for that
     /// drv with the cell excluded.
     ///
     /// Also drops entries for drvs that have left Ready (dispatched

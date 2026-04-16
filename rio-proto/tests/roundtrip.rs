@@ -9,9 +9,7 @@
 //! and the new receiver reads the proto3 default.
 
 use prost::Message;
-use rio_proto::types::{
-    DerivationNode, GetSizeClassStatusResponse, HeartbeatRequest, SizeClassStatus,
-};
+use rio_proto::types::{DerivationNode, GetSpawnIntentsResponse, HeartbeatRequest};
 
 /// `store_degraded` (field 9) defaults to false through a full
 /// encode/decode cycle. Wire-compatibility: an old worker that
@@ -26,62 +24,42 @@ fn heartbeat_request_store_degraded_default_false() {
     assert!(!decoded.store_degraded);
 }
 
-/// `SizeClassStatus` roundtrip. The dashboard (P0236) and autoscaler
-/// (P0234) both decode this; a field-number collision or type mismatch
-/// would silently zero a field on decode. Pin all six fields survive.
-///
-/// double fields get NaN-safety from prost (encodes NaN, decodes NaN)
-/// but we don't send NaN — the actor computes from finite cutoffs.
-/// Pinning a specific nonzero value here catches "field not wired"
-/// (which would read as 0.0).
+/// `GetSpawnIntentsResponse` roundtrip. The controller's pool
+/// reconcilers decode this; a field-number collision or type mismatch
+/// would silently zero a field on decode. Pin all SpawnIntent fields
+/// survive — `cores`/`mem_bytes`/`deadline_secs` drive pod resources,
+/// `kind`/`system`/`required_features` drive client-side filtering.
 #[test]
-fn sizeclass_status_proto_roundtrip() {
-    let orig = GetSizeClassStatusResponse {
-        classes: vec![
-            SizeClassStatus {
-                name: "small".into(),
-                effective_cutoff_secs: 62.5,
-                configured_cutoff_secs: 60.0,
-                queued: 5,
-                running: 3,
-                sample_count: 142,
-                queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
-                running_by_system: [("x86_64-linux".into(), 3)].into(),
-                spawn_intents: vec![rio_proto::types::SpawnIntent {
-                    intent_id: "i-abc".into(),
-                    cores: 8,
-                    mem_bytes: 17_179_869_184,
-                    disk_bytes: 42_949_672_960,
-                    node_selector: [("rio.build/hw-band".into(), "mid".into())].into(),
-                    kind: rio_proto::types::ExecutorKind::Builder.into(),
-                    system: "x86_64-linux".into(),
-                    required_features: vec!["kvm".into()],
-                    deadline_secs: 600,
-                }],
+fn spawn_intents_proto_roundtrip() {
+    let orig = GetSpawnIntentsResponse {
+        intents: vec![
+            rio_proto::types::SpawnIntent {
+                intent_id: "i-abc".into(),
+                cores: 8,
+                mem_bytes: 17_179_869_184,
+                disk_bytes: 42_949_672_960,
+                node_selector: [("rio.build/hw-band".into(), "mid".into())].into(),
+                kind: rio_proto::types::ExecutorKind::Builder.into(),
+                system: "x86_64-linux".into(),
+                required_features: vec!["kvm".into()],
+                deadline_secs: 600,
             },
-            SizeClassStatus {
-                name: "large".into(),
-                effective_cutoff_secs: 1800.0,
-                configured_cutoff_secs: 1800.0,
-                queued: 0,
-                running: 1,
-                sample_count: 17,
-                queued_by_system: Default::default(),
-                running_by_system: [("aarch64-linux".into(), 1)].into(),
-                spawn_intents: vec![],
+            rio_proto::types::SpawnIntent {
+                intent_id: "i-fod".into(),
+                cores: 2,
+                mem_bytes: 4 << 30,
+                disk_bytes: 16 << 30,
+                node_selector: Default::default(),
+                kind: rio_proto::types::ExecutorKind::Fetcher.into(),
+                system: "aarch64-linux".into(),
+                required_features: vec![],
+                deadline_secs: 300,
             },
         ],
-        // P0556: same SizeClassStatus shape, cutoffs zeroed.
-        fod_classes: vec![SizeClassStatus {
-            name: "tiny".into(),
-            queued: 7,
-            running: 2,
-            queued_by_system: [("x86_64-linux".into(), 7)].into(),
-            ..Default::default()
-        }],
+        queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
     };
     let bytes = orig.encode_to_vec();
-    let decoded = GetSizeClassStatusResponse::decode(&*bytes).unwrap();
+    let decoded = GetSpawnIntentsResponse::decode(&*bytes).unwrap();
     assert_eq!(orig, decoded);
 }
 

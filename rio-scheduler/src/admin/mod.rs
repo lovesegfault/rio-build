@@ -3,10 +3,10 @@
 //! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
 //! `ClusterStatus`, `DrainExecutor`, `TriggerGC`, `ListExecutors`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
-//! `GetBuildGraph`, `GetSizeClassStatus`.
+//! `GetBuildGraph`, `GetSpawnIntents`.
 //!
 //! Per-RPC bodies live in submodules (`logs`, `gc`, `tenants`,
-//! `builds`, `workers`, `graph`, `sizeclass`). This file holds only the
+//! `builds`, `workers`, `graph`, `spawn_intents`). This file holds only the
 //! [`AdminServiceImpl`] state struct + thin wrapper methods that
 //! delegate into the submodules. Split from a single 861L file (P0383)
 //! after collision count hit 20.
@@ -31,11 +31,11 @@ use rio_proto::types::{
     ClusterStatusResponse, CreateTenantRequest, CreateTenantResponse, DebugExecutorState,
     DebugListExecutorsResponse, DrainExecutorRequest, DrainExecutorResponse,
     ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetSizeClassStatusRequest,
-    GetSizeClassStatusResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
-    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
-    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
+    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
+    ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
     ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
     SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
     SlaStatusResponse, TerminationReason,
@@ -66,8 +66,8 @@ mod executors;
 mod gc;
 mod graph;
 mod logs;
-mod sizeclass;
 mod sla;
+mod spawn_intents;
 mod tenants;
 
 pub use gc::spawn_store_size_refresh;
@@ -239,7 +239,6 @@ impl AdminService for AdminServiceImpl {
             active_builds: snap.active_builds,
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
-            queued_fod_derivations: snap.queued_fod_derivations,
             queued_by_system: snap.queued_by_system.clone(),
             store_size_bytes: self
                 .store_size_bytes
@@ -375,14 +374,12 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("executor_id is required"));
         }
         let reason = TerminationReason::try_from(req.reason).unwrap_or(TerminationReason::Unknown);
-        let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
         let executor_id = req.executor_id.into();
 
         let promoted = query_actor(&self.actor, |reply| {
             ActorCommand::ReportExecutorTermination {
                 executor_id,
                 reason,
-                size_class,
                 reply,
             }
         })
@@ -488,30 +485,19 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(resp))
     }
 
-    /// SITA-E size-class status snapshot. Actor supplies effective vs
-    /// configured cutoffs + queued/running counts; DB supplies sample
-    /// counts (partitioned by effective cutoff band).
-    ///
-    /// Returns empty `classes` if size-class routing is disabled (the
-    /// actor's `size_classes` is empty). CLI/dashboard can render that
-    /// as "feature off" without a separate error path.
-    #[instrument(skip(self, request), fields(rpc = "GetSizeClassStatus"))]
-    async fn get_size_class_status(
+    /// ADR-023 spawn-intent stream: one `SpawnIntent` per Ready
+    /// derivation, filtered server-side by `{kind, systems, features}`.
+    /// Returns empty `intents` if `[sla]` is unconfigured (Static-mode
+    /// gate) — controller falls back to `ClusterStatus`.
+    #[instrument(skip(self, request), fields(rpc = "GetSpawnIntents"))]
+    async fn get_spawn_intents(
         &self,
-        request: Request<GetSizeClassStatusRequest>,
-    ) -> Result<Response<GetSizeClassStatusResponse>, Status> {
+        request: Request<GetSpawnIntentsRequest>,
+    ) -> Result<Response<GetSpawnIntentsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        let req = request.into_inner();
-        // I-176: proto3 repeated can't be optional, so the wire shape
-        // is `(filter_features: bool, pool_features: Vec)`. Collapse
-        // to Option here so the actor sees the tristate directly:
-        // false → None (unfiltered); true → Some(vec) (filter, even
-        // when vec is empty = "I support no features").
-        let pool_features = req.filter_features.then_some(req.pool_features);
-        let db = crate::db::SchedulerDb::new(self.pool.clone());
-        let resp = sizeclass::get_size_class_status(&self.actor, &db, pool_features).await?;
+        let resp = spawn_intents::get_spawn_intents(&self.actor, request.into_inner()).await?;
         Ok(Response::new(resp))
     }
 

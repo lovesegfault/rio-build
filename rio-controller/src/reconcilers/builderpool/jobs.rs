@@ -273,12 +273,12 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     // Gate scheduler-side `size_class_floor` promotion on actual k8s
     // OOMKilled/DiskPressure (not bare disconnect). Best-effort;
     // scheduler-side dedup makes re-reporting every tick a no-op.
-    report_terminated_pods(ctx, &ns, &name, &wp.spec.size_class).await;
+    report_terminated_pods(ctx, &ns, &name).await;
     // `activeDeadlineSeconds` backstop fired (worker wedged past its
     // own daemon_timeout). Job controller deletes the Pod, so observe
     // the Job condition instead. Iterates `jobs.items` already listed
     // above — no extra apiserver call.
-    report_deadline_exceeded_jobs(ctx, &jobs.items, &wp.spec.size_class).await;
+    report_deadline_exceeded_jobs(ctx, &jobs.items).await;
 
     // ---- Status patch ----
     // `replicas` = active Jobs; `readyReplicas` = same (a Job pod is
@@ -302,78 +302,54 @@ pub(super) async fn reconcile(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     Ok(Action::requeue(JOB_REQUEUE))
 }
 
-/// Queue depth relevant to THIS ephemeral pool.
+/// Queue depth + per-drv spawn intents relevant to THIS ephemeral
+/// pool.
 ///
-/// Two cases:
-///   - `size_class` empty (standalone pool) → cluster-wide
-///     `ClusterStatus` filtered by `spec.systems` (I-107 per-arch
-///     filter). Preserves pre-I-117 behavior.
-///   - `size_class` set (typically a WPS child) → per-class
-///     `queued` from `GetSizeClassStatus`. Without this, N
-///     ephemeral child pools each spawn for the FULL backlog →
-///     N× over-provisioning. With it, each pool spawns only for
-///     work that `classify()` would route to its class.
+/// D5: queries `GetSpawnIntents` filtered server-side by
+/// `{kind=Builder, systems=spec.systems, features=spec.features}`.
+/// The scheduler applies the same {system, feature} subset checks
+/// `hard_filter` would (I-107/I-143/I-176/I-181), so every returned
+/// intent is one this pool's workers could accept. Returns
+/// `(len(intents), intents)` — `queued` is no longer a separate
+/// per-class scalar; it IS the intent count.
 ///
-/// Missing class in the RPC response (scheduler doesn't have
-/// `size_classes` configured for this name, or feature off) →
-/// fall back to the systems-filtered cluster count. Better to
-/// over-spawn than to never spawn — the `activeDeadlineSeconds`
-/// backstop reaps wrong-class Jobs after 1h.
-///
-/// Returns `(queued, spawn_intents)`. ADR-023: `spawn_intents` is
-/// the matching class's per-drv intent list (empty under Static
-/// sizing or unclassed pools); `queued` is the legacy scalar for
-/// `spawn_count` and the reap comparison. Both are read from the
-/// same RPC response, so they're a coherent snapshot.
+/// `intents` is empty under Static mode (`[sla]` unconfigured); the
+/// caller falls through to `ClusterStatus` (systems-filtered) so a
+/// legacy deployment still scales. Better to over-spawn than to
+/// never spawn — the `activeDeadlineSeconds` backstop reaps
+/// wrong-pool Jobs after 1h.
+// r[impl ctrl.pool.per-system-class-depth]
+// r[impl ctrl.pool.per-feature-class-depth]
 async fn queued_for_pool(
     ctx: &Ctx,
     wp: &BuilderPool,
 ) -> std::result::Result<(u32, Vec<SpawnIntent>), tonic::Status> {
-    if !wp.spec.size_class.is_empty() {
-        // I-176: pass `spec.features` so the scheduler excludes
-        // derivations whose `required_features` this pool's workers
-        // can't satisfy (mirrors hard_filter's `feature-missing`).
-        // `filter_features=true` even when `features` is empty: a
-        // featureless pool then sees only featureless work — it stops
-        // spawning builders that hard_filter rejects on dispatch.
-        let resp = ctx
-            .admin
-            .clone()
-            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {
-                pool_features: wp.spec.features.clone(),
-                filter_features: true,
-            })
-            .await?
-            .into_inner();
-        // I-143 (per-system) + I-176 (per-feature, cross-class for
-        // feature-gated pools). See class_queued_for_pool() doc.
-        if let Some(queued) = crate::scaling::class_queued_for_pool(
-            &resp,
-            &wp.spec.size_class,
-            &wp.spec.systems,
-            &wp.spec.features,
-        ) {
-            // ADR-023: extract this class's SpawnIntents. The scheduler
-            // already buckets by class; the controller takes them
-            // verbatim. TODO(ADR-023 phase-2): per-system filter once
-            // intents carry a `system` field — for MVP the scheduler
-            // populates per-pool-features-filtered intents only.
-            let intents = resp
-                .classes
-                .into_iter()
-                .find(|c| c.name == wp.spec.size_class)
-                .map(|c| c.spawn_intents)
-                .unwrap_or_default();
-            // proto field is u64; spawn_count takes u32. Saturate —
-            // a queue > 4 billion derivations is pathological but
-            // shouldn't wrap to 0 (would scale DOWN under extreme load).
-            return Ok((queued.min(u32::MAX as u64) as u32, intents));
-        }
-        // Class not in response → fall through to systems filter.
+    // I-176: `filter_features=true` even when `features` is empty: a
+    // featureless pool then sees only featureless work — it stops
+    // spawning builders that hard_filter rejects on dispatch.
+    let resp = ctx
+        .admin
+        .clone()
+        .get_spawn_intents(rio_proto::types::GetSpawnIntentsRequest {
+            kind: Some(rio_proto::types::ExecutorKind::Builder.into()),
+            systems: wp.spec.systems.clone(),
+            features: wp.spec.features.clone(),
+            filter_features: true,
+        })
+        .await?
+        .into_inner();
+    if !resp.intents.is_empty() {
+        // u32 saturate — a queue > 4 billion derivations is
+        // pathological but shouldn't wrap to 0 (would scale DOWN
+        // under extreme load).
+        let n = resp.intents.len().min(u32::MAX as usize) as u32;
+        return Ok((n, resp.intents));
     }
-    let resp = ctx.admin.clone().cluster_status(()).await?.into_inner();
+    // Static mode (`[sla]` off) → fall back to the systems-filtered
+    // cluster scalar. Preserves pre-ADR-023 behavior.
+    let cs = ctx.admin.clone().cluster_status(()).await?.into_inner();
     Ok((
-        crate::scaling::queued_for_systems(&resp, &wp.spec.systems),
+        crate::scaling::queued_for_systems(&cs, &wp.spec.systems),
         Vec::new(),
     ))
 }

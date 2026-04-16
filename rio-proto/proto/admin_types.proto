@@ -2,7 +2,7 @@ syntax = "proto3";
 package rio.types;
 
 // Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,
-// GetBuildLogs, DrainExecutor, ClearPoison, GetSizeClassStatus. Data
+// GetBuildLogs, DrainExecutor, ClearPoison, GetSpawnIntents. Data
 // types for the AdminService RPCs defined in admin.proto.
 //
 // Same `package rio.types;` — prost merges by package into a single
@@ -26,12 +26,7 @@ message ClusterStatusResponse {
   uint32 running_derivations = 7;
   uint64 store_size_bytes = 8;           // Total store usage
   google.protobuf.Timestamp uptime_since = 9;
-  // Total in-flight FOD demand: (Ready | Assigned | Running) +
-  // is_fixed_output. The controller's FetcherPool autoscaler scales on
-  // this. NOT a subset of queued_derivations (which is Ready-only) —
-  // Ready-only undercounts since the first N FODs go Ready→Assigned
-  // within one dispatch tick, leaving 0 for a 30s controller poll.
-  uint32 queued_fod_derivations = 10;
+  reserved 10;                           // was queued_fod_derivations (D2: FODs go through GetSpawnIntents)
   // Per-system breakdown of queued_derivations (Ready-only, same
   // semantics as the scalar). Sum across all keys == queued_derivations.
   // BuilderPool autoscalers sum the entries matching pool.spec.systems
@@ -59,7 +54,7 @@ message ExecutorInfo {
   ResourceUsage resources = 7;           // (types.proto)
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;
-  string size_class = 10;                // empty = unknown/unclassified (fetchers always empty)
+  reserved 10;                           // was size_class (legacy sizer removed)
   ExecutorKind kind = 11;                // builder or fetcher (build_types.proto)
   bool busy = 12;                        // A build is in flight (P0537: at most one per executor)
 }
@@ -130,18 +125,20 @@ message DrainExecutorResponse {
 // Why a builder/fetcher Pod's container terminated. Populated by the
 // controller from k8s PodStatus (containerStatuses[].state.terminated.
 // reason for OOMKilled/Completed/Error; status.reason+message for
-// Evicted). The scheduler uses OomKilled / EvictedDiskPressure to gate
-// size_class_floor promotion — bare disconnect no longer infers OOM.
+// Evicted). The scheduler uses OomKilled / EvictedDiskPressure /
+// DeadlineExceeded to gate `resource_floor` bump — bare disconnect no
+// longer infers OOM.
 enum TerminationReason {
   // Wire-default: controller couldn't classify (no terminated state,
   // status not yet populated). Scheduler treats as no-op.
   TERMINATION_REASON_UNKNOWN = 0;
   // containerStatuses[].state.terminated.reason == "OOMKilled". Pod hit
-  // memory limit. → promote size_class_floor.
+  // memory limit. → bump `resource_floor.mem_bytes`.
   TERMINATION_REASON_OOM_KILLED = 1;
   // status.reason == "Evicted" + message mentions DiskPressure /
-  // ephemeral-storage. Node ran out of disk. → promote size_class_floor
-  // (next-larger pod gets a bigger ephemeral-storage request).
+  // ephemeral-storage. Node ran out of disk. → bump
+  // `resource_floor.disk_bytes` (next pod gets a bigger
+  // ephemeral-storage request).
   TERMINATION_REASON_EVICTED_DISK_PRESSURE = 2;
   // status.reason == "Evicted", other cause (MemoryPressure, PID
   // pressure, node-shutdown). NOT a per-drv sizing signal. → no-op.
@@ -153,9 +150,9 @@ enum TerminationReason {
   TERMINATION_REASON_ERROR = 5;
   // Job.status.conditions has type=Failed reason=DeadlineExceeded —
   // activeDeadlineSeconds backstop fired (worker wedged past its own
-  // daemon_timeout). → promote size_class_floor + bump timeout_count
-  // (same bounded ladder as worker-reported TimedOut). Reported by JOB
-  // name (pod is already deleted by Job controller); scheduler prefix-
+  // daemon_timeout). → bump `resource_floor.deadline_secs` (same
+  // bounded ladder as worker-reported TimedOut). Reported by JOB name
+  // (pod is already deleted by Job controller); scheduler prefix-
   // matches recently_disconnected.
   TERMINATION_REASON_DEADLINE_EXCEEDED = 6;
 }
@@ -166,17 +163,15 @@ message ReportExecutorTerminationRequest {
   // running at disconnect via its recently_disconnected map.
   string executor_id = 1;
   TerminationReason reason = 2;
-  // Pod's size_class label. The scheduler usually has this from the
-  // disconnect-time capture, but the controller sends it anyway so a
-  // report that races ahead of (or replaces a swept) disconnect entry
-  // can still resolve next_*_class. Empty = unclassed.
-  string size_class = 3;
+  reserved 3;  // was size_class (D4: resource_floor needs no class label)
 }
 
 message ReportExecutorTerminationResponse {
-  // size_class_floor was actually bumped. False for non-resource
+  // `resource_floor` was actually bumped. False for non-resource
   // reasons, unknown executor (already swept / never had a running
-  // build at disconnect), or already at the largest class.
+  // build at disconnect), or already at ceiling on the relevant
+  // dimension (in which case `bump_floor_or_count` increments the
+  // matching budget counter instead).
   bool promoted = 1;
 }
 
@@ -355,58 +350,11 @@ message CreateTenantResponse {
 //           CreateEphemeralBuilderResponse {job_name=1}
 
 // ───────────────────────────────────────────────────────────────────────────
-// SITA-E size-class status (GetSizeClassStatus)
-// Live snapshot of the rebalancer's state: effective vs configured cutoffs,
-// per-class queue depth, sample counts. HUB for P0234 (autoscaler reads
-// effective_cutoff), P0236 (CLI prints table), P0237 (CLI embeds in WPS
-// describe).
+// GetSpawnIntents (ADR-023)
+// One SpawnIntent per Ready derivation, filtered server-side by
+// {kind, systems, features}. The controller's pool reconcilers spawn one
+// Job per intent with `(cores, mem, disk)` stamped into pod resources.
 // ───────────────────────────────────────────────────────────────────────────
-
-message SizeClassStatus {
-  string name = 1;
-  // Current (post-rebalancer) cutoff. The rebalancer EMA-smooths this
-  // hourly against build_samples — drifts from configured over time.
-  double effective_cutoff_secs = 2;
-  // Static TOML cutoff (scheduler.toml `[[size_classes]]` cutoff_secs).
-  // Drift visibility: if effective diverged 3× from configured, either
-  // the workload shifted or the initial config was off.
-  double configured_cutoff_secs = 3;
-  // Derivations in ready-queue that WOULD classify into this class.
-  // Computed by classify() on each Ready-status derivation's
-  // est_duration — the same call dispatch_ready() makes. O(n) in
-  // ready-queue depth; fine for an operator/autoscaler-facing RPC.
-  uint64 queued = 4;
-  // Derivations currently Assigned/Running on executors of this class.
-  // Counted via DerivationState.assigned_size_class (set at dispatch
-  // time, may reflect overflow — a small build on a large builder
-  // counts as "running in large").
-  uint64 running = 5;
-  // build_samples rows in the rebalancer's lookback window (default 7
-  // days) whose duration_secs falls within this class's effective
-  // cutoff band. Feeds the "is the rebalancer working off enough data
-  // for this class?" operator question.
-  uint64 sample_count = 6;
-  // Per-system breakdown of `queued` (sum across keys == `queued`).
-  // I-143: size-class pools are per-arch (one BPS per arch). Without
-  // this, an x86-64-tiny pool reads `queued` for the WHOLE class —
-  // including aarch64 derivations it can never build — and spawns at
-  // ceiling for wrong-arch work. Controller intersects this map with
-  // `BuilderPool.spec.systems`. Empty map (old scheduler) → controller
-  // falls back to the scalar.
-  map<string, uint64> queued_by_system = 7;
-  // Per-system breakdown of `running` (sum across keys == `running`).
-  // Symmetry with `queued_by_system` for operator/dashboard use.
-  map<string, uint64> running_by_system = 8;
-  // ADR-023 SLA-driven sizing: per-derivation spawn intents. When the
-  // pool's BuilderPoolSet has `sizing: Sla`, the scheduler pre-computes
-  // (cores, mem, disk) per queued derivation and exposes one intent per
-  // drv here; the controller spawns one pod per intent with those
-  // resources stamped in (pod resources are immutable post-create, so
-  // they must be known at spawn time, not at heartbeat-dispatch time).
-  // Empty under `sizing: Static` — controller falls back to the scalar
-  // `queued` and per-class `spec.resources`.
-  repeated SpawnIntent spawn_intents = 9;
-}
 
 // ADR-023: scheduler-computed resources for one to-be-spawned builder
 // pod. The controller stamps these into the pod's `resources.requests`
@@ -445,39 +393,43 @@ message SpawnIntent {
   uint32 deadline_secs = 9;
 }
 
-message GetSizeClassStatusRequest {
-  // I-176: when `filter_features=true`, per-class `queued` /
-  // `queued_by_system` only count Ready derivations whose
-  // `required_features ⊆ pool_features` — derivations a worker
-  // advertising exactly `pool_features` would pass hard_filter's
-  // feature check for. The controller sets this per-pool so a kvm
-  // pool spawns for kvm-required work (which classify() may bucket
-  // into any duration class) and a featureless pool stops spawning
-  // for feature-gated work it can't build.
+message GetSpawnIntentsRequest {
+  // Filter by executor kind. Absent = unfiltered. Controller pool
+  // reconcilers set this to `pool.spec.kind` so a BuilderPool sees
+  // only `kind=Builder` intents and a FetcherPool sees only
+  // `kind=Fetcher` (the ADR-019 airgap boundary). `optional` because
+  // ExecutorKind has no UNSPECIFIED variant (Builder is wire-0).
+  optional ExecutorKind kind = 1;
+  // Filter by `intent.system ∈ systems`. Empty = unfiltered (the
+  // server-side analogue of `BuilderPool.spec.systems`; I-107/I-143).
+  repeated string systems = 2;
+  // I-176: when `filter_features=true`, only emit intents whose
+  // `required_features ⊆ features` — derivations a worker advertising
+  // exactly `features` would pass hard_filter's feature check for.
+  // Feature-gated pools (`features ≠ ∅`) ALSO exclude derivations
+  // with empty `required_features` (I-181: those are owned by the
+  // featureless pool).
   //
   // `filter_features=false` (default) → unfiltered. Distinguishes
-  // "no filter" (CLI, BPS status, pre-I-176 controllers) from
-  // "filter to required_features=∅" (a pool with `features: []`).
-  // proto3 repeated can't be optional, hence the explicit bool.
-  repeated string pool_features = 1;
-  bool filter_features = 2;
+  // "no filter" (CLI, status display) from "filter to
+  // required_features=∅" (a pool with `features: []`). proto3 repeated
+  // can't be optional, hence the explicit bool.
+  repeated string features = 3;
+  bool filter_features = 4;
 }
 
-message GetSizeClassStatusResponse {
-  // Sorted by effective_cutoff_secs ascending (smallest class first).
-  // Empty = size-classes not configured on this scheduler (optional
-  // feature).
-  repeated SizeClassStatus classes = 1;
-  // FOD (fetcher) classes — same names as `classes` (fetcher tiers ARE
-  // builder tiers), smallest first. Same `SizeClassStatus` shape but
-  // cutoff/sample fields are zero — fetcher routing is reactive
-  // (`size_class_floor`, r[sched.fod.size-class-reactive]), not
-  // duration-estimated. `queued` counts in-flight FOD demand
-  // (Ready+Assigned+Running) bucketed by `size_class_floor` so sum
-  // across classes == `ClusterStatus.queued_fod_derivations`. P0556:
-  // ephemeral FetcherPool reconciler reads this for per-class Job
-  // spawning. Empty = `[[size_classes]]` unconfigured.
-  repeated SizeClassStatus fod_classes = 2;
+message GetSpawnIntentsResponse {
+  // One intent per Ready derivation that passed the request filter.
+  // Empty when `[sla]` is unconfigured on the scheduler (Static-mode
+  // gate) — the controller falls back to `ClusterStatus`.
+  repeated SpawnIntent intents = 1;
+  // Per-system breakdown of Ready derivations (same population the
+  // intent filter sees, before the kind/feature filters apply). Sum
+  // across keys == `ClusterStatus.queued_derivations`. The
+  // ComponentScaler reads this for the predictive store-replica
+  // signal; it's a coherent snapshot with `intents` so a single RPC
+  // serves both the spawn loop and the predictive scaler.
+  map<string, uint64> queued_by_system = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

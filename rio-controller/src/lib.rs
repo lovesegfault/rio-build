@@ -28,7 +28,7 @@
 //! │  └─────────────────────────────────┘  │
 //! └──────────────────────────────────────┘
 //!        │
-//!        │ gRPC: AdminService (ClusterStatus, GetSizeClassStatus)
+//!        │ gRPC: AdminService (ClusterStatus, GetSpawnIntents)
 //!        ▼
 //!   rio-scheduler
 //! ```

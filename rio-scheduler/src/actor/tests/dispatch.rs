@@ -1453,7 +1453,7 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 
 // ─── ADR-023 SlaEstimator → SpawnIntent ────────────────────────────────
 
-/// `compute_size_class_snapshot` emits one SpawnIntent per Ready non-FOD,
+/// `compute_spawn_intents` emits one SpawnIntent per Ready derivation,
 /// with `intent_id == drv_hash` and `cores ≈ solve_mvp(c_star)` for a
 /// fitted key. Unfitted keys (no SlaEstimator entry) get probe defaults.
 // r[verify sched.sla.intent-from-solve]
@@ -1548,19 +1548,16 @@ async fn spawn_intent_from_sla_estimator() {
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
     actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
 
-    let snap = actor.compute_size_class_snapshot(None);
-    // Both classify into "small" (est_dur=0 → smallest covering class).
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    let snap = actor.compute_spawn_intents(&Default::default());
     assert_eq!(
-        small.spawn_intents.len(),
+        snap.intents.len(),
         2,
-        "one SpawnIntent per Ready non-FOD; queued={}",
-        small.queued
+        "one SpawnIntent per Ready derivation"
     );
-    assert_eq!(small.spawn_intents.len() as u64, small.queued);
+    assert_eq!(snap.queued_by_system.get("x86_64-linux"), Some(&2));
 
-    let fitted = small
-        .spawn_intents
+    let fitted = snap
+        .intents
         .iter()
         .find(|i| i.intent_id == "fitted")
         .expect("intent_id == drv_hash");
@@ -1572,11 +1569,7 @@ async fn spawn_intent_from_sla_estimator() {
     assert_eq!(fitted.disk_bytes, 10 << 30, "disk_p90 from fit");
     assert!(fitted.mem_bytes >= 6 << 30, "mem ≥ p90 (× headroom)");
 
-    let cold = small
-        .spawn_intents
-        .iter()
-        .find(|i| i.intent_id == "cold")
-        .unwrap();
+    let cold = snap.intents.iter().find(|i| i.intent_id == "cold").unwrap();
     // No SlaEstimator entry + no [sla] config → fallback probe (4c, 8Gi).
     assert_eq!(cold.cores, 4, "no fit → fallback probe cores");
     assert_eq!(cold.mem_bytes, 8 << 30);
@@ -1718,11 +1711,10 @@ async fn spawn_intent_node_selector_from_solve_full() {
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
     actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
 
-    let snap = actor.compute_size_class_snapshot(None);
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    let snap = actor.compute_spawn_intents(&Default::default());
 
-    let fitted = small
-        .spawn_intents
+    let fitted = snap
+        .intents
         .iter()
         .find(|i| i.intent_id == "fitted")
         .unwrap();
@@ -1743,11 +1735,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
         "Pending-watch armed on first emit"
     );
 
-    let cold = small
-        .spawn_intents
-        .iter()
-        .find(|i| i.intent_id == "cold")
-        .unwrap();
+    let cold = snap.intents.iter().find(|i| i.intent_id == "cold").unwrap();
     assert!(
         cold.node_selector.is_empty(),
         "no fit → band-agnostic intent_for path"
@@ -1757,12 +1745,9 @@ async fn spawn_intent_node_selector_from_solve_full() {
     // Gate: hw_cost_source unset → solve_full skipped even with hw table.
     actor.sla_config.as_mut().unwrap().hw_cost_source = None;
     actor.pending_intents.clear();
-    let snap = actor.compute_size_class_snapshot(None);
+    let snap = actor.compute_spawn_intents(&Default::default());
     let fitted = snap
-        .iter()
-        .find(|s| s.name == "small")
-        .unwrap()
-        .spawn_intents
+        .intents
         .iter()
         .find(|i| i.intent_id == "fitted")
         .unwrap();
@@ -1770,39 +1755,6 @@ async fn spawn_intent_node_selector_from_solve_full() {
         fitted.node_selector.is_empty(),
         "hw_cost_source=None → band-agnostic"
     );
-}
-
-fn test_sla_config() -> crate::sla::config::SlaConfig {
-    use crate::sla::{config, solve};
-    config::SlaConfig {
-        tiers: vec![config::Tier {
-            name: "normal".into(),
-            p50: None,
-            p90: Some(1200.0),
-            p99: None,
-        }],
-        default_tier: "normal".into(),
-        probe: config::ProbeShape {
-            cpu: 4.0,
-            mem_per_core: 1 << 30,
-            mem_base: 4 << 30,
-            deadline_secs: 3600,
-        },
-        feature_probes: Default::default(),
-        max_cores: solve::DEFAULT_CEILINGS.max_cores,
-        max_mem: solve::DEFAULT_CEILINGS.max_mem,
-        max_disk: solve::DEFAULT_CEILINGS.max_disk,
-        default_disk: solve::DEFAULT_CEILINGS.default_disk,
-        fuse_cache_budget: 0,
-        log_budget: 0,
-        ring_buffer: 32,
-        halflife_secs: 7.0 * 86400.0,
-        seed_corpus: None,
-        hw_cost_source: None,
-        hw_softmax_temp: 0.0,
-        hw_fallback_after_secs: 120.0,
-        cluster: String::new(),
-    }
 }
 
 /// SLA mode: `try_dispatch_one` writes `solve_intent_for().0` to

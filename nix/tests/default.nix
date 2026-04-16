@@ -104,9 +104,9 @@ let
         mem_base = 4294967296
 
         # cost-solve / ice-backoff observe SpawnIntent.node_selector
-        # via GetSizeClassStatus, which early-returns [] when no
-        # size_classes are configured (snapshot.rs:230). One class is
-        # enough — every Ready non-FOD lands in it.
+        # via GetSpawnIntents. Intent emission is gated on [sla] (set
+        # above). [[size_classes]] kept until Phase 6 deletes the
+        # config key.
         [[size_classes]]
         name = "default"
         cutoff_secs = 86400.0

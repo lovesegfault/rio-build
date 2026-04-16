@@ -75,7 +75,7 @@ spec:
         - path: { type: Exact, value: /rio.admin.AdminService/GetBuildLogs }
         - path: { type: Exact, value: /rio.admin.AdminService/ListTenants }
         - path: { type: Exact, value: /rio.admin.AdminService/GetBuildGraph }
-        - path: { type: Exact, value: /rio.admin.AdminService/GetSizeClassStatus }
+        - path: { type: Exact, value: /rio.admin.AdminService/GetSpawnIntents }
         - path: { type: Exact, value: /rio.scheduler.SchedulerService/WatchBuild }
         - path: { type: Exact, value: /rio.scheduler.SchedulerService/QueryBuildStatus }
       backendRefs:

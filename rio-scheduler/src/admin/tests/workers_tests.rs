@@ -53,10 +53,6 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     assert!(!w.busy);
     assert!(w.connected_since.is_some());
     assert!(w.last_heartbeat.is_some());
-    // size_class: connect_executor doesn't set it → empty string.
-    // (Proves the field is wired — a worker heartbeating with
-    // size_class="medium" would round-trip it here.)
-    assert_eq!(w.size_class, "");
 
     // filter=draining → only drain-worker.
     let resp = svc

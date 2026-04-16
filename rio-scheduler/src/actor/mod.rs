@@ -227,7 +227,7 @@ pub struct DagActor {
     /// `merge.rs::check_cached_outputs`.
     cache_breaker: CacheCheckBreaker,
     /// ADR-023 per-`(pname, system, tenant)` fitted curves. Feeds
-    /// `compute_size_class_snapshot` (SpawnIntent population) and
+    /// `compute_spawn_intents` (SpawnIntent population) and
     /// dispatch's resource-fit filter via [`crate::sla::solve::intent_for`].
     /// Internally `Arc<RwLock<…>>`; reads on the snapshot/dispatch path
     /// are a single `.cached()` clone.
@@ -616,12 +616,9 @@ impl DagActor {
                 ActorCommand::ReportExecutorTermination {
                     executor_id,
                     reason,
-                    size_class,
                     reply,
                 } => {
-                    let promoted = self
-                        .handle_executor_termination(&executor_id, reason, size_class.as_deref())
-                        .await;
+                    let promoted = self.handle_executor_termination(&executor_id, reason).await;
                     let _ = reply.send(promoted);
                 }
                 ActorCommand::PrefetchComplete {

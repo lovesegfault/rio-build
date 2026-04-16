@@ -265,8 +265,8 @@ impl DagActor {
         });
     }
 
-    /// Inject a Ready FOD. For `compute_fod_size_class_snapshot` tests
-    /// — bypasses the merge dance.
+    /// Inject a Ready FOD. For `compute_spawn_intents` kind-filter
+    /// tests — bypasses the merge dance.
     pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
             is_fixed_output: true,

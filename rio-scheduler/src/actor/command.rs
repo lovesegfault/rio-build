@@ -170,12 +170,6 @@ pub enum ActorCommand {
     ReportExecutorTermination {
         executor_id: ExecutorId,
         reason: rio_proto::types::TerminationReason,
-        /// Pod's size_class label from the controller. Fallback when
-        /// `recently_disconnected` has the entry but with `None` class
-        /// (shouldn't happen) or when the report races ahead of the
-        /// disconnect (controller observed Pod-status before the gRPC
-        /// stream broke at the scheduler).
-        size_class: Option<String>,
         reply: oneshot::Sender<bool>,
     },
 
@@ -321,22 +315,12 @@ pub enum ActorCommand {
 /// saturated; dropping the snapshot under backpressure blinds the
 /// autoscaler exactly when it needs to scale up.
 pub enum AdminQuery {
-    /// Snapshot SITA-E size-class state for
-    /// `AdminService.GetSizeClassStatus`. O(dag_nodes) for the
-    /// classify() pass over Ready derivations.
-    GetSizeClassSnapshot {
-        /// I-176: when `Some`, only count Ready derivations whose
-        /// `required_features ⊆ pool_features` — mirrors
-        /// `hard_filter`'s feature check so per-pool ephemeral
-        /// reconcilers see the queue depth their workers could
-        /// actually accept. `None` = unfiltered (CLI, BPS status).
-        /// `Some(vec![])` = "I support no features" → only counts
-        /// derivations with empty `required_features`.
-        pool_features: Option<Vec<String>>,
-        /// `(builder_classes, fod_classes)`. FOD classes (P0556) reuse
-        /// the same struct with cutoffs zeroed — fetcher routing is
-        /// reactive (`size_class_floor`), not duration-estimated.
-        reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
+    /// Snapshot per-derivation spawn intents for
+    /// `AdminService.GetSpawnIntents`. O(dag_nodes) — single pass over
+    /// Ready derivations, one `solve_intent_for` each.
+    GetSpawnIntents {
+        req: SpawnIntentsRequest,
+        reply: oneshot::Sender<SpawnIntentsSnapshot>,
     },
     /// Return expected output paths for all non-terminal
     /// derivations. Used by TriggerGC to pass as extra_roots to
@@ -484,7 +468,7 @@ pub enum DebugCmd {
 impl AdminQuery {
     pub(super) fn name(&self) -> &'static str {
         match self {
-            Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
+            Self::GetSpawnIntents { .. } => "GetSpawnIntents",
             Self::GcRoots { .. } => "GcRoots",
             Self::ListExecutors { .. } => "ListExecutors",
             Self::InspectBuildDag { .. } => "InspectBuildDag",
@@ -560,48 +544,41 @@ pub struct ExecutorSnapshot {
     pub busy: bool,
     pub draining: bool,
     pub store_degraded: bool,
-    pub size_class: Option<String>,
     pub connected_since: std::time::Instant,
     pub last_heartbeat: std::time::Instant,
     pub last_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
-/// Point-in-time per-size-class snapshot for
-/// `AdminService.GetSizeClassStatus`. Internal (not proto) —
-/// `admin/sizeclass.rs` translates + joins DB sample counts.
-///
-/// `sample_count` is NOT filled here (it's DB state, not actor state).
-/// The admin handler queries `build_samples` separately and partitions
-/// by the effective cutoffs in THIS snapshot.
-#[derive(Debug, Clone)]
-pub struct SizeClassSnapshot {
-    pub name: String,
-    /// Current (post-rebalancer) cutoff, from `size_classes.read()`.
-    pub effective_cutoff_secs: f64,
-    /// Static TOML cutoff, from `configured_cutoffs` (captured in
-    /// `with_size_classes()` before the rebalancer's first write).
-    /// Drift visibility: if this diverges from effective, the
-    /// rebalancer has moved — check if the workload shifted or the
-    /// initial config was wrong.
-    pub configured_cutoff_secs: f64,
-    /// Ready-status derivations that `classify()` assigns here.
-    pub queued: u64,
-    /// Assigned/Running derivations with `assigned_size_class == name`.
-    pub running: u64,
-    /// Per-system breakdown of `queued` (sum across keys == `queued`).
-    /// I-143: size-class pools are per-arch; without this the
-    /// controller spawns x86 builders at ceiling for aarch64-only
-    /// backlogs. Same shape as `ClusterSnapshot.queued_by_system`
-    /// (I-107) but per-class.
+/// Server-side filter for [`AdminQuery::GetSpawnIntents`]. Mirrors the
+/// proto request; collapsed `(filter_features, features)` →
+/// `Option<Vec>` so the actor sees the I-176 tristate directly.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnIntentsRequest {
+    /// `None` (proto3 `UNKNOWN`) = unfiltered.
+    pub kind: Option<rio_proto::types::ExecutorKind>,
+    /// Empty = unfiltered.
+    pub systems: Vec<String>,
+    /// `None` = unfiltered. `Some(vec![])` = featureless pool —
+    /// only emits intents with empty `required_features`.
+    pub features: Option<Vec<String>>,
+}
+
+/// Point-in-time spawn-intent snapshot for
+/// `AdminService.GetSpawnIntents`. Internal (not proto) —
+/// `admin/spawn_intents.rs` translates.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnIntentsSnapshot {
+    /// One intent per Ready derivation that passed the request
+    /// filter. `intent_id == drv_hash` — dispatch matches
+    /// `worker.intent_id == drv_hash` so the mapping is structural
+    /// (no separate table to keep in sync).
+    pub intents: Vec<rio_proto::types::SpawnIntent>,
+    /// Per-system breakdown of Ready derivations (kind/feature filters
+    /// NOT applied — same population as
+    /// `ClusterSnapshot.queued_by_system`, but `u64` for proto-compat).
+    /// The ComponentScaler reads this for the predictive store-replica
+    /// signal.
     pub queued_by_system: std::collections::HashMap<String, u64>,
-    /// Per-system breakdown of `running`. Symmetry with
-    /// `queued_by_system` for operator/dashboard use.
-    pub running_by_system: std::collections::HashMap<String, u64>,
-    /// ADR-023: per-derivation `(cores, mem, disk)` for each Ready
-    /// derivation that buckets into this class. `intent_id` is the
-    /// drv_hash — dispatch matches `worker.intent_id == drv_hash` so
-    /// the mapping is structural (no separate table to keep in sync).
-    pub spawn_intents: Vec<rio_proto::types::SpawnIntent>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.
@@ -634,15 +611,10 @@ pub struct ClusterSnapshot {
     /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
     /// currently occupied.
     pub running_derivations: u32,
-    /// FOD subset of `queued_derivations`: Ready + `is_fixed_output`.
-    /// FetcherPool autoscaling input. Always `<= queued_derivations`.
-    /// Computed via DAG iteration (not `ready_queue` — which is
-    /// hash+priority only and doesn't carry the FOD bit).
-    pub queued_fod_derivations: u32,
     /// Per-system breakdown of `queued_derivations` (Ready-only). Sum
     /// across keys == `queued_derivations`. Populated from
     /// `DerivationState.system` during the same DAG iteration that
-    /// computes `queued_fod_derivations`. Consumed by the controller's
+    /// computes `running_derivations`. Consumed by the controller's
     /// BuilderPool autoscaler so per-arch pools scale on their own
     /// backlog (I-107).
     pub queued_by_system: std::collections::HashMap<String, u32>,

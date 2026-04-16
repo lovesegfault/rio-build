@@ -176,26 +176,23 @@ logged, reconcile continues). Defense-in-depth behind the worker-side
 `daemon_timeout` -> `TimedOut` primary path.
 
 r[ctrl.pool.per-system-class-depth]
-For pools with `spec.sizeClass` set, the spawn/scale decision MUST
-intersect the class's `SizeClassStatus.queued_by_system` with
-`spec.systems` rather than reading the class-wide `queued` scalar.
-Size-class pools are per-arch (one BuilderPoolSet per arch), so the
-class scalar includes other-arch derivations the pool can never build —
-an x86-64-tiny pool spawned at ceiling for an aarch64-only backlog
-floods the scheduler with wrong-arch idle executors (I-143). Falls back
-to the scalar when `queued_by_system` is empty (scheduler predates the
-breakdown) — over-spawn rather than never spawn, same posture as
-I-107's cluster-wide filter. This narrows but does not eliminate the
-`r[ctrl.pool.ephemeral-deadline]` backstop.
+The spawn/scale decision MUST pass `spec.systems` as
+`GetSpawnIntentsRequest.systems` so the returned intent stream only
+includes derivations this pool can build. Pools are per-arch (one
+BuilderPoolSet per arch), so an unfiltered stream includes other-arch
+derivations the pool can never build — an x86-64 pool spawned at
+ceiling for an aarch64-only backlog floods the scheduler with
+wrong-arch idle executors (I-143). This narrows but does not eliminate
+the `r[ctrl.pool.ephemeral-deadline]` backstop.
 
 r[ctrl.pool.per-feature-class-depth]
-For pools with `spec.sizeClass` set, the spawn/scale decision MUST
-pass `spec.features` as the `GetSizeClassStatus` feature filter
-(`r[sched.sizeclass.feature-filter+2]`) so the per-class count reflects
-derivations whose `requiredSystemFeatures` this pool's executors can
-satisfy. When `spec.features` is non-empty, the pool sums the filtered
-count across ALL classes rather than only `spec.sizeClass`: dispatch
-overflow walks up the class chain, so a `tiny`-classified kvm derivation
+The spawn/scale decision MUST pass `spec.features` as the
+`GetSpawnIntents` feature filter
+(`r[sched.admin.spawn-intents.feature-filter]`) so the intent stream
+reflects derivations whose `requiredSystemFeatures` this pool's
+executors can satisfy. With server-side filtering there is no
+cross-class summing concern: every returned intent is one this pool's
+workers could accept, so a `tiny`-classified kvm derivation
 will route to the `xlarge`-kvm pool if that is the only kvm-capable
 pool. Without this, the kvm pool reads `queued{xlarge}=0` and never
 spawns while the featureless `tiny` pool spawns a builder that
@@ -255,16 +252,16 @@ r[ctrl.fetcherpool.classes]
 When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent` (both optional — omit for uncapped). Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
 
 r[ctrl.fetcherpool.ephemeral-per-class]
-When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxConcurrent)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[size_classes]]` unconfigured) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
+When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSpawnIntents{kind=Fetcher, systems=spec.systems}` and spawn `spawn_count(len(intents), active, class.maxConcurrent)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Under Static mode (`[sla]` unconfigured, `intents` empty) falls back to `Σ queued_by_system[spec.systems]` for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
 
 r[ctrl.fetcherpool.multiarch]
 Multiple `FetcherPool` CRs MAY coexist (typically one per arch). The reconciler derives the `rio.build/pool` label as `{fp.name}-{class.name}` so pools sharing a class name don't collide in the same namespace. Each pool's `spec.systems` and `spec.nodeSelector["kubernetes.io/arch"]` MUST agree (a pool advertising `x86_64-linux` MUST select `amd64` nodes). Dispatch is pool-agnostic: the scheduler scores across all registered fetchers regardless of which `FetcherPool` spawned them.
 
 r[ctrl.fetcherpool.spawn-builtin]
-The spawn signal (`class_queued_for_systems`) counts `queued_by_system["builtin"]` for every `FetcherPool` regardless of whether `"builtin"` appears in `spec.systems`. Every executor unconditionally advertises `"builtin"` (`r[sched.dispatch.fod-builtin-any-arch]`), so a `system="builtin"` FOD can land on any pool; omitting it from the spawn signal would stall a cold-store bootstrap. Accept ≤N× spawn for `system="builtin"` FODs across N pools --- `reap_excess_pending` reclaims the surplus once dispatch drains the queue.
+`fetch_queue_signals` always appends `"builtin"` to `GetSpawnIntentsRequest.systems` for every `FetcherPool` regardless of whether `"builtin"` appears in `spec.systems`. Every executor unconditionally advertises `"builtin"` (`r[sched.dispatch.fod-builtin-any-arch]`), so a `system="builtin"` FOD can land on any pool; omitting it from the spawn signal would stall a cold-store bootstrap. Accept ≤N× spawn for `system="builtin"` FODs across N pools --- `reap_excess_pending` reclaims the surplus once dispatch drains the queue.
 
 r[ctrl.wps.cutoff-status]
-The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSizeClassStatus` admin RPC. SSA patch body MUST include `apiVersion` + `kind`.
+The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSpawnIntents` admin RPC (`queued = len(intents)`; `effective_cutoff_secs` mirrors the spec value — the rebalancer is removed). SSA patch body MUST include `apiVersion` + `kind`.
 
 r[ctrl.wps.prune-stale]
 The BPS reconciler prunes child BuilderPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to BPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the BPS reconciler iterates `spec.classes` and won't touch it, and ownerRef GC doesn't fire while the parent still exists.
@@ -453,16 +450,6 @@ fresh failure restarts the curve from 5s. `Error::InvalidSpec` is NOT
 on the curve — it requeues at a fixed per-reconciler interval (300s
 for pools, 30s for ComponentScaler where 5min of no scaling under a
 builder burst is the I-105 cliff).
-
-r[ctrl.cache.size-class-status]
-`Ctx::size_class_status()` caches the `AdminService.GetSizeClassStatus`
-response with a 5s TTL, shared across the BuilderPool ephemeral
-reconciler and the ComponentScaler reconciler (both poll on ~10s
-ticks). The lock is held across the gRPC call so two concurrent callers
-share one fetch; the call has a 5s timeout, and on timeout the caller
-falls back to the stale cached value (reconcilers already tolerate
-half-a-tick staleness). Without the cache the two reconcilers
-double-poll the scheduler.
 
 r[ctrl.condition.sched-unreachable]
 BuilderPool and FetcherPool `.status.conditions[]` MUST carry a

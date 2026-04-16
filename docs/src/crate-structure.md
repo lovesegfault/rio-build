@@ -301,7 +301,7 @@ src/
 │   ├── gc.rs          # TriggerGC
 │   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
 │   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
-│   ├── sizeclass.rs   # GetCutoffs / SetCutoffs
+│   ├── spawn_intents.rs # GetSpawnIntents (ADR-023 per-drv intents)
 │   ├── tenants.rs     # ListTenants / tenant quota inspect
 │   ├── executors.rs   # ListExecutors / DrainExecutor / ClusterStatus
 │   └── tests/         # per-handler admin tests
@@ -442,7 +442,7 @@ src/
     │   └── mod.rs     # ComponentScaler reconcile: learnedRatio EMA + /scale patch
     └── fetcherpool/
         ├── mod.rs     # FetcherPool reconcile: per-class Job spawn (FOD-only executors)
-        └── jobs.rs    # Per-class spawn count from GetSizeClassStatus.fod_classes
+        └── jobs.rs    # Per-class spawn from GetSpawnIntents{kind=Fetcher}
 ```
 
 ### rio-test-support — Test harness

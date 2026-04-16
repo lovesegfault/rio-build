@@ -4,8 +4,8 @@
 //! module's header for the full design rationale — push-vs-poll,
 //! Job naming, zero cross-build state). Differences here:
 //!
-//!   - Queue signal is `queued_fod_derivations` (in-flight FOD
-//!     demand), not `queued_derivations`.
+//!   - Queue signal is `GetSpawnIntents{kind=Fetcher}` (D2/D5: FODs go
+//!     through the same SLA pipeline as builds).
 //!   - Pod spec comes from `executor_params(fp)` →
 //!     `pod::build_executor_pod_spec` (the fetcher-hardened params:
 //!     `readOnlyRootFilesystem`, stricter seccomp, fetcher node
@@ -46,21 +46,21 @@ use super::executor_params;
 /// completed in 5 minutes is a stuck download (TCP black-hole,
 /// upstream rate-limit) — kill and let the scheduler retry on a
 /// fresh pod. The wrong-pool-spawn case (BuilderPool's 1h backstop
-/// rationale) is less of a concern here: `queued_fod_derivations`
+/// rationale) is less of a concern here: the `kind=Fetcher` filter
 /// is FOD-specific, so a queue full of x86 FODs DOES match an x86
 /// fetcher pool. The remaining mismatch is system-only (arm64 pool
 /// spawning for x86 FODs), bounded by the same deadline.
 pub(super) const FOD_EPHEMERAL_DEADLINE_SECS: i64 = 300;
 
 /// Reconcile an ephemeral FetcherPool: count active Jobs, poll FOD
-/// queue depth, spawn Jobs if FOD work is waiting.
+/// spawn intents, spawn Jobs if FOD work is waiting.
 ///
 /// Per-class loop (P0556, `r[ctrl.fetcherpool.ephemeral-per-class]`;
-/// CEL enforces `classes` non-empty). Queue signal is `GetSizeClass
-/// Status.fod_classes[class.name].queued` (in-flight FOD demand
-/// bucketed by `size_class_floor`); active Jobs counted per class
-/// via `rio.build/pool={class.name}` label; ceiling is `class.
-/// max_replicas` (falling back to `spec.replicas.max`).
+/// CEL enforces `classes` non-empty). Queue signal is
+/// `GetSpawnIntents{kind=Fetcher, systems=spec.systems}`; active
+/// Jobs counted per class via `rio.build/pool={class.name}` label;
+/// ceiling is `class.max_replicas` (falling back to
+/// `spec.replicas.max`).
 pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     let JobReconcilePrologue {
         ns,
@@ -72,9 +72,11 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     } = job_reconcile_prologue(fp, ctx)?;
 
     // ── queue signals ───────────────────────────────────────────────
-    // Per-class depth from GetSizeClassStatus, with the flat
-    // queued_fod_derivations from ClusterStatus as fallback. Both
-    // polled best-effort (scheduler_err recorded for the
+    // D2/D5: FOD intents from `GetSpawnIntents{kind=Fetcher,
+    // systems=spec.systems}`. The scheduler runs the same SLA solve
+    // for FODs as for builds; per-intent resources are stamped via
+    // `apply_intent_resources` in the per-class spawn loop. Polled
+    // best-effort (scheduler_err recorded for the
     // SchedulerUnreachable status condition).
     let (signals, scheduler_err) = fetch_queue_signals(ctx, fp).await;
 
@@ -133,13 +135,11 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
         // nothing. Lazy RPC; fail-closed.
         total_reaped += reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &pool_name).await;
 
-        // Gate scheduler-side `size_class_floor` promotion on actual
-        // k8s OOMKilled/DiskPressure (not bare disconnect). Per-class
-        // pool_name + class.name so the scheduler can resolve
-        // next_fetcher_class. Best-effort; scheduler-side dedup makes
-        // re-reporting every tick a no-op.
-        report_terminated_pods(ctx, &ns, &pool_name, &class.name).await;
-        report_deadline_exceeded_jobs(ctx, &jobs.items, &class.name).await;
+        // Gate scheduler-side `resource_floor` bump on actual k8s
+        // OOMKilled/DiskPressure (not bare disconnect). Best-effort;
+        // scheduler-side dedup makes re-reporting every tick a no-op.
+        report_terminated_pods(ctx, &ns, &pool_name).await;
+        report_deadline_exceeded_jobs(ctx, &jobs.items).await;
     }
 
     patch_job_pool_status::<FetcherPool, _>(
@@ -168,93 +168,108 @@ pub(super) async fn reconcile(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     Ok(Action::requeue(JOB_REQUEUE))
 }
 
-/// Queue signals for one ephemeral reconcile tick. Carries both the
-/// flat count (unclassed fallback) and the per-class breakdown so
-/// `reconcile` can serve either path from one fetch.
+/// Queue signals for one ephemeral reconcile tick. D2/D5: a single
+/// flat FOD-intent stream (server-side filtered by `kind=Fetcher` +
+/// `spec.systems`). The per-class spawn loop draws from this — class
+/// boundaries are now resource-shape only; routing is by intent.
 struct QueueSignals {
-    /// Flat in-flight FOD demand (`queued_fod_derivations`). Fallback
-    /// when `fod_classes` is empty (scheduler `[[size_classes]]`
-    /// unconfigured) — applied to `classes[0]` only so
-    /// the smallest class over-spawns rather than every class
-    /// duplicating the flat count.
+    /// All `kind=Fetcher` intents matching this pool's `spec.systems`.
+    /// Empty under Static mode (`[sla]` unconfigured) — the smallest
+    /// class falls back to `flat`.
+    intents: Vec<rio_proto::types::SpawnIntent>,
+    /// `ClusterStatus.queued_derivations` filtered by `spec.systems`.
+    /// Static-mode fallback so a legacy deployment still spawns
+    /// (over-spawn-smallest posture, `r[ctrl.fetcherpool.
+    /// ephemeral-per-class]`).
     flat: u32,
-    /// `name → in-flight demand`, from `GetSizeClassStatus.fod_classes`.
-    by_class: std::collections::HashMap<String, u32>,
 }
 
 impl QueueSignals {
-    fn zero() -> Self {
-        Self {
-            flat: 0,
-            by_class: std::collections::HashMap::new(),
+    /// Queue depth for one class iteration. D2: there is no per-class
+    /// FOD signal anymore — the smallest class (`idx==0`) owns the
+    /// full intent count (or the `flat` fallback when intents are
+    /// empty). Larger classes get 0 from the count signal; they
+    /// receive work via `bump_floor_or_count` → next intent's
+    /// `mem_bytes` exceeds smallest's `spec.resources` → controller
+    /// spawns from a larger class (Phase 6 unifies this fully).
+    fn queued_for(&self, _class: &str, idx: usize) -> u32 {
+        if idx != 0 {
+            return 0;
         }
-    }
-
-    /// Queue depth for one class iteration. Per-class count; if absent
-    /// from `by_class` (scheduler doesn't know this class), fall back
-    /// to `flat` for the SMALLEST class only (`idx==0`), 0 otherwise —
-    /// matches `r[ctrl.fetcherpool.ephemeral-per-class]`'s
-    /// over-spawn-smallest posture.
-    fn queued_for(&self, class: &str, idx: usize) -> u32 {
-        match self.by_class.get(class) {
-            Some(&q) => q,
-            None if self.by_class.is_empty() && idx == 0 => self.flat,
-            None => 0,
+        if self.intents.is_empty() {
+            self.flat
+        } else {
+            self.intents.len().min(u32::MAX as usize) as u32
         }
     }
 }
 
-/// Poll the scheduler for FOD queue depth. Best-effort: on error,
+/// Poll the scheduler for FOD spawn intents. Best-effort: on error,
 /// returns `(zero, Some(err))` so the reconcile tick still runs
 /// (status condition `SchedulerUnreachable` surfaces the error;
 /// next requeue retries).
+// r[impl ctrl.fetcherpool.ephemeral-per-class]
+// r[impl ctrl.fetcherpool.spawn-builtin]
 async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Option<String>) {
-    let flat = match ctx.admin.clone().cluster_status(()).await {
-        Ok(resp) => resp.into_inner().queued_fod_derivations,
-        Err(e) => {
-            warn!(
-                pool = %fp.name_any(), error = %e,
-                "ClusterStatus poll failed; treating as queued_fod=0, will retry"
-            );
-            return (QueueSignals::zero(), Some(e.to_string()));
-        }
-    };
-    // r[impl ctrl.fetcherpool.ephemeral-per-class]
-    let by_class = match ctx
+    // `"builtin"` always included regardless of `spec.systems` — every
+    // executor advertises it unconditionally (rio-builder/main.rs), so
+    // a `system="builtin"` FOD can land on any pool. Omitting it from
+    // the spawn signal stalls cold-store bootstrap (bootstrap-tools
+    // FODs queue with no fetcher spawned).
+    const BUILTIN: &str = "builtin";
+    let mut systems = fp.spec.systems.clone();
+    if !systems.is_empty() && !systems.iter().any(|s| s == BUILTIN) {
+        systems.push(BUILTIN.into());
+    }
+    match ctx
         .admin
         .clone()
-        .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest::default())
+        .get_spawn_intents(rio_proto::types::GetSpawnIntentsRequest {
+            kind: Some(rio_proto::types::ExecutorKind::Fetcher.into()),
+            systems,
+            features: Vec::new(),
+            filter_features: false,
+        })
         .await
     {
-        Ok(resp) => resp
-            .into_inner()
-            .fod_classes
-            .into_iter()
-            .map(|c| {
-                // I-143 per-system filter (mirrors builderpool::
-                // queued_for_pool). Same u64→u32 saturating cast as
-                // scaling::per_class — pathological queue depth
-                // shouldn't wrap to 0.
-                let q = crate::scaling::class_queued_for_systems(&c, &fp.spec.systems);
-                (c.name, q.min(u32::MAX as u64) as u32)
-            })
-            .collect(),
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            // Static-mode fallback: `queued_by_system` is populated
+            // even when `intents` is empty.
+            let flat = if fp.spec.systems.is_empty() {
+                resp.queued_by_system.values().sum::<u64>()
+            } else {
+                fp.spec
+                    .systems
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(BUILTIN))
+                    .map(|s| resp.queued_by_system.get(s).copied().unwrap_or(0))
+                    .sum()
+            }
+            .min(u32::MAX as u64) as u32;
+            (
+                QueueSignals {
+                    intents: resp.intents,
+                    flat,
+                },
+                None,
+            )
+        }
         Err(e) => {
             warn!(
                 pool = %fp.name_any(), error = %e,
-                "GetSizeClassStatus poll failed; falling back to flat \
-                 queued_fod for smallest class"
+                "GetSpawnIntents poll failed; treating as queued=0, will retry"
             );
-            return (
+            (
                 QueueSignals {
-                    flat,
-                    by_class: std::collections::HashMap::new(),
+                    intents: Vec::new(),
+                    flat: 0,
                 },
                 Some(e.to_string()),
-            );
+            )
         }
-    };
-    (QueueSignals { flat, by_class }, None)
+    }
 }
 
 /// Build a K8s Job for one ephemeral fetcher pod. Same Job-level
@@ -496,27 +511,29 @@ mod tests {
     }
 
     // r[verify ctrl.fetcherpool.ephemeral-per-class]
-    /// `QueueSignals::queued_for` routing: per-class count when known;
-    /// flat fallback to smallest only.
+    /// `QueueSignals::queued_for` routing: smallest class owns the
+    /// full intent count; non-smallest get 0. Static-mode (`intents`
+    /// empty) falls back to `flat` for smallest only.
     #[test]
     fn queue_signals_routing() {
-        // Per-class breakdown known.
-        let s = QueueSignals {
-            flat: 5,
-            by_class: std::collections::HashMap::from([("tiny".into(), 3), ("small".into(), 2)]),
+        let mk = |id: &str| rio_proto::types::SpawnIntent {
+            intent_id: id.into(),
+            kind: rio_proto::types::ExecutorKind::Fetcher.into(),
+            ..Default::default()
         };
-        assert_eq!(s.queued_for("tiny", 0), 3);
-        assert_eq!(s.queued_for("small", 1), 2);
-        // Class the scheduler doesn't know → 0 (don't double-count).
-        assert_eq!(s.queued_for("huge", 2), 0);
-
-        // Breakdown empty (scheduler [[size_classes]] off):
-        // smallest class falls back to flat, others get 0.
         let s = QueueSignals {
-            flat: 5,
-            by_class: std::collections::HashMap::new(),
+            intents: vec![mk("a"), mk("b"), mk("c")],
+            flat: 99,
         };
-        assert_eq!(s.queued_for("tiny", 0), 5, "smallest gets flat");
+        assert_eq!(s.queued_for("tiny", 0), 3, "smallest gets intent count");
         assert_eq!(s.queued_for("small", 1), 0, "non-smallest gets 0");
+
+        // Static-mode (intents empty): smallest falls back to flat.
+        let s = QueueSignals {
+            intents: Vec::new(),
+            flat: 5,
+        };
+        assert_eq!(s.queued_for("tiny", 0), 5, "smallest gets flat fallback");
+        assert_eq!(s.queued_for("small", 1), 0, "non-smallest still 0");
     }
 }

@@ -33,8 +33,8 @@
 #   sched.sla.prior-partial-pool.
 #
 # cost-solve — seed band-aware hw_perf_samples + low lambda, queue a
-#   build with the worker stopped, assert GetSizeClassStatus
-#   spawn_intents[].nodeSelector carries rio.build/hw-band. Covers
+#   build with the worker stopped, assert GetSpawnIntents
+#   intents[].nodeSelector carries rio.build/hw-band. Covers
 #   sched.sla.solve-per-band-cap. Requires the solve_full -> intent_for
 #   node_selector wiring; fails until that lands.
 #
@@ -307,9 +307,9 @@ let
           # carries rio.build/hw-band; the per-band cost ranking is
           # unit-tested in solve.rs. Standalone fixture has no
           # controller, so we read the scheduler-side intent via
-          # GetSizeClassStatus instead of inspecting a pod spec.
+          # GetSpawnIntents instead of inspecting a pod spec.
           #
-          # NOTE: requires solve_full -> intent_for -> spawn_intents
+          # NOTE: requires solve_full -> intent_for -> intents
           # node_selector wiring (impl-todos commit 3). Until that
           # lands, nodeSelector stays {} and this subtest fails.
           band_hw = [("intel-6-ebs", 1.0), ("intel-7-ebs", 1.4), ("intel-8-nvme", 2.0)]
@@ -350,7 +350,7 @@ let
               })
           wait_estimator_tick()
           # Stop the worker so the next submit stays Ready and shows
-          # up in compute_size_class_snapshot -> spawn_intents.
+          # up in compute_spawn_intents -> intents.
           worker.systemctl("stop rio-builder")
           client.execute(
               "nohup nix-build --no-out-link "
@@ -359,24 +359,21 @@ let
               "${costDrv} > /tmp/synth-cost.log 2>&1 < /dev/null &"
           )
           # Poll until the scheduler reports a SpawnIntent for the
-          # queued synth-cost drv. GetSizeClassStatus.classes is
-          # populated iff [[size_classes]] is configured (it is, in
+          # queued synth-cost drv. GetSpawnIntents.intents is
+          # populated iff [sla] is configured (it is, in
           # slaSizingFixture).
           intent: dict = {}
           resp: dict = {}
           for _ in range(30):
-              resp = json.loads(grpcurl_admin("GetSizeClassStatus", {}))
-              intents = [
-                  si for cls in resp.get("classes", [])
-                  for si in cls.get("spawnIntents", [])
-              ]
+              resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
+              intents = resp.get("intents", [])
               if intents:
                   intent = intents[0]
                   break
               time.sleep(2)
           assert intent, (
               "no SpawnIntent after 60s. "
-              f"GetSizeClassStatus={resp!r} "
+              f"GetSpawnIntents={resp!r} "
               f"nix-build={client.execute('cat /tmp/synth-cost.log')[1]!r}"
           )
           sel = intent.get("nodeSelector", {})
@@ -423,11 +420,8 @@ let
           # is recomputed every snapshot.
           sel: dict = {}
           for _ in range(15):
-              resp = json.loads(grpcurl_admin("GetSizeClassStatus", {}))
-              intents = [
-                  si for cls in resp.get("classes", [])
-                  for si in cls.get("spawnIntents", [])
-              ]
+              resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
+              intents = resp.get("intents", [])
               if intents:
                   sel = intents[0].get("nodeSelector", {})
                   break

@@ -50,9 +50,24 @@ r[sched.sla.disk-reaches-ephemeral-storage]
 r[sched.sla.intent-from-solve]
 
 The scheduler exposes one `SpawnIntent{intent_id, cores, mem, disk}` per
-queued non-FOD derivation in `GetSizeClassStatus`. `cores` is
+queued derivation (FOD and non-FOD) in `GetSpawnIntents`. `cores` is
 `ceil(solve_mvp(c_star))` for fitted keys, probe defaults otherwise;
 `prefer_local_build` / `enable_parallel_building=false` pin `cores=1`.
+
+r[sched.admin.spawn-intents.feature-filter]
+
+When `GetSpawnIntentsRequest.filter_features` is set, the returned
+`intents` MUST only include Ready derivations whose
+`requiredSystemFeatures` is a subset of `features` --- i.e., derivations
+an executor advertising exactly `features` would pass `hard_filter`'s
+feature check for. Feature-gated pools (`features ≠ ∅`) MUST exclude
+derivations with empty `requiredSystemFeatures` --- those are owned by
+the featureless pool. The subset check alone (∅ ⊆ anything) would
+over-count (I-181). The `kind` filter MUST be applied alongside (the
+ADR-019 airgap boundary), and `systems` (when non-empty) MUST intersect
+`intent.system` so a per-arch pool sees only its own backlog
+(I-107/I-143). Unset `filter_features` (default) = unfiltered,
+preserving CLI behavior.
 
 r[sched.sla.intent-match]
 

@@ -294,10 +294,9 @@ impl DagActor {
             // argument ("controller spawns and dispatch accepts the
             // SAME shape") only holds when the controller actually
             // receives intents and runs `apply_intent_resources`.
-            // `compute_size_class_snapshot` emits intents iff
-            // `size_classes non-empty ∧ sla_config.is_some()` — empty
-            // classes early-returns Vec::new() (snapshot.rs:185); the
-            // sla_config gate is 9f1f321a. With either false the
+            // `compute_spawn_intents` emits intents iff
+            // `sla_config.is_some()` (Static-mode gate). With it
+            // false the
             // controller takes the `spawn_n` path (jobs.rs:244
             // `intents.is_empty()`) → fixed per-class `spec.resources`
             // → a cold-start `solve_intent_for` probe (12 GiB at helm

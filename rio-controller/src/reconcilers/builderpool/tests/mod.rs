@@ -66,7 +66,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         },
         recorder,
         error_counts: Default::default(),
-        size_class_cache: Default::default(),
+        spawn_intents_cache: Default::default(),
         scaler: Default::default(),
     })
 }

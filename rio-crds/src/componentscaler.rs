@@ -10,7 +10,7 @@
 //!
 //! Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
 //! in-cluster. The controller already has the demand signal
-//! (`GetSizeClassStatus`) and the reconcile-loop pattern; an HPA-on-
+//! (`GetSpawnIntents`) and the reconcile-loop pattern; an HPA-on-
 //! custom-metrics path would mean deploying that stack first.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -54,10 +54,11 @@ pub struct Replicas {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Signal {
-    /// `Σ(class.queued + class.running)` from `AdminService.
-    /// GetSizeClassStatus`. Builders are the store's load source
-    /// (~12 batch-RPCs/builder post-I-110) so `store_load ∝
-    /// builder_count` is the assumption the learned ratio corrects.
+    /// `Σ queued_by_system + running_derivations` from
+    /// `AdminService.GetSpawnIntents` + `ClusterStatus`. Builders are
+    /// the store's load source (~12 batch-RPCs/builder post-I-110) so
+    /// `store_load ∝ builder_count` is the assumption the learned
+    /// ratio corrects.
     #[default]
     SchedulerBuilders,
 }

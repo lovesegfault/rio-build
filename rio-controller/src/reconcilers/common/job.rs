@@ -921,7 +921,7 @@ pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
 /// the reconcile continues. A missed report degrades to "one OOM
 /// doesn't promote"; the next OOM on the same drv will (floor is
 /// sticky). Never blocks the spawn/reap loop.
-pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str, size_class: &str) {
+pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     let list = match pods
         .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool}")))
@@ -946,15 +946,14 @@ pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str, size
             .report_executor_termination(ReportExecutorTerminationRequest {
                 executor_id: name.to_owned(),
                 reason: reason.into(),
-                size_class: size_class.to_owned(),
             })
             .await
         {
             Ok(resp) => {
                 if resp.into_inner().promoted {
                     info!(
-                        pool, executor_id = %name, ?reason, size_class,
-                        "reported pod termination → scheduler promoted size_class_floor"
+                        pool, executor_id = %name, ?reason,
+                        "reported pod termination → scheduler bumped resource_floor"
                     );
                 }
             }
@@ -1001,7 +1000,7 @@ pub(crate) fn job_deadline_exceeded(job: &Job) -> bool {
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
 // r[impl ctrl.terminated.deadline-exceeded]
-pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job], size_class: &str) {
+pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
         if !job_deadline_exceeded(job) {
@@ -1014,15 +1013,14 @@ pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job], size_
             .report_executor_termination(ReportExecutorTerminationRequest {
                 executor_id: name.to_owned(),
                 reason: TerminationReason::DeadlineExceeded.into(),
-                size_class: size_class.to_owned(),
             })
             .await
         {
             Ok(resp) => {
                 if resp.into_inner().promoted {
                     info!(
-                        executor_id = %name, size_class,
-                        "reported Job DeadlineExceeded → scheduler promoted size_class_floor"
+                        executor_id = %name,
+                        "reported Job DeadlineExceeded → scheduler bumped resource_floor"
                     );
                 }
             }

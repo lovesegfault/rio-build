@@ -71,7 +71,6 @@ fn snapshot_to_proto(s: ExecutorSnapshot) -> ExecutorInfo {
         resources: s.last_resources,
         last_heartbeat: instant_to_ts(s.last_heartbeat),
         connected_since: instant_to_ts(s.connected_since),
-        size_class: s.size_class.unwrap_or_default(),
         kind: s.kind as i32,
     }
 }

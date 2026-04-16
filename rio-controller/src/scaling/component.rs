@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use rio_proto::types::GetSizeClassStatusResponse;
+use rio_proto::types::GetSpawnIntentsResponse;
 
 use rio_crds::componentscaler::{ComponentScalerSpec, ComponentScalerStatus, LoadThresholds};
 
@@ -88,22 +88,21 @@ pub struct Decision {
 
 /// Sum `Σ(class.queued + class.running)` across all size classes.
 ///
-/// `running` is included (not just `queued`): a builder that's
-/// running is STILL a store load source (FUSE reads, output
-/// PutPath). I-110's batching made the per-builder RPC count
-/// roughly constant across the build's lifetime, so queued and
-/// running weigh the same.
+/// Reads `queued_by_system` (Ready-only) — a queued builder is the
+/// store's load source (FUSE reads on input prefetch, output
+/// PutPath). The reconciler adds `ClusterStatus.running_derivations`
+/// for the in-flight half so queued and running weigh the same
+/// (I-110's batching made the per-builder RPC count roughly constant
+/// across the build's lifetime).
 ///
-/// Empty classes list (size-classes not configured on this
-/// scheduler) → 0. Caller treats 0 builders as "scale to min" —
-/// correct for an idle cluster, and a misconfigured one will be
-/// caught by the high-load reactive path (`current + 1`) instead.
+/// Empty map (no Ready derivations) → 0. Caller treats 0 builders as
+/// "scale to min" — correct for an idle cluster, and a misconfigured
+/// one will be caught by the high-load reactive path (`current + 1`).
 // r[impl ctrl.scaler.component]
-pub fn total_builders(resp: &GetSizeClassStatusResponse) -> u64 {
-    resp.classes
-        .iter()
-        .map(|c| c.queued.saturating_add(c.running))
-        .fold(0u64, |a, b| a.saturating_add(b))
+pub fn total_builders(resp: &GetSpawnIntentsResponse) -> u64 {
+    resp.queued_by_system
+        .values()
+        .fold(0u64, |a, b| a.saturating_add(*b))
 }
 
 /// Compute the next replica count + ratio adjustment.
@@ -210,7 +209,6 @@ pub fn decide(
 mod tests {
     use super::*;
     use rio_crds::componentscaler::{Replicas, Signal, TargetRef};
-    use rio_proto::types::SizeClassStatus;
 
     fn spec(min: i32, max: i32) -> ComponentScalerSpec {
         ComponentScalerSpec {
@@ -241,28 +239,22 @@ mod tests {
     // r[verify ctrl.scaler.component]
     #[test]
     fn total_builders_sums_and_saturates() {
-        let mk = |q, r| SizeClassStatus {
-            name: "x".into(),
-            queued: q,
-            running: r,
-            ..Default::default()
-        };
-        let resp = GetSizeClassStatusResponse {
-            classes: vec![mk(10, 5), mk(0, 7), mk(100, 0)],
-            fod_classes: vec![],
+        let resp = GetSpawnIntentsResponse {
+            intents: vec![],
+            queued_by_system: [("x86_64-linux".into(), 110), ("aarch64-linux".into(), 12)].into(),
         };
         assert_eq!(total_builders(&resp), 122);
 
-        let resp = GetSizeClassStatusResponse {
-            classes: vec![mk(u64::MAX, 1)],
-            fod_classes: vec![],
+        let resp = GetSpawnIntentsResponse {
+            intents: vec![],
+            queued_by_system: [("a".into(), u64::MAX), ("b".into(), 1)].into(),
         };
         assert_eq!(total_builders(&resp), u64::MAX, "saturates, not wraps");
 
         assert_eq!(
-            total_builders(&GetSizeClassStatusResponse::default()),
+            total_builders(&GetSpawnIntentsResponse::default()),
             0,
-            "empty classes → 0 (size-classes not configured)"
+            "empty map → 0 (idle cluster)"
         );
     }
 

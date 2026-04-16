@@ -59,14 +59,6 @@ pub(crate) struct SizingConfig {
     /// (never the class SET), so the construction-time name snapshot
     /// stays valid.
     pub(super) fetcher_classes: Vec<String>,
-    /// Static TOML cutoffs, captured once from `cfg.size_classes`
-    /// BEFORE the rebalancer's first write. The rebalancer mutates
-    /// `size_classes[i].cutoff_secs` in-place hourly; without this
-    /// snapshot, there's no way to report drift to operators.
-    /// `(name, cutoff_secs)` pairs — Vec preserves config order
-    /// (matters for the RPC response which sorts by effective cutoff,
-    /// but configured order is useful for logging).
-    pub(super) configured_cutoffs: Vec<(String, f64)>,
     /// I-204: capability-hint features stripped at DAG insertion.
     /// Re-applied by [`apply_to_dag`] on every fresh DAG (recovery
     /// replaces `DagActor.dag` on each leader transition).
@@ -75,18 +67,9 @@ pub(crate) struct SizingConfig {
 
 impl SizingConfig {
     pub(super) fn new(cfg: &DagActorConfig) -> Self {
-        // Snapshot the as-loaded cutoffs BEFORE the rebalancer sees
-        // them. GetSizeClassSnapshot reports both: effective (mutated
-        // hourly) vs configured (this snapshot) for drift visibility.
-        let configured_cutoffs = cfg
-            .size_classes
-            .iter()
-            .map(|c| (c.name.clone(), c.cutoff_secs))
-            .collect();
         Self {
             size_classes: Arc::new(parking_lot::RwLock::new(cfg.size_classes.clone())),
             fetcher_classes: crate::assignment::builder_class_order(&cfg.size_classes),
-            configured_cutoffs,
             soft_features: cfg.soft_features.clone(),
         }
     }
