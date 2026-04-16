@@ -267,7 +267,7 @@ impl DagActor {
         // guards aren't `Send`; the await point would be a
         // compile error anyway, but keeping the scope tight
         // is defensive.
-        let (target_class, est_memory_bytes, sla_predicted, is_fixed_output, system) = {
+        let (target_class, est_cores, est_memory_bytes, sla_predicted, is_fixed_output, system) = {
             let pname = state.pname.as_deref();
             let system = &state.system;
             let classes = self.sizing.size_classes.read();
@@ -300,15 +300,16 @@ impl DagActor {
             // when `w.last_resources` is still None from the cgroup-
             // poll-vs-first-heartbeat race). The pre-ADR-023 path
             // (`bucketed_estimate`) returned None on cold start.
-            let (est_memory_bytes, sla_predicted) =
+            let (est_cores, est_memory_bytes, sla_predicted) =
                 if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
-                    (None, None)
+                    (None, None, None)
                 } else {
-                    let (_, mem, _, pred, _) = self.solve_intent_for(pname, state);
-                    (Some(mem), pred)
+                    let (cores, mem, _, pred, _) = self.solve_intent_for(pname, state);
+                    (Some(cores), Some(mem), pred)
                 };
             (
                 target_class,
+                est_cores,
                 est_memory_bytes,
                 sla_predicted,
                 state.is_fixed_output,
@@ -321,6 +322,7 @@ impl DagActor {
         // best_executor) reads the fresh value. Refreshed each
         // dispatch pass — picks up estimator Tick updates.
         if let Some(state) = self.dag.node_mut(&drv_hash) {
+            state.sched.est_cores = est_cores;
             state.sched.est_memory_bytes = est_memory_bytes;
             // ADR-023 phase-7: capture the dispatch-time prediction so
             // completion can score actual-vs-predicted on the SAME
@@ -1660,10 +1662,13 @@ impl DagActor {
             generation,
             is_fixed_output: state.is_fixed_output,
             traceparent: state.traceparent.clone(),
-            // TODO: ADR-023 — populate from the size class picked by
-            // classify(). For now None → executor falls back to its
-            // cgroup cpu.max clamp (pre-ADR-023 behavior).
-            assigned_cores: None,
+            // Intent for this drv (matches the SpawnIntent that spawned the
+            // pod). Builder clamps to cgroup cpu.max so a wildcard worker
+            // (different intent) still gets ground-truth. Populating this
+            // makes resolve_build_opts override client `--cores N`, closing
+            // the model-corruption vector where the build runs at N but
+            // telemetry records cgroup limit.
+            assigned_cores: state.sched.est_cores,
             assigned_mem_bytes: None,
             assigned_disk_bytes: None,
         })

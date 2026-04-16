@@ -1877,6 +1877,120 @@ fn test_sla_config() -> crate::sla::config::SlaConfig {
     }
 }
 
+/// SLA mode: `try_dispatch_one` writes `solve_intent_for().0` to
+/// `sched.est_cores`, and `build_assignment_proto` forwards it as
+/// `WorkAssignment.assigned_cores`. With `sla_config=None` the gate
+/// skips the solve → `est_cores` stays `None` → `assigned_cores=None`.
+// r[verify sched.sla.cores-reach-nix-build-cores]
+#[tokio::test]
+async fn work_assignment_carries_sla_cores() {
+    use crate::sla::types::*;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 3600.0)]);
+    actor.sla_config = Some(test_sla_config());
+    actor.sla_tiers = vec![crate::sla::solve::Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(1200.0),
+        p99: None,
+    }];
+    // Same Amdahl fit as `spawn_intent_from_sla_estimator` → c*≈1.95 → 2.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "test-pkg".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
+    let expected_cores = {
+        let state = actor.dag.node("fitted").unwrap();
+        actor.solve_intent_for(Some("test-pkg"), state).0
+    };
+    actor.push_ready("fitted".to_string().into());
+
+    let mut rx = bare_connect_builder(&mut actor, "w-sla", "small");
+    actor.dispatch_ready().await;
+
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.assigned_cores,
+        Some(expected_cores),
+        "SLA mode: WorkAssignment.assigned_cores == solve_intent_for().0"
+    );
+    assert_eq!(
+        actor.dag.node("fitted").unwrap().sched.est_cores,
+        Some(expected_cores),
+        "est_cores persisted on state for build_assignment_proto"
+    );
+
+    // sla_config=None → gate skips solve_intent_for → assigned_cores=None.
+    // (FOD takes the same gate-branch; this is the cheaper case to wire.)
+    actor.sla_config = None;
+    actor.test_inject_ready("no-sla", Some("test-pkg"), "x86_64-linux");
+    actor.push_ready("no-sla".to_string().into());
+    let mut rx2 = bare_connect_builder(&mut actor, "w-nosla", "small");
+    actor.dispatch_ready().await;
+
+    let assignment = recv_assignment(&mut rx2).await;
+    assert_eq!(
+        assignment.assigned_cores, None,
+        "sla_config=None → assigned_cores=None (builder falls back to cgroup clamp)"
+    );
+    assert_eq!(actor.dag.node("no-sla").unwrap().sched.est_cores, None);
+}
+
+/// Connect+heartbeat+warm a builder against a bare (unspawned) actor.
+/// `resources=None` so the resource-fit gate is bypassed.
+fn bare_connect_builder(
+    actor: &mut DagActor,
+    id: &str,
+    size_class: &str,
+) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
+    let (tx, rx) = mpsc::channel(8);
+    actor.handle_worker_connected(&id.into(), tx);
+    actor.handle_heartbeat(HeartbeatPayload {
+        executor_id: id.into(),
+        systems: vec!["x86_64-linux".into()],
+        supported_features: vec![],
+        running_build: None,
+        size_class: Some(size_class.into()),
+        resources: None,
+        store_degraded: false,
+        draining: false,
+        kind: rio_proto::types::ExecutorKind::Builder,
+        intent_id: None,
+    });
+    actor.handle_prefetch_complete(&id.into(), 0);
+    rx
+}
+
 /// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when
 /// it isn't FIFO-first. Proves the `find_executor_with_overflow` intent
 /// match preempts pick-from-queue. On miss (stale intent), the worker

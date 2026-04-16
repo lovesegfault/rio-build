@@ -424,6 +424,13 @@ pub struct SchedHint {
     /// cold start (no `build_history` row, no `pname`, or no memory
     /// sample); filter treats `None` as "any worker fits".
     pub est_memory_bytes: Option<u64>,
+    /// SLA-solved core count for this dispatch (same `solve_intent_for`
+    /// call as `est_memory_bytes`). `build_assignment_proto` forwards it
+    /// as `WorkAssignment.assigned_cores` so the builder's
+    /// `resolve_build_opts` overrides client `--cores N` with the value
+    /// the SpawnIntent actually requested. `None` = FOD / SLA off /
+    /// classes empty (same gate as `est_memory_bytes`). In-memory only.
+    pub est_cores: Option<u32>,
     /// ADR-023 phase-7: dispatch-time SLA prediction snapshot. Set
     /// alongside `est_memory_bytes` (same `solve_intent_for` call);
     /// `record_build_history` reads it back to emit

@@ -1109,6 +1109,7 @@ mod tests {
             max_silent_time: 0,
             cgroup_parent: "/tmp".into(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
+            systems: Arc::from(["x86_64-linux".to_string()]),
             fuse_cache: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
