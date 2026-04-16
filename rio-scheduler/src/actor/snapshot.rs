@@ -188,10 +188,9 @@ impl DagActor {
     ///
     /// For **queued**: Ready-status derivations. They haven't been
     /// dispatched yet so `assigned_size_class` is None. We call
-    /// `classify()` with the SAME inputs dispatch would use
-    /// (est_duration + estimator peaks) — this is a forecast, not a
-    /// fact. If the rebalancer shifts cutoffs between this call and
-    /// actual dispatch, the class may differ. Acceptable for an
+    /// `classify()` with the SAME inputs dispatch would use:
+    /// est_duration only — peaks stubbed `None` until Phase 6 deletes
+    /// classify(). This is a forecast, not a fact; acceptable for an
     /// operator view.
     ///
     /// For **running**: Assigned/Running derivations. Use

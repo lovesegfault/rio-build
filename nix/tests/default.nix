@@ -157,7 +157,7 @@ let
       extraConfig = ''
         [[size_classes]]
         name = "small"
-        cutoff_secs = 30.0
+        cutoff_secs = 60.0
         mem_limit_bytes = 17179869184
 
         [[size_classes]]
