@@ -82,6 +82,7 @@ let
       extraConfig = ''
         [sla]
         default_tier = "normal"
+        hw_cost_source = "static"
         max_cores = 64
         max_mem = 274877906944
         max_disk = 214748364800
@@ -402,6 +403,10 @@ in
           "override-precedence"
           # r[verify sched.sla.hw-ref-seconds]
           "hw-normalize"
+          # r[verify sched.sla.solve-per-band-cap]
+          "cost-solve"
+          # r[verify sched.sla.tier-envelope]
+          "ice-backoff"
           # r[verify sched.sla.prior-partial-pool]
           "seed-corpus"
         ];

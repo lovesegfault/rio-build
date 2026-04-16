@@ -32,6 +32,17 @@
 #   one sample -> SlaStatus.prior_source == "seed". Covers
 #   sched.sla.prior-partial-pool.
 #
+# cost-solve — seed band-aware hw_perf_samples + low lambda, queue a
+#   build with the worker stopped, assert GetSizeClassStatus
+#   spawn_intents[].nodeSelector carries rio.build/hw-band. Covers
+#   sched.sla.solve-per-band-cap. Requires the solve_full -> intent_for
+#   node_selector wiring; fails until that lands.
+#
+# ice-backoff — push lambda very high (100 interrupts / 1s exposure)
+#   on every band -> spot infeasible at the p>0.5 gate -> nodeSelector
+#   capacity-type flips to on-demand. Covers sched.sla.tier-envelope
+#   (per-(band,cap) cell exclusion).
+#
 # CAVEAT: standalone-fixture workers read effective_cores from the host
 # cgroup, NOT from a per-dispatch SpawnIntent (no controller). The
 # convergence subtest therefore asserts the SAMPLES landed (proving the
@@ -74,6 +85,18 @@ let
     2
   ];
 
+  # Distinct pname for the cost-solve subtest so its fit + queue state
+  # are independent of synth-amdahl (which earlier subtests reset /
+  # override). Body is irrelevant (worker is stopped while this is
+  # queued); the fixture-miss marker is defensive only.
+  costDrv = drvs.mkCustom {
+    name = "synth-cost-0";
+    extraAttrs.pname = "synth-cost";
+    script = ''
+      echo synth-cost-fixture-miss-ran-real-build > $out
+    '';
+  };
+
   prelude = ''
     ${common.mkBootstrap {
       inherit fixture gatewayHost;
@@ -100,6 +123,8 @@ let
             "RIO_SCHEDULER_ADDR=localhost:9001 "
             f"${rioCli} {args} 2>&1"
         )
+
+    import time
 
     def wait_estimator_tick() -> None:
         # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
@@ -272,6 +297,125 @@ let
           assert st["sigmaResid"] < 0.2, f"sigma={st['sigmaResid']}"
     '';
 
+    cost-solve = ''
+      with subtest("cost-solve: solve_full populates SpawnIntent.nodeSelector"):
+          # Phase-13 wiring: hw_cost_source="static" + populated
+          # hw_perf_factors + non-seed lambda -> solve_full picks a
+          # (band, cap) and stamps it into SpawnIntent.node_selector.
+          # ASSERT-LIGHT: only checks the selector is non-empty and
+          # carries rio.build/hw-band; the per-band cost ranking is
+          # unit-tested in solve.rs. Standalone fixture has no
+          # controller, so we read the scheduler-side intent via
+          # GetSizeClassStatus instead of inspecting a pod spec.
+          #
+          # NOTE: requires solve_full -> intent_for -> spawn_intents
+          # node_selector wiring (impl-todos commit 3). Until that
+          # lands, nodeSelector stays {} and this subtest fails.
+          band_hw = [("intel-6-ebs", 1.0), ("intel-7-ebs", 1.4), ("intel-8-nvme", 2.0)]
+          for hw, factor in band_hw:
+              for i in range(3):
+                  ${gatewayHost}.succeed(
+                      "sudo -u postgres psql -d rio -c \""
+                      "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) "
+                      f"VALUES ('{hw}', 'pod-{hw}-{i}', {factor})\""
+                  )
+              # Low lambda (1 interrupt / 3600s exposure) so spot
+              # stays feasible under the p>0.5 gate.
+              grpcurl_admin("AppendInterruptSample",
+                  {"hwClass": hw, "kind": "exposure", "value": 3600})
+              grpcurl_admin("AppendInterruptSample",
+                  {"hwClass": hw, "kind": "interrupt", "value": 1})
+          # On-curve samples (S=30 P=2000) -> synth-cost gets a fit on
+          # the next refresh tick so intent_for takes the solve branch.
+          for c, t in [(4, 530), (8, 280), (16, 155), (32, 92.5), (64, 61.25)]:
+              grpcurl_admin("InjectBuildSample", {
+                  "pname": "synth-cost", "system": "x86_64-linux",
+                  "tenant": "", "durationSecs": t,
+                  "peakMemoryBytes": 1073741824,
+                  "cpuLimitCores": c, "cpuSecondsTotal": t * c * 0.9,
+              })
+          wait_estimator_tick()
+          # Stop the worker so the next submit stays Ready and shows
+          # up in compute_size_class_snapshot -> spawn_intents.
+          worker.systemctl("stop rio-builder")
+          client.execute(
+              "nohup nix-build --no-out-link "
+              "--store 'ssh-ng://${gatewayHost}' "
+              "--arg busybox '(builtins.storePath ${pkgs.pkgsStatic.busybox})' "
+              "${costDrv} > /tmp/synth-cost.log 2>&1 < /dev/null &"
+          )
+          # Poll until the scheduler reports a SpawnIntent for the
+          # queued synth-cost drv.
+          intent = {}
+          for _ in range(30):
+              resp = json.loads(grpcurl_admin("GetSizeClassStatus", {}))
+              intents = [
+                  si for cls in resp.get("classes", [])
+                  for si in cls.get("spawnIntents", [])
+              ]
+              if intents:
+                  intent = intents[0]
+                  break
+              time.sleep(2)
+          assert intent, (
+              "no SpawnIntent after 60s; build never queued? "
+              f"log={client.execute('cat /tmp/synth-cost.log')[1]}"
+          )
+          sel = intent.get("nodeSelector", {})
+          print(f"cost-solve: nodeSelector={sel}")
+          assert sel, (
+              "SpawnIntent.nodeSelector empty: solve_full not wired into "
+              f"intent_for (impl-todos commit 3 not landed?). intent={intent}"
+          )
+          assert "rio.build/hw-band" in sel, sel
+          assert sel.get("rio.build/hw-band") in ("hi", "mid", "lo"), sel
+    '';
+
+    ice-backoff = ''
+      with subtest("ice-backoff: high lambda forces on-demand capacity-type"):
+          # Force lambda very high on every band-aware hw_class (100
+          # interrupts / 1s exposure) -> p(preempt) > 0.5 at any c ->
+          # solve_full rejects all spot cells -> picked candidate has
+          # capacity-type=on-demand. Exercises the same per-(band,cap)
+          # exclusion path IceBackoff.mark feeds (solve_full skips
+          # infeasible cells then softmax-picks among the survivors).
+          for hw in ("intel-6-ebs", "intel-7-ebs", "intel-8-nvme"):
+              grpcurl_admin("AppendInterruptSample",
+                  {"hwClass": hw, "kind": "interrupt", "value": 100})
+              grpcurl_admin("AppendInterruptSample",
+                  {"hwClass": hw, "kind": "exposure", "value": 1})
+          wait_estimator_tick()
+          # synth-cost is still queued (worker stopped); its SpawnIntent
+          # is recomputed every snapshot, so the next GetSizeClassStatus
+          # reflects the new lambda.
+          sel = {}
+          for _ in range(15):
+              resp = json.loads(grpcurl_admin("GetSizeClassStatus", {}))
+              intents = [
+                  si for cls in resp.get("classes", [])
+                  for si in cls.get("spawnIntents", [])
+              ]
+              if intents:
+                  sel = intents[0].get("nodeSelector", {})
+                  if sel.get("karpenter.sh/capacity-type") == "on-demand":
+                      break
+              time.sleep(2)
+          print(f"ice-backoff: nodeSelector={sel}")
+          assert sel.get("karpenter.sh/capacity-type") == "on-demand", (
+              "high lambda did not force on-demand; spot still picked? "
+              f"sel={sel}"
+          )
+          # Cleanup: drain the backgrounded build + restore the worker
+          # so seed-corpus (chained after) has a working fixture.
+          client.execute("pkill -f 'nix-build.*synth-cost' || true")
+          worker.systemctl("start rio-builder")
+          ${gatewayHost}.wait_until_succeeds(
+              "curl -fsS localhost:9091/metrics | "
+              "grep -q '^rio_scheduler_executors_registered '",
+              timeout=60,
+          )
+    '';
+
     seed-corpus = ''
       with subtest("seed-corpus: export -> reset -> import seeds prior"):
           # The convergence/outlier subtests left synth-amdahl with a
@@ -331,6 +475,16 @@ let
         before = "override-precedence";
         after = "seed-corpus";
         msg = "seed-corpus exports synth-amdahl then resets it";
+      }
+      {
+        before = "cost-solve";
+        after = "ice-backoff";
+        msg = "ice-backoff reuses cost-solve's queued drv + band-aware hw_perf_samples";
+      }
+      {
+        before = "ice-backoff";
+        after = "seed-corpus";
+        msg = "ice-backoff stops the worker; seed-corpus needs it restarted";
       }
     ];
   };
