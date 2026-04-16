@@ -431,6 +431,20 @@ async fn queued_for_pool(
 ///     concern (scheduler thinks running, pod gone) is handled
 ///     the same way any other pod-death is: heartbeat timeout →
 ///     reassign.
+/// DNS-1123-safe deterministic suffix from `intent_id`. In production
+/// `intent_id == drv_hash` (nixbase32, already lowercase-alnum); the
+/// filter is belt-and-suspenders for the proto's "opaque" contract.
+/// Falls back to [`random_suffix`] if the filtered result is empty
+/// (degenerate test inputs).
+fn intent_suffix(intent_id: &str) -> String {
+    let s: String = intent_id
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .take(12)
+        .collect();
+    if s.is_empty() { random_suffix() } else { s }
+}
+
 // r[impl ctrl.pool.ephemeral]
 // r[impl ctrl.pool.ephemeral-deadline]
 // r[impl ctrl.ephemeral.per-class-deadline+2]
@@ -442,10 +456,22 @@ pub(super) fn build_job(
     intent: Option<&SpawnIntent>,
 ) -> Result<Job> {
     let pool = wp.name_any();
-    // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
-    // Pool names are short (<20 chars); a 49+ char pool gets a
-    // clear K8s rejection — no silent truncation.
-    let job_name = pod::job_name(&pool, ExecutorKind::Builder, &random_suffix());
+    // K8s name limit: 63 chars. `rio-builder-{pool}-{suffix}` =
+    // pool + 13 + suffix. Pool names are short (<20 chars); a long
+    // pool gets a clear K8s rejection — no silent truncation.
+    //
+    // Sla-mode (`intent: Some`): suffix derives from `intent_id` so a
+    // re-polled still-Ready intent re-creates the SAME Job name and
+    // the apiserver's NameCollision dedupes (cold-start re-spawn
+    // would otherwise fire one pod per reconcile tick). `intent_id`
+    // is `drv_hash` (32-char nixbase32, DNS-1123-safe) — first 12
+    // chars are unique enough to avoid pool-scoped collisions while
+    // keeping the name readable. Static-mode (`intent: None`) keeps
+    // the random suffix: those pods are interchangeable.
+    let suffix = intent
+        .map(|i| intent_suffix(&i.intent_id))
+        .unwrap_or_else(random_suffix);
+    let job_name = pod::job_name(&pool, ExecutorKind::Builder, &suffix);
     let mut pod_spec = builders::build_pod_spec(wp, scheduler, store);
     // ADR-023 Sla mode: override the per-class `spec.resources` with
     // the scheduler-computed per-drv values. Static mode (`intent:
@@ -773,6 +799,28 @@ mod tests {
     // dns1123, spawn_count_subtracts_active moved to common::job::
     // tests alongside their functions.
 
+    /// `intent_suffix` is deterministic (same intent_id → same Job
+    /// name → apiserver 409 dedupes cold-start re-spawn) and
+    /// DNS-1123-safe regardless of what the scheduler puts in the
+    /// "opaque" intent_id.
+    #[test]
+    fn intent_suffix_deterministic_and_dns_safe() {
+        // Production shape: drv_hash is 32-char nixbase32 — passes
+        // through verbatim, truncated to 12.
+        let h = "0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5r";
+        assert_eq!(intent_suffix(h), "0a1b2c3d4f5g");
+        assert_eq!(intent_suffix(h), intent_suffix(h), "deterministic");
+        // Non-DNS chars filtered.
+        assert_eq!(intent_suffix("FOO-bar.baz/9"), "barbaz9");
+        // Degenerate (all-filtered) falls back to random — still valid.
+        let s = intent_suffix("---");
+        assert_eq!(s.len(), 6);
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+    }
+
     /// ADR-023 Sla mode: `build_job(.., Some(intent))` stamps the
     /// scheduler-computed resources onto the executor container and
     /// the overlay emptyDir, plus the `rio.build/intent-id` annotation.
@@ -818,6 +866,13 @@ mod tests {
             pod_anns.get(INTENT_ID_ANNOTATION),
             Some(&"i-abc".to_string()),
             "intent_id annotation feeds RIO_INTENT_ID downward-API"
+        );
+        // Job name derives from intent_id (DNS-1123-filtered) so a
+        // re-polled still-Ready intent NameCollisions instead of
+        // double-spawning. "i-abc" → "iabc" (hyphen filtered).
+        assert_eq!(
+            job.metadata.name.as_deref(),
+            Some("rio-builder-eph-pool-iabc")
         );
 
         let pod_spec = tmpl.spec.as_ref().unwrap();
