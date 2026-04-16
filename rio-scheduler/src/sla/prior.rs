@@ -282,6 +282,7 @@ mod tests {
             cpu: 4.0,
             mem_per_core: 2 * GIB,
             mem_base: 4 * GIB,
+            deadline_secs: 3600,
         }
     }
 

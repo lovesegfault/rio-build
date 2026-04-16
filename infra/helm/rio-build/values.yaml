@@ -377,7 +377,9 @@ scheduler:
   # tiers: ladder of SLA targets. solve_mvp picks the TIGHTEST feasible
   #   tier (sorted by p50→p90→p99); a tier with no targets is best-effort.
   # probe: cold-start sizing for never-seen (pname,system,tenant). cpu
-  #   MUST be in [4, maxCores/4] — validated at scheduler boot.
+  #   MUST be in [1, maxCores] — validated at scheduler boot.
+  #   deadlineSecs: activeDeadlineSeconds for unfitted (probe/explore)
+  #   builds; fitted keys derive from wall_p99.
   # featureProbes: per-requiredSystemFeatures override (e.g. kvm builds
   #   want a high mem floor regardless of cores).
   # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
@@ -390,10 +392,10 @@ scheduler:
       - {name: slow,             p90: 3600}
       - {name: best-effort}
     defaultTier: normal
-    probe: {cpu: 4, memPerCore: 2147483648, memBase: 4294967296}
+    probe: {cpu: 4, memPerCore: 2147483648, memBase: 4294967296, deadlineSecs: 3600}
     featureProbes:
-      kvm:        {cpu: 2, memPerCore: 1073741824, memBase: 8589934592}
-      nixos-test: {cpu: 2, memPerCore: 1073741824, memBase: 8589934592}
+      kvm:        {cpu: 2, memPerCore: 1073741824, memBase: 8589934592, deadlineSecs: 3600}
+      nixos-test: {cpu: 2, memPerCore: 1073741824, memBase: 8589934592, deadlineSecs: 3600}
     maxCores: 64
     maxMem: 274877906944       # 256 GiB
     maxDisk: 214748364800      # 200 GiB

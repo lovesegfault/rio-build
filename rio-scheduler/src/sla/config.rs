@@ -133,6 +133,15 @@ pub struct ProbeShape {
     pub cpu: f64,
     pub mem_per_core: u64,
     pub mem_base: u64,
+    /// `activeDeadlineSeconds` for unfitted (probe/explore) builds —
+    /// D7 in the legacy-sizer removal: fitted keys derive a deadline
+    /// from `wall_p99`, unfitted ones fall back to this.
+    #[serde(default = "default_probe_deadline_secs")]
+    pub deadline_secs: u32,
+}
+
+pub(crate) fn default_probe_deadline_secs() -> u32 {
+    3600
 }
 
 impl SlaConfig {
@@ -140,17 +149,16 @@ impl SlaConfig {
     /// with [`rio_common::config::ValidateConfig::validate`]; sorting
     /// is provided separately by [`Self::solve_tiers`].
     ///
-    /// `probe.cpu ∈ [4, max_cores/4]`: the explore walk both ×4-bumps
-    /// and halves from the probe point; with span < 4 on either side
-    /// the fit's `p̄` estimate is garbage (single-point regression).
-    /// `probe.cpu = 4` gives halve-room down to 1; `= max_cores/4`
-    /// gives ×4-room up to `max_cores`.
+    /// `probe.cpu ∈ [1, max_cores]`: was `[4, max_cores/4]` to give the
+    /// explore walk span≥4 on both halve and ×4 sides, but that floor
+    /// blocks VM-test pools where `max_cores < 16` from booting at all.
+    /// A degenerate-span `p̄` fit is recoverable (next sample fixes it);
+    /// a config that won't load is not.
     pub fn validate(&self) -> anyhow::Result<()> {
-        let hi = self.max_cores / 4.0;
+        let hi = self.max_cores;
         anyhow::ensure!(
-            self.probe.cpu >= 4.0 && self.probe.cpu <= hi,
-            "sla.probe.cpu must be in [4, max_cores/4={hi}] so both x4-bump \
-             and halve paths reach span>=4; got {}",
+            self.probe.cpu >= 1.0 && self.probe.cpu <= hi,
+            "sla.probe.cpu must be in [1, max_cores={hi}]; got {}",
             self.probe.cpu
         );
         anyhow::ensure!(
@@ -217,6 +225,7 @@ mod tests {
                 cpu: 4.0,
                 mem_per_core: 2 << 30,
                 mem_base: 4 << 30,
+                deadline_secs: default_probe_deadline_secs(),
             },
             feature_probes: HashMap::new(),
             max_cores: 64.0,
@@ -236,17 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_probe_cpu_gt_maxcores_div4() {
+    fn rejects_probe_cpu_gt_maxcores() {
         let mut cfg = base();
-        cfg.probe.cpu = 32.0; // max_cores=64 → hi=16
+        cfg.probe.cpu = 96.0; // max_cores=64
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("[4, max_cores/4=16]"), "{err}");
+        assert!(err.contains("[1, max_cores=64]"), "{err}");
     }
 
     #[test]
-    fn rejects_probe_cpu_lt_4() {
+    fn rejects_probe_cpu_lt_1() {
         let mut cfg = base();
-        cfg.probe.cpu = 2.0;
+        cfg.probe.cpu = 0.5;
         assert!(cfg.validate().is_err());
     }
 
@@ -261,10 +270,29 @@ mod tests {
     #[test]
     fn accepts_probe_cpu_at_bounds() {
         let mut cfg = base();
-        cfg.probe.cpu = 4.0;
+        cfg.probe.cpu = 1.0;
         cfg.validate().unwrap();
-        cfg.probe.cpu = 16.0; // = 64/4
+        cfg.probe.cpu = 64.0; // = max_cores
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_tiny_pool() {
+        // pre-relaxation this was unrepresentable: max_cores=8 →
+        // [4, 2] = ∅. VM-test pools live here.
+        let mut cfg = base();
+        cfg.max_cores = 8.0;
+        cfg.probe.cpu = 2.0;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn probe_deadline_secs_defaults_when_absent() {
+        let p: ProbeShape = serde_json::from_str(
+            r#"{"cpu": 4.0, "mem_per_core": 2147483648, "mem_base": 4294967296}"#,
+        )
+        .unwrap();
+        assert_eq!(p.deadline_secs, 3600);
     }
 
     #[test]

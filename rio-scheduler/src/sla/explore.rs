@@ -99,6 +99,7 @@ pub(super) fn fallback_probe() -> ProbeShape {
         cpu: 4.0,
         mem_per_core: 1 << 30,
         mem_base: 4 << 30,
+        deadline_secs: super::config::default_probe_deadline_secs(),
     }
 }
 
@@ -122,6 +123,7 @@ mod tests {
                 cpu: 4.0,
                 mem_per_core: 2 << 30,
                 mem_base: 4 << 30,
+                deadline_secs: 3600,
             },
             feature_probes: HashMap::new(),
             max_cores: 64.0,
@@ -242,6 +244,7 @@ mod tests {
                 cpu: 8.0,
                 mem_per_core: 4 << 30,
                 mem_base: 16 << 30,
+                deadline_secs: 3600,
             },
         );
         let hints = DrvHints {

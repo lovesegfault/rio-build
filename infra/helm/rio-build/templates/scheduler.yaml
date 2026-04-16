@@ -219,12 +219,14 @@ data:
     cpu = {{ printf "%.1f" (float64 .probe.cpu) }}
     mem_per_core = {{ int64 .probe.memPerCore }}
     mem_base = {{ int64 .probe.memBase }}
+    deadline_secs = {{ int64 (default 3600 .probe.deadlineSecs) }}
     {{- range $feat, $p := .featureProbes }}
 
     [sla.feature_probes.{{ $feat | quote }}]
     cpu = {{ printf "%.1f" (float64 $p.cpu) }}
     mem_per_core = {{ int64 $p.memPerCore }}
     mem_base = {{ int64 $p.memBase }}
+    deadline_secs = {{ int64 (default 3600 $p.deadlineSecs) }}
     {{- end }}
     {{- range .tiers }}
 

@@ -393,6 +393,7 @@ mod tests {
                 cpu: 4.0,
                 mem_per_core: 2 << 30,
                 mem_base: 4 << 30,
+                deadline_secs: 3600,
             },
             feature_probes: HashMap::new(),
             max_cores: 64.0,
