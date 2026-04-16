@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use ed25519_dalek::SigningKey;
 use rio_auth::jwt;
@@ -31,6 +31,38 @@ use super::session_jwt::{mint_session_jwt, refresh_session_jwt};
 use crate::quota::QuotaCache;
 use crate::ratelimit::TenantLimiter;
 use crate::session::run_protocol;
+
+/// How far an SSH connection got before it ended. Stored as an
+/// `AtomicU8` shared between the [`ConnectionHandler`] (advances it)
+/// and the spawned `ssh-session` task in `mod.rs` (reads it for
+/// `log_session_end`). A `Keepalive timeout` at `tcp-accepted` means
+/// the client opened TCP but never sent SSH bytes (e.g., wedged on a
+/// hung ssh-agent before the version exchange) — versus the same error
+/// at `channel-open` meaning a real session went silent mid-build.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(super) enum ConnStage {
+    /// TCP accepted; no SSH protocol bytes yet (NLB probe or wedged client).
+    TcpAccepted = 0,
+    /// First `auth_*` callback fired (real SSH client, not a TCP probe).
+    AuthAttempted = 1,
+    /// `auth_publickey` returned `Accept`.
+    Authenticated = 2,
+    /// At least one `channel_open_session` accepted.
+    ChannelOpen = 3,
+}
+
+impl ConnStage {
+    pub(super) fn name(v: u8) -> &'static str {
+        match v {
+            0 => "tcp-accepted",
+            1 => "auth-attempted",
+            2 => "authenticated",
+            3 => "channel-open",
+            _ => "?",
+        }
+    }
+}
 
 /// Max active protocol sessions per SSH connection. Matches Nix's
 /// default `max-jobs` — a well-behaved `nix build -j4` opens at most
@@ -149,6 +181,10 @@ pub struct ConnectionHandler {
     /// clients from TCP probes (NLB/kubelet health checks) — probes
     /// close before any SSH bytes, so no auth callback ever fires.
     pub(super) auth_attempted: bool,
+    /// Highest [`ConnStage`] reached. Shared with the `ssh-session`
+    /// spawn site so `log_session_end` can report how far the
+    /// connection got — see the `ConnStage` doc.
+    pub(super) stage: Arc<AtomicU8>,
     /// Global connection-cap permit (`r[gw.conn.cap]`). Acquired in
     /// `GatewayServer::new_client`; dropped here in `Drop` so every
     /// disconnect path (EOF, error, abort) releases the slot. `None`
@@ -177,6 +213,8 @@ impl ConnectionHandler {
             return;
         }
         self.auth_attempted = true;
+        self.stage
+            .store(ConnStage::AuthAttempted as u8, Ordering::Relaxed);
         self.active_conns.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
         metrics::gauge!("rio_gateway_connections_active").increment(1.0);
@@ -270,7 +308,8 @@ impl ConnectionHandler {
     /// (`conn_permit: None`), return `Err` so russh tears down the
     /// connection. Called from every `auth_*` entry point — the
     /// earliest we can surface a visible SSH-level disconnect
-    /// reason. The error propagates via `handle_session_error`.
+    /// reason. The error propagates to `log_session_end` (with
+    /// `stage=auth-attempted`).
     fn ensure_permit(&self) -> Result<(), anyhow::Error> {
         if self.conn_permit.is_none() {
             // The cap value lives on GatewayServer (semaphore), not here.
@@ -516,6 +555,8 @@ impl Handler for ConnectionHandler {
             }
 
             metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);
+            self.stage
+                .store(ConnStage::Authenticated as u8, Ordering::Relaxed);
             info!(
                 user = user,
                 peer = ?self.peer_addr,
@@ -539,6 +580,8 @@ impl Handler for ConnectionHandler {
         channel: russh::Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.stage
+            .store(ConnStage::ChannelOpen as u8, Ordering::Relaxed);
         let channel_id = channel.id();
         // r[impl gw.conn.channel-limit]
         // Gate on sessions.len(), not "channels ever opened" — a channel

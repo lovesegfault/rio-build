@@ -768,7 +768,7 @@ permit is held by the `ConnectionHandler` and released in `Drop` so
 every disconnect path (EOF, error, abort) frees the slot. At cap: the
 handler's `conn_permit` is `None`, and the first `auth_*` callback
 returns `Err` to tear down the connection before any channel work.
-russh's `handle_session_error` logs the reject.
+`log_session_end` logs the reject with `stage=auth-attempted`.
 
 r[gw.put.aborted-retry]
 The buffered `grpc_put_path` helper (used by `wopAddToStore`, `wopAddTextToStore`, and the `.drv`-buffered branch of `wopAddToStoreNar`/`wopAddMultipleToStore`) MUST retry on store `Code::Aborted` up to `PUT_PATH_ABORTED_MAX_ATTEMPTS` (8) with full-jitter exponential backoff (50 ms base, ×2, 2 s cap → ≤ ~6 s total budget). The store returns `Aborted` when another upload holds the placeholder row for the same path (I-068) or on PG serialization conflicts. Each retry rebuilds the request stream from the `Arc<[u8]>`-held NAR without copying. Emits `rio_gateway_putpath_aborted_retries_total{attempt}` per retry. The streaming `grpc_put_path_streaming` helper is **not** retried on `Aborted` — its reader is consumed and the bytes were forwarded as they arrived, so there is nothing to replay; in practice that path only fires for oversize non-`.drv` entries where the I-068 collision case does not apply.

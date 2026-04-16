@@ -68,7 +68,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_gateway_errors_total",
-        "Protocol errors (labeled by type)"
+        "Protocol errors (labeled by type; type=session also carries \
+         stage=tcp-accepted|auth-attempted|authenticated|channel-open)"
     );
     describe_counter!(
         "rio_gateway_bytes_total",

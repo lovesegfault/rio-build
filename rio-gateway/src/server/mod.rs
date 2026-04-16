@@ -15,7 +15,7 @@ pub use keys::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -25,7 +25,7 @@ use rio_common::signal::Token as CancellationToken;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::{PrivateKey, PublicKey};
-use russh::server::{Handler, Server as _, run_stream};
+use russh::server::{Server as _, run_stream};
 use russh::{MethodKind, MethodSet};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -262,6 +262,7 @@ impl GatewayServer {
                 r = socket.accept() => r.context("SSH accept")?,
             };
             let handler = self.new_client(Some(peer));
+            let stage = Arc::clone(&handler.stage);
             let config = Arc::clone(&config);
             // Detached: NOT coupled to accept-loop lifetime. The handler
             // holds `active_conns` (via `mark_real_connection`/`Drop`),
@@ -278,26 +279,28 @@ impl GatewayServer {
                 let session = match run_stream(config, stream, handler).await {
                     Ok(s) => s,
                     Err(e) => {
-                        log_session_end(&e);
+                        log_session_end(peer, &stage, &e);
                         return;
                     }
                 };
                 if let Err(e) = session.await {
-                    log_session_end(&e);
+                    log_session_end(peer, &stage, &e);
                 }
             });
         }
     }
 }
 
+// r[impl gw.conn.session-error-visible]
 /// Shared session-end logging: downgrade benign disconnects (NLB health
 /// check, client-initiated close, RST) to DEBUG; everything else ERROR +
-/// metric. Same classification the previous `handle_session_error`
-/// override used — extracted because the custom accept loop spawns
-/// sessions detached and `Server::handle_session_error` (which is called
-/// by `run_on_socket`'s error channel) is no longer reachable.
-fn log_session_end(error: &anyhow::Error) {
+/// metric. `stage` reports the highest `ConnStage` reached
+/// — `Keepalive timeout` at `tcp-accepted` means the client opened TCP
+/// but never sent the SSH version string (e.g., wedged on a hung
+/// ssh-agent before the protocol exchange).
+pub fn log_session_end(peer: SocketAddr, stage: &Arc<AtomicU8>, error: &anyhow::Error) {
     use std::io::ErrorKind;
+    let stage = connection::ConnStage::name(stage.load(Ordering::Relaxed));
     let benign = error
         .downcast_ref::<russh::Error>()
         .is_some_and(|e| match e {
@@ -312,10 +315,15 @@ fn log_session_end(error: &anyhow::Error) {
             _ => false,
         });
     if benign {
-        debug!(error = %error, "SSH session closed");
+        debug!(%peer, stage, error = %error, "SSH session closed");
     } else {
-        error!(error = %error, "SSH session error");
-        metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
+        error!(%peer, stage, error = %error, "SSH session error");
+        metrics::counter!(
+            "rio_gateway_errors_total",
+            "type" => "session",
+            "stage" => stage,
+        )
+        .increment(1);
     }
 }
 
@@ -376,15 +384,6 @@ pub fn build_ssh_config(host_key: PrivateKey) -> russh::server::Config {
 impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
-    // r[impl gw.conn.session-error-visible]
-    // The custom accept loop in `run()` calls `log_session_end` directly
-    // (sessions are detached, so `run_on_socket`'s error-channel path
-    // that would invoke this is unreachable). This impl is required by
-    // the `Server` trait; delegate so any future caller stays consistent.
-    fn handle_session_error(&mut self, error: <Self::Handler as Handler>::Error) {
-        log_session_end(&error);
-    }
-
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
         // TCP accept only — NLB health checks and kubelet liveness probes
         // (bare connect+close, no SSH bytes) land here and drop ~200μs
@@ -429,6 +428,7 @@ impl russh::server::Server for GatewayServer {
             tenant_name: None,
             jwt_token: None,
             auth_attempted: false,
+            stage: Arc::new(AtomicU8::new(connection::ConnStage::TcpAccepted as u8)),
             conn_permit,
             active_conns: Arc::clone(&self.active_conns),
             sessions_shutdown: self.sessions_shutdown.clone(),
@@ -468,8 +468,8 @@ mod conn_cap_tests {
     }
 
     /// `ensure_permit` with `conn_permit: None` returns Err. This is
-    /// what the auth callbacks check; Err propagates to russh's
-    /// `handle_session_error` which tears down the connection.
+    /// what the auth callbacks check; Err propagates to the spawned
+    /// session task → `log_session_end` (with `stage=auth-attempted`).
     ///
     /// Structural — constructing a real `ConnectionHandler` needs
     /// live gRPC clients. We test the invariant that matters: the

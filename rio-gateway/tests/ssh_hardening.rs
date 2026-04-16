@@ -76,48 +76,56 @@ fn test_ssh_config_hardened_fields() {
 }
 
 // ===========================================================================
-// T2b — handle_session_error metric-delta
+// T2b — log_session_end metric-delta + stage label
 // ===========================================================================
 
 use rio_test_support::metrics::CountingRecorder;
 
 // r[verify gw.conn.session-error-visible]
-/// `handle_session_error` increments `rio_gateway_errors_total{type="session"}`.
+/// `log_session_end` increments `rio_gateway_errors_total{type="session",stage}`
+/// for non-benign errors and skips it for benign disconnects.
 ///
 /// This is the metric-delta half of the keepalive proof: T2a shows
 /// keepalive is configured; this shows that WHEN a session errors out
 /// (for any reason — keepalive timeout, `?` propagation, connection-setup
-/// failure), the error surfaces to the operator via the metric.
-///
-/// Combined, T2a + T2b prove the full chain: half-open → keepalive fires
-/// (russh's job) → session errors → `handle_session_error` → metric.
-#[tokio::test]
-async fn test_handle_session_error_increments_metric() -> anyhow::Result<()> {
-    // Need a GatewayServer to call handle_session_error on. The gRPC
-    // clients are never exercised (handle_session_error doesn't touch
-    // them), but GatewayServer::new wants them.
-    let (_store, store_addr, _sh) = spawn_mock_store().await?;
-    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
-    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
-    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
-
-    let mut server = GatewayServer::new(store_client, scheduler_client, vec![]);
+/// failure), the error surfaces to the operator via the metric WITH the
+/// `ConnStage` reached — `tcp-accepted` distinguishes "client opened TCP
+/// but never sent SSH bytes" from a real session going silent.
+#[test]
+fn test_log_session_end_increments_metric_with_stage() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU8;
 
     let recorder = CountingRecorder::default();
-    let before = recorder.get("rio_gateway_errors_total{type=session}");
+    let stage = Arc::new(AtomicU8::new(0)); // tcp-accepted
+    let peer = "[::1]:1".parse().unwrap();
 
     metrics::with_local_recorder(&recorder, || {
-        // Sync call — handle_session_error is a plain fn, no .await.
-        server.handle_session_error(anyhow::anyhow!("simulated keepalive timeout"));
+        rio_gateway::server::log_session_end(
+            peer,
+            &stage,
+            &anyhow::anyhow!("simulated keepalive timeout"),
+        );
     });
 
-    let after = recorder.get("rio_gateway_errors_total{type=session}");
+    let key = "rio_gateway_errors_total{stage=tcp-accepted,type=session}";
     assert_eq!(
-        after - before,
+        recorder.get(key),
         1,
-        "handle_session_error must increment type=session by exactly 1"
+        "non-benign session error must increment type=session,stage=tcp-accepted; keys={:?}",
+        recorder.all_keys()
     );
-    Ok(())
+
+    // Benign disconnect at channel-open → debug only, no metric.
+    let stage = Arc::new(AtomicU8::new(3));
+    metrics::with_local_recorder(&recorder, || {
+        rio_gateway::server::log_session_end(peer, &stage, &russh::Error::Disconnect.into());
+    });
+    assert_eq!(
+        recorder.get("rio_gateway_errors_total{stage=channel-open,type=session}"),
+        0,
+        "benign disconnect must NOT increment the metric"
+    );
 }
 
 // ===========================================================================
