@@ -1495,11 +1495,32 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
         }
     });
 
-    // Connect a riscv builder → next tick dispatches.
+    // Connect a riscv builder → next tick dispatches. That same tick
+    // sees riscv as routable, so `unroutable_warned.retain()` drops it.
     let mut rv_rx = connect_executor(&handle, "rv-b1", "riscv64-linux").await?;
     tick(&handle).await?;
     let assn = recv_assignment(&mut rv_rx).await;
     assert!(assn.drv_path.contains("rv-unroutable"));
+
+    // Re-arm: riscv becomes unroutable again (only executor gone) → a
+    // fresh riscv drv must trip a SECOND WARN.
+    disconnect(&handle, "rv-b1").await?;
+    let riscv2 = make_test_node("rv-unroutable-2", "riscv64-linux");
+    let _ev2 = merge_dag(&handle, Uuid::new_v4(), vec![riscv2], vec![], false).await?;
+    tick(&handle).await?;
+    logs_assert(|lines| {
+        let n = lines
+            .iter()
+            .filter(|l| l.contains("no registered executor advertises this system"))
+            .count();
+        if n == 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "WARN must re-arm after routable→unroutable; got {n}"
+            ))
+        }
+    });
 
     Ok(())
 }
