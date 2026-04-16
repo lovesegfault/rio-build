@@ -47,26 +47,6 @@ pub struct BuilderPoolSetSpec {
     /// class fields (resources, cutoff) override; template fields
     /// (image, node_selector, seccomp) apply uniformly.
     pub pool_template: PoolTemplate,
-
-    /// How per-derivation resources are chosen. `Static` routes
-    /// by the operator-declared `classes[]` ladder (legacy).
-    /// `Sla` (ADR-023) computes (cores, mem, disk) per-derivation
-    /// from observed history + tier SLA; `classes[]` is then
-    /// advisory (used only for child-pool naming/count, not
-    /// routing). Defaults to `Sla`.
-    #[serde(default)]
-    pub sizing: Sizing,
-}
-
-/// Sizing strategy selector. See ADR-023.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub enum Sizing {
-    /// Operator-declared static SizeClassSpec ladder (legacy).
-    Static,
-    /// ADR-023: scheduler-computed (c*, M(c*), D) per-derivation.
-    #[default]
-    Sla,
 }
 
 /// One size class. The scheduler's classify() maps a derivation's

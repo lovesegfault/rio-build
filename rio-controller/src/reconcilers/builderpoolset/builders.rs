@@ -180,7 +180,6 @@ pub(super) mod tests {
                 privileged: None,
                 host_network: None,
             },
-            sizing: Default::default(),
         };
         let mut wps = BuilderPoolSet::new("test-bps", spec);
         // controller_owner_ref needs uid + name. Apiserver sets
