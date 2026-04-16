@@ -403,6 +403,20 @@ async fn queued_for_pool(
     ))
 }
 
+/// DNS-1123-safe deterministic suffix from `intent_id`. In production
+/// `intent_id == drv_hash` (nixbase32, already lowercase-alnum); the
+/// filter is belt-and-suspenders for the proto's "opaque" contract.
+/// Falls back to [`random_suffix`] if the filtered result is empty
+/// (degenerate test inputs).
+fn intent_suffix(intent_id: &str) -> String {
+    let s: String = intent_id
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .take(12)
+        .collect();
+    if s.is_empty() { random_suffix() } else { s }
+}
+
 /// Build a K8s Job for one ephemeral worker pod.
 ///
 /// The pod spec is REUSED from `build_pod_spec` — same volumes,
@@ -431,20 +445,6 @@ async fn queued_for_pool(
 ///     concern (scheduler thinks running, pod gone) is handled
 ///     the same way any other pod-death is: heartbeat timeout →
 ///     reassign.
-/// DNS-1123-safe deterministic suffix from `intent_id`. In production
-/// `intent_id == drv_hash` (nixbase32, already lowercase-alnum); the
-/// filter is belt-and-suspenders for the proto's "opaque" contract.
-/// Falls back to [`random_suffix`] if the filtered result is empty
-/// (degenerate test inputs).
-fn intent_suffix(intent_id: &str) -> String {
-    let s: String = intent_id
-        .chars()
-        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        .take(12)
-        .collect();
-    if s.is_empty() { random_suffix() } else { s }
-}
-
 // r[impl ctrl.pool.ephemeral]
 // r[impl ctrl.pool.ephemeral-deadline]
 // r[impl ctrl.ephemeral.per-class-deadline+2]

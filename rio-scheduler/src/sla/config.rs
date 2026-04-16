@@ -77,6 +77,15 @@ pub struct SlaConfig {
     /// is ICE-backed-off and the build re-solved excluding it.
     #[serde(default = "default_hw_fallback_after_secs")]
     pub hw_fallback_after_secs: f64,
+    /// Cluster identifier for `sla_ema_state` / `interrupt_samples`
+    /// scoping. ADR-023 §2.13: under the global-DB topology multiple
+    /// regions share one PG; without this every scheduler upserts the
+    /// SAME `key` and reads every region's interrupt rows. Helm sets
+    /// `scheduler.sla.cluster = .Values.karpenter.clusterName`.
+    /// Empty (single-cluster default) matches the migration-043
+    /// `DEFAULT ''` so greenfield deploys need no config.
+    #[serde(default)]
+    pub cluster: String,
 }
 
 fn default_hw_softmax_temp() -> f64 {
@@ -222,6 +231,7 @@ mod tests {
             hw_cost_source: None,
             hw_softmax_temp: default_hw_softmax_temp(),
             hw_fallback_after_secs: default_hw_fallback_after_secs(),
+            cluster: String::new(),
         }
     }
 

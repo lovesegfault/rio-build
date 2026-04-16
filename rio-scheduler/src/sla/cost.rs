@@ -184,6 +184,13 @@ pub struct CostTable {
     /// Unix-epoch seconds of the last successful price refresh. Feeds
     /// `rio_scheduler_sla_hw_cost_stale_seconds`.
     pub price_updated_at: f64,
+    /// `sla_ema_state.cluster` / `interrupt_samples.cluster` scope
+    /// (ADR-023 §2.13). Set by [`CostTable::load`]; empty for the
+    /// single-cluster default. Carried on the struct so
+    /// [`CostTable::persist`] / [`CostTable::refresh_lambda`] (called
+    /// from the poller's snapshot-mutate-swap) don't need it threaded
+    /// separately.
+    cluster: String,
 }
 
 impl Default for CostTable {
@@ -197,6 +204,7 @@ impl Default for CostTable {
             price,
             lambda: HashMap::new(),
             price_updated_at: 0.0,
+            cluster: String::new(),
         }
     }
 }
@@ -260,15 +268,27 @@ impl CostTable {
         self.price(band, cap) * c_star.0 * e_wall / 3600.0
     }
 
+    /// Seed-backed table scoped to `cluster`. Use instead of
+    /// [`Default`] when the load fallback needs the cluster carried
+    /// forward to `persist`.
+    pub fn seeded(cluster: &str) -> Self {
+        Self {
+            cluster: cluster.to_owned(),
+            ..Self::default()
+        }
+    }
+
     /// Load persisted EMAs from `sla_ema_state`. Called once at
-    /// startup so a scheduler restart doesn't re-warm.
-    pub async fn load(db: &SchedulerDb) -> anyhow::Result<Self> {
+    /// startup so a scheduler restart doesn't re-warm. `cluster`
+    /// scopes the rows (ADR-023 §2.13 global-DB safety).
+    pub async fn load(db: &SchedulerDb, cluster: &str) -> anyhow::Result<Self> {
         type Row = (String, f64, Option<f64>, Option<f64>, f64);
-        let mut t = Self::default();
+        let mut t = Self::seeded(cluster);
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT key, value, numerator, denominator, \
-             EXTRACT(EPOCH FROM updated_at) FROM sla_ema_state",
+             EXTRACT(EPOCH FROM updated_at)::float8 FROM sla_ema_state WHERE cluster = $1",
         )
+        .bind(cluster)
         .fetch_all(db.pool())
         .await?;
         for (key, value, num, den, at) in rows {
@@ -293,15 +313,16 @@ impl CostTable {
         Ok(t)
     }
 
-    /// Persist all EMAs to `sla_ema_state` (upsert). One row per key;
-    /// small (≤9 rows), so no batching.
+    /// Persist all EMAs to `sla_ema_state` (upsert). One row per
+    /// `(cluster, key)`; small (≤9 rows), so no batching.
     pub async fn persist(&self, db: &SchedulerDb) -> anyhow::Result<()> {
         for (&(b, c), &v) in &self.price {
             sqlx::query(
-                "INSERT INTO sla_ema_state (key, value, updated_at) \
-                 VALUES ($1, $2, now()) \
-                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
+                "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
+                 VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = now()",
             )
+            .bind(&self.cluster)
             .bind(format!("price:{}:{}", b.label(), c.label()))
             .bind(v)
             .execute(db.pool())
@@ -309,11 +330,12 @@ impl CostTable {
         }
         for (&b, ema) in &self.lambda {
             sqlx::query(
-                "INSERT INTO sla_ema_state (key, value, numerator, denominator, updated_at) \
-                 VALUES ($1, $2, $3, $4, to_timestamp($5)) \
-                 ON CONFLICT (key) DO UPDATE SET \
-                   value = $2, numerator = $3, denominator = $4, updated_at = to_timestamp($5)",
+                "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
+                 ON CONFLICT (cluster, key) DO UPDATE SET \
+                   value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6)",
             )
+            .bind(&self.cluster)
             .bind(format!("lambda:{}", b.label()))
             .bind(ema.value_or(LAMBDA_SEED))
             .bind(ema.numerator)
@@ -335,10 +357,11 @@ impl CostTable {
         // contribute to neither numerator nor denominator.
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
-                    EXTRACT(EPOCH FROM MAX(at)) \
-             FROM interrupt_samples WHERE at > to_timestamp($1) \
+                    EXTRACT(EPOCH FROM MAX(at))::float8 \
+             FROM interrupt_samples WHERE cluster = $1 AND at > to_timestamp($2) \
              GROUP BY hw_class, kind",
         )
+        .bind(&self.cluster)
         .bind(
             self.lambda
                 .values()
@@ -393,6 +416,7 @@ impl CostTable {
             price,
             lambda,
             price_updated_at: now_epoch(),
+            cluster: String::new(),
         }
     }
 }
@@ -863,6 +887,55 @@ mod tests {
         assert!((obs[&(Band::Hi, Cap::Spot)] - 0.02).abs() < 1e-9);
         assert!((obs[&(Band::Mid, Cap::Spot)] - 0.025).abs() < 1e-9);
         assert!(!obs.contains_key(&(Band::Lo, Cap::Spot)));
+    }
+
+    /// `persist`/`load`/`refresh_lambda` are cluster-scoped: two
+    /// schedulers writing to the same global DB with different
+    /// `cluster` keys don't read each other's EMAs or interrupt rows.
+    /// ADR-023 §2.13 regression — pre-043 the `key` PK collided.
+    #[tokio::test]
+    async fn persist_load_cluster_scoped() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+
+        // Cluster A writes price=0.5 for (Hi, Spot) and a Hi-band
+        // interrupt row.
+        let mut a = CostTable::seeded("us-east-1");
+        a.price.insert((Band::Hi, Cap::Spot), 0.5);
+        a.persist(&sdb).await.unwrap();
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
+             VALUES ('us-east-1', 'aws-8-nvme', 'interrupt', 5), \
+                    ('us-east-1', 'aws-8-nvme', 'exposure', 100)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Cluster B loads → sees seeds (NOT A's 0.5), and refresh_lambda
+        // sees no rows.
+        let mut b = CostTable::load(&sdb, "eu-west-2").await.unwrap();
+        assert!(
+            (b.price(Band::Hi, Cap::Spot) - 0.5).abs() > 1e-3,
+            "B leaked A's price"
+        );
+        b.refresh_lambda(&sdb).await.unwrap();
+        assert!(b.lambda.is_empty(), "B leaked A's interrupt rows");
+
+        // Cluster A reload roundtrips its own price.
+        let a2 = CostTable::load(&sdb, "us-east-1").await.unwrap();
+        assert!((a2.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+        // And sees its own interrupt rows.
+        let mut a3 = CostTable::seeded("us-east-1");
+        a3.refresh_lambda(&sdb).await.unwrap();
+        assert!(a3.lambda.contains_key(&Band::Hi));
+
+        // B persists then A reloads: A's price unchanged (PK is
+        // (cluster, key) — no overwrite).
+        b.price.insert((Band::Hi, Cap::Spot), 0.01);
+        b.persist(&sdb).await.unwrap();
+        let a4 = CostTable::load(&sdb, "us-east-1").await.unwrap();
+        assert!((a4.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
     }
 
     #[test]

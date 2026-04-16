@@ -206,6 +206,7 @@ data:
     {{- with $s.sla }}
     {{- "" | nindent 4 }}
     [sla]
+    cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
     default_tier = {{ .defaultTier | quote }}
     max_cores = {{ printf "%.1f" (float64 .maxCores) }}
     max_mem = {{ int64 .maxMem }}

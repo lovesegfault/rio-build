@@ -117,6 +117,11 @@ pub struct AdminServiceImpl {
     /// just stop forwarding progress to a client who's about to be
     /// disconnected anyway).
     shutdown: rio_common::signal::Token,
+    /// `[sla].cluster` — written into `interrupt_samples.cluster` so
+    /// `CostTable::refresh_lambda`'s `WHERE cluster = $1` matches.
+    /// Empty for the single-cluster default (matches the `DEFAULT ''`
+    /// migration-043 column).
+    cluster: String,
 }
 
 impl AdminServiceImpl {
@@ -130,6 +135,7 @@ impl AdminServiceImpl {
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
         is_leader: Arc<AtomicBool>,
         shutdown: rio_common::signal::Token,
+        cluster: String,
     ) -> Self {
         Self {
             log_buffers,
@@ -141,6 +147,7 @@ impl AdminServiceImpl {
             store_size_bytes,
             is_leader,
             shutdown,
+            cluster,
         }
     }
 
@@ -822,13 +829,17 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let r = request.into_inner();
-        sqlx::query("INSERT INTO interrupt_samples (hw_class, kind, value) VALUES ($1, $2, $3)")
-            .bind(&r.hw_class)
-            .bind(&r.kind)
-            .bind(r.value)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Status::internal(format!("append_interrupt_sample: {e}")))?;
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&self.cluster)
+        .bind(&r.hw_class)
+        .bind(&r.kind)
+        .bind(r.value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Status::internal(format!("append_interrupt_sample: {e}")))?;
         Ok(Response::new(()))
     }
 }

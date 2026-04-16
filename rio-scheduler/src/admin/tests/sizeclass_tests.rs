@@ -50,6 +50,7 @@ async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> 
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
+        String::new(),
     );
 
     let resp = svc
@@ -94,6 +95,7 @@ async fn test_get_size_class_status_reports_configured_classes() -> anyhow::Resu
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
+        String::new(),
     );
 
     let resp = svc

@@ -1567,6 +1567,7 @@ async fn spawn_intent_from_sla_estimator() {
         hw_cost_source: None,
         hw_softmax_temp: 0.3,
         hw_fallback_after_secs: 120.0,
+        cluster: String::new(),
     });
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_mvp BestEffort at
@@ -1872,6 +1873,7 @@ fn test_sla_config() -> crate::sla::config::SlaConfig {
         hw_cost_source: None,
         hw_softmax_temp: 0.0,
         hw_fallback_after_secs: 120.0,
+        cluster: String::new(),
     }
 }
 

@@ -136,6 +136,7 @@ mod tests {
             hw_cost_source: None,
             hw_softmax_temp: 0.3,
             hw_fallback_after_secs: 120.0,
+            cluster: String::new(),
         }
     }
 
