@@ -296,7 +296,16 @@ pub fn solve_envelope(
             lo = mid;
         }
     }
-    Some(RawCores(hi.ceil()))
+    // Bisection halts at `hi - lo < 0.5` so `hi` may sit anywhere in
+    // `(c*, c* + 0.5)`; `ceil(hi)` then over-allocates by 1 core when
+    // `hi` straddles an integer (e.g. c*=8.9 → hi=9.3 → ceil=10 but 9
+    // is feasible). Probe `n-1` once — `feasible` is cheap.
+    let n = hi.ceil();
+    Some(RawCores(if n > c_lo + 1.0 && feasible(n - 1.0) {
+        n - 1.0
+    } else {
+        n
+    }))
 }
 
 // r[impl sched.sla.solve-citardauq]
@@ -652,6 +661,20 @@ mod tests {
             (env.0 - scalar).abs() <= 1.0,
             "envelope={} scalar={scalar:.2}",
             env.0
+        );
+    }
+    #[test]
+    fn envelope_ceil_does_not_overallocate() {
+        // c* ≈ 8.9 (T·e^{0.128} ≤ 289.5 → T ≤ 254.7 → c* = 2000/224.7).
+        // Bisection from (1, 64) lands hi≈9.37 (lo≈8.88, gap<0.5); raw
+        // `hi.ceil()` would return 10 but feasible(9) holds (T(9)=252.2,
+        // q=286.7 ≤ 289.5). The post-ceil `feasible(n-1)` probe catches
+        // the +1 over-allocation.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let c = solve_envelope(&fit, &t("x", 289.5), 1.0, 64.0, 1.0, 0.0).unwrap();
+        assert_eq!(
+            c.0, 9.0,
+            "feasible(9) holds; ceil(hi≈9.37)=10 over-allocates"
         );
     }
     #[test]
