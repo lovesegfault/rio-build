@@ -235,6 +235,14 @@ impl SlaEstimator {
         Self::new(c.halflife_secs, c.ring_buffer, Some(&c))
     }
 
+    /// Seed the hw-factor table. Test-only: bypasses the
+    /// `hw_perf_factors` view so `solve_full` sees a populated
+    /// `HwTable` without an ephemeral PG round-trip.
+    #[cfg(test)]
+    pub fn seed_hw(&self, t: hw::HwTable) {
+        *self.hw.write() = t;
+    }
+
     /// Seed the override cache. Test-only.
     #[cfg(test)]
     pub fn seed_overrides(&self, rows: Vec<SlaOverrideRow>) {

@@ -401,8 +401,22 @@ impl DagActor {
                     // gates have no symmetric spawn-side. Static mode ⇒
                     // empty intents ⇒ exactly pre-ADR-023 behavior.
                     if self.sla_config.is_some() {
-                        let (cores, mem_bytes, disk_bytes, _) =
+                        let (cores, mem_bytes, disk_bytes, _, node_selector) =
                             self.solve_intent_for(state.pname.as_deref(), state);
+                        // ADR-023 §2.8: arm the Pending-watch the FIRST
+                        // time a band-targeted selector is emitted for
+                        // this drv. or_insert keeps the original
+                        // timestamp across re-emits (snapshot runs each
+                        // tick). Band-agnostic intents don't enter the
+                        // ladder.
+                        if let Some((band, cap)) = crate::sla::cost::parse_selector(&node_selector)
+                        {
+                            self.pending_intents.entry(drv_hash.into()).or_insert((
+                                band,
+                                cap,
+                                std::time::Instant::now(),
+                            ));
+                        }
                         snapshots[i]
                             .spawn_intents
                             .push(rio_proto::types::SpawnIntent {
@@ -410,7 +424,7 @@ impl DagActor {
                                 cores,
                                 mem_bytes,
                                 disk_bytes,
-                                node_selector: Default::default(),
+                                node_selector: node_selector.into_iter().collect(),
                             });
                     }
                 }
@@ -445,10 +459,20 @@ impl DagActor {
         snapshots
     }
 
-    /// `(cores, mem, disk)` for one queued derivation via the SLA
-    /// estimator. Shared between [`Self::compute_size_class_snapshot`]
-    /// (SpawnIntent population) and dispatch's resource-fit filter so
-    /// the controller spawns and the scheduler accepts the SAME shape.
+    /// `(cores, mem, disk, predicted, node_selector)` for one queued
+    /// derivation via the SLA estimator. Shared between
+    /// [`Self::compute_size_class_snapshot`] (SpawnIntent population)
+    /// and dispatch's resource-fit filter so the controller spawns and
+    /// the scheduler accepts the SAME shape.
+    ///
+    /// When `[sla].hw_cost_source` is set AND the hw-factor table is
+    /// populated, the fitted-key branch routes through
+    /// [`solve::solve_full`] (per-`(band, cap)` envelope + cost
+    /// softmax) and returns a `rio.build/hw-band` +
+    /// `karpenter.sh/capacity-type` nodeSelector. Otherwise — or for
+    /// override/probe/explore branches — it routes through
+    /// [`solve::intent_for`] (band-agnostic `solve_mvp`) and returns
+    /// an empty selector.
     ///
     /// `pname` is taken separately so the dispatch caller (which has
     /// already destructured `state.pname.as_deref()` for `classify()`)
@@ -457,7 +481,13 @@ impl DagActor {
         &self,
         pname: Option<&str>,
         state: &crate::state::DerivationState,
-    ) -> (u32, u64, u64, Option<crate::sla::solve::SlaPrediction>) {
+    ) -> (
+        u32,
+        u64,
+        u64,
+        Option<crate::sla::solve::SlaPrediction>,
+        std::collections::BTreeMap<String, String>,
+    ) {
         use crate::sla::{
             solve,
             types::{ModelKey, RawCores},
@@ -484,26 +514,76 @@ impl DagActor {
         let override_ = key
             .as_ref()
             .and_then(|k| self.sla_estimator.resolved_override(k));
-        let (cores, mem, disk) = solve::intent_for(
-            fit.as_ref(),
-            &solve::DrvHints {
-                enable_parallel_building: state.enable_parallel_building,
-                prefer_local_build: state.prefer_local_build,
-                required_features: state.required_features.clone(),
-            },
-            override_.as_ref(),
-            self.sla_config.as_ref(),
-            &self.sla_tiers,
-            &self.sla_ceilings,
-        );
+        let hints = solve::DrvHints {
+            enable_parallel_building: state.enable_parallel_building,
+            prefer_local_build: state.prefer_local_build,
+            required_features: state.required_features.clone(),
+        };
+
+        // r[impl sched.sla.solve-per-band-cap]
+        // solve_full path: gated on hw_cost_source set ∧ hw-factor
+        // table populated ∧ a usable fit (same n_eff/span gate as
+        // intent_for's solve branch — override/probe/explore stay on
+        // the band-agnostic path). The hw_table snapshot is one
+        // RwLock-read clone (~dozens of entries); cost_table same.
+        let hw = self.sla_estimator.hw_table();
+        let full = self
+            .sla_config
+            .as_ref()
+            .filter(|c| c.hw_cost_source.is_some())
+            .filter(|_| !hw.is_empty())
+            .filter(|_| override_.as_ref().is_none_or(|o| o.forced_cores.is_none()))
+            .filter(|_| hints.prefer_local_build != Some(true))
+            .and_then(|c| {
+                let f = fit.as_ref()?;
+                if f.n_eff < 3.0
+                    || (f.span < 4.0
+                        && !crate::sla::explore::frozen(&f.explore, self.sla_ceilings.max_cores))
+                {
+                    return None;
+                }
+                Some(solve::solve_full(
+                    f,
+                    &self.sla_tiers,
+                    &hw,
+                    &self.cost_table.read(),
+                    &self.sla_ceilings,
+                    &self.ice,
+                    c.hw_softmax_temp,
+                    &mut rand::rng(),
+                ))
+            });
+
+        let (cores, mem, disk, node_selector) = match &full {
+            Some(r) => (
+                (r.cores().0.ceil() as u32).max(1),
+                r.mem().0,
+                r.disk().0,
+                r.node_selector().cloned().unwrap_or_default(),
+            ),
+            None => {
+                let (c, m, d) = solve::intent_for(
+                    fit.as_ref(),
+                    &hints,
+                    override_.as_ref(),
+                    self.sla_config.as_ref(),
+                    &self.sla_tiers,
+                    &self.sla_ceilings,
+                );
+                (c, m, d, Default::default())
+            }
+        };
         // Dispatch-time prediction snapshot for completion's
         // actual-vs-predicted scoring. Only meaningful when there's a
         // fitted curve to evaluate `T(c)` against — cold-start probes
         // and forced-cores overrides leave `wall_secs=None` so the
         // prediction-ratio histogram isn't poisoned by guesses.
         let predicted = fit.as_ref().map(|f| {
-            let solved = solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings);
-            let (tier, tier_p90) = match &solved {
+            let (tier, tier_p90) = match full
+                .as_ref()
+                .map(|r| r as &solve::SolveResult)
+                .unwrap_or(&solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings))
+            {
                 solve::SolveResult::Feasible { tier, .. } => (
                     Some(tier.clone()),
                     self.sla_tiers
@@ -520,7 +600,7 @@ impl DagActor {
                 tier_p90,
             }
         });
-        (cores, mem, disk, predicted)
+        (cores, mem, disk, predicted, node_selector)
     }
 
     /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`

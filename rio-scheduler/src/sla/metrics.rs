@@ -65,6 +65,13 @@ pub fn describe_all() {
          lease-gated spot-price poller is failing or this replica is \
          standby (price is PG-backed; standby reads but doesn't write)"
     );
+    describe_counter!(
+        "rio_scheduler_sla_ice_backoff_total",
+        "(band, cap) cells marked ICE-infeasible by the Pending-watch \
+         (no heartbeat within hw_fallback_after_secs of first emitting \
+         a band-targeted SpawnIntent). 60s TTL; next solve excludes the \
+         cell. Labeled `band`, `cap`."
+    );
 }
 
 pub fn outlier_rejected(tenant: &str) {

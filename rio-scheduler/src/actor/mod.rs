@@ -248,6 +248,13 @@ pub struct DagActor {
     /// probe shape and feature overrides. `None` ⇔ `[sla]` absent
     /// (explore falls back to a fixed probe).
     pub(crate) sla_config: Option<crate::sla::config::SlaConfig>,
+    /// ADR-023 phase-13 hw-band cost table — `$/vCPU·hr` per
+    /// `(band, cap)` + per-band λ. `Arc<RwLock<_>>` shared with
+    /// `spot_price_poller` (lease-gated, 10min tick); the actor reads a
+    /// snapshot per `solve_intent_for` call. Seed-backed Default →
+    /// `solve_full` always has a comparable scalar even before the
+    /// first poll.
+    pub(crate) cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     /// In-process insufficient-capacity backoff. `solve_full` skips
     /// marked cells; the Pending-watch marks them. Arc so the snapshot
     /// path (`&self`) and housekeeping (`&mut self`) share one map.
@@ -448,6 +455,7 @@ impl DagActor {
                 .map(|s| s.ceilings())
                 .unwrap_or(crate::sla::solve::DEFAULT_CEILINGS),
             sla_config: cfg.sla.clone(),
+            cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::default()),
             pending_intents: dashmap::DashMap::new(),
             tick_count: 0,

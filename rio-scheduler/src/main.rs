@@ -197,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
             hmac_signer: hmac_signer.map(Arc::new),
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
+            cost_table,
             shutdown: shutdown.clone(),
         },
     );

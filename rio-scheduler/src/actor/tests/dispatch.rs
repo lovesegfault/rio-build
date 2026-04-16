@@ -1718,6 +1718,132 @@ async fn pending_intent_timeout_marks_ice() {
     assert!(actor.pending_intents.is_empty(), "heartbeat clears entry");
 }
 
+/// `solve_full` wired into the actor: with `hw_cost_source` set, a
+/// populated hw-factor table, and a fitted key, `SpawnIntent.
+/// node_selector` carries `rio.build/hw-band` + `karpenter.sh/
+/// capacity-type` and the Pending-watch ledger is armed.
+// r[verify sched.sla.solve-per-band-cap]
+#[tokio::test]
+async fn spawn_intent_node_selector_from_solve_full() {
+    use crate::sla::{cost, hw, types::*};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0)]);
+    actor.sla_config = Some(crate::sla::config::SlaConfig {
+        hw_cost_source: Some(cost::HwCostSource::Static),
+        // temp=0 → greedy argmin → deterministic pick.
+        hw_softmax_temp: 0.0,
+        ..test_sla_config()
+    });
+    actor.sla_tiers = vec![crate::sla::solve::Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(1200.0),
+        p99: None,
+    }];
+    // hw table with one Mid-band class only (so h_dagger picks it for
+    // every band → only Mid is feasible, Hi/Lo fall back to factor=1.0
+    // via empty match … actually h_dagger returns ("",1.0) for bands
+    // with no hw_class, which is still feasible). To make the assertion
+    // tight, populate one class per band so all 6 cells are candidates
+    // and the argmin picks the cheapest spot.
+    let mut m = HashMap::new();
+    m.insert("aws-7-ebs".into(), 1.0);
+    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
+    // cost_table left at seed defaults — spot < on-demand for every
+    // band, Lo cheapest. With only Mid in hw table, h_dagger for Hi/Lo
+    // returns ("",1.0); all bands are feasible at factor=1.0 so argmin
+    // by E[cost] picks (Lo, Spot).
+
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "test-pkg".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
+    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
+
+    let snap = actor.compute_size_class_snapshot(None);
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+
+    let fitted = small
+        .spawn_intents
+        .iter()
+        .find(|i| i.intent_id == "fitted")
+        .unwrap();
+    assert!(
+        fitted.node_selector.contains_key("rio.build/hw-band"),
+        "solve_full populated band selector: {:?}",
+        fitted.node_selector
+    );
+    assert!(
+        fitted
+            .node_selector
+            .contains_key("karpenter.sh/capacity-type"),
+        "solve_full populated capacity selector: {:?}",
+        fitted.node_selector
+    );
+    assert!(
+        actor.pending_intents.contains_key("fitted"),
+        "Pending-watch armed on first emit"
+    );
+
+    let cold = small
+        .spawn_intents
+        .iter()
+        .find(|i| i.intent_id == "cold")
+        .unwrap();
+    assert!(
+        cold.node_selector.is_empty(),
+        "no fit → band-agnostic intent_for path"
+    );
+    assert!(!actor.pending_intents.contains_key("cold"));
+
+    // Gate: hw_cost_source unset → solve_full skipped even with hw table.
+    actor.sla_config.as_mut().unwrap().hw_cost_source = None;
+    actor.pending_intents.clear();
+    let snap = actor.compute_size_class_snapshot(None);
+    let fitted = snap
+        .iter()
+        .find(|s| s.name == "small")
+        .unwrap()
+        .spawn_intents
+        .iter()
+        .find(|i| i.intent_id == "fitted")
+        .unwrap();
+    assert!(
+        fitted.node_selector.is_empty(),
+        "hw_cost_source=None → band-agnostic"
+    );
+}
+
 fn test_sla_config() -> crate::sla::config::SlaConfig {
     use crate::sla::{config, solve};
     config::SlaConfig {

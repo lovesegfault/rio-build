@@ -192,6 +192,10 @@ pub struct DagActorPlumbing {
     /// `recovery_complete`. Non-K8s/test default is
     /// [`LeaderState::always_leader`].
     pub leader: LeaderState,
+    /// ADR-023 phase-13 hw-band cost table. Shared with
+    /// `spot_price_poller`; the actor reads a snapshot per
+    /// `solve_intent_for`. Default → seed prices.
+    pub cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     /// Shutdown token. The run loop `select!`s on `cancelled()` with
     /// `biased` ordering so SIGTERM drains workers immediately.
     pub shutdown: rio_common::signal::Token,
@@ -217,6 +221,7 @@ impl Default for DagActorPlumbing {
             hmac_signer: None,
             service_signer: None,
             leader: LeaderState::default(),
+            cost_table: Arc::default(),
             shutdown: rio_common::signal::Token::new(),
             #[cfg(test)]
             recovery_toctou_gate: None,

@@ -63,7 +63,7 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
 
 /// Freeze predicate, shared with [`super::solve::intent_for`]'s gate so
 /// "explore done" and "solve takes over" agree on the same boundary.
-pub(super) fn frozen(st: &super::types::ExploreState, max_cores: f64) -> bool {
+pub(crate) fn frozen(st: &super::types::ExploreState, max_cores: f64) -> bool {
     let span = if st.min_c.0 > 0.0 {
         st.max_c.0 / st.min_c.0
     } else {

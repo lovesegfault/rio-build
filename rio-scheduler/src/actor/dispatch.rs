@@ -304,7 +304,7 @@ impl DagActor {
                 if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
                     (None, None)
                 } else {
-                    let (_, mem, _, pred) = self.solve_intent_for(pname, state);
+                    let (_, mem, _, pred, _) = self.solve_intent_for(pname, state);
                     (Some(mem), pred)
                 };
             (
