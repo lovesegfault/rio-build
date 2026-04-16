@@ -272,6 +272,7 @@ impl DagActor {
             est_cores,
             est_memory_bytes,
             est_disk_bytes,
+            est_deadline_secs,
             sla_predicted,
             is_fixed_output,
             system,
@@ -306,18 +307,19 @@ impl DagActor {
             // when `w.last_resources` is still None from the cgroup-
             // poll-vs-first-heartbeat race). The pre-ADR-023 path
             // (`bucketed_estimate`) returned None on cold start.
-            let (est_cores, est_memory_bytes, est_disk_bytes, sla_predicted) =
+            let (est_cores, est_memory_bytes, est_disk_bytes, est_deadline_secs, sla_predicted) =
                 if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
-                    (None, None, None, None)
+                    (None, None, None, None, None)
                 } else {
-                    let (cores, mem, disk, pred, _) = self.solve_intent_for(pname, state);
-                    (Some(cores), Some(mem), Some(disk), pred)
+                    let (cores, mem, disk, deadline, pred, _) = self.solve_intent_for(pname, state);
+                    (Some(cores), Some(mem), Some(disk), Some(deadline), pred)
                 };
             (
                 target_class,
                 est_cores,
                 est_memory_bytes,
                 est_disk_bytes,
+                est_deadline_secs,
                 sla_predicted,
                 state.is_fixed_output,
                 system.clone(),
@@ -334,10 +336,10 @@ impl DagActor {
             // D4: `bump_floor_or_count` reads est_{disk,deadline} as
             // `last_intent` for the doubling base.
             state.sched.est_disk_bytes = est_disk_bytes;
-            state.sched.est_deadline_secs = sla_predicted
-                .as_ref()
-                .and_then(|p| p.wall_secs)
-                .map(|s| s as u32);
+            // D7: same `solve_intent_for` value the snapshot stamps
+            // onto SpawnIntent.deadline_secs (was P3's stopgap
+            // `wall_secs as u32`; now the floor-clamped 5×p99).
+            state.sched.est_deadline_secs = est_deadline_secs;
             // ADR-023 phase-7: capture the dispatch-time prediction so
             // completion can score actual-vs-predicted on the SAME
             // curve we sized against (the estimator may have refit by

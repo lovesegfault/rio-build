@@ -66,10 +66,9 @@ use crate::reconcilers::Ctx;
 #[cfg(test)]
 use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    DEADLINE_SLACK_SECS, EPHEMERAL_TGPS, JOB_REQUEUE, JobReconcilePrologue, ephemeral_job,
-    is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
-    report_terminated_pods, spawn_count, spawn_for_each, spawn_n,
+    JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
+    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running,
+    report_deadline_exceeded_jobs, report_terminated_pods, spawn_count, spawn_for_each, spawn_n,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
@@ -95,58 +94,34 @@ const OVERLAY_HEADROOM: f64 = 1.5;
 
 use super::builders::{self, UpstreamAddrs};
 
-/// Fallback `activeDeadlineSeconds` when neither `ephemeral_deadline_
-/// seconds` nor `size_class_cutoff_secs` is set (standalone unclassed
-/// BuilderPool). 3600 (1h): long enough that a matched dispatch +
-/// build completes in the common case; short enough that a wrong-pool
-/// spawn (worker heartbeats but never matches dispatch — queue depth
-/// was for a different pool's system/size_class) doesn't leak for the
-/// life of the cluster. BuilderPoolSet children always carry
-/// `size_class_cutoff_secs`, so this fires only for hand-authored
-/// unclassed pools.
+/// Fallback `activeDeadlineSeconds` when neither the SpawnIntent nor
+/// `spec.deadline_seconds` carries a deadline (Static-mode pool with
+/// no operator override). 3600 (1h): long enough that a matched
+/// dispatch + build completes in the common case; short enough that a
+/// wrong-pool spawn (worker heartbeats but never matches dispatch)
+/// doesn't leak for the life of the cluster.
 const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 
-/// I-200: worker-side `daemon_timeout_secs = cutoffSecs × DEADLINE_
-/// MULTIPLIER`. 5×: a build still going at 5× its class's upper-bound
-/// prediction is either hung or grossly misclassified — the worker's
-/// own `tokio::time::timeout` (stderr_loop.rs) reports `BuildStatus::
-/// TimedOut` → `r[sched.timeout.promote-on-exceed]` promotes
-/// `size_class_floor` and the next dispatch lands on the next-larger
-/// class (with a 5× longer timer). tiny (cutoff 30s) → 150s, small
-/// (120s) → 600s, medium (600s) → 3000s, large (1800s) → 9000s,
-/// xlarge (7200s) → 36000s. The k8s `activeDeadlineSeconds` BACKSTOP
-/// is this + [`EPHEMERAL_TGPS`] + [`DEADLINE_SLACK_SECS`] (=+90s) so
-/// the worker timer fires first; the k8s deadline only kills a worker
-/// too wedged to fire its own timer (`r[ctrl.terminated.deadline-
-/// exceeded]` then climbs the ladder anyway). NOT 2× (the
-/// misclassification-detector threshold): that would race a
-/// borderline-slow-but-legit build.
-pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
-
 /// `activeDeadlineSeconds` for an ephemeral Job. Precedence:
-///   1. `ephemeral_deadline_seconds` — explicit override, verbatim.
-///   2. `size_class_cutoff_secs × DEADLINE_MULTIPLIER + TGPS + SLACK`
-///      (I-200, `r[ctrl.ephemeral.per-class-deadline]`). The worker's
-///      own `daemon_timeout = cutoff × DEADLINE_MULTIPLIER` fires
-///      first; this adds [`EPHEMERAL_TGPS`] + [`DEADLINE_SLACK_SECS`]
-///      so k8s only kills a worker too wedged to time itself out.
+///   1. `intent.deadline_secs` — scheduler-computed per-derivation
+///      bound (D7: `wall_p99 × 5` for fitted, `[sla].probe.
+///      deadline_secs` for unfitted, clamped `[floor, 86400]`). The
+///      scheduler owns the 5× headroom; no controller-side multiplier.
+///   2. `spec.deadline_seconds` — explicit operator override, verbatim.
 ///   3. `DEFAULT_EPHEMERAL_DEADLINE_SECS` — flat 1h fallback.
 ///
-/// `ceil` so a fractional cutoff (EMA-derived) rounds UP — never
-/// shorten below the integer-second boundary. `max(1)`: a zero/
-/// negative cutoff (misconfigured spec) would set deadline=0 and K8s
-/// kills the pod immediately; clamp to 1s so the misconfiguration is
-/// at least observable (pod starts, then dies) rather than a silent
-/// no-op spawn loop.
-// r[impl ctrl.ephemeral.per-class-deadline+2]
-pub(super) fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
+/// `intent.deadline_secs == 0` (proto default — Static-mode snapshot
+/// or pre-D7 scheduler) is treated as unset and falls through.
+// r[impl ctrl.ephemeral.intent-deadline]
+pub(super) fn ephemeral_deadline(
+    spec: &rio_crds::builderpool::BuilderPoolSpec,
+    intent: Option<&SpawnIntent>,
+) -> i64 {
+    if let Some(d) = intent.map(|i| i.deadline_secs).filter(|&d| d > 0) {
+        return i64::from(d);
+    }
     if let Some(explicit) = spec.deadline_seconds {
         return i64::from(explicit);
-    }
-    if let Some(cutoff) = spec.size_class_cutoff_secs {
-        return ((cutoff * DEADLINE_MULTIPLIER as f64).ceil() as i64).max(1)
-            + EPHEMERAL_TGPS
-            + DEADLINE_SLACK_SECS;
     }
     DEFAULT_EPHEMERAL_DEADLINE_SECS
 }
@@ -447,7 +422,7 @@ fn intent_suffix(intent_id: &str) -> String {
 ///     reassign.
 // r[impl ctrl.pool.ephemeral]
 // r[impl ctrl.pool.ephemeral-deadline]
-// r[impl ctrl.ephemeral.per-class-deadline+2]
+// r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn build_job(
     wp: &BuilderPool,
     oref: OwnerReference,
@@ -485,9 +460,10 @@ pub(super) fn build_job(
         wp.namespace(),
         oref,
         builders::labels(wp),
-        // Wrong-pool-spawn backstop + per-class hung-build detector
-        // (I-200). Precedence: explicit override > cutoff×5 > flat 3600.
-        ephemeral_deadline(&wp.spec),
+        // Wrong-pool-spawn backstop + per-intent hung-build bound
+        // (D7). Precedence: intent.deadline_secs > spec override >
+        // flat 3600.
+        ephemeral_deadline(&wp.spec, intent),
         pod_spec,
     );
     // ADR-023 Sla mode: stamp `rio.build/intent-id` on the pod
@@ -624,9 +600,9 @@ mod tests {
         );
         // r[verify ctrl.pool.ephemeral-deadline]
         // Wrong-pool-spawn backstop present, defaults to 3600 when
-        // BOTH ephemeral_deadline_seconds and size_class_cutoff_secs
-        // are unset (test_wp sets neither). The per-class branch is
-        // covered by `per_class_deadline_from_cutoff_secs`.
+        // neither intent nor spec.deadline_seconds is set (test_wp
+        // sets neither, intent=None). The intent-precedence branch is
+        // covered by `intent_deadline_propagates_to_job_spec`.
         assert_eq!(
             spec.active_deadline_seconds,
             Some(DEFAULT_EPHEMERAL_DEADLINE_SECS),
@@ -707,24 +683,14 @@ mod tests {
     }
 
     // r[verify ctrl.pool.ephemeral-deadline]
-    /// Non-default `ephemeral_deadline_seconds` propagates to the Job
-    /// spec verbatim AND wins over `size_class_cutoff_secs`.
-    /// Complements `job_spec_load_bearing_fields` (which covers the
-    /// `None → DEFAULT_EPHEMERAL_DEADLINE_SECS` branch) and
-    /// `per_class_deadline_from_cutoff_secs` (cutoff×5 branch) with
-    /// the explicit-override branch.
-    ///
-    /// Without this: a refactor that always used the default (or
-    /// swapped the precedence, or dropped the `i64::from` and wired
-    /// the wrong field) would pass the other two tests and silently
-    /// ignore user-configured deadlines.
+    /// `spec.deadline_seconds` propagates verbatim when no intent
+    /// carries a deadline. Complements `job_spec_load_bearing_fields`
+    /// (the `None → DEFAULT` branch) and `intent_deadline_propagates_
+    /// to_job_spec` (intent-precedence branch).
     #[test]
     fn ephemeral_deadline_some_propagates_to_job_spec() {
         let mut wp = test_wp();
         wp.spec.deadline_seconds = Some(7200);
-        // Cutoff also set → would compute 30×5+90=240 if precedence
-        // were wrong. 7200 must win.
-        wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
 
@@ -732,66 +698,78 @@ mod tests {
         assert_eq!(
             spec.active_deadline_seconds,
             Some(7200),
-            "explicit ephemeral_deadline_seconds=7200 must override \
-             cutoff×5 (=150) AND default (=3600)"
+            "spec.deadline_seconds=7200 must override default (=3600)"
         );
     }
 
-    // r[verify ctrl.ephemeral.per-class-deadline+2]
-    /// I-200: with `size_class_cutoff_secs` set and no explicit
-    /// override, `activeDeadlineSeconds = cutoff × DEADLINE_MULTIPLIER
-    /// plus `EPHEMERAL_TGPS + DEADLINE_SLACK_SECS`. The k8s deadline is
-    /// a BACKSTOP behind the worker's own `daemon_timeout = cutoff×5`:
-    /// the 90s margin lets the worker report `TimedOut` cleanly before
-    /// k8s kills it (medium-shallow-32x looped python3 at tiny for 17h
-    /// when 2acd1b32 removed disconnect-promote with no margin).
+    // r[verify ctrl.ephemeral.intent-deadline]
+    /// D7: `SpawnIntent.deadline_secs` wins over BOTH the spec
+    /// override and the default. The scheduler computes this per-drv
+    /// (`wall_p99 × 5` clamped `[floor, 86400]`); the controller
+    /// passes it through verbatim — no multiplier, no margin.
     ///
-    /// Mutation check: revert `ephemeral_deadline()` to drop the
-    /// margin → first case fails (expects 240, gets 150). Drop
-    /// `.ceil()` → fractional case fails (expects 691, gets 690).
+    /// `deadline_secs == 0` (proto default) is unset and falls
+    /// through to `spec.deadline_seconds`.
     #[test]
-    fn per_class_deadline_from_cutoff_secs() {
-        const MARGIN: i64 = EPHEMERAL_TGPS + DEADLINE_SLACK_SECS;
+    fn intent_deadline_propagates_to_job_spec() {
         let mut wp = test_wp();
-        wp.spec.size_class_cutoff_secs = Some(30.0);
+        wp.spec.deadline_seconds = Some(7200);
+        let intent = SpawnIntent {
+            intent_id: "abc123def456".into(),
+            deadline_secs: 240,
+            ..Default::default()
+        };
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
+        let job = build_job(
+            &wp,
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            Some(&intent),
+        )
+        .unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(30 * DEADLINE_MULTIPLIER + MARGIN),
-            "cutoff=30 × {DEADLINE_MULTIPLIER} + {MARGIN} (TGPS+slack) → 240; \
-             k8s deadline backstops the worker's daemon_timeout=150"
+            Some(240),
+            "intent.deadline_secs=240 must override spec.deadline_seconds=7200"
         );
 
-        // xlarge: cutoff=7200 → 36000+90. Proves the multiplier
-        // scales (not a clamped-to-default refactor).
-        wp.spec.size_class_cutoff_secs = Some(7200.0);
+        // deadline_secs=0 (proto default — Static-mode or pre-D7
+        // scheduler) falls through to spec.
+        let intent_zero = SpawnIntent {
+            intent_id: "abc123def456".into(),
+            deadline_secs: 0,
+            ..Default::default()
+        };
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
+        let job = build_job(
+            &wp,
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            Some(&intent_zero),
+        )
+        .unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(36000 + MARGIN)
+            Some(7200),
+            "intent.deadline_secs=0 is unset → spec.deadline_seconds wins"
         );
 
-        // Fractional cutoff (EMA-derived) rounds UP. 120.1 × 5 =
-        // 600.5 → 601 → +90 = 691. Floor would give 690 and shave a
-        // second off the bound — wrong direction.
-        wp.spec.size_class_cutoff_secs = Some(120.1);
+        // Neither intent nor spec → DEFAULT.
+        wp.spec.deadline_seconds = None;
         let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
+        let job = build_job(
+            &wp,
+            oref,
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            Some(&intent_zero),
+        )
+        .unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(601 + MARGIN)
-        );
-
-        // Degenerate cutoff=0 clamps the cutoff×5 term to 1s (not 0)
-        // before adding margin → 1 + 90 = 91.
-        wp.spec.size_class_cutoff_secs = Some(0.0);
-        let oref = crate::fixtures::oref(&wp);
-        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
-        assert_eq!(
-            job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(1 + MARGIN)
+            Some(DEFAULT_EPHEMERAL_DEADLINE_SECS)
         );
     }
 
@@ -844,6 +822,7 @@ mod tests {
                 ("karpenter.sh/capacity-type".into(), "spot".into()),
             ]
             .into(),
+            ..Default::default()
         };
         let job = build_job(
             &wp,

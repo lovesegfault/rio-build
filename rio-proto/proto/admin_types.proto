@@ -427,6 +427,22 @@ message SpawnIntent {
   // Empty under hw_cost_source=None — pod lands wherever Karpenter
   // bin-packs cheapest.
   map<string, string> node_selector = 5;
+  // D5: Builder vs Fetcher. Controller filters by `intent.kind ==
+  // pool.spec.kind` so a single flat intents stream serves both
+  // BuilderPool and FetcherPool reconcilers.
+  ExecutorKind kind = 6;
+  // D5: target system (e.g. "x86_64-linux"). Controller filters by
+  // `intent.system ∈ pool.spec.systems`.
+  string system = 7;
+  // D5: required system features. Controller filters by
+  // `intent.required_features ⊆ pool.spec.features`.
+  repeated string required_features = 8;
+  // D7: scheduler-computed `activeDeadlineSeconds` for the spawned
+  // Job. For fitted keys: `wall_p99 × 5`; for probe/explore:
+  // `[sla].probe.deadline_secs`. Clamped `[floor.deadline_secs, 86400]`.
+  // Precedence in `ephemeral_deadline`: this > spec.deadline_seconds
+  // > DEFAULT_EPHEMERAL_DEADLINE_SECS.
+  uint32 deadline_secs = 9;
 }
 
 message GetSizeClassStatusRequest {

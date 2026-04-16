@@ -379,7 +379,7 @@ impl DagActor {
                     // gates have no symmetric spawn-side. Static mode ⇒
                     // empty intents ⇒ exactly pre-ADR-023 behavior.
                     if self.sla_config.is_some() {
-                        let (cores, mem_bytes, disk_bytes, _, node_selector) =
+                        let (cores, mem_bytes, disk_bytes, deadline_secs, _, node_selector) =
                             self.solve_intent_for(state.pname.as_deref(), state);
                         // ADR-023 §2.8: arm the Pending-watch the FIRST
                         // time a band-targeted selector is emitted for
@@ -403,6 +403,21 @@ impl DagActor {
                                 mem_bytes,
                                 disk_bytes,
                                 node_selector: node_selector.into_iter().collect(),
+                                // D5/D7 (Phase 4): per-intent
+                                // routing keys + deadline. The
+                                // per-class wrapper stays until
+                                // Phase 5 flattens; controller-side
+                                // consumers of these fields land
+                                // alongside the flatten.
+                                kind: if state.is_fixed_output {
+                                    rio_proto::types::ExecutorKind::Fetcher
+                                } else {
+                                    rio_proto::types::ExecutorKind::Builder
+                                }
+                                .into(),
+                                system: state.system.clone(),
+                                required_features: state.required_features.clone(),
+                                deadline_secs,
                             });
                     }
                 }
@@ -463,11 +478,12 @@ impl DagActor {
         u32,
         u64,
         u64,
+        u32,
         Option<crate::sla::solve::SlaPrediction>,
         std::collections::BTreeMap<String, String>,
     ) {
         use crate::sla::{
-            solve,
+            quantile, solve,
             types::{ModelKey, RawCores},
         };
         // Tenant: same attribution as completion.rs's write_build_sample
@@ -561,6 +577,27 @@ impl DagActor {
         let floor = &state.sched.resource_floor;
         let mem = mem.max(floor.mem_bytes);
         let disk = disk.max(floor.disk_bytes);
+        // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
+        // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
+        // — k8s-kill-then-reactive-floor IS the retry). Unfitted
+        // (probe/explore/override-with-no-fit) ⇒ `[sla].probe.
+        // deadline_secs`. Clamp order: floor first (D4 — a
+        // `bump_floor_or_count(DeadlineExceeded)` doubles
+        // `floor.deadline_secs`; the next solve must honor it), then
+        // 24h ceiling so a doubled floor cannot run away.
+        let probe_deadline = self
+            .sla_config
+            .as_ref()
+            .map(|c| c.probe.deadline_secs)
+            .unwrap_or_else(crate::sla::config::default_probe_deadline_secs);
+        let computed = fit
+            .as_ref()
+            .map(|f| {
+                let t = f.fit.t_at(RawCores(f64::from(cores))).0;
+                (quantile::quantile(0.99, t, f.sigma_resid, 0.0) * 5.0) as u32
+            })
+            .unwrap_or(probe_deadline);
+        let deadline_secs = computed.max(floor.deadline_secs).min(86400);
         // Dispatch-time prediction snapshot for completion's
         // actual-vs-predicted scoring. Only meaningful when there's a
         // fitted curve to evaluate `T(c)` against — cold-start probes
@@ -588,7 +625,7 @@ impl DagActor {
                 tier_p90,
             }
         });
-        (cores, mem, disk, predicted, node_selector)
+        (cores, mem, disk, deadline_secs, predicted, node_selector)
     }
 
     /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`

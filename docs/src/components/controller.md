@@ -148,24 +148,18 @@ spawn; the spawned executor heartbeats in, never matches dispatch (wrong
 the pod at deadline, `backoffLimit: 0` marks the Job Failed,
 `ttlSecondsAfterFinished` reaps.
 
-r[ctrl.ephemeral.per-class-deadline+2]
-When `BuilderPoolSpec.sizeClassCutoffSecs` is set (stamped onto every
-BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the child also
-gets `daemonTimeoutSecs = cutoffSecs * DEADLINE_MULTIPLIER` (5) ---
-the WORKER's own `tokio::time::timeout` --- and the Job's
-`activeDeadlineSeconds = daemonTimeoutSecs + EPHEMERAL_TGPS +
-DEADLINE_SLACK_SECS` (= +90s). The worker timer fires first and
-reports `BuildResultStatus::TimedOut` -> `r[sched.timeout.promote-on-
-exceed]` promotes; the k8s deadline is a BACKSTOP that only kills a
-worker too wedged to time itself out (`r[ctrl.terminated.deadline-
-exceeded]` then promotes anyway). `tiny` (cutoff 30s): worker 150s,
-k8s 240s. `xlarge` (cutoff 7200s): worker 36000s, k8s 36090s. An
-explicit `deadlineSeconds` on the pool overrides `activeDeadlineSeconds`
-verbatim. Rationale (I-200): per-class timer makes misclassification
-self-correcting. The +90s margin is the 2acd1b32 regression fix ---
-disconnect-promote was removed, so the k8s kill alone (bare
-disconnect) looped python3 at `tiny` for 17h. `FetcherSizeClass` has
-no `cutoffSecs` so fetcher Jobs keep the flat 300s default.
+r[ctrl.ephemeral.intent-deadline]
+When a `SpawnIntent` carries `deadline_secs > 0`, the Job's
+`activeDeadlineSeconds` is set to that value verbatim. Precedence:
+`intent.deadline_secs` > `spec.deadlineSeconds` > 3600 default. The
+scheduler computes `deadline_secs` per-derivation (D7): for fitted
+keys, `wall_p99 * 5` at the solved core count; for unfitted
+(probe/explore), `[sla].probe.deadline_secs`; both clamped
+`[resource_floor.deadline_secs, 86400]`. A `DeadlineExceeded` kill
+triggers `r[ctrl.terminated.deadline-exceeded]` -> `bump_floor_or_count`
+doubles `floor.deadline_secs` -> the next intent gets a longer
+`activeDeadlineSeconds`. The 5x headroom is scheduler-side; the
+controller adds no multiplier or margin.
 
 r[ctrl.terminated.deadline-exceeded]
 The Job-mode reconciler MUST report each Job with `status.conditions`

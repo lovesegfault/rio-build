@@ -52,7 +52,6 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
             },
         },
         resources: None,
-        size_class_cutoff_secs: None,
         fuse_threads: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,

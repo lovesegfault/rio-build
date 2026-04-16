@@ -53,6 +53,10 @@ fn sizeclass_status_proto_roundtrip() {
                     mem_bytes: 17_179_869_184,
                     disk_bytes: 42_949_672_960,
                     node_selector: [("rio.build/hw-band".into(), "mid".into())].into(),
+                    kind: rio_proto::types::ExecutorKind::Builder.into(),
+                    system: "x86_64-linux".into(),
+                    required_features: vec!["kvm".into()],
+                    deadline_secs: 600,
                 }],
             },
             SizeClassStatus {

@@ -97,23 +97,10 @@ pub struct BuilderPoolSpec {
     // build completes; short enough that a wrong-pool spawn (queue
     // full of `x86_64-linux` work on an `aarch64-darwin` pool —
     // worker heartbeats, never matches dispatch) doesn't leak for
-    // the life of the cluster. This bounds BUILD time too
-    // (`backoffLimit: 0` means K8s can't tell "idle" from "busy on
-    // 90min build"). Per-pool queue depth (the proper fix) is
-    // deferred to phase5's ClusterStatus proto extension. See
-    // `r[ctrl.pool.ephemeral-deadline]` in controller.md.
-    /// The class's `cutoffSecs` (upper-bound predicted build duration).
-    /// Stamped onto BuilderPoolSet children from `SizeClassSpec.cutoff_
-    /// secs`; standalone BuilderPools may set it directly. When set and
-    /// `deadline_seconds` is unset, Jobs derive `activeDeadlineSeconds
-    /// = cutoff * DEADLINE_MULTIPLIER` instead of the flat 3600
-    /// default --- per-class hung-build detection (I-200,
-    /// `r[ctrl.ephemeral.per-class-deadline]`). f64 to match
-    /// `SizeClassSpec.cutoff_secs` (EMA-smoothed cutoffs are
-    /// fractional); the controller `ceil`s before casting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_class_cutoff_secs: Option<f64>,
-
+    // the life of the cluster. SLA-mode pools get a per-intent
+    // `activeDeadlineSeconds` from `SpawnIntent.deadline_secs`
+    // (`r[ctrl.ephemeral.intent-deadline]`) which overrides this.
+    // See `r[ctrl.pool.ephemeral-deadline]` in controller.md.
     /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
     /// `None` = worker default (4). Tune up for NAR-heavy build
     /// profiles where FUSE readahead is the bottleneck (visible

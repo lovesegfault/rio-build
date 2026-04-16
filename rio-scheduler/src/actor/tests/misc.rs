@@ -760,7 +760,7 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     // probe-default mem (typically a few GiB) — the clamp raises it.
     actor.test_inject_ready_with_floor("a", "x86_64-linux", 32 << 30);
     let state = actor.dag.node("a").unwrap();
-    let (_, mem, disk, _, _) = actor.solve_intent_for(None, state);
+    let (_, mem, disk, _, _, _) = actor.solve_intent_for(None, state);
     assert!(
         mem >= 32 << 30,
         "D4: solve_intent_for clamps mem at floor (got {mem})"
@@ -769,7 +769,7 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     // floor=zero (cold start) → solve returns its own value unchanged.
     actor.test_inject_ready_with_floor("b", "x86_64-linux", 0);
     let state = actor.dag.node("b").unwrap();
-    let (_, mem_b, _, _, _) = actor.solve_intent_for(None, state);
+    let (_, mem_b, _, _, _, _) = actor.solve_intent_for(None, state);
     assert!(mem_b < 32 << 30, "control: floor=0 → no clamp");
     // disk also clamped (orthogonal dimension).
     let _ = disk;

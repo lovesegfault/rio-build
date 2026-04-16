@@ -1966,9 +1966,9 @@ impl DagActor {
     /// larger class — bounded by `max_timeout_retries`, after which
     /// terminal `Cancelled` (retriable on EXPLICIT resubmit only).
     ///
-    /// I-200: with per-class `activeDeadlineSeconds = cutoff×5`
-    /// (`r[ctrl.ephemeral.per-class-deadline]`) the next dispatch
-    /// lands on a larger class with a proportionally longer deadline,
+    /// D7: with per-intent `activeDeadlineSeconds`
+    /// (`r[ctrl.ephemeral.intent-deadline]`) the next dispatch gets a
+    /// doubled `floor.deadline_secs` and a proportionally longer deadline,
     /// so "same inputs → same timeout → storm" no longer holds for
     /// the first N retries. The cap (default 4: tiny→xlarge) ensures
     /// a genuinely-infinite build still goes terminal.

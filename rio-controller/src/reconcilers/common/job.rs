@@ -74,15 +74,6 @@ pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 /// LONG-drain case; ephemeral pods don't drain, they finish and die.)
 pub(crate) const EPHEMERAL_TGPS: i64 = 30;
 
-/// Slack added on top of the worker's `daemon_timeout` when deriving
-/// `activeDeadlineSeconds` (`r[ctrl.ephemeral.per-class-deadline]`).
-/// Covers Job-create→build-start overhead (pod scheduling + container
-/// pull + FUSE mount + first heartbeat + dispatch) so the worker's
-/// timer fires BEFORE k8s kills the pod. Live timing showed ~36s
-/// (medium-shallow-32x, 2026-04-13); 60s gives headroom for cold-node
-/// image pull.
-pub(crate) const DEADLINE_SLACK_SECS: i64 = 60;
-
 /// The shared one-shot Job literal for executor pods. Both
 /// Job-mode reconcilers (`builderpool::jobs`,
 /// `fetcherpool::jobs`) route through this so the load-bearing
