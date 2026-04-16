@@ -104,4 +104,32 @@ mod tests {
         assert!(f.is_finite(), "factor={f} (loop elided?)");
         assert!(f > 0.0, "factor={f}");
     }
+
+    /// `run()` is deterministic-instruction-count → two back-to-back
+    /// calls on the same host should agree within ±5%. Also bounds the
+    /// factor to `(0.1, 100.0)`: anything outside means either the loop
+    /// was elided (factor → ∞) or `ITERS` drifted so far from
+    /// `REF_TIME_SECS` calibration that the hw-normalize math is
+    /// meaningless. The append-only contract relies on factors being
+    /// comparable across pods; a non-reproducible bench would poison
+    /// the `hw_perf_factors` median.
+    // r[verify sched.sla.hw-bench-append-only]
+    #[test]
+    fn run_is_reproducible_within_band() {
+        let f1 = super::run();
+        let f2 = super::run();
+        assert!(
+            f1.is_finite() && (0.1..100.0).contains(&f1),
+            "f1={f1} outside (0.1, 100.0) — loop elided or ITERS miscalibrated"
+        );
+        assert!(
+            f2.is_finite() && (0.1..100.0).contains(&f2),
+            "f2={f2} outside (0.1, 100.0)"
+        );
+        let rel = (f1 - f2).abs() / f1.max(f2);
+        assert!(
+            rel < 0.05,
+            "factor not reproducible: f1={f1} f2={f2} (rel diff {rel:.3})"
+        );
+    }
 }

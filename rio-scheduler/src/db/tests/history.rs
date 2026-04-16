@@ -704,3 +704,50 @@ async fn test_trim_build_samples_keeps_newest_n() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `read_build_samples_for_key` filters on `tenant` — same `(pname,
+/// system)` under two tenants are distinct ModelKeys (ADR-023: a
+/// tenant's curve must never be polluted by another tenant's samples).
+/// Two rows, identical pname/system, different tenant → reading for
+/// tenant `a` returns exactly tenant `a`'s row.
+// r[verify sched.sla.model-key-tenant-scoped]
+#[tokio::test]
+async fn test_read_build_samples_tenant_scoped() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    db.write_build_sample(&BuildSampleRow {
+        pname: "shared".into(),
+        system: "x86_64-linux".into(),
+        tenant: "tenant-a".into(),
+        duration_secs: 100.0,
+        peak_memory_bytes: 1 << 30,
+        ..Default::default()
+    })
+    .await?;
+    db.write_build_sample(&BuildSampleRow {
+        pname: "shared".into(),
+        system: "x86_64-linux".into(),
+        tenant: "tenant-b".into(),
+        duration_secs: 999.0,
+        peak_memory_bytes: 1 << 30,
+        ..Default::default()
+    })
+    .await?;
+
+    let rows_a = db
+        .read_build_samples_for_key("shared", "x86_64-linux", "tenant-a", 32)
+        .await?;
+    assert_eq!(rows_a.len(), 1, "tenant-a should see only its own row");
+    assert_eq!(rows_a[0].tenant, "tenant-a");
+    assert!((rows_a[0].duration_secs - 100.0).abs() < 1e-9);
+
+    let rows_b = db
+        .read_build_samples_for_key("shared", "x86_64-linux", "tenant-b", 32)
+        .await?;
+    assert_eq!(rows_b.len(), 1, "tenant-b should see only its own row");
+    assert_eq!(rows_b[0].tenant, "tenant-b");
+    assert!((rows_b[0].duration_secs - 999.0).abs() < 1e-9);
+
+    Ok(())
+}

@@ -98,6 +98,7 @@ mod tests {
     /// tmpfs has no project quotas → `Ok(None)`, not `Err`. Verifies
     /// the ENOTTY-on-ioctl path degrades gracefully (the cgroup poll
     /// loop must not crash on a node without `-o prjquota`).
+    // r[verify sched.sla.disk-scalar]
     #[test]
     fn returns_none_on_tmpfs() {
         let r = peak_bytes(std::path::Path::new("/tmp"));
