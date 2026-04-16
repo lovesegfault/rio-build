@@ -2,16 +2,15 @@
 # PutPath, worker-disconnect reassignment, cgroup→build_history.
 #
 # Ports phase2a + phase2c + phase3a(cgroup) to the fixture architecture.
-# Needs the standalone fixture with 3 workers (2 small, 1 large) and
-# size-class + chunk-backend TOML:
+# Needs the standalone fixture with 3 workers and chunk-backend TOML:
 #
 #   fixture = standalone {
 #     workers = {
-#       wsmall1 = { sizeClass = "small"; };
-#       wsmall2 = { sizeClass = "small"; };
-#       wlarge  = { sizeClass = "large"; };
+#       wsmall1 = { };
+#       wsmall2 = { };
+#       wlarge  = { };
 #     };
-#     extraSchedulerConfig = { tickIntervalSecs = 2; extraConfig = <size-classes>; };
+#     extraSchedulerConfig = { tickIntervalSecs = 2; };
 #     extraStoreConfig = { extraConfig = <chunk_backend filesystem>; };
 #     extraPackages = [ pkgs.postgresql ];  # psql for build_history queries
 #   };
@@ -66,14 +65,13 @@ let
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
 
-  # reassign: slow build, no pname → estimator default → "small" class.
-  # 25s gives the test ~20s to find+kill the assigned worker before the
-  # build would naturally finish.
+  # reassign: slow build, no pname → estimator default. 25s gives the
+  # test ~20s to find+kill the assigned worker before the build would
+  # naturally finish.
   #
-  # I-177: after the SIGKILL, promote_size_class_floor bumps small→large
-  # and the retry lands on wlarge — which has RIO_MAX_SILENT_TIME_SECS=10
-  # (for the silence subtest). mkTrivial's single-sleep would TimedOut
-  # there, so this drv echoes every 5s to keep the silence watchdog fed.
+  # All workers have RIO_MAX_SILENT_TIME_SECS=10 (for the silence
+  # subtest). mkTrivial's single-sleep would TimedOut there, so this
+  # drv echoes every 5s to keep the silence watchdog fed.
   reassignDrv = drvs.mkCustom {
     name = "rio-test-sched-reassign";
     script = ''

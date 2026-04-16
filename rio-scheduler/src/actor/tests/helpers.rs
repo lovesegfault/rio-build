@@ -155,7 +155,7 @@ pub(crate) async fn setup_ca_fixture_configured(
 
 /// Set up an actor with a configurator closure that mutates
 /// `DagActorConfig`/`DagActorPlumbing` before spawn. For tests that
-/// need custom `size_classes`, `retry_policy`, `event_persist_tx`,
+/// need custom `retry_policy`, `event_persist_tx`,
 /// `leader`, etc.
 pub(crate) fn setup_actor_configured(
     pool: sqlx::PgPool,
@@ -256,7 +256,6 @@ pub(crate) struct HeartbeatFields {
     pub draining: bool,
     pub kind: rio_proto::types::ExecutorKind,
     pub resources: Option<rio_proto::types::ResourceUsage>,
-    pub size_class: Option<String>,
     pub supported_features: Vec<String>,
     pub running_build: Option<String>,
     pub intent_id: Option<String>,
@@ -269,7 +268,6 @@ impl Default for HeartbeatFields {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            size_class: None,
             supported_features: vec![],
             running_build: None,
             intent_id: None,
@@ -299,7 +297,6 @@ pub(crate) async fn send_heartbeat_with(
             draining: hb.draining,
             kind: hb.kind,
             resources: hb.resources,
-            size_class: hb.size_class,
             supported_features: hb.supported_features,
             running_build: hb.running_build,
             intent_id: hb.intent_id,
@@ -371,54 +368,45 @@ async fn connect_executor_with(
     Ok(stream_rx)
 }
 
-/// Connect a size-classed executor (stream + heartbeat + warm-gate
-/// ACK). For `r[sched.fod.size-class-reactive]` (I-170) and
-/// `r[sched.builder.size-class-reactive]` (I-177) — the floor walk
-/// matches against `ExecutorState.size_class`. Callers can merge then
-/// `recv_assignment` directly.
-pub(crate) async fn connect_executor_classed(
+/// Connect a kind-typed executor (stream + heartbeat + warm-gate ACK).
+/// Callers can merge then `recv_assignment` directly.
+pub(crate) async fn connect_executor_kind(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    size_class: &str,
     kind: rio_proto::types::ExecutorKind,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     connect_executor_with(handle, executor_id, system, true, |hb| {
         hb.kind = kind;
-        hb.size_class = Some(size_class.into());
     })
     .await
 }
 
-/// [`connect_executor_classed`] with `kind = Fetcher`.
-pub(crate) async fn connect_fetcher_classed(
+/// [`connect_executor_kind`] with `kind = Fetcher`.
+pub(crate) async fn connect_fetcher(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    size_class: &str,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_classed(
+    connect_executor_kind(
         handle,
         executor_id,
         system,
-        size_class,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await
 }
 
-/// [`connect_executor_classed`] with `kind = Builder`.
-pub(crate) async fn connect_builder_classed(
+/// [`connect_executor_kind`] with `kind = Builder`.
+pub(crate) async fn connect_builder(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    size_class: &str,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_classed(
+    connect_executor_kind(
         handle,
         executor_id,
         system,
-        size_class,
         rio_proto::types::ExecutorKind::Builder,
     )
     .await
@@ -839,49 +827,6 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
         hw_fallback_after_secs: 120.0,
         cluster: String::new(),
     }
-}
-
-/// Build a `Vec<SizeClassConfig>` from `(name, cutoff_secs)` pairs with
-/// unbounded mem/cpu. Replaces the 25× inline 6-line struct literals
-/// scattered across `misc.rs`/`completion.rs`/`executor.rs`.
-pub(crate) fn size_classes(pairs: &[(&str, f64)]) -> Vec<crate::assignment::SizeClassConfig> {
-    pairs
-        .iter()
-        .map(|(n, c)| crate::assignment::SizeClassConfig {
-            name: (*n).into(),
-            cutoff_secs: *c,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        })
-        .collect()
-}
-
-/// Bootstrap PG + actor configured with builder size_classes from
-/// `(name, cutoff)` pairs. Absorbs the `TestDb::new` +
-/// `setup_actor_configured(|c,_| c.size_classes = vec![...])` preamble
-/// repeated across size-class routing / promote-on-fail tests.
-pub(crate) async fn setup_with_classes(
-    pairs: &[(&str, f64)],
-) -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
-    let db = TestDb::new(&MIGRATOR).await;
-    let classes = size_classes(pairs);
-    let (handle, task) =
-        setup_actor_configured(db.pool.clone(), None, |c, _| c.size_classes = classes);
-    (db, handle, task)
-}
-
-/// Bare (unspawned) actor with builder size_classes. For snapshot tests
-/// that exercise `compute_spawn_intents` / `compute_capacity_manifest`
-/// directly via `&self`. Replaces 8× `bare_actor_cfg(pool,
-/// DagActorConfig{ size_classes: vec![...20 lines...], ..Default })`.
-pub(crate) fn bare_actor_classed(pool: sqlx::PgPool, pairs: &[(&str, f64)]) -> DagActor {
-    bare_actor_cfg(
-        pool,
-        DagActorConfig {
-            size_classes: size_classes(pairs),
-            ..Default::default()
-        },
-    )
 }
 
 /// Bare (unspawned) actor with `[sla]` configured (default config).

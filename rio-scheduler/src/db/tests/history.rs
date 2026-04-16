@@ -78,19 +78,6 @@ async fn test_build_samples_insert_and_retention() -> anyhow::Result<()> {
         .await?;
     assert_eq!(count, 1, "expected 1 fresh row remaining");
 
-    // Rebalancer query: same window (7d) should see the 1 fresh
-    // row. The aged row (45d) is already deleted, but even if it
-    // weren't, it's outside the 7d window. Roundtrip: insert with
-    // (8.0, 2_097_152) survived → that's the row we expect.
-    let samples = db.query_build_samples_last_days(7).await?;
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], (8.0, 2_097_152));
-
-    // And the window actually filters: 0 days → nothing is
-    // strictly newer than now().
-    let empty = db.query_build_samples_last_days(0).await?;
-    assert!(empty.is_empty(), "0-day window should be empty");
-
     Ok(())
 }
 

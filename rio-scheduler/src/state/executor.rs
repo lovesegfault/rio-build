@@ -42,12 +42,6 @@ pub struct ExecutorState {
     pub last_heartbeat: Instant,
     /// Number of consecutive missed heartbeats.
     pub missed_heartbeats: u32,
-    /// Size class (e.g., "small", "large") reported by the executor.
-    /// `None` = executor didn't declare a class. If the scheduler has
-    /// size_classes configured, best_executor() REJECTS unclassified
-    /// executors (misconfiguration — visible failure, not silent wildcard).
-    /// If the scheduler has no size_classes, this field is ignored.
-    pub size_class: Option<String>,
     /// Stop accepting new assignments (graceful shutdown).
     ///
     /// Set by `AdminService.DrainExecutor` which the executor's SIGTERM
@@ -181,7 +175,6 @@ impl ExecutorState {
             stream_tx: None,
             last_heartbeat: Instant::now(),
             missed_heartbeats: 0,
-            size_class: None,
             draining: false,
             draining_hb: false,
             last_completed: None,

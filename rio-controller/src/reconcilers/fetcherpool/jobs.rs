@@ -423,7 +423,7 @@ mod tests {
 
     // r[verify ctrl.fetcherpool.ephemeral-per-class]
     /// Per-class Job stamping. `class=Some(small)` →
-    /// `RIO_SIZE_CLASS=small` env, per-class resources, `rio.build/
+    /// per-class resources, `rio.build/
     /// pool={fp.name}-small` label (per-arch collision-safe), Job
     /// name prefix `rio-fetcher-{fp.name}-small-`.
     #[test]
@@ -465,7 +465,7 @@ mod tests {
         let pod = job.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
         let envs = crate::fixtures::env_map(c.env.as_deref().unwrap());
-        assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
+        assert_eq!(envs.get("RIO_SIZE_CLASS"), None);
         assert_eq!(
             c.resources
                 .as_ref()

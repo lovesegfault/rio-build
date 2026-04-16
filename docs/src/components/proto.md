@@ -49,7 +49,7 @@ service ExecutorService {
 }
 ```
 
-> **Executor registration:** Executor registration is implicit and two-step: (1) the executor opens a `BuildExecution` bidirectional stream, (2) the executor calls the separate `Heartbeat` unary RPC with its initial capabilities (executor_id, systems, supported_features, size_class, kind). The scheduler creates the executor entry when it receives a heartbeat from an executor_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#executor-registration-protocol) for deregistration rules.
+> **Executor registration:** Executor registration is implicit and two-step: (1) the executor opens a `BuildExecution` bidirectional stream, (2) the executor calls the separate `Heartbeat` unary RPC with its initial capabilities (executor_id, systems, supported_features, kind). The scheduler creates the executor entry when it receives a heartbeat from an executor_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#executor-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -197,7 +197,7 @@ message CompletionReport {
 ### HeartbeatRequest
 
 r[proto.heartbeat.capability-fields]
-Executors include inventory data in heartbeats so the scheduler can make informed placement decisions. Fields 8–11 are the **dispatch-filter capability set** the scheduler reads on every heartbeat: `size_class` (static, from `builder.toml`; empty = wildcard; fetchers always empty), `store_degraded` (FUSE breaker open → `has_capacity()` returns false), `kind` (builder/fetcher routing), `draining` (executor-authoritative — the executor knows whether it received SIGTERM; scheduler sets `worker.draining` from this field, NOT from `DrainExecutor` RPC or reconnect inference). All four default to zero/false (wire-compatible with old executors).
+Executors include inventory data in heartbeats so the scheduler can make informed placement decisions. Fields 9–11 are the **dispatch-filter capability set** the scheduler reads on every heartbeat: `store_degraded` (FUSE breaker open → `has_capacity()` returns false), `kind` (builder/fetcher routing), `draining` (executor-authoritative — the executor knows whether it received SIGTERM; scheduler sets `worker.draining` from this field, NOT from `DrainExecutor` RPC or reconnect inference). All default to zero/false (wire-compatible with old executors). Field 8 (`size_class`) is reserved.
 
 ```protobuf
 message HeartbeatRequest {
@@ -208,7 +208,7 @@ message HeartbeatRequest {
   repeated string systems = 5;     // Systems this executor builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   reserved 7;                      // was max_builds (always 1 now)
-  string size_class = 8;           // Static size-class from builder.toml ("small"/"large"/"" = wildcard)
+  reserved 8;                      // was size_class (ADR-023: SLA per-drv sizing)
   bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
   ExecutorKind kind = 10;          // builder (airgapped) or fetcher (open egress, FOD-only)
   bool draining = 11;              // executor-authoritative drain flag; scheduler stops dispatching

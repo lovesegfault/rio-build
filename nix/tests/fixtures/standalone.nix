@@ -30,11 +30,7 @@ in
 {
   # Attrset of worker-node-name → mkWorkerNode args. Keys become
   # hostname + node var in testScript. scenarios/scheduling.nix uses
-  # this to pass distinct sizeClass per worker:
-  #   workers = {
-  #     wsmall1 = { sizeClass = "small"; };
-  #     wlarge  = { sizeClass = "large"; };
-  #   };
+  # this to pass distinct service env per worker.
   # For the common 1-worker case: workers = { worker = { }; }
   workers,
 

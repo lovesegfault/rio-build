@@ -28,7 +28,7 @@ spec:
   tolerations:
     - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
   # ---- BuilderPoolSpec-only fields ----
-  sizeClass: small                             # string, default "" — maps to RIO_SIZE_CLASS env
+  sizeClass: small                             # string, default "" — (legacy; ignored under SLA sizing)
   sizeClassCutoffSecs: 60.0                    # f64?, optional — stamped from BuilderPoolSet; drives per-class activeDeadlineSeconds
   features: [big-parallel, kvm]                # list<string>, default [] — maps to requiredSystemFeatures
   imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
@@ -249,10 +249,10 @@ r[ctrl.wps.cleanup-sweep]
 The BuilderPoolSet finalizer's `cleanup()` MUST list child BuilderPools by ownerRef UID (NOT by iterating `spec.classes`) and explicitly delete each. Spec-iteration leaks orphans when an operator removes a class from `spec.classes` then deletes the BPS before the next reconcile runs `r[ctrl.wps.prune-stale]` — the now-shortened spec never names the orphan. 404 on delete is tolerated (GC ran first / operator manually deleted / previous cleanup partially succeeded); a non-404 delete error propagates so the finalizer stays and cleanup retries — leaking a child after BPS delete is worse than retrying. ownerRef GC would eventually do this; explicit delete is deterministic for tests and produces clear `kubectl get events` output.
 
 r[ctrl.fetcherpool.classes]
-When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent` (both optional — omit for uncapped). Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
+When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`). Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent` (both optional — omit for uncapped). Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
 
 r[ctrl.fetcherpool.ephemeral-per-class]
-When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSpawnIntents{kind=Fetcher, systems=spec.systems}` and spawn `spawn_count(len(intents), active, class.maxConcurrent)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Under Static mode (`[sla]` unconfigured, `intents` empty) falls back to `Σ queued_by_system[spec.systems]` for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
+When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSpawnIntents{kind=Fetcher, systems=spec.systems}` and spawn `spawn_count(len(intents), active, class.maxConcurrent)` Jobs with per-class `resources`. Under Static mode (`[sla]` unconfigured, `intents` empty) falls back to `Σ queued_by_system[spec.systems]` for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
 
 r[ctrl.fetcherpool.multiarch]
 Multiple `FetcherPool` CRs MAY coexist (typically one per arch). The reconciler derives the `rio.build/pool` label as `{fp.name}-{class.name}` so pools sharing a class name don't collide in the same namespace. Each pool's `spec.systems` and `spec.nodeSelector["kubernetes.io/arch"]` MUST agree (a pool advertising `x86_64-linux` MUST select `amd64` nodes). Dispatch is pool-agnostic: the scheduler scores across all registered fetchers regardless of which `FetcherPool` spawned them.
@@ -349,7 +349,7 @@ status:
 |---|---|---|
 | `name` | string | Matches `spec.classes[].name`. |
 | `effectiveCutoffSecs` | f64 | Cutoff the scheduler is actually using (drifts from spec when learning is on). |
-| `queued` | u64 | Builds queued for this class (`GetSizeClassStatus`). |
+| `queued` | u64 | Builds queued for this class (`GetSpawnIntents`). |
 | `childPool` | string | Owned child BuilderPool name (`{bps}-{name}`). |
 | `replicas` / `readyReplicas` | i32 | Mirrored from child `BuilderPool.status`. |
 
@@ -430,7 +430,7 @@ status:
 
 Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
 in-cluster, and the controller already has the demand signal
-(`GetSizeClassStatus`). See `r[ctrl.scaler.component]` /
+(`GetSpawnIntents`). See `r[ctrl.scaler.component]` /
 `r[ctrl.scaler.ratio-learn]` for reconciler behavior.
 
 ## Reconciliation Loops
@@ -492,7 +492,7 @@ NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/t
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
 - **Scheduler**: egress to PostgreSQL. DNS egress to kube-system.
 - **Store**: egress to PostgreSQL and S3. DNS egress to kube-system.
-- **Controller**: egress to rio-scheduler (gRPC, for `AdminService.ClusterStatus`/`GetSizeClassStatus` queue-depth queries) and to the Kubernetes API server (for CRD watches and Job management). DNS egress to kube-system.
+- **Controller**: egress to rio-scheduler (gRPC, for `AdminService.ClusterStatus`/`GetSpawnIntents` queue-depth queries) and to the Kubernetes API server (for CRD watches and Job management). DNS egress to kube-system.
 
 ## PodDisruptionBudget
 
@@ -545,7 +545,7 @@ r[ctrl.drain.disruption-target]
 ## ComponentScaler
 
 r[ctrl.scaler.component]
-The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.GetSizeClassStatus` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
+The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.GetSpawnIntents` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
 
 r[ctrl.scaler.ratio-learn]
 `status.learnedRatio` self-calibrates against `max(StoreAdminService.GetLoad().pg_pool_utilization)` over the `spec.loadEndpoint` headless-service endpoints (the **observed** signal). Asymmetric correction: `load > spec.loadThresholds.high` (default 0.8) → immediate `current+1` AND `learnedRatio *= 0.95` (under-provisioning is dangerous — I-105 cascade); `load < spec.loadThresholds.low` (default 0.3) for 30 consecutive ticks → `learnedRatio *= 1.02` (over-provisioning is cheap). The ratio persists in `.status` so a controller restart resumes from the learned value, not `spec.seedRatio`.

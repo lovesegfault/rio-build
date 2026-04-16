@@ -51,5 +51,4 @@ The ADR-019–defined markers for this component live in [ADR-019](../decisions/
 - `r[ctrl.fetcherpool.spawn-builtin]` — spawn signal counts `builtin` FODs for every pool
 - `r[sched.dispatch.fod-to-fetcher]` — scheduler hard-filter routes FODs here
 - `r[sched.dispatch.fod-builtin-any-arch]` — `system="builtin"` FOD eligible on any fetcher
-- `r[sched.dispatch.no-fod-fallback]` — FODs queue rather than fall back to builders
-- `r[sched.fod.size-class-reactive]` — FOD size-class floor promoted on transient failure
+- `r[sched.sla.reactive-floor]` — `resource_floor` doubled on explicit resource-exhaustion signals (FOD and non-FOD share the same path)

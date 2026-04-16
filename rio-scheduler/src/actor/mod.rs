@@ -180,13 +180,13 @@ pub struct DagActor {
     executors: HashMap<ExecutorId, ExecutorState>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
-    /// `(drv_hash, size_class, inserted_at)` — captured before
+    /// `(drv_hash, inserted_at)` — captured before
     /// `self.executors.remove()`. The controller's report arrives ~1-3s
     /// after disconnect; entries are swept on Tick after
     /// [`executor::TERMINATION_REPORT_TTL`]. In-memory only: a lost
     /// entry (scheduler restart) degrades to "one OOM doesn't promote"
     /// — same as pre-I-197 behavior for one cycle.
-    recently_disconnected: HashMap<ExecutorId, (DrvHash, Option<String>, Instant)>,
+    recently_disconnected: HashMap<ExecutorId, (DrvHash, Instant)>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -294,9 +294,7 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
-    /// Size-class routing + soft-feature config. See [`SizingConfig`].
-    /// `pub(crate)` for tests that simulate a rebalancer pass by
-    /// writing `sizing.size_classes` directly.
+    /// Soft-feature config. See [`SizingConfig`].
     pub(crate) sizing: SizingConfig,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
@@ -336,20 +334,18 @@ pub struct DagActor {
     /// Reset to None when either side of the AND clears.
     ///
     /// The scheduler already surfaces the freeze via the
-    /// `rio_scheduler_fod_queue_depth` + `rio_scheduler_fetcher_utilization`
+    /// `rio_scheduler_queue_depth{kind}` + `rio_scheduler_utilization{kind}`
     /// gauges — but those require a port-forward to observe. A WARN lands
     /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
-    /// with zero ERROR/WARN while fod_queue_depth=41 and fetcher streams=0.
-    fod_freeze_since: Option<Instant>,
+    /// with zero ERROR/WARN while queue_depth{fetcher}=41 and fetcher
+    /// streams=0. Per-kind so builder/fetcher freeze independently.
+    freeze_since: HashMap<rio_proto::types::ExecutorKind, Option<Instant>>,
     /// Systems already WARNed as unroutable. Edge-triggers the
     /// `r[sched.dispatch.unroutable-system]` log: WARN once when a
     /// system first has Ready drvs but zero advertising executors;
     /// re-armed when the system becomes routable again. Also the set
     /// the gauge zeroing loop iterates so stale labels don't persist.
     unroutable_warned: HashSet<String>,
-    /// Same pattern for non-FOD derivations stuck with zero builder streams.
-    /// Tracks `class_deferred.values().sum() > 0 && builder_streams == 0`.
-    builder_freeze_since: Option<Instant>,
     /// Set by events that change dispatch eligibility (Heartbeat, drain).
     /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
     /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
@@ -461,9 +457,8 @@ impl DagActor {
             hmac_signer: plumbing.hmac_signer,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
-            fod_freeze_since: None,
+            freeze_since: HashMap::new(),
             unroutable_warned: HashSet::new(),
-            builder_freeze_since: None,
             dispatch_dirty: false,
             probe_generation: 1,
             became_idle_inline_this_tick: 0,

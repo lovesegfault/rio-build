@@ -109,9 +109,9 @@ r[obs.metric.scheduler]
 | `rio_scheduler_log_flush_dropped_total` | Counter | Final-flush requests dropped due to flusher channel backpressure. Periodic tick will snapshot instead. |
 | `rio_scheduler_log_forward_dropped_total` | Counter | Live log forwards dropped due to actor channel backpressure. Lines remain in the ring buffer (serveable via AdminService) but the gateway misses the live stream. Sustained non-zero → actor is saturated. |
 | `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio (actual/estimated; 1.0 = perfect, >1.0 = underestimate) |
-| `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
 | `rio_scheduler_resource_floor_bumps_total` | Counter | `resource_floor` doublings on explicit resource-exhaustion signals (D4; labeled `reason`=`oom_killed`\|`disk_pressure`\|`cgroup_oom`\|`timeout`\|`deadline_exceeded`; `r[sched.sla.reactive-floor]`). Frequent firing for one pname = raise `[sla].probe` defaults. |
-| `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
+| `rio_scheduler_queue_depth` | Gauge | Deferred Ready derivations per executor kind (labeled `kind`=builder\|fetcher; snapshot per dispatch pass). Sustained nonzero → scale the matching pool. |
+| `rio_scheduler_utilization` | Gauge | Fraction of executors currently running a build (`busy/total`; labeled `kind`=builder\|fetcher; per dispatch pass). |
 | `rio_scheduler_unroutable_ready` | Gauge | Ready derivations whose `system` is advertised by zero registered executors of the matching kind (labeled by `system`; snapshot per dispatch pass). Nonzero = no pool exists for that system --- add it to a Builder/FetcherPool's `systems` list. The scheduler also WARNs once when a system first becomes unroutable (`r[sched.dispatch.unroutable-system]`). |
 | `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler is rejecting SubmitBuild with `UNAVAILABLE` until a half-open probe succeeds or 30 s elapse (`r[sched.breaker.cache-check]`). |
 | `rio_scheduler_phantom_assignments_drained_total` | Counter | Phantom-assignment drains: scheduler-kept running build absent from the executor's heartbeat report across two consecutive heartbeats → reset to Ready (`r[sched.heartbeat.phantom-drain]`). Non-zero after a scheduler restart is normal; sustained non-zero on a stable leader = executor/heartbeat desync. |
@@ -154,7 +154,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_sla_ice_backoff_total` | Counter | ADR-023 §2.8: `(band, cap)` cells marked ICE-infeasible by the Pending-watch (no heartbeat within `hw_fallback_after_secs` of first emitting a band-targeted SpawnIntent). Labeled `band`, `cap`. |
 
 r[obs.metric.scheduler-leader-gate]
-Scheduler state gauges (`_builds_active`, `_derivations_queued`, `_derivations_running`, `_workers_active`, `_class_queue_depth`) are published **only by the leader**. The standby's actor is warm (DAGs merge for fast takeover per `r[sched.lease.k8s-lease]`) but executors do not connect to it (leader-guarded gRPC per `r[sched.grpc.leader-guard]`), so its counts are stale or zero. With `replicas>1`, publishing from both would create duplicate Prometheus series with identical labels; a naked gauge query returns both, and stat-panel reducers pick one nondeterministically. Counters and histograms are unaffected --- the standby's dispatch loop no-ops, so its counters stay at zero naturally, and `sum(rate(...))` is the idiomatic query form anyway.
+Scheduler state gauges (`_builds_active`, `_derivations_queued`, `_derivations_running`, `_workers_active`, `_queue_depth`) are published **only by the leader**. The standby's actor is warm (DAGs merge for fast takeover per `r[sched.lease.k8s-lease]`) but executors do not connect to it (leader-guarded gRPC per `r[sched.grpc.leader-guard]`), so its counts are stale or zero. With `replicas>1`, publishing from both would create duplicate Prometheus series with identical labels; a naked gauge query returns both, and stat-panel reducers pick one nondeterministically. Counters and histograms are unaffected --- the standby's dispatch loop no-ops, so its counters stay at zero naturally, and `sum(rate(...))` is the idiomatic query form anyway.
 
 ### Store Metrics
 
@@ -194,7 +194,7 @@ r[obs.metric.store-pg-pool]
 
 ### Builder Metrics
 
-> Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Observability, the former `rio_worker_*` metrics are now `rio_builder_*`. New scheduler-side metrics `rio_scheduler_fod_queue_depth` and `rio_scheduler_fetcher_utilization` track the builder/fetcher split; rows added when the emitters land.
+> Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Observability, the former `rio_worker_*` metrics are now `rio_builder_*`. The scheduler-side `rio_scheduler_queue_depth{kind}` and `rio_scheduler_utilization{kind}` gauges track the builder/fetcher split.
 
 r[obs.metric.builder]
 | Metric | Type | Description |

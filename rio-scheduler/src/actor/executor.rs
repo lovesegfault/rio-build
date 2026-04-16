@@ -283,7 +283,6 @@ impl DagActor {
         // one-shot exit → no entry; the controller will report
         // `Completed` and we'd ignore it anyway, so skip the map
         // churn).
-        let lost_class = worker.size_class.clone();
         let lost_last_completed = worker.last_completed.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
         // Record for the controller's follow-up report. Only when the
@@ -292,10 +291,8 @@ impl DagActor {
         if let Some(drv) = to_reassign.first()
             && lost_last_completed.as_ref() != Some(drv)
         {
-            self.recently_disconnected.insert(
-                executor_id.clone(),
-                (drv.clone(), lost_class, Instant::now()),
-            );
+            self.recently_disconnected
+                .insert(executor_id.clone(), (drv.clone(), Instant::now()));
         }
         self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
@@ -391,8 +388,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.fod.size-class-reactive]
-    // r[impl sched.builder.size-class-reactive]
+    // r[impl sched.sla.reactive-floor]
     /// Controller-reported Pod termination reason. `OomKilled` /
     /// `EvictedDiskPressure` / `DeadlineExceeded` → bump the relevant
     /// `resource_floor` dimension (D4). Other reasons → no-op (log
@@ -425,7 +421,7 @@ impl DagActor {
 
         // Resolve drv. remove() = first-report-wins dedup.
         let drv_hash = match self.recently_disconnected.remove(executor_id) {
-            Some((drv, _, _)) => drv,
+            Some((drv, _)) => drv,
             // Race-ahead: report landed before ExecutorDisconnected.
             // Look at the still-live executor.
             None => match self.executors.get(executor_id) {
@@ -487,7 +483,7 @@ impl DagActor {
                     TimedOut first)");
             return false;
         };
-        let (drv_hash, _, _) = self
+        let (drv_hash, _) = self
             .recently_disconnected
             .remove(&pod_name)
             .expect("key found above");
@@ -525,7 +521,7 @@ impl DagActor {
     /// "this one OOM didn't promote".
     pub(super) fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
         self.recently_disconnected
-            .retain(|_, (_, _, at)| now.duration_since(*at) < TERMINATION_REPORT_TTL);
+            .retain(|_, (_, at)| now.duration_since(*at) < TERMINATION_REPORT_TTL);
     }
 
     /// Mark a worker draining. In-flight builds continue; no new
@@ -766,10 +762,6 @@ impl DagActor {
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
         worker.running_build = reconciled;
-        // size_class: overwrite unconditionally. None means the
-        // worker didn't declare one (empty string in proto) — it
-        // becomes a wildcard worker that accepts any class.
-        worker.size_class = hb.size_class;
         // intent_id: the pod annotation is immutable post-create, but
         // the scheduler may re-plan (drv completed elsewhere, scheduler
         // restarted) before this pod heartbeats. `rejection_reason()`

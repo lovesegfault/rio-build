@@ -31,10 +31,6 @@ pub struct HeartbeatPayload {
     /// at most one build per pod — the wire field is `optional string
     /// running_build`, passed through as-is.
     pub running_build: Option<String>,
-    /// Size-class from worker config (e.g. "small", "large"). gRPC
-    /// maps empty-string → None. Stored on ExecutorState for the
-    /// classify() → best_executor() filter.
-    pub size_class: Option<String>,
     /// ResourceUsage from the heartbeat. Prost generates Option for
     /// message fields; worker always populates, so None is defensive
     /// (shouldn't happen). Stored on ExecutorState as `last_resources`
@@ -161,7 +157,7 @@ pub enum ActorCommand {
     /// Controller observed a builder/fetcher Pod's container terminate
     /// and reports the k8s reason (OOMKilled / Evicted-DiskPressure /
     /// etc.). `OomKilled`/`EvictedDiskPressure` → promote
-    /// `size_class_floor` for whatever drv was running at disconnect
+    /// `resource_floor` for whatever drv was running at disconnect
     /// (resolved via `recently_disconnected`). Other reasons → no-op.
     ///
     /// `send_unchecked`: a dropped report means a real OOM doesn't

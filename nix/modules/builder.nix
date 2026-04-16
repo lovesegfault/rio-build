@@ -58,17 +58,6 @@ in
     };
 
     metricsAddr = rioLib.mkMetricsOption 9093;
-
-    sizeClass = lib.mkOption {
-      type = lib.types.str;
-      default = "";
-      description = ''
-        Size-class this worker is deployed as (`RIO_SIZE_CLASS`). Matches
-        a name in the scheduler's `size_classes` config. Empty = wildcard
-        (accepts any-class work). Scheduler routes builds by estimated
-        duration; this declares which bucket this worker serves.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -98,9 +87,6 @@ in
           RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
           RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
           RIO_METRICS_ADDR = cfg.metricsAddr;
-        }
-        // lib.optionalAttrs (cfg.sizeClass != "") {
-          RIO_SIZE_CLASS = cfg.sizeClass;
         }
         // lib.optionalAttrs (cfg.workerId != null) {
           RIO_EXECUTOR_ID = cfg.workerId;

@@ -742,7 +742,7 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0)]).await;
+    let (_db, handle, _task) = setup().await;
 
     let _ev = merge_single_node(
         &handle,
@@ -757,7 +757,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     let mut prev_disk = 0u64;
     for i in 0..5 {
         let id = format!("b-213-{i}");
-        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "tiny").await?;
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
         let asgn = recv_assignment(&mut rx).await;
         assert!(asgn.drv_path.contains("ladder-213"));
         assert!(handle.debug_backdate_running("ladder-213", 0).await?);
@@ -821,7 +821,6 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     use rio_proto::types::TerminationReason as R;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 60.0)]);
         c.retry_policy = crate::RetryPolicy {
             max_infra_retries: 2,
             ..Default::default()
@@ -844,7 +843,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
         .await?;
 
     // ── OOM at ceiling → promoted=false, infra_count++ ────────────────
-    let mut rx = connect_builder_classed(&handle, "b-cap-0", "x86_64-linux", "tiny").await?;
+    let mut rx = connect_builder(&handle, "b-cap-0", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "b-cap-0").await?;
     drop(rx);
@@ -861,7 +860,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     // bump's infra_count++ (1→2) → cap check (2>=max_infra_retries=2)
     // → poison.
     let p = test_drv_path("cap-mem");
-    let mut rx = connect_builder_classed(&handle, "b-cap-1", "x86_64-linux", "tiny").await?;
+    let mut rx = connect_builder(&handle, "b-cap-1", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     complete_failure(
         &handle,
@@ -894,8 +893,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
             }),
         )
         .await?;
-    let mut rx =
-        connect_builder_classed(&handle, "rio-b-dl-abc-x9k4p", "x86_64-linux", "tiny").await?;
+    let mut rx = connect_builder(&handle, "rio-b-dl-abc-x9k4p", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "rio-b-dl-abc-x9k4p").await?;
     drop(rx);
@@ -929,7 +927,6 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     use crate::sla::solve::DEFAULT_CEILINGS;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 60.0)]);
         c.retry_policy = crate::RetryPolicy {
             max_infra_retries: 4,
             ..Default::default()
@@ -960,7 +957,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     // ── Cycles 1..=3: each counts ONCE; not poisoned ────────────────
     for i in 1..=3u32 {
         let id = format!("b-coom-{i}");
-        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "tiny").await?;
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
         let _ = recv_assignment(&mut rx).await;
         complete_failure(
             &handle,
@@ -987,7 +984,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     }
 
     // ── Cycle 4: bump→infra_count=4; cap check 4>=4 → poison ────────
-    let mut rx = connect_builder_classed(&handle, "b-coom-4", "x86_64-linux", "tiny").await?;
+    let mut rx = connect_builder(&handle, "b-coom-4", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     complete_failure(
         &handle,
@@ -1008,8 +1005,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.fod.size-class-reactive]
-// r[verify sched.builder.size-class-reactive]
+// r[verify sched.sla.reactive-floor]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// Bare disconnect does NOT promote `size_class_floor`; the
 /// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
@@ -1039,12 +1035,9 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     #[case] tag: &str,
 ) -> TestResult {
     use rio_proto::types::TerminationReason;
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 60.0), ("small", 3600.0)]);
-    });
+    let (_db, handle, _task) = setup().await;
 
-    let mut rx = connect_executor_classed(&handle, "w-tiny", "x86_64-linux", "tiny", kind).await?;
+    let mut rx = connect_executor_kind(&handle, "w-tiny", "x86_64-linux", kind).await?;
 
     let mut node = make_node(tag);
     node.is_fixed_output = is_fod;
@@ -1108,8 +1101,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
 
     // ── Non-resource reason (Error = pod-kill / SIGKILL / node
     // failure) on a SECOND OOM cycle → no bump ─────────────────────
-    let mut rx2 =
-        connect_executor_classed(&handle, "w-small", "x86_64-linux", "small", kind).await?;
+    let mut rx2 = connect_executor_kind(&handle, "w-small", "x86_64-linux", kind).await?;
     let asgn = recv_assignment(&mut rx2).await;
     assert!(asgn.drv_path.contains(tag));
     disconnect(&handle, "w-small").await?;
@@ -1152,13 +1144,9 @@ async fn test_disconnect_no_promote_oom_report_promotes(
 /// depth.
 #[tokio::test]
 async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
-    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0), ("small", 3600.0)]).await;
+    let (_db, handle, _task) = setup().await;
 
-    let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;
-    send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
-        hb.size_class = Some("tiny".into());
-    })
-    .await?;
+    let mut rx = connect_builder(&handle, "b-eph2", "x86_64-linux").await?;
     barrier(&handle).await;
 
     let node = make_node("eph-race-188");
@@ -1179,7 +1167,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     // caller still sets running_build). last_completed stays X
     // (heartbeat doesn't touch it).
     send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
-        hb.size_class = Some("tiny".into());
         hb.running_build = Some(drv_path);
     })
     .await?;
@@ -1240,16 +1227,10 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 #[tokio::test]
 async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0), ("small", 3600.0)]).await;
+    let (_db, handle, _task) = setup().await;
 
     // Pod name = `{job}-{5char}` (k8s Job-controller suffix).
-    let mut rx = connect_builder_classed(
-        &handle,
-        "rio-builder-tiny-abc123-x9k4p",
-        "x86_64-linux",
-        "tiny",
-    )
-    .await?;
+    let mut rx = connect_builder(&handle, "rio-builder-tiny-abc123-x9k4p", "x86_64-linux").await?;
     let node = make_node("python3-deadline");
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
     let asgn = recv_assignment(&mut rx).await;

@@ -352,7 +352,7 @@ impl AdminService for AdminServiceImpl {
     }
 
     /// Controller reports a builder/fetcher Pod's k8s termination
-    /// reason. OOMKilled/DiskPressure → promote `size_class_floor`
+    /// reason. OOMKilled/DiskPressure → promote `resource_floor`
     /// for whatever drv was running at disconnect; other reasons →
     /// no-op. Replaces the bare-disconnect OOM heuristic.
     ///

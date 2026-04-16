@@ -1,76 +1,6 @@
-//! Dispatch: size-class routing, skip-ineligible, options propagation, interactive priority.
-// r[verify sched.classify.smallest-covering]
-// r[verify sched.overflow.up-only]
+//! Dispatch: skip-ineligible, options propagation, interactive priority.
 
 use super::*;
-
-/// Size-class routing: a derivation classified as "large" goes only to
-/// the large worker, even when a small worker has free capacity. The
-/// overflow chain walks small→large but a large build never tries small.
-#[tokio::test]
-async fn test_size_class_routing_respects_classification() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // est_duration defaults to 60s (DEFAULT_DURATION_SECS) for an
-    // unfitted SLA key. With a 30s small cutoff, classify() picks
-    // "large" — no seed needed.
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("small", 30.0), ("large", 3600.0)]);
-    });
-
-    // Connect TWO workers: one small (will NOT get the big build),
-    // one large (will). Both idle with capacity.
-    let (small_tx, mut small_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: "w-small".into(),
-            stream_tx: small_tx,
-        })
-        .await?;
-    send_heartbeat_with(&handle, "w-small", "x86_64-linux", |hb| {
-        hb.size_class = Some("small".into());
-    })
-    .await?;
-
-    let (large_tx, mut large_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: "w-large".into(),
-            stream_tx: large_tx,
-        })
-        .await?;
-    send_heartbeat_with(&handle, "w-large", "x86_64-linux", |hb| {
-        hb.size_class = Some("large".into());
-    })
-    .await?;
-
-    let build_id = Uuid::new_v4();
-    let mut node = make_node("bigthing-hash");
-    node.pname = "bigthing".into();
-    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    // Large worker should get the assignment. Small worker should NOT.
-    // recv_assignment panics if not an Assignment within 2s.
-    let _ = recv_assignment(&mut large_rx).await;
-
-    // Small worker got nothing (try_recv = empty). If classify() was
-    // broken and sent to small, this would fail.
-    assert!(
-        small_rx.try_recv().is_err(),
-        "small worker should NOT get the big build (classify routed to large)"
-    );
-
-    // The derivation should record that it was assigned to "large"
-    // (for misclassification detection at completion).
-    let state = expect_drv(&handle, "bigthing-hash").await;
-    assert_eq!(
-        state.sched.assigned_size_class.as_deref(),
-        Some("large"),
-        "assigned_size_class recorded for misclassification detection"
-    );
-
-    Ok(())
-}
 
 /// Dispatch should skip over derivations with no eligible worker (wrong
 /// system or missing feature) instead of blocking the entire queue.
@@ -1253,9 +1183,7 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.fod.size-class-reactive]
-// r[verify sched.builder.size-class-reactive]
-// r[verify sched.dispatch.no-fod-fallback]
+// r[verify sched.sla.reactive-floor]
 /// D4: `InfrastructureFailure(CgroupOom)` doubles
 /// `resource_floor.mem_bytes` for both FOD and non-FOD (D2: same
 /// reactive path). The floor feeds `solve_intent_for`'s mem clamp →
@@ -1267,14 +1195,13 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 #[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod")]
 #[case::builder(rio_proto::types::ExecutorKind::Builder, false, "glibc-177")]
 #[tokio::test]
-async fn size_class_floor_skips_smaller(
+async fn cgroup_oom_doubles_mem_floor(
     #[case] kind: rio_proto::types::ExecutorKind,
     #[case] is_fod: bool,
     #[case] tag: &str,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 60.0), ("small", 3600.0)]);
         // Zero backoff so the retry redispatches on the next Tick.
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
@@ -1282,25 +1209,15 @@ async fn size_class_floor_skips_smaller(
         };
     });
 
-    let mut tiny1 =
-        connect_executor_classed(&handle, "tiny-1", "x86_64-linux", "tiny", kind).await?;
-    let mut tiny2 =
-        connect_executor_classed(&handle, "tiny-2", "x86_64-linux", "tiny", kind).await?;
-    let mut small =
-        connect_executor_classed(&handle, "small", "x86_64-linux", "small", kind).await?;
+    let mut rx = connect_executor_kind(&handle, "w-1", "x86_64-linux", kind).await?;
 
     let mut node = make_node(tag);
     node.is_fixed_output = is_fod;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
-    // First dispatch: floor=None → tiny.
     barrier(&handle).await;
-    let (first_exec, first_asgn) = tokio::select! {
-        a = recv_assignment(&mut tiny1) => ("tiny-1", a),
-        a = recv_assignment(&mut tiny2) => ("tiny-2", a),
-    };
+    let first_asgn = recv_assignment(&mut rx).await;
     assert!(first_asgn.drv_path.contains(tag));
-    assert!(small.try_recv().is_err(), "floor=None: small not used");
 
     // Seed est_memory_bytes so the doubling has a base.
     handle
@@ -1310,7 +1227,7 @@ async fn size_class_floor_skips_smaller(
     // Worker-reported CgroupOom → floor.mem doubled.
     complete_failure(
         &handle,
-        first_exec,
+        "w-1",
         tag,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "cgroup OOM during build; promoting size class",
@@ -1326,52 +1243,6 @@ async fn size_class_floor_skips_smaller(
             .mem_bytes,
         4 << 30,
         "CgroupOom → mem floor doubled (2GiB→4GiB)"
-    );
-    // D4: class-name routing clamp removed (Phase 6 deletes the
-    // overflow chain entirely). The reactive floor lives in
-    // `solve_intent_for`'s mem/disk output → SpawnIntent → controller
-    // spawns a 4GiB pod. Dispatch routing stays class-based until
-    // Phase 6, so the second dispatch still goes to whichever class
-    // is free — assert only that the floor is set, not which class
-    // wins.
-    let _ = (small, tiny1, tiny2);
-    Ok(())
-}
-
-// r[verify sched.fod.size-class-reactive]
-/// I-170 back-compat: with `size_classes` empty (default), FOD dispatch
-/// is unchanged — no class filter, any free fetcher. `resource_floor`
-/// stays zero across failures with no `est_*` seeded. Fetcher classes
-/// are derived from `size_classes`, so empty → both ladders off.
-#[tokio::test]
-async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-    // Fetcher with NO size_class declared (pre-I-170 pool).
-    let mut rx = connect_executor_no_ack_kind(
-        &handle,
-        "f-unclassed",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: "f-unclassed".into(),
-            paths_fetched: 0,
-        })
-        .await?;
-
-    let mut node = make_node("plain-fod");
-    node.is_fixed_output = true;
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-
-    let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("plain-fod"));
-    let state = expect_drv(&handle, "plain-fod").await;
-    assert_eq!(
-        state.sched.resource_floor,
-        Default::default(),
-        "feature off: floor stays zero"
     );
     Ok(())
 }
@@ -1461,7 +1332,7 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 async fn spawn_intent_from_sla_estimator() {
     use crate::sla::{config, solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
+    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     // `sla_config.is_some()` gates spawn_intent emission (Static-mode
     // deployments must NOT emit intents — controller branches on
     // `intents.is_empty()`). The actor derives `sla_tiers`/`sla_ceilings`
@@ -1545,8 +1416,8 @@ async fn spawn_intent_from_sla_estimator() {
     // "fitted" matches the seeded key; "cold" has no fit (different
     // pname). Both Ready, both non-FOD. test_inject_ready uses the
     // first arg verbatim as drv_hash.
-    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
-    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
+    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux", false);
 
     let snap = actor.compute_spawn_intents(&Default::default());
     assert_eq!(
@@ -1584,20 +1455,20 @@ async fn pending_intent_timeout_marks_ice() {
     use crate::sla::cost::{Band, Cap};
     use std::time::{Duration, Instant};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0)]);
+    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     actor.sla_config = Some(crate::sla::config::SlaConfig {
         hw_fallback_after_secs: 120.0,
         ..test_sla_config()
     });
 
     // "stuck": Ready, backdated past max-jitter (1.2×120s).
-    actor.test_inject_ready("stuck", Some("p"), "x86_64-linux");
+    actor.test_inject_ready("stuck", Some("p"), "x86_64-linux", false);
     let old = Instant::now() - Duration::from_secs(200);
     actor
         .pending_intents
         .insert("stuck".into(), (Band::Mid, Cap::Spot, old));
     // "fresh": Ready, just emitted → kept.
-    actor.test_inject_ready("fresh", Some("p"), "x86_64-linux");
+    actor.test_inject_ready("fresh", Some("p"), "x86_64-linux", false);
     actor
         .pending_intents
         .insert("fresh".into(), (Band::Hi, Cap::Spot, Instant::now()));
@@ -1629,7 +1500,6 @@ async fn pending_intent_timeout_marks_ice() {
         systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
         running_build: None,
-        size_class: None,
         resources: None,
         store_degraded: false,
         draining: false,
@@ -1648,7 +1518,7 @@ async fn pending_intent_timeout_marks_ice() {
 async fn spawn_intent_node_selector_from_solve_full() {
     use crate::sla::{cost, hw, types::*};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0)]);
+    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     actor.sla_config = Some(crate::sla::config::SlaConfig {
         hw_cost_source: Some(cost::HwCostSource::Static),
         // temp=0 → greedy argmin → deterministic pick.
@@ -1708,8 +1578,8 @@ async fn spawn_intent_node_selector_from_solve_full() {
         prior_source: None,
     });
 
-    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
-    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux");
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
+    actor.test_inject_ready("cold", Some("never-seen"), "x86_64-linux", false);
 
     let snap = actor.compute_spawn_intents(&Default::default());
 
@@ -1766,7 +1636,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
 async fn work_assignment_carries_sla_cores() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 3600.0)]);
+    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     actor.sla_config = Some(test_sla_config());
     actor.sla_tiers = vec![crate::sla::solve::Tier {
         name: "normal".into(),
@@ -1808,14 +1678,14 @@ async fn work_assignment_carries_sla_cores() {
         prior_source: None,
     });
 
-    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux");
+    actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
     let expected_cores = {
         let state = actor.dag.node("fitted").unwrap();
         actor.solve_intent_for(Some("test-pkg"), state).0
     };
     actor.push_ready("fitted".to_string().into());
 
-    let mut rx = bare_connect_builder(&mut actor, "w-sla", "small");
+    let mut rx = bare_connect_builder(&mut actor, "w-sla");
     actor.dispatch_ready().await;
 
     let assignment = recv_assignment(&mut rx).await;
@@ -1830,20 +1700,20 @@ async fn work_assignment_carries_sla_cores() {
         "est_cores persisted on state for build_assignment_proto"
     );
 
-    // sla_config=None → gate skips solve_intent_for → assigned_cores=None.
-    // (FOD takes the same gate-branch; this is the cheaper case to wire.)
+    // D2: sla_config=None → solve_intent_for falls back to probe
+    // defaults (NOT skipped). assigned_cores is always Some.
     actor.sla_config = None;
-    actor.test_inject_ready("no-sla", Some("test-pkg"), "x86_64-linux");
+    actor.test_inject_ready("no-sla", Some("test-pkg"), "x86_64-linux", false);
     actor.push_ready("no-sla".to_string().into());
-    let mut rx2 = bare_connect_builder(&mut actor, "w-nosla", "small");
+    let mut rx2 = bare_connect_builder(&mut actor, "w-nosla");
     actor.dispatch_ready().await;
 
     let assignment = recv_assignment(&mut rx2).await;
-    assert_eq!(
-        assignment.assigned_cores, None,
-        "sla_config=None → assigned_cores=None (builder falls back to cgroup clamp)"
+    assert!(
+        assignment.assigned_cores.is_some(),
+        "D2: sla_config=None → probe-default cores (NOT None)"
     );
-    assert_eq!(actor.dag.node("no-sla").unwrap().sched.est_cores, None);
+    assert!(actor.dag.node("no-sla").unwrap().sched.est_cores.is_some());
 }
 
 /// Connect+heartbeat+warm a builder against a bare (unspawned) actor.
@@ -1851,7 +1721,6 @@ async fn work_assignment_carries_sla_cores() {
 fn bare_connect_builder(
     actor: &mut DagActor,
     id: &str,
-    size_class: &str,
 ) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
     let (tx, rx) = mpsc::channel(8);
     actor.handle_worker_connected(&id.into(), tx);
@@ -1860,7 +1729,6 @@ fn bare_connect_builder(
         systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
         running_build: None,
-        size_class: Some(size_class.into()),
         resources: None,
         store_degraded: false,
         draining: false,
@@ -1872,13 +1740,13 @@ fn bare_connect_builder(
 }
 
 /// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when
-/// it isn't FIFO-first. Proves the `find_executor_with_overflow` intent
-/// match preempts pick-from-queue. On miss (stale intent), the worker
-/// falls through to FIFO.
+/// it isn't FIFO-first. Proves the `find_executor` intent match preempts
+/// pick-from-queue. On miss (stale intent), the worker falls through to
+/// FIFO.
 // r[verify sched.sla.intent-match]
 #[tokio::test]
 async fn heartbeat_intent_id_prefers_precomputed_drv() -> TestResult {
-    let (_db, handle, _task) = setup_with_classes(&[("small", 3600.0)]).await;
+    let (_db, handle, _task) = setup().await;
 
     // Two Ready drvs: "a" merged first (FIFO head), "b" second.
     let _rx = merge_dag(
@@ -1914,8 +1782,8 @@ async fn heartbeat_intent_id_prefers_precomputed_drv() -> TestResult {
     Ok(())
 }
 
-/// Connect a size-classed builder with `intent_id` set. Local helper
-/// for the ADR-023 intent-match tests above.
+/// Connect a builder with `intent_id` set. Local helper for the
+/// ADR-023 intent-match tests above.
 async fn connect_executor_with_intent(
     handle: &ActorHandle,
     executor_id: &str,
@@ -1929,7 +1797,6 @@ async fn connect_executor_with_intent(
         })
         .await?;
     send_heartbeat_with(handle, executor_id, "x86_64-linux", |hb| {
-        hb.size_class = Some("small".into());
         hb.intent_id = Some(intent_id.into());
     })
     .await?;

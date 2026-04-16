@@ -1586,21 +1586,19 @@ mod tests {
     /// case varies one input; the body asserts the full proto so a
     /// hardcoded literal in any position fails every row.
     ///
-    /// Covers: running_build/busy from slot, size_class verbatim
-    /// ("" = unclassified), store_degraded from CircuitBreaker::is_open()
-    /// (P0211 has_capacity gate), supported_features from CRD config
-    /// (regression: hardcoded-empty silently ignored requiredSystemFeatures).
+    /// Covers: running_build/busy from slot, store_degraded from
+    /// CircuitBreaker::is_open() (P0211 has_capacity gate),
+    /// supported_features from CRD config (regression: hardcoded-empty
+    /// silently ignored requiredSystemFeatures).
     #[rstest]
-    #[case::running(Some("/nix/store/foo.drv"), vec![], "", false)]
-    #[case::idle(None, vec![], "", false)]
-    #[case::size_class(None, vec![], "large", false)]
-    #[case::degraded(None, vec![], "", true)]
-    #[case::features(None, vec!["kvm".into(), "big-parallel".into()], "", false)]
+    #[case::running(Some("/nix/store/foo.drv"), vec![], false)]
+    #[case::idle(None, vec![], false)]
+    #[case::degraded(None, vec![], true)]
+    #[case::features(None, vec!["kvm".into(), "big-parallel".into()], false)]
     #[tokio::test]
     async fn heartbeat_field_passthrough(
         #[case] claim: Option<&'static str>,
         #[case] features: Vec<String>,
-        #[case] size_class: &'static str,
         #[case] store_degraded: bool,
     ) {
         let slot = Arc::new(BuildSlot::default());
@@ -1610,7 +1608,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &features,
-            size_class,
             "",
             &slot,
             &ResourceSnapshotHandle::default(),
@@ -1621,7 +1618,6 @@ mod tests {
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
         assert_eq!(req.running_build.as_deref(), claim);
-        assert_eq!(req.size_class, size_class);
         assert_eq!(req.store_degraded, store_degraded);
         assert_eq!(req.supported_features, features);
         assert_eq!(req.resources.unwrap().busy, claim.is_some());

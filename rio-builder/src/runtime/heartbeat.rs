@@ -35,7 +35,6 @@ pub async fn build_heartbeat_request(
     executor_kind: rio_proto::types::ExecutorKind,
     systems: &[String],
     features: &[String],
-    size_class: &str,
     intent_id: &str,
     slot: &BuildSlot,
     resources: &ResourceSnapshotHandle,
@@ -62,10 +61,6 @@ pub async fn build_heartbeat_request(
         resources: Some(resources),
         systems: systems.to_vec(),
         supported_features: features.to_vec(),
-        // Empty string = unclassified (scheduler maps to None). We
-        // pass through verbatim — the worker doesn't interpret it,
-        // just declares what the operator configured.
-        size_class: size_class.to_string(),
         // r[impl builder.heartbeat.store-degraded]
         // Reflects CircuitBreaker::is_open() — main.rs reads the
         // breaker each heartbeat tick and passes it here. Scheduler
@@ -97,7 +92,6 @@ pub(super) struct HeartbeatCtx {
     pub(super) executor_kind: rio_proto::types::ExecutorKind,
     pub(super) systems: Vec<String>,
     pub(super) features: Vec<String>,
-    pub(super) size_class: String,
     pub(super) intent_id: String,
     pub(super) slot: Arc<BuildSlot>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
@@ -120,7 +114,6 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
         executor_kind,
         systems,
         features,
-        size_class,
         intent_id,
         slot,
         ready,
@@ -140,7 +133,6 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
                 executor_kind,
                 &systems,
                 &features,
-                &size_class,
                 &intent_id,
                 &slot,
                 &resources,

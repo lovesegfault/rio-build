@@ -26,7 +26,7 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 - `SubmitBuild` → DAG merge command
 - `ReportCompletion` → node completion + downstream release command
 - `CancelBuild` → orphan derivations command
-- Heartbeat → executor liveness + running_build reconcile + size_class
+- Heartbeat → executor liveness + running_build reconcile
 - CA early cutoff → edge cutoff + potential cancellation command
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
@@ -235,34 +235,6 @@ X's dispatch. The filter is
 
 Build duration estimates feed into critical-path priority computation. The estimate is the SLA model's `T_min` (`DurationFit::t_min()`, ref-seconds at `min(p̄, c_opt)`) for the derivation's `(pname, system, tenant)` key, falling back to a flat 60-second default when the key is unfitted (cold start, or `pname` absent). `T_min` is monotone in work size, requires no solve, and is a single cache lookup — priority is a relative ordering, not a schedule.
 
-## Size-Class Routing
-
-> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Executors declare their class in the heartbeat. The `BuilderPoolSet` CRD declares the class set and manages one child `BuilderPool` per class; the CutoffRebalancer (below) adjusts cutoffs adaptively from `build_samples`.
-
-When size classes are configured, the scheduler routes derivations to right-sized executor pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
-
-### Classification
-
-r[sched.classify.smallest-covering]
-Each derivation is classified into a size class by comparing its estimated duration against the configured cutoffs:
-
-```
-class(drv) = smallest class i where estimated_duration(drv) <= cutoff_i
-```
-
-r[sched.classify.mem-bump]
-If `ema_peak_memory_bytes` for a derivation exceeds the target class's memory limit, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping).
-
-r[sched.classify.cpu-bump]
-If `ema_peak_cpu_cores` for a derivation exceeds the target class's `cpu_limit_cores`, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping, mirroring mem-bump).
-
-If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all executors are candidates (backward compatible with single `BuilderPool` deployments).
-
-### Overflow Routing
-
-r[sched.overflow.up-only]
-When a size class's executor pool is fully occupied but another class has idle executors, the scheduler may route overflow derivations to the next larger class. This prevents queue starvation when the workload is temporarily skewed. Overflow routing is never applied downward (large builds are never routed to small executors).
-
 ## Preemption
 
 r[sched.preempt.never-running]
@@ -461,14 +433,7 @@ Per [ADR-019](../decisions/019-builder-fetcher-split.md), `hard_filter()` reject
 r[sched.dispatch.fod-builtin-any-arch]
 A FOD with `system="builtin"` is eligible on any registered fetcher regardless of arch. Every executor appends `"builtin"` to its advertised `systems` unconditionally at startup (before the first heartbeat), so `hard_filter()`'s `system-mismatch` clause matches on the union. `best_executor()` scores across the flat `executors` map (keyed by `ExecutorId`, not pool), so a `builtin` FOD overflows to whichever arch's fetchers have capacity. Arch-specific FODs (`system="x86_64-linux"` inherited from stdenv) match only fetchers advertising that system.
 
-r[sched.dispatch.no-fod-fallback]
-`find_executor_with_overflow()` for `drv.is_fixed_output` walks `[[size_classes]]` smallest→largest starting at `size_class_floor` (fetcher tiers are the same names as builder tiers; the scheduler derives the FOD ladder from the builder config); it never crosses into the builder overflow chain (the `kind=fetcher` hard-filter is the absolute boundary). If no fetcher of any class is available the FOD queues; the scheduler NEVER sends a FOD to a builder under pressure. A queued FOD is preferable to a builder with internet access. The `rio_scheduler_fod_queue_depth` gauge tracks queued FODs.
-
-r[sched.fod.size-class-reactive]
-FODs have no a-priori size signal (excluded from `build_samples`; `outputHash` carries no size information), so routing is reactive: `DerivationState.size_class_floor` starts `None` (= smallest configured fetcher class) and `record_failure_and_check_poison` promotes it to the next-larger class on every recorded failure. Promotion happens on ANY transient failure (executor disconnect, explicit `TransientFailure`), not just confirmed OOM --- there is no clean OOM signal at the scheduler (pod death surfaces as a stream-close), and over-promoting is cheap because FODs rarely retry. Clamps at the largest class. The `rio_scheduler_size_class_promotions_total{kind="fod",from,to}` counter tracks promotions; frequent firing for a given pname is the operator signal to raise the default tiny class's memory limit.
-
-r[sched.builder.size-class-reactive]
-Non-FOD derivations are size-classed proactively from `build_history` EMAs (`classify()`), but the EMA only ingests SUCCESSFUL completions --- a derivation that OOMs on its estimated class produces no sample, so the next dispatch re-estimates the same too-small class and re-OOMs until poison. `DerivationState.size_class_floor` is therefore promoted reactively for non-FODs too: any transient failure on class N bumps the floor to class N+1 (next-larger by `cutoff_secs`), and `find_executor_with_overflow()`'s non-FOD branch starts its overflow chain at `max(classify(), size_class_floor)`. Clamps at the largest class. The `rio_scheduler_size_class_promotions_total{kind="builder",from,to}` counter tracks promotions.
+FODs and non-FODs share the same `find_executor()` path: intent-match (ADR-023) first, else `best_executor()` over the kind-matching pool. The `kind=fetcher` hard-filter in `r[sched.dispatch.fod-to-fetcher]` is the absolute boundary --- if no fetcher is available the FOD queues; the scheduler NEVER sends a FOD to a builder under pressure. A queued FOD is preferable to a builder with internet access. The `rio_scheduler_queue_depth{kind}` gauge tracks queued derivations per kind.
 
 r[sched.timeout.promote-on-exceed+2]
 A `BuildResultStatus::TimedOut` completion MUST double `resource_floor.deadline_secs` (`r[sched.sla.reactive-floor]`) and reset the derivation to `Ready` for re-dispatch, NOT terminal-cancel. The next dispatch carries the doubled deadline --- "same inputs -> same timeout" no longer holds. Bounded by a separate `timeout_retry_count` against `RetryPolicy.max_timeout_retries`: a genuinely-infinite build still goes terminal (`Cancelled`, retriable on explicit resubmit) after exhausting promotions instead of walking forever. `timeout_retry_count` is in-memory only (recovery resets to 0, conservative) and separate from `retry_count` / `infra_retry_count` so timeouts neither consume the transient budget nor get masked by the infra time-window reset. I-200: before this, `TimedOut` went straight to `Cancelled` and the I-199/I-197 promotion only fired on the K8s-deadline-kill -> disconnect path, not on the executor-side `daemon_timeout_secs` -> clean `TimedOut` report path.
@@ -483,7 +448,7 @@ r[sched.ephemeral.no-redispatch-after-completion]
 When an executor completes a build and its `running_build` slot becomes empty, the scheduler MUST mark it `draining=true` immediately --- before the same actor turn's `dispatch_ready` runs. `has_capacity()` then rejects it. Closes the I-188 race at the source: every executor exits after its one build, so re-dispatching to its freed slot guarantees an Assigned-never-Running reassign.
 
 r[sched.assign.resource-fit]
-`hard_filter()` rejects any executor whose `memory_total_bytes < drv.est_memory_bytes` as a hard filter, same position as `has_capacity()`. `est_memory_bytes` is `EMA × headroom_multiplier` rounded UP to a 4GiB bucket. An executor reporting `memory_total_bytes == 0` (cgroup `memory.max=max`, no k8s limit set --- [rio-builder/src/cgroup.rs](../../rio-builder/src/cgroup.rs) sends 0 for `None`) is treated as unlimited-fit. A derivation with `est_memory_bytes == None` (cold start: no `build_history` row, no `pname`, or no memory sample) fits any executor. This is defense-in-depth alongside the size-class string match: a derivation routed to its class by `classify()` whose EMA peak memory exceeds the worker's actual cgroup limit is still rejected before assignment rather than OOM-killing mid-build.
+`hard_filter()` rejects any executor whose `memory_total_bytes < drv.est_memory_bytes` as a hard filter, same position as `has_capacity()`. `est_memory_bytes` is the SLA-solved memory from `solve_intent_for()` clamped at `resource_floor`. An executor reporting `memory_total_bytes == 0` (cgroup `memory.max=max`, no k8s limit set --- [rio-builder/src/cgroup.rs](../../rio-builder/src/cgroup.rs) sends 0 for `None`) is treated as unlimited-fit. A derivation with `est_memory_bytes == None` fits any executor. This rejects a derivation whose solved memory exceeds the worker's actual cgroup limit before assignment rather than OOM-killing mid-build.
 
 r[sched.assign.warm-gate]
 A newly-registered executor (step 3 above --- first heartbeat with open stream) receives an initial `PrefetchHint` before any `WorkAssignment`. The executor fetches the hinted paths into its FUSE cache and replies with `PrefetchComplete` on the `BuildExecution` stream. The scheduler's `ExecutorState.warm` flag starts `false` and flips `true` on receipt. `best_executor()` filters out `warm=false` executors from its candidate set --- but falls back to cold executors if no warm executor passes the hard filter (single-executor clusters and mass-scale-up must not deadlock). Empty scheduler queue at registration time → `warm` flips `true` immediately (nothing to prefetch for). Hint contents select up to 32 Ready derivations sorted by fan-in (interested-builds count) descending, union their input closures, sort by occurrence frequency descending, cap at 100 paths --- the selection is deterministic for a given queue state. The warm-gate is per-executor: a second executor registering while the first is still warming does not delay builds that the second (already warm) executor can take.

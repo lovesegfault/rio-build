@@ -480,7 +480,7 @@ fn req_features(f: Option<&[&str]>) -> SpawnIntentsRequest {
 async fn spawn_intents_empty_when_sla_unconfigured() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
-    actor.test_inject_ready("a", None, "x86_64-linux");
+    actor.test_inject_ready("a", None, "x86_64-linux", false);
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
     assert!(
         snap.intents.is_empty(),
@@ -517,7 +517,7 @@ async fn spawn_intents_feature_filter() {
     //   a: required_features=[]             — featureless work
     //   b: required_features=["kvm"]        — needs kvm
     //   c: required_features=["kvm","nixos-test"] — the I-176 trigger
-    actor.test_inject_ready("a", None, "x86_64-linux");
+    actor.test_inject_ready("a", None, "x86_64-linux", false);
     actor.test_inject_ready_with_features("b", None, "x86_64-linux", &["kvm"]);
     actor.test_inject_ready_with_features("c", None, "x86_64-linux", &["kvm", "nixos-test"]);
 
@@ -587,7 +587,7 @@ async fn spawn_intents_kvm_pool_excludes_featureless_work() {
     let mut actor = bare_actor_sla(db.pool.clone());
 
     // Single Ready derivation, required_features = ∅ (e.g., hello).
-    actor.test_inject_ready("hello", None, "x86_64-linux");
+    actor.test_inject_ready("hello", None, "x86_64-linux", false);
 
     // kvm pool query → empty. The bug: pre-I-181 this was 1.
     let snap = actor.compute_spawn_intents(&req_features(Some(&["kvm"])));
@@ -628,7 +628,6 @@ async fn spawn_intents_soft_features_strip() {
             sla: Some(test_sla_config()),
             soft_features: vec![crate::assignment::SoftFeature {
                 name: "big-parallel".into(),
-                floor_hint: None,
             }],
             ..Default::default()
         },
@@ -675,11 +674,11 @@ async fn spawn_intents_soft_features_strip() {
     );
 }
 
-/// D6: soft features are strip-only; `floor_hint` is ignored. SLA
-/// `solve_intent_for` + `resource_floor` doubling own initial sizing.
-/// I-204 regression preserved: stripping survives leader transition.
+/// D6: soft features are strip-only. SLA `solve_intent_for` +
+/// `resource_floor` doubling own initial sizing. I-204 regression
+/// preserved: stripping survives leader transition.
 #[tokio::test]
-async fn soft_feature_strip_only_floor_hint_ignored() {
+async fn soft_feature_strip_only() {
     use crate::assignment::SoftFeature;
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(
@@ -688,25 +687,23 @@ async fn soft_feature_strip_only_floor_hint_ignored() {
             soft_features: vec![
                 SoftFeature {
                     name: "big-parallel".into(),
-                    floor_hint: Some("xlarge".into()),
                 },
                 SoftFeature {
                     name: "benchmark".into(),
-                    floor_hint: None,
                 },
             ],
             ..Default::default()
         },
     );
 
-    // big-parallel → stripped; D6: floor_hint ignored, floor stays zero.
+    // big-parallel → stripped; D6: floor stays zero.
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     let s = actor.dag.node("ff").unwrap();
     assert!(s.required_features.is_empty(), "stripped");
     assert_eq!(
         s.sched.resource_floor,
         Default::default(),
-        "D6: floor_hint ignored (strip-only)"
+        "D6: strip-only — floor stays zero"
     );
 
     // I-204: survives leader transition.
@@ -818,7 +815,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
         ("x3", "x86_64-linux"),
         ("a1", "aarch64-linux"),
     ] {
-        actor.test_inject_ready(h, None, sys);
+        actor.test_inject_ready(h, None, sys, false);
         actor.push_ready(h.to_string().into());
     }
 
@@ -846,10 +843,10 @@ async fn spawn_intents_kind_and_system_filter() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_sla(db.pool.clone());
 
-    actor.test_inject_ready("build-x86", None, "x86_64-linux");
-    actor.test_inject_ready("build-arm", None, "aarch64-linux");
-    actor.test_inject_ready_fod("fod-x86", "x86_64-linux");
-    actor.test_inject_ready_fod("fod-builtin", "builtin");
+    actor.test_inject_ready("build-x86", None, "x86_64-linux", false);
+    actor.test_inject_ready("build-arm", None, "aarch64-linux", false);
+    actor.test_inject_ready("fod-x86", None, "x86_64-linux", true);
+    actor.test_inject_ready("fod-builtin", None, "builtin", true);
 
     let ids = |s: &crate::actor::SpawnIntentsSnapshot| -> std::collections::HashSet<String> {
         s.intents.iter().map(|i| i.intent_id.clone()).collect()

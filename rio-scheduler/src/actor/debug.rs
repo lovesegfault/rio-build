@@ -226,10 +226,19 @@ impl DagActor {
         self.dag.insert_recovered_node(state);
     }
 
-    /// Inject a Ready non-FOD with default fields.
-    pub(crate) fn test_inject_ready(&mut self, hash: &str, pname: Option<&str>, system: &str) {
+    /// Inject a Ready derivation with default fields. `is_fod` sets
+    /// `is_fixed_output` so the kind boundary in `hard_filter` /
+    /// `compute_spawn_intents` routes it to fetcher executors.
+    pub(crate) fn test_inject_ready(
+        &mut self,
+        hash: &str,
+        pname: Option<&str>,
+        system: &str,
+        is_fod: bool,
+    ) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
             pname: pname.map(String::from),
+            is_fixed_output: is_fod,
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }
@@ -261,15 +270,6 @@ impl DagActor {
     ) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
             floor_mem_bytes: floor_mem_bytes as i64,
-            ..crate::db::RecoveryDerivationRow::test_default(hash, system)
-        });
-    }
-
-    /// Inject a Ready FOD. For `compute_spawn_intents` kind-filter
-    /// tests — bypasses the merge dance.
-    pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str) {
-        self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
-            is_fixed_output: true,
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }

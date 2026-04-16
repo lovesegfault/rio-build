@@ -354,7 +354,6 @@ rec {
   #
   # Parameterized by:
   #   - hostName: VM hostname (also used as worker_id)
-  #   - sizeClass: optional size-class tag
   #   - otelEndpoint: optional OTLP endpoint (worker spans not strictly
   #     needed for the milestone but make the trace tree look like the
   #     observability.md spec diagram)
@@ -367,7 +366,6 @@ rec {
   mkWorkerNode =
     {
       hostName,
-      sizeClass ? null,
       otelEndpoint ? null,
       # Merged into systemd.services.rio-builder.environment. Composed
       # with the optional RIO_OTEL_ENDPOINT below via //.
@@ -389,8 +387,7 @@ rec {
           enable = true;
           schedulerAddr = "control:9001";
           storeAddr = "control:9002";
-        }
-        // lib.optionalAttrs (sizeClass != null) { inherit sizeClass; };
+        };
       };
 
       # OTel endpoint for the worker. Worker spans aren't strictly

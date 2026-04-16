@@ -129,14 +129,14 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Per-class queue depth",
-      "description": "rio_scheduler_class_queue_depth — Ready derivations broken down by size class. One class starving while others drain = rebalancer cutoff misconfigured.",
+      "title": "Per-kind queue depth",
+      "description": "rio_scheduler_queue_depth — Ready derivations broken down by executor kind (builder/fetcher). One kind starving while the other drains = pool misconfigured.",
       "gridPos": {"x": 0, "y": 17, "w": 24, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rio_scheduler_class_queue_depth",
-          "legendFormat": "{{class}}",
+          "expr": "rio_scheduler_queue_depth",
+          "legendFormat": "{{kind}}",
           "refId": "A"
         }
       ],

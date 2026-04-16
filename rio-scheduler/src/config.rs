@@ -27,21 +27,10 @@ pub(super) struct Config {
     /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
     pub(super) log_s3_bucket: Option<String>,
     pub(super) log_s3_prefix: String,
-    /// Size-class cutoff config. Empty = disabled (all workers get all
-    /// builds). Workers declare their class in heartbeat; scheduler
-    /// routes by estimated duration. TOML array-of-tables:
-    ///   [[size_classes]]
-    ///   name = "small"
-    ///   cutoff_secs = 30.0
-    ///   mem_limit_bytes = 1073741824
-    /// No CLI override — this is structural deploy config, not a knob
-    /// you tweak per-invocation. Change it in scheduler.toml.
-    pub(super) size_classes: Vec<rio_scheduler::SizeClassConfig>,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
     /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
-    /// D6: `floor_hint` is deserialized but ignored (config back-compat).
     pub(super) soft_features: Vec<rio_scheduler::SoftFeature>,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
@@ -135,7 +124,6 @@ impl Default for Config {
             tick_interval: std::time::Duration::from_secs(10),
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
-            size_classes: Vec::new(),
             soft_features: Vec::new(),
             hmac_key_path: None,
             service_hmac_key_path: None,
@@ -278,33 +266,6 @@ impl rio_common::config::ValidateConfig for Config {
          every derivation poisons immediately)",
             cfg.poison.threshold
         );
-        for class in &cfg.size_classes {
-            // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like
-            // `cutoff_secs = nan` would crash the scheduler on every dispatch
-            // (the pre-total_cmp sort panicked on NaN). Moved here from the
-            // inline main() loop so it fires BEFORE PG connect/migrations/
-            // S3-flusher spawn, and is unit-testable alongside config_rejects_*.
-            anyhow::ensure!(
-                class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
-                "size_classes[{}].cutoff_secs must be finite and positive, got {}",
-                class.name,
-                class.cutoff_secs
-            );
-            // r[impl sched.classify.cpu-bump]
-            // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
-            // or Some(neg) would silently disable or always-bump respectively
-            // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
-            // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
-            // Missed by the P0415 wave (bughunt-mc238, P0424).
-            if let Some(limit) = class.cpu_limit_cores {
-                anyhow::ensure!(
-                    limit.is_finite() && limit > 0.0,
-                    "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
-                    class.name,
-                    limit
-                );
-            }
-        }
         if let Some(sla) = &cfg.sla {
             sla.validate()?;
         }

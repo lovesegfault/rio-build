@@ -3,10 +3,8 @@
 //! posture from ADR-019 §Sandbox hardening.
 //!
 //! Size-classed via `spec.classes[]` (CEL-enforced non-empty, I-170): one Job
-//! loop per class, each registering `RIO_SIZE_CLASS=name` so the
-//! scheduler can route by `size_class_floor`. Simpler than
-//! [`builderpool`](super::builderpool): no duration-cutoff
-//! rebalancer.
+//! loop per class. Simpler than [`builderpool`](super::builderpool): no
+//! duration-cutoff rebalancer.
 // r[impl ctrl.fetcherpool.reconcile]
 
 use std::collections::BTreeMap;
@@ -20,7 +18,9 @@ use kube::runtime::controller::Action;
 use tracing::info;
 
 use crate::error::{Error, Result};
-use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
+#[cfg(test)]
+use crate::reconcilers::common::pod;
+use crate::reconcilers::common::pod::{ExecutorKind, ExecutorPodParams};
 use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
 use rio_crds::builderpool::SeccompProfileKind;
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
@@ -60,12 +60,11 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: Arc<Ctx>) -> Result<Action> {
 /// Convert `FetcherPool` → `ExecutorPodParams` with fetcher-specific
 /// hardening defaults.
 ///
-/// `class`: sets `pool_name` suffix, `resources`, and injects
-/// `RIO_SIZE_CLASS` so the executor reports it in heartbeat
+/// `class`: sets `pool_name` suffix and `resources`
 /// (`r[ctrl.fetcherpool.classes]`). The CRD CEL-enforces
 /// `size(self.classes) > 0` so every reconcile is per-class.
 /// Security posture (read-only rootfs, seccomp, node placement) is
-/// identical across classes — only resources + size_class env vary.
+/// identical across classes — only resources vary.
 fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodParams {
     // r[impl fetcher.node.dedicated]
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
@@ -95,11 +94,7 @@ fn executor_params(fp: &FetcherPool, class: &FetcherSizeClass) -> ExecutorPodPar
         // at `seccomp_profile`.
         read_only_root_fs: true,
         // r[impl ctrl.fetcherpool.classes]
-        // RIO_SIZE_CLASS: same env builders use (common/pod.rs reads
-        // it from extra_env). The executor copies this into
-        // HeartbeatRequest.size_class → ExecutorState.size_class →
-        // hard_filter's size-class match clause.
-        extra_env: vec![pod::env("RIO_SIZE_CLASS", &class.name)],
+        extra_env: vec![],
         // r[impl ctrl.fetcherpool.multiarch]
         // Per-class pool_name → Job-name prefix
         // `rio-fetcher-{fp}-{class}`.
@@ -233,12 +228,12 @@ mod tests {
     }
 
     // r[verify ctrl.fetcherpool.classes]
-    /// I-170: per-class params carry `RIO_SIZE_CLASS=<name>`, the
-    /// per-class resources, and a `{pool}-{class}` pool_name
-    /// (→ Job-name prefix `rio-fetcher-{pool}-{class}`). Security
-    /// posture is identical across classes.
+    /// I-170: per-class params carry the per-class resources and a
+    /// `{pool}-{class}` pool_name (→ Job-name prefix
+    /// `rio-fetcher-{pool}-{class}`). Security posture is identical
+    /// across classes.
     #[test]
-    fn per_class_params_set_size_class_and_resources() {
+    fn per_class_params_set_resources() {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
         let fp = mk(8);
         let class: FetcherSizeClass = rio_crds::common::SizeClassCommon {
@@ -251,10 +246,6 @@ mod tests {
         }
         .into();
         let params = executor_params(&fp, &class);
-        // RIO_SIZE_CLASS injected via extra_env (appended after the
-        // base env set in the Job pod spec).
-        let env = crate::fixtures::env_map(&params.extra_env);
-        assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
         // pool_name = `{fp.name}-{class.name}` so per-arch pools
         // don't collide (multiarch_pools_distinct_job_names below).
         assert_eq!(params.pool_name, "test-small");
@@ -272,7 +263,7 @@ mod tests {
             Some(&Quantity("8Gi".into()))
         );
         // Security posture unchanged across classes — only
-        // resources + size_class env vary.
+        // resources vary.
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
     }

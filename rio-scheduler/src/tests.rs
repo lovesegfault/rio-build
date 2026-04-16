@@ -21,7 +21,6 @@ fn config_defaults_are_stable() {
     assert_eq!(d.log_s3_bucket, None);
     assert_eq!(d.log_s3_prefix, "logs");
     // Size-classes: optional feature, off by default.
-    assert!(d.size_classes.is_empty());
     assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
     // Phase 4a (plan 21E): lease config via figment, not raw env.
     assert_eq!(d.lease_name, None, "non-K8s mode by default");
@@ -85,14 +84,13 @@ fn poison_and_retry_load_from_toml() {
 }
 
 /// `[[soft_features]]` array-of-tables (the helm-rendered shape)
-/// parses into `Vec<SoftFeature>` with `floor_hint` optional.
+/// parses into `Vec<SoftFeature>`.
 #[test]
 fn soft_features_load_from_toml() {
     use figment::providers::{Format, Toml};
     let toml = r#"
         [[soft_features]]
         name = "big-parallel"
-        floor_hint = "xlarge"
         [[soft_features]]
         name = "benchmark"
     "#;
@@ -103,9 +101,7 @@ fn soft_features_load_from_toml() {
             .expect("toml parses into Config");
     assert_eq!(cfg.soft_features.len(), 2);
     assert_eq!(cfg.soft_features[0].name, "big-parallel");
-    assert_eq!(cfg.soft_features[0].floor_hint.as_deref(), Some("xlarge"));
     assert_eq!(cfg.soft_features[1].name, "benchmark");
-    assert_eq!(cfg.soft_features[1].floor_hint, None);
 }
 
 /// Empty TOML → `#[serde(default)]` on Config + sub-struct
@@ -196,11 +192,6 @@ fn test_valid_config() -> Config {
     |c: &mut Config| { c.retry.backoff_base_secs = 10.0; c.retry.backoff_max_secs = 5.0; },
     &["backoff_max_secs", ">= backoff_base_secs"]
 )]
-// cpu_limit NaN → `c > NaN` always false → CPU-bump silently disabled (P0424).
-#[case::nan_cpu_limit_cores(
-    |c: &mut Config| c.size_classes = size_classes_with_cpu_limit(Some(f64::NAN)),
-    &["cpu_limit_cores", "finite"]
-)]
 fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
     let mut cfg = test_valid_config();
     mutate(&mut cfg);
@@ -282,50 +273,6 @@ fn config_accepts_backoff_boundaries() {
         .expect("defaults should be valid");
 }
 
-/// Helper: single-element size_classes vec with the given cpu_limit_cores.
-/// Fills cutoff_secs and mem_limit_bytes with valid placeholders so the
-/// test exercises ONLY the cpu_limit check.
-fn size_classes_with_cpu_limit(limit: Option<f64>) -> Vec<rio_scheduler::SizeClassConfig> {
-    vec![rio_scheduler::SizeClassConfig {
-        name: "small".into(),
-        cutoff_secs: 30.0,
-        mem_limit_bytes: 1 << 30,
-        cpu_limit_cores: limit,
-    }]
-}
-
-#[test]
-fn config_rejects_negative_cpu_limit_cores() {
-    let cfg = Config {
-        size_classes: size_classes_with_cpu_limit(Some(-1.0)),
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(
-        err.contains("cpu_limit_cores") && err.contains("positive"),
-        "negative cpu_limit must be rejected, got: {err}"
-    );
-}
-
-/// `cpu_limit_cores = None` → no CPU check, valid. The Option is what
-/// makes this field optional for existing TOML without the key. Only
-/// Some(bad) is an error.
-#[test]
-fn config_accepts_none_cpu_limit_cores() {
-    let cfg = Config {
-        size_classes: size_classes_with_cpu_limit(None),
-        ..test_valid_config()
-    };
-    cfg.validate()
-        .expect("None cpu_limit_cores = no check, should be valid");
-    // Boundary: Some(small positive) is fine.
-    let cfg = Config {
-        size_classes: size_classes_with_cpu_limit(Some(0.5)),
-        ..test_valid_config()
-    };
-    cfg.validate().expect("positive cpu_limit should be valid");
-}
-
 // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
 // When you add Config.newfield: ADD IT to both assert blocks below.
 
@@ -362,7 +309,6 @@ rio_test_support::jail_defaults!(
     |cfg: Config| {
         assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
         assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
-        assert!(cfg.size_classes.is_empty());
     }
 );
 

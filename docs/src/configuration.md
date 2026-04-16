@@ -78,7 +78,6 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `health_addr` | socket addr | `[::]:9193` | HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server) |
 | `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
 | `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
-| `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, builders with an empty `size_class` are **rejected**. |
 | `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
 | `executor_kind` | enum | `builder` | `builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs only). Set via `RIO_EXECUTOR_KIND`. See [ADR-019](./decisions/019-builder-fetcher-split.md). |
 

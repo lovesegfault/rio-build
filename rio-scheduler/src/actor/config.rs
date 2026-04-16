@@ -10,66 +10,26 @@ use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 
-use crate::assignment::{SizeClassConfig, SoftFeature};
+use crate::assignment::SoftFeature;
 use crate::dag::DerivationDag;
 use crate::lease::LeaderState;
 use crate::state::{PoisonConfig, RetryPolicy};
 
-/// Size-class routing + soft-feature config. Sub-struct of
-/// [`super::DagActor`] — bundles the five fields that control where a
-/// derivation lands. All read-only after construction except
-/// `size_classes`, whose `cutoff_secs` the rebalancer mutates hourly
-/// via the shared `Arc<RwLock<_>>`.
-///
-/// Fields are `pub(super)` for direct read access from
-/// dispatch/completion/snapshot — these are pure config, no invariant
-/// to guard. The struct exists to make ownership clear and to
-/// centralize the DAG soft-feature setup ([`apply_to_dag`]) that was
-/// previously open-coded at both construction and leader-transition
-/// reset.
+/// Soft-feature config. Sub-struct of [`super::DagActor`] —
+/// centralizes the DAG soft-feature setup
+/// ([`apply_to_dag`](Self::apply_to_dag)) that was previously
+/// open-coded at both construction and leader-transition reset.
 pub(crate) struct SizingConfig {
-    /// Builder size-class cutoff config. Empty = feature off (no
-    /// classification). dispatch.rs calls classify() with a read
-    /// guard; completion.rs reads cutoff_for() for misclassification
-    /// detection.
-    ///
-    /// `Arc<parking_lot::RwLock<...>>` — shared with the rebalancer
-    /// task (spawned in `run_inner`) which writes new cutoffs hourly.
-    /// parking_lot not tokio::sync: writes are rare (1/hour) so
-    /// contention is near-zero, and a sync lock keeps `classify()`
-    /// sync — no `.await` inside dispatch's hot read path.
-    ///
-    /// R10 CHECK: callers MUST NOT hold a read/write guard across
-    /// `.await`. parking_lot guards are not `Send` so the borrow
-    /// checker catches some misuse, but a `.read()` followed by
-    /// `.await` on the same task blocks the executor thread. See
-    /// dispatch.rs: guards are dropped before any await boundary.
-    pub(super) size_classes: Arc<parking_lot::RwLock<Vec<SizeClassConfig>>>,
-    /// Fetcher size-class config (I-170). Empty = feature off (single
-    /// fetcher pool, no class filter — original behavior). Ordered
-    /// smallest→largest; `find_executor_with_overflow`'s FOD branch
-    /// walks from `DerivationState.sched.size_class_floor` upward.
-    /// Plain `Vec` (not `Arc<RwLock>`): no rebalancer mutates this —
-    /// it's an ordered name list, config-static after construction.
-    /// Derived via `builder_class_order(&cfg.size_classes)`: fetcher
-    /// tiers ARE builder tiers (live QA 2026-04-13: a separate
-    /// `fetcher_size_classes` TOML key was rendered after
-    /// `[[size_classes]]` → scoped to last table → empty → fetcher
-    /// OOMs never promoted). The rebalancer mutates `cutoff_secs` only
-    /// (never the class SET), so the construction-time name snapshot
-    /// stays valid.
-    pub(super) fetcher_classes: Vec<String>,
     /// I-204: capability-hint features stripped at DAG insertion.
-    /// Re-applied by [`apply_to_dag`] on every fresh DAG (recovery
-    /// replaces `DagActor.dag` on each leader transition).
+    /// Re-applied by [`apply_to_dag`](Self::apply_to_dag) on every
+    /// fresh DAG (recovery replaces `DagActor.dag` on each leader
+    /// transition).
     pub(super) soft_features: Vec<SoftFeature>,
 }
 
 impl SizingConfig {
     pub(super) fn new(cfg: &DagActorConfig) -> Self {
         Self {
-            size_classes: Arc::new(parking_lot::RwLock::new(cfg.size_classes.clone())),
-            fetcher_classes: crate::assignment::builder_class_order(&cfg.size_classes),
             soft_features: cfg.soft_features.clone(),
         }
     }
@@ -108,12 +68,6 @@ pub struct DagActorConfig {
     /// Max in-flight `QueryPathInfo` calls during merge-time eager
     /// substitute fetch. Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
     pub substitute_max_concurrent: usize,
-    /// Builder size-class cutoff config. Empty = feature off (no
-    /// classification). The rebalancer mutates the `cutoff_secs` of
-    /// the actor-owned `Arc<RwLock<...>>` derived from this; the
-    /// initial values are also captured into `configured_cutoffs` for
-    /// drift reporting.
-    pub size_classes: Vec<crate::assignment::SizeClassConfig>,
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
@@ -132,7 +86,6 @@ impl Default for DagActorConfig {
             poison: PoisonConfig::default(),
             grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
-            size_classes: Vec::new(),
             soft_features: Vec::new(),
             sla: None,
         }

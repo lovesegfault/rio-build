@@ -524,7 +524,7 @@ impl DagActor {
                         .values()
                         .map(|w| rio_proto::types::ExecutorRejection {
                             executor_id: w.executor_id.to_string(),
-                            reason: crate::assignment::rejection_reason(w, s, None)
+                            reason: crate::assignment::rejection_reason(w, s)
                                 .unwrap_or("ACCEPT")
                                 .to_string(),
                         })

@@ -61,7 +61,7 @@ pub struct Report {
     /// InsufficientCapacity, etc.
     stuck_nodeclaims: Vec<StuckNodeClaim>,
     /// Scheduler Prometheus scrape via port-forward (leader pod :9091).
-    /// The I-025 signal — fod_queue_depth + fetcher_utilization.
+    /// The I-025 signal — queue_depth{kind} + utilization{kind}.
     scheduler_metrics: Option<SchedulerMetrics>,
     /// Pods with FailedCreatePodSandBox events in the last 5min.
     /// The I-022/I-027 signal — aws-cni IP assignment failures.
@@ -138,10 +138,12 @@ pub struct StuckNodeClaim {
 
 #[derive(Serialize)]
 pub struct SchedulerMetrics {
-    pub fod_queue_depth: f64,
+    pub fetcher_queue_depth: f64,
     pub fetcher_utilization: f64,
+    pub builder_queue_depth: f64,
+    pub builder_utilization: f64,
     pub derivations_queued: f64,
-    /// fod_queue_depth > 0 && fetcher_utilization == 0.
+    /// queue_depth{kind=fetcher} > 0 && utilization{kind=fetcher} == 0.
     /// The I-025 check — FODs queued but no fetcher streams.
     pub possible_freeze: bool,
 }
@@ -436,13 +438,25 @@ pub(crate) async fn gather_scheduler_metrics(client: &k::Client) -> Option<Sched
             .inspect_err(|e| debug!("scrape: {e:#}"))
             .ok()?,
     );
-    let fod_queue_depth = s.first("rio_scheduler_fod_queue_depth").unwrap_or(0.0);
-    let fetcher_utilization = s.first("rio_scheduler_fetcher_utilization").unwrap_or(0.0);
+    let fetcher_queue_depth = s
+        .labeled("rio_scheduler_queue_depth", "kind", "EXECUTOR_KIND_FETCHER")
+        .unwrap_or(0.0);
+    let fetcher_utilization = s
+        .labeled("rio_scheduler_utilization", "kind", "EXECUTOR_KIND_FETCHER")
+        .unwrap_or(0.0);
+    let builder_queue_depth = s
+        .labeled("rio_scheduler_queue_depth", "kind", "EXECUTOR_KIND_BUILDER")
+        .unwrap_or(0.0);
+    let builder_utilization = s
+        .labeled("rio_scheduler_utilization", "kind", "EXECUTOR_KIND_BUILDER")
+        .unwrap_or(0.0);
     Some(SchedulerMetrics {
-        fod_queue_depth,
+        fetcher_queue_depth,
         fetcher_utilization,
+        builder_queue_depth,
+        builder_utilization,
         derivations_queued: s.first("rio_scheduler_derivations_queued").unwrap_or(0.0),
-        possible_freeze: fod_queue_depth > 0.0 && fetcher_utilization == 0.0,
+        possible_freeze: fetcher_queue_depth > 0.0 && fetcher_utilization == 0.0,
     })
 }
 
@@ -514,6 +528,16 @@ impl Scrape {
     fn first(&self, name: &str) -> Option<f64> {
         self.series(name).first().map(|(_, v)| *v)
     }
+
+    /// First series for `name` whose label string contains
+    /// `key="value"`. Substring match — robust to label ordering.
+    fn labeled(&self, name: &str, key: &str, value: &str) -> Option<f64> {
+        let needle = format!("{key}=\"{value}\"");
+        self.series(name)
+            .iter()
+            .find(|(l, _)| l.contains(&needle))
+            .map(|(_, v)| *v)
+    }
 }
 
 /// `--metrics` section: the gauges that answer "is the actor wedged?"
@@ -528,8 +552,8 @@ async fn print_metrics_detail(client: &k::Client) {
         ("rio_scheduler_derivations_running", "derivations_running"),
         ("rio_scheduler_workers_active", "workers_active"),
         ("rio_scheduler_builds_active", "builds_active"),
-        ("rio_scheduler_fod_queue_depth", "fod_queue_depth"),
-        ("rio_scheduler_class_queue_depth", "class_queue_depth"),
+        ("rio_scheduler_queue_depth", "queue_depth"),
+        ("rio_scheduler_utilization", "utilization"),
     ];
     const STORE_GAUGES: &[(&str, &str)] = &[
         ("rio_store_pg_pool_utilization", "pg_pool_util"),
@@ -1167,10 +1191,12 @@ fn render_human(r: &Report) {
             String::new()
         };
         eprintln!(
-            "  {} fod_queue={}  fetcher_util={:.2}  queued={}{}",
+            "  {} fetcher_queue={}  fetcher_util={:.2}  builder_queue={}  builder_util={:.2}  queued={}{}",
             glyph(!m.possible_freeze),
-            m.fod_queue_depth,
+            m.fetcher_queue_depth,
             m.fetcher_utilization,
+            m.builder_queue_depth,
+            m.builder_utilization,
             m.derivations_queued,
             freeze
         );

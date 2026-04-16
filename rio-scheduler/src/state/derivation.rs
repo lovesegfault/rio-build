@@ -428,21 +428,16 @@ impl ResourceFloor {
 /// next dispatch / `full_sweep`.
 #[derive(Debug, Clone, Default)]
 pub struct SchedHint {
-    /// Size-class this derivation was dispatched to. Recorded at
-    /// assign time so completion can check misclassification (actual
-    /// duration > 2× the class cutoff). `None` = size-classes not
-    /// configured, or never assigned.
-    pub assigned_size_class: Option<String>,
     /// D4: per-dimension reactive floor. See [`ResourceFloor`].
     pub resource_floor: ResourceFloor,
-    /// Bucketed memory estimate for the resource-fit placement filter.
-    /// `hard_filter` checks `worker.memory_total_bytes >= est`.
+    /// SLA-solved memory estimate for the resource-fit placement
+    /// filter. `hard_filter` checks `worker.memory_total_bytes >=
+    /// est`.
     ///
-    /// Populated at DISPATCH time (`dispatch_ready`, same block as
-    /// `classify()`), not merge time — the estimator refreshes on Tick,
-    /// so a long-queued derivation picks up fresh history. `None` =
-    /// cold start (no `build_history` row, no `pname`, or no memory
-    /// sample); filter treats `None` as "any worker fits".
+    /// Populated at DISPATCH time (`dispatch_ready`, from
+    /// `solve_intent_for`), not merge time — the estimator refreshes
+    /// on Tick, so a long-queued derivation picks up fresh history.
+    /// `None` = filter treats it as "any worker fits".
     pub est_memory_bytes: Option<u64>,
     /// SLA-solved core count for this dispatch (same `solve_intent_for`
     /// call as `est_memory_bytes`). `build_assignment_proto` forwards it
@@ -898,7 +893,7 @@ impl DerivationState {
 /// `#[serde(default)]` on the struct → absent keys fall through to
 /// `Default::default()`, so `[poison] threshold = 5` leaves
 /// `require_distinct_workers = true` (unchanged). Matches the
-/// `size_classes` precedent in `Config`. Serialize + PartialEq are
+/// `Config` precedent. Serialize + PartialEq are
 /// for the TOML-roundtrip tests in main.rs (`assert_eq!(cfg.poison,
 /// PoisonConfig::default())`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

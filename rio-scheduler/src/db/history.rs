@@ -141,28 +141,6 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    /// Query raw `(duration_secs, peak_memory_bytes)` samples from the
-    /// last `days`. Feeds `admin/sizeclass.rs::count_samples_by_class`.
-    ///
-    /// Range on `completed_at` — covered by `build_samples_completed_at_idx`
-    /// (migration 013), same index that serves `delete_samples_older_than`.
-    pub async fn query_build_samples_last_days(
-        &self,
-        days: u32,
-    ) -> Result<Vec<(f64, i64)>, sqlx::Error> {
-        // `$1 * interval '1 day'` — same bind pattern as
-        // `delete_samples_older_than`. Keeps PG's interval arithmetic,
-        // avoids the text-cast detour.
-        sqlx::query_as::<_, (f64, i64)>(
-            "SELECT duration_secs, peak_memory_bytes
-             FROM build_samples
-             WHERE completed_at > now() - $1 * interval '1 day'",
-        )
-        .bind(days as i32)
-        .fetch_all(&self.pool)
-        .await
-    }
-
     /// All samples completed strictly after `since_epoch` (Unix seconds),
     /// excluding MAD-flagged outliers. Feeds [`SlaEstimator::refresh`] —
     /// the estimator only needs to know WHICH `(pname, system, tenant)`

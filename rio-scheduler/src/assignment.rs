@@ -1,11 +1,9 @@
 //! Worker selection.
 //!
-// r[impl sched.classify.smallest-covering]
-// r[impl sched.classify.mem-bump]
-//! `best_executor()`: hard-filter on system/features/kind/class, then
-//! the warm-gate (prefer workers that ACKed PrefetchComplete). With
-//! one-shot pods, all candidates that pass the filter are equivalent —
-//! no per-worker locality state to discriminate on. First match wins.
+//! `best_executor()`: hard-filter on system/features/kind, then the
+//! warm-gate (prefer workers that ACKed PrefetchComplete). With one-shot
+//! pods, all candidates that pass the filter are equivalent — no
+//! per-worker locality state to discriminate on. First match wins.
 
 use std::collections::HashMap;
 
@@ -16,163 +14,18 @@ use rio_proto::types::ExecutorKind;
 use crate::dag::DerivationDag;
 use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
 
-/// One size-class in the operator's cutoff config.
-///
-/// Classes form an ordered sequence: "small" < "medium" < "large" by
-/// `cutoff_secs`. A derivation is routed to the SMALLEST class whose
-/// cutoff covers its estimated duration — this concentrates quick
-/// builds on cheap workers and reserves big iron for slow builds.
-///
-/// `mem_limit_bytes` is a guard: if a derivation's known peak memory
-/// exceeds its duration-class's limit, it gets bumped to the next class
-/// regardless of duration. A 10-second build that OOMs on a 4GB worker
-/// isn't actually a small build.
-///
-/// Lives here (not main.rs) because the actor needs it: dispatch.rs
-/// calls `classify()` with a ref to the config vec, and completion.rs
-/// looks up `cutoff_for()` for misclassification detection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SizeClassConfig {
-    pub name: String,
-    /// Max estimated duration to route here. A build estimated at 25s
-    /// goes to the smallest class with cutoff ≥ 25.
-    pub cutoff_secs: f64,
-    /// If a build's ema_peak_memory exceeds this, bump to the next
-    /// class even if duration fits. `u64::MAX` = no memory check.
-    pub mem_limit_bytes: u64,
-    /// If a build's ema_peak_cpu_cores exceeds this, bump to the next
-    /// class even if duration fits (mirrors mem-bump). `None` = no CPU
-    /// check. Optional so existing TOML without `cpu_limit_cores` keeps
-    /// working. When Some, main.rs validate_config enforces is_finite
-    /// && >0 at startup (same shape as cutoff_secs / P0415 backoff_*
-    /// bounds; bughunt-mc238 found this gap — `c > NaN` at :128 would
-    /// silently disable the bump, `c > neg` would always-bump). P0424.
-    #[serde(default)]
-    pub cpu_limit_cores: Option<f64>,
-}
-
 /// One soft-feature entry (`[[soft_features]]` in scheduler.toml).
 /// `name` is stripped from `requiredSystemFeatures` at DAG-insert
 /// (`r[sched.dispatch.soft-features]`).
 ///
-/// D6: `floor_hint` retained for config back-compat (deserialized,
-/// ignored). SLA `solve_intent_for` + `resource_floor` doubling own
-/// initial sizing now; the I-213 firefox case (`big-parallel` →
-/// xlarge) is handled by the SLA model fitting on prior firefox
-/// samples + reactive doubling on cold start.
+/// D6: legacy `floor_hint` removed — SLA `solve_intent_for` +
+/// `resource_floor` doubling own initial sizing now; the I-213 firefox
+/// case (`big-parallel` → xlarge) is handled by the SLA model fitting on
+/// prior firefox samples + reactive doubling on cold start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoftFeature {
     pub name: String,
-    /// D6: ignored (was builder size-class name for initial
-    /// `size_class_floor`). Kept for config back-compat until the
-    /// helm chart drops it.
-    #[serde(default)]
-    pub floor_hint: Option<String>,
-}
-
-/// Builder class names sorted smallest→largest by `cutoff_secs`.
-/// Same ordering [`classify`] uses. Computed once at actor
-/// construction; the FOD class walk (Phase 6 deletes) reads this.
-pub fn builder_class_order(classes: &[SizeClassConfig]) -> Vec<String> {
-    let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
-    sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
-    sorted.into_iter().map(|c| c.name.clone()).collect()
-}
-
-/// Classify a derivation into a size-class.
-///
-/// `None` = no classification (size-classes not configured, optional feature).
-/// `Some(name)` = route to workers whose `size_class` matches.
-///
-/// Algorithm:
-/// 1. Empty config → None (no filtering; all workers are candidates)
-/// 2. Sort classes by cutoff (idempotent if already sorted)
-/// 3. Find smallest class where `est_dur ≤ cutoff`
-/// 4. If that class's mem_limit is exceeded → bump to next larger
-/// 5. If est_dur exceeds ALL cutoffs → largest class (builds gotta go
-///    somewhere; the largest class is "everything else")
-///
-/// Taking `&[SizeClassConfig]` owned-sort internally rather than
-/// requiring the caller to pre-sort: classify() is called per-dispatch
-/// and the sort is ~3-element. Cheaper than maintaining an invariant.
-pub fn classify(
-    est_dur: f64,
-    peak_mem: Option<f64>,
-    peak_cpu: Option<f64>,
-    classes: &[SizeClassConfig],
-) -> Option<String> {
-    if classes.is_empty() {
-        // If no size_classes configured, skip classification entirely —
-        // optional feature, not required for single-pool deployments.
-        return None;
-    }
-
-    // Sort by cutoff. Small-N (typically 2-4 classes); the clone is
-    // ~100 bytes and the sort is trivial. Not worth caching sorted
-    // order on the actor — this runs once per dispatch decision, not
-    // per-packet.
-    //
-    // total_cmp (not partial_cmp) — main.rs validates cutoff_secs is
-    // finite at startup, but total_cmp is defense-in-depth: it defines
-    // NaN as "largest" under IEEE 754 total order, so a hypothetical
-    // NaN cutoff would sort to the end rather than panicking the
-    // scheduler on every dispatch.
-    let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
-    sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
-
-    // Find the smallest class whose cutoff covers est_dur, then check
-    // memory + CPU. If either forces a bump, we want the NEXT class —
-    // hence iterating by index so we can peek ahead.
-    for (i, class) in sorted.iter().enumerate() {
-        if est_dur > class.cutoff_secs {
-            // Duration doesn't fit; try next class.
-            continue;
-        }
-        // Duration fits. Check memory.
-        let mem_over = peak_mem.is_some_and(|m| m > class.mem_limit_bytes as f64);
-        // r[impl sched.classify.cpu-bump]
-        // CPU-bump: if ema_peak_cpu_cores exceeds the duration-chosen
-        // class's cpu_limit, bump to the next larger class. Mirrors
-        // mem-bump. `None` limit = no CPU check (default).
-        let cpu_over = peak_cpu
-            .zip(class.cpu_limit_cores)
-            .is_some_and(|(c, limit)| c > limit);
-        if mem_over || cpu_over {
-            // Resource bump: return the NEXT class if there is one.
-            // If this is already the largest, return it anyway — a
-            // build has to go somewhere, and "largest" is the best
-            // we've got. The misclassification detector will catch
-            // the resulting OOM/CPU-starve and log it.
-            return Some(
-                sorted
-                    .get(i + 1)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| class.name.clone()),
-            );
-        }
-        return Some(class.name.clone());
-    }
-
-    // est_dur exceeded every cutoff. Route to the largest class —
-    // that's where slow builds belong. Returning None here would mean
-    // "no worker can take this," which is wrong: a 2-hour build should
-    // go to the big workers, not get stuck.
-    sorted.last().map(|c| c.name.clone())
-}
-
-/// Look up the cutoff for a class name. For misclassification detection:
-/// "did actual duration exceed 2× the cutoff we routed this to?"
-///
-/// `None` if the name isn't in the config (shouldn't happen — we only
-/// store names that came from `classify()`, but be defensive against
-/// config changes mid-run).
-pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> {
-    classes
-        .iter()
-        .find(|c| c.name == class_name)
-        .map(|c| c.cutoff_secs)
 }
 
 /// First clause of [`hard_filter`] that rejects, or `None` if it
@@ -185,17 +38,7 @@ pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> 
 /// implemented as `rejection_reason(..).is_none()` so the two cannot
 /// drift. The reason strings are stable identifiers (CLI/dashboard
 /// match on them), not prose — keep them terse.
-///
-/// `target_class` is the size-class filter as in `hard_filter`. The
-/// diagnostic call site passes `None` (it doesn't know the class); the
-/// size-class clause therefore won't show up in diagnostics — that's
-/// acceptable since size-class mismatches are already visible via
-/// `DebugExecutorState.size_class` vs the operator's class config.
-pub fn rejection_reason(
-    w: &ExecutorState,
-    drv: &DerivationState,
-    target_class: Option<&str>,
-) -> Option<&'static str> {
+pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'static str> {
     if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
         return Some("kind-mismatch");
     }
@@ -232,8 +75,8 @@ pub fn rejection_reason(
     // r[impl sched.sla.intent-match]
     // ADR-023: a worker spawned for intent X (= drv_hash X) is
     // RESERVED for X. Without this, the FIFO drain pops Y first, finds
-    // this worker via the regular overflow walk, and gives it Y — its
-    // pod resources were sized for X, so Y likely OOMs or wastes
+    // this worker via the regular best_executor walk, and gives it Y —
+    // its pod resources were sized for X, so Y likely OOMs or wastes
     // headroom. Stale intents (X not Ready) are cleared at heartbeat
     // (`handle_heartbeat`), so a worker with `Some(intent_id)` here
     // always has a live reservation.
@@ -257,12 +100,6 @@ pub fn rejection_reason(
     if drv.retry.failed_builders.contains(&w.executor_id) {
         return Some("failed-on");
     }
-    match (target_class, w.size_class.as_deref()) {
-        (None, _) => {}
-        (Some(_), None) => return Some("size-class-undeclared"),
-        (Some(t), Some(wc)) if t != wc => return Some("size-class-mismatch"),
-        (Some(_), Some(_)) => {}
-    }
     if let Some(est) = drv.sched.est_memory_bytes
         && let Some(r) = &w.last_resources
         && r.memory_total_bytes != 0
@@ -274,37 +111,31 @@ pub fn rejection_reason(
 }
 
 /// Hard filter: executor-kind, capacity, system/feature match,
-/// not-previously-failed, and size-class. The SAME predicate that both
+/// not-previously-failed, resource-fit. The SAME predicate that both
 /// warm-pass and cold-fallback use in [`best_executor`] — extracted so
 /// the two passes can't drift. Implemented via [`rejection_reason`] so
 /// the diagnostic and the filter cannot diverge.
-fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
+fn hard_filter(w: &ExecutorState, drv: &DerivationState) -> bool {
     // r[impl sched.dispatch.fod-to-fetcher]
     // r[impl sched.assign.resource-fit]
     // Clause-by-clause logic lives in `rejection_reason` (above) so the
     // dispatch path and the diagnostic cannot drift. The kind gate is
     // first (cheap boolean, airgap boundary: a builder NEVER sees a
-    // FOD, a fetcher NEVER sees arbitrary code). Size-class: workers
-    // MUST declare a class when the scheduler is classifying, or
-    // they're rejected (visible misconfig, not silent routing).
-    // Resource-fit: three unknown-ceiling cases (est=None, no
-    // heartbeat resources, memory_total_bytes==0 = "unknown" per
-    // builder cgroup.rs:667) all pass.
-    rejection_reason(w, drv, target_class).is_none()
+    // FOD, a fetcher NEVER sees arbitrary code). Resource-fit: three
+    // unknown-ceiling cases (est=None, no heartbeat resources,
+    // memory_total_bytes==0 = "unknown" per builder cgroup.rs:667)
+    // all pass.
+    rejection_reason(w, drv).is_none()
 }
 
 /// Select the best worker for a derivation.
 ///
-/// Hard filter first (has_capacity, can_build, size_class match), then
+/// Hard filter first (has_capacity, can_build, resource-fit), then
 /// score the survivors, return the lowest. `None` if nobody passes the
 /// filter — caller defers the derivation.
-///
-/// `target_class` is the size-class filter. `None` = size-classes not
-/// configured on this scheduler (optional feature).
 pub fn best_executor(
     workers: &HashMap<ExecutorId, ExecutorState>,
     drv: &DerivationState,
-    target_class: Option<&str>,
 ) -> Option<ExecutorId> {
     // r[impl sched.assign.warm-gate]
     // --- Hard filter: warm-gate two-pass ---
@@ -312,21 +143,18 @@ pub fn best_executor(
     // worker has ACKed its initial PrefetchHint (PrefetchComplete).
     let warm_candidates: Vec<&ExecutorState> = workers
         .values()
-        .filter(|w| w.warm && hard_filter(w, drv, target_class))
+        .filter(|w| w.warm && hard_filter(w, drv))
         .collect();
 
     // Fallback: no warm worker passes → relax the gate. Single-
     // worker clusters, mass scale-up where ALL workers are fresh —
     // can't deadlock. The gate is an optimization, not a correctness
     // constraint. Cold workers still go through the SAME hard_filter
-    // (capacity/features/class) — we're only relaxing `warm`.
+    // (capacity/features/kind) — we're only relaxing `warm`.
     let candidates: Vec<&ExecutorState> = if !warm_candidates.is_empty() {
         warm_candidates
     } else {
-        let cold: Vec<&ExecutorState> = workers
-            .values()
-            .filter(|w| hard_filter(w, drv, target_class))
-            .collect();
+        let cold: Vec<&ExecutorState> = workers.values().filter(|w| hard_filter(w, drv)).collect();
         if !cold.is_empty() {
             tracing::debug!(
                 cold_count = cold.len(),
@@ -396,26 +224,6 @@ mod tests {
     use super::*;
     use rio_test_support::fixtures::make_derivation_node;
 
-    #[test]
-    fn builder_class_order_sorts_by_cutoff() {
-        let classes = vec![
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-        assert_eq!(builder_class_order(&classes), vec!["tiny", "large"]);
-        assert!(builder_class_order(&[]).is_empty());
-    }
-
     fn make_worker(id: &str, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
@@ -456,12 +264,11 @@ mod tests {
     }
 
     // r[verify sched.dispatch.fod-to-fetcher]
-    // r[verify sched.dispatch.no-fod-fallback]
     /// 4-cell matrix: `is_fixed_output × executor.kind`. The XOR check
     /// in `hard_filter` must reject both cross-kind routings. The
-    /// `true×Builder` rejection also covers `no-fod-fallback`: even an
-    /// idle builder fails the filter, so there's no FOD→builder path
-    /// under any load condition.
+    /// `true×Builder` rejection is the airgap boundary: even an idle
+    /// builder fails the filter, so there's no FOD→builder path under
+    /// any load condition.
     #[test]
     fn hard_filter_kind_matrix() {
         let mk_worker = |kind| {
@@ -477,22 +284,22 @@ mod tests {
 
         // FOD → Fetcher: passes (rest of filter permitting)
         assert!(
-            hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(true), None),
+            hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(true)),
             "FOD must route to fetcher"
         );
         // FOD → Builder: rejected (airgap boundary)
         assert!(
-            !hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(true), None),
+            !hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(true)),
             "FOD must NOT route to builder (airgap)"
         );
         // non-FOD → Fetcher: rejected (arbitrary code on open egress)
         assert!(
-            !hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(false), None),
+            !hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(false)),
             "non-FOD must NOT route to fetcher"
         );
         // non-FOD → Builder: passes (rest of filter permitting)
         assert!(
-            hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(false), None),
+            hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(false)),
             "non-FOD must route to builder"
         );
     }
@@ -522,13 +329,13 @@ mod tests {
         let x86 = mk_fetcher(&["x86_64-linux", "builtin"]);
 
         // builtin FOD: both arches eligible (overflow to either).
-        assert!(hard_filter(&arm, &mk_fod("builtin"), None));
-        assert!(hard_filter(&x86, &mk_fod("builtin"), None));
+        assert!(hard_filter(&arm, &mk_fod("builtin")));
+        assert!(hard_filter(&x86, &mk_fod("builtin")));
         // x86_64-linux FOD: only x86 fetcher; arm rejects.
-        assert!(hard_filter(&x86, &mk_fod("x86_64-linux"), None));
-        assert!(!hard_filter(&arm, &mk_fod("x86_64-linux"), None));
+        assert!(hard_filter(&x86, &mk_fod("x86_64-linux")));
+        assert!(!hard_filter(&arm, &mk_fod("x86_64-linux")));
         assert_eq!(
-            rejection_reason(&arm, &mk_fod("x86_64-linux"), None),
+            rejection_reason(&arm, &mk_fod("x86_64-linux")),
             Some("system-mismatch")
         );
     }
@@ -544,17 +351,16 @@ mod tests {
         let mut fod = make_drv();
         fod.is_fixed_output = true;
         // Kind matches → falls through to capacity check → fails there.
-        assert!(!hard_filter(&fetcher_full, &fod, None));
+        assert!(!hard_filter(&fetcher_full, &fod));
 
         let mut builder_idle = make_worker("b", 0); // idle
         builder_idle.kind = ExecutorKind::Builder;
         // Kind mismatch → rejected regardless of idle capacity.
-        assert!(!hard_filter(&builder_idle, &fod, None));
+        assert!(!hard_filter(&builder_idle, &fod));
     }
 
     /// `rejection_reason` names each clause; `hard_filter` is its
-    /// `is_none()`. Exhaustive over the reasons the diagnostic surfaces
-    /// (size-class is exercised separately by the classify tests).
+    /// `is_none()`. Exhaustive over the reasons the diagnostic surfaces.
     /// ExecutorState isn't Clone (stream_tx), so each case rebuilds.
     #[test]
     fn rejection_reason_per_clause() {
@@ -562,44 +368,35 @@ mod tests {
 
         // Baseline: idle builder, non-FOD drv, system match → ACCEPT.
         let w = make_worker("w", 0);
-        assert_eq!(rejection_reason(&w, &drv, None), None);
-        assert!(hard_filter(&w, &drv, None));
+        assert_eq!(rejection_reason(&w, &drv), None);
+        assert!(hard_filter(&w, &drv));
 
         // kind-mismatch
         let mut fetcher = make_worker("w", 0);
         fetcher.kind = ExecutorKind::Fetcher;
-        assert_eq!(
-            rejection_reason(&fetcher, &drv, None),
-            Some("kind-mismatch")
-        );
+        assert_eq!(rejection_reason(&fetcher, &drv), Some("kind-mismatch"));
 
         // draining (admin) — checked before capacity, so a busy
         // draining worker reports "draining", not "at-capacity".
         let mut draining = make_worker("w", 1);
         draining.draining = true;
-        assert_eq!(rejection_reason(&draining, &drv, None), Some("draining"));
+        assert_eq!(rejection_reason(&draining, &drv), Some("draining"));
 
         // draining_hb (worker SIGTERM via heartbeat) — same gate via
         // is_draining()'s OR.
         let mut draining_hb = make_worker("w", 0);
         draining_hb.draining_hb = true;
-        assert_eq!(rejection_reason(&draining_hb, &drv, None), Some("draining"));
+        assert_eq!(rejection_reason(&draining_hb, &drv), Some("draining"));
 
         // store-degraded
         let mut degraded = make_worker("w", 0);
         degraded.store_degraded = true;
-        assert_eq!(
-            rejection_reason(&degraded, &drv, None),
-            Some("store-degraded")
-        );
+        assert_eq!(rejection_reason(&degraded, &drv), Some("store-degraded"));
 
         // not-registered (no stream)
         let mut no_stream = make_worker("w", 0);
         no_stream.stream_tx = None;
-        assert_eq!(
-            rejection_reason(&no_stream, &drv, None),
-            Some("not-registered")
-        );
+        assert_eq!(rejection_reason(&no_stream, &drv), Some("not-registered"));
 
         // stream-closed (I-095): stream_tx Some but receiver dropped.
         // Distinct from not-registered — is_registered() stays true
@@ -607,33 +404,27 @@ mod tests {
         let closed = make_worker_closed_stream("w");
         assert!(closed.is_registered(), "is_registered ignores is_closed()");
         assert!(!closed.has_capacity(), "has_capacity gates on is_closed()");
-        assert_eq!(rejection_reason(&closed, &drv, None), Some("stream-closed"));
-        assert!(!hard_filter(&closed, &drv, None));
+        assert_eq!(rejection_reason(&closed, &drv), Some("stream-closed"));
+        assert!(!hard_filter(&closed, &drv));
 
         // at-capacity
         let busy = make_worker("w", 1);
-        assert_eq!(rejection_reason(&busy, &drv, None), Some("at-capacity"));
+        assert_eq!(rejection_reason(&busy, &drv), Some("at-capacity"));
 
         // system-mismatch
         let mut aarch_drv = make_drv();
         "aarch64-linux".clone_into(&mut aarch_drv.system);
-        assert_eq!(
-            rejection_reason(&w, &aarch_drv, None),
-            Some("system-mismatch")
-        );
+        assert_eq!(rejection_reason(&w, &aarch_drv), Some("system-mismatch"));
 
         // feature-missing
         let mut feat_drv = make_drv();
         feat_drv.required_features = vec!["kvm".into()];
-        assert_eq!(
-            rejection_reason(&w, &feat_drv, None),
-            Some("feature-missing")
-        );
+        assert_eq!(rejection_reason(&w, &feat_drv), Some("feature-missing"));
 
         // failed-on
         let mut failed_drv = make_drv();
         failed_drv.retry.failed_builders.insert("w".into());
-        assert_eq!(rejection_reason(&w, &failed_drv, None), Some("failed-on"));
+        assert_eq!(rejection_reason(&w, &failed_drv), Some("failed-on"));
 
         // resource-fit
         let mut tight = make_worker("w", 0);
@@ -643,21 +434,18 @@ mod tests {
         });
         let mut big_drv = make_drv();
         big_drv.sched.est_memory_bytes = Some(8 << 30);
-        assert_eq!(
-            rejection_reason(&tight, &big_drv, None),
-            Some("resource-fit")
-        );
+        assert_eq!(rejection_reason(&tight, &big_drv), Some("resource-fit"));
 
         // hard_filter == rejection_reason.is_none() for every case
         // above. Spot-check one of each polarity.
-        assert!(!hard_filter(&busy, &drv, None));
-        assert!(hard_filter(&tight, &drv, None)); // est=None → fits
+        assert!(!hard_filter(&busy, &drv));
+        assert!(hard_filter(&tight, &drv)); // est=None → fits
     }
 
     #[test]
     fn no_candidates_returns_none() {
         let workers = workers_map(vec![make_worker("full", 2)]); // at capacity
-        assert_eq!(best_executor(&workers, &make_drv(), None), None);
+        assert_eq!(best_executor(&workers, &make_drv()), None);
     }
 
     #[test]
@@ -672,7 +460,7 @@ mod tests {
         let mut drv = make_drv();
         drv.retry.failed_builders.insert("worker-a".into());
 
-        let chosen = best_executor(&workers, &drv, None);
+        let chosen = best_executor(&workers, &drv);
         assert_eq!(
             chosen,
             Some("worker-b".into()),
@@ -684,7 +472,7 @@ mod tests {
         // handle_transient_failure poisons).
         drv.retry.failed_builders.insert("worker-b".into());
         assert_eq!(
-            best_executor(&workers, &drv, None),
+            best_executor(&workers, &drv),
             None,
             "all workers in failed_builders → nobody eligible"
         );
@@ -723,7 +511,7 @@ mod tests {
         // reachable in the dispatch loop, so the None here is never
         // observed in production.
         assert_eq!(
-            best_executor(&workers, &drv, None),
+            best_executor(&workers, &drv),
             None,
             "all workers in failed_builders → best_executor correctly returns \
              None; handle_transient_failure poisons upstream via \
@@ -738,7 +526,7 @@ mod tests {
         let c = make_worker("worker-c", 0);
         workers3.insert(c.executor_id.clone(), c);
         assert_eq!(
-            best_executor(&workers3, &drv, None),
+            best_executor(&workers3, &drv),
             Some("worker-c".into()),
             "fresh worker not in failed_builders → dispatch resumes"
         );
@@ -747,48 +535,8 @@ mod tests {
     #[test]
     fn single_candidate_short_circuits() {
         let workers = workers_map(vec![make_worker("only", 0)]);
-        let result = best_executor(&workers, &make_drv(), None);
+        let result = best_executor(&workers, &make_drv());
         assert_eq!(result.as_deref(), Some("only"));
-    }
-
-    #[test]
-    fn size_class_filter() {
-        let mut small = make_worker("small", 0);
-        small.size_class = Some("small".into());
-        let mut large = make_worker("large", 0);
-        large.size_class = Some("large".into());
-
-        let workers = workers_map(vec![small, large]);
-
-        // Target=large → only large passes.
-        let result = best_executor(&workers, &make_drv(), Some("large"));
-        assert_eq!(result.as_deref(), Some("large"));
-
-        // Target=None → both pass (filter disabled).
-        let result = best_executor(&workers, &make_drv(), None);
-        assert!(result.is_some()); // either one
-    }
-
-    #[test]
-    fn unclassified_worker_rejected_when_scheduler_classified() {
-        // If the scheduler has size_classes configured (target is Some),
-        // a worker that doesn't declare a class is a misconfiguration.
-        // Rejecting it surfaces the problem instead of silently
-        // wildcarding — the old (Some(_), None) => true behavior could
-        // route a 10-hour "large" build to a spot instance that just
-        // never set RIO_SIZE_CLASS.
-        let unclassified = make_worker("misconfigured", 0); // size_class=None
-        let workers = workers_map(vec![unclassified]);
-
-        let result = best_executor(&workers, &make_drv(), Some("large"));
-        assert_eq!(
-            result, None,
-            "unclassified worker must be rejected when scheduler is classifying"
-        );
-
-        // Sanity: same worker IS accepted when scheduler not classifying.
-        let result = best_executor(&workers, &make_drv(), None);
-        assert_eq!(result.as_deref(), Some("misconfigured"));
     }
 
     // r[verify sched.assign.resource-fit]
@@ -818,20 +566,20 @@ mod tests {
 
         // Worker 8Gi, drv est 6Gi → fits (6 ≤ 8).
         assert!(
-            hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(6 * GIB)), None),
+            hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(6 * GIB))),
             "8Gi worker must fit 6Gi drv"
         );
 
         // Worker 8Gi, drv est 12Gi → doesn't fit.
         assert!(
-            !hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(12 * GIB)), None),
+            !hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(12 * GIB))),
             "8Gi worker must REJECT 12Gi drv"
         );
 
         // Worker 64Gi, drv est 6Gi → fits (overflow routing: a small
         // drv CAN go to a big pod if that's what's idle).
         assert!(
-            hard_filter(&mk_worker(64 * GIB), &mk_drv(Some(6 * GIB)), None),
+            hard_filter(&mk_worker(64 * GIB), &mk_drv(Some(6 * GIB))),
             "64Gi worker must fit 6Gi drv (overflow routing)"
         );
 
@@ -839,7 +587,7 @@ mod tests {
         // → fits. rio-builder cgroup.rs:667 unwrap_or(0) → 0 means
         // "unknown ceiling", never "zero memory".
         assert!(
-            hard_filter(&mk_worker(0), &mk_drv(Some(128 * GIB)), None),
+            hard_filter(&mk_worker(0), &mk_drv(Some(128 * GIB))),
             "memory_total_bytes=0 (unlimited cgroup) must fit any drv"
         );
 
@@ -848,7 +596,7 @@ mod tests {
         // (controller uses operator floor) — consistent with "no
         // estimate means no constraint".
         assert!(
-            hard_filter(&mk_worker(8 * GIB), &mk_drv(None), None),
+            hard_filter(&mk_worker(8 * GIB), &mk_drv(None)),
             "est=None (cold start) must fit any worker"
         );
     }
@@ -867,52 +615,8 @@ mod tests {
         d.sched.est_memory_bytes = Some(128 << 30); // 128Gi
 
         assert!(
-            hard_filter(&w, &d, None),
+            hard_filter(&w, &d),
             "worker with no heartbeat resources must be treated as unknown-fits"
-        );
-    }
-
-    // r[verify sched.assign.resource-fit]
-    // Resource-fit is AND-ed with size-class, not replacing it. A
-    // worker that passes size-class but fails resource-fit → reject.
-    // A worker that passes resource-fit but fails size-class → reject.
-    // Proves the filter slots in the same position as has_capacity
-    // without disrupting Static mode.
-    #[test]
-    fn resource_fit_composes_with_size_class() {
-        const GIB: u64 = 1 << 30;
-
-        let mut small_8gi = make_worker("small-8gi", 0);
-        small_8gi.size_class = Some("small".into());
-        small_8gi.last_resources = Some(rio_proto::types::ResourceUsage {
-            memory_total_bytes: 8 * GIB,
-            ..Default::default()
-        });
-
-        let mut drv_12gi = make_drv();
-        drv_12gi.sched.est_memory_bytes = Some(12 * GIB);
-
-        // target=small matches size_class, but 8Gi < 12Gi → reject.
-        // Proves resource-fit runs AFTER size-class passes.
-        assert!(
-            !hard_filter(&small_8gi, &drv_12gi, Some("small")),
-            "size-class match must not bypass resource-fit"
-        );
-
-        // target=large fails size_class (worker is "small"), even
-        // though 8Gi > 6Gi would pass resource-fit → reject.
-        // Proves size-class still works (exit criterion).
-        let mut drv_6gi = make_drv();
-        drv_6gi.sched.est_memory_bytes = Some(6 * GIB);
-        assert!(
-            !hard_filter(&small_8gi, &drv_6gi, Some("large")),
-            "resource-fit match must not bypass size-class"
-        );
-
-        // Both pass → accept.
-        assert!(
-            hard_filter(&small_8gi, &drv_6gi, Some("small")),
-            "both filters passing must accept"
         );
     }
 
@@ -933,7 +637,7 @@ mod tests {
 
         // Warm-gate first-pass: only "warm" passes. Cold is
         // filtered out. "warm" is the ONLY candidate → picked.
-        let result = best_executor(&workers, &make_drv(), None);
+        let result = best_executor(&workers, &make_drv());
         assert_eq!(
             result.as_deref(),
             Some("warm"),
@@ -963,7 +667,7 @@ mod tests {
         // With zero warm candidates, fallback uses cold workers with
         // the SAME hard_filter (capacity/features) then scores.
         // "b" has lower load (0.0 vs 0.25) → wins.
-        let result = best_executor(&workers, &make_drv(), None);
+        let result = best_executor(&workers, &make_drv());
         assert_eq!(
             result.as_deref(),
             Some("b"),
@@ -992,200 +696,12 @@ mod tests {
 
         let workers = workers_map(vec![cold, warm]);
 
-        let result = best_executor(&workers, &make_drv(), None);
+        let result = best_executor(&workers, &make_drv());
         assert_eq!(
             result.as_deref(),
             Some("warm-ready"),
             "a cold worker's presence must not block dispatch to a warm one"
         );
-    }
-
-    // ----- classify() tests -----
-
-    /// Index of a class name in the cutoff-sorted order. For asserting
-    /// "bump never goes down" properties — string names don't compare
-    /// directly, but sorted indices do.
-    fn class_index(name: Option<&str>, classes: &[SizeClassConfig]) -> usize {
-        let Some(name) = name else {
-            return 0;
-        };
-        let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
-        sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
-        sorted.iter().position(|c| c.name == name).unwrap_or(0)
-    }
-
-    fn mk_class(
-        name: &str,
-        cutoff: f64,
-        mem_limit: u64,
-        cpu_limit: Option<f64>,
-    ) -> SizeClassConfig {
-        SizeClassConfig {
-            name: name.into(),
-            cutoff_secs: cutoff,
-            mem_limit_bytes: mem_limit,
-            cpu_limit_cores: cpu_limit,
-        }
-    }
-
-    fn classes() -> Vec<SizeClassConfig> {
-        vec![
-            mk_class("small", 30.0, 1 << 30, Some(2.0)),
-            mk_class("large", 3600.0, 16 << 30, Some(16.0)),
-        ]
-    }
-
-    #[test]
-    fn classify_empty_config_returns_none() {
-        // Empty config = optional feature off, no filtering.
-        assert_eq!(classify(100.0, None, None, &[]), None);
-        assert_eq!(classify(0.1, Some(1e12), None, &[]), None);
-    }
-
-    #[test]
-    fn classify_by_duration() {
-        let c = classes();
-        // 10s → small (smallest class covering 10s)
-        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
-        // 30s exactly → small (≤ is inclusive)
-        assert_eq!(classify(30.0, None, None, &c).as_deref(), Some("small"));
-        // 31s → large
-        assert_eq!(classify(31.0, None, None, &c).as_deref(), Some("large"));
-        // 3600s exactly → large
-        assert_eq!(classify(3600.0, None, None, &c).as_deref(), Some("large"));
-    }
-
-    // r[verify sched.classify.mem-bump]
-    // 10s would classify "small" by duration alone, but 2 GiB > the
-    // 1 GiB mem_limit on "small" → bumps to "large". Proves the
-    // mem_limit_bytes gate at classify():115-119 fires.
-    #[test]
-    fn classify_memory_bump() {
-        let c = classes();
-        // 10s would be small, but 2 GiB > 1 GiB limit → bump to large.
-        assert_eq!(
-            classify(10.0, Some(2.0 * (1 << 30) as f64), None, &c).as_deref(),
-            Some("large")
-        );
-        // 10s + 500 MiB → small (under limit).
-        assert_eq!(
-            classify(10.0, Some(500.0 * (1 << 20) as f64), None, &c).as_deref(),
-            Some("small")
-        );
-        // None peak_mem → no bump (no data, don't guess).
-        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
-    }
-
-    #[test]
-    fn classify_memory_bump_at_largest_stays_largest() {
-        let c = classes();
-        // 100s → large. 32 GiB > 16 GiB limit, but there's no larger
-        // class → stays large. Build has to go SOMEWHERE.
-        assert_eq!(
-            classify(100.0, Some(32.0 * (1 << 30) as f64), None, &c).as_deref(),
-            Some("large")
-        );
-    }
-
-    // r[verify sched.classify.cpu-bump]
-    #[test]
-    fn classify_cpu_bump() {
-        let c = classes();
-        // 10s would be small by duration, but 4.0 cores > 2.0 limit →
-        // bump to large. Mirrors mem-bump.
-        assert_eq!(
-            classify(10.0, None, Some(4.0), &c).as_deref(),
-            Some("large")
-        );
-        // 10s + 1.5 cores → small (under 2.0 limit).
-        assert_eq!(
-            classify(10.0, None, Some(1.5), &c).as_deref(),
-            Some("small")
-        );
-        // None peak_cpu → no bump (no data, don't guess).
-        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
-        // cpu_limit_cores=None on class → no cpu check for that class.
-        let no_cpu_limit = vec![mk_class("small", 30.0, u64::MAX, None)];
-        assert_eq!(
-            classify(10.0, None, Some(64.0), &no_cpu_limit).as_deref(),
-            Some("small"),
-            "class without cpu_limit_cores doesn't bump on CPU"
-        );
-    }
-
-    #[test]
-    fn classify_cpu_bump_at_largest_stays_largest() {
-        let c = classes();
-        // 100s → large. 32 cores > 16 limit, but no larger class.
-        assert_eq!(
-            classify(100.0, None, Some(32.0), &c).as_deref(),
-            Some("large")
-        );
-    }
-
-    /// CPU-bump is monotone: adding CPU pressure never moves a
-    /// derivation to a SMALLER class. Property-style sweep across
-    /// (dur, mem, cpu) — if this fails, the bump logic can route
-    /// a high-CPU build to a smaller worker, which would starve it.
-    #[test]
-    fn cpu_bump_monotone() {
-        let c = classes();
-        for dur in [0.1, 10.0, 25.0, 30.0, 31.0, 100.0, 3600.0, 36000.0] {
-            for mem in [None, Some(5e8), Some(2e9), Some(2e10)] {
-                for cpu in [0.5, 1.5, 2.0, 4.0, 8.0, 16.0, 32.0] {
-                    let without_cpu = classify(dur, mem, None, &c);
-                    let with_cpu = classify(dur, mem, Some(cpu), &c);
-                    let idx_without = class_index(without_cpu.as_deref(), &c);
-                    let idx_with = class_index(with_cpu.as_deref(), &c);
-                    assert!(
-                        idx_with >= idx_without,
-                        "cpu-bump went DOWN: dur={dur} mem={mem:?} cpu={cpu} → \
-                         without={without_cpu:?}(idx {idx_without}) \
-                         with={with_cpu:?}(idx {idx_with})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn classify_overflow_duration_picks_largest() {
-        let c = classes();
-        // 10 hours > every cutoff. Goes to largest, not None.
-        // Returning None would strand slow builds forever.
-        assert_eq!(classify(36000.0, None, None, &c).as_deref(), Some("large"));
-    }
-
-    #[test]
-    fn classify_nan_cutoff_does_not_panic() {
-        // main.rs rejects NaN cutoffs at startup with an operator-facing
-        // error. But classify() is still defense-in-depth: total_cmp
-        // puts NaN at the end of the sort (IEEE 754 total order), so a
-        // NaN cutoff acts like "infinite cutoff" — it becomes the
-        // overflow bucket. The important property: no panic.
-        let c = vec![
-            mk_class("normal", 30.0, u64::MAX, None),
-            mk_class("broken", f64::NAN, u64::MAX, None),
-        ];
-        // 10s fits in "normal" → that wins (NaN sorted last).
-        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("normal"));
-        // 100s overflows "normal". The NaN class is "largest" by
-        // total_cmp, so it's the overflow target. `100.0 > NaN` is
-        // false so the duration-fits check at line ~107 passes.
-        assert_eq!(classify(100.0, None, None, &c).as_deref(), Some("broken"));
-    }
-
-    #[test]
-    fn classify_unsorted_config() {
-        // Operator might list large before small in toml. Sort
-        // internally so order doesn't matter.
-        let c = vec![
-            mk_class("large", 3600.0, u64::MAX, None),
-            mk_class("small", 30.0, u64::MAX, None),
-        ];
-        // 10s must go to small (SMALLEST covering class), not large
-        // (first in config). If we didn't sort, this would pick large.
-        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
     }
 
     /// I-095 regression: a closed-channel executor must NOT be picked.
@@ -1200,7 +716,7 @@ mod tests {
         // Only candidate has a closed channel → no executor.
         let dead = make_worker_closed_stream("dead");
         let map = workers_map(vec![dead]);
-        assert_eq!(best_executor(&map, &drv, None), None);
+        assert_eq!(best_executor(&map, &drv), None);
 
         // Closed + live → live is picked. Loop to guard against
         // accidental ordering-dependence (HashMap iteration).
@@ -1208,15 +724,7 @@ mod tests {
             let dead = make_worker_closed_stream("dead");
             let live = make_worker("live", 0);
             let map = workers_map(vec![dead, live]);
-            assert_eq!(best_executor(&map, &drv, None).as_deref(), Some("live"));
+            assert_eq!(best_executor(&map, &drv).as_deref(), Some("live"));
         }
-    }
-
-    #[test]
-    fn cutoff_for_lookup() {
-        let c = classes();
-        assert_eq!(cutoff_for("small", &c), Some(30.0));
-        assert_eq!(cutoff_for("large", &c), Some(3600.0));
-        assert_eq!(cutoff_for("nonexistent", &c), None);
     }
 }

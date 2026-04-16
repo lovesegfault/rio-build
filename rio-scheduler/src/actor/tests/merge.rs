@@ -470,8 +470,7 @@ async fn test_fixed_ca_fod_path_based_lane(
     #[case] expect_cached: u32,
 ) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut fetcher_rx =
-        connect_fetcher_classed(&handle, "f-ca-fod", "x86_64-linux", "tiny").await?;
+    let mut fetcher_rx = connect_fetcher(&handle, "f-ca-fod", "x86_64-linux").await?;
 
     let fod_out = test_store_path("ca-fod-out");
     if substitutable {
@@ -1667,9 +1666,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
 #[tokio::test]
 async fn merge_hydrates_resource_floor_from_db() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
-    });
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, _| {});
 
     // Pre-seed: prior run promoted this FOD to floor.mem=8GiB, then
     // went terminal. New build re-merges it; ON CONFLICT RETURNING

@@ -62,7 +62,6 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             supported_features: vec![],
             running_build: None,
             resources: None,
-            size_class: String::new(),
             store_degraded: false,
             draining: false,
             intent_id: String::new(),

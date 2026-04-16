@@ -28,11 +28,11 @@ pub(super) fn labels(wp: &BuilderPool) -> BTreeMap<String, String> {
 }
 
 /// Convert `BuilderPool` → `ExecutorPodParams`. The builder-specific
-/// tuning knobs (size_class, daemon_timeout, fuse_passthrough)
-/// become `extra_env` entries — keeps them out of the shared params
-/// struct where the fetcher reconciler would have to supply dummies.
+/// tuning knobs (daemon_timeout, fuse_passthrough) become `extra_env`
+/// entries — keeps them out of the shared params struct where the
+/// fetcher reconciler would have to supply dummies.
 fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
-    let mut extra_env = vec![pod::env("RIO_SIZE_CLASS", &wp.spec.size_class)];
+    let mut extra_env = vec![];
     if let Some(p) = wp.spec.fuse_passthrough {
         extra_env.push(pod::env(
             "RIO_FUSE_PASSTHROUGH",

@@ -237,7 +237,6 @@ pub async fn setup(
         systems: systems.to_vec(),
         // move: setup() has no further use for features.
         features,
-        size_class: cfg.size_class.clone(),
         intent_id: cfg.intent_id.clone(),
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),

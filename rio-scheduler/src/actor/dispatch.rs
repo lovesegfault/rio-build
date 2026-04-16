@@ -1,5 +1,4 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
-// r[impl sched.overflow.up-only]
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -30,11 +29,9 @@ struct DispatchTickCtx {
     /// elapsed, no eligible worker, or assignment send failed).
     /// Re-pushed onto the ready queue at end of each cycle.
     deferred: Vec<DrvHash>,
-    /// Per-TARGET-class deferral counts (operator gauge).
-    class_deferred: HashMap<String, u64>,
-    /// FOD deferral count. Separate from `class_deferred` — fetchers
-    /// aren't size-classed (ADR-019).
-    fod_deferred: u64,
+    /// Per-kind deferral counts (operator gauge:
+    /// `rio_scheduler_queue_depth{kind}`).
+    kind_deferred: HashMap<rio_proto::types::ExecutorKind, u64>,
     /// Ready drvs whose `system` is advertised by ZERO registered
     /// executors of the matching kind. Per-system count → gauge + a
     /// single WARN on first observation (operator action: add a pool).
@@ -58,16 +55,17 @@ enum DispatchOutcome {
 /// I-025 freeze detector: state machine that WARNs when derivations are
 /// queued but zero streams of the matching kind exist for >60s.
 ///
-/// The scheduler already surfaces this via metrics (`fod_queue_depth` +
-/// `fetcher_utilization`), but metrics need a port-forward. A WARN lands
-/// in `kubectl logs`. QA I-025: 20-minute freeze with zero ERROR/WARN is
-/// operator-hostile — the scheduler knew, it just didn't say.
+/// The scheduler already surfaces this via the `_queue_depth{kind}` and
+/// `_utilization{kind}` gauges, but metrics need a port-forward. A WARN
+/// lands in `kubectl logs`. QA I-025: 20-minute freeze with zero
+/// ERROR/WARN is operator-hostile — the scheduler knew, it just didn't
+/// say.
 ///
 /// Rate-limit: `since` is reset on each WARN so we emit once/minute, not
 /// once/dispatch-pass (~once/tick = every 10s would spam).
 ///
 /// Free function (not `&mut self`) so the call site can borrow
-/// `&mut self.fod_freeze_since` while also reading `self.executors`.
+/// `&mut self.freeze_since[kind]` while also reading `self.executors`.
 fn check_freeze(
     since: &mut Option<Instant>,
     frozen: bool,
@@ -203,7 +201,7 @@ impl DagActor {
         }
         phase!("1-drain-loop");
 
-        self.publish_dispatch_gauges(ctx.class_deferred, ctx.fod_deferred, ctx.unroutable_systems);
+        self.publish_dispatch_gauges(ctx.kind_deferred, ctx.unroutable_systems);
         phase!("2-gauges");
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -219,7 +217,7 @@ impl DagActor {
     }
 
     /// One iteration of the dispatch drain loop: stale guards, backoff
-    /// check, classify, FOD store short-circuit, executor placement,
+    /// check, SLA solve, store short-circuit, executor placement,
     /// assign or defer or poison. Mutates `ctx` for deferral/count
     /// accumulators; returns whether progress was made (drives the
     /// outer `dispatched_any` cycle).
@@ -249,26 +247,17 @@ impl DagActor {
             return DispatchOutcome::NoProgress;
         }
 
-        // Classify by estimated duration + memory + CPU. None
-        // if size_classes unconfigured (optional feature off —
-        // no filter, all workers candidates).
-        //
-        // Also compute the SLA-solved memory for the resource-fit
+        // SLA-solved (cores, mem, disk, deadline) for the resource-fit
         // filter (`r[sched.assign.resource-fit]`): same
         // `solve_intent_for` the snapshot uses, so the controller
-        // spawns and dispatch accepts the SAME shape.
+        // spawns and dispatch accepts the SAME shape. D2: FODs go
+        // through the identical pipeline — the `hard_filter` kind gate
+        // routes them to fetchers.
         //
-        // `is_fixed_output` is captured into a local so the
-        // `state` borrow ends here — `node_mut` below needs
-        // exclusive access to `self.dag`.
-        //
-        // Read guard is dropped at the end of this block —
-        // BEFORE `assign_to_worker().await`. parking_lot
-        // guards aren't `Send`; the await point would be a
-        // compile error anyway, but keeping the scope tight
-        // is defensive.
+        // `is_fixed_output` is captured into a local so the `state`
+        // borrow ends here — `node_mut` below needs exclusive access
+        // to `self.dag`.
         let (
-            target_class,
             est_cores,
             est_memory_bytes,
             est_disk_bytes,
@@ -278,57 +267,22 @@ impl DagActor {
             system,
         ) = {
             let pname = state.pname.as_deref();
-            let system = &state.system;
-            let classes = self.sizing.size_classes.read();
-            // Phase 6 deletes the whole classify() block; until then
-            // (None, None) degrades it to duration-only.
-            let target_class =
-                crate::assignment::classify(state.sched.est_duration, None, None, &classes);
-            // Skip for FODs: probe defaults (8 GiB) would reject
-            // 2 GiB fetchers. I-062: 5 recurrences of fod_queue=2 +
-            // fetcher_util=0 before the per-clause diagnostic exposed
-            // this. FOD memory is the download buffer, not a compile
-            // heap; resource-fit is the wrong gate.
-            //
-            // Skip when SpawnIntent emission is inactive: the symmetry
-            // argument ("controller spawns and dispatch accepts the
-            // SAME shape") only holds when the controller actually
-            // receives intents and runs `apply_intent_resources`.
-            // `compute_spawn_intents` emits intents iff
-            // `sla_config.is_some()` (Static-mode gate). With it
-            // false the
-            // controller takes the `spawn_n` path (jobs.rs:244
-            // `intents.is_empty()`) → fixed per-class `spec.resources`
-            // → a cold-start `solve_intent_for` probe (12 GiB at helm
-            // defaults) makes the resource-fit gate reject every
-            // smaller worker. vm-lifecycle-recovery / vm-le-build-k3s
-            // 2 GiB `tiny` pool flaked (not deterministic — gate passes
-            // when `w.last_resources` is still None from the cgroup-
-            // poll-vs-first-heartbeat race). The pre-ADR-023 path
-            // (`bucketed_estimate`) returned None on cold start.
-            let (est_cores, est_memory_bytes, est_disk_bytes, est_deadline_secs, sla_predicted) =
-                if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
-                    (None, None, None, None, None)
-                } else {
-                    let (cores, mem, disk, deadline, pred, _) = self.solve_intent_for(pname, state);
-                    (Some(cores), Some(mem), Some(disk), Some(deadline), pred)
-                };
+            let (cores, mem, disk, deadline, pred, _) = self.solve_intent_for(pname, state);
             (
-                target_class,
-                est_cores,
-                est_memory_bytes,
-                est_disk_bytes,
-                est_deadline_secs,
-                sla_predicted,
+                Some(cores),
+                Some(mem),
+                Some(disk),
+                Some(deadline),
+                pred,
                 state.is_fixed_output,
-                system.clone(),
+                state.system.clone(),
             )
         };
 
         // Write the estimate onto the state BEFORE placement
-        // so `hard_filter` (via find_executor_with_overflow →
-        // best_executor) reads the fresh value. Refreshed each
-        // dispatch pass — picks up estimator Tick updates.
+        // so `hard_filter` (via find_executor → best_executor)
+        // reads the fresh value. Refreshed each dispatch pass —
+        // picks up estimator Tick updates.
         if let Some(state) = self.dag.node_mut(&drv_hash) {
             state.sched.est_cores = est_cores;
             state.sched.est_memory_bytes = est_memory_bytes;
@@ -366,31 +320,10 @@ impl DagActor {
             return DispatchOutcome::Progressed;
         }
 
-        // Try target class first, then overflow to larger
-        // classes if no worker in target has capacity. A
-        // "small" build CAN go to a "large" worker (just
-        // wasteful); a "large" build CANNOT go to "small"
-        // (would under-provision). So overflow walks UP only.
-        let (eligible_worker, chosen_class) =
-            self.find_executor_with_overflow(&drv_hash, target_class.as_deref());
-
-        match eligible_worker {
+        // Intent-match (worker spawned FOR this drv) first, else
+        // best_executor over the kind-matching pool.
+        match self.find_executor(&drv_hash) {
             Some(executor_id) => {
-                // Record what class we ACTUALLY routed to (may
-                // be larger than target if we overflowed).
-                // Misclassification detector reads this at
-                // completion time.
-                if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    state.sched.assigned_size_class = chosen_class.clone();
-                }
-                if let Some(class) = &chosen_class {
-                    metrics::counter!(
-                        "rio_scheduler_size_class_assignments_total",
-                        "class" => class.clone()
-                    )
-                    .increment(1);
-                }
-
                 if self.assign_to_worker(&drv_hash, &executor_id).await {
                     ctx.n_assigned += 1;
                     DispatchOutcome::Progressed
@@ -404,7 +337,7 @@ impl DagActor {
                 }
             }
             None => {
-                // No eligible worker (even with overflow).
+                // No eligible worker.
                 //
                 // I-065: if EVERY currently-registered worker of
                 // the matching kind is in failed_builders, this
@@ -423,6 +356,11 @@ impl DagActor {
                     self.poison_and_cascade(&drv_hash).await;
                     return DispatchOutcome::NoProgress;
                 }
+                let want_kind = if is_fixed_output {
+                    rio_proto::types::ExecutorKind::Fetcher
+                } else {
+                    rio_proto::types::ExecutorKind::Builder
+                };
                 // I-056: distinguish "no capacity right now" (defer,
                 // autoscaler handles it) from "no pool advertises this
                 // system at all" (operator action — add the pool or
@@ -431,16 +369,8 @@ impl DagActor {
                 if !self.any_executor_advertises_system(&system, is_fixed_output) {
                     *ctx.unroutable_systems.entry(system).or_insert(0) += 1;
                 }
-                // Defer and track by TARGET class (not chosen —
-                // chosen is None when there's no eligible).
-                // FODs tracked separately: they have no class,
-                // and the operator action is "scale fetchers"
-                // not "scale class X builders".
-                if is_fixed_output {
-                    ctx.fod_deferred += 1;
-                } else if let Some(class) = &target_class {
-                    *ctx.class_deferred.entry(class.clone()).or_insert(0) += 1;
-                }
+                // Defer and track by kind.
+                *ctx.kind_deferred.entry(want_kind).or_insert(0) += 1;
                 // I-056-style per-clause diagnostic: when there ARE
                 // registered workers of the right kind but none
                 // eligible, the freeze detectors above don't fire
@@ -451,11 +381,6 @@ impl DagActor {
                 // the .map().collect() allocates per-tick; if that
                 // becomes a problem, gate on a counter.
                 if let Some(state) = self.dag.node(&drv_hash) {
-                    let want_kind = if is_fixed_output {
-                        rio_proto::types::ExecutorKind::Fetcher
-                    } else {
-                        rio_proto::types::ExecutorKind::Builder
-                    };
                     let reasons: Vec<_> = self
                         .executors
                         .values()
@@ -463,18 +388,13 @@ impl DagActor {
                         .map(|w| {
                             (
                                 w.executor_id.as_ref().to_string(),
-                                crate::assignment::rejection_reason(
-                                    w,
-                                    state,
-                                    target_class.as_deref(),
-                                ),
+                                crate::assignment::rejection_reason(w, state),
                             )
                         })
                         .collect();
                     if !reasons.is_empty() {
                         tracing::info!(
                             drv_hash = %drv_hash,
-                            target_class = ?target_class,
                             ?reasons,
                             "no eligible executor; per-worker rejection reasons"
                         );
@@ -486,82 +406,62 @@ impl DagActor {
         }
     }
 
-    /// Per-class deferral gauges + FOD queue depth + fetcher
-    /// utilization + I-025 freeze-detector. Snapshot from one dispatch
-    /// pass; next pass overwrites. ALL configured classes are zeroed
-    /// first — gauges PERSIST in Prometheus until overwritten, so a
-    /// class that was backed up (gauge=50) then cleared would stay at
-    /// 50 forever otherwise.
+    /// Per-kind deferral gauges + utilization + I-025 freeze-detector.
+    /// Snapshot from one dispatch pass; next pass overwrites. Both
+    /// kinds emit a value every pass (zero is a legitimate value) so
+    /// Prometheus doesn't persist stale nonzero.
     // r[impl sched.freeze-detector]
     // r[impl sched.dispatch.unroutable-system]
     fn publish_dispatch_gauges(
         &mut self,
-        class_deferred: HashMap<String, u64>,
-        fod_deferred: u64,
+        kind_deferred: HashMap<rio_proto::types::ExecutorKind, u64>,
         unroutable_systems: HashMap<String, u64>,
     ) {
-        for sc in self.sizing.size_classes.read().iter() {
-            metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
-        }
-        // Sum before class_deferred is consumed by the gauge loop below.
-        // Feeds the I-025 builder-freeze check at the end of this fn.
-        let class_total: u64 = class_deferred.values().sum();
-        for (class, count) in class_deferred {
-            metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
-        }
-
-        // FOD queue depth + fetcher utilization (ADR-019 observability).
-        // Zero is a legitimate value (no FODs queued), emitted
-        // explicitly so Prometheus doesn't persist stale nonzero.
-        metrics::gauge!("rio_scheduler_fod_queue_depth").set(fod_deferred as f64);
-        // I-048b: count only is_registered() fetchers. A heartbeat-only
-        // zombie (stream_tx: None — race after scheduler restart, fixed
-        // at the create-side in handle_heartbeat) would inflate `total`
-        // here, hiding the freeze: fod_queue>0 + util=0 + total>0 looks
-        // like "fetchers busy on something else" when really nothing
-        // can dispatch. Filtering by is_registered() makes the freeze
-        // detector below fire on genuine no-stream-connected.
-        let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
-            if e.kind == rio_proto::types::ExecutorKind::Fetcher && e.is_registered() {
-                (b + u32::from(e.running_build.is_some()), t + 1)
+        use rio_proto::types::ExecutorKind;
+        for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
+            let label = kind.as_str_name();
+            let queued = kind_deferred.get(&kind).copied().unwrap_or(0);
+            metrics::gauge!("rio_scheduler_queue_depth", "kind" => label).set(queued as f64);
+            // I-048b: count only is_registered() executors. A heartbeat-
+            // only zombie (stream_tx: None — race after scheduler
+            // restart, fixed at the create-side in handle_heartbeat)
+            // would inflate `total` here, hiding the freeze:
+            // queue_depth>0 + util=0 + total>0 looks like "busy on
+            // something else" when really nothing can dispatch.
+            // Filtering by is_registered() makes the freeze detector
+            // below fire on genuine no-stream-connected.
+            let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
+                if e.kind == kind && e.is_registered() {
+                    (b + u32::from(e.running_build.is_some()), t + 1)
+                } else {
+                    (b, t)
+                }
+            });
+            // No executors of this kind → emit 0.0 (not NaN). An
+            // operator seeing queue_depth > 0 AND utilization == 0
+            // with no executors registered knows the pool isn't
+            // deployed.
+            let util = if total > 0 {
+                f64::from(busy) / f64::from(total)
             } else {
-                (b, t)
-            }
-        });
-        // No fetchers → emit 0.0 (not NaN). An operator seeing
-        // fod_queue_depth > 0 AND fetcher_utilization == 0 with no
-        // fetchers registered knows the FetcherPool isn't deployed.
-        let util = if total > 0 {
-            f64::from(busy) / f64::from(total)
-        } else {
-            0.0
-        };
-        metrics::gauge!("rio_scheduler_fetcher_utilization").set(util);
+                0.0
+            };
+            metrics::gauge!("rio_scheduler_utilization", "kind" => label).set(util);
 
-        // I-025 freeze detector: WARN if queue pressure + zero streams >60s.
-        check_freeze(
-            &mut self.fod_freeze_since,
-            fod_deferred > 0 && total == 0,
-            "fetcher",
-            fod_deferred,
-            total as usize,
-        );
-        let builder_stream_count = self
-            .executors
-            .values()
-            .filter(|e| e.kind == rio_proto::types::ExecutorKind::Builder && e.is_registered())
-            .count();
-        check_freeze(
-            &mut self.builder_freeze_since,
-            class_total > 0 && builder_stream_count == 0,
-            "builder",
-            class_total,
-            builder_stream_count,
-        );
+            // I-025 freeze detector: WARN if queue pressure + zero
+            // streams >60s.
+            check_freeze(
+                self.freeze_since.entry(kind).or_insert(None),
+                queued > 0 && total == 0,
+                label,
+                queued,
+                total as usize,
+            );
+        }
 
         // Unroutable-system gauge + edge-triggered WARN. Zero stale
-        // labels first (same persist-until-overwritten reason as
-        // class_queue_depth above), then set this pass's counts.
+        // labels first (gauges PERSIST in Prometheus until
+        // overwritten), then set this pass's counts.
         for sys in self.unroutable_warned.iter() {
             metrics::gauge!("rio_scheduler_unroutable_ready", "system" => sys.clone()).set(0.0);
         }
@@ -586,7 +486,7 @@ impl DagActor {
     }
 
     /// Any registered executor of the matching kind advertises
-    /// `system`. Ignores busy/warm/class — distinguishes "no capacity
+    /// `system`. Ignores busy/warm — distinguishes "no capacity
     /// right now" (transient, autoscaler handles it) from "no such
     /// pool exists" (operator action; the I-056 silent-stuck case).
     fn any_executor_advertises_system(&self, system: &str, is_fixed_output: bool) -> bool {
@@ -1102,8 +1002,6 @@ impl DagActor {
         }
     }
 
-    /// Find a worker for this derivation, starting at `target_class` and
-    /// overflowing to progressively larger classes if needed.
     /// I-065: has `failed_builders` excluded EVERY currently-registered
     /// worker of the matching kind?
     ///
@@ -1162,21 +1060,11 @@ impl DagActor {
         exhausted
     }
 
-    ///
-    /// Returns `(executor_id, class_actually_used)`. Both None if nobody
-    /// can take it (wrong system, all full, no workers).
-    ///
-    /// Overflow direction: small → large only. A slow build on a small
-    /// worker would dominate that worker's single slot; a fast build on
-    /// a large worker is just slightly wasteful. scheduler.md:178.
-    fn find_executor_with_overflow(
-        &self,
-        drv_hash: &DrvHash,
-        target_class: Option<&str>,
-    ) -> (Option<ExecutorId>, Option<String>) {
-        let Some(drv_state) = self.dag.node(drv_hash) else {
-            return (None, None);
-        };
+    /// Find a worker for this derivation: intent-match (ADR-023)
+    /// first, else `best_executor` over the kind-matching pool. `None`
+    /// if nobody can take it (wrong system, all full, no workers).
+    fn find_executor(&self, drv_hash: &DrvHash) -> Option<ExecutorId> {
+        let drv_state = self.dag.node(drv_hash)?;
 
         // r[impl sched.sla.intent-match]
         // ADR-023: a worker that heartbeated `intent_id == drv_hash` was
@@ -1192,86 +1080,15 @@ impl DagActor {
                 && w.has_capacity()
                 && w.can_build(&drv_state.system, &drv_state.required_features)
         }) {
-            return (Some(w.executor_id.clone()), w.size_class.clone());
+            return Some(w.executor_id.clone());
         }
 
-        // r[impl sched.dispatch.no-fod-fallback]
-        // r[impl sched.fod.size-class-reactive]
-        // FOD overflow walks FETCHER classes only (I-170) — never the
-        // builder size_classes chain below. If no fetcher class has a
-        // free executor the FOD queues; the scheduler NEVER sends a
-        // FOD to a builder under pressure (kind-mismatch in
-        // hard_filter is the absolute boundary). A queued FOD is
-        // preferable to a builder with internet access.
-        //
-        // D4: class-name `size_class_floor` removed; the reactive
-        // `resource_floor` is applied inside `solve_intent_for`.
-        // Phase 6 (D2) deletes this whole FOD branch — FODs go through
-        // the same intent-match path as builds. Empty config = no
-        // class filter (original behavior).
-        if drv_state.is_fixed_output {
-            if self.sizing.fetcher_classes.is_empty() {
-                let w = crate::assignment::best_executor(&self.executors, drv_state, None);
-                return (w, None);
-            }
-            for class in &self.sizing.fetcher_classes {
-                if let Some(w) =
-                    crate::assignment::best_executor(&self.executors, drv_state, Some(class))
-                {
-                    return (Some(w), Some(class.clone()));
-                }
-            }
-            return (None, None);
-        }
-
-        // No classification configured → single best_executor call with
-        // no filter. Fast path for deployments without size-classes.
-        let Some(target) = target_class else {
-            let w = crate::assignment::best_executor(&self.executors, drv_state, None);
-            return (w, None);
-        };
-
-        // Build the overflow chain: target class, then all classes with
-        // cutoff > target's cutoff, sorted ascending. If target cutoff
-        // is 30s, chain is [small(30), medium(300), large(3600)].
-        //
-        // We don't cache this chain because classify() is called fresh
-        // per-dispatch anyway (est_duration can change between ticks
-        // via estimator refresh) and the sort is 2-4 elements.
-        //
-        // Read guard lives through the chain walk — no `.await` in
-        // this fn, so it's safe. best_executor is sync.
-        let classes = self.sizing.size_classes.read();
-        // r[impl sched.builder.size-class-reactive]
-        // D4: class-name `size_class_floor` clamp removed; the
-        // reactive `resource_floor` is applied inside
-        // `solve_intent_for` (mem/disk bytes) which feeds
-        // `est_memory_bytes` for `hard_filter`'s resource-fit gate.
-        // Phase 6 deletes this whole overflow chain.
-        let start_cutoff = crate::assignment::cutoff_for(target, &classes);
-        let mut chain: Vec<(&str, f64)> = classes
-            .iter()
-            .filter(|c| {
-                // Target itself (== cutoff) or larger, raised to
-                // floor. start_cutoff=None shouldn't happen (target
-                // came FROM classify which reads the same config)
-                // but be defensive: if None, include everything.
-                start_cutoff.is_none_or(|t| c.cutoff_secs >= t)
-            })
-            .map(|c| (c.name.as_str(), c.cutoff_secs))
-            .collect();
-        chain.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        // Walk the chain: first class with an available worker wins.
-        for (class, _) in chain {
-            if let Some(w) =
-                crate::assignment::best_executor(&self.executors, drv_state, Some(class))
-            {
-                return (Some(w), Some(class.to_string()));
-            }
-        }
-
-        (None, None)
+        // D2: builds and FODs share this path. The kind boundary in
+        // `hard_filter` (`r[sched.dispatch.fod-to-fetcher]`) routes
+        // FODs to fetcher executors and non-FODs to builders; the
+        // resource-fit clause (fed by `est_memory_bytes` ←
+        // `solve_intent_for` ← `resource_floor`) handles sizing.
+        crate::assignment::best_executor(&self.executors, drv_state)
     }
 
     /// Transition a derivation to Assigned and send it to the worker.

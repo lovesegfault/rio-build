@@ -69,10 +69,6 @@ let
   slaSizingFixture = standalone {
     workers = {
       worker = {
-        # cost-solve adds [[size_classes]]; with classes configured,
-        # dispatch hard-rejects workers that don't declare one
-        # (rejection_reason = "size-class-undeclared").
-        sizeClass = "default";
         extraServiceEnv = {
           RIO_BUILDER_SCRIPT = "${./fixtures/sla-builder-script.toml}";
         };
@@ -102,15 +98,6 @@ let
         cpu = 4
         mem_per_core = 2147483648
         mem_base = 4294967296
-
-        # cost-solve / ice-backoff observe SpawnIntent.node_selector
-        # via GetSpawnIntents. Intent emission is gated on [sla] (set
-        # above). [[size_classes]] kept until Phase 6 deletes the
-        # config key.
-        [[size_classes]]
-        name = "default"
-        cutoff_secs = 86400.0
-        mem_limit_bytes = 274877906944
       '';
     };
     extraPackages = [
@@ -135,13 +122,11 @@ let
       # wopSetOptions (protocol 1.38) — client --max-silent-time cannot
       # propagate to the gateway.
       wsmall1 = {
-        sizeClass = "small";
         extraServiceEnv = {
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
       wsmall2 = {
-        sizeClass = "small";
         extraServiceEnv = {
           # Non-passthrough FUSE: exercises open_files tracking,
           # userspace read(), release(). fuse/ops.rs read() at 33%
@@ -152,7 +137,6 @@ let
         };
       };
       wlarge = {
-        sizeClass = "large";
         extraServiceEnv = {
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
@@ -160,17 +144,6 @@ let
     };
     extraSchedulerConfig = {
       tickIntervalSecs = 2;
-      extraConfig = ''
-        [[size_classes]]
-        name = "small"
-        cutoff_secs = 60.0
-        mem_limit_bytes = 17179869184
-
-        [[size_classes]]
-        name = "large"
-        cutoff_secs = 3600.0
-        mem_limit_bytes = 68719476736
-      '';
     };
     extraStoreConfig = {
       extraConfig = ''
@@ -478,7 +451,7 @@ in
           # setOptions() call runs regardless).
           "setoptions-unreachable"
           "cancel-timing"
-          # r[verify sched.builder.size-class-reactive]
+          # r[verify sched.sla.reactive-floor]
           "reassign"
           # r[verify obs.metric.scheduler]
           # r[verify obs.metric.builder]

@@ -220,8 +220,8 @@ async fn cmd_run(
                     let m = crate::k8s::status::gather_scheduler_metrics(&client)
                         .await
                         .map(|m| format!(
-                            "queued={} fod_q={} util={:.2}",
-                            m.derivations_queued, m.fod_queue_depth, m.fetcher_utilization
+                            "queued={} fetcher_q={} fetcher_util={:.2}",
+                            m.derivations_queued, m.fetcher_queue_depth, m.fetcher_utilization
                         ))
                         .unwrap_or_else(|| "(metrics unavailable)".into());
                     eprintln!("{} alive={alive}/{parallel}  {}", style("·").dim(), style(m).dim());

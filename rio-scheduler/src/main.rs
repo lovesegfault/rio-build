@@ -162,13 +162,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Spawn the DAG actor with the shared leader state. Poison +
-    // retry + size_classes come from scheduler.toml (or
-    // `#[serde(default)]` if absent — same behavior unless the
-    // operator writes a `[poison]` / `[retry]` table).
+    // retry come from scheduler.toml (or `#[serde(default)]` if
+    // absent — same behavior unless the operator writes a `[poison]`
+    // / `[retry]` table).
     let actor = ActorHandle::spawn(
         db.clone(),
         rio_scheduler::actor::DagActorConfig {
-            size_classes: cfg.size_classes,
             soft_features: cfg.soft_features,
             poison: cfg.poison,
             retry_policy: cfg.retry,

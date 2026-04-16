@@ -674,7 +674,7 @@ fn job_pod_env_vars() {
         Some(&"store-headless"),
         "balance host injected when ctx.store.balance_host is Some"
     );
-    assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
+    assert_eq!(envs.get("RIO_SIZE_CLASS"), None);
     // systems + features: comma-sep strings. fixture wp has
     // systems=["x86_64-linux"], features=["kvm"]. CRD defines
     // them → reconciler passes them as env → worker's comma_vec

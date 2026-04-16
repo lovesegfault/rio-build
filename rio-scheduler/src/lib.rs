@@ -36,11 +36,11 @@ pub mod state;
 
 // Re-export for main.rs — `assignment` is pub(crate) but the config struct
 // is part of the binary's TOML schema.
-pub use assignment::{SizeClassConfig, SoftFeature};
+pub use assignment::SoftFeature;
 // Same pattern for PoisonConfig + RetryPolicy: main.rs's `Config`
 // struct embeds them as `#[serde(default)]` sub-tables. `state` IS
-// pub, but the re-export keeps main.rs's imports uniform with
-// `SizeClassConfig` (crate-root path, no deep-module reach-in).
+// pub, but the re-export keeps main.rs's imports uniform
+// (crate-root path, no deep-module reach-in).
 pub use state::{PoisonConfig, RetryPolicy};
 // Default for main.rs Config's `#[serde(default = ...)]` fn.
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
@@ -296,18 +296,11 @@ pub fn describe_metrics() {
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"
     );
-    describe_counter!(
-        "rio_scheduler_size_class_assignments_total",
-        "Assignments per size class (labeled by class name)"
-    );
     describe_gauge!(
-        "rio_scheduler_class_queue_depth",
-        "Deferred derivations per target class (snapshot per dispatch pass)"
-    );
-    describe_gauge!(
-        "rio_scheduler_fod_queue_depth",
-        "FODs deferred waiting for a fetcher (snapshot per dispatch pass). \
-         Sustained nonzero → scale FetcherPool.spec.replicas."
+        "rio_scheduler_queue_depth",
+        "Deferred Ready derivations waiting for an executor of the matching \
+         kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). \
+         Sustained nonzero → scale the matching pool."
     );
     describe_gauge!(
         "rio_scheduler_unroutable_ready",
@@ -317,9 +310,10 @@ pub fn describe_metrics() {
          to a Builder/FetcherPool's `systems` list."
     );
     describe_gauge!(
-        "rio_scheduler_fetcher_utilization",
-        "Fraction of fetchers currently running a build (busy/total). \
-         Emitted per dispatch pass alongside fod_queue_depth."
+        "rio_scheduler_utilization",
+        "Fraction of executors currently running a build (busy/total; labeled \
+         by kind=builder|fetcher). Emitted per dispatch pass alongside \
+         queue_depth."
     );
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",

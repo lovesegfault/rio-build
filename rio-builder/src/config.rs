@@ -133,14 +133,6 @@ pub struct Config {
     /// in every heartbeat so the scheduler can match this pod to its
     /// pre-computed assignment. Empty = Static-sized pod (no intent).
     pub intent_id: String,
-    /// Size-class this builder is deployed as. Empty = unclassified.
-    /// If the scheduler has size_classes configured, unclassified
-    /// builders are REJECTED (misconfiguration — set this). Operator
-    /// sets it to match the scheduler's size_classes config — e.g.
-    /// "small" builders on cheap spot instances, "large" on
-    /// memory-optimized. The scheduler routes by estimated duration;
-    /// this just declares which bucket this builder serves.
-    pub size_class: String,
     /// Timeout (seconds) for the local nix-daemon subprocess build when
     /// the client didn't specify BuildOptions.build_timeout. Intentionally
     /// long (2h default) — some builds genuinely take that long; this is
@@ -206,7 +198,6 @@ impl Default for Config {
             node_name: String::new(),
             hw_class: String::new(),
             intent_id: String::new(),
-            size_class: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
@@ -307,11 +298,6 @@ pub struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_size_limit: Option<u64>,
-
-    /// Size-class (matches scheduler config; e.g. "small", "large")
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size_class: Option<String>,
 
     /// Daemon build timeout seconds (default: 7200)
     #[arg(long)]

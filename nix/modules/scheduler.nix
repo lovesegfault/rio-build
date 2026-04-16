@@ -54,14 +54,12 @@ in
       description = ''
         Extra TOML appended to `/etc/rio/scheduler.toml`. figment reads
         this with lower precedence than env vars and CLI. Use for nested
-        config that doesn't map to env vars (e.g. `[[size_classes]]`
-        arrays). Example:
+        config that doesn't map to env vars (e.g. `[sla]` tables).
+        Example:
 
             extraConfig = ${"''"}
-              [[size_classes]]
-              name = "small"
-              cutoff_secs = 30.0
-              mem_limit_bytes = 1073741824
+              [sla]
+              default_tier = "best-effort"
             ${"''"};
       '';
     };
@@ -108,7 +106,7 @@ in
 
   config = lib.mkIf cfg.enable {
     # TOML config for settings that don't map to flat env vars (nested
-    # arrays like size_classes). figment layers: compiled defaults <
+    # arrays like [sla.tiers]). figment layers: compiled defaults <
     # /etc/rio/scheduler.toml < RIO_* env < CLI. So env vars above
     # still override anything here.
     environment.etc."rio/scheduler.toml" = lib.mkIf (cfg.extraConfig != "") {

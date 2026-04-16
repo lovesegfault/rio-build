@@ -762,15 +762,8 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let classes = ["tiny", "small", "medium", "large", "xlarge"];
+    let names = ["tiny", "small", "medium", "large", "xlarge"];
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[
-            ("tiny", 30.0),
-            ("small", 60.0),
-            ("medium", 90.0),
-            ("large", 120.0),
-            ("xlarge", 150.0),
-        ]);
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
@@ -782,8 +775,8 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         };
     });
     let mut rxs = Vec::new();
-    for c in classes {
-        rxs.push(connect_builder_classed(&handle, &format!("b-{c}"), "x86_64-linux", c).await?);
+    for n in names {
+        rxs.push(connect_builder(&handle, &format!("b-{n}"), "x86_64-linux").await?);
     }
 
     let _ev = merge_single_node(
@@ -806,7 +799,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     // retry_count (transient budget) and infra_count stay 0
     // (promoted=true → exempt_from_cap).
     let mut prev_mem = 0u64;
-    for c in &classes[..4] {
+    for c in &names[..4] {
         handle
             .debug_force_assign("ladder-drv", &format!("b-{c}"))
             .await?;
@@ -835,7 +828,12 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         );
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
-    assert_eq!(prev_mem, 32 << 30, "2GiB → 4→8→16→32 after 4 doublings");
+    // D2: dispatch_ready refreshes est_memory_bytes from
+    // solve_intent_for after each completion (clamped at floor), so
+    // the doubling base picks up the probe default. The loop above
+    // already proved monotone increase + budget exemption; the exact
+    // ladder rungs depend on probe defaults.
+    assert!(prev_mem >= 32 << 30, "≥4 doublings from a 2GiB seed");
 
     // Sanity: a non-OOM InfrastructureFailure does NOT bump
     // (the over-broad I-199 promote is gone).
@@ -1054,7 +1052,6 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 120.0), ("medium", 600.0)]);
         // 2 retries → walks tiny→small, small→medium, then terminal on 3rd TimedOut.
         c.retry_policy = crate::RetryPolicy {
             max_timeout_retries: 2,
@@ -1064,9 +1061,9 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
 
     // D4: bump_floor_or_count reads est_deadline_secs as the doubling
     // base; class is irrelevant.
-    let _t = connect_builder_classed(&handle, "to-tiny", "x86_64-linux", "tiny").await?;
-    let _s = connect_builder_classed(&handle, "to-small", "x86_64-linux", "small").await?;
-    let _m = connect_builder_classed(&handle, "to-medium", "x86_64-linux", "medium").await?;
+    let _t = connect_builder(&handle, "to-tiny", "x86_64-linux").await?;
+    let _s = connect_builder(&handle, "to-small", "x86_64-linux").await?;
+    let _m = connect_builder(&handle, "to-medium", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "i200-timeout";
@@ -1119,7 +1116,13 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "TimedOut is not per-worker — failed_builders stays empty"
     );
 
-    // ── Retry 2: TimedOut on small → floor=medium, status=Ready ────
+    // ── Retry 2: TimedOut on small → floor doubled again, Ready ────
+    // D2: dispatch_ready (triggered by completion above) overwrote
+    // est_deadline_secs from solve_intent_for. Re-seed to keep the
+    // doubling base under test control.
+    handle
+        .debug_seed_sched_hint(drv_hash, None, None, Some(600), None)
+        .await?;
     let ok = handle.debug_force_assign(drv_hash, "to-small").await?;
     assert!(ok, "force-assign small should succeed");
     complete_failure(
@@ -1144,8 +1147,10 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
 
     // ── Cap exhausted: 3rd TimedOut on medium → terminal Cancelled ──
     // Floor still promoted (promote happens before cap check) so an
-    // explicit resubmit would start at the next class — but there IS
-    // no next class (medium is largest), so floor stays at medium.
+    // explicit resubmit would start higher.
+    handle
+        .debug_seed_sched_hint(drv_hash, None, None, Some(1200), None)
+        .await?;
     let ok = handle.debug_force_assign(drv_hash, "to-medium").await?;
     assert!(ok, "force-assign medium should succeed");
     complete_failure(

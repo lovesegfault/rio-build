@@ -211,7 +211,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
   - **Builders** (`rio-builders` namespace) are airgapped — egress to CoreDNS, rio-scheduler, rio-store only. No internet, no proxy. See `r[builder.netpol.airgap]`.
   - **Fetchers** (`rio-fetchers` namespace) get egress to `0.0.0.0/0` on ports 80/443, **minus** RFC1918, link-local, and loopback. See `r[fetcher.netpol.egress-open]`.
   - The FOD hash check (`r[builder.fod.verify-hash]`) is the integrity backstop: tampered content fails `verify_fod_hashes()` before upload.
-  - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure (`r[sched.dispatch.no-fod-fallback]`).
+  - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure (`r[sched.dispatch.fod-to-fetcher]`).
 - **Formerly:** the Squid `fod-proxy` with domain allowlisting. Deleted in ADR-019 — the hash check is sufficient; a domain allowlist adds operational friction for marginal gain.
 
 ### Log Injection
