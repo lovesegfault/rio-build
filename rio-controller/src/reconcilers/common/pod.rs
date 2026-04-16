@@ -182,19 +182,23 @@ pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
     ])
 }
 
-/// Map a single-arch nix `systems` list to a `kubernetes.io/arch`
-/// nodeSelector value. `None` when the list is empty, multi-arch, or
-/// `builtin`-only — those pools deliberately float across arches and
-/// rely on rio-builder's startup arch check (I-098 part B) instead.
+/// Map a nix `systems` list to the `kubernetes.io/arch` nodeSelector value
+/// of a *host* that can run all of them natively. `None` when the list is
+/// empty, spans incompatible host arches, or is `builtin`-only — those
+/// pools deliberately float and rely on rio-builder's startup arch check
+/// (I-098 part B) instead.
+///
+/// 32-bit guest systems map to their 64-bit host (i686→amd64,
+/// armv7l→arm64): a pool advertising `[x86_64-linux, i686-linux]` via
+/// `extra-platforms` must land on amd64, and no cloud provider offers
+/// 386/arm nodes anyway.
 // r[impl ctrl.pod.arch-selector]
 pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str> {
     let mut arch: Option<&'static str> = None;
     for s in systems {
         let a = match s.split_once('-').map(|(a, _)| a).unwrap_or(s.as_str()) {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            "i686" => "386",
-            "armv7l" | "armv6l" => "arm",
+            "x86_64" | "i686" => "amd64",
+            "aarch64" | "armv7l" | "armv6l" => "arm64",
             "builtin" => continue,
             _ => return None,
         };
@@ -682,8 +686,22 @@ mod tests {
             nix_systems_to_k8s_arch(&s(&["aarch64-linux"])),
             Some("arm64")
         );
-        assert_eq!(nix_systems_to_k8s_arch(&s(&["i686-linux"])), Some("386"));
-        assert_eq!(nix_systems_to_k8s_arch(&s(&["armv7l-linux"])), Some("arm"));
+        // 32-bit guests map to their 64-bit host arch
+        assert_eq!(nix_systems_to_k8s_arch(&s(&["i686-linux"])), Some("amd64"));
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["armv7l-linux"])),
+            Some("arm64")
+        );
+        // r[verify ctrl.pod.arch-selector]
+        // extra-platforms pool: i686 alongside x86_64 → still amd64
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["x86_64-linux", "i686-linux"])),
+            Some("amd64")
+        );
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["aarch64-linux", "armv7l-linux"])),
+            Some("arm64")
+        );
         // builtin is ignored
         assert_eq!(
             nix_systems_to_k8s_arch(&s(&["x86_64-linux", "builtin"])),
@@ -694,6 +712,10 @@ mod tests {
         // multi-arch → no constraint
         assert_eq!(
             nix_systems_to_k8s_arch(&s(&["x86_64-linux", "aarch64-linux"])),
+            None
+        );
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["i686-linux", "aarch64-linux"])),
             None
         );
         // same arch twice (e.g. x86_64-linux + x86_64-darwin) → still constrains

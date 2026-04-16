@@ -211,14 +211,18 @@ active-subtraction and the `r[ctrl.pool.ephemeral-deadline]` backstop
 bound the waste.
 
 r[ctrl.pod.arch-selector]
-When the pool's `spec.systems` resolves to a single CPU architecture,
-the controller MUST inject `kubernetes.io/arch={amd64|arm64|386|arm}`
-into the Job pod's `nodeSelector` (operator-set value wins via
-`or_insert`). Builder-only: fetchers run `builtin` (arch-agnostic) and
-benefit from cheaper nodes. Without this, an `x86_64-linux` pool can
-land on an arm64 node (unconstrained fallback NodePool — I-098),
-register as `x86_64` from `RIO_SYSTEMS`, accept dispatch, and have the
-local nix-daemon refuse the build. Multi-arch and `builtin`-only pools
+When the pool's `spec.systems` resolves to a single *host* CPU
+architecture, the controller MUST inject
+`kubernetes.io/arch={amd64|arm64}` into the Job pod's `nodeSelector`
+(operator-set value wins via `or_insert`). 32-bit guest systems map to
+their 64-bit host (`i686`→`amd64`, `armv7l`/`armv6l`→`arm64`) so an
+`extra-platforms` pool like `[x86_64-linux, i686-linux]` still
+constrains to amd64. Builder-only: fetchers run `builtin`
+(arch-agnostic) and benefit from cheaper nodes. Without this, an
+`x86_64-linux` pool can land on an arm64 node (unconstrained fallback
+NodePool — I-098), register as `x86_64` from `RIO_SYSTEMS`, accept
+dispatch, and have the local nix-daemon refuse the build. Multi-arch
+and `builtin`-only pools
 get no selector and rely on the executor's startup arch check as the
 safety net.
 
