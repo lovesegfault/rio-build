@@ -298,7 +298,6 @@ src/
 ├── admin/
 │   ├── mod.rs         # AdminService impl dispatch
 │   ├── builds.rs      # ListBuilds / GetBuild / CancelBuild
-│   ├── estimator.rs   # GetEstimatorStats: per-drv-name EMA snapshot dump
 │   ├── gc.rs          # TriggerGC
 │   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
 │   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
@@ -327,7 +326,6 @@ src/
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
 ├── estimator.rs       # Duration/memory estimates from build_history
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
-├── rebalancer.rs      # SITA-E adaptive size-class cutoff recompute (hourly pass)
 └── queue.rs           # ReadyQueue: BinaryHeap with lazy invalidation
 ```
 
@@ -512,9 +510,7 @@ src/
 ```
 src/
 ├── main.rs            # clap CLI entry + AdminService client wiring
-├── cutoffs.rs         # `rio cutoffs` — size-class cutoff table (GetSizeClassStatus)
 ├── derivations.rs     # `rio derivations` — actor in-memory DAG snapshot for a build
-├── estimator.rs       # `rio estimator` — per-drv-name EMA dump (GetEstimatorStats)
 ├── gc.rs              # `rio gc` — trigger store GC sweep (AdminService.TriggerGC, server-streaming)
 ├── logs.rs            # `rio logs` — stream build logs for a derivation (GetBuildLogs)
 ├── status.rs          # `rio status` — cluster summary + executor/build rollup
