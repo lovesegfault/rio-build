@@ -19,7 +19,7 @@
 # container at all (instead of mknod-ing a dead 10:232 that fools
 # `test -c /dev/kvm` probes then ENXIOs on open). kvm pods route to
 # .metal via the `rio.build/kvm` nodeSelector (controller-derived
-# from features:[kvm], r[ctrl.builderpool.kvm-device]).
+# from features:[kvm], r[ctrl.pool.kvm-device]).
 #
 # `base_runtime_spec` is the STARTING spec — CRI's spec opts layer on
 # top (`oci.WithSpecFromFile` then `WithProcessCwd`/`WithNamespaces`/…)

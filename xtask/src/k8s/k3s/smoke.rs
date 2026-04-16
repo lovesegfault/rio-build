@@ -41,12 +41,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         ui::step("restart gateway", || chaos::step_restart_gateway(&client)).await?;
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel = ui::step("establish tunnel", || tunnel(LOCAL_PORT)).await?;
-        ui::step("builderpool reconcile", || {
-            chaos::step_builderpoolset_reconciled(&client)
+        ui::step("builder pool reconcile", || {
+            chaos::step_pool_reconciled(&client, crate::k8s::NS_BUILDERS, "x86-64")
         })
         .await?;
-        ui::step("fetcherpool reconcile", || {
-            chaos::step_fetcherpool_reconciled(&client)
+        ui::step("fetcher pool reconcile", || {
+            chaos::step_pool_reconciled(&client, crate::k8s::NS_FETCHERS, "x86-64-fetcher")
         })
         .await?;
         // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces

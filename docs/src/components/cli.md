@@ -41,7 +41,7 @@ All unary admin RPCs go through `rpc()` which applies the retry above and a per-
 | `poison-list` / `poison-clear` | `AdminService.{ListPoisoned,ClearPoison}` | Show/clear derivation poison roots |
 | `cancel-build` | `SchedulerService.CancelBuild` | Force-cancel an active build |
 | `drain-executor` | `AdminService.DrainExecutor` | Mark a worker draining (`--force` reassigns) |
-| `bps` | k8s apiserver (no gRPC) | `BuilderPoolSet` CR get/describe |
+| `pool` | k8s apiserver (no gRPC) | `Pool` CR get/describe |
 | `verify-chunks` | `StoreAdminService.VerifyChunks` | PG↔backend chunk audit |
 | `upstream` | `StoreAdminService.{List,Add,Remove}Upstream` | Per-tenant upstream cache CRUD |
 | `create-tenant` / `list-tenants` | `AdminService.{CreateTenant,ListTenants}` | Tenant CRUD |

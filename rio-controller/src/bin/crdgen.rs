@@ -6,10 +6,8 @@
 //! Write-only here — serializes our own structs.
 
 use kube::CustomResourceExt;
-use rio_crds::builderpool::BuilderPool;
-use rio_crds::builderpoolset::BuilderPoolSet;
 use rio_crds::componentscaler::ComponentScaler;
-use rio_crds::fetcherpool::FetcherPool;
+use rio_crds::pool::Pool;
 
 fn main() {
     // serde_yml does NOT emit the `---` document separator
@@ -18,17 +16,15 @@ fn main() {
     // stricter with multi-doc files — include it before each doc.
     // No trailing newline after the last doc: serde_yml already
     // ends with one, and kustomize chokes on `---\n\n` empty docs.
-    print!("---\n{}", yaml::<BuilderPool>());
-    print!("---\n{}", yaml::<BuilderPoolSet>());
-    print!("---\n{}", yaml::<FetcherPool>());
+    print!("---\n{}", yaml::<Pool>());
     print!("---\n{}", yaml::<ComponentScaler>());
 }
 
 /// Serialize one CRD to YAML. Generic over the kube-derive-
-/// generated struct (BuilderPool, BuilderPoolSet, FetcherPool).
-/// Panics on serialize failure — crdgen is a build-time tool; a
-/// CRD that can't serialize is a compile-surface bug, not a
-/// recoverable runtime condition.
+/// generated struct (Pool, ComponentScaler). Panics on serialize
+/// failure — crdgen is a build-time tool; a CRD that can't
+/// serialize is a compile-surface bug, not a recoverable runtime
+/// condition.
 fn yaml<K: CustomResourceExt>() -> String {
     serde_yml::to_string(&K::crd())
         .unwrap_or_else(|e| panic!("{} CRD serialize: {e}", K::crd_name()))

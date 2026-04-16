@@ -1,0 +1,53 @@
+{{- $root := . -}}
+{{- range .Values.pools }}
+{{- /* Per-entry deep-merged over poolDefaults. mergeOverwrite mutates
+       its first arg, so deepCopy the defaults each iteration. */ -}}
+{{- $p := mergeOverwrite (deepCopy $root.Values.poolDefaults) . -}}
+{{- if $p.enabled }}
+---
+# Pool: one-shot rio-builder Jobs (Builder OR Fetcher mode). The
+# scheduler's GetSpawnIntents returns per-drv (cores,mem,disk); the
+# controller spawns one Job per intent sized accordingly.
+apiVersion: rio.build/v1alpha1
+kind: Pool
+metadata:
+  name: {{ $p.name }}
+  namespace: {{ if eq $p.kind "Fetcher" }}{{ $root.Values.namespaces.fetchers.name }}{{ else }}{{ $root.Values.namespaces.builders.name }}{{ end }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    rio.build/role: {{ $p.kind | lower }}
+spec:
+  kind: {{ required "pool: kind (Builder|Fetcher) required" $p.kind }}
+  image: {{ include "rio.image" (list $root $p.image) }}
+  systems:
+    {{- toYaml (required "pool: systems must be non-empty" $p.systems) | nindent 4 }}
+  features:
+    {{- toYaml ($p.features | default list) | nindent 4 }}
+  {{- with $p.maxConcurrent }}
+  maxConcurrent: {{ . }}
+  {{- end }}
+  {{- with $p.deadlineSeconds }}
+  deadlineSeconds: {{ . }}
+  {{- end }}
+  {{- if ne $p.kind "Fetcher" }}
+  {{- /* CEL forbids these for Fetcher; the reconciler forces ADR-019
+         hardening regardless. Render only for Builder so a Fetcher
+         entry inheriting poolDefaults.{privileged,hostUsers,seccomp}
+         isn't rejected at admission. */}}
+  {{- include "rio.optBool" (list $p "privileged" $p.privileged) | nindent 2 }}
+  {{- include "rio.optBool" (list $p "hostUsers" $p.hostUsers) | nindent 2 }}
+  {{- with $p.seccompProfile }}
+  seccompProfile:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- with $p.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $p.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

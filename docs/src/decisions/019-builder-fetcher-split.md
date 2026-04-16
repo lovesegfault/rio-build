@@ -35,19 +35,11 @@ Split the single worker type into two distinct executor kinds with separate CRDs
 
 `privileged` PSA narrows to the two namespaces that need `CAP_SYS_ADMIN` for FUSE. Control plane drops to `baseline`.
 
-### Two CRDs
+### One CRD, two kinds
 
-r[ctrl.builderpool.reconcile]
+A `Pool{kind=Builder}` lives in `rio-builders`. The reconciler spawns one-shot rio-builder Jobs up to `spec.maxConcurrent` against `GetSpawnIntents{kind=Builder}` (see `r[ctrl.pool.ephemeral]`) and labels pods `rio.build/role: builder`.
 
-`BuilderPool` (renamed `WorkerPool`) lives in `rio-builders`. Same spec as today minus `fodProxyUrl`. The reconciler spawns one-shot rio-builder Jobs up to `spec.maxConcurrent` against scheduler queue depth (see [`r[ctrl.pool.ephemeral]`](../components/controller.md)) and labels pods `rio.build/role: builder`.
-
-r[ctrl.fetcherpool.reconcile]
-
-`FetcherPool` is new, lives in `rio-fetchers`. Minimal spec (`maxConcurrent`, `systems`, `nodeSelector`, `tolerations`, `resources`, optionally `classes[]`). The reconciler spawns one-shot fetcher Jobs up to `spec.maxConcurrent` against `queued_fod_derivations`, labels pods `rio.build/role: fetcher`, and sets stricter `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
-
-Originally this CRD had no size-class on the assumption that fetches are network-bound and not CPU-predictable. I-170 falsified that: fetchers run arbitrary code (the FOD's `builder` script), and a large source unpack + NAR-serialize can OOM a 2Gi pod (chromium-source.drv at medium-mixed-32x). There is still no a-priori signal --- FODs are excluded from `build_samples`, and `outputHash` carries no size information --- so routing is reactive: a FOD that fails on class N retries on class N+1 (`r[sched.fod.size-class-reactive]`). The `FetcherPool.spec.classes[]` field declares the available classes; the scheduler derives the floor-walk ladder from `[[size_classes]]` (fetcher tiers ARE builder tiers --- same five names).
-
-`BuilderPoolSet` (renamed `WorkerPoolSet`) generates size-class `BuilderPool` children per [ADR-015](015-size-class-routing.md). Unchanged semantics; the rename is cosmetic.
+A `Pool{kind=Fetcher}` lives in `rio-fetchers`. The reconciler spawns one-shot fetcher Jobs up to `spec.maxConcurrent` against `GetSpawnIntents{kind=Fetcher}`, labels pods `rio.build/role: fetcher`, and forces ADR-019 hardening (`r[ctrl.pool.fetcher-hardening]`).
 
 ### Scheduler routing
 
@@ -65,7 +57,7 @@ FODs route only to fetchers. Non-FODs route only to builders.
 
 The overflow chain (`find_executor_with_overflow()`) for FODs walks fetcher classes only --- never the builder size-class chain. If no fetcher of any class is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
-The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bounded by `FetcherPool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations` (no duration-EMA).
+The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bounded by `Pool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations` (no duration-EMA).
 
 ### Executor enforcement
 
@@ -100,7 +92,7 @@ Rationale: fetchers face the open internet; the threat is a compromised upstream
 
 r[fetcher.node.dedicated]
 
-A Karpenter NodePool (`rio-fetcher`) with taint `rio.build/fetcher=true:NoSchedule` and label `rio.build/node-role: fetcher`. `FetcherPool` reconciler sets the matching toleration and nodeSelector. Builder NodePools keep their existing `rio.build/builder=true:NoSchedule` taint. Neither can land on the other's nodes.
+A Karpenter NodePool (`rio-fetcher`) with taint `rio.build/fetcher=true:NoSchedule` and label `rio.build/node-role: fetcher`. `Pool` reconciler sets the matching toleration and nodeSelector. Builder NodePools keep their existing `rio.build/builder=true:NoSchedule` taint. Neither can land on the other's nodes.
 
 An attacker who escapes a fetcher pod lands on a node that runs only other fetchers. Lateral movement stays inside the hash-check boundary.
 

@@ -163,29 +163,22 @@ pub async fn run() -> Result<()> {
     // strips it (controller will be gone after step 2). Deleting now
     // lets the controller START draining while it's still up — best-
     // effort graceful, not blocking.
-    const POOL_KINDS: &[(&str, &str)] = &[
-        (NS_BUILDERS, "builderpool"),
-        (NS_BUILDERS, "builderpoolset"),
-        (NS_FETCHERS, "fetcherpool"),
-    ];
-    ui::step(
-        "delete BuilderPool/FetcherPool CRs (non-blocking)",
-        || async {
-            for &(ns, kind) in POOL_KINDS {
-                k(&[
-                    "-n",
-                    ns,
-                    "delete",
-                    kind,
-                    "--all",
-                    "--wait=false",
-                    "--ignore-not-found",
-                ])
-                .await?;
-            }
-            Ok(())
-        },
-    )
+    const POOL_KINDS: &[(&str, &str)] = &[(NS_BUILDERS, "pool"), (NS_FETCHERS, "pool")];
+    ui::step("delete Pool CRs (non-blocking)", || async {
+        for &(ns, kind) in POOL_KINDS {
+            k(&[
+                "-n",
+                ns,
+                "delete",
+                kind,
+                "--all",
+                "--wait=false",
+                "--ignore-not-found",
+            ])
+            .await?;
+        }
+        Ok(())
+    })
     .await?;
 
     // ── 2. helm uninstall rio ──────────────────────────────────────

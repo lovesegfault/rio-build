@@ -1,7 +1,7 @@
 //! rio-controller binary.
 //!
-//! Runs one Controller::run loop per CRD (BuilderPool, FetcherPool,
-//! BuilderPoolSet, ComponentScaler) plus the disruption watcher and
+//! Runs one Controller::run loop per CRD (Pool, ComponentScaler)
+//! plus the disruption watcher and
 //! GC schedule. All terminate on SIGTERM via graceful_shutdown_on.
 //!
 // r[impl sec.psa.control-plane-restricted]
@@ -23,14 +23,10 @@ use tracing::{info, warn};
 
 use rio_controller::reconcilers::node_informer::NodeLabelCache;
 use rio_controller::reconcilers::nodepoolbudget::NodePoolBudgetConfig;
-use rio_controller::reconcilers::{
-    Ctx, builderpool, builderpoolset, componentscaler, fetcherpool, node_informer, nodepoolbudget,
-};
+use rio_controller::reconcilers::{Ctx, componentscaler, node_informer, nodepoolbudget, pool};
 use rio_controller::spawn_controller;
-use rio_crds::builderpool::BuilderPool;
-use rio_crds::builderpoolset::BuilderPoolSet;
 use rio_crds::componentscaler::ComponentScaler;
-use rio_crds::fetcherpool::FetcherPool;
+use rio_crds::pool::Pool;
 
 // ----- config (figment two-struct) --------------------------------------------
 
@@ -47,7 +43,7 @@ struct Config {
     scheduler: rio_common::config::UpstreamAddrs,
     /// rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST`
     /// / `__BALANCE_PORT`. Injected into worker pod containers by
-    /// the BuilderPool reconciler. I-077: balance host needed so
+    /// the Pool reconciler. I-077: balance host needed so
     /// scaling rio-store 1→4 actually spreads load.
     store: rio_common::config::UpstreamAddrs,
     #[serde(flatten)]
@@ -210,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- Reconcilers ----
     // `spawn_controller!` expands to `Controller::new().owns()
     // .graceful_shutdown_on().run().for_each()`. Each yields a
-    // future; `tokio::join!` below polls all four concurrently.
+    // future; `tokio::join!` below polls both concurrently.
     //
     // `owns:` — kube-runtime watches that child kind and re-enqueues
     // the parent on child status change (e.g. Job complete → re-spawn
@@ -219,12 +215,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // graceful_shutdown_on: SIGTERM cancels the token (registered
     // eagerly at top of main()), which drains in-flight reconciles.
-    let wp_controller =
-        spawn_controller!(client, shutdown, ctx, BuilderPool, builderpool, owns: Job);
-    let wps_controller =
-        spawn_controller!(client, shutdown, ctx, BuilderPoolSet, builderpoolset, owns: BuilderPool);
-    let fp_controller =
-        spawn_controller!(client, shutdown, ctx, FetcherPool, fetcherpool, owns: Job);
+    let pool_controller = spawn_controller!(client, shutdown, ctx, Pool, pool, owns: Job);
     let cs_controller = spawn_controller!(client, shutdown, ctx, ComponentScaler, componentscaler);
 
     // ---- DisruptionTarget watcher ----
@@ -240,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
     // (SIGTERM drain still runs).
     rio_common::task::spawn_monitored(
         "disruption-watcher",
-        builderpool::disruption::run(client.clone(), admin.clone(), shutdown.clone()),
+        pool::disruption::run(client.clone(), admin.clone(), shutdown.clone()),
     );
 
     // ---- Node informer ----
@@ -332,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
     // This is the intended behavior: panics propagate (no JoinHandle
     // silent-swallow), Ok-exits wait for sibling (no half-drained
     // state on shutdown).
-    tokio::join!(wp_controller, wps_controller, fp_controller, cs_controller);
+    tokio::join!(pool_controller, cs_controller);
 
     info!("controller shutting down");
     Ok(())

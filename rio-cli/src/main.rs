@@ -23,12 +23,12 @@ use tonic::transport::Channel;
 // Subcommand handlers. Each module owns its `#[derive(Args)]` struct
 // and `run*` fn so `main.rs` deltas for a new subcommand stay at enum
 // variant + match arm + mod decl.
-mod bps;
 mod builds;
 mod derivations;
 mod gc;
 mod logs;
 mod poison;
+mod pool;
 mod sla;
 mod status;
 mod tenants;
@@ -279,13 +279,11 @@ enum Cmd {
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
     /// this is the manual operator lever for the same path.
     DrainExecutor(workers::DrainArgs),
-    /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
-    /// `get` lists BPSes; `describe` joins spec classes with live
-    /// child BuilderPool replica counts + effective-cutoff status —
-    /// the spec→child→replica chain kubectl can't show in one place.
-    Bps {
+    /// Inspect Pool CRs via the K8s apiserver (not gRPC). `get`
+    /// lists Pools; `describe` shows spec + live status/conditions.
+    Pool {
         #[command(subcommand)]
-        cmd: bps::BpsCmd,
+        cmd: pool::PoolCmd,
     },
     /// ADR-023 SLA-driven sizing: per-pname overrides, model reset,
     /// cached-fit status, candidate-table explain, seed-corpus export/import.
@@ -331,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         // kube-only — talks to the K8s apiserver via KUBECONFIG /
         // in-cluster config; no gRPC connect at all.
-        Cmd::Bps { cmd } => bps::run(as_json, cmd).await,
+        Cmd::Pool { cmd } => pool::run(as_json, cmd).await,
         // store-admin only — don't fail on an unreachable scheduler
         // when the operator just wants to add a cache URL or audit
         // chunk consistency.
@@ -359,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
-                Cmd::Bps { .. }
+                Cmd::Pool { .. }
                 | Cmd::Upstream { .. }
                 | Cmd::VerifyChunks(_)
                 | Cmd::CancelBuild(_) => unreachable!("handled above"),

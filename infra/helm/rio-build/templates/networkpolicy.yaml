@@ -24,24 +24,28 @@
 # r[impl builder.netpol.deny-kube-api]
 #
 # Builder egress: DNS, scheduler, store. AIRGAPPED per ADR-019 — no
-# internet egress, no kube-apiserver. FODs route to FetcherPool
-# (separate policy below). NO `toEntities: [kube-apiserver]` and no
-# world rule → both DENIED (default-deny on policed endpoints). The
+# internet egress, no kube-apiserver. FODs route to kind=Fetcher
+# pools (separate policy below). NO `toEntities: [kube-apiserver]` and
+# no world rule → both DENIED (default-deny on policed endpoints). The
 # kube-apiserver deny is the load-bearing isolation: a sandbox-escaped
 # builder cannot read Secrets, list pods, or escalate via RBAC.
+#
+# D3a: CiliumClusterwideNetworkPolicy (not namespaced CNP). With one
+# Pool CRD an operator can apply a Pool{kind=Builder} into ANY
+# namespace; a namespaced CNP wouldn't select it → Cilium default-allow
+# → full egress. CCNP selects by `app.kubernetes.io/component` (which
+# the reconciler stamps unconditionally — pool/pod.rs executor_labels)
+# regardless of which namespace the Pool lands in.
 apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
+kind: CiliumClusterwideNetworkPolicy
 metadata:
   name: builder-egress
-  namespace: {{ $ns.builders.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Matches pods created by BuilderPool reconciler — the Job pod-spec
-  # builder sets rio.build/role (common/pod.rs ROLE_LABEL).
   endpointSelector:
     matchLabels:
-      rio.build/role: builder
+      app.kubernetes.io/component: rio-builder
   egress:
     # CoreDNS. L4-only (port 53 allow); the L7 DNS-proxy rule
     # (`rules: dns:`) is omitted — it would give Hubble DNS visibility
@@ -88,16 +92,15 @@ spec:
 # it). IMDS (169.254.169.254 / fd00:ec2::254) is host-local → covered
 # by the `host` entity, NOT `world` → DENIED.
 apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
+kind: CiliumClusterwideNetworkPolicy
 metadata:
   name: fetcher-egress
-  namespace: {{ $ns.fetchers.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
   endpointSelector:
     matchLabels:
-      rio.build/role: fetcher
+      app.kubernetes.io/component: rio-fetcher
   egress:
     - toEndpoints:
         - matchLabels:
@@ -190,10 +193,11 @@ spec:
         - matchLabels: {app.kubernetes.io/name: rio-gateway}
         - matchLabels: {app.kubernetes.io/name: rio-controller}
         - matchLabels: {gateway.networking.k8s.io/gateway-name: rio-dashboard}
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.builders.name }}
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.fetchers.name }}
+        # D3a: ns-agnostic match on the reconciler-stamped component
+        # label. A misplaced Pool's pods are airgapped (CCNP above)
+        # AND can reach scheduler/store (here).
+        - matchLabels: {app.kubernetes.io/component: rio-builder}
+        - matchLabels: {app.kubernetes.io/component: rio-fetcher}
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
@@ -219,10 +223,8 @@ spec:
     - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.builders.name }}
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.fetchers.name }}
+        - matchLabels: {app.kubernetes.io/component: rio-builder}
+        - matchLabels: {app.kubernetes.io/component: rio-fetcher}
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     - fromEntities: [host, remote-node, cluster]
       toPorts:

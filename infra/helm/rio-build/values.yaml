@@ -37,7 +37,7 @@ global:
 #
 # `system` is the control-plane namespace (scheduler, gateway,
 # controller) and the one `helm --namespace` anchors to. Cross-ns
-# resources (store, builderpool, fetcherpool) set explicit
+# resources (store, pool) set explicit
 # `metadata.namespace:` from the other entries.
 namespaces:
   create: true
@@ -160,7 +160,7 @@ monitoring:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────
-# K8s operator. Watches BuilderPool/FetcherPool CRDs, spawns one Job per
+# K8s operator. Watches Pool CRDs, spawns one Job per
 # build/FOD. HARD replicas=1: NOT leader-elected. Two controllers fight —
 # both create Jobs for the same queue depth, doubling spawn. kube-runtime
 # handles concurrent reconcile within one process but not across processes.
@@ -344,7 +344,7 @@ scheduler:
   # rio-scheduler-config ConfigMap mounted at /etc/rio/scheduler.toml
   # with [[size_classes]] entries; the scheduler's classify() routes
   # each derivation to the smallest covering class. MUST agree with
-  # builderPoolSetDefaults.classes (or manually-created BuilderPools'
+  # per-pool [sla] config
   # spec.sizeClass) — the scheduler classifies, the controller
   # provisions; mismatched names mean work classified into a class
   # with no workers (queues forever).
@@ -558,7 +558,7 @@ karpenter:
     # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
     # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =
     # ["kvm"]). Tainted rio.build/kvm so ONLY pools with features:[kvm]
-    # land here (controller appends the toleration — r[ctrl.builderpool.
+    # land here (controller appends the toleration — r[ctrl.pool.
     # kvm-device]). Arch-agnostic: I-098's per-pod kubernetes.io/arch
     # nodeSelector picks c7a.metal-48xl vs c7g.metal etc. Weight 1 +
     # tight cpu limit + short consolidateAfter: metal is expensive
@@ -730,135 +730,72 @@ dashboard:
       - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
-# BuilderPoolSets (one per arch) — per-size-class builder pools
+# Pools (one per arch×kind) — Builder OR Fetcher executor pools
 # ──────────────────────────────────────────────────────────────────────────
-# One BuilderPoolSet per arch. `builderPoolSets` is the list of sets to
-# render (each entry needs at minimum `name` + `systems`); every other
-# field is deep-merged from `builderPoolSetDefaults`. Per-set entries
-# can override `classes` (e.g., aarch64 wants different maxReplicas) or
-# `poolTemplate` (e.g., arm-specific nodeSelector). Overlays that want
-# to change a property for ALL sets (classes, poolTemplate.resources)
-# set it on `builderPoolSetDefaults`. Overlays that want a different
-# SET LIST replace `builderPoolSets` (lists are replaced wholesale).
-builderPoolSets:
-  # Becomes the BPS metadata.name AND the child-pool name prefix:
-  # `{name}-{class.name}` (e.g., `x86-64-tiny`). RFC 1123 — combined
-  # length ≤ 63 chars (controller validates).
+# One Pool per (arch, kind). `pools` is the list to render (each entry
+# needs at minimum `name` + `kind` + `systems`); every other field is
+# deep-merged from `poolDefaults`. Per-entry overrides go on the list
+# item (e.g. arm-specific nodeSelector, kvm-pool features). Overlays
+# that want to change a property for ALL pools set it on `poolDefaults`.
+# Overlays that want a different POOL LIST replace `pools` (lists are
+# replaced wholesale).
+#
+# Per-pod (cores, mem, disk) come from the scheduler's per-drv
+# SpawnIntent (ADR-023) — there is NO per-pool resources knob.
+pools:
   - name: x86-64
-    # r[builder.platform.i686]: x86_64 hosts run i686 natively. The
-    # builder appends `extra-platforms = <systems>` to the daemon's
-    # nix.conf, so advertising i686-linux here is the only knob —
-    # routing (scheduler) and acceptance (daemon) follow.
+    kind: Builder
+    # r[builder.platform.i686]: x86_64 hosts run i686 natively.
     systems: [x86_64-linux, i686-linux]
-  # Multi-arch: add a second entry (EKS deploy.rs does this via
-  # --set-json):
-  #   - name: aarch64
-  #     systems: [aarch64-linux]
+  - name: x86-64-fetcher
+    kind: Fetcher
+    image: rio-fetcher
+    # `builtin` so the spawn-signal intent is self-describing.
+    systems: [x86_64-linux, i686-linux, builtin]
+    nodeSelector:
+      rio.build/node-role: fetcher
+      kubernetes.io/arch: amd64
+  # Multi-arch: add per-arch entries (EKS deploy.rs does this via
+  # --set-json pools):
+  #   - {name: aarch64, kind: Builder, systems: [aarch64-linux]}
+  #   - {name: aarch64-fetcher, kind: Fetcher, image: rio-fetcher,
+  #      systems: [aarch64-linux, builtin],
+  #      nodeSelector: {rio.build/node-role: fetcher, kubernetes.io/arch: arm64}}
 
-builderPoolSetDefaults:
+# Base for every Pool. The pool.yaml template deep-merges each
+# `pools[]` entry over this, so security posture (privileged/
+# hostUsers/seccompProfile) and scheduling (tolerations/nodeSelector)
+# stay single-sourced across all per-arch pools. Helm's `null`-deletes-
+# key deep-merge semantics work for overlays.
+#
+# kind=Fetcher entries SHOULD NOT inherit privileged/hostUsers/
+# seccompProfile (CRD CEL rejects them at admission); the reconciler
+# forces ADR-019 hardening regardless. Fetcher entries override
+# `image: rio-fetcher` and (typically) `nodeSelector`.
+poolDefaults:
   enabled: false
-  # Size classes. Each becomes a child BuilderPool `{name}-{class}`
-  # with the given resources. cutoffSecs/mem feed the SCHEDULER's
-  # classify() (via scheduler.sizeClasses — keep names in sync).
-  # Five-tier default sized for c6a/c7a bin-packing on EKS:
-  #   tiny→c6a.large(2), small→c6a.2xlarge(8), medium→c6a.8xlarge(32),
-  #   large→c6a.16xlarge(64), xlarge→c6a.32xlarge(128).
-  # Memory limit at 2× request (blast-radius cap — I-005).
-  # I-196/I-197: 2/8/32/64/128 cores. CPU is HARD LIMIT (limits =
-  # requests) — a build that needs more should be PROMOTED (I-177),
-  # not burst into a neighbor's headroom. Bursting makes EMA duration
-  # estimates unreliable and defeats size-class learning. With
-  # limits.cpu set, cgroup cpu.max = limit → effective_cores() reads
-  # it directly → NIX_BUILD_CORES = -jN matches the class.
-  #
-  # Memory limit = 2× request: OOM headroom while bounded.
-  # Storage limit = class table (2/4/32/64/96 Gi); request = 65% of
-  # limit. Scheduler reserves 65% headroom (better bin-packing); pod
-  # is hard-evicted at the table value. Eviction → disconnect → I-177
-  # promotes → retry on next class.
-  # MUST track scheduler.sizeClasses in deploy.rs SIZE_CLASSES_JSON.
-  # No per-class maxConcurrent: the controller spawns one Job per
-  # queued derivation; Karpenter NodePool `limits.cpu` (and ultimately
-  # the AWS vCPU service quota) is the only fanout gate. Excess Jobs
-  # sit Pending until nodes provision; reap-excess-pending trims them
-  # if demand drops before scheduling.
-  classes:
-    - name: tiny
-      cutoffSecs: 30
-      resources: &res-tiny
-        # I-118: hello-class builds need <500MB FUSE cache + overlay.
-        requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
-        limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
-    - name: small
-      cutoffSecs: 120
-      resources: &res-small
-        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
-        limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
-    - name: medium
-      cutoffSecs: 600
-      resources: &res-medium
-        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
-        limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
-    - name: large
-      cutoffSecs: 1800
-      resources: &res-large
-        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
-        limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
-    - name: xlarge
-      cutoffSecs: 7200
-      resources: &res-xlarge
-        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
-        limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
-  # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
-  # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
-  # sourced. Override here only for set-specific divergence.
-  poolTemplate: {}
-
-# Base for BuilderPoolSet poolTemplate. The builderpoolset.yaml template
-# deep-merges each set's `poolTemplate` over this, so security posture
-# (privileged/hostUsers/seccompProfile) and scheduling (tolerations/
-# nodeSelector) stay single-sourced across all per-arch sets. Overlays
-# that want to change a poolTemplate property for ALL sets set it here —
-# Helm's `null`-deletes-key deep-merge semantics work.
-builderPoolDefaults:
   features: []
   image: rio-builder
-  # Device cgroup: /dev/fuse is provided via containerd base_runtime_spec
-  # (nix/base-runtime-spec.nix). Granular SYS_ADMIN+SYS_CHROOT caps
-  # suffice and hostUsers:false works (hostPath /dev/fuse breaks idmap
-  # mounts).
-  #
   # privileged:true is an ESCAPE HATCH for clusters whose containerd
   # lacks base_runtime_spec device injection. It disables seccomp
-  # entirely (ADR-012:10) and is unacceptable for multi-tenant
-  # (ADR-012:18). Production on EKS/GKE should NOT need this.
+  # entirely (ADR-012) and is unacceptable for multi-tenant.
+  # Production on EKS/GKE should NOT need this.
   #
-  # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
-  # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist. The
-  # Localhost profile (nix/nixos-node/seccomp/rio-builder.json, baked into
-  # the AMI at /var/lib/kubelet/seccomp/operator/ via nix/nixos-node/
-  # hardening.nix) is RuntimeDefault + pivot_root − {ptrace, bpf, setns,
-  # process_vm_*}. Keeps granular caps and the base_runtime_spec /dev/fuse
-  # path while denying syscalls a sandbox escapee with CAP_SYS_ADMIN would
-  # otherwise have.
+  # privileged=false + seccompProfile=Localhost: containerd's
+  # RuntimeDefault seccomp profile omits pivot_root from the
+  # CAP_SYS_ADMIN allowlist. The Localhost profile (nix/nixos-node/
+  # seccomp/rio-builder.json, baked into the AMI) is RuntimeDefault +
+  # pivot_root − {ptrace, bpf, setns, process_vm_*}.
   #
   # hostUsers default = true here so k3s VM tests work without
   # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd
-  # cgroup_writable=true, nix/nixos-node/eks-node.nix) overrides to
-  # false via xtask deploy.rs — ADR-012 userns isolation only applies
-  # where the runtime supports it.
+  # cgroup_writable=true) overrides to false via xtask deploy.rs.
   privileged: false
   hostUsers: true
   seccompProfile:
     type: Localhost
-    # Relative to /var/lib/kubelet/seccomp/. Written by systemd-tmpfiles
-    # before kubelet starts on every supported target (NixOS AMI:
-    # nix/nixos-node/hardening.nix; k3s VM tests: fixtures/k3s-full.nix).
-    # The `operator/` path component is historical (SPO wrote there);
-    # kept so existing nodes don't need a tmpfiles change to roll out.
     localhostProfile: operator/rio-builder.json
-  # Pairs with the NodePool taint. Change NodePool taint/labels → change
-  # these too.
+  # Pairs with the NodePool taint.
   tolerations:
     - key: rio.build/builder
       operator: Equal
@@ -866,79 +803,6 @@ builderPoolDefaults:
       effect: NoSchedule
   nodeSelector:
     rio.build/node-role: builder
-
-# ──────────────────────────────────────────────────────────────────────────
-# FetcherPools (one per arch) — FOD-only executors. See ADR-019.
-# ──────────────────────────────────────────────────────────────────────────
-# r[impl ctrl.fetcherpool.multiarch]
-#
-# Same list/defaults split as I-117b's builderPoolSets[] — one
-# FetcherPool per arch. Each entry needs at minimum `name` + `systems`
-# + `nodeSelector.kubernetes.io/arch`; everything else deep-merges
-# from `fetcherPoolDefaults`. Per-entry overrides go on the list item
-# (e.g. PLAN-PREBAKE adds per-arch digest-pinned `image`). Overlays
-# that want to change a property for ALL pools (classes, ephemeral)
-# set it on `fetcherPoolDefaults`. Overlays that want a different POOL
-# LIST replace `fetcherPools` (lists are replaced wholesale).
-#
-# `systems` MUST include `builtin` so the spawn-signal intent is
-# self-describing in `kubectl get fp -o yaml` (the controller
-# includes it regardless as a safety net). nodeSelector REPLACES the
-# reconciler default — include `rio.build/node-role: fetcher` too.
-fetcherPools:
-  - name: x86-64
-    systems: [x86_64-linux, i686-linux, builtin]
-    nodeSelector:
-      rio.build/node-role: fetcher
-      kubernetes.io/arch: amd64
-  # Multi-arch: add a second entry (EKS deploy.rs does this via
-  # --set-json):
-  #   - name: aarch64
-  #     systems: [aarch64-linux, builtin]
-  #     nodeSelector:
-  #       rio.build/node-role: fetcher
-  #       kubernetes.io/arch: arm64
-
-fetcherPoolDefaults:
-  enabled: false
-  # deadlineSeconds: ~  # default 300
-  # No maxConcurrent: uncapped — one Job per queued FOD. Karpenter
-  # rio-fetcher NodePool `limits.cpu` is the only fanout gate.
-  # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
-  # the image (nix/docker.nix rio-fetcher wraps rio-builder).
-  # PLAN-PREBAKE: per-entry override with `localhost/…@sha256:<digest>`.
-  image: rio-fetcher
-  # Same default-true-EKS-overrides-false as builderPoolDefaults above.
-  hostUsers: true
-  # I-170/I-208: fetchers run arbitrary code (the FOD's `builder`
-  # script — fetchgit delta resolution, fetchCargoVendor parallel
-  # pulls, repack steps), so the cpu/mem axis isn't flat. Mirror
-  # builderPoolSetDefaults.classes via the &res-* anchors above (same
-  # five names, identical resources by reference) so the
-  # size_class_floor promotion ladder is identical for both kinds. No
-  # a-priori sizing — routing stays reactive (FOD fails on N → retry
-  # on N+1). Out-of-disk on a tier is handled the same as OOM:
-  # eviction → disconnect → I-177 floor promotion → next tier.
-  #
-  # MUST agree with scheduler.toml `[[size_classes]].name` — fetcher
-  # tiers ARE builder tiers (the scheduler derives the FOD floor-walk
-  # ladder from `size_classes`, not a separate key).
-  classes:
-    - name: tiny
-      resources: *res-tiny
-    - name: small
-      resources: *res-small
-    - name: medium
-      resources: *res-medium
-    - name: large
-      resources: *res-large
-    - name: xlarge
-      resources: *res-xlarge
-  tolerations:
-    - key: rio.build/fetcher
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
 
 # ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.

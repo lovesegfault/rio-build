@@ -507,7 +507,6 @@ async fn spawn_intents_empty_when_sla_unconfigured() {
 /// dispatch routes it to the cheap featureless pool, the kvm builder
 /// idles until activeDeadlineSeconds.
 // r[verify sched.admin.spawn-intents.feature-filter]
-// r[verify ctrl.pool.per-feature-class-depth]
 #[tokio::test]
 async fn spawn_intents_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -835,8 +834,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 /// excludes FODs; `kind=Fetcher` excludes non-FODs; unfiltered emits
 /// both. I-143: `systems` filter excludes other-arch derivations.
 // r[verify sched.admin.spawn-intents.feature-filter]
-// r[verify ctrl.pool.per-system-class-depth]
-// r[verify ctrl.fetcherpool.spawn-builtin]
+// r[verify ctrl.pool.fetcher-spawn-builtin]
 #[tokio::test]
 async fn spawn_intents_kind_and_system_filter() {
     use rio_proto::types::ExecutorKind;

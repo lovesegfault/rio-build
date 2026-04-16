@@ -15,7 +15,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
-use crate::reconcilers::common::job::{SpawnOutcome, reap_excess_pending, try_spawn_job};
+use crate::reconcilers::pool::job::{SpawnOutcome, reap_excess_pending, try_spawn_job};
 
 // r[verify ctrl.pool.ephemeral]
 #[test]
@@ -33,14 +33,14 @@ fn ephemeral_spawn_fail_still_patches_status() {
     // Same brittleness-is-the-point: anyone reintroducing a
     // bail in spawn_n trips this and must consciously decide the
     // caller's status patch can be skipped.
-    let src = include_str!("../../common/job.rs");
+    let src = include_str!("../job.rs");
     let fn_start = src
-        .find("pub(crate) async fn spawn_n(")
-        .expect("spawn_n present in common/job.rs");
+        .find("pub(crate) async fn spawn_for_each<")
+        .expect("spawn_for_each present in job.rs");
     let fn_end = src[fn_start..]
         .find("\n}\n")
         .map(|i| i + fn_start)
-        .expect("spawn_n body terminates");
+        .expect("spawn_for_each body terminates");
     // Filter comment lines: the Failed arm's doc says "was `return
     // Err(e.into())`" to explain the history — we want CODE matches
     // only. treefmt/rustfmt normalizes comment indent, so `trim_start
@@ -53,16 +53,12 @@ fn ephemeral_spawn_fail_still_patches_status() {
 
     assert!(
         !body.contains("return Err"),
-        "spawn_n must warn+continue on create error, not bail — \
-         bailing skips the caller's patch_job_pool_status. Pre-fix \
-         line was `return Err(e.into())`."
+        "spawn_for_each must warn+continue on create error, not bail — \
+         bailing skips the caller's patch_job_pool_status."
     );
-    // Positive: the warn message is there (proves the Failed arm
-    // exists and does something observable).
     assert!(
         body.contains("ephemeral Job spawn failed; continuing tick"),
-        "spawn_n should warn on create error with a grep-able \
-         message (SpawnOutcome::Failed arm)"
+        "spawn_for_each should warn on create error (SpawnOutcome::Failed arm)"
     );
 }
 
@@ -226,14 +222,14 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         },
     ]);
 
-    let reaped = reap_excess_pending(&jobs_api, &jobs, Some(1), "med-pool", "medium").await;
+    let reaped = reap_excess_pending(&jobs_api, &jobs, Some(1), "med-pool").await;
     guard.verified().await;
 
     assert_eq!(reaped, 1, "404 not counted; one successful delete");
     assert_eq!(
-        recorder.get("rio_controller_ephemeral_jobs_reaped_total{class=medium,pool=med-pool}"),
+        recorder.get("rio_controller_ephemeral_jobs_reaped_total{pool=med-pool}"),
         1,
-        "metric incremented with pool+class labels; saw keys: {:?}",
+        "metric incremented with pool label; saw keys: {:?}",
         recorder.all_keys(),
     );
 }
@@ -254,16 +250,10 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     ];
     let guard = verifier.run(vec![]);
     // pending=2, queued=2 → covered.
-    assert_eq!(
-        reap_excess_pending(&jobs_api, &jobs, Some(2), "p", "c").await,
-        0
-    );
+    assert_eq!(reap_excess_pending(&jobs_api, &jobs, Some(2), "p").await, 0);
     // queued=None → fail-closed (scheduler unreachable; spawn treats
     // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
     // on a scheduler restart).
-    assert_eq!(
-        reap_excess_pending(&jobs_api, &jobs, None, "p", "c").await,
-        0
-    );
+    assert_eq!(reap_excess_pending(&jobs_api, &jobs, None, "p").await, 0);
     guard.verified().await;
 }

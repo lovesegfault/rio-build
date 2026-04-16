@@ -12,12 +12,11 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
     EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    ResourceRequirements, SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use rio_crds::builderpool::SeccompProfileKind;
-use rio_crds::common::PoolDeployKnobs;
+use rio_crds::pool::{ExecutorKind, SeccompProfileKind};
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
@@ -66,20 +65,16 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("nix-var", "/nix/var", None, None),
 ];
 
-/// Executor role. Determines the `rio.build/role` label value and
-/// gates role-specific pod-spec tweaks (readOnlyRootFilesystem,
-/// seccomp profile name, RIO_EXECUTOR_KIND env). This IS the proto
-/// enum — `Builder` (airgapped, arbitrary-code; `rio-builders`
-/// namespace) or `Fetcher` (internet-facing, hash-checked FODs;
-/// `rio-fetchers` namespace, stricter seccomp + readOnlyRootFilesystem).
-pub use rio_proto::types::ExecutorKind;
-
 /// Lowercase string repr for the `rio.build/role` label and
 /// `RIO_EXECUTOR_KIND` env (matches the deserializer in
-/// `rio-builder/src/config.rs`). Distinct from prost's
-/// `as_str_name()` (SCREAMING_SNAKE).
+/// `rio-builder/src/config.rs`); plus the `app.kubernetes.io/
+/// component` label value used by the D3a CCNP selectors.
 pub trait ExecutorKindExt {
     fn as_str(&self) -> &'static str;
+    /// `rio-builder` / `rio-fetcher` — the canonical
+    /// `app.kubernetes.io/component` label that the cluster-wide
+    /// network policies select on (D3a).
+    fn component_label(&self) -> &'static str;
 }
 
 impl ExecutorKindExt for ExecutorKind {
@@ -88,6 +83,22 @@ impl ExecutorKindExt for ExecutorKind {
             Self::Builder => "builder",
             Self::Fetcher => "fetcher",
         }
+    }
+    fn component_label(&self) -> &'static str {
+        match self {
+            Self::Builder => "rio-builder",
+            Self::Fetcher => "rio-fetcher",
+        }
+    }
+}
+
+/// CRD `ExecutorKind` → proto `ExecutorKind` (for the
+/// `GetSpawnIntents` request filter). The CRD enum is local because
+/// rio-crds stays kube-only (no prost).
+pub fn executor_kind_to_proto(k: ExecutorKind) -> rio_proto::types::ExecutorKind {
+    match k {
+        ExecutorKind::Builder => rio_proto::types::ExecutorKind::Builder,
+        ExecutorKind::Fetcher => rio_proto::types::ExecutorKind::Fetcher,
     }
 }
 
@@ -128,18 +139,17 @@ pub struct ExecutorPodParams {
     /// Pool CR name. Feeds [`job_name`] (`rio-{role}-{pool_name}-…`).
     pub pool_name: String,
 
-    // ── deployment knobs (image / systems / node placement / mTLS /
-    // host_users) ─────────────────────────────────────────────────
-    /// Shared with the CRD's `PoolSpecCommon.deploy` flatten — both
-    /// reconcilers pass `spec.common.deploy.clone()` (fetcher mutates
-    /// the clone for ADR-019 default node placement).
-    pub deploy: PoolDeployKnobs,
+    // ── deployment knobs ─────────────────────────────────────────
+    pub image: String,
+    pub systems: Vec<String>,
+    pub node_selector: Option<BTreeMap<String, String>>,
+    pub tolerations: Option<Vec<Toleration>>,
+    pub host_users: Option<bool>,
     pub image_pull_policy: Option<String>,
 
     // ── capacity ─────────────────────────────────────────────────
     /// Comma-joined → `RIO_FEATURES`. Empty for fetchers.
     pub features: Vec<String>,
-    pub resources: Option<ResourceRequirements>,
 
     // ── FUSE ─────────────────────────────────────────────────────
     /// Raw Quantity for the emptyDir sizeLimit.
@@ -162,7 +172,7 @@ pub struct ExecutorPodParams {
 impl ExecutorPodParams {
     /// Pool advertises the `kvm` Nix system-feature → pod needs a host
     /// with working `/dev/kvm` (metal nodeSelector + toleration). See
-    /// `r[ctrl.builderpool.kvm-device]`.
+    /// `r[ctrl.pool.kvm-device]`.
     fn wants_kvm(&self) -> bool {
         self.features.iter().any(|f| f == KVM_FEATURE)
     }
@@ -177,7 +187,13 @@ pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
         (POOL_LABEL.into(), p.pool_name.clone()),
         (ROLE_LABEL.into(), p.role.as_str().into()),
         ("app.kubernetes.io/name".into(), "rio-builder".into()),
-        ("app.kubernetes.io/component".into(), p.role.as_str().into()),
+        // D3a: cluster-wide netpols select on this label (ns-agnostic
+        // airgap). Value is `rio-builder` / `rio-fetcher` — matches
+        // the helm component naming convention.
+        (
+            "app.kubernetes.io/component".into(),
+            p.role.component_label().into(),
+        ),
         ("app.kubernetes.io/part-of".into(), "rio-build".into()),
     ])
 }
@@ -265,7 +281,6 @@ pub fn build_executor_pod_spec(
         // spec.hostUsers override handles containerd<2.1 cgroup
         // ownership issues (cgroup_writable knob).
         host_users: p
-            .deploy
             .host_users
             .or_else(|| (!privileged && p.host_network != Some(true)).then_some(false)),
 
@@ -388,7 +403,7 @@ pub fn build_executor_pod_spec(
         // r[impl ctrl.pod.tgps-default]
         termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
         node_selector: {
-            let mut ns = p.deploy.node_selector.clone().unwrap_or_default();
+            let mut ns = p.node_selector.clone().unwrap_or_default();
             // r[impl ctrl.pod.arch-selector]
             // I-098: a pool with systems=[x86_64-linux] landed pods on an
             // arm64 node (fallback NodePool unconstrained) — builder
@@ -399,11 +414,11 @@ pub fn build_executor_pod_spec(
             // benefit from cheaper Graviton; rio-builder's startup arch
             // check is the safety net for builders that slip through.
             if p.role == ExecutorKind::Builder
-                && let Some(arch) = nix_systems_to_k8s_arch(&p.deploy.systems)
+                && let Some(arch) = nix_systems_to_k8s_arch(&p.systems)
             {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
-            // r[impl ctrl.builderpool.kvm-device]
+            // r[impl ctrl.pool.kvm-device]
             // features:[kvm] → land on the metal NodePool. Operator-set
             // value wins (or_insert) so a non-Karpenter cluster with a
             // different kvm-capable label can override. Unconditional
@@ -415,8 +430,8 @@ pub fn build_executor_pod_spec(
             if ns.is_empty() { None } else { Some(ns) }
         },
         tolerations: {
-            let mut t = p.deploy.tolerations.clone().unwrap_or_default();
-            // r[impl ctrl.builderpool.kvm-device]
+            let mut t = p.tolerations.clone().unwrap_or_default();
+            // r[impl ctrl.pool.kvm-device]
             // Metal NodePool is tainted rio.build/kvm=true:NoSchedule so
             // non-kvm builders don't bin-pack onto $$ metal. Append
             // (don't replace) — the operator-set rio.build/builder
@@ -447,7 +462,7 @@ fn build_executor_container(
 
     Container {
         name: p.role.as_str().into(),
-        image: Some(p.deploy.image.clone()),
+        image: Some(p.image.clone()),
         command: Some(vec!["/bin/rio-builder".into()]),
         image_pull_policy: p.image_pull_policy.clone(),
         env: Some({
@@ -458,7 +473,7 @@ fn build_executor_container(
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
-                env("RIO_SYSTEMS", &p.deploy.systems.join(",")),
+                env("RIO_SYSTEMS", &p.systems.join(",")),
                 env("RIO_FEATURES", &p.features.join(",")),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
@@ -613,11 +628,12 @@ fn build_executor_container(
             ..Default::default()
         }),
 
-        // Operator resources only. /dev/{fuse,kvm} arrive via containerd
-        // base_runtime_spec on every pod (nix/base-runtime-spec.nix) — no
-        // extended-resource request. kvm placement is the nodeSelector +
-        // toleration above (r[ctrl.builderpool.kvm-device]).
-        resources: p.resources.clone(),
+        // /dev/{fuse,kvm} arrive via containerd base_runtime_spec on
+        // every pod (nix/base-runtime-spec.nix) — no extended-resource
+        // request. kvm placement is the nodeSelector + toleration above
+        // (r[ctrl.pool.kvm-device]). resources are stamped per-intent
+        // by `jobs::apply_intent_resources` AFTER this builder runs.
+        resources: None,
 
         ports: Some(vec![
             ContainerPort {

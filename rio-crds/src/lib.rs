@@ -22,11 +22,8 @@
 //! kube-runtime), so they live here rather than spawning a
 //! `rio-kube` micro-crate for ~30 lines.
 
-pub mod builderpool;
-pub mod builderpoolset;
-pub mod common;
 pub mod componentscaler;
-pub mod fetcherpool;
+pub mod pool;
 
 // ----- kube::Error classification helpers ---------------------------
 //
@@ -88,18 +85,7 @@ impl<T> KubeResultExt<T> for Result<T, kube::Error> {
 // "this is an object, don't strip unknown fields."
 //
 // `pub(crate)`: used by CRD modules via
-// `#[schemars(schema_with = "crate::any_object")]`.
-
-/// Schema for `Option<K8sType>` fields where K8sType is a single
-/// object (ResourceRequirements, etc). nullable + object +
-/// preserve-unknown.
-pub(crate) fn any_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({
-        "type": "object",
-        "nullable": true,
-        "x-kubernetes-preserve-unknown-fields": true,
-    })
-}
+// `#[schemars(schema_with = "crate::any_object_array")]`.
 
 /// Schema for `Vec<K8sType>` or `Option<Vec<K8sType>>` fields
 /// (tolerations, conditions). Array of preserve-unknown objects.

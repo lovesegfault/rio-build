@@ -10,18 +10,15 @@
 //! scratch, reads current state, computes desired, applies the
 //! diff via server-side apply. Reconciling twice is a no-op.
 
-pub mod builderpool;
-pub mod builderpoolset;
+pub mod componentscaler;
+pub mod gc_schedule;
+pub mod node_informer;
+pub mod nodepoolbudget;
 // WONTFIX: pub(crate) here ICEs stable rustdoc 1.94.1 ("no resolutions
 // for a doc link" — collect_intra_doc_links). Re-verified 2026-04: still
 // crashes the .#checks.*.doc build. Nightly is fine. Leaf binary; pub-ness
 // is cosmetic. Re-tighten once the upstream ICE is fixed.
-pub mod common;
-pub mod componentscaler;
-pub mod fetcherpool;
-pub mod gc_schedule;
-pub mod node_informer;
-pub mod nodepoolbudget;
+pub mod pool;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,10 +66,10 @@ pub struct Ctx {
     /// rio-scheduler addresses. For builder pod env injection ONLY
     /// (reconcilers use `admin` above). `balance_host = None` → env
     /// var NOT injected → builders fall back to single-channel.
-    pub scheduler: common::pod::UpstreamAddrs,
+    pub scheduler: pool::pod::UpstreamAddrs,
     /// rio-store addresses. Injected into builder pod containers
     /// (builders connect to the store directly for PutPath/GetPath).
-    pub store: common::pod::UpstreamAddrs,
+    pub store: pool::pod::UpstreamAddrs,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
     /// event(obj, ev)` to emit; events show in `kubectl describe`
     /// and `kubectl get events`. Operator visibility for "what
@@ -289,8 +286,7 @@ where
 /// Derives `Api<K>` from the object's namespace, runs
 /// `kube::runtime::finalizer` with the given apply/cleanup, and maps
 /// the recursive `finalizer::Error<Error>` into our boxed
-/// [`Error::Finalizer`]. The three pool reconcilers (builderpool /
-/// fetcherpool / builderpoolset) had byte-identical copies of this.
+/// [`Error::Finalizer`].
 ///
 /// `apply`/`cleanup` take `Arc<Ctx>` (not `&Ctx`) so the closure
 /// passed to `finalizer()` can move them in by value without lifetime

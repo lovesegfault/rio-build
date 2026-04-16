@@ -25,7 +25,7 @@ use rio_proto::types::{ReportExecutorTerminationRequest, TerminationReason};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt};
-use rio_crds::common::PoolStatusCommon;
+use rio_crds::pool::{Pool, PoolStatus};
 
 use super::pod::{POOL_LABEL, UpstreamAddrs};
 
@@ -321,12 +321,11 @@ pub(crate) async fn reap_excess_pending(
     jobs: &[Job],
     queued: Option<u32>,
     pool: &str,
-    class: &str,
 ) -> u32 {
     let Some(queued) = queued else {
         debug!(
             pool,
-            class, "skipping Pending-reap: queued unknown (scheduler unreachable)"
+            "skipping Pending-reap: queued unknown (scheduler unreachable)"
         );
         return 0;
     };
@@ -348,17 +347,17 @@ pub(crate) async fn reap_excess_pending(
         match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
             Ok(_) => {
                 info!(
-                    pool, class, job = %job_name, queued,
+                    pool, job = %job_name, queued,
                     "reaped excess Pending ephemeral Job (queued dropped below pending)"
                 );
                 reaped += 1;
             }
             Err(e) if e.is_not_found() => {
-                debug!(pool, class, job = %job_name, "Pending Job already gone");
+                debug!(pool, job = %job_name, "Pending Job already gone");
             }
             Err(e) => {
                 warn!(
-                    pool, class, job = %job_name, error = %e,
+                    pool, job = %job_name, error = %e,
                     "failed to reap excess Pending Job; will retry next tick"
                 );
             }
@@ -368,7 +367,6 @@ pub(crate) async fn reap_excess_pending(
         metrics::counter!(
             "rio_controller_ephemeral_jobs_reaped_total",
             "pool" => pool.to_owned(),
-            "class" => class.to_owned(),
         )
         .increment(reaped.into());
     }
@@ -464,7 +462,6 @@ pub(crate) async fn reap_orphan_running(
     jobs: &[Job],
     ctx: &Ctx,
     pool: &str,
-    class: &str,
 ) -> u32 {
     // Cheap pre-filter: any candidates at all? Avoids the RPC on the
     // hot path (every 10s tick × every pool).
@@ -485,7 +482,7 @@ pub(crate) async fn reap_orphan_running(
         Ok(resp) => resp.into_inner().executors,
         Err(e) => {
             warn!(
-                pool, class, error = %e,
+                pool, error = %e,
                 "ListExecutors failed; skipping orphan-reap this tick (fail-closed)"
             );
             return 0;
@@ -507,18 +504,18 @@ pub(crate) async fn reap_orphan_running(
         match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
             Ok(_) => {
                 info!(
-                    pool, class, job = %job_name,
+                    pool, job = %job_name,
                     grace_secs = ORPHAN_REAP_GRACE.as_secs(),
                     "reaped orphan Running ephemeral Job (no scheduler assignment past grace)"
                 );
                 reaped += 1;
             }
             Err(e) if e.is_not_found() => {
-                debug!(pool, class, job = %job_name, "orphan Job already gone");
+                debug!(pool, job = %job_name, "orphan Job already gone");
             }
             Err(e) => {
                 warn!(
-                    pool, class, job = %job_name, error = %e,
+                    pool, job = %job_name, error = %e,
                     "failed to reap orphan Running Job; will retry next tick"
                 );
             }
@@ -528,7 +525,6 @@ pub(crate) async fn reap_orphan_running(
         metrics::counter!(
             "rio_controller_orphan_jobs_reaped_total",
             "pool" => pool.to_owned(),
-            "class" => class.to_owned(),
         )
         .increment(reaped.into());
     }
@@ -626,76 +622,22 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
     }
 }
 
-/// Spawn `n` ephemeral Jobs, logging each outcome. Owns the
-/// `for _ in 0..n { build → try_spawn_job → match SpawnOutcome }`
-/// loop that both Job-mode reconcilers had open-coded ~28 lines
-/// each — sharing the [`SpawnOutcome`] semantics (P0526) without
-/// sharing the warn+continue log was the remaining drift surface.
+/// Spawn one Job per item, logging each outcome. ADR-023: the
+/// scheduler returns per-drv `SpawnIntent`s; the controller spawns
+/// one pod per intent with that intent's resources stamped in — the
+/// closure receives the item so `build_job(pool, intent)` can read it.
 ///
 /// Returns the count that reached `Spawned`. `NameCollision` and
 /// `Failed` are logged (debug/warn) and the loop CONTINUES — the
 /// P0516 invariant: a spawn error never short-circuits the reconcile
 /// tick, so the caller's status patch still runs. The structural
-/// guard at `builderpool/tests/jobs_tests.rs::
+/// guard at `pool/tests/jobs_tests.rs::
 /// ephemeral_spawn_fail_still_patches_status` asserts this body
 /// contains no `return Err`.
-///
-/// `pool`/`class` feed log fields only. For BuilderPool, `class` is
-/// `spec.size_class`; for FetcherPool, the per-class `pool_name`.
-pub(crate) async fn spawn_n(
-    jobs_api: &Api<Job>,
-    n: u32,
-    pool: &str,
-    class: &str,
-    mut build: impl FnMut() -> Result<Job>,
-) -> u32 {
-    let mut spawned = 0;
-    for _ in 0..n {
-        let job = match build() {
-            Ok(j) => j,
-            Err(e) => {
-                warn!(pool, class, error = %e, "build_job failed; continuing tick");
-                continue;
-            }
-        };
-        let job_name = job.metadata.name.clone().unwrap_or_default();
-        match try_spawn_job(jobs_api, &job).await {
-            SpawnOutcome::Spawned => {
-                spawned += 1;
-                info!(pool, class, job = %job_name, "spawned ephemeral Job");
-            }
-            SpawnOutcome::NameCollision => {
-                debug!(pool, class, job = %job_name, "Job name collision; will retry");
-            }
-            SpawnOutcome::Failed(e) => {
-                // P0516: was `return Err(e.into())` in both callers.
-                // warn+continue so the caller's status patch runs
-                // regardless; next tick retries.
-                warn!(
-                    pool, class, job = %job_name, error = %e,
-                    "ephemeral Job spawn failed; continuing tick"
-                );
-            }
-        }
-    }
-    spawned
-}
-
-/// [`spawn_n`] but driven by an iterator of per-iteration data instead
-/// of a bare count. ADR-023: when the scheduler returns per-drv
-/// `SpawnIntent`s (Sla mode), the controller spawns one pod per intent
-/// with that intent's resources stamped in — the closure receives the
-/// item so `build_job(wp, Some(intent))` can read it.
-///
-/// Same warn+continue semantics as [`spawn_n`]: a spawn error never
-/// short-circuits the reconcile tick. The structural guard at
-/// `builderpool/tests/jobs_tests.rs` covers `spawn_n`; this body is
-/// mechanically identical (no `return Err`).
 pub(crate) async fn spawn_for_each<I, T>(
     jobs_api: &Api<Job>,
     items: I,
     pool: &str,
-    class: &str,
     mut build: impl FnMut(T) -> Result<Job>,
 ) -> u32
 where
@@ -706,7 +648,7 @@ where
         let job = match build(item) {
             Ok(j) => j,
             Err(e) => {
-                warn!(pool, class, error = %e, "build_job failed; continuing tick");
+                warn!(pool, error = %e, "build_job failed; continuing tick");
                 continue;
             }
         };
@@ -714,14 +656,14 @@ where
         match try_spawn_job(jobs_api, &job).await {
             SpawnOutcome::Spawned => {
                 spawned += 1;
-                info!(pool, class, job = %job_name, "spawned ephemeral Job");
+                info!(pool, job = %job_name, "spawned ephemeral Job");
             }
             SpawnOutcome::NameCollision => {
-                debug!(pool, class, job = %job_name, "Job name collision; will retry");
+                debug!(pool, job = %job_name, "Job name collision; will retry");
             }
             SpawnOutcome::Failed(e) => {
                 warn!(
-                    pool, class, job = %job_name, error = %e,
+                    pool, job = %job_name, error = %e,
                     "ephemeral Job spawn failed; continuing tick"
                 );
             }
@@ -748,41 +690,28 @@ where
 /// different field manager; SSA keeps them separate.
 ///
 /// `prev_status`: the CR's `.status` (for `lastTransitionTime`
-/// preservation). Generic over `S: AsRef<PoolStatusCommon>` so both
-/// `*PoolStatus` structs feed in directly. `K` must be turbofished
-/// at the call site (`patch_job_pool_status::<BuilderPool, _>(…)`)
-/// — there's no value param it could infer from.
+/// preservation).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn patch_job_pool_status<K, S>(
+pub(crate) async fn patch_job_pool_status(
     ctx: &Ctx,
-    prev_status: Option<&S>,
+    prev_status: Option<&PoolStatus>,
     ns: &str,
     name: &str,
-    replicas: Option<i32>,
+    replicas: i32,
     ready: i32,
     desired: i32,
     scheduler_err: Option<&str>,
-) -> Result<()>
-where
-    K: Resource<DynamicType = (), Scope = kube::core::NamespaceResourceScope>
-        + CustomResourceExt
-        + Clone
-        + serde::de::DeserializeOwned
-        + std::fmt::Debug,
-    S: AsRef<PoolStatusCommon>,
-{
-    let api: Api<K> = Api::namespaced(ctx.client.clone(), ns);
-    let ar = K::api_resource();
+) -> Result<()> {
+    let api: Api<Pool> = Api::namespaced(ctx.client.clone(), ns);
+    let ar = Pool::api_resource();
     let prev = super::conditions::find_condition(prev_status, "SchedulerUnreachable");
     let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
-    let mut status = serde_json::json!({
+    let status = serde_json::json!({
+        "replicas": replicas,
         "readyReplicas": ready,
         "desiredReplicas": desired,
         "conditions": [cond],
     });
-    if let Some(r) = replicas {
-        status["replicas"] = r.into();
-    }
     api.patch_status(
         name,
         &kube::api::PatchParams::apply(MANAGER).force(),
@@ -1035,18 +964,6 @@ pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     }
 }
 
-pub(crate) fn random_suffix() -> String {
-    use rand::RngExt;
-    // 36^6 ≈ 2.18 billion combinations. With JOB_TTL_SECS=600 and a
-    // realistic ~10 Jobs/sec, steady-state is ~6k live names → birthday
-    // collision ~0.0008%. K8s 409-on-create handles the rare hit.
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
-    (0..6)
-        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,23 +1121,6 @@ mod tests {
         assert!(!job_deadline_exceeded(&job_with_cond("Complete", None)));
         // No status → not deadline.
         assert!(!job_deadline_exceeded(&Job::default()));
-    }
-
-    /// random_suffix returns valid K8s name chars. DNS-1123 subdomain
-    /// rules: lowercase alphanumeric, '-', max 253 chars. Our suffix
-    /// is a tail fragment so '-' is fine contextually, but we use
-    /// only alnum to be safe with any future prefix.
-    #[test]
-    fn random_suffix_valid_dns1123() {
-        for _ in 0..100 {
-            let s = random_suffix();
-            assert_eq!(s.len(), 6);
-            assert!(
-                s.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-                "invalid char in suffix: {s}"
-            );
-        }
     }
 
     /// `is_active_job`: verify status→predicate mapping for all four

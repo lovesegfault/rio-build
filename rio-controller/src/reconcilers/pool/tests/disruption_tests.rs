@@ -71,16 +71,16 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
         // Status patch — reconcile reports active/ceiling.
         Scenario::ok(
             http::Method::PATCH,
-            "/builderpools/test-pool/status",
+            "/pools/test-pool/status",
             serde_json::json!({
                 "apiVersion": "rio.build/v1alpha1",
-                "kind": "BuilderPool",
+                "kind": "Pool",
                 "metadata": {"name": "test-pool", "namespace": "rio"},
                 "spec": {
+                    "kind": "Builder",
                     "maxConcurrent": 10,
                     "features": [],
                     "systems": ["x"],
-                    "sizeClass": "x",
                     "image": "x",
                 },
             })

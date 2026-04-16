@@ -9,7 +9,7 @@ rio-build/
 ├── rio-auth/            # JWT/HMAC tokens + tonic auth interceptor (depends on rio-common only)
 ├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
 ├── rio-proto/           # Protobuf/gRPC definitions
-├── rio-crds/            # Kubernetes CRD types (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)
+├── rio-crds/            # Kubernetes CRD types (Pool, ComponentScaler)
 ├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
 ├── rio-gateway/         # SSH server + Nix worker protocol frontend
 ├── rio-scheduler/       # DAG-aware build scheduler
@@ -95,7 +95,7 @@ Notable edges:
 - **`rio-proto → rio-nix`**: `ValidatedPathInfo` wraps `StorePath` from rio-nix. No cycle — rio-nix has no rio-* deps.
 - **`rio-proto → rio-common`**: `connect_channel`/`connect_with_retry` use `rio_common::backoff` and `rio_common::grpc` constants. Contract tests floor-assert `rio_common::limits` constants at compile time (e.g., `MAX_DAG_NODES >= 70_000`).
 - **`rio-scheduler → rio-nix` (prod)**: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
-- **`rio-scheduler → rio-crds` (prod)**: lease-election reads `BuilderPoolSet` to seed size-class config at startup.
+- **`rio-scheduler → rio-crds` (prod)**: lease-election only.
 - **`rio-scheduler → rio-store` (dev-only)**: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
 - **`rio-gateway → rio-store` (dev-only)**: golden-daemon tests assert against a real `StoreServiceServer` (with `test-utils` feature) instead of `MockStore`.
 
@@ -415,7 +415,7 @@ src/
 ├── lib.rs
 ├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
 ├── bin/
-│   └── crdgen.rs      # Emit BuilderPool/BuilderPoolSet/FetcherPool/ComponentScaler CRD YAML
+│   └── crdgen.rs      # Emit Pool/ComponentScaler CRD YAML
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
 ├── scaling/
@@ -425,24 +425,14 @@ src/
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
     ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
-    ├── common/
-    │   ├── mod.rs     # Shared reconcile helpers (SSA apply, ownerRef, labels)
-    │   ├── job.rs     # Job-mode reconciler plumbing: spawn_count, reap_excess_pending, reap_orphan_running
-    │   └── pod.rs     # Pod-spec builders shared by builder/fetcher (security context, volumes)
-    ├── builderpool/
-    │   ├── mod.rs     # BuilderPool reconcile: spawn/reap Jobs + drain finalizer
-    │   ├── builders.rs   # Job/ConfigMap object builders (labels, volumes, envFrom)
-    │   ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
-    │   ├── static_sizing.rs # Static-sizing Job spawn/reap (queue-depth poll, excess-Pending reap)
-    │   └── tests/
-    ├── builderpoolset/
-    │   ├── mod.rs     # BuilderPoolSet reconcile: child BuilderPool fan-out + status aggregate
-    │   └── builders.rs # Child-BuilderPool spec builders (poolTemplate + per-class overrides)
-    ├── componentscaler/
-    │   └── mod.rs     # ComponentScaler reconcile: learnedRatio EMA + /scale patch
-    └── fetcherpool/
-        ├── mod.rs     # FetcherPool reconcile: per-class Job spawn (FOD-only executors)
-        └── jobs.rs    # Per-class spawn from GetSpawnIntents{kind=Fetcher}
+    └── pool/
+        ├── mod.rs     # Pool reconcile: executor_params kind branch + drain finalizer
+        ├── pod.rs     # Pod-spec builder (security context, volumes, labels)
+        ├── job.rs     # Job-mode plumbing: spawn_for_each, reap_excess_pending, reap_orphan_running
+        ├── jobs.rs    # Reconcile loop: GetSpawnIntents → build_job → status patch
+        ├── conditions.rs # K8s Condition helpers (transition_time)
+        ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
+        └── tests/
 ```
 
 ### rio-test-support — Test harness
@@ -498,10 +488,7 @@ r[ts.metrics.asserts]
 ```
 src/
 ├── lib.rs             # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-├── common.rs          # Shared CRD substructures (#[serde(flatten)] into BuilderPool/FetcherPool)
-├── builderpool.rs     # BuilderPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
-├── builderpoolset.rs  # BuilderPoolSet CRD spec/status (per-class child-pool fan-out)
-├── fetcherpool.rs     # FetcherPool CRD spec/status (FOD-only executors, open egress)
+├── pool.rs            # Pool CRD spec/status (kind: Builder|Fetcher) + #[derive(CustomResource, KubeSchema)]
 └── componentscaler.rs # ComponentScaler CRD spec/status (predictive Deployment /scale)
 ```
 
@@ -517,7 +504,7 @@ src/
 ├── upstream.rs        # `rio upstream list|add|remove` — per-tenant upstream cache CRUD (StoreAdminService)
 ├── verify_chunks.rs   # `rio verify-chunks` — PG↔backend chunk consistency audit (StoreAdminService.VerifyChunks)
 ├── workers.rs         # `rio workers` — ListExecutors table + per-executor drain; --actor/--diff for in-mem state
-└── bps.rs             # `rio bps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
+└── pool.rs            # `rio pool get|describe` — Pool CR inspection (kube-rs, not gRPC)
 ```
 
 ### xtask — Dev/ops tooling

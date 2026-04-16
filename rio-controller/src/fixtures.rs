@@ -3,60 +3,38 @@
 //! The generic scenario-driven mock apiserver lives in
 //! `rio-test-support::kube_mock` (shared with rio-scheduler's
 //! lease election tests). This module keeps the rio-controller-
-//! specific scenario builders that know about BuilderPool/Job/
-//! PodSpec shapes.
-//!
-//! This tests the WIRING, not the business logic — that's what
-//! the pure unit tests on `build_executor_pod_spec` etc are for.
-//! Here we prove: apply() spawns Jobs then patches
-//! BuilderPool/status, in that order, with server-side-apply
-//! params. Get the order wrong → test fails.
-//!
-//! # Why not mock the WHOLE thing (scheduler too)
-//!
-//! Reconcile's K8s calls are the meat — that's what finalizer()
-//! and server-side apply make tricky. The scheduler calls in
-//! cleanup() are one RPC (DrainExecutor). A MockScheduler is a
-//! separate thing (rio-test-support already has one, but not
-//! wired for AdminService). Scope: K8s mocks only. Scheduler
-//! integration is what vm-phase3a is for.
+//! specific scenario builders that know about Pool/Job/PodSpec
+//! shapes.
 //!
 //! `#[cfg(test)]` is on the `mod fixtures;` in lib.rs — not
 //! here (stable clippy flags the duplicate).
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::reconcilers::common::pod::UpstreamAddrs;
-use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec};
-use rio_crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
+use crate::reconcilers::pool::pod::UpstreamAddrs;
+use rio_crds::pool::{ExecutorKind, Pool, PoolSpec};
 
-/// Minimal BuilderPoolSpec with all CEL-required fields explicit
-/// and optional fields `None`. Used by [`test_builderpool`] and
-/// directly by tests that need to mutate a field before wrapping
-/// in a `BuilderPool`.
+/// Minimal `PoolSpec` with all CEL-required fields explicit and
+/// optional fields `None`.
 ///
-/// NEXT FIELD ADD: touch THIS fn + the production literal at
-/// `reconcilers/builderpoolset/builders.rs::build_child_builderpool`
-/// — 2 sites (down from the previous 4-5 test literals each
-/// hitting E0063 on every field add). CEL-exhaustiveness is the
-/// point; don't `#[derive(Default)]` on `BuilderPoolSpec`.
-pub fn test_builderpool_spec() -> BuilderPoolSpec {
-    BuilderPoolSpec {
-        common: rio_crds::common::PoolSpecCommon {
-            max_concurrent: Some(10),
-            deadline_seconds: None,
-            deploy: rio_crds::common::PoolDeployKnobs {
-                systems: vec!["x86_64-linux".into()],
-                image: "rio-builder:test".into(),
-                ..Default::default()
-            },
-        },
-        resources: None,
+/// NEXT FIELD ADD: touch THIS fn — 1 site (down from the previous
+/// 4-5 test literals each hitting E0063 on every field add).
+/// CEL-exhaustiveness is the point; don't `#[derive(Default)]` on
+/// `PoolSpec`.
+pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
+    PoolSpec {
+        kind,
+        image: "rio-builder:test".into(),
+        systems: vec!["x86_64-linux".into()],
+        max_concurrent: Some(10),
+        deadline_seconds: None,
+        node_selector: None,
+        tolerations: None,
+        host_users: None,
         fuse_threads: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         features: vec!["kvm".into()],
-        size_class: "small".into(),
         image_pull_policy: None,
         termination_grace_period_seconds: None,
         privileged: None,
@@ -65,39 +43,19 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
     }
 }
 
-/// Minimal FetcherPoolSpec mirroring [`test_builderpool_spec`].
-///
-/// NEXT FIELD ADD: touch THIS fn — 1 site (the only production
-/// `FetcherPoolSpec` literal is helm-side YAML).
-pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
-    FetcherPoolSpec {
-        common: rio_crds::common::PoolSpecCommon {
-            max_concurrent: Some(8),
-            deadline_seconds: None,
-            deploy: rio_crds::common::PoolDeployKnobs {
-                systems: vec!["x86_64-linux".into()],
-                image: "rio-fetcher:test".into(),
-                ..Default::default()
-            },
-        },
-        // CEL enforces `size(self.classes) > 0` (I-170); the fixture
-        // ships one default class so unit tests match the apiserver-
-        // admitted shape.
-        classes: vec![
-            rio_crds::common::SizeClassCommon {
-                name: "default".into(),
-                resources: Default::default(),
-                max_concurrent: None,
-            }
-            .into(),
-        ],
-    }
+/// Wrap a [`test_pool_spec`] in a `Pool` with name + UID + namespace
+/// set. `controller_owner_ref` needs UID; the apiserver sets it in
+/// prod, tests fake it.
+pub fn test_pool(name: &str, kind: ExecutorKind) -> Pool {
+    let mut p = Pool::new(name, test_pool_spec(kind));
+    p.metadata.uid = Some(format!("{name}-uid"));
+    p.metadata.namespace = Some("rio".into());
+    p
 }
 
 /// Collect a slice of `EnvVar` into a `name → value` map for test
 /// asserts. Skips entries with `value: None` (e.g. `valueFrom`
-/// downward-API refs). Dedup of the per-test `c.env...filter_map`
-/// collectors that every env-var assertion open-coded.
+/// downward-API refs).
 pub fn env_map(
     env: &[k8s_openapi::api::core::v1::EnvVar],
 ) -> std::collections::BTreeMap<&str, &str> {
@@ -107,8 +65,7 @@ pub fn env_map(
 }
 
 /// `controller_owner_ref` for a test CR. The fixture constructors
-/// above all set `metadata.uid` so this never returns `None`; the
-/// `expect` message names the fix if a future fixture forgets.
+/// above all set `metadata.uid` so this never returns `None`.
 pub fn oref<K: kube::Resource<DynamicType = ()>>(
     obj: &K,
 ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
@@ -116,28 +73,7 @@ pub fn oref<K: kube::Resource<DynamicType = ()>>(
         .expect("test fixture missing metadata.uid — set it in the constructor")
 }
 
-/// Wrap a [`test_fetcherpool_spec`] in a `FetcherPool` with name +
-/// UID + namespace set.
-pub fn test_fetcherpool(name: &str) -> FetcherPool {
-    let mut fp = FetcherPool::new(name, test_fetcherpool_spec());
-    fp.metadata.uid = Some(format!("{name}-uid"));
-    fp.metadata.namespace = Some("rio-fetchers".into());
-    fp
-}
-
-/// Wrap a [`test_builderpool_spec`] in a `BuilderPool` with name +
-/// UID + namespace set. `controller_owner_ref` needs UID; the
-/// apiserver sets it in prod, tests fake it.
-pub fn test_builderpool(name: &str) -> BuilderPool {
-    let mut wp = BuilderPool::new(name, test_builderpool_spec());
-    wp.metadata.uid = Some(format!("{name}-uid"));
-    wp.metadata.namespace = Some("rio".into());
-    wp
-}
-
-/// UpstreamAddrs for builder tests. Dedup of the previous
-/// `test_sched_addrs` / `test_sched` local helpers in
-/// `reconcilers/builderpool/{tests,ephemeral}.rs`.
+/// UpstreamAddrs for builder tests.
 pub fn test_sched_addrs() -> UpstreamAddrs {
     UpstreamAddrs {
         addr: "sched:9001".into(),

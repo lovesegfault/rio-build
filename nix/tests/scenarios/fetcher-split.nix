@@ -5,7 +5,7 @@
 # holds, fetcher egress open but IMDS-blocked.
 #
 # Fixture gotchas — fetcher pods have NO privileged escape hatch (hard-
-# coded false at reconcilers/fetcherpool/mod.rs:237) AND a hard-coded
+# coded false at reconcilers/pool/mod.rs:237) AND a hard-coded
 # Localhost seccomp (operator/rio-fetcher.json, :241). To get a RUNNING
 # fetcher pod in the airgap VM:
 #   - seccomp profile pre-installed on both nodes via systemd-tmpfiles
@@ -60,8 +60,8 @@ let
 
   # Ephemeral workers: pod names are Job-generated, not STS ordinals.
   # Resolved at runtime via wait_worker_pod() after the build is
-  # queued. BuilderPoolSet "x86-64" + class "tiny" → child pool
-  # label `x86-64-tiny`; same scheme for fetcherPools[].
+  # queued. Pool "x86-64"
+  # label `x86-64`; same scheme for fetcherPools[].
   builderPool = "x86-64-tiny";
   fetcherPool = "x86-64-tiny";
 in
@@ -207,8 +207,8 @@ pkgs.testers.runNixOSTest {
     except Exception:
         print("=== fetcher pod TIMEOUT: diagnostic dump ===")
         print(k3s_server.execute(
-            "k3s kubectl -n ${nsFetchers} get fetcherpool,job,pod -o wide 2>&1; "
-            "k3s kubectl -n ${nsFetchers} describe fetcherpool 2>&1; "
+            "k3s kubectl -n ${nsFetchers} get pool,job,pod -o wide 2>&1; "
+            "k3s kubectl -n ${nsFetchers} describe pool 2>&1; "
             "k3s kubectl -n rio-system logs deploy/rio-controller --tail=80 2>&1"
         )[1])
         raise

@@ -32,6 +32,7 @@
 //! already-cleared `running_build`. No client-side dedup needed.
 
 // r[impl ctrl.drain.disruption-target]
+// r[impl ctrl.pool.disruption]
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;

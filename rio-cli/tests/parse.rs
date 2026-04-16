@@ -72,7 +72,7 @@ fn top_level_help_lists_all_subcommands() {
         "poison-clear",
         "cancel-build",
         "drain-executor",
-        "bps",
+        "pool",
         "upstream",
     ] {
         assert!(help.contains(sub), "--help missing {sub}:\n{help}");
@@ -100,9 +100,9 @@ fn per_subcommand_help_renders() {
     }
     // bps has nested subcommands — check both levels.
     for sub in [
-        &["bps", "--help"][..],
-        &["bps", "get", "--help"],
-        &["bps", "describe", "--help"],
+        &["pool", "--help"][..],
+        &["pool", "get", "--help"],
+        &["pool", "describe", "--help"],
     ] {
         let out = run_cli(sub);
         assert!(out.status.success(), "{sub:?}: {:?}", out.status);
@@ -165,11 +165,11 @@ fn per_subcommand_help_renders() {
 #[case::drain_force(&["drain-executor", "builder-0", "--force"], true)]
 #[case::drain_missing_id(&["drain-executor"], false)]
 // bps: nested. get has default namespace; describe needs a name; bare errors.
-#[case::bps_get_default_ns(&["bps", "get"], true)]
-#[case::bps_get_ns(&["bps", "get", "-n", "rio-system"], true)]
-#[case::bps_describe(&["bps", "describe", "my-bps"], true)]
-#[case::bps_describe_missing_name(&["bps", "describe"], false)]
-#[case::bps_bare(&["bps"], false)]
+#[case::pool_get_default_ns(&["pool", "get"], true)]
+#[case::pool_get_ns(&["pool", "get", "-n", "rio-system"], true)]
+#[case::pool_describe(&["pool", "describe", "my-pool"], true)]
+#[case::pool_describe_missing_name(&["pool", "describe"], false)]
+#[case::pool_bare(&["pool"], false)]
 // upstream: nested. list/add/remove all need --tenant; add/remove need --url.
 #[case::upstream_list(&["upstream", "list", "--tenant", "t1"], true)]
 #[case::upstream_list_no_tenant(&["upstream", "list"], false)]

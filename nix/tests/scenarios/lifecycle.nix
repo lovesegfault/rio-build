@@ -80,13 +80,9 @@
 #   ephemeral-pool: applies an ephemeral BuilderPool; asserts
 #   status.desiredReplicas == replicas.max (reconcile_ephemeral ran and
 #   patched status, ephemeral.rs:220-228) and the Job-spawn-on-queue path
-#   end-to-end. Subtest deletes the default x86-64 BuilderPoolSet first
+#   end-to-end. Subtest deletes the default x86-64 Pool first
 #   so its child pool's reconciler doesn't steal dispatch.
 #
-# ctrl.wps.reconcile — verify marker at default.nix:subtests[bps-lifecycle]
-# ctrl.wps.autoscale — verify marker at default.nix:subtests[bps-lifecycle]
-#   bps-lifecycle: apply a 3-class BPS → BuilderPoolSet reconciler
-#   (builderpoolset/mod.rs:131) creates 3 child BuilderPools named
 #   `{bps}-{class}` with sizeClass=class.name + ownerReferences[0]→BPS
 #   + controller=true. Delete BPS → finalizer cleanup explicitly
 #   deletes each child (mod.rs:375), ownerRef GC as fallback.
@@ -100,6 +96,7 @@ let
     ns
     nsStore
     nsBuilders
+    nsFetchers
     ;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
@@ -525,6 +522,7 @@ let
       ns
       nsStore
       nsBuilders
+      nsFetchers
       grpcurl
       grpcurlTls
       protoset

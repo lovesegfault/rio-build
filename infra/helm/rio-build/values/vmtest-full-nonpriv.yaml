@@ -8,7 +8,7 @@
 # yaml` (last wins). helm-render.nix's extraValuesFiles parameter feeds
 # the second -f.
 
-builderPoolDefaults:
+poolDefaults:
   # Flip the escape hatch OFF. values.yaml default is already false
   # (production); vmtest-full.yaml overrides to true. This overrides
   # BACK to false for the one scenario that proves the production path

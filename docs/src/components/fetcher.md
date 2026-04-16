@@ -21,7 +21,7 @@ See [ADR-019](../decisions/019-builder-fetcher-split.md) for the full rationale 
 | Seccomp | Standard builder profile | Stricter (`r[fetcher.sandbox.strict-seccomp]`) |
 | Node pool | `rio.build/builder` taint | Dedicated `rio.build/fetcher` taint (`r[fetcher.node.dedicated]`) |
 | Rootfs | Writable | `readOnlyRootFilesystem: true` |
-| CRD | `BuilderPool` (size-classed by duration cutoff) | `FetcherPool` (optional `classes[]`, reactive routing only) |
+| CRD | `Pool{kind=Builder}` | `Pool{kind=Fetcher}` (ADR-019 hardening forced) |
 | Namespace | `rio-builders` | `rio-fetchers` |
 
 ## Hash verification before upload
@@ -45,10 +45,9 @@ The ADR-019–defined markers for this component live in [ADR-019](../decisions/
 - `r[fetcher.netpol.egress-open]` — NetworkPolicy: 0.0.0.0/0 on 80/443 minus RFC1918/link-local/loopback
 - `r[fetcher.sandbox.strict-seccomp]` — stricter seccomp (deny ptrace/bpf/setns/keyctl), readOnlyRootFilesystem
 - `r[fetcher.node.dedicated]` — dedicated Karpenter NodePool with `rio.build/fetcher` taint
-- `r[ctrl.fetcherpool.reconcile]` — FetcherPool CRD reconciler
-- `r[ctrl.fetcherpool.classes]` — per-class Job spawning (I-170)
-- `r[ctrl.fetcherpool.multiarch]` — multiple FetcherPools coexist (one per arch); `{fp.name}-{class}` naming
-- `r[ctrl.fetcherpool.spawn-builtin]` — spawn signal counts `builtin` FODs for every pool
+- `r[ctrl.pool.reconcile]` --- Pool CRD reconciler (kind=Fetcher arm)
+- `r[ctrl.pool.fetcher-hardening]` --- ADR-019 hardening forced regardless of spec
+- `r[ctrl.pool.fetcher-spawn-builtin]` --- spawn signal counts `builtin` FODs
 - `r[sched.dispatch.fod-to-fetcher]` — scheduler hard-filter routes FODs here
 - `r[sched.dispatch.fod-builtin-any-arch]` — `system="builtin"` FOD eligible on any fetcher
 - `r[sched.sla.reactive-floor]` — `resource_floor` doubled on explicit resource-exhaustion signals (FOD and non-FOD share the same path)

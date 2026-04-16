@@ -927,13 +927,12 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
 async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 60.0)]);
         c.retry_policy = crate::RetryPolicy {
             max_timeout_retries: 2,
             ..Default::default()
         };
     });
-    let _rx = connect_builder_classed(&handle, "cs-w", "x86_64-linux", "tiny").await?;
+    let _rx = connect_builder(&handle, "cs-w", "x86_64-linux").await?;
 
     let drv_hash = "i200-coldstart";
     let drv_path = test_drv_path(drv_hash);
@@ -953,13 +952,15 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
         )
         .await?;
         let s = expect_drv(&handle, drv_hash).await;
-        assert_eq!(
-            s.sched.resource_floor.deadline_secs, 0,
-            "cold-start: floor stays 0 (base=0 → no doubling)"
-        );
+        // Under mandatory `[sla]` (Phase 5) the floor seeds from
+        // `probe.deadline_secs` and DOES bump on each TimedOut
+        // (promoted=true), but `counted=false` → `if !counted`
+        // increments timeout_count regardless. The I-200 invariant:
+        // every TimedOut consumes budget; with `if promoted` the
+        // pre-SLA cold-start (floor=0, never promotes) looped forever.
         assert_eq!(
             s.retry.timeout_count, n,
-            "I-200: cold-start TimedOut MUST consume budget (was: if-promoted skipped, count stuck at 0)"
+            "I-200: TimedOut MUST consume budget when !counted (was: if-promoted gated, count stuck)"
         );
         assert!(
             matches!(

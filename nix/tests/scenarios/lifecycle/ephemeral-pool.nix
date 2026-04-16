@@ -4,7 +4,7 @@ scope: with scope; ''
   # ephemeral-pool — ephemeral BuilderPool → Job/build
   # ══════════════════════════════════════════════════════════════════
   # REQUIRES: no other workers alive. Subtest deletes the default
-  # x86-64 BuilderPoolSet first so its child pool's reconciler
+  # x86-64 Pool first so it's reconciler
   # doesn't steal dispatch.
   #
   # Proves end-to-end:
@@ -24,7 +24,7 @@ scope: with scope; ''
       # ephemeral reconciler ALSO sees queued>0 and spawns — build 2
       # may dispatch there, leaving no `rio.build/pool=ephemeral` Job.
       kubectl(
-          "delete builderpoolset x86-64 --ignore-not-found --wait=true",
+          "delete pool x86-64 --ignore-not-found --wait=true",
           ns="${nsBuilders}",
       )
       # wait_workers_zero (see prelude) bounds the scheduler's view

@@ -115,27 +115,18 @@ gateway:
     # client uses StrictHostKeyChecking=no.
     hostKeySecret: ""
 
-# VM tests use the chart-default single-arch builderPoolSets list
-# (`x86-64`) with one tiny size class. Per-class resources sized for
-# the 4GB k3s agent VM; poolTemplate fields (image/privileged/
-# tolerations/nodeSelector) flow from builderPoolDefaults so the
-# layered nonpriv overlay can null-clear them via Helm's deep-merge.
-builderPoolSetDefaults:
-  enabled: true
-  classes:
-    - name: tiny
-      cutoffSecs: 7200
-      maxConcurrent: 2
-      # Smaller than prod defaults — k3s agent VM is 4GB. Memory limit
-      # at 2× request caps one builder at half the node (I-005).
-      resources:
-        requests: {cpu: "1", memory: "1Gi", ephemeral-storage: "6Gi"}
-        limits: {memory: "2Gi"}
+# VM tests render one Builder pool. Per-pod resources come from the
+# scheduler's per-drv SpawnIntent (sized for the 4GB k3s agent VM via
+# the [sla] block above). poolDefaults fields flow so the layered
+# nonpriv overlay can null-clear them via Helm's deep-merge.
+pools:
+  - name: x86-64
+    kind: Builder
+    systems: [x86_64-linux]
+    maxConcurrent: 2
 
-builderPoolDefaults:
-  # Per-component ref from the same vmTestSeed preload as control-plane
-  # pods. builders.rs sets `command: ["/bin/rio-builder"]` unconditionally
-  # (no-op here — rio-builder's Entrypoint is already rio-builder).
+poolDefaults:
+  enabled: true
   image: rio-builder
   # k3s escape hatch. Most scenarios don't care about pod security
   # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
@@ -146,12 +137,11 @@ builderPoolDefaults:
   # No Karpenter nodepools → no dedicated worker nodes. Workers
   # schedule on any k3s node.
   #
-  # null (not {} or []): Helm DEEP-MERGES values files. The default
-  # values.yaml has nodeSelector: {rio.build/node-role: builder} and
-  # a matching toleration. `{}` merges → default wins → pod Pending
-  # (no node has that label). `null` deletes the key from the merge.
+  # null (not {} or []): Helm DEEP-MERGES values files. `null` deletes
+  # the key from the merge.
   tolerations: null
   nodeSelector: null
+  seccompProfile: null
 
 postgresql:
   enabled: true

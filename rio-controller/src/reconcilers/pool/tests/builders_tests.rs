@@ -289,40 +289,7 @@ fn job_pod_no_fuse_hostpath_when_unprivileged() {
     );
 }
 
-#[test]
-fn job_pod_operator_resources_pass_through() {
-    // Operator-supplied resources (cpu/memory/ephemeral) pass through
-    // to the container unchanged. Controller used to merge in
-    // rio.build/{fuse,kvm} extended resources here; that's gone (the
-    // NodeOverlay-declared capacity was simulation-only and broke EKS
-    // scheduling), so this is now a straight pass-through.
-    use k8s_openapi::api::core::v1::ResourceRequirements;
-    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-
-    let mut wp = test_wp();
-    wp.spec.resources = Some(ResourceRequirements {
-        requests: Some(BTreeMap::from([
-            ("cpu".into(), Quantity("2".into())),
-            ("memory".into(), Quantity("4Gi".into())),
-        ])),
-        limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
-        ..Default::default()
-    });
-    let pod = test_pod_spec(&wp);
-
-    let resources = pod.containers[0].resources.as_ref().unwrap();
-    let limits = resources.limits.as_ref().unwrap();
-    let requests = resources.requests.as_ref().unwrap();
-
-    assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("8Gi"));
-    assert_eq!(requests.get("cpu").map(|q| q.0.as_str()), Some("2"));
-    assert_eq!(requests.get("memory").map(|q| q.0.as_str()), Some("4Gi"));
-    // Nothing the operator didn't put there.
-    assert_eq!(limits.len(), 1, "no controller-injected limits");
-    assert_eq!(requests.len(), 2, "no controller-injected requests");
-}
-
-// r[verify ctrl.builderpool.kvm-device]
+// r[verify ctrl.pool.kvm-device]
 #[test]
 fn job_pod_kvm_feature_adds_nodeselector_toleration() {
     // Fixture wp has features=["kvm"]. The controller derives the
@@ -355,7 +322,7 @@ fn job_pod_kvm_feature_adds_nodeselector_toleration() {
     assert_eq!(kvm_tol.effect.as_deref(), Some("NoSchedule"));
 }
 
-// r[verify ctrl.builderpool.kvm-device]
+// r[verify ctrl.pool.kvm-device]
 #[test]
 fn job_pod_no_kvm_feature_no_kvm_wiring() {
     // The CONDITIONAL is the load-bearing part: a non-kvm pool must
@@ -380,7 +347,7 @@ fn job_pod_no_kvm_feature_no_kvm_wiring() {
     );
 }
 
-// r[verify ctrl.builderpool.kvm-device]
+// r[verify ctrl.pool.kvm-device]
 #[test]
 fn job_pod_kvm_privileged_keeps_selector() {
     // Privileged escape hatch still needs a host that HAS working

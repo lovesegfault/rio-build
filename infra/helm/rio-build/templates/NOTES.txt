@@ -6,7 +6,7 @@ Post-install prerequisites that the chart cannot apply itself
 */ -}}
 rio-build installed to namespace {{ .Values.namespaces.system.name }}.
 
-{{- if not .Values.builderPoolDefaults.privileged }}
+{{- if not .Values.poolDefaults.privileged }}
 
 ── /dev/fuse via containerd base_runtime_spec ─────────────────────────
 Builder pods get /dev/{fuse,kvm} injected by containerd's
@@ -23,7 +23,7 @@ Verify on a builder pod:
   kubectl -n {{ .Values.namespaces.builders.name }} debug rio-builder-x86-64-0 -it --image=busybox -- ls -l /dev/fuse
 {{- end }}
 
-{{- if not .Values.builderPoolDefaults.privileged }}
+{{- if not .Values.poolDefaults.privileged }}
 
 ── Seccomp Localhost profile (node-baked, ADR-021) ────────────────────
 Profiles are baked into the node image and copied to
@@ -41,10 +41,10 @@ new amiSelectorTerms tag. See docs/src/security.md
 r[worker.seccomp.localhost-profile].
 {{- end }}
 
-{{- if .Values.builderPoolDefaults.privileged }}
+{{- if .Values.poolDefaults.privileged }}
 
 ── privileged:true escape hatch ───────────────────────────────────────
-WARNING: builderPoolDefaults.privileged=true is active. This disables seccomp
+WARNING: poolDefaults.privileged=true is active. This disables seccomp
 entirely and is UNACCEPTABLE for multi-tenant deployments (ADR-012).
 It is intended for clusters whose containerd lacks `base_runtime_spec`
 device injection or idmap-mount support. Production on EKS/GKE should

@@ -88,7 +88,7 @@ idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
 symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't
 see a dead device node. No extended resource is requested and no device
 plugin runs. kvm pods route to `.metal` via the `rio.build/kvm`
-nodeSelector (`r[ctrl.builderpool.kvm-device]`). `privileged: true`
+nodeSelector (`r[ctrl.pool.kvm-device]`). `privileged: true`
 remains an escape
 hatch for clusters whose containerd lacks `base_runtime_spec` device
 injection; it falls back to the hostPath mechanism and MUST NOT be the
@@ -251,7 +251,7 @@ exfiltrate.
 | User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
 | Seccomp | `BuilderPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
 | Node isolation | Dedicated tainted node pool | Sandbox escape confined to builder nodes |
-| Network | NetworkPolicy egress deny | No exfil to arbitrary endpoints (FODs route to FetcherPool) |
+| Network | NetworkPolicy egress deny | No exfil to arbitrary endpoints (FODs route to kind=Fetcher pools) |
 
 The cost is per-build cold start (~10–30s pod scheduling + FUSE mount +
 heartbeat) plus one reconciler tick (~10s).

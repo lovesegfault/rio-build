@@ -37,11 +37,9 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
 const STORE_PORT: u16 = 19002;
-// BuilderPoolSet name (deploy.rs builderPoolSets=[{name:"x86-64",...},
-// {name:"aarch64",...}]). The set fans out to {name}-{class} child
-// BuilderPools — there is no BuilderPool literally named "x86-64".
-const BUILDER_POOL_SET: &str = "x86-64";
-const FETCHER_POOL: &str = "x86-64";
+// Pool names from deploy.rs POOLS_JSON.
+const BUILDER_POOL: &str = "x86-64";
+const FETCHER_POOL: &str = "x86-64-fetcher";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
 /// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
@@ -141,15 +139,15 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // destination port failed" while targets are still `initial`.
         ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
         let _tunnel = ui::step("SSM tunnel", || ssm_tunnel(LOCAL_PORT)).await?;
-        ui::step("builderpool reconcile", || {
-            step_builderpoolset_reconciled(&client)
+        ui::step("builder pool reconcile", || {
+            step_pool_reconciled(&client, NS_BUILDERS, BUILDER_POOL)
         })
         .await?;
         // SMOKE_EXPR has a builtin:fetchurl FOD + raw consumer.
-        // P0452 hard-split routes the FOD to FetcherPool only —
+        // P0452 hard-split routes the FOD to kind=Fetcher only —
         // without a reconciled fetcher the FOD queues forever.
-        ui::step("fetcherpool reconcile", || {
-            step_fetcherpool_reconciled(&client)
+        ui::step("fetcher pool reconcile", || {
+            step_pool_reconciled(&client, NS_FETCHERS, FETCHER_POOL)
         })
         .await?;
         // 1 MiB NAR — well over cas::INLINE_THRESHOLD (256 KiB) —
@@ -509,22 +507,17 @@ where
     .await
 }
 
-pub async fn step_builderpoolset_reconciled(client: &kube::Client) -> Result<()> {
-    use rio_crds::builderpoolset::BuilderPoolSet;
-    // The chart creates a BuilderPoolSet (not a BuilderPool); the
-    // controller stamps out {set}-{class} child BuilderPools from it.
-    // Polling the set's status is sufficient: the controller writes
-    // status.classes[] only after all child pools are reconciled.
-    wait_cr_status::<BuilderPoolSet>(client, NS_BUILDERS, BUILDER_POOL_SET).await
-}
-
-pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
-    use rio_crds::fetcherpool::FetcherPool;
-    // deploy.rs FETCHER_POOLS_JSON renders one FetcherPool per arch;
-    // poll the x86-64 one (smoke runs from x86 host).
+pub async fn step_pool_reconciled(
+    client: &kube::Client,
+    ns: &'static str,
+    name: &'static str,
+) -> Result<()> {
+    use rio_crds::pool::Pool;
+    // deploy.rs POOLS_JSON renders one Pool per (arch, kind); poll
+    // until the controller writes .status (replicas + conditions).
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
-    wait_cr_status::<FetcherPool>(client, NS_FETCHERS, FETCHER_POOL).await
+    wait_cr_status::<Pool>(client, ns, name).await
 }
 
 /// nix-instantiate + nix copy + nix build

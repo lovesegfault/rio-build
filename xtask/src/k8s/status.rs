@@ -13,8 +13,7 @@ use console::style;
 use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret};
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-use rio_crds::builderpool::BuilderPool;
-use rio_crds::fetcherpool::FetcherPool;
+use rio_crds::pool::{ExecutorKind, Pool};
 use serde::Serialize;
 use tracing::{debug, info};
 
@@ -48,8 +47,7 @@ pub struct Report {
     /// control plane in rio-system, store in rio-store, builders in
     /// rio-builders, fetchers in rio-fetchers.
     namespaces: Vec<NsReport>,
-    builder_pools: Vec<BpStatus>,
-    fetcher_pools: Vec<FpStatus>,
+    pools: Vec<PlStatus>,
     /// Per-subnet IP health. EKS-only (aws-sdk-ec2 describe-subnets);
     /// None for k3s (no subnet concept).
     subnets: Option<Vec<SubnetHealth>>,
@@ -79,27 +77,14 @@ pub struct NsReport {
 }
 
 #[derive(Serialize)]
-pub struct BpStatus {
+pub struct PlStatus {
     name: String,
+    kind: String,
     ready: i32,
     replicas: i32,
     desired: i32,
-    /// Last `Scaling` condition reason (ScaledUp/ScaledDown/UnknownMetric).
-    reason: Option<String>,
     /// `SchedulerUnreachable` condition is True.
     scheduler_unreachable: bool,
-}
-
-/// FetcherPool status. Same shape as BuilderPool now (I-014):
-/// {min,max} bounds, autoscaler-driven `desired`.
-#[derive(Serialize)]
-pub struct FpStatus {
-    name: String,
-    ready: i32,
-    /// `status.desiredReplicas` — what the autoscaler last reconciled
-    /// (or `spec.replicas.min` before first reconcile).
-    desired: i32,
-    max: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -248,8 +233,17 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         context,
         release: helm::release_status("rio", NS).ok().flatten(),
         namespaces,
-        builder_pools: list_builder_pools(client).await.unwrap_or_default(),
-        fetcher_pools: list_fetcher_pools(client).await.unwrap_or_default(),
+        pools: {
+            let mut v = list_pools(client, NS_BUILDERS, ExecutorKind::Builder)
+                .await
+                .unwrap_or_default();
+            v.extend(
+                list_pools(client, NS_FETCHERS, ExecutorKind::Fetcher)
+                    .await
+                    .unwrap_or_default(),
+            );
+            v
+        },
         subnets,
         cilium: gather_cilium(client).await,
         stuck_nodeclaims: gather_stuck_nodeclaims(client).await,
@@ -817,56 +811,27 @@ pub(super) fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
     Api::all_with(client.clone(), &ar)
 }
 
-async fn list_builder_pools(client: &k::Client) -> Result<Vec<BpStatus>> {
-    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
+async fn list_pools(client: &k::Client, ns: &str, kind: ExecutorKind) -> Result<Vec<PlStatus>> {
+    let api: Api<Pool> = Api::namespaced(client.clone(), ns);
     let mut out: Vec<_> = api
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .map(|bp| {
-            let name = bp.metadata.name.unwrap_or_default();
-            let st = bp.status.unwrap_or_default();
-            let reason = st
-                .conditions
-                .iter()
-                .find(|c| c.type_ == "Scaling")
-                .map(|c| c.reason.clone());
+        .filter(|p| p.spec.kind == kind)
+        .map(|p| {
+            let name = p.metadata.name.unwrap_or_default();
+            let st = p.status.unwrap_or_default();
             let scheduler_unreachable = st
                 .conditions
                 .iter()
                 .any(|c| c.type_ == "SchedulerUnreachable" && c.status == "True");
-            BpStatus {
+            PlStatus {
                 name,
+                kind: format!("{:?}", p.spec.kind),
                 ready: st.ready_replicas,
                 replicas: st.replicas,
                 desired: st.desired_replicas,
-                reason,
                 scheduler_unreachable,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
-}
-
-async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
-    let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);
-    let mut out: Vec<_> = api
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
-        .map(|fp| {
-            let max = fp.spec.max_concurrent.map(|c| c as i32);
-            let min = 0i32;
-            FpStatus {
-                name: fp.metadata.name.unwrap_or_default(),
-                ready: fp
-                    .status
-                    .as_ref()
-                    .map(|s| s.ready_replicas)
-                    .unwrap_or_default(),
-                desired: fp.status.map(|s| s.desired_replicas).unwrap_or(min),
-                max,
             }
         })
         .collect();
@@ -1055,46 +1020,27 @@ fn render_human(r: &Report) {
     }
 
     eprintln!();
-    header("BuilderPools");
-    if r.builder_pools.is_empty() {
+    header("Pools");
+    if r.pools.is_empty() {
         eprintln!("  {} none", style("·").dim());
     }
-    let w = col_width(&r.builder_pools, |p| &p.name);
-    for p in &r.builder_pools {
+    let w = col_width(&r.pools, |p| &p.name);
+    for p in &r.pools {
         let ok = p.ready == p.desired && !p.scheduler_unreachable;
-        let reason = p.reason.as_deref().unwrap_or("-");
         let unreach = if p.scheduler_unreachable {
             style(" SchedulerUnreachable").red().to_string()
         } else {
             String::new()
         };
         eprintln!(
-            "  {} {:w$}  {}/{}→{}  {}{}",
+            "  {} {:w$}  {:<8}  {}/{}→{}{}",
             glyph(ok),
             p.name,
+            style(&p.kind).dim(),
             p.ready,
             p.replicas,
             p.desired,
-            style(reason).dim(),
             unreach
-        );
-    }
-
-    eprintln!();
-    header("FetcherPools");
-    if r.fetcher_pools.is_empty() {
-        eprintln!("  {} none", style("·").dim());
-    }
-    let w = col_width(&r.fetcher_pools, |p| &p.name);
-    for p in &r.fetcher_pools {
-        let ok = p.ready == p.desired;
-        eprintln!(
-            "  {} {:w$}  {}/{}→{}",
-            glyph(ok),
-            p.name,
-            p.ready,
-            p.desired,
-            p.max.map_or("∞".into(), |m| m.to_string())
         );
     }
 
@@ -1260,8 +1206,7 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
             context: String::new(),
             release: None,
             namespaces: vec![],
-            builder_pools: vec![],
-            fetcher_pools: vec![],
+            pools: vec![],
             subnets: Some(vec![SubnetHealth {
                 az: "us-east-2a".into(),
                 cidr: "10.0.32.0/19".into(),
@@ -1295,8 +1240,7 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
                 image_tag: None,
             }),
             namespaces: vec![],
-            builder_pools: vec![],
-            fetcher_pools: vec![],
+            pools: vec![],
             subnets: None,
             cilium: None,
             stuck_nodeclaims: vec![],
@@ -1323,8 +1267,7 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
                 image_tag: None,
             }),
             namespaces: vec![],
-            builder_pools: vec![],
-            fetcher_pools: vec![],
+            pools: vec![],
             subnets: Some(vec![SubnetHealth {
                 az: "us-east-2a".into(),
                 cidr: "10.0.32.0/19".into(),

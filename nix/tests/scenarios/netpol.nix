@@ -88,8 +88,8 @@ pkgs.testers.runNixOSTest {
     # helm-render.nix puts NetworkPolicy (not Namespace/RBAC kind) in
     # 02-workloads.yaml → k3s auto-applies it at boot along with
     # everything else. If this get fails, the helm override didn't take.
-    # ADR-019: builder-egress policy lives in rio-builders namespace.
-    kubectl("get cnp builder-egress -o name", ns="${nsBuilders}")
+    # D3a: builder-egress is now a CCNP (cluster-wide, ns-agnostic).
+    k3s_server.succeed("k3s kubectl get ccnp builder-egress -o name")
 
     # Cilium attaches policy at endpoint-create time. Gate on this
     # specific pod's CiliumEndpoint having an identity — proves the
@@ -342,6 +342,84 @@ pkgs.testers.runNixOSTest {
             f"Cilium should DROP.\n{out}"
         )
         print(f"netpol-store IMDS PASS: blocked (curl rc={rc})")
+
+    # ══════════════════════════════════════════════════════════════════
+    # netpol-cross-ns — D3a: Pool{kind=Builder} in fetcher ns airgapped
+    # ══════════════════════════════════════════════════════════════════
+    # D3a regression: with one Pool CRD, an operator can apply a
+    # builder Pool into ANY namespace. Under namespaced CNPs that
+    # builder pod would be unselected → Cilium default-allow → full
+    # egress including kube-apiserver. CCNP selects by component label
+    # ns-agnostically: a misplaced builder is STILL airgapped (egress
+    # to apiserver blocked) AND can reach store (label-match ingress).
+    with subtest("netpol-cross-ns: misplaced builder Pool is airgapped"):
+        # Spawn a builder Pool in the FETCHER namespace.
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Pool\n"
+            "metadata: {name: misplaced, namespace: ${fixture.nsFetchers}}\n"
+            "spec:\n"
+            "  kind: Builder\n"
+            "  image: rio-builder\n"
+            "  systems: [x86_64-linux]\n"
+            "  privileged: true\n"
+            "  maxConcurrent: 1\n"
+            "EOF"
+        )
+        client.succeed(
+            "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${warmupDrv} >/tmp/warmup-x.log 2>&1 &"
+        )
+        # Wait for the misplaced pod (label rio.build/pool=misplaced).
+        mp = k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${fixture.nsFetchers} get pod "
+            "-l rio.build/pool=misplaced "
+            "-o jsonpath='{.items[0].metadata.name}' | grep .",
+            timeout=120,
+        ).strip()
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${fixture.nsFetchers} get ciliumendpoint "
+            f"{mp} -o jsonpath='{{.status.identity.id}}' | grep -q .",
+            timeout=60,
+        )
+        mp_node = kubectl(
+            f"get pod {mp} -o jsonpath='{{.spec.nodeName}}'",
+            ns="${fixture.nsFetchers}",
+        ).strip()
+        mp_vm = k3s_agent if mp_node == "k3s-agent" else k3s_server
+        mp_cid = mp_vm.succeed(
+            f"k3s crictl ps -q --label io.kubernetes.pod.name={mp} | head -1"
+        ).strip()
+        mp_pid = mp_vm.succeed(
+            f"k3s crictl inspect {mp_cid} | ${jq} -r .info.pid"
+        ).strip()
+
+        # Egress to kube-api BLOCKED (CCNP selected this pod by
+        # app.kubernetes.io/component=rio-builder regardless of ns).
+        rc, _ = mp_vm.execute(
+            f"nsenter -t {mp_pid} -n -- ${nc} -z -w5 {api_ip} 443"
+        )
+        assert rc != 0, (
+            "D3a FAILURE: misplaced builder reached kube-api — CCNP "
+            "did not select cross-ns. Builder airgap broken."
+        )
+        # Ingress to rio-store ALLOWED (store-ingress fromEndpoints
+        # matches by component label, not namespace).
+        store_ip = kubectl(
+            "get svc rio-store -o jsonpath='{.spec.clusterIP}'",
+            ns="${nsStore}",
+        ).strip()
+        rc, _ = mp_vm.execute(
+            f"nsenter -t {mp_pid} -n -- ${nc} -z -w5 {store_ip} 9002"
+        )
+        assert rc == 0, (
+            "D3a FAILURE: misplaced builder cannot reach rio-store — "
+            "store-ingress label-match did not select cross-ns."
+        )
+        kubectl("delete pool misplaced --wait=false", ns="${fixture.nsFetchers}")
+        print("netpol-cross-ns PASS: misplaced builder airgapped + store reachable")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

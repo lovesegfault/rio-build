@@ -633,18 +633,13 @@ in
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
       # heartbeat + build + exit). Subtest deletes the default x86-64
-      # BuilderPoolSet first so its child pool doesn't steal dispatch.
+      # Pool first so it doesn't steal dispatch.
       "ephemeral-pool"
     ];
     # ephemeral ~180s.
     globalTimeout = 1400;
   };
 
-  # r[verify ctrl.wps.reconcile]
-  #   bps-lifecycle: apply 3-class BPS → 3 child BuilderPools named
-  #   `{bps}-{class}` each with sizeClass=class.name + ownerRef[0]=
-  #   BuilderPoolSet (controller=true). Delete BPS → finalizer
-  #   cleanup explicitly deletes children; ownerRef GC as fallback.
   #
   # Own split (not folded into autoscale): fresh fixture → clean
   # state → fast finalizers. ~4min boot + ~3min subtests.
@@ -676,10 +671,12 @@ in
     };
   };
 
-  vm-lifecycle-bps-k3s = lifecycleMod.mkTest {
-    name = "bps";
+  vm-lifecycle-pool-k3s = lifecycleMod.mkTest {
+    name = "pool";
     subtests = [
-      "bps-lifecycle"
+      # r[verify ctrl.pool.reconcile]
+      # r[verify ctrl.crd.pool]
+      "pool-lifecycle"
     ];
   };
 
@@ -832,12 +829,6 @@ in
   #   actually scheduled on the labeled k3s-agent node. Karpenter
   #   NodePool enforcement is EKS-only; this proves the params→
   #   podspec chain.
-  # r[verify ctrl.fetcherpool.multiarch]
-  #   fetcherPools[] list-shape renders one FetcherPool per entry;
-  #   STS named `rio-fetcher-{pool}-{class}` (the test's fetcherPod
-  #   = rio-fetcher-x86-64-tiny-0). Per-arch dispatch covered by
-  #   the assignment.rs hard_filter unit test; second-pool e2e via
-  #   EKS smoke (FETCHER_POOLS_JSON has both arches).
   # r[verify fetcher.nixconf.hashed-mirrors]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
   #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
@@ -850,36 +841,25 @@ in
         "networkPolicy.enabled" = "true";
         "nixConf.hashedMirrors" = "http://203.0.113.1/";
       };
-      # fetcherPools via values file (not --set-string) so hostUsers
-      # stays bool true. --set-string would coerce to the STRING
-      # "true" which the CRD Option<bool> field rejects.
+      # pools via values file (not --set-string) so types stay correct.
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
-        (pkgs.writeText "fetcherpool-vm.yaml" ''
-          fetcherPools:
+        (pkgs.writeText "fetcher-pool-vm.yaml" ''
+          pools:
             - name: x86-64
-              # builtin:fetchurl FOD has system=builtin; hard_filter's
-              # can_build check needs the fetcher to advertise it.
+              kind: Builder
+              systems: [x86_64-linux]
+              maxConcurrent: 2
+            - name: x86-64-fetcher
+              kind: Fetcher
+              image: rio-fetcher
+              # builtin:fetchurl FOD has system=builtin.
               systems: [x86_64-linux, builtin]
-          fetcherPoolDefaults:
-            enabled: true
-            maxConcurrent: 1
-            image: rio-fetcher
-            # k3s containerd doesn't chown the pod cgroup under
-            # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/
-            # leaf EACCES → CrashLoop. Same escape hatch builderPool
-            # uses (via privileged:true which implies hostUsers:true).
-            hostUsers: true
-            # I-170/I-208: values.yaml defaults classes mirror the
-            # 5-tier builder ladder (tiny=2cpu/2Gi … xlarge=128cpu).
-            # k3s-agent VM can't fit even tiny alongside the builder
-            # pod. Override to a single 128Mi tier — this test
-            # exercises routing/netpol, not memory sizing.
-            classes:
-              - name: tiny
-                resources:
-                  requests: {cpu: 100m, memory: 128Mi}
-                  limits: {memory: 512Mi}
+              maxConcurrent: 1
+              # CEL forbids privileged/hostUsers/seccomp for Fetcher.
+              privileged: null
+              hostUsers: null
+              seccompProfile: null
         '')
       ];
     };

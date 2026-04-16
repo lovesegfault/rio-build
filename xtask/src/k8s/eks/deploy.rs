@@ -31,47 +31,34 @@ const SIZE_CLASSES_JSON: &str = r#"[
   {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":274877906944,"cpuLimitCores":128.0}
 ]"#;
 
-/// `builderPoolSets[]` (helm list — replaced wholesale, hence one const).
-/// Per-arch general sets use `builderPoolSetDefaults.classes` (5-tier).
-/// Per-arch kvm sets override `classes` to a single xlarge bucket (NixOS
-/// VM tests are uniformly heavy — no point tiering) and `poolTemplate.
-/// features` to the standard nixpkgs VM-test feature triple. The
-/// controller derives the metal nodeSelector + `rio.build/kvm`
-/// toleration from `features:[kvm]`
-/// (`r[ctrl.builderpool.kvm-device]`) — NOT set here.
+/// `pools[]` (helm list — replaced wholesale, hence one const).
+/// Per-arch general builder pools, per-arch kvm builder pools (NixOS
+/// VM tests; the controller derives the metal nodeSelector +
+/// `rio.build/kvm` toleration from `features:[kvm]` —
+/// `r[ctrl.pool.kvm-device]`), and per-arch fetcher pools.
 ///
-/// Validate end-to-end after deploy by building a derivation with
-/// `requiredSystemFeatures = ["kvm" "nixos-test"]` through the gateway:
-///   cargo xtask k8s -p eks rsb -- nix build -L --store ssh-ng://… \
-///     'nixpkgs#nixosTests.simple'
-/// Scheduler routes it to the `{arch}-kvm-xlarge` pool; Karpenter
-/// provisions a `.metal` node (nodeSelector); pod gets `/dev/kvm` via
-/// containerd base_runtime_spec.
-const BUILDER_POOL_SETS_JSON: &str = r#"[
-  {"name":"x86-64","systems":["x86_64-linux","i686-linux"]},
-  {"name":"aarch64","systems":["aarch64-linux"]},
-  {"name":"x86-64-kvm","systems":["x86_64-linux","i686-linux"],
-   "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
-   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxConcurrent":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
-                  "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]},
-  {"name":"aarch64-kvm","systems":["aarch64-linux"],
-   "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
-   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxConcurrent":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
-                  "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]}
-]"#;
-
-/// One FetcherPool per arch — `system="builtin"` FODs overflow to
-/// either (every executor advertises `builtin`; `best_executor` scores
-/// across the union). nodeSelector REPLACES the reconciler default, so
-/// `rio.build/node-role: fetcher` is repeated. Image stays the ECR ref
-/// from `fetcherPoolDefaults.image` (PLAN-PREBAKE: layer-cache-warm,
-/// not digest-pin).
-const FETCHER_POOLS_JSON: &str = r#"[
-  {"name":"x86-64","systems":["x86_64-linux","i686-linux","builtin"],
+/// Per-pod (cores, mem, disk) come from the scheduler's per-drv
+/// SpawnIntent (ADR-023) — there is NO per-pool resources knob.
+///
+/// Fetcher entries: `system="builtin"` FODs overflow to either arch;
+/// nodeSelector REPLACES the reconciler default. CEL forbids
+/// privileged/hostUsers/seccompProfile on Fetcher entries — those
+/// fields are deep-merged from poolDefaults but rejected at admission;
+/// the `seccompProfile:null` clears prevent the merge.
+const POOLS_JSON: &str = r#"[
+  {"name":"x86-64","kind":"Builder","systems":["x86_64-linux","i686-linux"]},
+  {"name":"aarch64","kind":"Builder","systems":["aarch64-linux"]},
+  {"name":"x86-64-kvm","kind":"Builder","systems":["x86_64-linux","i686-linux"],
+   "features":["kvm","nixos-test","big-parallel"],"maxConcurrent":10},
+  {"name":"aarch64-kvm","kind":"Builder","systems":["aarch64-linux"],
+   "features":["kvm","nixos-test","big-parallel"],"maxConcurrent":10},
+  {"name":"x86-64-fetcher","kind":"Fetcher","image":"rio-fetcher",
+   "systems":["x86_64-linux","i686-linux","builtin"],
+   "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"amd64"}},
-  {"name":"aarch64","systems":["aarch64-linux","builtin"],
+  {"name":"aarch64-fetcher","kind":"Fetcher","image":"rio-fetcher",
+   "systems":["aarch64-linux","builtin"],
+   "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}
 ]"#;
 
@@ -263,7 +250,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // builderPoolDefaults stays the poolTemplate base (seccomp,
             // tolerations, nodeSelector, hostUsers — deep-merged in the
             // chart).
-            .set("builderPoolSetDefaults.enabled", "true")
+            .set("poolDefaults.enabled", "true")
             // I-186: hostUsers:false breaks FUSE passthrough
             // (FUSE_DEV_IOC_BACKING_OPEN needs init-userns
             // CAP_SYS_ADMIN) and fusectl mount (I-165b). Passthrough
@@ -274,19 +261,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // The NixOS AMI's containerd cgroup_writable=true is in
             // place (nix/nixos-node/eks-node.nix) so the flip is a
             // one-line revert here when P0560 lands.
-            .set_json("builderPoolSets", BUILDER_POOL_SETS_JSON)
-            // scheduler.sizeClasses MUST agree with builderPoolSetDefaults.
-            // classes (names + cutoffs). memLimitBytes ≈ the class's
-            // resources.limits.memory — a build whose EMA peak exceeds
-            // it bumps to the next class even if duration fits.
+            .set_json("pools", POOLS_JSON)
             .set_json("scheduler.sizeClasses", SIZE_CLASSES_JSON)
-            // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
-            // to FetcherPool only. Without this, the FOD queues forever
-            // (scheduler never sends a FOD to a builder per ADR-019).
-            // One pool per arch; builtin FODs overflow to whichever
-            // has capacity.
-            .set_json("fetcherPools", FETCHER_POOLS_JSON)
-            .set("fetcherPoolDefaults.enabled", "true")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             // I-128: store.replicas was a fixed "8" here (I-105

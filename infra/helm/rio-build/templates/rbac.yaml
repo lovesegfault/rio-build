@@ -78,9 +78,7 @@ rules:
   {{- $full := list "get" "list" "watch" "create" "update" "patch" "delete" }}
   {{- $ro   := list "get" "list" "watch" "patch" "update" }}
   {{- range $r := list
-        (dict "name" "builderpools"     "verbs" $full "status" (list "get" "patch")          "finalizers" true)
-        (dict "name" "builderpoolsets"  "verbs" $ro   "status" (list "get" "patch" "update") "finalizers" true)
-        (dict "name" "fetcherpools"     "verbs" $full "status" (list "get" "patch")          "finalizers" true)
+        (dict "name" "pools"            "verbs" $full "status" (list "get" "patch")          "finalizers" true)
         (dict "name" "componentscalers" "verbs" $ro   "status" (list "get" "patch" "update") "finalizers" false)
   }}
   - apiGroups: [rio.build]
