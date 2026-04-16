@@ -69,6 +69,10 @@ let
   slaSizingFixture = standalone {
     workers = {
       worker = {
+        # cost-solve adds [[size_classes]]; with classes configured,
+        # dispatch hard-rejects workers that don't declare one
+        # (rejection_reason = "size-class-undeclared").
+        sizeClass = "default";
         extraServiceEnv = {
           RIO_BUILDER_SCRIPT = "${./fixtures/sla-builder-script.toml}";
         };
@@ -98,6 +102,15 @@ let
         cpu = 4
         mem_per_core = 2147483648
         mem_base = 4294967296
+
+        # cost-solve / ice-backoff observe SpawnIntent.node_selector
+        # via GetSizeClassStatus, which early-returns [] when no
+        # size_classes are configured (snapshot.rs:230). One class is
+        # enough — every Ready non-FOD lands in it.
+        [[size_classes]]
+        name = "default"
+        cutoff_secs = 86400.0
+        mem_limit_bytes = 274877906944
       '';
     };
     extraPackages = [
