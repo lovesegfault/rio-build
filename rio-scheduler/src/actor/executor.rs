@@ -270,7 +270,7 @@ impl DagActor {
         // Reassign whatever was on this worker. The worker is gone;
         // whether it was draining or not doesn't matter now.
         //
-        // Disconnect does NOT promote `size_class_floor` — the
+        // Disconnect does NOT bump `resource_floor` — the
         // controller is authoritative on termination reason
         // (`ReportExecutorTermination` with k8s OOMKilled/DiskPressure
         // → promote; anything else → no-op). A bare disconnect is
@@ -329,7 +329,7 @@ impl DagActor {
     /// `running_build` but split-brain or delayed heartbeat reconcile
     /// can produce it.
     ///
-    /// Disconnect does NOT promote `size_class_floor` and does NOT
+    /// Disconnect does NOT bump `resource_floor` and does NOT
     /// record into `failed_builders`/`failure_count`/`retry_count`. The
     /// controller is authoritative on termination reason: it calls
     /// `ReportExecutorTermination` with the k8s OOMKilled/Evicted
@@ -350,7 +350,7 @@ impl DagActor {
     /// `lost_worker`: kept for the existing-poison-state check (3 prior
     /// REAL failures + 1 disconnect → poison instead of dispatching a
     /// 4th time) and for logging.
-    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+3]
+    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+4]
     pub(super) async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],
@@ -373,6 +373,9 @@ impl DagActor {
                 continue;
             }
 
+            // Disconnect does NOT bump `resource_floor` — the
+            // controller's follow-up `ReportExecutorTermination` is
+            // authoritative on whether the cause was a sizing signal.
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
@@ -391,8 +394,9 @@ impl DagActor {
     // r[impl sched.fod.size-class-reactive]
     // r[impl sched.builder.size-class-reactive]
     /// Controller-reported Pod termination reason. `OomKilled` /
-    /// `EvictedDiskPressure` → promote `size_class_floor` for the drv
-    /// that was running at disconnect. Other reasons → no-op (log only).
+    /// `EvictedDiskPressure` / `DeadlineExceeded` → bump the relevant
+    /// `resource_floor` dimension (D4). Other reasons → no-op (log
+    /// only).
     ///
     /// Resolves `executor_id → drv_hash` via `recently_disconnected`
     /// (populated by `handle_executor_disconnected` when the worker died
@@ -404,43 +408,34 @@ impl DagActor {
     /// scheduler — rare), fall back to the still-live executor's
     /// `running_build`.
     ///
-    /// `reported_class`: the controller sends the Pod's size_class
-    /// label as a fallback. Normally `recently_disconnected` already
-    /// has the class (captured at disconnect); this covers the race-
-    /// ahead case where the executor entry exists but
-    /// `recently_disconnected` doesn't.
+    /// `_reported_class` is now unused (D4: floor is per-dimension
+    /// bytes, not class names) but kept in the wire shape until the
+    /// controller stops sending it (Phase 7).
     pub(super) async fn handle_executor_termination(
         &mut self,
         executor_id: &ExecutorId,
         reason: rio_proto::types::TerminationReason,
-        reported_class: Option<&str>,
+        _reported_class: Option<&str>,
     ) -> bool {
         use rio_proto::types::TerminationReason as R;
 
-        // r[impl sched.termination.deadline-exceeded]
+        // r[impl sched.termination.deadline-exceeded+2]
         // DeadlineExceeded is reported by JOB name (the Job controller
         // deletes the Pod when activeDeadlineSeconds fires, so the
         // controller never sees a terminated container). Prefix-match
         // recently_disconnected: pod name = `{job}-{5char}`.
         if reason == R::DeadlineExceeded {
-            return self
-                .handle_deadline_exceeded(executor_id, reported_class)
-                .await;
+            return self.handle_deadline_exceeded(executor_id).await;
         }
 
-        // Resolve drv + class. remove() = first-report-wins dedup.
-        let (drv_hash, class) = match self.recently_disconnected.remove(executor_id) {
-            Some((drv, class, _)) => (drv, class.or_else(|| reported_class.map(String::from))),
+        // Resolve drv. remove() = first-report-wins dedup.
+        let drv_hash = match self.recently_disconnected.remove(executor_id) {
+            Some((drv, _, _)) => drv,
             // Race-ahead: report landed before ExecutorDisconnected.
             // Look at the still-live executor.
             None => match self.executors.get(executor_id) {
                 Some(w) => match &w.running_build {
-                    Some(drv) => (
-                        drv.clone(),
-                        w.size_class
-                            .clone()
-                            .or_else(|| reported_class.map(String::from)),
-                    ),
+                    Some(drv) => drv.clone(),
                     None => {
                         debug!(executor_id = %executor_id, ?reason,
                                "termination report: executor live but idle, ignoring");
@@ -456,25 +451,21 @@ impl DagActor {
             },
         };
 
-        let promote_reason = match reason {
-            R::OomKilled => "oom_killed",
-            R::EvictedDiskPressure => "disk_pressure",
-            R::DeadlineExceeded => unreachable!("handled above"),
-            R::EvictedOther | R::Completed | R::Error | R::Unknown => {
-                debug!(executor_id = %executor_id, drv_hash = %drv_hash, ?reason,
-                       "termination report: non-resource reason, no promotion");
-                return false;
-            }
+        let Some(label) = super::floor::reason_label(reason) else {
+            debug!(executor_id = %executor_id, drv_hash = %drv_hash, ?reason,
+                   "termination report: non-resource reason, no promotion");
+            return false;
         };
 
-        self.promote_size_class_floor(&drv_hash, class.as_deref(), promote_reason)
-            .await
+        self.bump_resource_floor(&drv_hash, reason, label).await
     }
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
-    /// to fire its own `daemon_timeout`. Promote `size_class_floor`
-    /// and bump `timeout_count` (same bounded-ladder semantics as
-    /// `handle_timeout_failure`, `r[sched.timeout.promote-on-exceed]`).
+    /// to fire its own `daemon_timeout`. Bump `resource_floor.
+    /// deadline_secs` (D4; `bump_floor_or_count` handles the
+    /// `timeout_count` increment at the cap — same bounded-ladder
+    /// semantics as `handle_timeout_failure`,
+    /// `r[sched.timeout.promote-on-exceed+2]`).
     ///
     /// `job_name` is the JOB name; the Pod is already deleted.
     /// Prefix-match `recently_disconnected` (pod name = `{job}-{5}`).
@@ -482,14 +473,10 @@ impl DagActor {
     /// path. Unlike `handle_timeout_failure`, this does NOT
     /// `reset_to_ready` — `handle_executor_disconnected` already re-
     /// queued, and the drv may already be re-dispatched. The cap is
-    /// observed but not enforced terminally here: at the cap the floor
-    /// is at the largest class anyway (next deadline ~10h); the
-    /// worker-side `TimedOut` (primary path) owns terminal `Cancelled`.
-    async fn handle_deadline_exceeded(
-        &mut self,
-        job_name: &ExecutorId,
-        reported_class: Option<&str>,
-    ) -> bool {
+    /// observed but not enforced terminally here; the worker-side
+    /// `TimedOut` (primary path) owns terminal `Cancelled`.
+    async fn handle_deadline_exceeded(&mut self, job_name: &ExecutorId) -> bool {
+        use rio_proto::types::TerminationReason as R;
         let prefix = format!("{job_name}-");
         let Some(pod_name) = self
             .recently_disconnected
@@ -503,32 +490,30 @@ impl DagActor {
                     TimedOut first)");
             return false;
         };
-        let (drv_hash, class, _) = self
+        let (drv_hash, _, _) = self
             .recently_disconnected
             .remove(&pod_name)
             .expect("key found above");
-        let class = class.or_else(|| reported_class.map(String::from));
 
         let promoted = self
-            .promote_size_class_floor(&drv_hash, class.as_deref(), "deadline_exceeded")
+            .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
             .await;
 
         let max = self.retry_policy.max_timeout_retries;
-        if let Some(state) = self.dag.node_mut(&drv_hash) {
-            state.retry.timeout_count += 1;
+        if let Some(state) = self.dag.node(&drv_hash) {
             if state.retry.timeout_count > max {
                 warn!(
                     drv_hash = %drv_hash, job_name = %job_name,
                     timeout_retry_count = state.retry.timeout_count, max,
-                    "DeadlineExceeded: max_timeout_retries exhausted; floor \
-                     at largest class, worker-side TimedOut owns terminal-Cancel"
+                    "DeadlineExceeded: max_timeout_retries exhausted; \
+                     worker-side TimedOut owns terminal-Cancel"
                 );
             } else {
                 info!(
                     drv_hash = %drv_hash, job_name = %job_name,
-                    pod_name = %pod_name, failed_class = ?class,
+                    pod_name = %pod_name, promoted,
                     timeout_retry_count = state.retry.timeout_count, max,
-                    "DeadlineExceeded backstop fired — promoted size_class_floor"
+                    "DeadlineExceeded backstop fired"
                 );
             }
         }

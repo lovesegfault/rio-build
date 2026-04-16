@@ -91,17 +91,14 @@ impl SizingConfig {
         }
     }
 
-    /// Configure soft-feature stripping on `dag`. The class-order
-    /// snapshot (for I-213 floor-hint comparison) is derived from
-    /// `size_classes` so soft_features always sees the right order.
-    /// Called from `DagActor::new` and `clear_persisted_state` — the
-    /// latter replaces `self.dag` on every leader transition and would
+    /// Configure soft-feature stripping on `dag`. Called from
+    /// `DagActor::new` and `clear_persisted_state` — the latter
+    /// replaces `self.dag` on every leader transition and would
     /// otherwise drop soft_features (regression: the original
     /// open-coded reset at each site meant the first prod deploy of
     /// I-204 was a no-op after the lease acquired).
     pub(super) fn apply_to_dag(&self, dag: &mut DerivationDag) {
-        let order = crate::assignment::builder_class_order(&self.size_classes.read());
-        dag.set_soft_features(self.soft_features.clone(), order);
+        dag.set_soft_features(self.soft_features.clone());
     }
 }
 

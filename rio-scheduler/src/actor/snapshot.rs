@@ -343,26 +343,11 @@ impl DagActor {
                     )
                     .and_then(|c| index.get(&c).copied())
                     .unwrap_or(smallest_idx);
-                    // r[impl sched.sizeclass.snapshot-honors-floor]
-                    // I-187: clamp at `size_class_floor` — the same
-                    // `max(target_cutoff, floor_cutoff)` dispatch.rs
-                    // applies in `find_executor_with_overflow`. A
-                    // derivation promoted tiny→small via I-177 still
-                    // classifies as tiny (EMA is success-only); without
-                    // this clamp the snapshot reports `tiny.queued=1`,
-                    // controller spawns tiny, dispatch rejects
-                    // (floor>tiny), tiny idles 120s → disconnects →
-                    // I-173 bumps floor again → spawn loop. A floor
-                    // not in the current config (stale) degrades to
-                    // no-clamp via `index.get()=None` — same fallback
-                    // as dispatch's `cutoff_for()=None`.
-                    let i = state
-                        .sched
-                        .size_class_floor
-                        .as_deref()
-                        .and_then(|f| index.get(f).copied())
-                        .filter(|&fi| classes[fi].cutoff_secs > classes[classify_idx].cutoff_secs)
-                        .unwrap_or(classify_idx);
+                    // D4: class-name floor clamp removed; the reactive
+                    // `resource_floor` lives in `solve_intent_for`'s
+                    // mem/disk output below. Phase 6 deletes this
+                    // per-class snapshot path entirely (D5).
+                    let i = classify_idx;
                     snapshots[i].queued += 1;
                     // I-143: per-system breakdown so per-arch
                     // size-class pools scale on their own backlog.
@@ -566,6 +551,16 @@ impl DagActor {
                 (c, m, d, Default::default())
             }
         };
+        // r[impl sched.sla.reactive-floor]
+        // D4: clamp at the reactive floor. A derivation that OOM'd at
+        // its solved mem (cold-start probe or fit under-estimate) had
+        // `bump_floor_or_count` double `floor.mem`; the next solve
+        // returns at least that. The solver's BestEffort term is
+        // clamped to `ceil.max_mem` independently (solve.rs), so floor
+        // and ceiling compose.
+        let floor = &state.sched.resource_floor;
+        let mem = mem.max(floor.mem_bytes);
+        let disk = disk.max(floor.disk_bytes);
         // Dispatch-time prediction snapshot for completion's
         // actual-vs-predicted scoring. Only meaningful when there's a
         // fitted curve to evaluate `T(c)` against — cold-start probes
@@ -663,14 +658,11 @@ impl DagActor {
             if !in_flight {
                 continue;
             }
-            // floor=None → smallest (index 0, config-order convention).
-            // Unknown floor (config drift) → also smallest.
-            let i = state
-                .sched
-                .size_class_floor
-                .as_ref()
-                .and_then(|f| index.get(f).copied())
-                .unwrap_or(0);
+            // D4: class-name floor removed; all FODs bucket to
+            // smallest. Phase 6 (D2/D5) deletes this whole function —
+            // FODs go through the same per-drv SpawnIntent path as
+            // builds.
+            let i = 0;
             snapshots[i].queued += 1;
             *snapshots[i]
                 .queued_by_system

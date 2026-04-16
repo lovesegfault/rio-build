@@ -339,7 +339,11 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
         };
     }
     let c = fit.fit.p_bar().0.min(ceil.max_cores);
-    let mem = (fit.mem.at(RawCores(c)).0 as f64 * h) as u64;
+    // D4: clamp at `ceil.max_mem` — pre-existing gap; the BestEffort
+    // term `M(p̄) × headroom` could exceed the ceiling independent of
+    // the reactive floor. The Feasible arm above already gates on
+    // `mem > ceil.max_mem` (reject-not-clamp).
+    let mem = ((fit.mem.at(RawCores(c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
         c: RawCores(c),
         mem: MemBytes(mem),
@@ -449,7 +453,11 @@ pub fn solve_full(
         }
     }
     let c = fit.fit.p_bar().0.min(ceil.max_cores);
-    let mem = (fit.mem.at(RawCores(c)).0 as f64 * h) as u64;
+    // D4: clamp at `ceil.max_mem` — pre-existing gap; the BestEffort
+    // term `M(p̄) × headroom` could exceed the ceiling independent of
+    // the reactive floor. The Feasible arm above already gates on
+    // `mem > ceil.max_mem` (reject-not-clamp).
+    let mem = ((fit.mem.at(RawCores(c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
         c: RawCores(c),
         mem: MemBytes(mem),

@@ -213,50 +213,6 @@ fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
     }
 }
 
-// r[verify sched.sizing.soft-feature-floor]
-/// `floor_hint` naming an unconfigured size class would silently
-/// no-op (the strip ranks unknown below known) — big-parallel
-/// work would still land on tiny. Fail at startup instead.
-#[test]
-fn config_rejects_unknown_floor_hint() {
-    let cfg = Config {
-        size_classes: vec![rio_scheduler::SizeClassConfig {
-            name: "tiny".into(),
-            cutoff_secs: 30.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        }],
-        soft_features: vec![rio_scheduler::SoftFeature {
-            name: "big-parallel".into(),
-            floor_hint: Some("xlarge".into()),
-        }],
-        ..test_valid_config()
-    };
-    let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("floor_hint"), "{err}");
-    assert!(err.contains("xlarge"), "{err}");
-    assert!(
-        err.contains("tiny"),
-        "error must list known classes for operator diagnosis: {err}"
-    );
-
-    // size_classes=[] (tiered-sizing OFF, vmtest/single-pool) →
-    // hint is a no-op; validation must NOT reject. Otherwise the
-    // chart default (floorHint: xlarge) crashloops the scheduler
-    // in every overlay that doesn't also configure sizeClasses.
-    let cfg_unclassed = Config {
-        size_classes: vec![],
-        soft_features: vec![rio_scheduler::SoftFeature {
-            name: "big-parallel".into(),
-            floor_hint: Some("xlarge".into()),
-        }],
-        ..test_valid_config()
-    };
-    cfg_unclassed
-        .validate()
-        .expect("floor_hint must be ignored when size_classes is empty");
-}
-
 /// Boundary values: the INCLUSIVE endpoints of each range are
 /// valid. jf=0.0 → deterministic (no jitter, `random_range(0..=0)`
 /// is fine). jf=1.0 → backoff ∈ [0, 2*clamped] (wide but sane,

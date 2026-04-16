@@ -32,8 +32,7 @@ scope: with scope; ''
 
       disc_before = scrape_metrics(${gatewayHost}, 9091)
       promo_before = metric_value(disc_before,
-          "rio_scheduler_size_class_promotions_total",
-          '{kind="builder",from="small",to="large"}') or 0.0
+          "rio_scheduler_resource_floor_bumps_total") or 0.0
 
       # Start the slow build in a background thread. Thread-safe:
       # the NixOS test driver's Machine.succeed() can overlap across
@@ -105,18 +104,17 @@ scope: with scope; ''
           f"before={d_before}, after={d_after}"
       )
 
-      # I-177-reversed: bare disconnect/SIGKILL must NOT promote
-      # size_class_floor — only controller-reported OOMKilled or
-      # EvictedDiskPressure does (ReportExecutorTermination RPC). The
+      # D4: bare disconnect/SIGKILL must NOT bump resource_floor —
+      # only controller-reported OOMKilled / EvictedDiskPressure /
+      # DeadlineExceeded does (ReportExecutorTermination RPC). The
       # standalone fixture has no rio-controller pod-watch, so no
-      # termination report is sent; promotion stays at 0. The retry
-      # re-queues at the SAME class (small), not wlarge.
+      # termination report is sent; bumps stay at 0. The retry
+      # re-queues at the SAME floor.
       promo_after = metric_value(disc_after,
-          "rio_scheduler_size_class_promotions_total",
-          '{kind="builder",from="small",to="large"}') or 0.0
+          "rio_scheduler_resource_floor_bumps_total") or 0.0
       assert promo_after == promo_before, (
-          f"SIGKILL alone must NOT promote size_class_floor "
-          f"(only OOMKilled/DiskPressure does); "
+          f"SIGKILL alone must NOT bump resource_floor "
+          f"(only OOMKilled/DiskPressure/DeadlineExceeded does); "
           f"before={promo_before}, after={promo_after}"
       )
 

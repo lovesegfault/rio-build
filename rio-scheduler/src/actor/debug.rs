@@ -64,6 +64,31 @@ impl DagActor {
             DebugCmd::TripBreaker { n, reply } => {
                 let _ = reply.send(self.handle_debug_trip_breaker(n));
             }
+            DebugCmd::SeedSchedHint {
+                drv_hash,
+                est_memory_bytes,
+                est_disk_bytes,
+                est_deadline_secs,
+                floor,
+                reply,
+            } => {
+                let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
+                    if let Some(v) = est_memory_bytes {
+                        s.sched.est_memory_bytes = Some(v);
+                    }
+                    if let Some(v) = est_disk_bytes {
+                        s.sched.est_disk_bytes = Some(v);
+                    }
+                    if let Some(v) = est_deadline_secs {
+                        s.sched.est_deadline_secs = Some(v);
+                    }
+                    if let Some(f) = floor {
+                        s.sched.resource_floor = f;
+                    }
+                    true
+                });
+                let _ = reply.send(ok);
+            }
         }
     }
 
@@ -193,7 +218,7 @@ impl DagActor {
     /// Inject a derivation directly into the DAG at `Ready` status.
     /// Bypasses MergeDag + PG persist. The row defaults are
     /// `is_fixed_output=false`, `required_features=[]`,
-    /// `size_class_floor=None`; callers override via struct-update on
+    /// `resource_floor=zeros`; callers override via struct-update on
     /// [`crate::db::RecoveryDerivationRow::test_default`].
     pub(crate) fn test_inject_ready_row(&mut self, row: crate::db::RecoveryDerivationRow) {
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
@@ -225,28 +250,26 @@ impl DagActor {
         });
     }
 
-    /// Inject a Ready non-FOD with a given `size_class_floor`. For the
-    /// I-187 snapshot-honors-floor test — bypasses the
-    /// disconnect→`promote_size_class_floor` dance.
+    /// Inject a Ready non-FOD with a given `resource_floor.mem_bytes`.
+    /// For the D4 solve_intent_for-clamps-at-floor test — bypasses the
+    /// disconnect→`bump_floor_or_count` dance.
     pub(crate) fn test_inject_ready_with_floor(
         &mut self,
         hash: &str,
         system: &str,
-        floor: Option<&str>,
+        floor_mem_bytes: u64,
     ) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
-            size_class_floor: floor.map(String::from),
+            floor_mem_bytes: floor_mem_bytes as i64,
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }
 
-    /// Inject a Ready FOD with a given `size_class_floor`. For
-    /// `compute_fod_size_class_snapshot` tests (P0556) — bypasses the
-    /// merge+fail-to-promote dance.
-    pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str, floor: Option<&str>) {
+    /// Inject a Ready FOD. For `compute_fod_size_class_snapshot` tests
+    /// — bypasses the merge dance.
+    pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
             is_fixed_output: true,
-            size_class_floor: floor.map(String::from),
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }

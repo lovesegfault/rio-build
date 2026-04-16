@@ -742,14 +742,14 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     Ok(())
 }
 
-/// I-213 + controller-reports-reason: worker-reported `CgroupOom`
-/// (build child hit cgroup memory.max while pod survived →
-/// `InfrastructureFailure` with "cgroup OOM …" message) promotes
-/// `size_class_floor` and does NOT consume `max_infra_retries` for
-/// the climb itself (each promotion is a different class). Promotion
-/// is bounded by the ladder length, not the retry budget. Regression:
+/// I-213 + D4: worker-reported `CgroupOom` (build child hit cgroup
+/// memory.max while pod survived → `InfrastructureFailure` with
+/// "cgroup OOM …" message) doubles `resource_floor.mem_bytes` and
+/// does NOT consume `max_infra_retries` for the climb itself
+/// (`promoted=true` → `exempt_from_cap=true`). Doubling is bounded by
+/// `Ceilings.max_mem`, not the retry budget. Regression:
 /// firefox-unwrapped climbed tiny→small→medium and poisoned at
-/// retry_count=2 with the ladder's `large`/`xlarge` never tried.
+/// retry_count=2 with `large`/`xlarge` never tried.
 ///
 /// `TransientFailure` (build script exited nonzero) does NOT promote
 /// — that's a build-determinism signal. The previous test used
@@ -757,7 +757,8 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// reports-reason design that's wrong. CgroupOom is the worker-
 /// reported sizing signal (pod-level OOMKilled is controller-
 /// reported via `ReportExecutorTermination`).
-// r[verify sched.retry.promotion-exempt]
+// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.sla.reactive-floor]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -794,10 +795,18 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     .await?;
     let p = test_drv_path("ladder-drv");
 
-    // Walk tiny→small→medium→large via worker-reported CgroupOom
-    // (InfrastructureFailure with the CgroupOom error string): each
-    // promotes; retry_count (transient budget) stays 0.
-    for (i, c) in classes[..4].iter().enumerate() {
+    // Seed est_memory_bytes (no SLA config → solve_intent_for gated
+    // off → bump base would be zero).
+    handle
+        .debug_seed_sched_hint("ladder-drv", Some(2 << 30), None, None, None)
+        .await?;
+
+    // Walk via worker-reported CgroupOom (InfrastructureFailure with
+    // the CgroupOom error string): each doubles mem floor;
+    // retry_count (transient budget) and infra_count stay 0
+    // (promoted=true → exempt_from_cap).
+    let mut prev_mem = 0u64;
+    for c in &classes[..4] {
         handle
             .debug_force_assign("ladder-drv", &format!("b-{c}"))
             .await?;
@@ -810,20 +819,25 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         )
         .await?;
         let s = expect_drv(&handle, "ladder-drv").await;
-        assert_eq!(
-            s.sched.size_class_floor.as_deref(),
-            Some(classes[i + 1]),
-            "CgroupOom on {c} → floor promoted to {}",
-            classes[i + 1]
+        assert!(
+            s.sched.resource_floor.mem_bytes > prev_mem,
+            "CgroupOom on {c} → mem floor doubled (was {prev_mem}, now {})",
+            s.sched.resource_floor.mem_bytes
         );
+        prev_mem = s.sched.resource_floor.mem_bytes;
         assert_eq!(
             s.retry.count, 0,
             "InfrastructureFailure does NOT consume transient budget (after {c})"
         );
+        assert_eq!(
+            s.retry.infra_count, 0,
+            "D4: promoted=true → exempt_from_cap → infra_count stays 0 (after {c})"
+        );
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
+    assert_eq!(prev_mem, 32 << 30, "2GiB → 4→8→16→32 after 4 doublings");
 
-    // Sanity: a non-OOM InfrastructureFailure does NOT promote
+    // Sanity: a non-OOM InfrastructureFailure does NOT bump
     // (the over-broad I-199 promote is gone).
     handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
     complete_failure(
@@ -836,9 +850,8 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     .await?;
     let s = expect_drv(&handle, "ladder-drv").await;
     assert_eq!(
-        s.sched.size_class_floor.as_deref(),
-        Some("xlarge"),
-        "non-OOM InfrastructureFailure (FUSE EIO) must NOT promote"
+        s.sched.resource_floor.mem_bytes, prev_mem,
+        "non-OOM InfrastructureFailure (FUSE EIO) must NOT bump"
     );
 
     // At xlarge (top of ladder): TransientFailure (build script
@@ -1022,7 +1035,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     Ok(())
 }
 
-// r[verify sched.timeout.promote-on-exceed]
+// r[verify sched.timeout.promote-on-exceed+2]
 /// I-200: `TimedOut` promotes `size_class_floor` AND resets to Ready
 /// (bounded by `max_timeout_retries`), then goes terminal `Cancelled`.
 ///
@@ -1049,9 +1062,8 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         };
     });
 
-    // Three classed builders. promote_size_class_floor reads the
-    // FAILED executor's `size_class` to compute next_builder_class,
-    // so each completion must come from the class the drv is on.
+    // D4: bump_floor_or_count reads est_deadline_secs as the doubling
+    // base; class is irrelevant.
     let _t = connect_builder_classed(&handle, "to-tiny", "x86_64-linux", "tiny").await?;
     let _s = connect_builder_classed(&handle, "to-small", "x86_64-linux", "small").await?;
     let _m = connect_builder_classed(&handle, "to-medium", "x86_64-linux", "medium").await?;
@@ -1060,8 +1072,11 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     let drv_hash = "i200-timeout";
     let drv_path = test_drv_path(drv_hash);
     let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(drv_hash, None, None, Some(300), None)
+        .await?;
 
-    // ── Retry 1: TimedOut on tiny → floor=small, status=Ready ──────
+    // ── Retry 1: TimedOut → floor.deadline=600, status=Ready ──────
     let ok = handle.debug_force_assign(drv_hash, "to-tiny").await?;
     assert!(ok, "force-assign tiny should succeed");
     complete_failure(
@@ -1075,9 +1090,8 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
 
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "I-200: TimedOut on tiny → floor promoted to small"
+        info.sched.resource_floor.deadline_secs, 600,
+        "I-200: TimedOut → deadline floor doubled (300→600)"
     );
     assert!(
         matches!(
@@ -1117,7 +1131,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(info.sched.size_class_floor.as_deref(), Some("medium"));
+    assert_eq!(info.sched.resource_floor.deadline_secs, 1200);
     assert!(
         matches!(
             info.status,
@@ -1150,9 +1164,8 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         info.status
     );
     assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("medium"),
-        "promote ran but clamped at largest class (no demote)"
+        info.sched.resource_floor.deadline_secs, 2400,
+        "bump ran on terminal path too (so explicit resubmit starts higher)"
     );
     Ok(())
 }

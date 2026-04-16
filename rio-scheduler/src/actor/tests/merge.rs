@@ -1658,33 +1658,33 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.fod.floor-survives-merge]
-/// I-208: a FOD whose DB row pre-exists with `size_class_floor='small'`
-/// (promoted by a prior run's failures, then the build terminated and
-/// the node left memory) MUST come back at floor=small when re-merged.
-/// Regression: `try_from_node` set `floor=None` and the upsert's
-/// RETURNING didn't carry `size_class_floor`, so the FOD snapshot
-/// bucketed to the smallest class and the controller re-spawned
-/// `tiny` every run — chromium/firefox sources looped on 2Gi-storage
-/// tiny fetchers indefinitely.
+/// I-208 (D4 form): a FOD whose DB row pre-exists with
+/// `floor_mem_bytes=8GiB` (promoted by a prior run's failures, then
+/// the build terminated and the node left memory) MUST come back at
+/// floor.mem=8GiB when re-merged. Regression: `try_from_node` set
+/// `floor=zeros` and the upsert's RETURNING didn't carry the floor
+/// columns, so the next SpawnIntent was probe-default and re-OOM'd.
 #[tokio::test]
-async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
+async fn merge_hydrates_resource_floor_from_db() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
     });
 
-    // Pre-seed: prior run promoted this FOD to floor='small', then went
-    // terminal. New build re-merges it; ON CONFLICT RETURNING must
-    // bring the floor back into the freshly-constructed in-memory state.
+    // Pre-seed: prior run promoted this FOD to floor.mem=8GiB, then
+    // went terminal. New build re-merges it; ON CONFLICT RETURNING
+    // must bring the floor back into the freshly-constructed in-memory
+    // state.
     let mut fod = make_node("i208-fod");
     fod.is_fixed_output = true;
     fod.expected_output_paths = vec![test_store_path("i208-out")];
     sqlx::query(
         "INSERT INTO derivations
              (drv_hash, drv_path, system, status, is_fixed_output,
-              size_class_floor, expected_output_paths, output_names)
-         VALUES ($1, $2, 'x86_64-linux', 'completed', true, 'small',
+              floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+              expected_output_paths, output_names)
+         VALUES ($1, $2, 'x86_64-linux', 'completed', true,
+                 8589934592, 0, 0,
                  ARRAY[$3], ARRAY['out'])",
     )
     .bind(&fod.drv_hash)
@@ -1696,21 +1696,12 @@ async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![fod], vec![], false).await?;
 
-    let (_builder, fod_snap) = handle
-        .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
-                pool_features: None,
-                reply,
-            })
-        })
-        .await?;
-    let tiny = fod_snap.iter().find(|s| s.name == "tiny").unwrap();
-    let small = fod_snap.iter().find(|s| s.name == "small").unwrap();
+    let info = expect_drv(&handle, "i208-fod").await;
     assert_eq!(
-        tiny.queued, 0,
-        "I-208: floor='small' from DB must NOT bucket to tiny"
+        info.sched.resource_floor.mem_bytes,
+        8 << 30,
+        "I-208: floor_mem_bytes from DB hydrated onto re-merged node"
     );
-    assert_eq!(small.queued, 1, "I-208: hydrated floor buckets to small");
     Ok(())
 }
 

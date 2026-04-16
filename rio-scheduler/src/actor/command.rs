@@ -468,6 +468,17 @@ pub enum DebugCmd {
         n: u32,
         reply: oneshot::Sender<bool>,
     },
+    /// Seed `state.sched.est_*` and/or `resource_floor` for D4 floor
+    /// tests — fixtures without `[sla]` skip `solve_intent_for` so the
+    /// doubling base would otherwise be zero.
+    SeedSchedHint {
+        drv_hash: String,
+        est_memory_bytes: Option<u64>,
+        est_disk_bytes: Option<u64>,
+        est_deadline_secs: Option<u32>,
+        floor: Option<crate::state::ResourceFloor>,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 impl AdminQuery {

@@ -165,26 +165,32 @@ impl SchedulerDb {
         Ok(())
     }
 
-    // r[impl sched.fod.size-class-reactive]
-    /// Persist a FOD's reactive `size_class_floor` (I-170, P0556).
+    // r[impl sched.sla.reactive-floor]
+    /// Persist a derivation's reactive `resource_floor` (D4, `M_044`).
     ///
-    /// Called from `record_failure_and_check_poison` right after the
-    /// in-mem promotion so a scheduler failover between OOM and retry
-    /// doesn't reset the floor to None → re-dispatch to tiny → OOM
+    /// Called from `bump_floor_or_count` right after the in-mem
+    /// doubling so a scheduler failover between OOM and retry doesn't
+    /// reset the floor to zero → re-dispatch at probe defaults → OOM
     /// again. Same write-at-mutation pattern as `append_failed_worker`
     /// above (NOT in `batch_upsert_derivations` — merge-time floor is
-    /// always None and `ON CONFLICT DO UPDATE` there would clobber a
+    /// always zero and `ON CONFLICT DO UPDATE` there would clobber a
     /// promoted floor on re-merge).
-    pub async fn update_size_class_floor(
+    pub async fn update_resource_floor(
         &self,
         drv_hash: &DrvHash,
-        floor: &str,
+        floor: &crate::state::ResourceFloor,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "UPDATE derivations SET size_class_floor = $2, updated_at = now() \
+            "UPDATE derivations SET \
+               floor_mem_bytes = $2, \
+               floor_disk_bytes = $3, \
+               floor_deadline_secs = $4, \
+               updated_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
-            floor,
+            floor.mem_bytes as i64,
+            floor.disk_bytes as i64,
+            i64::from(floor.deadline_secs),
         )
         .execute(&self.pool)
         .await?;

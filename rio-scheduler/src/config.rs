@@ -41,8 +41,7 @@ pub(super) struct Config {
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
     /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
-    /// I-213: each entry MAY carry `floor_hint = "<size-class>"` so the
-    /// strip also seeds `size_class_floor` (e.g. big-parallel → xlarge).
+    /// D6: `floor_hint` is deserialized but ignored (config back-compat).
     pub(super) soft_features: Vec<rio_scheduler::SoftFeature>,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
@@ -304,28 +303,6 @@ impl rio_common::config::ValidateConfig for Config {
                     class.name,
                     limit
                 );
-            }
-        }
-        // r[impl sched.sizing.soft-feature-floor]
-        // I-213: a `floor_hint` that doesn't name a configured class
-        // would silently no-op (`max_class_by_order` ranks unknown
-        // below known) — big-parallel work would still land on tiny.
-        // Fail fast at startup instead of after the first eviction.
-        // Skipped when size_classes is empty: tiered-sizing is OFF
-        // (vmtest, single-pool dev), so the hint is a deliberate no-op
-        // and validating it would force every values overlay to also
-        // override softFeatures.
-        if !cfg.size_classes.is_empty() {
-            for sf in &cfg.soft_features {
-                if let Some(hint) = &sf.floor_hint {
-                    anyhow::ensure!(
-                        cfg.size_classes.iter().any(|c| &c.name == hint),
-                        "soft_features[{}].floor_hint = {hint:?} is not a configured size_class \
-                         (known: {:?})",
-                        sf.name,
-                        cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
-                    );
-                }
             }
         }
         if let Some(sla) = &cfg.sla {

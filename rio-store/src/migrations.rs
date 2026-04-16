@@ -653,6 +653,20 @@ pub const M_042: () = ();
 ///   greenfield single-cluster path working with no config.
 pub const M_043: () = ();
 
+/// `migrations/044_resource_floor.sql`
+///
+/// D4 (legacy-sizer removal): per-dimension reactive floor replaces
+/// the class-name `size_class_floor` (M_032). All three columns are
+/// `bigint` — `deadline_secs` would naturally be `integer` (the
+/// in-memory type is `u32`) but repeated doubling under a runaway
+/// reactive loop would overflow `i32` at ~24 days; the read path
+/// saturating-casts back to `u32`.
+///
+/// `size_class_floor` (M_032) is NOT dropped here — Phase 8 does that
+/// once the SLA-only dispatch path lands and no recovery code reads
+/// the legacy column.
+pub const M_044: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

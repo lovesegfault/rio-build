@@ -54,85 +54,31 @@ pub struct SizeClassConfig {
 
 /// One soft-feature entry (`[[soft_features]]` in scheduler.toml).
 /// `name` is stripped from `requiredSystemFeatures` at DAG-insert
-/// (`r[sched.dispatch.soft-features]`). `floor_hint` is the I-213
-/// addition: a stripped feature MAY carry a builder size-class name
-/// that becomes the derivation's initial `size_class_floor` --- so
-/// `big-parallel` lands on `xlarge` directly instead of climbing
-/// tiny→small→medium and exhausting the retry budget before reaching
-/// a viable tier (firefox-unwrapped: ~50GB build dir, evicted on
-/// every tier <large).
+/// (`r[sched.dispatch.soft-features]`).
+///
+/// D6: `floor_hint` retained for config back-compat (deserialized,
+/// ignored). SLA `solve_intent_for` + `resource_floor` doubling own
+/// initial sizing now; the I-213 firefox case (`big-parallel` →
+/// xlarge) is handled by the SLA model fitting on prior firefox
+/// samples + reactive doubling on cold start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoftFeature {
     pub name: String,
-    /// Builder size-class name to use as initial `size_class_floor`
-    /// when this feature is stripped. `None` = strip-only (pre-I-213
-    /// behavior). Validated against `[[size_classes]].name` at startup.
+    /// D6: ignored (was builder size-class name for initial
+    /// `size_class_floor`). Kept for config back-compat until the
+    /// helm chart drops it.
     #[serde(default)]
     pub floor_hint: Option<String>,
 }
 
 /// Builder class names sorted smallest→largest by `cutoff_secs`.
-/// Same ordering [`next_builder_class`] / [`classify`] use. Computed
-/// once at actor construction so the DAG's soft-feature strip can
-/// compare `floor_hint`s without holding the `size_classes` RwLock.
+/// Same ordering [`classify`] uses. Computed once at actor
+/// construction; the FOD class walk (Phase 6 deletes) reads this.
 pub fn builder_class_order(classes: &[SizeClassConfig]) -> Vec<String> {
     let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
     sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
     sorted.into_iter().map(|c| c.name.clone()).collect()
-}
-
-/// Higher-ranked of two class names by position in `order`
-/// (smallest→largest). `None` ranks below any `Some`. A name not in
-/// `order` (stale floor after config change) ranks below any known
-/// name --- matches `cutoff_for() = None` degrade-to-no-clamp
-/// elsewhere. Both unknown → `a`.
-pub fn max_class_by_order<'a>(
-    a: Option<&'a str>,
-    b: Option<&'a str>,
-    order: &[String],
-) -> Option<&'a str> {
-    let rank = |n: Option<&str>| n.and_then(|n| order.iter().position(|c| c == n));
-    match (rank(a), rank(b)) {
-        (Some(ra), Some(rb)) => {
-            if rb > ra {
-                b
-            } else {
-                a
-            }
-        }
-        (Some(_), None) => a,
-        (None, Some(_)) => b,
-        (None, None) => a.or(b),
-    }
-}
-
-/// Next-larger fetcher class after `current`, or `None` if `current`
-/// is already the largest (or unknown). Clamps at the top: a FOD
-/// that OOMs on the largest class stays there until poison.
-///
-/// Config order is authoritative (smallest→largest); this does NOT
-/// sort. Unlike builder classes there's no `cutoff_secs` to sort by
-/// — the operator declares the order.
-pub fn next_fetcher_class(current: &str, classes: &[String]) -> Option<String> {
-    let idx = classes.iter().position(|c| c == current)?;
-    classes.get(idx + 1).cloned()
-}
-
-/// Next-larger builder class after `current`, or `None` if `current`
-/// is already the largest (or unknown, or `classes` empty). Unlike
-/// [`next_fetcher_class`], builder classes are ordered by
-/// `cutoff_secs` (config order is NOT authoritative — `classify()`
-/// sorts internally), so "next larger" = smallest cutoff strictly
-/// greater than `current`'s. I-177: reactive promotion for non-FOD
-/// OOMs (bootstrap-glibc on a tiny builder → floor=small).
-pub fn next_builder_class(current: &str, classes: &[SizeClassConfig]) -> Option<String> {
-    let current_cutoff = cutoff_for(current, classes)?;
-    classes
-        .iter()
-        .filter(|c| c.cutoff_secs > current_cutoff)
-        .min_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs))
-        .map(|c| c.name.clone())
 }
 
 /// Classify a derivation into a size-class.
@@ -449,36 +395,6 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 mod tests {
     use super::*;
     use rio_test_support::fixtures::make_derivation_node;
-
-    #[test]
-    fn max_class_by_order_picks_higher_rank() {
-        let order = vec!["tiny".into(), "small".into(), "xlarge".into()];
-        assert_eq!(
-            max_class_by_order(Some("tiny"), Some("xlarge"), &order),
-            Some("xlarge")
-        );
-        assert_eq!(
-            max_class_by_order(Some("xlarge"), Some("tiny"), &order),
-            Some("xlarge")
-        );
-        assert_eq!(
-            max_class_by_order(None, Some("tiny"), &order),
-            Some("tiny"),
-            "None ranks below any Some"
-        );
-        assert_eq!(max_class_by_order(Some("tiny"), None, &order), Some("tiny"));
-        assert_eq!(
-            max_class_by_order(Some("stale"), Some("tiny"), &order),
-            Some("tiny"),
-            "unknown class (stale floor after config change) ranks below known"
-        );
-        assert_eq!(
-            max_class_by_order(Some("a"), Some("b"), &[]),
-            Some("a"),
-            "no order configured → preserve a (degrade to no-clamp)"
-        );
-        assert_eq!(max_class_by_order(None, None, &order), None);
-    }
 
     #[test]
     fn builder_class_order_sorts_by_cutoff() {

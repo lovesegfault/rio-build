@@ -381,11 +381,50 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
+// r[impl sched.sla.reactive-floor]
+/// Per-dimension resource floor for the NEXT dispatch (D4).
+///
+/// Reactive promotion: an explicit resource-exhaustion signal
+/// (controller-reported `OomKilled`/`EvictedDiskPressure`/
+/// `DeadlineExceeded`, worker-reported `CgroupOom`/`TimedOut`) calls
+/// `actor::floor::bump_floor_or_count` which doubles the
+/// relevant dimension, capped at `Ceilings`. `solve_intent_for` clamps
+/// its solved (mem, disk) at this floor before returning so the next
+/// SpawnIntent is at least as large.
+///
+/// `Default` = zeros = no clamp (cold start). Persisted as
+/// `derivations.floor_{mem,disk,deadline}_*` (`M_044`) so a scheduler
+/// failover between OOM and retry doesn't reset to zero → re-OOM at
+/// probe defaults.
+///
+/// No `cores` dimension: OOM/DiskPressure are mem/disk under-
+/// provision; DeadlineExceeded is a wall-time bound, not a
+/// parallelism bound. The SLA model owns core selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceFloor {
+    pub mem_bytes: u64,
+    pub disk_bytes: u64,
+    pub deadline_secs: u32,
+}
+
+impl ResourceFloor {
+    /// Per-dimension max (only RAISES — a hydration source with a
+    /// lower value never demotes an in-memory floor already promoted
+    /// past it).
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            mem_bytes: self.mem_bytes.max(other.mem_bytes),
+            disk_bytes: self.disk_bytes.max(other.disk_bytes),
+            deadline_secs: self.deadline_secs.max(other.deadline_secs),
+        }
+    }
+}
+
 /// Scheduling-hint sub-state of a [`DerivationState`].
 ///
 /// Estimator outputs and critical-path priority. All fields are
-/// **in-memory only** except `size_class_floor` (persisted as
-/// `derivations.size_class_floor`, M_032); the rest are recomputed at
+/// **in-memory only** except `resource_floor` (persisted as
+/// `derivations.floor_*`, `M_044`); the rest are recomputed at
 /// next dispatch / `full_sweep`.
 #[derive(Debug, Clone, Default)]
 pub struct SchedHint {
@@ -394,27 +433,8 @@ pub struct SchedHint {
     /// duration > 2× the class cutoff). `None` = size-classes not
     /// configured, or never assigned.
     pub assigned_size_class: Option<String>,
-    /// Minimum size-class for the NEXT dispatch (I-170, FOD-only).
-    /// Reactive promotion: when a FOD fails transiently (typically
-    /// OOMKilled → executor disconnect — there's no clean OOM signal
-    /// at the scheduler), `record_failure_and_check_poison` bumps
-    /// this to the next-larger fetcher class. `find_executor_with_
-    /// overflow` then walks fetcher classes from this floor upward
-    /// instead of starting at the smallest.
-    ///
-    /// `None` = never failed → route to the smallest class (or no
-    /// class filter if `[[size_classes]]` unconfigured).
-    ///
-    /// Over-promotes on ANY transient failure (node preemption,
-    /// network blip), not just OOM. Acceptable: FODs rarely retry,
-    /// and a one-class bump is cheap ("rare that a fetcher ever
-    /// goes beyond tiny or small"). If signal fidelity matters
-    /// later, the controller can post a typed `OomKilled` result
-    /// from `pod.status.containerStatuses[].terminated.reason`.
-    ///
-    /// Persisted as `derivations.size_class_floor` (P0556, `M_032`)
-    /// so the OOM loop doesn't resume across scheduler failover.
-    pub size_class_floor: Option<String>,
+    /// D4: per-dimension reactive floor. See [`ResourceFloor`].
+    pub resource_floor: ResourceFloor,
     /// Bucketed memory estimate for the resource-fit placement filter.
     /// `hard_filter` checks `worker.memory_total_bytes >= est`.
     ///
@@ -431,6 +451,17 @@ pub struct SchedHint {
     /// the SpawnIntent actually requested. `None` = FOD / SLA off /
     /// classes empty (same gate as `est_memory_bytes`). In-memory only.
     pub est_cores: Option<u32>,
+    /// SLA-solved disk request for this dispatch (same `solve_intent_for`
+    /// call as `est_memory_bytes`). D4: `bump_floor_or_count` reads this
+    /// as `last_intent.disk` so the doubled floor starts from what was
+    /// actually requested, not zero. In-memory only.
+    pub est_disk_bytes: Option<u64>,
+    /// SLA-predicted wall time for this dispatch (from
+    /// `SlaPrediction.wall_secs`). D4: `bump_floor_or_count` reads this
+    /// as `last_intent.deadline` for the `DeadlineExceeded` doubling.
+    /// `None` on cold start / no fit — the helper falls back to floor
+    /// alone. In-memory only.
+    pub est_deadline_secs: Option<u32>,
     /// ADR-023 phase-7: dispatch-time SLA prediction snapshot. Set
     /// alongside `est_memory_bytes` (same `solve_intent_for` call);
     /// `record_build_history` reads it back to emit
@@ -644,7 +675,14 @@ impl DerivationState {
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             sched: SchedHint {
-                size_class_floor: row.size_class_floor, // P0556: persisted (M_032)
+                // M_044: persisted reactive floor. PG bigint → i64;
+                // negatives (impossible by DEFAULT 0 + only-ever-doubled
+                // writes) saturate to 0; deadline_secs saturates to u32.
+                resource_floor: ResourceFloor {
+                    mem_bytes: row.floor_mem_bytes.max(0) as u64,
+                    disk_bytes: row.floor_disk_bytes.max(0) as u64,
+                    deadline_secs: row.floor_deadline_secs.clamp(0, u32::MAX as i64) as u32,
+                },
                 // Remaining sched fields lossy; recomputed at next
                 // dispatch / full_sweep — see SchedHint doc.
                 ..Default::default()
@@ -1195,7 +1233,9 @@ mod tests {
             // regardless.
             is_ca: true,
             failed_builders: vec![],
-            size_class_floor: None,
+            floor_mem_bytes: 0,
+            floor_disk_bytes: 0,
+            floor_deadline_secs: 0,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
         assert!(state.ca.is_ca, "precondition: recovered as CA");

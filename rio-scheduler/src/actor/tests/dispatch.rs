@@ -1256,18 +1256,12 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 // r[verify sched.fod.size-class-reactive]
 // r[verify sched.builder.size-class-reactive]
 // r[verify sched.dispatch.no-fod-fallback]
-/// `size_class_floor=small` skips tiny-class executors even when free.
-/// The overflow chain starts at `max(classify(), floor)`.
+/// D4: `InfrastructureFailure(CgroupOom)` doubles
+/// `resource_floor.mem_bytes` for both FOD and non-FOD (D2: same
+/// reactive path). The floor feeds `solve_intent_for`'s mem clamp →
+/// next SpawnIntent is at least the doubled value.
 ///
-/// - **fod** (I-170): FOD branch walks `fetcher_classes` (= size_classes names).
-/// - **builder** (I-177): non-FOD branch ignored floor before fix → a
-///   build that OOM'd on tiny was re-routed to tiny by the
-///   (success-only) EMA classifier → poison-loop.
-///
-/// Shape: 2 tiny + 1 small executor. Merge → first dispatch goes to
-/// tiny (floor=None) → InfrastructureFailure(CgroupOom) → floor
-/// promoted → second dispatch goes to small, tiny skipped.
-/// (TransientFailure does NOT promote — that's a build-determinism
+/// (TransientFailure does NOT bump — that's a build-determinism
 /// signal. CgroupOom is the worker-reported sizing signal.)
 #[rstest::rstest]
 #[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod")]
@@ -1308,7 +1302,12 @@ async fn size_class_floor_skips_smaller(
     assert!(first_asgn.drv_path.contains(tag));
     assert!(small.try_recv().is_err(), "floor=None: small not used");
 
-    // Worker-reported CgroupOom → floor promoted tiny→small.
+    // Seed est_memory_bytes so the doubling has a base.
+    handle
+        .debug_seed_sched_hint(tag, Some(2 << 30), None, None, None)
+        .await?;
+
+    // Worker-reported CgroupOom → floor.mem doubled.
     complete_failure(
         &handle,
         first_exec,
@@ -1323,57 +1322,26 @@ async fn size_class_floor_skips_smaller(
         expect_drv(&handle, tag)
             .await
             .sched
-            .size_class_floor
-            .as_deref(),
-        Some("small"),
-        "CgroupOom on tiny → floor promoted to small"
+            .resource_floor
+            .mem_bytes,
+        4 << 30,
+        "CgroupOom → mem floor doubled (2GiB→4GiB)"
     );
-
-    // Second dispatch: floor=small. Other tiny is free but MUST be skipped.
-    let asgn = recv_assignment(&mut small).await;
-    assert!(asgn.drv_path.contains(tag));
-    assert!(
-        tiny1.try_recv().is_err() && tiny2.try_recv().is_err(),
-        "floor=small: tiny executors skipped even when free"
-    );
-    Ok(())
-}
-
-// r[verify sched.fod.size-class-reactive]
-/// I-170: floor clamps at the largest class. A FOD that fails on
-/// the largest configured fetcher class keeps `floor = largest`;
-/// `next_fetcher_class(largest)` returns None.
-#[tokio::test]
-async fn fod_size_class_floor_clamps_at_largest() -> TestResult {
-    use crate::assignment::next_fetcher_class;
-
-    let classes = vec!["tiny".into(), "small".into()];
-    assert_eq!(
-        next_fetcher_class("tiny", &classes).as_deref(),
-        Some("small")
-    );
-    assert_eq!(
-        next_fetcher_class("small", &classes),
-        None,
-        "largest → None (clamp)"
-    );
-    assert_eq!(
-        next_fetcher_class("unknown", &classes),
-        None,
-        "unknown class (config changed mid-run) → None, no promotion"
-    );
-    assert_eq!(
-        next_fetcher_class("tiny", &[]),
-        None,
-        "feature off → no promotion"
-    );
+    // D4: class-name routing clamp removed (Phase 6 deletes the
+    // overflow chain entirely). The reactive floor lives in
+    // `solve_intent_for`'s mem/disk output → SpawnIntent → controller
+    // spawns a 4GiB pod. Dispatch routing stays class-based until
+    // Phase 6, so the second dispatch still goes to whichever class
+    // is free — assert only that the floor is set, not which class
+    // wins.
+    let _ = (small, tiny1, tiny2);
     Ok(())
 }
 
 // r[verify sched.fod.size-class-reactive]
 /// I-170 back-compat: with `size_classes` empty (default), FOD dispatch
-/// is unchanged — no class filter, any free fetcher. `size_class_floor`
-/// stays None across failures (nothing to promote to). Fetcher classes
+/// is unchanged — no class filter, any free fetcher. `resource_floor`
+/// stays zero across failures with no `est_*` seeded. Fetcher classes
 /// are derived from `size_classes`, so empty → both ladders off.
 #[tokio::test]
 async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
@@ -1401,36 +1369,11 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
     assert!(asgn.drv_path.contains("plain-fod"));
     let state = expect_drv(&handle, "plain-fod").await;
     assert_eq!(
-        state.sched.size_class_floor, None,
-        "feature off: floor stays None"
+        state.sched.resource_floor,
+        Default::default(),
+        "feature off: floor stays zero"
     );
     Ok(())
-}
-
-// r[verify sched.builder.size-class-reactive]
-/// I-177: `next_builder_class` orders by `cutoff_secs`, not config
-/// order. Clamps at largest; unknown/empty → None.
-#[test]
-fn next_builder_class_cutoff_ordered() {
-    use crate::assignment::next_builder_class;
-    // Deliberately unsorted config order — next_builder_class must
-    // sort by cutoff, not by Vec position.
-    let classes = size_classes(&[("large", 3600.0), ("tiny", 30.0), ("small", 300.0)]);
-    assert_eq!(
-        next_builder_class("tiny", &classes).as_deref(),
-        Some("small")
-    );
-    assert_eq!(
-        next_builder_class("small", &classes).as_deref(),
-        Some("large")
-    );
-    assert_eq!(
-        next_builder_class("large", &classes),
-        None,
-        "largest clamps"
-    );
-    assert_eq!(next_builder_class("unknown", &classes), None);
-    assert_eq!(next_builder_class("tiny", &[]), None, "feature off");
 }
 
 // r[verify sched.dispatch.unroutable-system]

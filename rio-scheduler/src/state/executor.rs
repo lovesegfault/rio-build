@@ -98,7 +98,7 @@ pub struct ExecutorState {
     /// died → record into `recently_disconnected` so the controller's
     /// follow-up `ReportExecutorTermination` (k8s OOMKilled/Evicted
     /// reason) can resolve `executor_id → drv_hash` and promote
-    /// `size_class_floor` IFF the reason was OOMKilled/DiskPressure.
+    /// `resource_floor` IFF the reason was OOMKilled/DiskPressure.
     /// When `last_completed == running_build` the disconnect is the
     /// expected post-completion one-shot exit → no entry (controller
     /// would report `Completed` and we'd ignore it; skip the churn).
@@ -281,7 +281,7 @@ pub struct RetryPolicy {
     pub max_infra_retries: u32,
     /// Maximum number of `TimedOut` re-dispatches before the
     /// derivation goes terminal (`Cancelled`). Each `TimedOut` retry
-    /// promotes `size_class_floor` (I-200, `r[sched.timeout.promote-
+    /// bumps `resource_floor.deadline` (I-200, `r[sched.timeout.promote-
     /// on-exceed]`), so this caps how many size-class steps a build
     /// can climb on timeout before the operator gets a visible
     /// failure. Default 4: tiny→small→medium→large→xlarge is 4

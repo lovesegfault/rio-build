@@ -49,6 +49,7 @@ mod config;
 mod dispatch;
 mod event;
 mod executor;
+pub(crate) mod floor;
 mod handle;
 mod housekeeping;
 mod merge;

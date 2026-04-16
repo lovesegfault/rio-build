@@ -298,4 +298,27 @@ impl ActorHandle {
     pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
         self.debug(|reply| DebugCmd::TripBreaker { n, reply }).await
     }
+
+    /// Seed `state.sched.est_*` for D4 floor tests — fixtures without
+    /// `[sla]` skip `solve_intent_for` so the doubling base is
+    /// otherwise zero. `None` fields are left unchanged.
+    pub async fn debug_seed_sched_hint(
+        &self,
+        drv_hash: &str,
+        est_memory_bytes: Option<u64>,
+        est_disk_bytes: Option<u64>,
+        est_deadline_secs: Option<u32>,
+        floor: Option<crate::state::ResourceFloor>,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SeedSchedHint {
+            drv_hash,
+            est_memory_bytes,
+            est_disk_bytes,
+            est_deadline_secs,
+            floor,
+            reply,
+        })
+        .await
+    }
 }

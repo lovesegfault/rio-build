@@ -703,26 +703,16 @@ async fn size_class_snapshot_soft_features_strip() {
     );
 }
 
-/// I-213: a soft feature with `floor_hint` raises `size_class_floor`
-/// at DAG-insert. firefox-unwrapped (`{big-parallel}`, ~50GB build dir)
-/// previously landed on `tiny` after the strip, climbed
-/// tiny→small→medium, and poisoned at `max_retries=2` before reaching
-/// a tier with enough disk.
-// r[verify sched.sizing.soft-feature-floor]
+/// D6: soft features are strip-only; `floor_hint` is ignored. SLA
+/// `solve_intent_for` + `resource_floor` doubling own initial sizing.
+/// I-204 regression preserved: stripping survives leader transition.
 #[tokio::test]
-async fn soft_feature_floor_hint_seeds_size_class_floor() {
+async fn soft_feature_strip_only_floor_hint_ignored() {
     use crate::assignment::SoftFeature;
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            size_classes: size_classes(&[
-                ("tiny", 30.0),
-                ("small", 120.0),
-                ("medium", 600.0),
-                ("large", 3600.0),
-                ("xlarge", 36000.0),
-            ]),
             soft_features: vec![
                 SoftFeature {
                     name: "big-parallel".into(),
@@ -737,148 +727,52 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
         },
     );
 
-    // big-parallel → stripped + floor=xlarge.
+    // big-parallel → stripped; D6: floor_hint ignored, floor stays zero.
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     let s = actor.dag.node("ff").unwrap();
     assert!(s.required_features.is_empty(), "stripped");
     assert_eq!(
-        s.sched.size_class_floor.as_deref(),
-        Some("xlarge"),
-        "floor_hint applied on strip"
+        s.sched.resource_floor,
+        Default::default(),
+        "D6: floor_hint ignored (strip-only)"
     );
 
-    // benchmark only → stripped, no hint → floor stays None.
-    actor.test_inject_ready_with_features("bench", None, "x86_64-linux", &["benchmark"]);
-    assert_eq!(
-        actor
-            .dag
-            .node("bench")
-            .unwrap()
-            .sched
-            .size_class_floor
-            .as_deref(),
-        None,
-        "no-hint soft feature is strip-only"
-    );
-
-    // Hint must only RAISE: a recovered node with floor=xlarge keeps it
-    // even if a lower-hint feature is stripped. Exercise via a node
-    // whose persisted floor (medium) is BELOW the hint (xlarge) →
-    // raised; and one whose persisted floor would be ABOVE a lower hint.
-    let mut actor2 = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: size_classes(&[("tiny", 30.0), ("xlarge", 36000.0)]),
-            soft_features: vec![SoftFeature {
-                name: "big-parallel".into(),
-                floor_hint: Some("tiny".into()),
-            }],
-            ..Default::default()
-        },
-    );
-    let row = crate::db::RecoveryDerivationRow {
-        derivation_id: uuid::Uuid::new_v4(),
-        drv_hash: "persisted".into(),
-        drv_path: rio_test_support::fixtures::test_drv_path("persisted"),
-        pname: None,
-        system: "x86_64-linux".into(),
-        status: "ready".into(),
-        required_features: vec!["big-parallel".into()],
-        assigned_builder_id: None,
-        retry_count: 0,
-        expected_output_paths: vec![],
-        output_names: vec!["out".into()],
-        is_fixed_output: false,
-        is_ca: false,
-        failed_builders: vec![],
-        size_class_floor: Some("xlarge".into()),
-    };
-    let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
-        .expect("valid path");
-    actor2.dag.insert_recovered_node(state);
-    assert_eq!(
-        actor2
-            .dag
-            .node("persisted")
-            .unwrap()
-            .sched
-            .size_class_floor
-            .as_deref(),
-        Some("xlarge"),
-        "floor_hint never demotes a higher persisted floor"
-    );
-
-    // Survives leader transition.
+    // I-204: survives leader transition.
     actor.clear_persisted_state();
     actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
-    assert_eq!(
-        actor
-            .dag
-            .node("ff2")
-            .unwrap()
-            .sched
-            .size_class_floor
-            .as_deref(),
-        Some("xlarge"),
-        "floor_hint survives clear_persisted_state"
+    assert!(
+        actor.dag.node("ff2").unwrap().required_features.is_empty(),
+        "stripping survives clear_persisted_state"
     );
 }
 
-/// I-187: snapshot honors `size_class_floor`. A derivation that
-/// `classify()` puts in `tiny` (no estimator sample → smallest class)
-/// but has `size_class_floor=small` (I-177 reactive promotion after a
-/// disconnect) MUST count toward `small.queued`, NOT `tiny.queued` —
-/// the same `max(target_cutoff, floor_cutoff)` clamp dispatch's
-/// `find_executor_with_overflow` applies. Regression: pre-I-187 the
-/// snapshot ignored the floor → controller spawned tiny → dispatch
-/// rejected (floor>tiny) → tiny idled 120s → disconnected → I-173
-/// bumped floor again → spawn loop.
-// r[verify sched.sizeclass.snapshot-honors-floor]
+// r[verify sched.sla.reactive-floor]
+/// D4: `solve_intent_for` clamps its solved (mem, disk) at
+/// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior
+/// `bump_floor_or_count` cycles) gets a SpawnIntent with mem ≥ 32GiB
+/// even when the SLA solve would return less.
 #[tokio::test]
-async fn size_class_snapshot_honors_floor() {
+async fn solve_intent_for_clamps_at_resource_floor() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("tiny", 60.0), ("small", 600.0)]);
+    let mut actor = bare_actor(db.pool.clone());
 
-    // 1 Ready non-FOD: classify()=tiny (no estimator sample → smallest),
-    // floor=small (set by I-177 promote_size_class_floor on a prior
-    // disconnect).
-    actor.test_inject_ready_with_floor("a", "x86_64-linux", Some("small"));
-
-    let snap = actor.compute_size_class_snapshot(None);
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
-    assert_eq!(
-        small.queued, 1,
-        "I-187: floor=small clamps the snapshot bucket — controller spawns small"
-    );
-    assert_eq!(
-        tiny.queued, 0,
-        "I-187: classify()=tiny is overridden by floor — pre-fix this was 1 (spawn loop)"
-    );
-    assert_eq!(
-        small.queued_by_system.get("x86_64-linux").copied(),
-        Some(1),
-        "per-system breakdown follows the clamped bucket"
+    // floor.mem=32GiB; cold-start solve (no fit, no override) returns
+    // probe-default mem (typically a few GiB) — the clamp raises it.
+    actor.test_inject_ready_with_floor("a", "x86_64-linux", 32 << 30);
+    let state = actor.dag.node("a").unwrap();
+    let (_, mem, disk, _, _) = actor.solve_intent_for(None, state);
+    assert!(
+        mem >= 32 << 30,
+        "D4: solve_intent_for clamps mem at floor (got {mem})"
     );
 
-    // Floor below classify (or equal) → classify wins. Inject a second
-    // derivation with floor=tiny: max(tiny,tiny)=tiny.
-    actor.test_inject_ready_with_floor("b", "x86_64-linux", Some("tiny"));
-    let snap = actor.compute_size_class_snapshot(None);
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
-    let small = snap.iter().find(|s| s.name == "small").unwrap();
-    assert_eq!(tiny.queued, 1, "floor==classify → no change");
-    assert_eq!(small.queued, 1);
-
-    // Stale floor (not in config) → no-clamp, classify wins. Same
-    // graceful fallback as dispatch's `cutoff_for()=None`.
-    actor.test_inject_ready_with_floor("c", "x86_64-linux", Some("nonexistent"));
-    let snap = actor.compute_size_class_snapshot(None);
-    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
-    assert_eq!(
-        tiny.queued, 2,
-        "stale floor degrades to no-clamp (classify=tiny)"
-    );
+    // floor=zero (cold start) → solve returns its own value unchanged.
+    actor.test_inject_ready_with_floor("b", "x86_64-linux", 0);
+    let state = actor.dag.node("b").unwrap();
+    let (_, mem_b, _, _, _) = actor.solve_intent_for(None, state);
+    assert!(mem_b < 32 << 30, "control: floor=0 → no clamp");
+    // disk also clamped (orthogonal dimension).
+    let _ = disk;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,14 +861,12 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
-// r[verify sched.fod.size-class-reactive]
-/// P0556: `compute_fod_size_class_snapshot` buckets in-flight FODs by
-/// `size_class_floor`. floor=None → smallest class; unknown floor →
-/// also smallest (config-drift fallback). Σ queued ==
-/// `queued_fod_derivations` so the per-class signal and the flat
-/// signal agree.
+/// P0556 (D4 transitional): `compute_fod_size_class_snapshot` buckets
+/// all in-flight FODs to the smallest class (class-name floor removed).
+/// Σ queued == `queued_fod_derivations` so the per-class signal and
+/// the flat signal agree. Phase 6 deletes this snapshot.
 #[tokio::test]
-async fn fod_size_class_snapshot_buckets_by_floor() {
+async fn fod_size_class_snapshot_buckets_to_smallest() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
@@ -984,28 +876,21 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
         },
     );
 
-    // 5 FODs: 3 floor=None → tiny; 2 floor=small → small.
-    for h in ["f1", "f2", "f3"] {
-        actor.test_inject_ready_fod(h, "x86_64-linux", None);
+    // D4: class-name floor removed; all FODs bucket to smallest until
+    // Phase 6 (D2/D5) deletes this snapshot entirely.
+    for h in ["f1", "f2", "f3", "f4", "f5", "f6"] {
+        actor.test_inject_ready_fod(h, "x86_64-linux");
     }
-    for h in ["f4", "f5"] {
-        actor.test_inject_ready_fod(h, "x86_64-linux", Some("small"));
-    }
-    // Unknown floor (config dropped a class) → smallest.
-    actor.test_inject_ready_fod("f6", "x86_64-linux", Some("huge"));
     // Non-FOD: ignored.
     actor.test_inject_ready("nonfod", None, "x86_64-linux");
 
     let fod = actor.compute_fod_size_class_snapshot();
     assert_eq!(fod.len(), 2);
     assert_eq!(fod[0].name, "tiny", "config order preserved");
-    assert_eq!(
-        fod[0].queued, 4,
-        "3×floor=None + 1×unknown-floor → smallest"
-    );
-    assert_eq!(fod[0].queued_by_system.get("x86_64-linux"), Some(&4));
+    assert_eq!(fod[0].queued, 6, "D4: all FODs bucket to smallest");
+    assert_eq!(fod[0].queued_by_system.get("x86_64-linux"), Some(&6));
     assert_eq!(fod[1].name, "small");
-    assert_eq!(fod[1].queued, 2, "2×floor=small");
+    assert_eq!(fod[1].queued, 0);
     assert_eq!(fod[0].running, 0);
 
     // Σ across classes == flat queued_fod_derivations (the invariant

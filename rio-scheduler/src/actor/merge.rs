@@ -1221,29 +1221,20 @@ impl DagActor {
         // In-mem db_id write ONLY after the tx is durable. If anything
         // above returned Err, the tx rolled back and we never reach
         // here — cleanup_failed_merge sees nodes with db_id = None.
-        // r[impl sched.fod.floor-survives-merge]
-        // I-208: hydrate `size_class_floor` for newly-inserted nodes
-        // from the DB row. `try_from_node` sets `floor=None`, but the
+        //
+        // I-208: hydrate `resource_floor` for newly-inserted nodes
+        // from the DB row. `try_from_node` sets `floor=zeros`, but the
         // row may pre-exist (ON CONFLICT) with a floor promoted by a
         // prior run's failures. Only newly_inserted: nodes already in
         // memory have a floor ≥ DB (recovery loaded it; any promotion
         // since then wrote both in-mem and DB), so overwriting would
-        // downgrade.
-        let order = crate::assignment::builder_class_order(&self.sizing.size_classes.read());
+        // downgrade. `ResourceFloor::max` only RAISES so a stale DB
+        // row never demotes a higher in-memory floor.
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
-                if newly_inserted.contains(hash.as_str()) && floor.is_some() {
-                    // I-213: max(soft-feature hint, persisted floor) ---
-                    // the DAG insert may have set floor=xlarge from a
-                    // `big-parallel` hint; a stale DB row at `medium`
-                    // must not demote it.
-                    state.sched.size_class_floor = crate::assignment::max_class_by_order(
-                        state.sched.size_class_floor.as_deref(),
-                        floor.as_deref(),
-                        &order,
-                    )
-                    .map(String::from);
+                if newly_inserted.contains(hash.as_str()) {
+                    state.sched.resource_floor = state.sched.resource_floor.max(*floor);
                 }
             }
         }

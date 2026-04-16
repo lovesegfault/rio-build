@@ -176,10 +176,11 @@ pub fn describe_metrics() {
         "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
     );
     describe_counter!(
-        "rio_scheduler_size_class_promotions_total",
-        "size_class_floor promotions on transient failure (I-170/I-177, labeled kind/from/to; \
-         kind=fod|builder). Reactive upsize: a derivation that fails on class N retries on \
-         class N+1. Frequent firing for one pname = raise the default tiny class's memory limit."
+        "rio_scheduler_resource_floor_bumps_total",
+        "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
+         reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \
+         upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for \
+         one pname = raise [sla].probe defaults."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",

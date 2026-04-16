@@ -63,7 +63,7 @@ impl SchedulerDb {
                    expected_output_paths, output_names, is_fixed_output,
                    is_ca,
                    failed_builders,
-                   size_class_floor
+                   floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             FROM derivations
             WHERE status NOT IN {TERMINAL_STATUS_SQL}
             "

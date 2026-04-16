@@ -729,32 +729,20 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
     Ok(())
 }
 
-/// I-213 + controller-reports-reason: the production firefox case is
-/// kubelet evicts (ephemeral-storage) → SIGKILL → gRPC disconnect →
-/// controller observes Pod-status `Evicted` + `ephemeral-storage` →
+/// I-213 + D4: the production firefox case is kubelet evicts
+/// (ephemeral-storage) → SIGKILL → gRPC disconnect → controller
+/// observes Pod-status `Evicted` + `ephemeral-storage` →
 /// `ReportExecutorTermination(EvictedDiskPressure)`. Disconnect alone
-/// re-queues at CURRENT floor; the controller's report promotes.
-/// Promotion never records into `failed_builders`/`failure_count`/
-/// `retry_count` so the ladder is bounded by class-count, not
-/// `PoisonConfig.threshold=3`.
-///
-/// At the top of the ladder, `promote_size_class_floor` returns
-/// false (no next class) → `promoted=false` from the report. The drv
-/// stays Ready: disconnect+report never poison; that requires explicit
-/// `BuildResultStatus::TransientFailure` reports from the worker.
-// r[verify sched.retry.promotion-exempt]
+/// re-queues at CURRENT floor; the controller's report doubles
+/// `resource_floor.disk_bytes`. The bump never records into
+/// `failed_builders`/`failure_count`/`retry_count` so the ladder is
+/// bounded by `Ceilings.max_disk`, not `PoisonConfig.threshold=3`.
+// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.sla.reactive-floor]
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let classes = ["tiny", "small", "medium", "large", "xlarge"];
-    let (_db, handle, _task) = setup_with_classes(&[
-        ("tiny", 60.0),
-        ("small", 90.0),
-        ("medium", 120.0),
-        ("large", 150.0),
-        ("xlarge", 180.0),
-    ])
-    .await;
+    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0)]).await;
 
     let _ev = merge_single_node(
         &handle,
@@ -764,85 +752,170 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     )
     .await?;
 
-    // Climb tiny→small→medium→large→xlarge via disconnect +
-    // ReportExecutorTermination(EvictedDiskPressure): each report
-    // promotes, none recorded.
-    for (i, c) in classes[..4].iter().enumerate() {
-        let id = format!("b-213-{c}");
-        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", c).await?;
+    // 5× disconnect + ReportExecutorTermination(EvictedDiskPressure):
+    // each report doubles disk_bytes; none recorded into retry budgets.
+    let mut prev_disk = 0u64;
+    for i in 0..5 {
+        let id = format!("b-213-{i}");
+        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "tiny").await?;
         let asgn = recv_assignment(&mut rx).await;
         assert!(asgn.drv_path.contains("ladder-213"));
         assert!(handle.debug_backdate_running("ladder-213", 0).await?);
+        // Seed est_disk_bytes (no SLA config → dispatch wrote None;
+        // seed AFTER dispatch so it isn't clobbered). After cycle 0
+        // floor.disk > est so the seed is the doubling base only once.
+        handle
+            .debug_seed_sched_hint("ladder-213", None, Some(2 << 30), None, None)
+            .await?;
         // Disconnect first (gRPC stream drops immediately).
         disconnect(&handle, &id).await?;
         let s = expect_drv(&handle, "ladder-213").await;
-        let prev = if i == 0 { None } else { Some(classes[i]) };
         assert_eq!(
-            s.sched.size_class_floor.as_deref(),
-            prev,
-            "bare disconnect on {c} must NOT promote (controller is authoritative)"
+            s.sched.resource_floor.disk_bytes, prev_disk,
+            "bare disconnect on cycle {i} must NOT bump (controller is authoritative)"
         );
         // Controller's report ~1-3s later.
-        let promoted = report_termination(
-            &handle,
-            &id,
-            TerminationReason::EvictedDiskPressure,
-            Some(c),
-        )
-        .await?;
-        assert!(promoted, "EvictedDiskPressure on {c} → floor promoted");
+        let promoted =
+            report_termination(&handle, &id, TerminationReason::EvictedDiskPressure, None).await?;
+        assert!(promoted, "EvictedDiskPressure cycle {i} → floor bumped");
         tick(&handle).await?;
         drop(rx);
 
         let s = expect_drv(&handle, "ladder-213").await;
-        assert_eq!(
-            s.sched.size_class_floor.as_deref(),
-            Some(classes[i + 1]),
-            "ReportExecutorTermination(EvictedDiskPressure) on {c} → floor promoted"
+        assert!(
+            s.sched.resource_floor.disk_bytes > prev_disk,
+            "EvictedDiskPressure cycle {i} → disk_bytes doubled (was {prev_disk}, now {})",
+            s.sched.resource_floor.disk_bytes
         );
+        prev_disk = s.sched.resource_floor.disk_bytes;
         assert_eq!(
             s.retry.failure_count, 0,
-            "I-213: promotion not recorded in failure_count (after {c})"
+            "I-213: promotion not recorded in failure_count (cycle {i})"
         );
         assert!(
             s.retry.failed_builders.is_empty(),
-            "I-213: promotion not recorded in failed_builders (after {c})"
+            "I-213: promotion not recorded in failed_builders (cycle {i})"
         );
-        assert_eq!(s.retry.count, 0);
+        assert_eq!(s.retry.count, 0, "I-213: retry_count stays 0 (cycle {i})");
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
+    // 2GiB → 4→8→16→32→64 after 5 doublings.
+    assert_eq!(prev_disk, 64 << 30);
+    Ok(())
+}
 
-    // Top of ladder: disconnect+report on xlarge → no next class →
-    // promoted=false. Stays Ready (disconnect+report never poison).
-    let id = "b-213-xl";
-    let mut rx = connect_builder_classed(&handle, id, "x86_64-linux", "xlarge").await?;
-    let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("ladder-213"));
-    assert!(handle.debug_backdate_running("ladder-213", 0).await?);
-    disconnect(&handle, id).await?;
-    let promoted = report_termination(
+// r[verify sched.sla.reactive-floor]
+/// D4 cap-then-count: with `floor.mem == ceil.max_mem`, an OOM report
+/// returns `promoted=false` and increments `infra_count`; after
+/// `max_infra_retries` such cycles the drv poisons (via the
+/// `handle_infrastructure_failure` cap check on the worker-reported
+/// path; the controller-reported path here only counts — disconnect
+/// already re-queued).
+///
+/// `DeadlineExceeded` variant: at `DEADLINE_CAP_SECS` the report
+/// increments `timeout_count`, NOT `infra_count` (separate budget per
+/// I-213).
+#[tokio::test]
+async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
+    use crate::sla::solve::DEFAULT_CEILINGS;
+    use rio_proto::types::TerminationReason as R;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = size_classes(&[("tiny", 60.0)]);
+        c.retry_policy = crate::RetryPolicy {
+            max_infra_retries: 2,
+            ..Default::default()
+        };
+    });
+
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "cap-mem", PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(
+            "cap-mem",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: DEFAULT_CEILINGS.max_mem,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    // ── OOM at ceiling → promoted=false, infra_count++ ────────────────
+    let mut rx = connect_builder_classed(&handle, "b-cap-0", "x86_64-linux", "tiny").await?;
+    let _ = recv_assignment(&mut rx).await;
+    disconnect(&handle, "b-cap-0").await?;
+    drop(rx);
+    let promoted = report_termination(&handle, "b-cap-0", R::OomKilled, None).await?;
+    assert!(!promoted, "floor at ceiling → promoted=false");
+    let s = expect_drv(&handle, "cap-mem").await;
+    assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
+    assert_eq!(s.retry.infra_count, 1, "at-cap OOM → infra_count++");
+    assert_eq!(s.retry.timeout_count, 0);
+
+    // Worker-reported CgroupOom path owns the poison (cap check is
+    // there). One more cycle via InfrastructureFailure(CgroupOom):
+    // floor at cap → promoted=false → exempt_from_cap=false →
+    // bump's infra_count++ (1→2) → cap check (2>=max_infra_retries=2)
+    // → poison.
+    let p = test_drv_path("cap-mem");
+    let mut rx = connect_builder_classed(&handle, "b-cap-1", "x86_64-linux", "tiny").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
         &handle,
-        id,
-        TerminationReason::EvictedDiskPressure,
-        Some("xlarge"),
+        "b-cap-1",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "cgroup OOM during build; promoting size class",
     )
     .await?;
-    assert!(!promoted, "no class above xlarge");
     drop(rx);
-    let s = expect_drv(&handle, "ladder-213").await;
-    assert_eq!(s.sched.size_class_floor.as_deref(), Some("xlarge"));
+    let s = expect_drv(&handle, "cap-mem").await;
     assert_eq!(
         s.status,
-        DerivationStatus::Ready,
-        "disconnect+report at top of ladder stays Ready (poison requires \
-         explicit TransientFailure from worker)"
+        DerivationStatus::Poisoned,
+        "infra_count exhausted at floor==ceiling → poison"
+    );
+
+    // ── DeadlineExceeded variant: timeout_count, NOT infra_count ─────
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "cap-dl", PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(
+            "cap-dl",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                deadline_secs: crate::actor::floor::DEADLINE_CAP_SECS,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let mut rx =
+        connect_builder_classed(&handle, "rio-b-dl-abc-x9k4p", "x86_64-linux", "tiny").await?;
+    let _ = recv_assignment(&mut rx).await;
+    disconnect(&handle, "rio-b-dl-abc-x9k4p").await?;
+    drop(rx);
+    let promoted = report_termination(&handle, "rio-b-dl-abc", R::DeadlineExceeded, None).await?;
+    assert!(!promoted, "deadline at 24h cap → promoted=false");
+    let s = expect_drv(&handle, "cap-dl").await;
+    assert_eq!(
+        s.retry.timeout_count, 1,
+        "at-cap deadline → timeout_count++"
+    );
+    assert_eq!(
+        s.retry.infra_count, 0,
+        "DeadlineExceeded uses timeout_count, NOT infra_count (I-213 separate budget)"
     );
     Ok(())
 }
 
 // r[verify sched.fod.size-class-reactive]
 // r[verify sched.builder.size-class-reactive]
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+3]
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// Bare disconnect does NOT promote `size_class_floor`; the
 /// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
 /// Live QA bug: cmake went medium→large→xlarge from a pod-kill +
@@ -898,8 +971,9 @@ async fn test_disconnect_no_promote_oom_report_promotes(
 
     let info = expect_drv(&handle, tag).await;
     assert_eq!(
-        info.sched.size_class_floor, None,
-        "bare disconnect must NOT promote (controller is authoritative); \
+        info.sched.resource_floor,
+        Default::default(),
+        "bare disconnect must NOT bump floor (controller is authoritative); \
          live QA: cmake medium→large→xlarge from pod-kill"
     );
     assert!(
@@ -909,34 +983,30 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     );
     assert_eq!(info.status, DerivationStatus::Ready);
 
-    // ── Controller reports OOMKilled ~1-3s later: promote ──────────
-    let promoted = report_termination(
-        &handle,
-        "w-tiny",
-        TerminationReason::OomKilled,
-        Some("tiny"),
-    )
-    .await?;
+    // Seed est_memory_bytes (no SLA config in this fixture →
+    // solve_intent_for gated off → est=None → bump would no-op).
+    handle
+        .debug_seed_sched_hint(tag, Some(4 << 30), None, None, None)
+        .await?;
+
+    // ── Controller reports OOMKilled ~1-3s later: bump ─────────────
+    let promoted =
+        report_termination(&handle, "w-tiny", TerminationReason::OomKilled, None).await?;
     assert!(
         promoted,
-        "ReportExecutorTermination(OomKilled) must promote tiny→small"
+        "ReportExecutorTermination(OomKilled) must double mem floor"
     );
     let info = expect_drv(&handle, tag).await;
     assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "OomKilled report promoted floor"
+        info.sched.resource_floor.mem_bytes,
+        8 << 30,
+        "OomKilled report doubled mem floor from est=4GiB"
     );
 
     // ── Dedup: second report (controller re-reports every ~10s tick
     // for JOB_TTL_SECS=600) → no-op ────────────────────────────────
-    let promoted = report_termination(
-        &handle,
-        "w-tiny",
-        TerminationReason::OomKilled,
-        Some("tiny"),
-    )
-    .await?;
+    let promoted =
+        report_termination(&handle, "w-tiny", TerminationReason::OomKilled, None).await?;
     assert!(
         !promoted,
         "second report for same executor_id → recently_disconnected entry \
@@ -944,30 +1014,29 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     );
 
     // ── Non-resource reason (Error = pod-kill / SIGKILL / node
-    // failure) on a SECOND OOM cycle → no promote ──────────────────
+    // failure) on a SECOND OOM cycle → no bump ─────────────────────
     let mut rx2 =
         connect_executor_classed(&handle, "w-small", "x86_64-linux", "small", kind).await?;
     let asgn = recv_assignment(&mut rx2).await;
     assert!(asgn.drv_path.contains(tag));
     disconnect(&handle, "w-small").await?;
     drop(rx2);
-    let promoted =
-        report_termination(&handle, "w-small", TerminationReason::Error, Some("small")).await?;
+    let promoted = report_termination(&handle, "w-small", TerminationReason::Error, None).await?;
     assert!(
         !promoted,
-        "ReportExecutorTermination(Error) must NOT promote (pod-kill / node \
+        "ReportExecutorTermination(Error) must NOT bump (pod-kill / node \
          failure is not a sizing signal)"
     );
     let info = expect_drv(&handle, tag).await;
     assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
+        info.sched.resource_floor.mem_bytes,
+        8 << 30,
         "floor unchanged after Error report"
     );
     Ok(())
 }
 
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+3]
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// I-188 race case: a builder that disconnects with `running_build ==
 /// Some(X)` AFTER having sent CompletionReport(X) gets NO
 /// `recently_disconnected` entry (`last_completed == running_build` →
@@ -1041,31 +1110,32 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 
     let info = expect_drv(&handle, "eph-race-188").await;
     assert_eq!(
-        info.sched.size_class_floor, None,
-        "bare disconnect never promotes"
+        info.sched.resource_floor,
+        Default::default(),
+        "bare disconnect never bumps floor"
     );
 
     // A spurious OOMKilled report (delayed reconcile) misses the map
-    // (last_completed == running_build → no entry) → no promote.
+    // (last_completed == running_build → no entry) → no bump.
     let promoted = report_termination(
         &handle,
         "b-eph2",
         rio_proto::types::TerminationReason::OomKilled,
-        Some("tiny"),
+        None,
     )
     .await?;
     assert!(
         !promoted,
         "I-188: disconnect AFTER CompletionReport → no recently_disconnected \
-         entry → spurious OOMKilled report does not promote"
+         entry → spurious OOMKilled report does not bump"
     );
     let info = expect_drv(&handle, "eph-race-188").await;
-    assert_eq!(info.sched.size_class_floor, None);
+    assert_eq!(info.sched.resource_floor, Default::default());
 
     Ok(())
 }
 
-// r[verify sched.termination.deadline-exceeded]
+// r[verify sched.termination.deadline-exceeded+2]
 /// `activeDeadlineSeconds` backstop fired (worker too wedged to report
 /// `TimedOut` itself). Controller reports `DeadlineExceeded` by JOB
 /// name; scheduler prefix-matches the disconnected pod, promotes
@@ -1093,13 +1163,17 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains("python3-deadline"));
 
+    // Seed est_deadline_secs (no SLA config → solve_intent_for gated
+    // off → est=None → bump would no-op).
+    handle
+        .debug_seed_sched_hint("python3-deadline", None, None, Some(300), None)
+        .await?;
+
     disconnect(&handle, "rio-builder-tiny-abc123-x9k4p").await?;
     drop(rx);
     let info = expect_drv(&handle, "python3-deadline").await;
-    assert_eq!(
-        info.sched.size_class_floor, None,
-        "precondition: bare disconnect did NOT promote"
-    );
+    let prev = info.sched.resource_floor.deadline_secs;
+    assert_eq!(prev, 0, "precondition: bare disconnect did NOT bump");
     assert_eq!(info.retry.timeout_count, 0);
 
     // Controller reports by JOB name — scheduler prefix-matches.
@@ -1107,18 +1181,22 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
         &handle,
         "rio-builder-tiny-abc123",
         TerminationReason::DeadlineExceeded,
-        Some("tiny"),
+        None,
     )
     .await?;
     assert!(
         promoted,
-        "DeadlineExceeded must promote tiny→small via Job-name prefix-match"
+        "DeadlineExceeded must double deadline floor via Job-name prefix-match"
     );
     let info = expect_drv(&handle, "python3-deadline").await;
-    assert_eq!(info.sched.size_class_floor.as_deref(), Some("small"));
     assert_eq!(
-        info.retry.timeout_count, 1,
-        "DeadlineExceeded bumps timeout_count (bounded ladder)"
+        info.sched.resource_floor.deadline_secs,
+        2 * 300,
+        "D4: floor.deadline_secs == 2 × est_deadline_secs"
+    );
+    assert_eq!(
+        info.retry.timeout_count, 0,
+        "below cap → bump_floor_or_count does NOT increment timeout_count"
     );
 
     // Second report for same Job → recently_disconnected entry already
@@ -1127,12 +1205,15 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
         &handle,
         "rio-builder-tiny-abc123",
         TerminationReason::DeadlineExceeded,
-        Some("tiny"),
+        None,
     )
     .await?;
     assert!(!promoted, "second report dedups");
     let info = expect_drv(&handle, "python3-deadline").await;
-    assert_eq!(info.retry.timeout_count, 1, "dedup: count unchanged");
+    assert_eq!(
+        info.sched.resource_floor.deadline_secs, 600,
+        "dedup: floor unchanged"
+    );
 
     Ok(())
 }

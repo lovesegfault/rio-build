@@ -34,23 +34,22 @@ impl SchedulerDb {
 
     // r[impl sched.db.batch-unnest]
     /// Batch-upsert derivations. Returns a map
-    /// `drv_hash -> (derivation_id, size_class_floor)`.
+    /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
     /// Array parameters via `UNNEST`: 10 bind params total regardless of
     /// row count (vs `push_values`' 10×N, which hits PG's 65535-param
     /// limit at ~6553 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
-    /// `size_class_floor` is returned so merge can hydrate it onto
+    /// `floor_*` columns are returned so merge can hydrate them onto
     /// newly-inserted in-memory state (I-208) — `try_from_node` sets
-    /// `floor=None`, but the DB row may pre-exist (ON CONFLICT) with a
-    /// floor promoted by a prior run's failures. Without this, the FOD
-    /// snapshot buckets to the smallest class and the controller
-    /// re-spawns the smallest fetcher every run.
+    /// `floor=zeros`, but the DB row may pre-exist (ON CONFLICT) with a
+    /// floor promoted by a prior run's failures. Without this the next
+    /// SpawnIntent re-uses probe defaults and re-OOMs every run.
     pub(crate) async fn batch_upsert_derivations(
         tx: &mut PgConnection,
         rows: &[DerivationRow],
-    ) -> Result<HashMap<String, (Uuid, Option<String>)>, sqlx::Error> {
+    ) -> Result<HashMap<String, (Uuid, crate::state::ResourceFloor)>, sqlx::Error> {
         if rows.is_empty() {
             return Ok(HashMap::new());
         }
@@ -94,7 +93,7 @@ impl SchedulerDb {
         // this is idempotent in practice, but keeps the row in sync
         // with in-mem). status/retry etc stay as-is — those reflect
         // LIVE state, not merge-time snapshot.
-        let result: Vec<(String, Uuid, Option<String>)> = sqlx::query_as(
+        let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
@@ -123,7 +122,8 @@ impl SchedulerDb {
                 output_names = EXCLUDED.output_names,
                 is_fixed_output = EXCLUDED.is_fixed_output,
                 is_ca = EXCLUDED.is_ca
-            RETURNING drv_hash, derivation_id, size_class_floor
+            RETURNING drv_hash, derivation_id,
+                      floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
         )
         .bind(&drv_hash)
@@ -140,7 +140,19 @@ impl SchedulerDb {
         .await?;
         Ok(result
             .into_iter()
-            .map(|(h, id, floor): (String, Uuid, Option<String>)| (h, (id, floor)))
+            .map(|(h, id, mem, disk, deadline)| {
+                (
+                    h,
+                    (
+                        id,
+                        crate::state::ResourceFloor {
+                            mem_bytes: mem.max(0) as u64,
+                            disk_bytes: disk.max(0) as u64,
+                            deadline_secs: deadline.clamp(0, u32::MAX as i64) as u32,
+                        },
+                    ),
+                )
+            })
             .collect())
     }
 

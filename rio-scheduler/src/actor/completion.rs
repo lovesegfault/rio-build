@@ -45,9 +45,8 @@ struct CaCutoffVerified {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FailureOutcome {
     pub(super) reached_poison: bool,
-    /// `promote_size_class_floor` actually changed the floor. False if
-    /// already at the largest class, executor unclassed, or floor
-    /// already at the target.
+    /// `bump_floor_or_count` actually raised a floor dimension. False
+    /// if already at the relevant ceiling, or non-resource reason.
     pub(super) promoted: bool,
 }
 
@@ -406,14 +405,15 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.fod.size-class-reactive]
-    // r[impl sched.builder.size-class-reactive]
-    /// Bump a derivation's `size_class_floor` to one above
-    /// `failed_class` so the next dispatch skips already-tried sizes.
+    // r[impl sched.sla.reactive-floor]
+    /// Double the relevant `resource_floor` dimension for `drv_hash`
+    /// (D4). Thin wrapper around [`floor::bump_floor_or_count`] that
+    /// handles the dag-node lookup, metric, log, and best-effort PG
+    /// persist.
     ///
     /// Called ONLY from explicit resource-exhaustion signals:
     /// - `handle_executor_termination` (controller-reported k8s
-    ///   OOMKilled / Evicted-DiskPressure)
+    ///   OOMKilled / Evicted-DiskPressure / DeadlineExceeded)
     /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
     ///   — build child hit cgroup memory.max while pod survived)
     /// - `handle_timeout_failure` (worker-reported `TimedOut`)
@@ -423,79 +423,49 @@ impl DagActor {
     /// I-170/I-173/I-177/I-199 over-broad heuristic (promote on ANY
     /// failure path) over-fired: live QA showed cmake going medium→
     /// large→xlarge from a pod-kill + store-replica-restart with zero
-    /// builds run, and floor is sticky (M_032) so the next submitter
+    /// builds run, and floor is sticky (M_044) so the next submitter
     /// paid for an oversized pod.
     ///
-    /// I-177: branches on `is_fixed_output` only for the metric `kind`
-    /// label; both walk `[[size_classes]]` (FOD via the cutoff-sorted
-    /// `fetcher_classes` snapshot, non-FOD via `next_builder_class`).
-    ///
-    /// `reason`: emitted as a label on the metric + the log line so
-    /// operators can tell `oom_killed` from `disk_pressure` from
-    /// `cgroup_oom` from `timeout` in dashboards.
-    ///
-    /// No-op for `failed_class=None`, largest class, unknown class,
-    /// feature off (relevant class list empty), or floor already at
-    /// target. Idempotent.
-    pub(super) async fn promote_size_class_floor(
+    /// `reason_label`: emitted as a label on the metric + the log
+    /// line so operators can tell `oom_killed` from `disk_pressure`
+    /// from `cgroup_oom` from `timeout` in dashboards.
+    pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
-        failed_class: Option<&str>,
-        reason: &'static str,
+        reason: rio_proto::types::TerminationReason,
+        reason_label: &'static str,
     ) -> bool {
-        let Some(from) = failed_class else {
-            return false;
-        };
-        let mut promoted_to: Option<String> = None;
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            let (to, kind) = if state.is_fixed_output {
-                let to = crate::assignment::next_fetcher_class(from, &self.sizing.fetcher_classes);
-                (to, "fod")
-            } else {
-                // parking_lot guard scope: ends here, before the
-                // persist `.await` below (guard is !Send).
-                let classes = self.sizing.size_classes.read();
-                let to = crate::assignment::next_builder_class(from, &classes);
-                (to, "builder")
-            };
-            let Some(to) = to else { return false };
-            // Change-detector, NOT an ordinal compare — fires on any
-            // `to != current floor`, not strictly `to > floor`. The
-            // "only ever bumps UP" property is structural: dispatch
-            // clamps assignments at floor (FOD + non-FOD as of I-177),
-            // so `from` ≥ floor, so `next_*_class(from)` is the class
-            // above floor (or None at top). A floor=large drv can't be
-            // assigned to tiny, so the demote case is unreachable in
-            // steady state. The `!=` form just skips the no-op write +
-            // metric when floor is already at `to` (e.g. floor=small,
-            // overflow-placed on tiny, `next(tiny)=small` — equal, no
-            // log spam).
-            if state.sched.size_class_floor.as_deref() != Some(to.as_str()) {
+        let mut new_floor = None;
+        let promoted = if let Some(state) = self.dag.node_mut(drv_hash) {
+            let p = super::floor::bump_floor_or_count(state, reason, &self.sla_ceilings);
+            if p {
                 info!(
-                    drv_hash = %drv_hash, kind, reason, from = %from, to = %to,
-                    "promoting size_class_floor"
+                    drv_hash = %drv_hash, reason = reason_label,
+                    floor = ?state.sched.resource_floor,
+                    "resource_floor bumped"
                 );
                 metrics::counter!(
-                    "rio_scheduler_size_class_promotions_total",
-                    "kind" => kind, "reason" => reason,
-                    "from" => from.to_owned(), "to" => to.clone()
+                    "rio_scheduler_resource_floor_bumps_total",
+                    "reason" => reason_label
                 )
                 .increment(1);
-                state.sched.size_class_floor = Some(to.clone());
-                promoted_to = Some(to);
+                new_floor = Some(state.sched.resource_floor);
             }
-        }
-        // P0556: persist the floor so failover doesn't reset it →
-        // re-OOM on tiny. Outside the node_mut borrow (await point);
-        // best-effort — a lost write degrades to one wasted retry,
-        // same as pre-P0556 behavior.
-        if let Some(to) = &promoted_to
-            && let Err(e) = self.db.update_size_class_floor(drv_hash, to).await
+            p
+        } else {
+            false
+        };
+        // M_044: persist the floor so failover doesn't reset it →
+        // re-OOM at probe defaults. Outside the node_mut borrow
+        // (await point); best-effort — a lost write degrades to one
+        // wasted retry.
+        if let Some(floor) = &new_floor
+            && let Err(e) = self.db.update_resource_floor(drv_hash, floor).await
         {
-            error!(drv_hash = %drv_hash, to = %to, error = %e,
-                   "failed to persist size_class_floor");
+            error!(drv_hash = %drv_hash, ?floor, error = %e,
+                   "failed to persist resource_floor");
         }
-        promoted_to.is_some()
+        promoted
     }
 
     /// Record a worker failure for `drv_hash` (in-mem + PG
@@ -514,15 +484,15 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
     ) -> FailureOutcome {
-        // No size_class_floor promotion here — `TransientFailure`
-        // (build script exited nonzero) is a build-determinism signal,
-        // not a sizing signal. Promotion is reserved for explicit
+        // No resource_floor bump here — `TransientFailure` (build
+        // script exited nonzero) is a build-determinism signal, not a
+        // sizing signal. Floor bumps are reserved for explicit
         // resource-exhaustion paths (controller-reported OOMKilled/
         // DiskPressure, worker-reported CgroupOom/TimedOut). The
         // previous I-170/I-173/I-177 over-broad promote here meant a
         // flaky build climbed the ladder and the next submitter paid
         // for an oversized pod.
-        // r[impl sched.retry.promotion-exempt]
+        // r[impl sched.retry.promotion-exempt+2]
         let promoted = false;
         {
             if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -746,7 +716,7 @@ impl DagActor {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
-            // TimedOut: I-200 promotes size_class_floor and retries on
+            // TimedOut: I-200 bumps resource_floor.deadline and retries on
             // a larger class (longer activeDeadlineSeconds), bounded by
             // max_timeout_retries. After the cap → Cancelled (terminal,
             // retriable-on-resubmit) — same inputs on the LARGEST class
@@ -1361,17 +1331,19 @@ impl DagActor {
                 // scalar. Best-effort: warn, never fail completion on
                 // sample-write error.
                 //
-                // FODs excluded (ADR-019): the SLA model fits BUILDER
-                // CPU-bound duration. Fetch durations are network-bound
-                // noise; mixing them into the per-key T(c) curve drags
-                // it toward whatever the upstream mirror's bandwidth
-                // happens to be.
+                // D2: FODs included. They go through the identical SLA
+                // pipeline as builds; "network-bound" is not a safe
+                // assumption (large source unpacks, vendored builds,
+                // git submodule recursion). If FOD telemetry later
+                // shows the T(c) model is a poor fit for genuinely
+                // network-dominated keys, the fix is a per-key
+                // adjustment in the fitter, not a parallel codepath.
                 //
                 // peak_memory_bytes passed raw (as i64), not 0→None
                 // filtered — 0 is a legitimate sample point
                 // ("sub-second build, poller didn't fire"); the
                 // percentile computation doesn't drag.
-                if !state.is_fixed_output {
+                {
                     // Tenant: first interested build's tenant_id,
                     // stringified. A derivation shared across tenants
                     // (dedup at merge) is attributed to whichever build
@@ -1723,7 +1695,7 @@ impl DagActor {
             reached_poison || self.failed_builders_exhausts_fleet(drv_hash, is_fod);
 
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
-            // r[impl sched.retry.promotion-exempt]
+            // r[impl sched.retry.promotion-exempt+2]
             // I-213: a failure that promoted the floor is a sizing
             // signal, not a build-determinism signal. It always
             // retries (on the next-larger class) and doesn't consume
@@ -1746,7 +1718,7 @@ impl DagActor {
                     drv_hash = %drv_hash,
                     retry_count = state.retry.count,
                     max = self.retry_policy.max_retries,
-                    size_class_floor = ?state.sched.size_class_floor,
+                    resource_floor = ?state.sched.resource_floor,
                     "transient failure: max_retries exhausted, poisoning"
                 );
                 false // poison_and_cascade below does the transition
@@ -1829,7 +1801,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         error_msg: &str,
     ) {
-        // I-199: promote size_class_floor ONLY on the worker-reported
+        // I-199: bump resource_floor ONLY on the worker-reported
         // `CgroupOom` infra failure (I-196 OOM watcher: build child
         // hit cgroup memory.max while the pod itself survived). Other
         // infra failures (FUSE EIO, PutPath race, store-replica-
@@ -1841,19 +1813,26 @@ impl DagActor {
         //
         // Substring match on the `ExecutorError::CgroupOom` Display
         // impl ("cgroup OOM during build…").
-        if error_msg.contains("cgroup OOM") {
-            let failed_class = self
-                .executors
-                .get(executor_id)
-                .and_then(|e| e.size_class.clone());
-            self.promote_size_class_floor(drv_hash, failed_class.as_deref(), "cgroup_oom")
-                .await;
-        }
+        let promoted = if error_msg.contains("cgroup OOM") {
+            self.bump_resource_floor(
+                drv_hash,
+                rio_proto::types::TerminationReason::OomKilled,
+                "cgroup_oom",
+            )
+            .await
+        } else {
+            false
+        };
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
 
+        // D4: a floor bump that returned `promoted=true` is a sizing
+        // signal — the next dispatch goes larger; the THIS-attempt
+        // failure is not the build's fault. Exempt from the infra cap
+        // alongside the I-127 PutPath case below.
+        //
         // I-127: "concurrent PutPath" is NEVER counted toward the
         // infra cap. It means another builder is uploading the SAME
         // output — the drv almost certainly succeeded elsewhere; this
@@ -1869,7 +1848,7 @@ impl DagActor {
         // Substring match mirrors `is_concurrent_put_path` in
         // rio-builder/src/upload.rs (the store emits this exact
         // phrase in its Aborted status).
-        let exempt_from_cap = error_msg.contains("concurrent PutPath");
+        let exempt_from_cap = promoted || error_msg.contains("concurrent PutPath");
 
         // I-127 time-window reset: if the last counted infra failure
         // was longer ago than `infra_retry_window_secs`, treat this as
@@ -1903,7 +1882,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 infra_retry_count = state.retry.infra_count,
                 max = self.retry_policy.max_infra_retries,
-                size_class_floor = ?state.sched.size_class_floor,
+                resource_floor = ?state.sched.resource_floor,
                 "infrastructure failure: max_infra_retries exhausted, poisoning"
             );
             self.poison_and_cascade(drv_hash).await;
@@ -1983,7 +1962,7 @@ impl DagActor {
     }
 
     /// Worker-side timeout (`BuildResultStatus::TimedOut`): promote
-    /// `size_class_floor` and reset to Ready for re-dispatch on a
+    /// `resource_floor.deadline_secs` and reset to Ready for re-dispatch on a
     /// larger class — bounded by `max_timeout_retries`, after which
     /// terminal `Cancelled` (retriable on EXPLICIT resubmit only).
     ///
@@ -2005,23 +1984,28 @@ impl DagActor {
     /// cascade/events/build-fail side-effects as
     /// `handle_permanent_failure` — the build still fails THIS time,
     /// just without the 24h resubmit lockout.
-    // r[impl sched.timeout.promote-on-exceed]
+    // r[impl sched.timeout.promote-on-exceed+2]
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,
         executor_id: &ExecutorId,
     ) {
-        // Promote BEFORE the cap check / state transition: even the
-        // terminal-path attempt should record that this class was
-        // inadequate, so an explicit resubmit starts on the next-
-        // larger class instead of replaying the timeout. Same shape
-        // as I-199's handle_infrastructure_failure prologue.
-        let failed_class = self
-            .executors
-            .get(executor_id)
-            .and_then(|e| e.size_class.clone());
-        self.promote_size_class_floor(drv_hash, failed_class.as_deref(), "timeout")
+        // Bump BEFORE the cap check / state transition: even the
+        // terminal-path attempt should record that this deadline was
+        // inadequate, so an explicit resubmit starts at the doubled
+        // floor instead of replaying the timeout. Same shape as
+        // I-199's handle_infrastructure_failure prologue. D4: at the
+        // 24h cap `bump_floor_or_count` increments `timeout_count`
+        // instead — that's the SAME counter the cap check below reads,
+        // so a build that hit the deadline cap goes terminal on the
+        // next iteration regardless of `max_timeout_retries`.
+        let promoted = self
+            .bump_resource_floor(
+                drv_hash,
+                rio_proto::types::TerminationReason::DeadlineExceeded,
+                "timeout",
+            )
             .await;
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
@@ -2029,9 +2013,8 @@ impl DagActor {
         };
 
         // Cap check BEFORE reset_to_ready. At the cap, fall through
-        // to terminal Cancelled — a build that timed out on every
-        // class (or on a class where promote_size_class_floor
-        // returned None: already at largest) is genuinely stuck.
+        // to terminal Cancelled — a build whose deadline floor is at
+        // 24h is genuinely stuck.
         if state.retry.timeout_count < self.retry_policy.max_timeout_retries {
             state.ensure_running();
             if let Err(e) = state.reset_to_ready() {
@@ -2040,18 +2023,22 @@ impl DagActor {
                 return;
             }
             // NO insert into failed_builders (timeout is not a per-
-            // worker problem — the SAME worker on a larger class
+            // worker problem — the SAME worker with a longer deadline
             // would succeed). NO retry_count++ (separate counter).
-            // NO backoff (next class has a longer deadline; that IS
-            // the backoff).
-            state.retry.timeout_count += 1;
+            // NO backoff (next dispatch's longer deadline IS the
+            // backoff). D4: `bump_floor_or_count` already handled the
+            // counter (incremented IFF at-cap and promoted=false), so
+            // only count the promoted-retry here.
+            if promoted {
+                state.retry.timeout_count += 1;
+            }
             info!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
                 timeout_retry_count = state.retry.timeout_count,
                 max = self.retry_policy.max_timeout_retries,
-                failed_class = ?failed_class,
-                "timeout — promoted size_class_floor, retrying on larger class"
+                promoted,
+                "timeout — bumped deadline floor, retrying"
             );
             self.requeue_after_retry(drv_hash).await;
             return;

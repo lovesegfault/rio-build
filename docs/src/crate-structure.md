@@ -323,6 +323,7 @@ src/
 │   ├── mod.rs         # LeaseState enum + leader-guard helpers
 │   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
 ├── assignment.rs      # Executor selection (hard-filter, first-match) + size-class classify()
+├── actor/floor.rs     # D4 reactive resource_floor doubling (bump_floor_or_count)
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
 └── queue.rs           # ReadyQueue: BinaryHeap with lazy invalidation

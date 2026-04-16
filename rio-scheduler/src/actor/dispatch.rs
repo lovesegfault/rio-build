@@ -267,7 +267,15 @@ impl DagActor {
         // guards aren't `Send`; the await point would be a
         // compile error anyway, but keeping the scope tight
         // is defensive.
-        let (target_class, est_cores, est_memory_bytes, sla_predicted, is_fixed_output, system) = {
+        let (
+            target_class,
+            est_cores,
+            est_memory_bytes,
+            est_disk_bytes,
+            sla_predicted,
+            is_fixed_output,
+            system,
+        ) = {
             let pname = state.pname.as_deref();
             let system = &state.system;
             let classes = self.sizing.size_classes.read();
@@ -298,17 +306,18 @@ impl DagActor {
             // when `w.last_resources` is still None from the cgroup-
             // poll-vs-first-heartbeat race). The pre-ADR-023 path
             // (`bucketed_estimate`) returned None on cold start.
-            let (est_cores, est_memory_bytes, sla_predicted) =
+            let (est_cores, est_memory_bytes, est_disk_bytes, sla_predicted) =
                 if state.is_fixed_output || self.sla_config.is_none() || classes.is_empty() {
-                    (None, None, None)
+                    (None, None, None, None)
                 } else {
-                    let (cores, mem, _, pred, _) = self.solve_intent_for(pname, state);
-                    (Some(cores), Some(mem), pred)
+                    let (cores, mem, disk, pred, _) = self.solve_intent_for(pname, state);
+                    (Some(cores), Some(mem), Some(disk), pred)
                 };
             (
                 target_class,
                 est_cores,
                 est_memory_bytes,
+                est_disk_bytes,
                 sla_predicted,
                 state.is_fixed_output,
                 system.clone(),
@@ -322,6 +331,13 @@ impl DagActor {
         if let Some(state) = self.dag.node_mut(&drv_hash) {
             state.sched.est_cores = est_cores;
             state.sched.est_memory_bytes = est_memory_bytes;
+            // D4: `bump_floor_or_count` reads est_{disk,deadline} as
+            // `last_intent` for the doubling base.
+            state.sched.est_disk_bytes = est_disk_bytes;
+            state.sched.est_deadline_secs = sla_predicted
+                .as_ref()
+                .and_then(|p| p.wall_secs)
+                .map(|s| s as u32);
             // ADR-023 phase-7: capture the dispatch-time prediction so
             // completion can score actual-vs-predicted on the SAME
             // curve we sized against (the estimator may have refit by
@@ -1187,25 +1203,17 @@ impl DagActor {
         // hard_filter is the absolute boundary). A queued FOD is
         // preferable to a builder with internet access.
         //
-        // Chain start: `size_class_floor` (set by reactive promotion
-        // on prior failure) or `fetcher_classes[0]` if never
-        // failed. Empty config = no class filter (original behavior).
+        // D4: class-name `size_class_floor` removed; the reactive
+        // `resource_floor` is applied inside `solve_intent_for`.
+        // Phase 6 (D2) deletes this whole FOD branch — FODs go through
+        // the same intent-match path as builds. Empty config = no
+        // class filter (original behavior).
         if drv_state.is_fixed_output {
             if self.sizing.fetcher_classes.is_empty() {
                 let w = crate::assignment::best_executor(&self.executors, drv_state, None);
                 return (w, None);
             }
-            // Walk fetcher classes from `floor` upward. Config order is
-            // authoritative (smallest→largest); a floor not in the
-            // config (stale after a config change) degrades to "start
-            // from smallest" via `position().unwrap_or(0)`.
-            let floor_idx = drv_state
-                .sched
-                .size_class_floor
-                .as_deref()
-                .and_then(|f| self.sizing.fetcher_classes.iter().position(|c| c == f))
-                .unwrap_or(0);
-            for class in &self.sizing.fetcher_classes[floor_idx..] {
+            for class in &self.sizing.fetcher_classes {
                 if let Some(w) =
                     crate::assignment::best_executor(&self.executors, drv_state, Some(class))
                 {
@@ -1233,25 +1241,13 @@ impl DagActor {
         // Read guard lives through the chain walk — no `.await` in
         // this fn, so it's safe. best_executor is sync.
         let classes = self.sizing.size_classes.read();
-        let target_cutoff = crate::assignment::cutoff_for(target, &classes);
         // r[impl sched.builder.size-class-reactive]
-        // I-177: clamp the chain start at `size_class_floor`. A
-        // non-FOD that OOM'd on tiny gets floor=small via
-        // `promote_size_class_floor`; the EMA classifier (success-
-        // only samples) still says tiny, so without this clamp the
-        // chain would re-start at tiny → re-OOM → poison. A floor
-        // not in the current config (stale after a config change)
-        // degrades to no-clamp via `cutoff_for() = None` — same
-        // graceful fallback as the FOD branch's `unwrap_or(0)`.
-        let floor_cutoff = drv_state
-            .sched
-            .size_class_floor
-            .as_deref()
-            .and_then(|f| crate::assignment::cutoff_for(f, &classes));
-        let start_cutoff = match (target_cutoff, floor_cutoff) {
-            (Some(t), Some(f)) => Some(t.max(f)),
-            (t, f) => t.or(f),
-        };
+        // D4: class-name `size_class_floor` clamp removed; the
+        // reactive `resource_floor` is applied inside
+        // `solve_intent_for` (mem/disk bytes) which feeds
+        // `est_memory_bytes` for `hard_filter`'s resource-fit gate.
+        // Phase 6 deletes this whole overflow chain.
+        let start_cutoff = crate::assignment::cutoff_for(target, &classes);
         let mut chain: Vec<(&str, f64)> = classes
             .iter()
             .filter(|c| {

@@ -78,15 +78,10 @@ pub struct DerivationDag {
     /// `rejection_reason` call sites. The DB persists the unstripped
     /// original (merge.rs writes `node.required_features`).
     ///
-    /// I-213: each entry MAY carry a `floor_hint` --- the strip raises
-    /// `size_class_floor` to that class so a `big-parallel` build lands
-    /// on `xlarge` directly instead of climbing from tiny.
+    /// D6: `floor_hint` seeding removed (legacy size-class names);
+    /// SLA `solve_intent_for` + `resource_floor` clamp own initial
+    /// sizing now. Strip-only.
     soft_features: Vec<crate::assignment::SoftFeature>,
-    /// Builder size-class names smallest→largest (cutoff order) for
-    /// comparing `floor_hint`s during the strip. Snapshot from
-    /// `with_size_classes` --- the rebalancer mutates cutoffs but never
-    /// reorders or renames classes, so a one-time copy is stable.
-    class_order: Vec<String>,
 }
 
 impl DerivationDag {
@@ -98,46 +93,21 @@ impl DerivationDag {
     /// Set soft features. Called once from `DagActor::with_soft_features`
     /// before any merge/recovery; stripping in `insert_recovered_node`
     /// and the merge path read this. No-op if called with an empty vec.
-    pub fn set_soft_features(
-        &mut self,
-        soft: Vec<crate::assignment::SoftFeature>,
-        class_order: Vec<String>,
-    ) {
+    pub fn set_soft_features(&mut self, soft: Vec<crate::assignment::SoftFeature>) {
         self.soft_features = soft;
-        self.class_order = class_order;
     }
 
     // r[impl sched.dispatch.soft-features]
-    // r[impl sched.sizing.soft-feature-floor]
-    /// Strip configured soft features from `state.required_features`
-    /// and raise `state.sched.size_class_floor` to the highest `floor_hint`
-    /// among the stripped features. Only RAISES --- a recovered node
-    /// with a persisted floor higher than the hint keeps it.
+    /// Strip configured soft features from `state.required_features`.
+    /// D6: `floor_hint` seeding removed — SLA sizing owns the initial
+    /// shape; reactive `resource_floor` doubling owns the climb.
     fn apply_soft_features(&self, state: &mut DerivationState) {
         if self.soft_features.is_empty() {
             return;
         }
-        let mut hint: Option<&str> = None;
-        state.required_features.retain(|f| {
-            match self.soft_features.iter().find(|sf| sf.name == *f) {
-                Some(sf) => {
-                    if let Some(h) = sf.floor_hint.as_deref() {
-                        hint =
-                            crate::assignment::max_class_by_order(hint, Some(h), &self.class_order);
-                    }
-                    false
-                }
-                None => true,
-            }
-        });
-        if let Some(h) = hint {
-            let raised = crate::assignment::max_class_by_order(
-                state.sched.size_class_floor.as_deref(),
-                Some(h),
-                &self.class_order,
-            );
-            state.sched.size_class_floor = raised.map(String::from);
-        }
+        state
+            .required_features
+            .retain(|f| !self.soft_features.iter().any(|sf| sf.name == *f));
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle
@@ -352,8 +322,7 @@ impl DerivationDag {
                 // features only. With `soft_features=[big-parallel]`,
                 // a `{big-parallel}` derivation becomes ∅-feature →
                 // featureless pools count it (subset vacuously true),
-                // kvm pool skips it (I-181 ∅ guard). I-213: also
-                // raises `size_class_floor` to the configured hint.
+                // kvm pool skips it (I-181 ∅ guard).
                 self.apply_soft_features(&mut state);
                 state.interested_builds.insert(build_id);
                 // Carry over interested_builds + retry_count from the

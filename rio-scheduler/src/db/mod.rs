@@ -209,9 +209,11 @@ pub(crate) struct RecoveryDerivationRow {
     pub is_fixed_output: bool,
     pub is_ca: bool,
     pub failed_builders: Vec<String>,
-    /// I-170/P0556: persisted reactive FOD size-class floor. NULL =
-    /// never promoted (smallest class). See `M_032`.
-    pub size_class_floor: Option<String>,
+    /// D4: persisted reactive resource floor (`M_044`). All `bigint`
+    /// (`i64`) — saturating-cast to `u64`/`u32` at hydration.
+    pub floor_mem_bytes: i64,
+    pub floor_disk_bytes: i64,
+    pub floor_deadline_secs: i64,
 }
 
 #[cfg(test)]
@@ -234,7 +236,9 @@ impl RecoveryDerivationRow {
             is_fixed_output: false,
             is_ca: false,
             failed_builders: vec![],
-            size_class_floor: None,
+            floor_mem_bytes: 0,
+            floor_disk_bytes: 0,
+            floor_deadline_secs: 0,
         }
     }
 }
