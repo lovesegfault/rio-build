@@ -1228,7 +1228,7 @@ mod tests {
             tid,
             &fake.url,
             50,
-            &[fake.trusted_key.clone()],
+            std::slice::from_ref(&fake.trusted_key),
             SigMode::Keep,
         )
         .await
