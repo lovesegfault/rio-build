@@ -78,14 +78,8 @@ scope: with scope; ''
           f"WHERE store_path IN ('{out_dep}', '{out_consumer}')"
       )
       pin_live(out_consumer, "vm-refs-e2e")
-      # force=true: dep is sweep-eligible (past grace, unpinned, and
-      # unreachable from any root EXCEPT via consumer's refs) and dep
-      # has refs=[] (its output is plain text with zero store paths).
-      # That's 1-of-N-eligible with empty refs → ≥10% → gate trips.
-      # force bypasses the gate; the SURVIVAL assertion below is what
-      # proves correctness, not the gate.
       result = sched_grpc(
-          '{"dry_run": false, "grace_period_hours": 24, "force": true}',
+          '{"dry_run": false, "grace_period_hours": 24}',
           "rio.admin.AdminService/TriggerGC",
       )
       gc_msgs = grpcurl_json_stream(result)
@@ -124,7 +118,7 @@ scope: with scope; ''
       # earlier subtest outputs) is still in-grace.
       unpin_live(out_consumer, "vm-refs-e2e")
       result = sched_grpc(
-          '{"dry_run": false, "grace_period_hours": 24, "force": true}',
+          '{"dry_run": false, "grace_period_hours": 24}',
           "rio.admin.AdminService/TriggerGC",
       )
       gc_msgs = grpcurl_json_stream(result)

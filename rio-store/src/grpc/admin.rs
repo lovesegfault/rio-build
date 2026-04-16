@@ -184,7 +184,6 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let shutdown = self.shutdown.clone();
         let params = gc::GcParams {
             dry_run: req.dry_run,
-            force: req.force,
             grace_hours,
             extra_roots: req.extra_roots,
         };
@@ -535,10 +534,9 @@ fn upstream_to_proto(u: metadata::Upstream) -> UpstreamInfo {
 mod tests {
     use super::*;
     use crate::gc::GC_LOCK_ID;
-    use crate::test_helpers::{StoreSeed, mem_backend};
+    use crate::test_helpers::mem_backend;
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
-    use rstest::rstest;
 
     /// GetLoad reflects checked-out connections as a fraction of
     /// `max_connections`.
@@ -610,7 +608,6 @@ mod tests {
                 dry_run: true,
                 grace_period_hours: Some(24),
                 extra_roots: vec![],
-                force: false,
             }))
             .await
             .unwrap();
@@ -636,7 +633,6 @@ mod tests {
                 dry_run: true,
                 grace_period_hours: Some(24),
                 extra_roots: vec![],
-                force: false,
             }))
             .await
             .unwrap();
@@ -669,7 +665,6 @@ mod tests {
                 extra_roots: roots,
                 dry_run: true,
                 grace_period_hours: Some(24),
-                force: false,
             }))
             .await
             .unwrap_err();
@@ -691,140 +686,10 @@ mod tests {
                 extra_roots: vec!["not-a-store-path".into()],
                 dry_run: true,
                 grace_period_hours: Some(24),
-                force: false,
             }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    // --- GC empty-refs safety gate (remediation 02) ---
-
-    /// Seed a narinfo+manifests row pair for gate tests.
-    /// `created_at` is forced 7 days into the past so the row is
-    /// sweep-eligible under any non-zero grace window. `ca` and
-    /// `references` are the two axes the gate pivots on.
-    async fn seed_narinfo_for_gate(pool: &PgPool, name: &str, refs: &[String], ca: Option<&str>) {
-        let mut seed = StoreSeed::path(name)
-            .with_refs(refs)
-            .with_nar_size(42)
-            .created_hours_ago(7 * 24);
-        if let Some(c) = ca {
-            seed = seed.with_ca(c);
-        }
-        seed.seed(pool).await;
-    }
-
-    /// Drain the TriggerGC stream to the first Err, or return the final
-    /// Ok(GcProgress) if no Err arrives. GC gate failures arrive as an
-    /// Err(Status) over the stream (the handler returns Ok(stream) then
-    /// the spawned task sends Err).
-    async fn drain_gc_stream(
-        stream: &mut (impl futures_util::Stream<Item = Result<GcProgress, Status>> + Unpin),
-    ) -> Result<GcProgress, Status> {
-        use futures_util::StreamExt;
-        let mut last_ok = None;
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(p) => last_ok = Some(p),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(last_ok.expect("stream produced at least one message"))
-    }
-
-    /// Dry-run TriggerGC with the given gate parameters; return the
-    /// drained final progress (Ok) or the gate-refused Status (Err).
-    async fn run_gate_gc(
-        svc: &StoreAdminServiceImpl,
-        grace_hours: u32,
-        force: bool,
-    ) -> Result<GcProgress, Status> {
-        let resp = svc
-            .trigger_gc(Request::new(GcRequest {
-                dry_run: true,
-                grace_period_hours: Some(grace_hours),
-                extra_roots: vec![],
-                force,
-            }))
-            .await
-            .expect("handler returns Ok(stream)");
-        drain_gc_stream(&mut resp.into_inner()).await
-    }
-
-    /// r[verify store.gc.empty-refs-gate]
-    /// Store with >10% empty-ref non-CA paths past grace → gate refuses
-    /// with FailedPrecondition. Message names the ratio + suggests force.
-    #[tokio::test]
-    async fn gc_refuses_on_high_empty_ref_ratio() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-
-        // 8 empty-ref non-CA + 2 with-refs = 80% empty. Well above 10%.
-        for i in 0..8 {
-            seed_narinfo_for_gate(&db.pool, &format!("empty-{i}"), &[], None).await;
-        }
-        let good_ref = vec![rio_test_support::fixtures::test_store_path("dep")];
-        for i in 0..2 {
-            seed_narinfo_for_gate(&db.pool, &format!("good-{i}"), &good_ref, None).await;
-        }
-
-        let err = run_gate_gc(&svc, 1, false)
-            .await
-            .expect_err("gate should refuse");
-        assert_eq!(
-            err.code(),
-            tonic::Code::FailedPrecondition,
-            "gate returns FailedPrecondition, got {:?}: {}",
-            err.code(),
-            err.message()
-        );
-        let msg = err.message();
-        assert!(msg.contains("GC refused"), "should say GC refused: {msg}");
-        assert!(
-            msg.contains("8/10") && msg.contains("80.0%"),
-            "should show 8/10 (80.0%) ratio: {msg}"
-        );
-        assert!(
-            msg.contains("force=true"),
-            "should hint force override: {msg}"
-        );
-    }
-
-    /// r[verify store.gc.empty-refs-gate]
-    /// Three ways the gate must PASS even with 5× empty-ref paths:
-    /// - `force_overrides`: 100% empty-ref non-CA, but `force=true`
-    ///   bypasses the gate entirely.
-    /// - `ca_excluded`: all CA → numerator=0 (fetchurl outputs etc.
-    ///   legitimately have no runtime deps; spec says CA paths are
-    ///   exempt).
-    /// - `inside_grace`: `seed_narinfo_for_gate` sets `created_at` 7d
-    ///   ago; with grace=720h (30d) they're inside grace →
-    ///   denominator=0 (protected from sweep anyway).
-    ///
-    /// All cases assert `is_complete` AND that the result isn't the
-    /// advisory-lock early-return ("already running").
-    #[rstest]
-    #[case::force_overrides(None, 1, true)]
-    #[case::ca_excluded(Some("fixed:r:sha256:abc"), 1, false)]
-    #[case::inside_grace(None, 720, false)]
-    #[tokio::test]
-    async fn gc_gate_passes(#[case] ca: Option<&str>, #[case] grace: u32, #[case] force: bool) {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-
-        for i in 0..5 {
-            seed_narinfo_for_gate(&db.pool, &format!("p-{i}"), &[], ca).await;
-        }
-
-        let final_msg = run_gate_gc(&svc, grace, force)
-            .await
-            .expect("gate should pass");
-        assert!(final_msg.is_complete, "GC should complete: {final_msg:?}");
-        assert!(
-            !final_msg.current_path.contains("already running"),
-            "should not be the advisory-lock early-return path"
-        );
     }
 
     // ────────────────────────────────────────────────────────────────

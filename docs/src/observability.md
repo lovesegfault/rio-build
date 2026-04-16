@@ -172,7 +172,6 @@ r[obs.metric.store]
 | `rio_store_gc_path_swept_total` | Counter | Paths deleted by GC sweep (`narinfo` DELETE + CASCADE). Monotonic over store lifetime; `rate()` ≈ GC throughput. Not incremented on dry-run. |
 | `rio_store_gc_s3_key_enqueued_total` | Counter | S3 keys enqueued to `pending_s3_deletes` by GC sweep (chunks that hit refcount=0). Gap vs `rio_store_s3_deletes_pending` gauge decreasing = drain keeping up. |
 | `rio_store_gc_chunk_orphan_swept_total` | Counter | Standalone chunks reaped by `sweep_orphan_chunks` after the grace-TTL expired (PutChunk at refcount=0, no subsequent PutPath claimed them). Nonzero indicates executors crashing mid-upload; sustained high suggests a client-side chunker bug. |
-| `rio_store_gc_empty_refs_pct` | Gauge | Percent of sweep-eligible paths with zero references at GC time. High values trigger the "suspicious GC sweep" error log (threshold configurable); sustained high = upstream ref-scanner likely broken. |
 | `rio_store_sign_empty_refs_total` | Counter | SignPath requests for non-CA paths with zero references. Suspicious for non-leaf derivations — GC cannot protect dependencies without the ref graph. Check executor ref-scanner if sustained. |
 | `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
 | `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |

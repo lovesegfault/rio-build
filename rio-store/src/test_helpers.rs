@@ -337,8 +337,8 @@ impl StoreSeed {
         self
     }
 
-    /// Backdate `narinfo.created_at`. The mark-phase grace check and
-    /// the GC empty-refs gate both pivot on this.
+    /// Backdate `narinfo.created_at`. The mark-phase grace check
+    /// pivots on this.
     pub fn created_hours_ago(mut self, hours: i32) -> Self {
         self.created_hours_ago = Some(hours);
         self
@@ -355,12 +355,6 @@ impl StoreSeed {
     /// Set `narinfo.nar_size`. Default 0.
     pub fn with_nar_size(mut self, size: i64) -> Self {
         self.nar_size = size;
-        self
-    }
-
-    /// Set `narinfo.ca`. The GC empty-refs gate excludes CA paths.
-    pub fn with_ca(mut self, ca: impl Into<String>) -> Self {
-        self.ca = Some(ca.into());
         self
     }
 

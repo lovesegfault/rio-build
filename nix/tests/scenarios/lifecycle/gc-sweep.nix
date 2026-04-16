@@ -57,13 +57,8 @@ scope: with scope; ''
       # Non-dry-run sweep. dry_run=false → sweep COMMITs. grace=24h →
       # ONLY out_victim is past grace → unreachable={out_victim}
       # → for-batch loop iterates once → DELETE → COMMIT.
-      #
-      # force=true bypasses the empty-refs safety gate — mkTrivial
-      # leaf outputs genuinely have refs=[] (scanner finds no store
-      # paths, see comment above), which would otherwise trip the
-      # gate (FailedPrecondition).
       result = sched_grpc(
-          '{"dry_run": false, "grace_period_hours": 24, "force": true}',
+          '{"dry_run": false, "grace_period_hours": 24}',
           "rio.admin.AdminService/TriggerGC",
       )
       # proto3 JSON uint64 is a STRING ("1" not 1). pathsCollected
@@ -277,7 +272,7 @@ scope: with scope; ''
       # → nix path-info fails → THIS assertion catches it.
       def trigger_gc_get_collected():
           out = sched_grpc(
-              '{"dry_run": false, "grace_period_hours": 24, "force": true}',
+              '{"dry_run": false, "grace_period_hours": 24}',
               "rio.admin.AdminService/TriggerGC",
           )
           msgs = grpcurl_json_stream(out)

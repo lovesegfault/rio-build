@@ -316,9 +316,6 @@ r[store.gc.dry-run]
 r[store.gc.shutdown-abort]
 `sweep` checks the shutdown token between batches (NOT mid-transaction --- a partial batch ROLLBACKs cleanly via tx drop). On cancellation it returns `SweepAbort::Shutdown`; `run_gc` releases `GC_LOCK_ID` and returns `Status::aborted("GC aborted: process shutting down")`. `VerifyChunks` likewise checks the token between PG batches and sends `Aborted` on the progress stream.
 
-r[store.gc.empty-refs-gate]
-Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the executor's reference scanner is broken.
-
 r[store.cas.upsert-inserted+2]
 The chunk-upsert batch INSERT returns per-row `(uploaded_at IS NULL) AS
 needs_upload` so the caller knows which blake3 hashes need upload to

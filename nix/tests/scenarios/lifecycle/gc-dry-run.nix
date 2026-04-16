@@ -8,12 +8,8 @@ scope: with scope; ''
   # unreachable set → proves the stream runs end-to-end, NOT that
   # the for-batch loop body executes (that's gc-sweep's job).
   with subtest("gc-dry-run: TriggerGC completes, currentPath describes outcome"):
-      # force=true bypasses the empty-refs safety gate — mkTrivial
-      # outputs embed no store-path strings, so the ref scanner
-      # correctly finds refs=[] for every fixture path, tripping
-      # the >10%-empty-refs precondition even on dry-run.
       result = sched_grpc(
-          '{"dry_run": true, "grace_period_hours": 24, "force": true}',
+          '{"dry_run": true, "grace_period_hours": 24}',
           "rio.admin.AdminService/TriggerGC",
       )
       # GCProgress stream: at least one message with isComplete=true.

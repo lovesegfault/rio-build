@@ -153,7 +153,7 @@ pub(crate) async fn run_loop<F, Fut>(
 /// [`TickResult`] variant.
 ///
 /// The GcRequest is intentionally minimal: `dry_run=false`,
-/// `force=false`, `grace_period_hours=None` (store's 2h default),
+/// `grace_period_hours=None` (store's 2h default),
 /// `extra_roots=vec![]`. The cron has no visibility into live-
 /// build output paths (that's the scheduler's `GcRoots` actor,
 /// and it proxies via `AdminService.TriggerGC`, not us). For
@@ -184,7 +184,6 @@ async fn tick_once(store_addr: &str) -> TickResult {
         dry_run: false,
         grace_period_hours: None, // store default (2h)
         extra_roots: Vec::new(),
-        force: false,
     };
     let mut stream = match client.trigger_gc(req).await {
         Ok(resp) => resp.into_inner(),

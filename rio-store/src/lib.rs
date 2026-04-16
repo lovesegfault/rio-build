@@ -194,12 +194,6 @@ pub fn describe_metrics() {
         "Paths not yet processed by the in-progress GC sweep. Ticks down per \
          batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow."
     );
-    describe_gauge!(
-        "rio_store_gc_empty_refs_pct",
-        "Percent of sweep-eligible paths with zero references at GC time. \
-         High values trigger the 'suspicious GC sweep' error log (threshold \
-         configurable); sustained high = upstream ref-scanner likely broken."
-    );
     describe_counter!(
         "rio_store_sign_tenant_key_fallback_total",
         "PutPath/PutPathBatch tenant-key lookups that failed (transient PG \

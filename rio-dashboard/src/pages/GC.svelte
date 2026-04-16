@@ -10,9 +10,7 @@
   // extraRoots is intentionally left empty: it's scheduler-populated
   // when GC runs via the controller's cron, not operator-supplied
   // through the dashboard (the operator doesn't have the live-build
-  // output-path set). force stays false for the same reason — the
-  // empty-refs safety gate is there to prevent catastrophic sweeps,
-  // and the dashboard is not the place to bypass it.
+  // output-path set).
   import { admin } from '../api/admin';
   import type { GCProgress } from '../api/types';
   import { toast } from '../lib/toast';
@@ -34,7 +32,6 @@
           dryRun,
           gracePeriodHours,
           extraRoots: [],
-          force: false,
         },
         { signal: ctrl.signal },
       );

@@ -104,9 +104,6 @@ pub struct GcParams {
     /// Compute stats, ROLLBACK sweep tx. Operator sees "would
     /// delete N paths" without committing.
     pub dry_run: bool,
-    /// Skip the empty-refs safety gate. Logged at `warn!` when
-    /// true so the override is visible.
-    pub force: bool,
     /// Paths younger than this are root seeds (don't GC what
     /// just arrived before a build can reference it). Already
     /// clamped at the gRPC boundary; clamped again in mark.rs
@@ -124,13 +121,6 @@ pub struct GcParams {
 /// "infinite grace" is a `scheduler_live_pins` entry or `extra_roots`
 /// pass, not a huge grace window.
 pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
-
-/// Default threshold for the empty-refs safety gate. 10% is
-/// intentionally low: in a healthy post-fix store, empty-ref non-CA
-/// paths should be ~0% (only genuinely ref-free outputs like static
-/// binaries). 10% gives headroom for legitimate cases without allowing
-/// a pre-fix store (where it'd be ~100%) through.
-const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
 
 /// Mark → sweep with advisory locks. Extracted from `grpc/admin.rs::
 /// trigger_gc` so it's callable outside the stream context (cron
@@ -233,22 +223,6 @@ pub async fn run_gc(
     let lock_conn = scopeguard::guard(lock_conn, |c| {
         let _ = c.detach();
     });
-
-    // r[impl store.gc.empty-refs-gate]
-    // Safety gate: refuse if >threshold% of sweep-eligible narinfo
-    // have empty refs (pre-refscan data). Runs AFTER advisory lock
-    // so two gated requests don't race on the check. Skip if
-    // force=true, but still log so the override is visible.
-    if !params.force {
-        if let Err(e) =
-            check_empty_refs_gate(pool, params.grace_hours, GC_EMPTY_REFS_THRESHOLD_PCT).await
-        {
-            gc_unlock(lock_conn).await;
-            return Err(e);
-        }
-    } else {
-        warn!("GC: force=true — bypassing empty-refs safety gate");
-    }
 
     // --- Mark phase ---
     // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
@@ -359,77 +333,6 @@ async fn gc_unlock(
     {
         warn!(error = %e, "GC: advisory unlock failed");
     }
-}
-
-/// Safety gate: if more than `threshold_pct`% of COMPLETE narinfo rows
-/// older than `grace_hours` have empty references AND no content
-/// address, refuse GC. Protects against running GC on pre-refscan data
-/// (worker upload.rs bug where references were never populated).
-///
-/// CA paths are excluded from the numerator (legitimately ref-free).
-/// Paths inside the grace window are excluded entirely (they're
-/// protected anyway; their ref-state doesn't matter for this sweep).
-///
-/// Schema note: narinfo column is `ca` (not `content_address`), and
-/// `"references"` is a TEXT[] — empty array is `'{}'` in PG.
-// r[impl store.gc.empty-refs-gate]
-async fn check_empty_refs_gate(
-    pool: &PgPool,
-    grace_hours: u32,
-    threshold_pct: f64,
-) -> Result<(), Status> {
-    let row: (i64, i64) = sqlx::query_as(
-        r#"
-        SELECT
-            count(*) FILTER (
-                WHERE n."references" = '{}'
-                  AND (n.ca IS NULL OR n.ca = '')
-            ) AS empty_ref_non_ca,
-            count(*) AS total
-        FROM narinfo n
-        JOIN manifests m USING (store_path_hash)
-        WHERE m.status = 'complete'
-          AND n.created_at < now() - make_interval(hours => $1::int)
-        "#,
-    )
-    .bind(grace_hours.min(GRACE_HOURS_CAP) as i32)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        // Don't leak sqlx chain to client; log full detail server-side.
-        warn!(error = %e, "empty-refs gate query failed");
-        Status::internal("empty-refs gate query failed")
-    })?;
-
-    let (empty, total) = row;
-    if total == 0 {
-        return Ok(()); // nothing sweep-eligible anyway
-    }
-    let pct = (empty as f64 / total as f64) * 100.0;
-    metrics::gauge!("rio_store_gc_empty_refs_pct").set(pct);
-
-    if pct > threshold_pct {
-        tracing::error!(
-            empty_ref_non_ca = empty,
-            total,
-            pct,
-            threshold_pct,
-            "GC REFUSED: high empty-refs ratio — store likely contains pre-refscan data"
-        );
-        return Err(Status::failed_precondition(format!(
-            "GC refused: {empty}/{total} ({pct:.1}%) of sweep-eligible paths have empty \
-             references (threshold {threshold_pct}%) — worker upload.rs bug? \
-             Run backfill first or use force=true to override."
-        )));
-    }
-
-    if empty > 0 {
-        warn!(
-            empty_ref_non_ca = empty,
-            total, pct, "GC proceeding with some empty-ref paths (below threshold)"
-        );
-    }
-    Ok(())
 }
 
 /// Result of [`decrement_and_enqueue`]: stats for the chunks touched by
@@ -916,8 +819,6 @@ mod tests {
         }
 
         // GC task: full run_gc (GC_LOCK_ID + mark + sweep).
-        // force=true: empty-refs gate would refuse on this synthetic
-        // DB; not what we're testing.
         let pool_gc = db.pool.clone();
         let (tx, mut rx) = mpsc::channel(64);
         let gc = tokio::spawn(async move {
@@ -927,7 +828,6 @@ mod tests {
                 None,
                 GcParams {
                     dry_run: false,
-                    force: true,
                     grace_hours: 2,
                     extra_roots: vec![],
                 },

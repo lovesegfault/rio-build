@@ -79,7 +79,6 @@ describe('GC page', () => {
     expect(req.dryRun).toBe(true);
     expect(req.gracePeriodHours).toBe(24);
     expect(req.extraRoots).toEqual([]);
-    expect(req.force).toBe(false);
     // AbortController pattern wired through the second arg.
     expect(opts.signal).toBeInstanceOf(AbortSignal);
   });
