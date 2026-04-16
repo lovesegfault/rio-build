@@ -934,55 +934,6 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
     Ok(())
 }
 
-/// `compute_estimator_stats` walks the in-memory snapshot and
-/// classifies under effective cutoffs (I-124). One short, one long
-/// entry → "small" / "large". With size_classes unconfigured →
-/// `size_class` is None for all entries.
-// r[verify sched.admin.estimator-stats]
-#[tokio::test]
-async fn estimator_stats_classifies_under_effective_cutoffs() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
-
-    actor.test_refresh_estimator(vec![
-        ("hello".into(), "x86_64-linux".into(), 5.0, None, None, 12),
-        (
-            "chromium".into(),
-            "x86_64-linux".into(),
-            1800.0,
-            Some(8e9),
-            None,
-            3,
-        ),
-    ]);
-
-    let stats = actor.compute_estimator_stats();
-    assert_eq!(stats.len(), 2);
-
-    let hello = stats.iter().find(|e| e.pname == "hello").unwrap();
-    assert_eq!(hello.size_class.as_deref(), Some("small"));
-    assert_eq!(hello.sample_count, 12);
-    assert_eq!(hello.ema_peak_memory_bytes, None);
-
-    let chromium = stats.iter().find(|e| e.pname == "chromium").unwrap();
-    assert_eq!(chromium.size_class.as_deref(), Some("large"));
-    assert_eq!(chromium.sample_count, 3);
-
-    // Feature off → size_class None for every entry.
-    let mut actor_off = bare_actor(db.pool.clone());
-    actor_off.test_refresh_estimator(vec![(
-        "hello".into(),
-        "x86_64-linux".into(),
-        5.0,
-        None,
-        None,
-        1,
-    )]);
-    let stats_off = actor_off.compute_estimator_stats();
-    assert_eq!(stats_off.len(), 1);
-    assert_eq!(stats_off[0].size_class, None);
-}
-
 /// I-107: `queued_by_system` is a per-system breakdown of
 /// `queued_derivations` — Ready-only, sum across keys equals the
 /// scalar. Non-Ready (Queued/Assigned/Running) drvs do NOT count.

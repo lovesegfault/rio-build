@@ -338,14 +338,6 @@ pub enum AdminQuery {
         /// reactive (`size_class_floor`), not duration-estimated.
         reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
     },
-    /// Dump the in-memory estimator snapshot — every `(pname, system)`
-    /// `HistoryEntry` plus what `classify()` returns for it under the
-    /// current effective cutoffs. I-124 / `rio-cli estimator`.
-    /// Reflects the last Tick refresh (~60s stale at worst), NOT a
-    /// live PG read — this is "what the scheduler SEES".
-    EstimatorStats {
-        reply: oneshot::Sender<Vec<EstimatorStatsEntry>>,
-    },
     /// Return expected output paths for all non-terminal
     /// derivations. Used by TriggerGC to pass as extra_roots to
     /// the store's mark phase — protects in-flight build outputs
@@ -482,7 +474,6 @@ impl AdminQuery {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
-            Self::EstimatorStats { .. } => "EstimatorStats",
             Self::GcRoots { .. } => "GcRoots",
             Self::ListExecutors { .. } => "ListExecutors",
             Self::InspectBuildDag { .. } => "InspectBuildDag",
@@ -562,20 +553,6 @@ pub struct ExecutorSnapshot {
     pub connected_since: std::time::Instant,
     pub last_heartbeat: std::time::Instant,
     pub last_resources: Option<rio_proto::types::ResourceUsage>,
-}
-
-/// One `(pname, system)` row from the in-memory estimator, joined
-/// with `classify()` under current effective cutoffs. Internal (not
-/// proto) — `admin/estimator.rs` filters + sorts + translates.
-#[derive(Debug, Clone)]
-pub struct EstimatorStatsEntry {
-    pub pname: String,
-    pub system: String,
-    pub sample_count: i32,
-    pub ema_duration_secs: f64,
-    pub ema_peak_memory_bytes: Option<f64>,
-    /// `classify()` result. `None` = size-classes unconfigured.
-    pub size_class: Option<String>,
 }
 
 /// Point-in-time per-size-class snapshot for

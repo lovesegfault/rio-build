@@ -25,9 +25,7 @@ use tonic::transport::Channel;
 // variant + match arm + mod decl.
 mod bps;
 mod builds;
-mod cutoffs;
 mod derivations;
-mod estimator;
 mod gc;
 mod logs;
 mod poison;
@@ -281,17 +279,6 @@ enum Cmd {
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
     /// this is the manual operator lever for the same path.
     DrainExecutor(workers::DrainArgs),
-    /// Size-class cutoff status: configured vs effective (post-rebalancer
-    /// EMA drift), per-class queue/running counts, sample-window size.
-    /// Surfaces how far SITA-E has drifted from the static TOML config
-    /// and whether each class has enough samples to trust its cutoff.
-    Cutoffs,
-    /// Dump the scheduler's in-memory build-history estimator: per-
-    /// `(pname, system)` EMA duration/memory + the size-class that
-    /// `classify()` picks under current effective cutoffs. I-124
-    /// diagnostic — "why is X routed to large? is its EMA plausible?".
-    /// Sorted by sample_count desc (most-observed first).
-    Estimator(estimator::Args),
     /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
     /// `get` lists BPSes; `describe` joins spec classes with live
     /// child BuilderPool replica counts + effective-cutoff status —
@@ -371,8 +358,6 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::PoisonClear(a) => poison::run_clear(as_json, &mut c, a).await,
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
-                Cmd::Cutoffs => cutoffs::run(as_json, &mut c).await,
-                Cmd::Estimator(a) => estimator::run(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
                 Cmd::Bps { .. }
                 | Cmd::Upstream { .. }

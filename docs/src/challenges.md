@@ -136,8 +136,6 @@ With size-class routing, two related challenges arise:
 
 **Cold start:** On a fresh deployment with no `build_history` data, all derivations use the operator-configured cutoffs or the default fallback (30s estimate). These initial cutoffs may be wildly wrong for the actual workload, leading to poor classification until sufficient data accumulates. Mitigation: allow operators to seed `build_history` from external sources (e.g., Hydra build logs, previous rio-build deployments), and use conservative initial cutoffs that over-classify into larger classes (wastes resources but avoids OOM kills).
 
-**Misclassification cascades:** A derivation that is consistently misclassified (e.g., a build whose duration depends on network speed for FODs, or on source code changes) creates oscillation: it gets routed to a small class, exceeds the cutoff, gets bumped to large, then gets routed back to small after the EMA decays. **Implemented mitigation: penalty-overwrite** (`r[sched.classify.penalty-overwrite]`) --- when actual duration exceeds 2× the assigned class's cutoff, the scheduler overwrites `ema_duration_secs` with the observed value directly (no alpha-blend). The next `classify()` call sees the real duration and picks the right class. A fluke self-corrects via normal EMA blending on the next successful completion; no consecutive-failure counter is tracked.
-
 **Queue imbalance:** If all ready derivations happen to be "medium" but only "small" executors are idle, derivations queue unnecessarily. Mitigation: overflow routing allows small-class derivations to spill to medium executors when the small queue is empty, but never routes large derivations downward.
 
 ## 15. Schema Migration

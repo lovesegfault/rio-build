@@ -156,15 +156,6 @@ let
         return _parse_submit_build_id(out)
 
     ${common.mkSubmitHelpers gatewayHost}
-
-    # ── Size-class config load (precondition) ─────────────────────────
-    # This gauge is set once at startup from /etc/rio/scheduler.toml.
-    # If absent, figment didn't read the TOML and every subsequent
-    # size-class assertion will fail for the wrong reason.
-    assert_metric_exact(${gatewayHost}, 9091,
-        "rio_scheduler_cutoff_seconds", 30.0, labels='{class="small"}')
-    assert_metric_exact(${gatewayHost}, 9091,
-        "rio_scheduler_cutoff_seconds", 3600.0, labels='{class="large"}')
   '';
 
   # ── Subtest fragments ─────────────────────────────────────────────────

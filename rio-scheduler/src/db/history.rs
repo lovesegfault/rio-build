@@ -1,7 +1,7 @@
 //! Build history EMA + build_samples retention — `build_history` /
 //! `build_samples` tables.
 
-use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb, TERMINAL_STATUS_SQL};
+use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb};
 
 /// One `build_samples` row. ADR-023 SLA telemetry: every successful
 /// completion appends a full-width row; the SLA fit reads these to
@@ -166,112 +166,15 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Penalty-write for misclassified builds: a build that took >2×
-    /// its class cutoff was routed wrong. Overwrite the EMA with the
-    /// actual duration (NOT blend — a blend would take multiple
-    /// overruns to correct) so the NEXT classify() picks a larger
-    /// class.
-    ///
-    /// This is intentionally harsh: one bad classification is enough
-    /// to fix the estimate. If the build was a fluke (transient slow
-    /// disk), the next normal completion blends it back down. Better
-    /// to over-correct once than to keep OOMing small workers.
-    pub async fn update_build_history_misclassified(
-        &self,
-        pname: &str,
-        system: &str,
-        actual_duration_secs: f64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            r#"
-            UPDATE build_history
-            SET ema_duration_secs = $3,
-                last_updated = now()
-            WHERE pname = $1 AND system = $2
-            "#,
-            pname,
-            system,
-            actual_duration_secs,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Proactive mid-build memory EMA update: a running build's cgroup
-    /// `memory.peak` already exceeds what the EMA predicted. Overwrite
-    /// the EMA NOW so the NEXT submit of this (pname, system) is
-    /// right-sized BEFORE the current build finishes (or OOMs).
-    ///
-    /// Same penalty-overwrite semantics as
-    /// [`Self::update_build_history_misclassified`] (not a blend — a blend
-    /// would need multiple mid-build samples to converge, defeating the
-    /// point of "proactive"). Self-correcting: if the peak was a spike,
-    /// the completion's normal EMA blend pulls it back down.
-    ///
-    /// Single-statement: joins `derivations` by `drv_path` (what
-    /// `ProgressUpdate` carries — workers don't know their drv_hash),
-    /// then updates `build_history` by the resolved `(pname, system)`.
-    /// The `WHERE` clause's NULL/less-than guard makes the whole thing
-    /// atomic — no read-compare-write race with concurrent completions.
-    ///
-    /// Filters to non-terminal status so the partial index applies
-    /// (see `TERMINAL_STATUS_SQL`). A progress update for a terminal
-    /// derivation is a late-arriving sample post-completion; harmless
-    /// to drop.
-    ///
-    /// Returns `true` if a row was updated (observed > current EMA, or
-    /// EMA was NULL). `false` covers: derivation not found / terminal /
-    /// pname NULL / no build_history row / observed ≤ current EMA. All
-    /// correct no-ops — the caller increments a counter on `true` only.
-    ///
-    /// `drv_path` is NOT indexed. This fires every 10s per running
-    /// build — ~10 qps at 100 concurrent builds, scanning the
-    /// non-terminal subset (small, via partial index). If this becomes
-    /// hot, add an index on `(drv_path) WHERE status NOT IN (...)`.
-    // r[impl sched.classify.proactive-ema]
-    pub async fn update_ema_peak_memory_proactive(
-        &self,
-        drv_path: &str,
-        observed_peak_bytes: u64,
-    ) -> Result<bool, sqlx::Error> {
-        // u64 → f64 for DOUBLE PRECISION. Precision loss at 2^53 bytes
-        // (~9 PB) — not a concern for memory.peak.
-        let observed = observed_peak_bytes as f64;
-
-        let result = sqlx::query(&format!(
-            r#"
-            UPDATE build_history bh
-            SET ema_peak_memory_bytes = $2,
-                last_updated = now()
-            FROM derivations d
-            WHERE d.drv_path = $1
-              AND d.status NOT IN {TERMINAL_STATUS_SQL}
-              AND d.pname IS NOT NULL
-              AND bh.pname = d.pname
-              AND bh.system = d.system
-              AND (bh.ema_peak_memory_bytes IS NULL
-                   OR bh.ema_peak_memory_bytes < $2)
-            "#
-        ))
-        .bind(drv_path)
-        .bind(observed)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
     /// Insert one raw build sample with full ADR-023 telemetry. Called
     /// from completion.rs success path alongside the EMA update.
     /// Best-effort: caller warns on Err.
     ///
     /// Unlike `update_build_history` which folds into a single EMA row per
-    /// `(pname, system)`, this appends every completion — the rebalancer
-    /// and the SLA fit both need the full distribution, not a smoothed
-    /// scalar. `completed_at` is server-side `now()`; `outlier_excluded`
-    /// keeps its DEFAULT FALSE (the MAD sweep flips it later).
+    /// `(pname, system)`, this appends every completion — the SLA fit
+    /// needs the full distribution, not a smoothed scalar.
+    /// `completed_at` is server-side `now()`; `outlier_excluded` keeps
+    /// its DEFAULT FALSE (the MAD sweep flips it later).
     pub async fn write_build_sample(&self, row: &BuildSampleRow) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "INSERT INTO build_samples
@@ -340,14 +243,10 @@ impl SchedulerDb {
     }
 
     /// Query raw `(duration_secs, peak_memory_bytes)` samples from the
-    /// last `days`. Feeds `rebalancer::compute_cutoffs`.
+    /// last `days`. Feeds `admin/sizeclass.rs::count_samples_by_class`.
     ///
     /// Range on `completed_at` — covered by `build_samples_completed_at_idx`
     /// (migration 013), same index that serves `delete_samples_older_than`.
-    ///
-    /// No `ORDER BY` — `compute_cutoffs` sorts internally. Returning
-    /// `Vec<(f64,i64)>` directly (no intermediate row struct) since the
-    /// rebalancer's signature takes exactly this tuple shape.
     pub async fn query_build_samples_last_days(
         &self,
         days: u32,

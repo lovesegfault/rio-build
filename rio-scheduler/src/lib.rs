@@ -32,7 +32,6 @@ pub mod grpc;
 pub mod lease;
 pub mod logs;
 pub(crate) mod queue;
-pub(crate) mod rebalancer;
 pub mod sla;
 pub mod state;
 
@@ -301,36 +300,9 @@ pub fn describe_metrics() {
         "rio_scheduler_size_class_assignments_total",
         "Assignments per size class (labeled by class name)"
     );
-    describe_counter!(
-        "rio_scheduler_misclassifications_total",
-        "Builds that exceeded 2x their class cutoff duration (triggers penalty EMA overwrite)"
-    );
-    describe_counter!(
-        "rio_scheduler_ema_proactive_updates_total",
-        "Mid-build cgroup memory.peak samples that exceeded the EMA and overwrote it proactively. \
-         Same penalty-overwrite as misclassifications_total but triggered BEFORE completion — \
-         next submit is right-sized without waiting for an OOM->retry cycle."
-    );
-    describe_counter!(
-        "rio_scheduler_class_drift_total",
-        "Builds where classify(actual) != assigned_class. Cutoff-drift signal, labeled by \
-         assigned_class+actual_class. Distinct from misclassifications_total (penalty trigger, \
-         actual > 2x cutoff) — a build can drift without penalty (barely over cutoff, under 2x)."
-    );
-    describe_gauge!(
-        "rio_scheduler_cutoff_seconds",
-        "Duration cutoff per class (labeled by class; initialized from \
-         config, live-updated hourly by the SITA-E rebalancer)"
-    );
     describe_gauge!(
         "rio_scheduler_class_queue_depth",
         "Deferred derivations per target class (snapshot per dispatch pass)"
-    );
-    describe_gauge!(
-        "rio_scheduler_class_load_fraction",
-        "Per-class sum(duration)/total from the last rebalancer pass (labeled by class). \
-         SITA-E's target is 1/N each — deviation means the EMA hasn't converged yet, or \
-         the workload distribution shifted faster than the smoothing can track."
     );
     describe_gauge!(
         "rio_scheduler_fod_queue_depth",

@@ -54,9 +54,6 @@ r[cli.cmd.derivations]
 r[cli.cmd.cancel-build]
 `rio-cli cancel-build BUILD_ID [--reason R]` calls `SchedulerService.CancelBuild` (NOT `AdminService` — cancel lives next to submit). Idempotent: returns `cancelled=false` for already-terminal/unknown. The operator lever for orphaned builds (gateway crash mid-disconnect cleanup, I-112); the scheduler's orphan-watcher sweep is the automatic counterpart.
 
-r[cli.cmd.estimator]
-`rio-cli estimator [--filter SUBSTR]` calls `GetEstimatorStats` and prints `name | samples | dur | mem | class` per `(pname, system)` from the actor's last-Tick `build_history` snapshot (~60s stale at worst). Answers "why is X routed to large?" / "is the EMA for X plausible?" (I-124).
-
 r[cli.cmd.verify-chunks]
 `rio-cli verify-chunks [--batch-size N]` server-streams `StoreAdminService.VerifyChunks`. Missing chunk hashes go to **stdout** (one hex BLAKE3 per line — pipeable into `xargs aws s3api head-object`); progress goes to **stderr** so `verify-chunks | tee missing.txt` captures hashes while progress scrolls. Warns on stream-closed-without-`done` (store disconnected mid-scan). I-040 diagnostic.
 

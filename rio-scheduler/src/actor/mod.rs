@@ -518,16 +518,6 @@ impl DagActor {
     async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
         info!("DAG actor started");
 
-        // Rebalancer: hourly recompute of size-class cutoffs.
-        // Shares the `size_classes` Arc — writes new `cutoff_secs`
-        // via write lock; dispatch/completion read via `.read()`.
-        // No-op if size_classes empty (feature off).
-        crate::rebalancer::spawn_task(
-            self.db.clone(),
-            Arc::clone(&self.sizing.size_classes),
-            self.shutdown.clone(),
-        );
-
         loop {
             let cmd = tokio::select! {
                 // biased: check the shutdown arm first so a cancelled

@@ -1,7 +1,7 @@
 //! Read-only snapshot/inspect handlers on [`DagActor`]. All methods
 //! here are `&self` over the in-memory DAG/executors and back the admin
-//! RPCs (ClusterStatus, GetSizeClassStatus, EstimatorStats,
-//! InspectBuildDag, DebugListExecutors).
+//! RPCs (ClusterStatus, GetSizeClassStatus, InspectBuildDag,
+//! DebugListExecutors).
 
 use std::collections::HashMap;
 
@@ -9,10 +9,7 @@ use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus};
 
-use super::{
-    AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, EstimatorStatsEntry,
-    SizeClassSnapshot, command,
-};
+use super::{AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SizeClassSnapshot, command};
 
 impl DagActor {
     /// Dispatch a read-only [`AdminQuery`].
@@ -26,9 +23,6 @@ impl DagActor {
                     self.compute_size_class_snapshot(pool_features.as_deref()),
                     self.compute_fod_size_class_snapshot(),
                 ));
-            }
-            AdminQuery::EstimatorStats { reply } => {
-                let _ = reply.send(self.compute_estimator_stats());
             }
             AdminQuery::GcRoots { reply } => {
                 let _ = reply.send(self.handle_gc_roots());
@@ -695,33 +689,6 @@ impl DagActor {
             }
         }
         snapshots
-    }
-
-    // r[impl sched.admin.estimator-stats]
-    /// Per-`(pname, system)` estimator dump for `GetEstimatorStats`
-    /// (I-124). Walks the in-memory `build_history` snapshot and
-    /// classifies each entry under the CURRENT effective cutoffs —
-    /// the same `self.sizing.size_classes.read()` dispatch uses, post-
-    /// rebalancer drift. Filtering + sorting happen handler-side
-    /// (admin/estimator.rs); this returns the full set.
-    pub(crate) fn compute_estimator_stats(&self) -> Vec<EstimatorStatsEntry> {
-        let classes = self.sizing.size_classes.read();
-        self.estimator
-            .iter_history()
-            .map(|((pname, system), entry)| EstimatorStatsEntry {
-                pname: pname.clone(),
-                system: system.clone(),
-                sample_count: entry.sample_count,
-                ema_duration_secs: entry.ema_duration_secs,
-                ema_peak_memory_bytes: entry.ema_peak_memory_bytes,
-                size_class: crate::assignment::classify(
-                    entry.ema_duration_secs,
-                    entry.ema_peak_memory_bytes,
-                    entry.ema_peak_cpu_cores,
-                    &classes,
-                ),
-            })
-            .collect()
     }
 
     pub(super) fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {

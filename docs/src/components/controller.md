@@ -249,7 +249,7 @@ NodePools. The nodeSelector + toleration are unconditional wrt
 
 ### BuilderPoolSet
 
-> **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), CutoffRebalancer (`r[sched.rebalancer.sita-e]`).
+> **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`).
 
 r[ctrl.wps.reconcile]
 The BuilderPoolSet reconciler creates one child BuilderPool per `spec.classes[i]`, named `{bps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the BPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children (`r[ctrl.wps.cleanup-sweep]`); k8s ownerRef GC is the fallback.

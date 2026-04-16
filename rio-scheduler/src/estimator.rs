@@ -43,9 +43,11 @@ pub struct HistoryEntry {
     /// size-class cpu-bump (assignment::classify).
     pub ema_peak_cpu_cores: Option<f64>,
     /// `build_history.sample_count` — completions that have fed this
-    /// EMA. Surfaced via `GetEstimatorStats` (I-124); the hot-path
-    /// estimate doesn't use it, but "EMA after 1 sample" vs "after 50"
-    /// matters to an operator reading `rio-cli estimator`.
+    /// EMA. Hot-path estimate doesn't use it.
+    #[expect(
+        dead_code,
+        reason = "read only by deleted GetEstimatorStats; whole module goes in phase 2"
+    )]
     pub sample_count: i32,
 }
 
@@ -214,13 +216,6 @@ impl Estimator {
 
         self.history = history;
         self.pname_fallback = pname_fallback;
-    }
-
-    /// Iterate the in-memory `(pname, system) → HistoryEntry` snapshot.
-    /// Feeds `GetEstimatorStats` (I-124) — the actor walks this to
-    /// classify each entry under the current effective cutoffs.
-    pub fn iter_history(&self) -> impl Iterator<Item = (&(String, String), &HistoryEntry)> {
-        self.history.iter()
     }
 
     /// Number of (pname, system) entries. Test-only.

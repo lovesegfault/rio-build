@@ -5,9 +5,9 @@
 //! bounds-checking and the stream message-dispatch tree change on a
 //! schedule independent of the client-facing SchedulerService RPCs.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
@@ -17,11 +17,6 @@ use rio_proto::ExecutorService;
 use crate::actor::{ActorCommand, HeartbeatPayload};
 
 use super::SchedulerGrpc;
-
-/// Cap on in-flight proactive ema PG writes. Progress arrives ~10s ×
-/// every running build; under PG slowdown, unbounded spawns accumulate.
-/// Dropped writes are caught by the next 10s tick (memory.peak monotone).
-static EMA_WRITE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -90,10 +85,6 @@ impl ExecutorService for SchedulerGrpc {
         let actor_for_recv = self.actor.clone();
         let log_buffers = Arc::clone(&self.log_buffers);
         let executor_id_for_recv = executor_id.clone();
-        // For the Progress arm's proactive ema. None in bare-actor
-        // tests (new_for_tests) — Progress becomes a no-op there,
-        // which is what those tests want anyway.
-        let pool_for_recv = self.db.as_ref().map(|d| d.pool().clone());
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
             loop {
@@ -184,78 +175,11 @@ impl ExecutorService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::executor_message::Msg::Progress(progress) => {
-                            // Proactive ema: if a running build's
-                            // cgroup memory.peak already exceeds what
-                            // the EMA predicted, overwrite the EMA NOW
-                            // — the next submit of this drv gets
-                            // right-sized before this build even
-                            // finishes. Same penalty-overwrite
-                            // semantics as completion.rs:363's
-                            // r[sched.classify.penalty-overwrite],
-                            // just triggered earlier (mid-build
-                            // instead of post-completion).
-                            //
-                            // r[sched.preempt.never-running] holds:
-                            // advisory only, never kills/migrates.
-                            // No CancelBuild, no reassignment — the
-                            // only side effect is a db write.
-                            //
-                            // Worker populates ONLY
-                            // resources.memory_used_bytes with cgroup
-                            // memory.peak (see rio-builder runtime.rs);
-                            // 0 = "couldn't read memory.peak" (ENOENT
-                            // during daemon-spawn), same no-signal
-                            // sentinel as completion's peak_mem filter.
-                            //
-                            // spawn_monitored (fire-and-forget): the db
-                            // write is fire-and-forget. `.await`ing inline
-                            // would stall the stream loop on PG
-                            // latency — a slow PG roundtrip would
-                            // backpressure the worker's log batches
-                            // and completion reports. Progress is
-                            // advisory; a dropped or failed update is
-                            // caught by the next 10s tick (memory.peak
-                            // is monotone — no info lost).
-                            if let (Some(pool), Some(res)) = (&pool_for_recv, &progress.resources)
-                                && res.memory_used_bytes > 0
-                                && let Ok(permit) =
-                                    Arc::clone(&EMA_WRITE_PERMITS).try_acquire_owned()
-                            {
-                                let db = crate::db::SchedulerDb::new(pool.clone());
-                                let drv_path = progress.drv_path;
-                                let observed = res.memory_used_bytes;
-                                rio_common::task::spawn_monitored(
-                                    "ema-proactive-write",
-                                    async move {
-                                        let _permit = permit;
-                                        match db
-                                            .update_ema_peak_memory_proactive(&drv_path, observed)
-                                            .await
-                                        {
-                                            Ok(true) => {
-                                                metrics::counter!(
-                                                    "rio_scheduler_ema_proactive_updates_total"
-                                                )
-                                                .increment(1);
-                                            }
-                                            Ok(false) => {
-                                                // observed ≤ ema, or no
-                                                // build_history row yet
-                                                // (first ever build of this
-                                                // pname). Expected path.
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    drv_path = %drv_path,
-                                                    error = %e,
-                                                    "proactive ema update failed"
-                                                );
-                                            }
-                                        }
-                                    },
-                                );
-                            }
+                        rio_proto::types::executor_message::Msg::Progress(_) => {
+                            // ADR-023 SLA sizing reads cgroup telemetry
+                            // from CompletionReport.final_resources, not
+                            // mid-build Progress. The arm stays for
+                            // protocol compat (worker still sends it).
                         }
                         rio_proto::types::executor_message::Msg::Phase(phase) => {
                             // Same try_send semantics as ForwardLogBatch:

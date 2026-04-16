@@ -61,7 +61,6 @@ export const adminMock = {
     .fn()
     .mockResolvedValue({ nodes: [], edges: [], truncated: false, totalNodes: 0 }),
   getSizeClassStatus: vi.fn(),
-  getEstimatorStats: vi.fn(),
   reportExecutorTermination: vi.fn(),
   injectBuildSample: vi.fn(),
   setSlaOverride: vi.fn(),

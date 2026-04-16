@@ -91,12 +91,6 @@ service AdminService {
   // routing is disabled.
   rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
 
-  // Dump the in-memory build_history estimator snapshot (per-pname EMA
-  // duration/memory + classify() result). I-124 diagnostic — `rio-cli
-  // estimator`. Read-only; reflects the actor's last Tick refresh (~60s
-  // stale at worst), NOT a live PG read.
-  rpc GetEstimatorStats(rio.types.GetEstimatorStatsRequest) returns (rio.types.GetEstimatorStatsResponse);
-
   // ─── ADR-023 SLA overrides ────────────────────────────────────────
 
   // Pin a (pname, system?, tenant?) key to a forced tier / cores / mem,

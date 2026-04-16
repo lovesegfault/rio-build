@@ -61,24 +61,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    // Emit cutoff gauges at startup with the CONFIG values. The
-    // rebalancer (apply_pass in rebalancer.rs) re-emits hourly after
-    // each pass writes new cutoffs through the RwLock. Operators
-    // correlate with class_queue_depth: "small=30s cutoff and 100
-    // queued there → scale small pool."
-    // Empty config → no gauges emitted (size-classes disabled).
-    for class in &cfg.size_classes {
-        // Bounds-check happens in validate_config() (fires before PG
-        // connect/migrations). This loop is gauge-emit-only.
-        metrics::gauge!("rio_scheduler_cutoff_seconds", "class" => class.name.clone())
-            .set(class.cutoff_secs);
-    }
-    if !cfg.size_classes.is_empty() {
-        info!(
-            classes = ?cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>(),
-            "size-class routing enabled"
-        );
-    }
     if !cfg.soft_features.is_empty() {
         info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
     }

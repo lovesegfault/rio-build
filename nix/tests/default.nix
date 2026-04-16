@@ -428,8 +428,8 @@ in
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (wsmall1/wsmall2/wlarge + size-classes) for
   # both — the fragment architecture changes what RUNS, not what's BOOTED.
-  # fanout→fuse-direct cache-state chain stays in core; sizeclass+reassign
-  # are disruptive (psql seed, SIGKILL) → own test.
+  # fanout→fuse-direct cache-state chain stays in core; reassign is
+  # disruptive (SIGKILL) → own test.
   vm-scheduling-core-standalone =
     (scheduling {
       inherit pkgs common;
@@ -462,15 +462,14 @@ in
       {
         name = "disrupt";
         subtests = [
-          "sizeclass"
           # r[verify builder.silence.timeout-kill]
           # r[verify sched.timeout.promote-on-exceed]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —
-          # placed after sizeclass + max-silent-time so it also covers
-          # THEIR ssh-ng sessions (neither passed --option, but the
-          # handshake's virtual setOptions() call runs regardless).
+          # placed after max-silent-time so it also covers ITS ssh-ng
+          # sessions (no --option passed, but the handshake's virtual
+          # setOptions() call runs regardless).
           "setoptions-unreachable"
           "cancel-timing"
           # r[verify sched.builder.size-class-reactive]
@@ -499,11 +498,11 @@ in
           # the host fs, doesn't need wsmall2 registered with scheduler).
           "sigint-graceful"
         ];
-        # Default 600s is tight now: sizeclass ~30s + max-silent-time
-        # ~25s + cancel-timing ~40s + reassign ~60s + load-50drv ~60s +
-        # sigint ~35s ≈ 250s subtests + ~120s boot. load-50drv under
-        # TCG could stretch to 150s (13 waves × tick=2s × TCG overhead).
-        # 900s is comfortable without being an open-ended escape hatch.
+        # Default 600s is tight now: max-silent-time ~25s + cancel-timing
+        # ~40s + reassign ~60s + load-50drv ~60s + sigint ~35s ≈ 220s
+        # subtests + ~120s boot. load-50drv under TCG could stretch to
+        # 150s (13 waves × tick=2s × TCG overhead). 900s is comfortable
+        # without being an open-ended escape hatch.
         globalTimeout = 900;
       };
 

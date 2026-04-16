@@ -72,7 +72,6 @@ fn top_level_help_lists_all_subcommands() {
         "poison-clear",
         "cancel-build",
         "drain-executor",
-        "cutoffs",
         "bps",
         "upstream",
     ] {
@@ -95,7 +94,6 @@ fn per_subcommand_help_renders() {
         "poison-clear",
         "cancel-build",
         "drain-executor",
-        "cutoffs",
     ] {
         let out = run_cli(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help: {:?}", out.status);

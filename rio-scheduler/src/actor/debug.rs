@@ -250,10 +250,4 @@ impl DagActor {
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }
-
-    /// Seed the Estimator directly, bypassing the Tick refresh path.
-    /// Pairs with [`Self::test_inject_ready`].
-    pub(crate) fn test_refresh_estimator(&mut self, rows: Vec<crate::db::BuildHistoryRow>) {
-        self.estimator.refresh(rows);
-    }
 }

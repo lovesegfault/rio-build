@@ -73,7 +73,6 @@ async fn unary_subcommands_exit_ok() -> anyhow::Result<()> {
         "builds --status",
         run_cli(&addr, &["builds", "--status", "active", "--limit", "5"]),
     );
-    assert_ok("cutoffs", run_cli(&addr, &["cutoffs"]));
     assert_ok(
         "drain-executor",
         run_cli(&addr, &["drain-executor", "builder-0"]),
@@ -142,12 +141,6 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     assert!(v.get("total_executors").is_some()); // flattened ClusterStatusResponse field
     assert!(v.get("executors").is_some_and(|w| w.is_array()));
 
-    // cutoffs --json: named key (not bare array), same as workers/builds.
-    let (status, stdout, stderr) = run_cli(&addr, &["cutoffs", "--json"]);
-    assert!(status.success(), "cutoffs --json: {stderr}");
-    let v: serde_json::Value = serde_json::from_str(&stdout)?;
-    assert!(v.get("classes").is_some_and(|c| c.is_array()));
-
     // drain-executor --json: inline struct with executor_id echoed back
     // and the two proto response fields.
     let (status, stdout, stderr) = run_cli(&addr, &["drain-executor", "builder-0", "--json"]);
@@ -194,12 +187,6 @@ async fn human_output_empty_state_messages() -> anyhow::Result<()> {
 
     let (_, stdout, _) = run_cli(&addr, &["list-tenants"]);
     assert!(stdout.contains("(no tenants)"), "list-tenants: {stdout}");
-
-    let (_, stdout, _) = run_cli(&addr, &["cutoffs"]);
-    assert!(
-        stdout.contains("(no size classes configured)"),
-        "cutoffs: {stdout}"
-    );
 
     Ok(())
 }

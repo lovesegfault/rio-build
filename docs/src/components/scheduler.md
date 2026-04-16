@@ -178,9 +178,6 @@ Any failure path that promotes `size_class_floor` (`r[sched.builder.size-class-r
 r[sched.sizeclass.snapshot-honors-floor]
 The size-class snapshot MUST bucket each Ready derivation by `max(classify(), size_class_floor)` --- the same clamp `find_executor_with_overflow` applies at dispatch (`r[sched.builder.size-class-reactive]`). The EMA classifier is success-only, so a derivation reactively promoted tiny→small (I-177) still classifies as tiny; without this clamp the snapshot reports `tiny.queued=1`, the controller spawns a tiny builder, dispatch rejects it (floor>tiny), the builder idles to `activeDeadlineSeconds`, disconnects, I-173 bumps the floor again --- spawn loop (I-187). A `size_class_floor` not in the current config (stale after a config change) degrades to no-clamp, matching dispatch's `cutoff_for() = None` fallback.
 
-r[sched.admin.estimator-stats]
-`AdminService.GetEstimatorStats` dumps the in-memory `build_history` snapshot — every `(pname, system)` EMA — joined with `classify()` under the current effective cutoffs. Reflects the last Tick refresh (~60s stale at worst), NOT a live PG read: this is "what the scheduler SEES".
-
 r[sched.admin.inspect-dag]
 `AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. Each derivation row includes `rejections` — a per-executor list of `{executor_id, reason}` veto strings from `dispatch_ready()` (e.g. `at-capacity`, `size-class-mismatch`, `stream-closed`, `feature-missing`) — so a stuck-Ready node is directly diagnosable without log diving. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
 
@@ -284,46 +281,6 @@ r[sched.classify.cpu-bump]
 If `ema_peak_cpu_cores` for a derivation exceeds the target class's `cpu_limit_cores`, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping, mirroring mem-bump).
 
 If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all executors are candidates (backward compatible with single `BuilderPool` deployments).
-
-### Misclassification Handling
-
-r[sched.classify.penalty-overwrite]
-Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a **completed** build's actual duration exceeds 2x its assigned-class cutoff, the scheduler (in the success-completion handler) applies a **penalty** to the EMA: sets `ema_duration_secs = actual_duration` (replaces the smoothed estimate with the observed value, ignoring the usual alpha blending).
-
-Penalty-overwrite detection happens post-completion; proactive EMA updates (`r[sched.classify.proactive-ema]`) may fire mid-run from executor Progress reports.
-
-Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. Penalty-overwrite alone drives per-derivation routing correction; the `CutoffRebalancer` handles aggregate drift.
-
-r[sched.classify.proactive-ema]
-When an executor reports `memory_used_bytes > 0` in a `Progress` update, the scheduler proactively updates `ema_peak_memory` for the running derivation's `(pname, system)` key. This gives the classifier fresher data for subsequent submissions of the same package even before the current build completes --- useful for long-running builds where waiting for completion (or OOM) delays class-correction by hours. The proactive update uses penalty-overwrite semantics (not blending --- a blend would need multiple mid-build samples to converge, defeating "proactive"). Self-correcting: if the peak was a spike, the completion's normal EMA blend pulls it back down. Recorded via `rio_scheduler_ema_proactive_updates_total`.
-
-### Adaptive Cutoff Learning (SITA-E)
-
-r[sched.rebalancer.sita-e]
-The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters default to `min_samples=500, ema_alpha=0.3, lookback_days=7`.
-
-> **TODO:** config-load wiring via `scheduler.toml [rebalancer]`.
-
- Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
-
-A background task (`CutoffRebalancer`) periodically recomputes class cutoffs to equalize load across pools:
-
-```
-For each class i, load_i = fraction_i * mean_duration_i
-where:
-  fraction_i = fraction of derivations with duration in [cutoff_{i-1}, cutoff_i]
-  mean_duration_i = mean actual duration of derivations in class i
-
-SITA-E sets cutoffs such that load_1 ~= load_2 ~= ... ~= load_k
-```
-
-1. Every `recomputeInterval` (default: 1h), query `build_history` for the duration distribution over the last 7 days
-2. Compute the empirical CDF of build durations
-3. Find cutoffs that equalize load across classes
-4. Blend new cutoffs with current: `c_new = alpha * c_computed + (1-alpha) * c_old` (default alpha=0.1)
-5. Update `BuilderPoolSet` status with new cutoffs; log changes as structured events
-
-**Cold start:** Operator-configured `durationCutoff` values from the CRD are used until sufficient history accumulates. **Stability guard:** Cutoffs only change if >= `minSamples` (default: 100) builds have been observed since the last adjustment and the computed cutoff differs by > 10%.
 
 ### Overflow Routing
 
