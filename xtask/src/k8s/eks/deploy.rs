@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
@@ -418,6 +418,12 @@ pub(crate) async fn wait_drift_settled(client: &kube::Client, skip_pools: &[&str
                             .and_then(|l| l.get("karpenter.sh/nodepool"))
                             .is_some_and(|p| skip.iter().any(|s| s == p))
                     })
+                    // Terminating claims are settling, not awaiting
+                    // disruption — Karpenter freezes the Drifted
+                    // condition during drain, so without this a
+                    // graceful drain reads as "still drifted" for up
+                    // to terminationGracePeriodSeconds.
+                    .filter(|nc| nc.metadata.deletion_timestamp.is_none())
                     .filter(|nc| {
                         nc.data
                             .pointer("/status/conditions")
@@ -447,27 +453,103 @@ pub(crate) async fn wait_drift_settled(client: &kube::Client, skip_pools: &[&str
     .context("timed out waiting for Karpenter drift to settle (--wait-drift)")
 }
 
-/// Delete `rio-general` NodeClaims so Karpenter re-provisions them on
-/// the current AMI, then wait for drift to settle (including
+/// Delete `rio-general` NodeClaims whose `status.imageID` doesn't match
+/// the EC2NodeClass-resolved AMI set, so Karpenter re-provisions them
+/// on the current AMI; then wait for drift to settle (including
 /// rio-general). See [`DRIFT_SKIP_NODEPOOLS`] for why this is manual.
+///
+/// Idempotent: skips claims already terminating (`deletionTimestamp`
+/// set) or already on a target AMI, so a re-run after a partial/timed-
+/// out rotation doesn't delete the fresh replacements. With
+/// [`wait_drift_settled`] now filtering terminating claims, the wait is
+/// bounded by node-launch (~2-3min) — it no longer races the gateway's
+/// 1h `sessionDrainSecs`.
 pub async fn rotate_general() -> Result<()> {
     let client = kube::client().await?;
     let api = status::nodeclaim_api(&client);
+    let target_amis = ec2nodeclass_resolved_amis(&client, "rio-default").await;
+    if target_amis.is_empty() {
+        warn!(
+            "EC2NodeClass rio-default has no resolved AMIs (status.amis empty or \
+             unreadable); AMI gate disabled — every rio-general claim will be deleted"
+        );
+    }
+
     let lp = ::kube::api::ListParams::default().labels("karpenter.sh/nodepool=rio-general");
     let claims = api.list(&lp).await?;
     if claims.items.is_empty() {
         info!("no rio-general NodeClaims found; nothing to rotate");
         return Ok(());
     }
+    let mut deleted = 0usize;
     for nc in &claims.items {
         let name = nc.metadata.name.as_deref().unwrap_or("?");
-        info!("deleting NodeClaim {name}");
+        if nc.metadata.deletion_timestamp.is_some() {
+            info!("NodeClaim {name}: already rotating (deletionTimestamp set); skipping");
+            continue;
+        }
+        let image_id = nc
+            .data
+            .pointer("/status/imageID")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if let Some(id) = &image_id
+            && target_amis.contains(id)
+        {
+            info!("NodeClaim {name}: already on target AMI {id}; skipping");
+            continue;
+        }
+        info!(
+            "deleting NodeClaim {name} (imageID={:?})",
+            image_id.as_deref().unwrap_or("?")
+        );
         api.delete(name, &Default::default()).await?;
+        deleted += 1;
+    }
+    if deleted == 0 {
+        info!(
+            "nothing to rotate — all {} rio-general claims already on target AMI or terminating",
+            claims.items.len()
+        );
+        return Ok(());
     }
     info!(
-        "rio-general nodes rotating ({} claims); gateway sessions on \
-         draining nodes have up to sessionDrainSecs (1h) to finish",
-        claims.items.len()
+        "rio-general nodes rotating ({deleted} claims); gateway sessions on \
+         draining nodes have up to sessionDrainSecs (1h) to finish"
     );
     wait_drift_settled(&client, &[]).await
+}
+
+/// Karpenter publishes the AMI(s) it resolved from `amiSelectorTerms` at
+/// `EC2NodeClass.status.amis[*].id`. Returns the set so `rotate_general`
+/// can gate deletes on `NodeClaim.status.imageID` — the same predicate
+/// Karpenter uses to mark a claim `Drifted`. Degrades to an empty set
+/// (no AMI filter) on lookup failure.
+async fn ec2nodeclass_resolved_amis(
+    client: &kube::Client,
+    name: &str,
+) -> std::collections::HashSet<String> {
+    use ::kube::{
+        api::Api,
+        core::{ApiResource, DynamicObject, GroupVersionKind},
+    };
+    let gvk = GroupVersionKind::gvk("karpenter.k8s.aws", "v1", "EC2NodeClass");
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::from_gvk(&gvk));
+    match api.get(name).await {
+        Ok(nc) => nc
+            .data
+            .pointer("/status/amis")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                "EC2NodeClass {name}: status.amis lookup failed ({e}); \
+                 proceeding without AMI filter"
+            );
+            std::collections::HashSet::new()
+        }
+    }
 }
