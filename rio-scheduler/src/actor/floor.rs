@@ -46,8 +46,9 @@ pub struct FloorOutcome {
 /// `max(floor, est)` form means a stale floor (lower than what was
 /// actually dispatched) doesn't under-double; if both are zero (cold
 /// start with the SLA gate skipped), the helper returns
-/// `{promoted:false, counted:false}` so the caller's retry budget
-/// bounds it.
+/// `{promoted:false, counted:false}` — the caller MUST increment its
+/// own retry counter when `!counted` so cold-start is bounded (I-200:
+/// `if promoted` here looped forever).
 ///
 /// `infra_count` for OOM/DiskPressure (mem/disk under-provision are
 /// infrastructure failures); `timeout_count` for DeadlineExceeded

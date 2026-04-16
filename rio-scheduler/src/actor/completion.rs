@@ -2013,14 +2013,13 @@ impl DagActor {
         // instead — that's the SAME counter the cap check below reads,
         // so a build that hit the deadline cap goes terminal on the
         // next iteration regardless of `max_timeout_retries`.
-        let promoted = self
+        let floor_outcome = self
             .bump_resource_floor(
                 drv_hash,
                 rio_proto::types::TerminationReason::DeadlineExceeded,
                 "timeout",
             )
-            .await
-            .promoted;
+            .await;
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2040,10 +2039,13 @@ impl DagActor {
             // worker problem — the SAME worker with a longer deadline
             // would succeed). NO retry_count++ (separate counter).
             // NO backoff (next dispatch's longer deadline IS the
-            // backoff). D4: `bump_floor_or_count` already handled the
-            // counter (incremented IFF at-cap and promoted=false), so
-            // only count the promoted-retry here.
-            if promoted {
+            // backoff). I-200: every TimedOut consumes budget UNLESS
+            // bump already counted (at-cap). Symmetric with
+            // `handle_infrastructure_failure`'s `!counted` guard —
+            // covers cold-start (no [sla], est=None, floor=0 →
+            // {false,false}) where `if promoted` would never increment
+            // → infinite retry until globalTimeout.
+            if !floor_outcome.counted {
                 state.retry.timeout_count += 1;
             }
             info!(
@@ -2051,7 +2053,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 timeout_retry_count = state.retry.timeout_count,
                 max = self.retry_policy.max_timeout_retries,
-                promoted,
+                promoted = floor_outcome.promoted,
                 "timeout — bumped deadline floor, retrying"
             );
             self.requeue_after_retry(drv_hash).await;

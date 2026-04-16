@@ -911,6 +911,86 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.timeout.promote-on-exceed+2]
+/// I-200 regression: cold-start (no `[sla]` → `est_deadline_secs=None`,
+/// `floor.deadline_secs=0`) means `bump_floor_or_count` returns
+/// `{promoted:false, counted:false}` (base=0 → next=0 → unchanged).
+/// `handle_timeout_failure`'s previous `if promoted` guard then NEVER
+/// incremented `timeout_count` → infinite retry until VM-test
+/// globalTimeout. With `if !counted`, every TimedOut consumes budget:
+/// `max_timeout_retries=2` → 3rd TimedOut goes terminal Cancelled.
+///
+/// Distinguish from `test_timeout_promotes_floor_then_cancels_at_cap`:
+/// that test seeds `est_deadline_secs=300` so the floor climbs and
+/// `promoted=true` masks this bug. This test leaves the hint unseeded.
+#[tokio::test]
+async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = size_classes(&[("tiny", 60.0)]);
+        c.retry_policy = crate::RetryPolicy {
+            max_timeout_retries: 2,
+            ..Default::default()
+        };
+    });
+    let _rx = connect_builder_classed(&handle, "cs-w", "x86_64-linux", "tiny").await?;
+
+    let drv_hash = "i200-coldstart";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    // NO debug_seed_sched_hint: est_deadline_secs stays None, floor=0.
+
+    for n in 1..=2u32 {
+        let ok = handle.debug_force_assign(drv_hash, "cs-w").await?;
+        assert!(ok, "force-assign cycle {n}");
+        complete_failure(
+            &handle,
+            "cs-w",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TimedOut,
+            "build exceeded daemon_timeout_secs",
+        )
+        .await?;
+        let s = expect_drv(&handle, drv_hash).await;
+        assert_eq!(
+            s.sched.resource_floor.deadline_secs, 0,
+            "cold-start: floor stays 0 (base=0 → no doubling)"
+        );
+        assert_eq!(
+            s.retry.timeout_count, n,
+            "I-200: cold-start TimedOut MUST consume budget (was: if-promoted skipped, count stuck at 0)"
+        );
+        assert!(
+            matches!(
+                s.status,
+                DerivationStatus::Ready | DerivationStatus::Assigned
+            ),
+            "cycle {n} under cap=2 → Ready, got {:?}",
+            s.status
+        );
+    }
+
+    // 3rd TimedOut: timeout_count==2==max → terminal Cancelled.
+    let ok = handle.debug_force_assign(drv_hash, "cs-w").await?;
+    assert!(ok);
+    complete_failure(
+        &handle,
+        "cs-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TimedOut,
+        "build exceeded daemon_timeout_secs",
+    )
+    .await?;
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        s.status,
+        DerivationStatus::Cancelled,
+        "3rd cold-start TimedOut at max_timeout_retries=2 → terminal (NOT infinite retry)"
+    );
+    Ok(())
+}
+
 // r[verify sched.retry.promotion-exempt+2]
 /// Regression: at-cap cgroup-OOM (worker-reported InfrastructureFailure
 /// path) used to double-count `infra_count` — `bump_floor_or_count`
