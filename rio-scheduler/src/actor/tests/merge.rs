@@ -1725,14 +1725,11 @@ async fn merge_reheaps_preexisting_ready_on_priority_raise() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Build 1 (Scheduled): two independent nodes. No worker connected
-    // so both stay Ready in the queue. "low" gets a longer
-    // est_duration via input_srcs_nar_size proxy so its base
-    // critical-path priority is higher than "shared" — under build 1
-    // alone, "low" would dispatch first.
-    let mut shared = make_node("shared");
-    shared.input_srcs_nar_size = 1;
-    let mut low = make_node("low");
-    low.input_srcs_nar_size = 1_000_000_000; // higher closure-size proxy
+    // so both stay Ready in the queue. Both unfitted →
+    // est_duration=DEFAULT_DURATION_SECS → equal base priority; under
+    // build 1 alone, dispatch order between them is undefined.
+    let shared = make_node("shared");
+    let low = make_node("low");
     let _ev1 = merge_dag(
         &handle,
         Uuid::new_v4(),

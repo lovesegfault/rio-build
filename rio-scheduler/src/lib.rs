@@ -26,7 +26,6 @@ pub(crate) mod critical_path;
 pub(crate) mod dag;
 pub mod db;
 pub(crate) mod domain;
-pub(crate) mod estimator;
 pub mod event_log;
 pub mod grpc;
 pub mod lease;
@@ -402,8 +401,9 @@ pub fn describe_metrics() {
         "K8s Lease losses (stepped down, partition, or preempted)"
     );
     describe_counter!(
-        "rio_scheduler_estimator_refresh_total",
-        "Duration estimator refresh cycles (re-reads build_history EMAs)"
+        "rio_scheduler_sla_refit_total",
+        "SLA estimator refresh ticks (≈60s cadence; VM-test sync barrier — \
+         increments regardless of [sla] gate)"
     );
     describe_histogram!(
         "rio_scheduler_build_graph_edges",

@@ -30,7 +30,6 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
         result: Some(r.result),
         assignment_token: r.assignment_token,
         peak_memory_bytes: r.peak_memory_bytes,
-        output_size_bytes: r.output_size_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
         node_name: stamp.node_name,
         final_resources: r.fixture_resources.or(stamp.final_resources),
@@ -87,7 +86,6 @@ pub(super) fn err_completion(
         // Executor error → cgroup never populated.
         // All resource fields = 0 = no-signal.
         peak_memory_bytes: 0,
-        output_size_bytes: 0,
         peak_cpu_cores: 0.0,
         node_name: stamp.node_name,
         // Carry the snapshot even on executor error: cpu_seconds_total
@@ -115,7 +113,6 @@ pub(super) fn panic_completion(
         // Panic = cgroup file descriptor likely dropped mid-read, or we
         // never got past spawn. 0 = no-signal.
         peak_memory_bytes: 0,
-        output_size_bytes: 0,
         peak_cpu_cores: 0.0,
         node_name: stamp.node_name,
         final_resources: stamp.final_resources,

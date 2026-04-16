@@ -10,7 +10,7 @@
 //! size-class memory-bump actually needs.
 //!
 //! Bonus: `cpu.stat usage_usec` gives us cumulative tree-wide CPU
-//! time, enabling `peak_cpu_cores` with the same mechanism.
+//! time, enabling `peak_cpu_cores` (build_samples) with the same mechanism.
 //!
 //! # cgroup v2 is a hard requirement
 //!
@@ -23,8 +23,8 @@
 //!
 //! This is intentional. A worker that silently falls back to the
 //! phase2c VmHWM bug (measuring 10MB for every build) poisons
-//! build_history with garbage that takes ~10 EMA cycles to wash out
-//! even after the bug is fixed. Better to fail loud at startup.
+//! build_samples with garbage the SLA fit then trains on. Better to
+//! fail loud at startup.
 //!
 //! # Layout
 //!

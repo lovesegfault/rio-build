@@ -271,12 +271,10 @@ impl DagActor {
             let pname = state.pname.as_deref();
             let system = &state.system;
             let classes = self.sizing.size_classes.read();
-            let target_class = crate::assignment::classify(
-                state.sched.est_duration,
-                self.estimator.peak_memory(pname, system),
-                self.estimator.peak_cpu(pname, system),
-                &classes,
-            );
+            // Phase 6 deletes the whole classify() block; until then
+            // (None, None) degrades it to duration-only.
+            let target_class =
+                crate::assignment::classify(state.sched.est_duration, None, None, &classes);
             // Skip for FODs: probe defaults (8 GiB) would reject
             // 2 GiB fetchers. I-062: 5 recurrences of fod_queue=2 +
             // fetcher_util=0 before the per-clause diagnostic exposed

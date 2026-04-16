@@ -407,8 +407,8 @@ pub(super) fn validate_host_arch(
 /// HARD REQUIREMENT — `?` on both delegated_root and
 /// enable_subtree_controllers. Fail startup loudly rather than silently
 /// fall back to broken metrics (the phase2c VmHWM bug measured ~10MB
-/// for every build; poisoning build_history like that takes ~10 EMA
-/// cycles to wash out).
+/// for every build; poisoning build_samples like that mis-trains the
+/// SLA fit until the ring buffer cycles).
 ///
 /// `delegated_root()` returns the PARENT of /proc/self/cgroup — NOT
 /// own_cgroup(). cgroup v2's no-internal-processes rule means per-build

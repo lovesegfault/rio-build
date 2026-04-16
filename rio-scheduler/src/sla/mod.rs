@@ -196,6 +196,17 @@ impl SlaEstimator {
         self.cache.read().get(key).cloned()
     }
 
+    /// `T_min` (ref-seconds) for one cached key. `None` for never-seen
+    /// keys — caller falls back to `critical_path::DEFAULT_DURATION_SECS`.
+    /// Feeds critical-path priority (D1): a relative ordering, so the
+    /// point estimate at `min(p̄, c_opt)` suffices — no solve, no
+    /// tier/ceiling dependency. `Probe` fits return `Some(∞)`; the
+    /// caller's `unwrap_or` doesn't fire but ∞ is a valid "this is the
+    /// longest thing" priority signal for a key under cold-start probing.
+    pub fn wall_estimate(&self, key: &types::ModelKey) -> Option<f64> {
+        self.cached(key).map(|p| p.fit.t_min().0)
+    }
+
     /// Drop one cached fit. Pairs with
     /// [`SchedulerDb::delete_build_samples_for_key`] for `ResetSlaModel`
     /// — next dispatch falls back to the cold-start probe path. Returns

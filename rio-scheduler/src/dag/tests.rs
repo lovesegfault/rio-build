@@ -775,7 +775,8 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
             .set_status_for_test(DerivationStatus::Queued);
     }
 
-    let est = crate::estimator::Estimator::default();
+    let sla = crate::sla::SlaEstimator::new(7.0 * 86400.0, 32, None);
+    let builds = std::collections::HashMap::new();
 
     macro_rules! time {
         ($name:literal, $bound_ms:literal, $body:expr) => {{
@@ -805,12 +806,12 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     time!(
         "compute_initial(critpath)",
         15000,
-        crate::critical_path::compute_initial(&mut dag, &est, &result.newly_inserted)
+        crate::critical_path::compute_initial(&mut dag, &sla, &builds, &result.newly_inserted)
     );
     time!(
         "full_sweep",
         15000,
-        crate::critical_path::full_sweep(&mut dag, &est)
+        crate::critical_path::full_sweep(&mut dag, &sla, &builds)
     );
 
     // update_ancestors when the completed node WAS the unique max-child

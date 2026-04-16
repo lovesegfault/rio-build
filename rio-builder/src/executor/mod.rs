@@ -274,8 +274,6 @@ pub struct ExecutionResult {
     /// Tree-wide: daemon + builder + every child compiler. 0 = build
     /// failed before cgroup populated (executor error before spawn).
     pub peak_memory_bytes: u64,
-    /// Total bytes uploaded (sum of NAR sizes). 0 on failure.
-    pub output_size_bytes: u64,
     /// Peak CPU cores-equivalent, polled 1Hz from cgroup `cpu.stat`
     /// usage_usec. `delta_usec / elapsed_usec`, max over build lifetime.
     /// Tree-wide. 0.0 = build failed before any sample (exited <1s).
@@ -527,10 +525,7 @@ pub async fn execute_build(
     let build_result = build_result?;
 
     // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
-    let BuildOutputs {
-        proto_result,
-        output_size_bytes,
-    } = collect_outputs(
+    let BuildOutputs { proto_result } = collect_outputs(
         &build_result,
         store_client,
         &overlay_mount,
@@ -563,7 +558,6 @@ pub async fn execute_build(
         result: proto_result,
         assignment_token: assignment.assignment_token.clone(),
         peak_memory_bytes,
-        output_size_bytes,
         peak_cpu_cores,
         fixture_resources: None,
     })

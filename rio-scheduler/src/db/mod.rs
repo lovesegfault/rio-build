@@ -90,18 +90,6 @@ pub(super) fn encode_pg_text_array(items: &[String]) -> String {
     out
 }
 
-/// One row from `build_history`. Fields in SELECT order:
-/// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count)`.
-///
-/// Type alias not struct: `sqlx::query_as` maps to tuples by ordinal
-/// position, and a struct would need `#[derive(FromRow)]` + named
-/// columns — more ceremony than a tuple for what's just a pipe from
-/// the DB read into `Estimator::refresh()`. The alias exists because
-/// 5-element tuples trip clippy's type-complexity lint, and naming
-/// it documents the field order where it matters (3 float-ish fields
-/// are easy to mix up).
-pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>, i32);
-
 crate::state::db_str_enum! {
     /// Assignment lifecycle status (assignments table).
     ///
@@ -129,9 +117,6 @@ crate::state::db_str_enum! {
 pub struct SchedulerDb {
     pool: PgPool,
 }
-
-/// EMA alpha for duration estimation updates.
-pub(super) const EMA_ALPHA: f64 = 0.3;
 
 /// Row from `list_builds` / `list_builds_keyset`. Single-table read
 /// (builds only, I-103) — counts are denormalized columns maintained

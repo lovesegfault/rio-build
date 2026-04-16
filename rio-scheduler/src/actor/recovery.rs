@@ -367,11 +367,10 @@ impl DagActor {
     /// `self.dag` (already populated by `load_dag_from_rows`).
     fn seed_ready_queue(&mut self) {
         // --- Recompute priorities (critical-path sweep) ---
-        // est_duration is recomputed from the estimator (build_
-        // history was already loaded on first tick). full_sweep
-        // does a bottom-up pass: leaves priority=est; parents
-        // priority=est+max(children).
-        crate::critical_path::full_sweep(&mut self.dag, &self.estimator);
+        // est_duration is recomputed from the SLA cache (refreshed on
+        // first tick). full_sweep does a bottom-up pass: leaves
+        // priority=est; parents priority=est+max(children).
+        crate::critical_path::full_sweep(&mut self.dag, &self.sla_estimator, &self.builds);
 
         // --- I-058: recompute Created/Queued initial states ---
         // load_edges_for_derivations only loads edges where BOTH

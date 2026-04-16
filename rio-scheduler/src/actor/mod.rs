@@ -26,7 +26,6 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
-use crate::estimator::Estimator;
 use crate::lease::LeaderState;
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
@@ -226,10 +225,6 @@ pub struct DagActor {
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
     cache_breaker: CacheCheckBreaker,
-    /// Build duration estimator. Snapshot of `build_history`, refreshed
-    /// periodically on Tick. Critical-path and size-class routing read
-    /// from this. Single-threaded actor owns it — no Arc/lock.
-    estimator: Estimator,
     /// ADR-023 per-`(pname, system, tenant)` fitted curves. Feeds
     /// `compute_size_class_snapshot` (SpawnIntent population) and
     /// dispatch's resource-fit filter via [`crate::sla::solve::intent_for`].
@@ -438,7 +433,6 @@ impl DagActor {
                 cfg.substitute_max_concurrent.max(1),
             )),
             cache_breaker: CacheCheckBreaker::default(),
-            estimator: Estimator::default(),
             sla_estimator: crate::sla::SlaEstimator::new(
                 cfg.sla.as_ref().map_or(7.0 * 86400.0, |s| s.halflife_secs),
                 cfg.sla.as_ref().map_or(32, |s| s.ring_buffer),

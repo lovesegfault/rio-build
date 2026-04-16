@@ -1027,9 +1027,9 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
 /// shows up; dispatch → Assigned → running shows up, queued drops).
 #[tokio::test]
 async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
-    // est_duration defaults to 0.0 (no build_history entries for test
-    // nodes) → classify() routes to the smallest class = small.
-    let (_db, handle, _task) = setup_with_classes(&[("small", 30.0), ("large", 3600.0)]).await;
+    // est_duration defaults to 60.0 (DEFAULT_DURATION_SECS; unfitted
+    // SLA key) → classify() routes to the smallest class = small.
+    let (_db, handle, _task) = setup_with_classes(&[("small", 60.0), ("large", 3600.0)]).await;
 
     // Merge 3 single-node DAGs. All three → Ready immediately (no
     // deps). No workers connected yet → they stay queued.
@@ -1115,10 +1115,10 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
 async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> TestResult {
     // Classes deliberately UNSORTED so the smallest-class fallback
     // can't accidentally rely on index 0 being smallest.
-    let (_db, handle, _task) = setup_with_classes(&[("large", 3600.0), ("tiny", 30.0)]).await;
+    let (_db, handle, _task) = setup_with_classes(&[("large", 3600.0), ("tiny", 60.0)]).await;
 
-    // Two non-FOD nodes with pnames the (empty) estimator has never
-    // seen → est_duration falls back to DEFAULT_DURATION_SECS (30s)
+    // Two non-FOD nodes with pnames the (empty) SLA cache has never
+    // seen → est_duration falls back to DEFAULT_DURATION_SECS (60s)
     // → classify() picks smallest covering class = tiny. One FOD
     // node → must NOT appear in any size-class queued.
     let mut fod = make_node("cold-fod");

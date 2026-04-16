@@ -1,6 +1,6 @@
 //! Periodic Tick housekeeping: heartbeat-timeout reap, backstop
 //! timeouts, orphan-watcher sweep, poison-TTL expiry, event-log GC,
-//! derivation-row GC, gauge publish, estimator refresh.
+//! derivation-row GC, gauge publish, SLA estimator refresh.
 //!
 //! Split from `executor.rs` — that module is the executor lifecycle
 //! (connect/disconnect/heartbeat); the eight `tick_*` fns here are
@@ -66,14 +66,14 @@ const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
 impl DagActor {
-    /// Refresh the estimator from build_history. Runs every ~6 ticks
-    /// (60s at the default 10s interval). Separated from handle_tick
-    /// so the every-tick housekeeping stays readable.
+    /// Refresh the SLA estimator from build_samples. Runs every ~6
+    /// ticks (60s at the default 10s interval). Separated from
+    /// handle_tick so the every-tick housekeeping stays readable.
     async fn maybe_refresh_estimator(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         // Every 6th tick (≈60s with 10s interval). Not configurable:
-        // the estimator is a snapshot, not live; 60s is plenty fresh
+        // the SLA cache is a snapshot, not live; 60s is plenty fresh
         // for critical-path priorities. Making this tunable is YAGNI
         // until someone asks.
         const ESTIMATOR_REFRESH_EVERY: u64 = 6;
@@ -81,32 +81,15 @@ impl DagActor {
             return;
         }
 
-        // PG read can fail (connection blip). Log and keep the OLD
-        // estimator — stale estimates are better than no estimates.
-        // The next successful refresh catches up.
-        match self.db.read_build_history().await {
-            Ok(rows) => {
-                let n = rows.len();
-                self.estimator.refresh(rows);
-                debug!(entries = n, "estimator refreshed from build_history");
-                // Counter for VM test observability: vm-phase2c
-                // previously sleep(15)'d waiting for this refresh
-                // to pick up a pre-seeded build_history row. Now
-                // it can poll this metric instead — ≥2 increments
-                // after the INSERT = refresh has seen the seed
-                // (first tick may have raced, second is certain).
-                metrics::counter!("rio_scheduler_estimator_refresh_total").increment(1);
-            }
-            Err(e) => {
-                warn!(error = %e, "estimator refresh failed; keeping previous snapshot");
-            }
-        }
+        // VM-test sync barrier: increments on every refresh tick
+        // regardless of `[sla]` gate so non-SLA fixtures can poll it
+        // as "≥2 ticks since INSERT" without configuring `[sla]`.
+        metrics::counter!("rio_scheduler_sla_refit_total").increment(1);
 
         // ADR-023 SLA estimator: incremental refit of touched
-        // (pname, system, tenant) keys. Same cadence + same
-        // log-and-keep-stale semantics on PG failure as the EMA
-        // estimator above; the cache holds the previous fit. The tier
-        // ladder feeds the Schmitt-trigger reassignment inside refit.
+        // (pname, system, tenant) keys. Log-and-keep-stale on PG
+        // failure; the cache holds the previous fit. The tier ladder
+        // feeds the Schmitt-trigger reassignment inside refit.
         //
         // Gated on `[sla]` configured: in Static mode the cache is
         // never read (snapshot.rs / dispatch.rs both gate on
@@ -126,7 +109,7 @@ impl DagActor {
         // suspenders over the incremental update_ancestors calls: any
         // drift (float accumulation, missed edge case) corrects here.
         // O(V+E); ~1ms for a 10k-node DAG.
-        crate::critical_path::full_sweep(&mut self.dag, &self.estimator);
+        crate::critical_path::full_sweep(&mut self.dag, &self.sla_estimator, &self.builds);
 
         // Compact the ready queue (remove lazy-invalidated garbage).
         // No-op if garbage <50% of heap. Without this, a long-running

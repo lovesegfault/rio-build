@@ -15,14 +15,14 @@ use super::*;
 // doesn't break cleanup.
 
 /// After pool close, a successful completion still transitions in-memory
-/// state, but update_build_history logs an error. Also exercises the
+/// state, but write_build_sample logs an error. Also exercises the
 /// derivation-status and assignment-status DB-error branches.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_completion_db_fault_build_history_logged() -> TestResult {
+async fn test_completion_db_fault_build_sample_logged() -> TestResult {
     let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux").await?;
 
-    // Use a node with pname so update_build_history is called.
+    // Use a node with pname so write_build_sample is called.
     let build_id = Uuid::new_v4();
     let mut node = make_node("fault-hash");
     node.pname = "fault-pkg".into();
@@ -65,8 +65,8 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
         "derivation status DB failure should be logged"
     );
     assert!(
-        logs_contain("failed to update build history EMA"),
-        "build_history EMA DB failure should be logged"
+        logs_contain("write_build_sample failed"),
+        "build_samples DB failure should be logged"
     );
     Ok(())
 }
@@ -151,41 +151,5 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
         logs_contain("failed to persist derivation status"),
         "newly-ready DB write failure should be logged"
     );
-    Ok(())
-}
-
-/// Estimator refresh with PG closed → keeps OLD snapshot, logs the
-/// failure, actor stays alive. The refresh runs every 6th Tick
-/// (ESTIMATOR_REFRESH_EVERY). Stale estimates are better than no
-/// estimates — critical-path priorities degrade gracefully, the next
-/// successful refresh catches up.
-#[tokio::test]
-#[tracing_test::traced_test]
-async fn test_estimator_refresh_pg_failure_keeps_old_snapshot() -> TestResult {
-    let (db, handle, _task) = setup().await;
-
-    // Close pool BEFORE any Ticks. All estimator refreshes will fail.
-    db.pool.close().await;
-
-    // 6 Ticks: tick_count increments each call; the 6th (a multiple
-    // of ESTIMATOR_REFRESH_EVERY=6) triggers the refresh. Send 7 to
-    // be robust against off-by-one in the modulo check.
-    for _ in 0..7 {
-        handle.send_unchecked(ActorCommand::Tick).await?;
-    }
-    barrier(&handle).await;
-
-    // The refresh-failure branch should have logged.
-    assert!(
-        logs_contain("estimator refresh failed"),
-        "estimator PG failure should be logged"
-    );
-
-    // Actor should still be alive (didn't panic or exit on the PG error).
-    assert!(
-        handle.is_alive(),
-        "actor should survive estimator refresh failure"
-    );
-
     Ok(())
 }

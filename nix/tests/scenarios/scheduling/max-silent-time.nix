@@ -22,25 +22,9 @@ scope: with scope; ''
   # → classify() picks "large" → dispatches to wlarge (the only worker
   # with the silence config). Same pattern as sizeclass/bigthing.
   with subtest("max-silent-time: silence arm kills at ~10s, not 60s wall-clock"):
-      # Seed + wait-for-refresh (same pattern as sizeclass).
-      # TWO refreshes not one: a refresh could fire between
-      # baseline-capture and INSERT (12s cadence vs sub-ms INSERT).
-      refresh_baseline = int(${gatewayHost}.succeed(
-          "curl -sf http://localhost:9091/metrics | "
-          "grep -E '^rio_scheduler_estimator_refresh_total ' | "
-          "awk '{print $2}' || echo 0"
-      ).strip() or "0")
-      psql(${gatewayHost},
-          "INSERT INTO build_history "
-          "(pname, system, ema_duration_secs, sample_count, last_updated) "
-          "VALUES ('rio-sched-silence', 'x86_64-linux', 120.0, 1, now())")
-      target = refresh_baseline + 2
-      ${gatewayHost}.wait_until_succeeds(
-          "test \"$(curl -sf http://localhost:9091/metrics | "
-          "grep -E '^rio_scheduler_estimator_refresh_total ' | "
-          f"awk '{{print $2}}' || echo 0)\" -ge {target}",
-          timeout=40,
-      )
+      # est_duration defaults to 60s (DEFAULT_DURATION_SECS) for an
+      # unfitted SLA key, which classify() routes to "large" given the
+      # 30s small cutoff — no seed needed.
 
       # expect_fail=True: TimedOut is a build FAILURE (nix-build
       # exits nonzero). The timing wrap stays at the callsite —

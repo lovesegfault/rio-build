@@ -132,10 +132,10 @@ let
         # cadence; gate on the refresh-counter advancing rather than
         # sleeping a fixed amount (TCG variance).
         base = metric_value(scrape_metrics(${gatewayHost}, 9091),
-            "rio_scheduler_estimator_refresh_total") or 0.0
+            "rio_scheduler_sla_refit_total") or 0.0
         ${gatewayHost}.wait_until_succeeds(
             "curl -fsS localhost:9091/metrics | "
-            f"awk '/^rio_scheduler_estimator_refresh_total / {{exit !($2>{base})}}'",
+            f"awk '/^rio_scheduler_sla_refit_total / {{exit !($2>{base})}}'",
             timeout=30,
         )
 

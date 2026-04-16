@@ -336,10 +336,10 @@ impl DagActor {
                     // every pool's queued count.
                     let classify_idx = crate::assignment::classify(
                         state.sched.est_duration,
-                        self.estimator
-                            .peak_memory(state.pname.as_deref(), &state.system),
-                        self.estimator
-                            .peak_cpu(state.pname.as_deref(), &state.system),
+                        // Phase 6 deletes classify(); (None, None) degrades
+                        // to duration-only until then.
+                        None,
+                        None,
                         &classes,
                     )
                     .and_then(|c| index.get(&c).copied())

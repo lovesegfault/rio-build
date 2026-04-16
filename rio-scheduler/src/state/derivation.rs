@@ -444,16 +444,6 @@ pub struct SchedHint {
     /// change the OPTIMAL schedule mid-execution — what's queued is
     /// queued).
     pub est_duration: f64,
-    /// Sum of input_srcs nar_sizes from the proto. Passed to
-    /// `Estimator::estimate()` for the closure-size-as-proxy fallback
-    /// when there's no `build_history` entry. 0 = no-signal (empty
-    /// srcs, or gateway's QueryPathInfo batch failed).
-    ///
-    /// Stored separately from `est_duration` even though it's only
-    /// USED to compute est_duration: the estimator call happens in
-    /// merge.rs AFTER try_from_node (estimator not in scope here),
-    /// and merge.rs needs the raw value to pass through.
-    pub input_srcs_nar_size: u64,
     /// Critical-path priority: `est_duration + max(children's priority)`.
     /// Bottom-up: leaves have `priority = est_duration`; roots have
     /// the sum along the longest path. Higher = more urgent (dispatch
@@ -583,14 +573,11 @@ impl DerivationState {
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_executor: None,
-            sched: SchedHint {
-                input_srcs_nar_size: node.input_srcs_nar_size,
-                // est_duration: placeholder — merge.rs sets this from
-                // the Estimator right after try_from_node (try_from_node
-                // doesn't have estimator access). 0.0 is a visible
-                // "not yet set" marker.
-                ..Default::default()
-            },
+            // est_duration/priority: placeholders — merge.rs sets them
+            // via critical_path::compute_initial right after
+            // try_from_node (SLA cache not in scope here). 0.0 is a
+            // visible "not yet set" marker.
+            sched: SchedHint::default(),
             drv_content: node.drv_content.clone(),
             retry: RetryState::default(),
             output_paths: Vec::new(),

@@ -29,14 +29,47 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use uuid::Uuid;
+
 use crate::dag::DerivationDag;
-use crate::estimator::Estimator;
-use crate::state::DrvHash;
+use crate::sla::SlaEstimator;
+use crate::sla::types::ModelKey;
+use crate::state::{BuildInfo, DerivationState, DrvHash};
+
+/// Fallback duration when the SLA cache has no fit for a key (cold
+/// start, or `pname` absent so no key can be built). 60s sits between
+/// "trivial" and "heavy" — close enough to the fleet median that a
+/// fresh derivation neither hogs the front of the queue nor starves
+/// behind known-long work. ADR-023's per-key fit replaces this after
+/// the first completion.
+pub const DEFAULT_DURATION_SECS: f64 = 60.0;
+
+/// Build the SLA [`ModelKey`] for `state`, using the same tenant
+/// attribution as `solve_intent_for` / `write_build_sample` — first
+/// interested build's `tenant_id`, stringified, `""` on none. The two
+/// MUST agree or the cache key never matches the rows that fed it.
+/// `None` when `pname` is absent (raw/FOD derivation) — nothing to key on.
+fn model_key_for(state: &DerivationState, builds: &HashMap<Uuid, BuildInfo>) -> Option<ModelKey> {
+    let pname = state.pname.as_ref()?;
+    let tenant = state
+        .interested_builds
+        .iter()
+        .filter_map(|id| builds.get(id)?.tenant_id)
+        .next()
+        .map(|u| u.to_string())
+        .unwrap_or_default();
+    Some(ModelKey {
+        pname: pname.clone(),
+        system: state.system.clone(),
+        tenant,
+    })
+}
 
 /// Compute priorities for newly-inserted nodes (bottom-up).
 ///
 /// Called after `dag.merge()` in the actor. Populates `est_duration`
-/// (from the Estimator) and `priority` (bottom-up from children).
+/// (SLA `T_min` for cached keys, [`DEFAULT_DURATION_SECS`] otherwise)
+/// and `priority` (bottom-up from children).
 ///
 /// Existing nodes are NOT recomputed unless a new subgraph connects to
 /// them with a higher-priority path (scheduler.md:473). This means:
@@ -46,7 +79,7 @@ use crate::state::DrvHash;
 ///
 /// # Algorithm
 ///
-/// 1. For each newly-inserted node, set `est_duration` from Estimator.
+/// 1. For each newly-inserted node, set `est_duration` from the SLA cache.
 /// 2. Topo-sort the newly-inserted nodes (children before parents). We
 ///    can't use a global topo-sort — the DAG has existing nodes mixed
 ///    in. Instead: BFS from leaves, tracking in-degree within the new set.
@@ -58,7 +91,8 @@ use crate::state::DrvHash;
 ///    (same as `update_ancestors`).
 pub fn compute_initial(
     dag: &mut DerivationDag,
-    estimator: &Estimator,
+    sla: &SlaEstimator,
+    builds: &HashMap<Uuid, BuildInfo>,
     newly_inserted: &HashSet<DrvHash>,
 ) {
     if newly_inserted.is_empty() {
@@ -68,12 +102,9 @@ pub fn compute_initial(
     // --- Step 1: set est_duration for new nodes ---
     for hash in newly_inserted {
         if let Some(state) = dag.node_mut(hash) {
-            let est = estimator.estimate(
-                state.pname.as_deref(),
-                &state.system,
-                state.sched.input_srcs_nar_size,
-            );
-            state.sched.est_duration = est;
+            state.sched.est_duration = model_key_for(state, builds)
+                .and_then(|k| sla.wall_estimate(&k))
+                .unwrap_or(DEFAULT_DURATION_SECS);
         }
     }
 
@@ -236,7 +267,7 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
 ///
 /// Cost: O(V + E) for the topo-sort + one pass. For a 10k-node DAG,
 /// ~1ms. Every 60s is negligible.
-pub fn full_sweep(dag: &mut DerivationDag, estimator: &Estimator) {
+pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<Uuid, BuildInfo>) {
     // Collect all non-terminal hashes. Terminal nodes don't need
     // priority (they won't be dispatched).
     let non_terminal: HashSet<DrvHash> = dag
@@ -248,14 +279,18 @@ pub fn full_sweep(dag: &mut DerivationDag, estimator: &Estimator) {
     // Reuse compute_initial — it's the same bottom-up algorithm.
     // Treating all non-terminal nodes as "newly inserted" is a valid
     // re-interpretation: compute_initial sets est_duration (idempotent;
-    // same estimator, same result) and recomputes priority bottom-up.
-    compute_initial(dag, estimator, &non_terminal);
+    // same SLA cache, same result) and recomputes priority bottom-up.
+    compute_initial(dag, sla, builds, &non_terminal);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dag::DerivationDag;
+    use crate::sla::types::{
+        DurationFit, ExploreState, FittedParams, MemBytes, MemFit, RawCores, RefSeconds,
+        WallSeconds,
+    };
     use crate::state::DerivationStatus;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
     use uuid::Uuid;
@@ -263,7 +298,7 @@ mod tests {
     /// Build a domain `DerivationNode` for test DAG construction.
     ///
     /// `pname` is set to `tag` (not the fixture's `"test-pkg"` default)
-    /// because the test estimator keys on (pname, system) — the test
+    /// because the SLA cache keys on (pname, system, tenant) — the test
     /// assertions below depend on `node("a")` having `pname == "a"`.
     fn node(tag: &str) -> crate::domain::DerivationNode {
         crate::domain::DerivationNode {
@@ -276,15 +311,58 @@ mod tests {
         make_edge(parent, child).into()
     }
 
-    /// Estimator with known values: a=10s, b=20s, c=30s, else default.
-    fn test_estimator() -> Estimator {
-        let mut e = Estimator::default();
-        e.refresh(vec![
-            ("a".into(), "x86_64-linux".into(), 10.0, None, None, 1),
-            ("b".into(), "x86_64-linux".into(), 20.0, None, None, 1),
-            ("c".into(), "x86_64-linux".into(), 30.0, None, None, 1),
-        ]);
+    /// Seed one Amdahl fit with `T_min == s` (p=0 → t_at(∞)=s). Tenant
+    /// `""` matches `model_key_for`'s attribution when `builds` is empty.
+    fn seed(sla: &SlaEstimator, pname: &str, t_min: f64) {
+        sla.seed(FittedParams {
+            key: ModelKey {
+                pname: pname.into(),
+                system: "x86_64-linux".into(),
+                tenant: String::new(),
+            },
+            fit: DurationFit::Amdahl {
+                s: RefSeconds(t_min),
+                p: RefSeconds(0.0),
+            },
+            mem: MemFit::Independent { p90: MemBytes(0) },
+            disk_p90: None,
+            sigma_resid: 0.0,
+            log_residuals: vec![],
+            n_eff: 5.0,
+            span: 1.0,
+            explore: ExploreState {
+                distinct_c: 1,
+                min_c: RawCores(1.0),
+                max_c: RawCores(1.0),
+                frozen: true,
+                saturated: false,
+                last_wall: WallSeconds(t_min),
+            },
+            t_min_ci: None,
+            ci_computed_at: None,
+            tier: None,
+            hw_bias: HashMap::new(),
+            prior_source: None,
+        });
+    }
+
+    /// SLA cache seeded with known T_min: a=10s, b=20s, c=30s, else
+    /// [`DEFAULT_DURATION_SECS`].
+    fn test_sla() -> SlaEstimator {
+        let e = SlaEstimator::new(7.0 * 86400.0, 32, None);
+        seed(&e, "a", 10.0);
+        seed(&e, "b", 20.0);
+        seed(&e, "c", 30.0);
         e
+    }
+
+    /// Unfitted-key cache: every node falls back to [`DEFAULT_DURATION_SECS`].
+    fn empty_sla() -> SlaEstimator {
+        SlaEstimator::new(7.0 * 86400.0, 32, None)
+    }
+
+    fn no_builds() -> HashMap<Uuid, BuildInfo> {
+        HashMap::new()
     }
 
     #[test]
@@ -292,7 +370,7 @@ mod tests {
         let mut dag = DerivationDag::new();
         let merge = dag.merge(Uuid::new_v4(), &[node("a")], &[], "").unwrap();
 
-        compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
+        compute_initial(&mut dag, &test_sla(), &no_builds(), &merge.newly_inserted);
 
         assert_eq!(dag.node("a").unwrap().sched.priority, 10.0);
     }
@@ -313,7 +391,7 @@ mod tests {
             )
             .unwrap();
 
-        compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
+        compute_initial(&mut dag, &test_sla(), &no_builds(), &merge.newly_inserted);
 
         assert_eq!(dag.node("c").unwrap().sched.priority, 30.0);
         assert_eq!(dag.node("b").unwrap().sched.priority, 50.0);
@@ -330,11 +408,11 @@ mod tests {
         // d is leaf. b and c both have d as child.
         // a has BOTH b and c as children; priority = a_dur + max(b.prio, c.prio).
         //
-        // Using default estimator (everything 30s):
-        // d: 30
-        // b: 30 + 30 = 60
-        // c: 30 + 30 = 60
-        // a: 30 + max(60, 60) = 90
+        // Using empty SLA cache (everything DEFAULT_DURATION_SECS=60s):
+        // d: 60
+        // b: 60 + 60 = 120
+        // c: 60 + 60 = 120
+        // a: 60 + max(120, 120) = 180
         let mut dag = DerivationDag::new();
         let merge = dag
             .merge(
@@ -350,10 +428,9 @@ mod tests {
             )
             .unwrap();
 
-        let est = Estimator::default(); // everything = 30s
-        compute_initial(&mut dag, &est, &merge.newly_inserted);
+        compute_initial(&mut dag, &empty_sla(), &no_builds(), &merge.newly_inserted);
 
-        assert_eq!(dag.node("a").unwrap().sched.priority, 90.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 180.0);
     }
 
     #[test]
@@ -368,7 +445,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        compute_initial(&mut dag, &test_estimator(), &merge1.newly_inserted);
+        compute_initial(&mut dag, &test_sla(), &no_builds(), &merge1.newly_inserted);
         assert_eq!(dag.node("a").unwrap().sched.priority, 30.0);
 
         // Second merge: b depends on c (new). c=30. Now b has a child
@@ -377,7 +454,7 @@ mod tests {
         let merge2 = dag
             .merge(Uuid::new_v4(), &[node("c")], &[edge("b", "c")], "")
             .unwrap();
-        compute_initial(&mut dag, &test_estimator(), &merge2.newly_inserted);
+        compute_initial(&mut dag, &test_sla(), &no_builds(), &merge2.newly_inserted);
 
         // c is new: priority = 30 (leaf).
         assert_eq!(dag.node("c").unwrap().sched.priority, 30.0);
@@ -409,7 +486,7 @@ mod tests {
                 "",
             )
             .unwrap();
-        compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
+        compute_initial(&mut dag, &test_sla(), &no_builds(), &merge.newly_inserted);
         assert_eq!(dag.node("b").unwrap().sched.priority, 50.0);
         assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
 
@@ -444,14 +521,13 @@ mod tests {
                 "",
             )
             .unwrap();
-        let est = Estimator::default(); // all 30s
-        compute_initial(&mut dag, &est, &merge.newly_inserted);
+        compute_initial(&mut dag, &empty_sla(), &no_builds(), &merge.newly_inserted);
 
-        // Verify initial: b=30, c=30, a=30+30=60, d=30+60=90.
-        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
-        assert_eq!(dag.node("d").unwrap().sched.priority, 90.0);
+        // Verify initial: b=60, c=60, a=60+60=120, d=60+120=180.
+        assert_eq!(dag.node("a").unwrap().sched.priority, 120.0);
+        assert_eq!(dag.node("d").unwrap().sched.priority, 180.0);
 
-        // Complete b. a's max-child: still c=30. a unchanged (60).
+        // Complete b. a's max-child: still c=60. a unchanged (120).
         // d should NOT be recomputed (dirty-flag stops at a).
         //
         // We can't directly observe "d wasn't touched", but we CAN
@@ -464,8 +540,8 @@ mod tests {
             .unwrap();
         update_ancestors(&mut dag, "b");
 
-        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0, "a unchanged");
-        assert_eq!(dag.node("d").unwrap().sched.priority, 90.0, "d unchanged");
+        assert_eq!(dag.node("a").unwrap().sched.priority, 120.0, "a unchanged");
+        assert_eq!(dag.node("d").unwrap().sched.priority, 180.0, "d unchanged");
     }
 
     #[test]
@@ -479,14 +555,14 @@ mod tests {
                 "",
             )
             .unwrap();
-        let est = test_estimator();
-        compute_initial(&mut dag, &est, &merge.newly_inserted);
+        let sla = test_sla();
+        compute_initial(&mut dag, &sla, &no_builds(), &merge.newly_inserted);
 
         let before_a = dag.node("a").unwrap().sched.priority;
         let before_b = dag.node("b").unwrap().sched.priority;
 
         // Full sweep should produce the SAME priorities (same input).
-        full_sweep(&mut dag, &est);
+        full_sweep(&mut dag, &sla, &no_builds());
 
         assert_eq!(dag.node("a").unwrap().sched.priority, before_a);
         assert_eq!(dag.node("b").unwrap().sched.priority, before_b);

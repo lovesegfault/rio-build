@@ -118,7 +118,7 @@ message ExecutorMessage {
     CompletionReport completion = 3;        // Build result
     BuildPhase phase = 7;                   // Build phase change (forwarded resSetPhase)
     // Mid-build resource sample (memory.peak so far). Proactive ema:
-    // scheduler updates ema_peak_memory_bytes BEFORE completion so the
+    // scheduler captures peak memory BEFORE completion so the
     // next submit of that drv is right-sized without waiting for an
     // OOM→retry cycle. Emitted every 10s by the executor's build task.
     // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
@@ -189,21 +189,17 @@ message CompletionReport {
   // builder's footprint never appears in the daemon's /proc.
   // memory.peak captures the whole TREE.
   //
-  // Feeds build_history.ema_peak_memory_bytes for size-class
-  // memory-bump: a derivation that fits the "small" duration class
-  // but historically OOMs on small builders gets bumped to medium.
+  // Feeds build_samples.peak_memory_bytes for the ADR-023 SLA fit
+  // (per-key M(c) curve). NOT carried by final_resources (field 8) —
+  // memory_used_bytes there is memory.current at last poll, which is
+  // near-zero after the builder process has exited.
   //
   // 0 means "couldn't read" — cgroup setup failed (see
   // resource_metrics_degraded below), or build failed before the
-  // cgroup was populated. Scheduler treats 0 as no-signal: EMA
-  // keeps its prior value, doesn't drag toward zero.
+  // cgroup was populated. Scheduler treats 0 as no-signal.
   uint64 peak_memory_bytes = 4;
 
-  // Total bytes uploaded to the store (sum of NAR sizes across all outputs).
-  // Builder still measures and sends this; scheduler does NOT persist it
-  // (build_history.ema_output_size_bytes was dropped — never read by
-  // routing or dashboards). Field kept for wire compatibility.
-  uint64 output_size_bytes = 5;
+  reserved 5; // was output_size_bytes (sum of uploaded NAR sizes; never consumed)
 
   // Peak CPU usage in cores-equivalent, sampled 1Hz from the
   // per-build cgroup's cpu.stat usage_usec. Unlike memory, there's
@@ -214,14 +210,14 @@ message CompletionReport {
   //
   // Max over the build's lifetime. Cumulative over the whole tree
   // (cgroup semantics), so a parallel make -j8 that pins 8 cores
-  // reports ~8.0. Feeds build_history.ema_peak_cpu_cores for
-  // potential future size-class CPU-bump (not wired yet).
+  // reports ~8.0. Feeds build_samples.peak_cpu_cores for the ADR-023
+  // SLA fit (saturation detection in ingest::refit).
   //
   // 0.0 = build failed before the cgroup was populated (executor
   // error before spawn, or daemon exited too fast to poll). Same
   // sentinel as peak_memory_bytes=0 — scheduler treats it as
-  // no-signal, EMA keeps prior. double not uint: fractional cores
-  // are real (a build that averages 2.5 cores is useful to know).
+  // no-signal. double not uint: fractional cores are real (a build
+  // that averages 2.5 cores is useful to know).
   //
   // cgroup v2 is a HARD REQUIREMENT. Executor fails startup if
   // /sys/fs/cgroup isn't cgroup2fs or the subtree isn't delegated.
@@ -241,10 +237,9 @@ message CompletionReport {
   // peak_disk_bytes) that otherwise only flows on the ProgressUpdate
   // side-channel. The scheduler's completion handler reads THIS — not
   // the last ProgressUpdate — when writing build_samples (ProgressUpdate
-  // is best-effort/droppable; CompletionReport is not). The legacy
-  // peak_memory_bytes/peak_cpu_cores scalars above stay for one release
-  // (EMA path reads them); they're redundant with this snapshot's
-  // memory_used_bytes/cpu_fraction once the EMA path is migrated.
+  // is best-effort/droppable; CompletionReport is not). Does NOT carry
+  // peak memory/cpu — fields 4/6 above remain the only source for
+  // those (memory_used_bytes here is memory.current, near-zero post-exit).
   optional ResourceUsage final_resources = 8;
 }
 

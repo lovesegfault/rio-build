@@ -1,7 +1,6 @@
-//! Build history EMA + build_samples retention — `build_history` /
-//! `build_samples` tables.
+//! `build_samples` retention + `sla_overrides` CRUD.
 
-use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb};
+use super::SchedulerDb;
 
 /// One `build_samples` row. ADR-023 SLA telemetry: every successful
 /// completion appends a full-width row; the SLA fit reads these to
@@ -68,113 +67,13 @@ pub struct SlaOverrideRow {
 }
 
 impl SchedulerDb {
-    /// Read the full build_history table for estimator refresh.
-    ///
-    /// Return tuple: `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count)`.
-    /// Aliased as [`BuildHistoryRow`] — 5-element tuples trip clippy's
-    /// type-complexity lint, and naming it documents the field order
-    /// at the one place where it's easy to mix up (3 f64-ish fields).
-    ///
-    /// 5-tuple (cpu included). Estimator::refresh signature matches.
-    /// The estimator doesn't USE cpu_cores yet (size-class routing
-    /// bumps on memory only, not cpu) but reading it now means future
-    /// cpu-bump logic is a pure-estimator change, no DB roundtrip.
-    ///
-    /// The estimator loads this into a HashMap at startup and refreshes
-    /// on Tick (every 60s). A full table scan is fine: even 10k distinct
-    /// (pname, system) pairs is ~1 MB and <10ms. The alternative —
-    /// loading on-demand per estimate — would be an async PG roundtrip
-    /// inside the single-threaded actor loop on every dispatch decision.
-    /// Batch-load once, query in-memory.
-    pub async fn read_build_history(&self) -> Result<Vec<BuildHistoryRow>, sqlx::Error> {
-        sqlx::query_as(
-            r#"
-            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count
-            FROM build_history
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-    }
-
-    /// Update the build history EMA for a (pname, system) pair.
-    ///
-    /// `peak_memory_bytes`/`peak_cpu_cores`: None means the worker had
-    /// no signal (build failed before cgroup populated, or exited in
-    /// <1s before CPU poll sampled). Must NOT drag the EMA toward zero
-    /// — None → column unchanged.
-    ///
-    /// The COALESCE(blend, new, old) pattern handles all four
-    /// old×new nullability combinations:
-    ///   old=Some, new=Some → blend (normal EMA)
-    ///   old=None, new=Some → blend is NULL (NULL*x), falls to new (first sample)
-    ///   old=Some, new=None → blend is NULL (x+NULL), falls to new=NULL, falls to old (keep)
-    ///   old=None, new=None → all NULL (still no signal)
-    ///
-    /// PG: any arithmetic with NULL yields NULL; COALESCE picks first non-NULL.
-    ///
-    /// # Historical memory data
-    ///
-    /// Older worker versions sent VmHWM of nix-daemon (~10MB
-    /// regardless of builder memory). cgroup memory.peak fixes that.
-    /// If existing build_history rows have wrong memory values, EMA
-    /// alpha=0.3 means ~10 completions per (pname,system) washes the
-    /// bad data out (0.7^10 ≈ 2.8% of the old value remains). No
-    /// migration needed — time heals it.
-    pub async fn update_build_history(
-        &self,
-        pname: &str,
-        system: &str,
-        actual_duration_secs: f64,
-        peak_memory_bytes: Option<u64>,
-        peak_cpu_cores: Option<f64>,
-    ) -> Result<(), sqlx::Error> {
-        // u64 → f64 for DOUBLE PRECISION binding. Precision loss at
-        // ~2^53 bytes (~9 PB) is not a concern. cpu is already f64.
-        let peak_mem = peak_memory_bytes.map(|b| b as f64);
-
-        sqlx::query(
-            r#"
-            INSERT INTO build_history
-              (pname, system, ema_duration_secs,
-               ema_peak_memory_bytes, ema_peak_cpu_cores,
-               sample_count, last_updated)
-            VALUES ($1, $2, $3, $5, $6, 1, now())
-            ON CONFLICT (pname, system) DO UPDATE SET
-                ema_duration_secs = build_history.ema_duration_secs * (1.0 - $4) + $3 * $4,
-                ema_peak_memory_bytes = COALESCE(
-                    build_history.ema_peak_memory_bytes * (1.0 - $4) + $5 * $4,
-                    $5,
-                    build_history.ema_peak_memory_bytes),
-                ema_peak_cpu_cores = COALESCE(
-                    build_history.ema_peak_cpu_cores * (1.0 - $4) + $6 * $4,
-                    $6,
-                    build_history.ema_peak_cpu_cores),
-                sample_count = build_history.sample_count + 1,
-                last_updated = now()
-            "#,
-        )
-        .bind(pname)
-        .bind(system)
-        .bind(actual_duration_secs)
-        .bind(EMA_ALPHA)
-        .bind(peak_mem)
-        .bind(peak_cpu_cores)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Insert one raw build sample with full ADR-023 telemetry. Called
-    /// from completion.rs success path alongside the EMA update.
-    /// Best-effort: caller warns on Err.
+    /// from completion.rs success path. Best-effort: caller warns on Err.
     ///
-    /// Unlike `update_build_history` which folds into a single EMA row per
-    /// `(pname, system)`, this appends every completion — the SLA fit
-    /// needs the full distribution, not a smoothed scalar.
-    /// `completed_at` is server-side `now()`; `outlier_excluded` keeps
-    /// its DEFAULT FALSE (the MAD sweep flips it later).
+    /// Appends every completion — the SLA fit needs the full
+    /// distribution, not a smoothed scalar. `completed_at` is
+    /// server-side `now()`; `outlier_excluded` keeps its DEFAULT FALSE
+    /// (the MAD sweep flips it later).
     pub async fn write_build_sample(&self, row: &BuildSampleRow) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "INSERT INTO build_samples

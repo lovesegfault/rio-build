@@ -403,7 +403,6 @@ mod opcodes_read;
 mod opcodes_write;
 
 use build::{handle_build_derivation, handle_build_paths, handle_build_paths_with_results};
-pub(crate) use grpc::grpc_query_path_info;
 use opcodes_read::{
     handle_add_signatures, handle_add_temp_root, handle_ensure_path, handle_is_valid_path,
     handle_nar_from_path, handle_query_derivation_output_map, handle_query_missing,

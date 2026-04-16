@@ -242,22 +242,7 @@ X's dispatch. The filter is
 
 ## Duration Estimation
 
-r[sched.estimate.fallback-chain]
-Build duration estimates feed into critical-path priority computation and scheduling decisions.
-
-| Priority | Method |
-|----------|--------|
-| 1 | Exact `(pname, system)` match in the `build_history` table (EMA) |
-| 2 | Cross-system `pname` match: mean of all `build_history` rows with the same `pname` (any system) |
-| 3 | Closure-size proxy: `input_srcs_nar_size / 10 MB/s`, floored at 5s |
-| 4 | Default constant: 30 seconds |
-
-Fallbacks 1–2 require a `pname` (extracted from the derivation's `env.pname` attr, or `None` for raw/FOD derivations without it). When `pname` is absent, the chain skips directly to fallback 3.
-
-r[sched.estimate.ema-alpha]
-After each build completes, the estimate is updated using an exponential moving average (alpha=0.3) of actual durations. Cold start: on a fresh deployment with no history, all derivations use fallback 3 (closure-size proxy) or 4 (default). Critical-path scheduling quality improves as history accumulates (typically 5-10 builds per derivation for convergence).
-
-The `build_history` table also tracks peak resource usage (memory, CPU, output size) via EMA, reported by executors in `CompletionReport`. These feed into size-class routing decisions (see below).
+Build duration estimates feed into critical-path priority computation. The estimate is the SLA model's `T_min` (`DurationFit::t_min()`, ref-seconds at `min(p̄, c_opt)`) for the derivation's `(pname, system, tenant)` key, falling back to a flat 60-second default when the key is unfitted (cold start, or `pname` absent). `T_min` is monotone in work size, requires no solve, and is a single cache lookup — priority is a relative ordering, not a schedule.
 
 ## Size-Class Routing
 

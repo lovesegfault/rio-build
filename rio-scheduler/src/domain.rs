@@ -57,7 +57,6 @@ pub struct DerivationNode {
     /// crate — the one extra copy at the boundary is per-merge, not
     /// per-tick.
     pub drv_content: Vec<u8>,
-    pub input_srcs_nar_size: u64,
     pub is_content_addressed: bool,
     /// Decoded `ca_modular_hash` — `Some` iff the wire field was
     /// exactly 32 bytes. The proto carries raw `bytes`; downstream
@@ -86,7 +85,6 @@ impl From<proto::DerivationNode> for DerivationNode {
             is_fixed_output: n.is_fixed_output,
             expected_output_paths: n.expected_output_paths,
             drv_content: n.drv_content.to_vec(),
-            input_srcs_nar_size: n.input_srcs_nar_size,
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,
             version: n.version,

@@ -129,12 +129,6 @@ pub async fn reconstruct_dag(
         "DAG reconstruction complete"
     );
 
-    // Populate input_srcs_nar_size for each node. Batched AFTER
-    // BFS so we QueryPathInfo each unique src exactly once across
-    // the whole DAG (many nodes share the same stdenv/bash srcs).
-    // Best-effort: store error → log, leave 0 (estimator skips).
-    populate_input_srcs_sizes(&mut nodes, drv_cache, store_client).await;
-
     // Populate ca_modular_hash for CA nodes. AFTER BFS so
     // hash_derivation_modulo has the full drv_cache to recurse
     // over (InputNotFound otherwise). Memoised via a single
@@ -211,79 +205,6 @@ pub(crate) fn compute_modular_hash_cached(
             );
             None
         }
-    }
-}
-
-/// Fill `input_srcs_nar_size` on each node via batched QueryPathInfo.
-///
-/// The estimator's closure-size-as-proxy fallback: a derivation with
-/// 10GB of source tarballs probably takes longer than one with 100MB.
-/// Used when there's no `build_history` entry yet (cold start on a
-/// fresh `(pname, system)`).
-///
-/// Best-effort and ORTHOGONAL to the build actually working:
-/// - Store error → `warn!` once, leave all nodes at 0, return.
-/// - Path not in store → that src contributes 0.
-///
-/// Batching: union `input_srcs` across all nodes, dedup, query once
-/// each. ~50 nodes × ~30 shared srcs → 30 RPCs not 1500.
-async fn populate_input_srcs_sizes(
-    nodes: &mut [types::DerivationNode],
-    drv_cache: &HashMap<StorePath, Derivation>,
-    store_client: &mut StoreServiceClient<Channel>,
-) {
-    use crate::handler::grpc_query_path_info;
-
-    // HashSet not Vec: the dedup IS the point.
-    let mut all_srcs: HashSet<String> = HashSet::new();
-    for (_, _, drv) in iter_cached_drvs(nodes, drv_cache, "populate_input_srcs_sizes") {
-        all_srcs.extend(drv.input_srcs().iter().cloned());
-    }
-
-    if all_srcs.is_empty() {
-        // Pure inputDrv DAG. Nothing to do.
-        return;
-    }
-
-    // Single store error → bail whole batch. Partial fill is
-    // confusing for dashboards; prefer honest "no signal".
-    let mut sizes: HashMap<String, u64> = HashMap::with_capacity(all_srcs.len());
-    for src in &all_srcs {
-        // Input srcs are build INPUTS — anonymous lookup (no JWT).
-        // See resolve_derivation docstring for the rationale.
-        match grpc_query_path_info(store_client, None, src).await {
-            Ok(Some(info)) => {
-                sizes.insert(src.clone(), info.nar_size);
-            }
-            Ok(None) => {
-                sizes.insert(src.clone(), 0);
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    queried = sizes.len(),
-                    total = all_srcs.len(),
-                    "populate_input_srcs: store error mid-batch; leaving all nodes at 0"
-                );
-                return;
-            }
-        }
-    }
-
-    // saturating_add: if someone has >u64::MAX bytes of srcs they
-    // have bigger problems, but don't panic on it.
-    let sums: Vec<(usize, u64)> = iter_cached_drvs(nodes, drv_cache, "populate_input_srcs_sizes")
-        .map(|(idx, _, drv)| {
-            let sum = drv
-                .input_srcs()
-                .iter()
-                .map(|s| sizes.get(s).copied().unwrap_or(0))
-                .fold(0u64, |acc, x| acc.saturating_add(x));
-            (idx, sum)
-        })
-        .collect();
-    for (idx, sum) in sums {
-        nodes[idx].input_srcs_nar_size = sum;
     }
 }
 
@@ -419,10 +340,9 @@ pub fn validate_dag(
 /// `DerivationNode` field-add (the `is_fixed_output` divergence P0384
 /// fixed; the dual `is_content_addressed` annotations P0250 added).
 ///
-/// `drv_content`/`input_srcs_nar_size` are left zeroed —
-/// [`filter_and_inline_drv`] and [`populate_input_srcs_sizes`] fill
-/// them AFTER FindMissingPaths/BFS batching (see call-site comments
-/// on the wrappers).
+/// `drv_content` is left zeroed — [`filter_and_inline_drv`] fills it
+/// AFTER FindMissingPaths batching (see call-site comments on the
+/// wrappers).
 ///
 /// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
 /// predicate (single `out` with both `hash_algo` AND `hash` set) —
@@ -473,7 +393,6 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
         drv_content: Vec::new(),
-        input_srcs_nar_size: 0,
         is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the
         // full BFS so hash_derivation_modulo has the complete
@@ -492,9 +411,9 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
 /// Create a single-node DAG from a [`BasicDerivation`] (no inputDrvs).
 /// Used as fallback when the full [`Derivation`] is not available.
 ///
-/// Wraps the generic `build_node`. `drv_content`/`input_srcs_nar_size`
-/// stay zeroed — this is the "full drv not available" fallback; the
-/// worker fetches from store.
+/// Wraps the generic `build_node`. `drv_content` stays zeroed — this
+/// is the "full drv not available" fallback; the worker fetches from
+/// store.
 pub fn single_node_from_basic(
     drv_path: &str,
     basic_drv: &BasicDerivation,
@@ -504,10 +423,8 @@ pub fn single_node_from_basic(
 
 /// Convert a full [`Derivation`] into a proto `DerivationNode`.
 ///
-/// Wraps [`build_node`]. `drv_content`/`input_srcs_nar_size` are
-/// populated AFTER by [`filter_and_inline_drv`] (batched
-/// FindMissingPaths) and [`populate_input_srcs_sizes`] (batched
-/// QueryPathInfo across the whole DAG).
+/// Wraps [`build_node`]. `drv_content` is populated AFTER by
+/// [`filter_and_inline_drv`] (batched FindMissingPaths).
 fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
     build_node(drv_path.as_str(), drv)
 }
@@ -951,16 +868,6 @@ mod tests {
     /// Parse a minimal ATerm derivation with the given inputDrvs.
     /// Format: Derive([outputs],[inputDrvs],[inputSrcs],system,builder,args,env)
     fn make_test_derivation(out_path: &str, input_drvs: &[(&str, &[&str])]) -> Derivation {
-        make_test_derivation_with_srcs(out_path, input_drvs, &[])
-    }
-
-    /// Same as make_test_derivation but with explicit inputSrcs
-    /// (for populate_input_srcs_sizes tests).
-    fn make_test_derivation_with_srcs(
-        out_path: &str,
-        input_drvs: &[(&str, &[&str])],
-        input_srcs: &[&str],
-    ) -> Derivation {
         let outputs = format!(r#"[("out","{out_path}","","")]"#);
         let inputs: Vec<String> = input_drvs
             .iter()
@@ -970,10 +877,8 @@ mod tests {
             })
             .collect();
         let input_drvs_str = format!("[{}]", inputs.join(","));
-        let srcs_str: Vec<String> = input_srcs.iter().map(|s| format!(r#""{s}""#)).collect();
-        let input_srcs_str = format!("[{}]", srcs_str.join(","));
         let aterm = format!(
-            r#"Derive({outputs},{input_drvs_str},{input_srcs_str},"x86_64-linux","/bin/sh",[],[("out","{out_path}")])"#
+            r#"Derive({outputs},{input_drvs_str},[],"x86_64-linux","/bin/sh",[],[("out","{out_path}")])"#
         );
         Derivation::parse(&aterm).expect("test ATerm should parse")
     }
@@ -1332,115 +1237,6 @@ mod tests {
         assert!(
             !nodes[1].drv_content.is_empty(),
             "CA node should inline (empty path → always dispatches)"
-        );
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------
-    // populate_input_srcs_sizes
-    // -------------------------------------------------------------------
-
-    /// Two input_srcs seeded in store → node gets their sum.
-    /// Exercises the batch-query-then-sum-per-node flow.
-    #[tokio::test]
-    async fn test_input_srcs_sizes_sums_from_store() -> anyhow::Result<()> {
-        use rio_test_support::grpc::spawn_mock_store_with_client;
-
-        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
-
-        // Seed two srcs with known sizes. nar_size is what matters.
-        let src_a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src-a";
-        let src_b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src-b";
-        for (path, size) in [(src_a, 1000u64), (src_b, 500u64)] {
-            store.seed(
-                rio_proto::validated::ValidatedPathInfo {
-                    store_path: rio_nix::store_path::StorePath::parse(path)?,
-                    nar_hash: [0u8; 32],
-                    nar_size: size,
-                    store_path_hash: vec![],
-                    deriver: None,
-                    references: vec![],
-                    signatures: vec![],
-                    content_address: None,
-                    registration_time: 0,
-                    ultimate: false,
-                },
-                vec![0u8; 1],
-            );
-        }
-
-        // Derivation referencing both srcs.
-        let drv_path = sp(&test_drv_path("with-srcs"));
-        let drv = make_test_derivation_with_srcs(
-            "/nix/store/oooooooooooooooooooooooooooooooo-out",
-            &[],
-            &[src_a, src_b],
-        );
-        let mut cache = HashMap::new();
-        cache.insert(drv_path.clone(), drv.clone());
-
-        // reconstruct_dag calls populate_input_srcs_sizes internally.
-        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut client, &mut cache).await?;
-
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(
-            nodes[0].input_srcs_nar_size, 1500,
-            "sum of 1000 + 500 from the two seeded srcs"
-        );
-        Ok(())
-    }
-
-    /// Store error mid-batch → ALL nodes stay 0. Partial fill would
-    /// be confusing (some nodes have data, some don't — dashboards
-    /// comparing sizes see inconsistency).
-    #[tokio::test]
-    async fn test_input_srcs_sizes_store_error_leaves_zero() -> anyhow::Result<()> {
-        use rio_test_support::grpc::spawn_mock_store_with_client;
-
-        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
-
-        // Inject query_path_info failure.
-        store
-            .faults
-            .fail_query_path_info
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let src = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src";
-        let drv_path = sp(&test_drv_path("store-flaky"));
-        let drv = make_test_derivation_with_srcs(
-            "/nix/store/oooooooooooooooooooooooooooooooo-out",
-            &[],
-            &[src],
-        );
-        let mut cache = HashMap::new();
-        cache.insert(drv_path.clone(), drv.clone());
-
-        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut client, &mut cache).await?;
-
-        assert_eq!(
-            nodes[0].input_srcs_nar_size, 0,
-            "store error → 0 (no-signal), build still proceeds — this is estimation metadata"
-        );
-        Ok(())
-    }
-
-    /// No input_srcs (pure inputDrv chain) → 0, no store RPCs.
-    /// Uses unreachable_store to prove no RPC fired.
-    #[tokio::test]
-    async fn test_input_srcs_sizes_empty_no_rpc() -> anyhow::Result<()> {
-        let drv_path = sp(&test_drv_path("no-srcs"));
-        let drv = make_test_derivation("/nix/store/oooooooooooooooooooooooooooooooo-out", &[]);
-
-        let mut store = unreachable_store();
-        let mut cache = HashMap::new();
-
-        // If populate_input_srcs_sizes made an RPC, unreachable_store
-        // would fail it. Success proves the early-return on empty.
-        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut store, &mut cache).await?;
-
-        assert_eq!(
-            nodes[0].input_srcs_nar_size, 0,
-            "no srcs → 0, no RPC (unreachable store didn't error)"
         );
         Ok(())
     }

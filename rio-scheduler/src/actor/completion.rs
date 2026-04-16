@@ -1329,9 +1329,9 @@ impl DagActor {
         }
     }
 
-    /// Phase 7 of success completion: build_history EMA update,
-    /// build_samples insert (rebalancer feed), and misclassification
-    /// penalty. All best-effort statistics — never fails completion.
+    /// Phase 7 of success completion: build_samples insert (SLA-fit
+    /// feed) and actual-vs-predicted scoring. All best-effort
+    /// statistics — never fails completion.
     async fn record_build_history(
         &mut self,
         drv_hash: &DrvHash,
@@ -1351,48 +1351,26 @@ impl DagActor {
             let duration_secs = actual.as_secs_f64();
             // Sanity bound: reject durations > 30 days (bogus worker timestamps)
             if duration_secs > 0.0 && duration_secs < 30.0 * 86400.0 {
-                // 0 → None: "no signal" must not drag the EMA toward
-                // zero. Worker uses 0 for build-failed-before-cgroup-
-                // populated paths. A real build using 0 bytes doesn't
-                // exist (nix-daemon alone is ~10MB cgroup peak); 0.0
-                // CPU cores likewise means "no samples taken" (build
-                // exited in <1s before the 1Hz poller fired).
-                //
-                // Phase2c correction: prior values in build_history
-                // are the WRONG memory (~10MB for every build, from
-                // daemon-PID VmHWM). cgroup memory.peak is correct.
-                // EMA alpha=0.3 → 0.7^10 ≈ 2.8% old value after 10
-                // completions. No migration; time heals.
-                let peak_mem = (peak_memory_bytes > 0).then_some(peak_memory_bytes);
+                // 0.0 CPU cores → "no samples taken" (build exited in
+                // <1s before the 1Hz poller fired). Filtered to None so
+                // the SLA fit's saturation detector doesn't see a
+                // spurious 0.
                 let peak_cpu = (peak_cpu_cores > 0.0).then_some(peak_cpu_cores);
-                if let Err(e) = self
-                    .db
-                    .update_build_history(pname, &state.system, duration_secs, peak_mem, peak_cpu)
-                    .await
-                {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");
-                }
-
-                // Raw sample for the CutoffRebalancer (P0229). Unlike
-                // the EMA above (one smoothed scalar per pname), this
-                // appends every completion — the rebalancer needs the
-                // full distribution. Best-effort: warn, never fail
-                // completion on sample-write error.
+                // Raw sample for the SLA fit. Appends every completion
+                // — the fit needs the full distribution, not a smoothed
+                // scalar. Best-effort: warn, never fail completion on
+                // sample-write error.
                 //
-                // FODs excluded (ADR-019): the rebalancer partitions
-                // BUILDER size classes by CPU-bound duration. Fetch
-                // durations are network-bound noise; mixing them into
-                // the SITA-E partition drags cutoffs toward whatever
-                // the upstream mirror's bandwidth happens to be.
-                // Fetchers aren't size-classed, so there's nothing to
-                // rebalance on their side anyway.
+                // FODs excluded (ADR-019): the SLA model fits BUILDER
+                // CPU-bound duration. Fetch durations are network-bound
+                // noise; mixing them into the per-key T(c) curve drags
+                // it toward whatever the upstream mirror's bandwidth
+                // happens to be.
                 //
-                // peak_memory_bytes passed raw (as i64), not the 0→None
-                // filtered Option — the rebalancer wants the full
-                // distribution including zeros; 0 is a legitimate
-                // sample point ("sub-second build, poller didn't fire").
-                // The EMA needs the filter to avoid dragging toward 0;
-                // the percentile computation doesn't.
+                // peak_memory_bytes passed raw (as i64), not 0→None
+                // filtered — 0 is a legitimate sample point
+                // ("sub-second build, poller didn't fire"); the
+                // percentile computation doesn't drag.
                 if !state.is_fixed_output {
                     // Tenant: first interested build's tenant_id,
                     // stringified. A derivation shared across tenants
@@ -1420,8 +1398,6 @@ impl DagActor {
                         // only fires on a misbehaving worker — but it
                         // costs nothing and prevents silent corruption.
                         peak_memory_bytes: peak_memory_bytes.min(i64::MAX as u64) as i64,
-                        // peak_cpu_cores: same 0→None filter as the EMA —
-                        // 0.0 means "no samples taken", not "used 0 cores".
                         peak_cpu_cores: peak_cpu,
                         // ADR-023 cgroup telemetry: builder attaches its
                         // final ResourceUsage snapshot to CompletionReport

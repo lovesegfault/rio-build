@@ -11,17 +11,9 @@ use super::*;
 async fn test_size_class_routing_respects_classification() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // Pre-seed build_history: "bigthing" has a 120s EMA. With a 30s
-    // small cutoff, classify() will pick "large". Without this seed,
-    // est_duration defaults to 30s (DEFAULT_DURATION_SECS) and hits
-    // the small class exactly — not what we want to test.
-    sqlx::query(
-        "INSERT INTO build_history (pname, system, ema_duration_secs, sample_count, last_updated) \
-         VALUES ('bigthing', 'x86_64-linux', 120.0, 1, now())",
-    )
-    .execute(&db.pool)
-    .await?;
-
+    // est_duration defaults to 60s (DEFAULT_DURATION_SECS) for an
+    // unfitted SLA key. With a 30s small cutoff, classify() picks
+    // "large" — no seed needed.
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.size_classes = size_classes(&[("small", 30.0), ("large", 3600.0)]);
     });
@@ -52,15 +44,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     })
     .await?;
 
-    // Prime the estimator. Normally it refreshes on Tick every 60s;
-    // for the test we trigger it via 6 Ticks (the refresh cadence).
-    // Without this, estimator is empty → est_duration=30s default →
-    // goes to "small" → test passes for the wrong reason.
-    for _ in 0..6 {
-        handle.send_unchecked(ActorCommand::Tick).await?;
-    }
-
-    // Merge a build with pname="bigthing" so estimator matches.
     let build_id = Uuid::new_v4();
     let mut node = make_node("bigthing-hash");
     node.pname = "bigthing".into();
@@ -1297,7 +1280,7 @@ async fn size_class_floor_skips_smaller(
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
+        c.size_classes = size_classes(&[("tiny", 60.0), ("small", 3600.0)]);
         // Zero backoff so the retry redispatches on the next Tick.
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,

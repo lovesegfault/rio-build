@@ -314,7 +314,7 @@ src/
 │   ├── batch.rs       # Batched multi-row INSERT helpers
 │   ├── builds.rs      # builds table CRUD + terminal transitions
 │   ├── derivations.rs # derivations table CRUD + status transitions
-│   ├── history.rs     # build_history EMA UPSERT (duration + peak-mem)
+│   ├── history.rs     # build_samples write/retention + sla_overrides CRUD
 │   ├── live_pins.rs   # GC live-pin rows (non-terminal build outputs)
 │   ├── recovery.rs    # Non-terminal state reload queries
 │   ├── tenants.rs     # tenant rows + quota columns
@@ -324,7 +324,6 @@ src/
 │   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
 ├── assignment.rs      # Executor selection (hard-filter, first-match) + size-class classify()
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
-├── estimator.rs       # Duration/memory estimates from build_history
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
 └── queue.rs           # ReadyQueue: BinaryHeap with lazy invalidation
 ```

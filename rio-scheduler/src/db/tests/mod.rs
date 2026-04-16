@@ -54,11 +54,6 @@ pub(super) async fn insert_test_derivation(
 }
 
 #[test]
-fn test_ema_alpha_range() {
-    const { assert!(EMA_ALPHA > 0.0 && EMA_ALPHA < 1.0) };
-}
-
-#[test]
 fn test_derivation_status_roundtrip() -> anyhow::Result<()> {
     for status in [
         DerivationStatus::Created,

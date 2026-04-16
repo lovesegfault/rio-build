@@ -475,11 +475,16 @@ impl DagActor {
         // are correctly excluded from their parents' max-child (a
         // cached dep doesn't block anything — it's done).
         //
-        // This sets est_duration (from estimator) + priority (bottom-up)
-        // for new nodes, and propagates to existing nodes if the new
-        // subgraph raises their priority. The ready queue reads these
-        // for BinaryHeap ordering.
-        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        // This sets est_duration (SLA T_min, default 60s on miss) +
+        // priority (bottom-up) for new nodes, and propagates to existing
+        // nodes if the new subgraph raises their priority. The ready
+        // queue reads these for BinaryHeap ordering.
+        crate::critical_path::compute_initial(
+            &mut self.dag,
+            &self.sla_estimator,
+            &self.builds,
+            newly_inserted,
+        );
         phase!("6b-critical-path");
 
         // I-047: pre-existing Completed nodes may have stale output_paths

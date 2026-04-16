@@ -748,11 +748,11 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
     let (_db, handle, _task) = setup_with_classes(&[
-        ("tiny", 30.0),
-        ("small", 60.0),
-        ("medium", 90.0),
-        ("large", 120.0),
-        ("xlarge", 150.0),
+        ("tiny", 60.0),
+        ("small", 90.0),
+        ("medium", 120.0),
+        ("large", 150.0),
+        ("xlarge", 180.0),
     ])
     .await;
 
@@ -873,7 +873,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     use rio_proto::types::TerminationReason;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
+        c.size_classes = size_classes(&[("tiny", 60.0), ("small", 3600.0)]);
     });
 
     let mut rx = connect_executor_classed(&handle, "w-tiny", "x86_64-linux", "tiny", kind).await?;
@@ -990,7 +990,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
 /// depth.
 #[tokio::test]
 async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
-    let (_db, handle, _task) = setup_with_classes(&[("tiny", 30.0), ("small", 3600.0)]).await;
+    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0), ("small", 3600.0)]).await;
 
     let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;
     send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
@@ -1078,7 +1078,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 #[tokio::test]
 async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup_with_classes(&[("tiny", 30.0), ("small", 3600.0)]).await;
+    let (_db, handle, _task) = setup_with_classes(&[("tiny", 60.0), ("small", 3600.0)]).await;
 
     // Pod name = `{job}-{5char}` (k8s Job-controller suffix).
     let mut rx = connect_builder_classed(
@@ -1515,10 +1515,11 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
     let _ev = merge_single_node(&handle, build_id, "bs-drv", PriorityClass::Scheduled).await?;
     let _assignment = recv_assignment(&mut rx).await;
 
-    // Backdate running_since. 100s is plenty past the 0s test floor.
-    // Also transitions Assigned → Running (required for the backstop
-    // check: it only fires on status==Running).
-    let ok = handle.debug_backdate_running("bs-drv", 100).await?;
+    // Backdate running_since. 200s clears est_duration×3 (60×3=180)
+    // with the 0s test floor. Also transitions Assigned → Running
+    // (required for the backstop check: it only fires on
+    // status==Running).
+    let ok = handle.debug_backdate_running("bs-drv", 200).await?;
     assert!(ok, "debug_backdate_running should succeed for Assigned drv");
 
     // Tick → backstop check → CancelSignal + reassign.

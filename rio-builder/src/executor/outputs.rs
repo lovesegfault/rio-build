@@ -21,17 +21,15 @@ use crate::upload;
 use super::ExecutorError;
 use super::inputs::verify_fod_hashes;
 
-/// Collected build outputs: proto BuildResult + total uploaded bytes.
+/// Collected build outputs: proto BuildResult.
 pub(super) struct BuildOutputs {
     /// Proto BuildResult to send to the scheduler in CompletionReport.
     pub(super) proto_result: ProtoBuildResult,
-    /// Sum of uploaded NAR sizes. 0 on build failure or output rejection.
-    pub(super) output_size_bytes: u64,
 }
 
 impl BuildOutputs {
     /// Failure-path shorthand: status + error_msg only, all other
-    /// `ProtoBuildResult` fields default, `output_size_bytes` 0.
+    /// `ProtoBuildResult` fields default.
     fn failed(status: BuildResultStatus, error_msg: impl Into<String>) -> Self {
         Self {
             proto_result: ProtoBuildResult {
@@ -39,7 +37,6 @@ impl BuildOutputs {
                 error_msg: error_msg.into(),
                 ..Default::default()
             },
-            output_size_bytes: 0,
         }
     }
 }
@@ -184,9 +181,6 @@ pub(super) async fn collect_outputs(
     .await
     {
         Ok(upload_results) => {
-            // Sum NAR sizes for the CompletionReport.
-            let output_size_bytes: u64 = upload_results.iter().map(|r| r.nar_size).sum();
-
             // Map store_path → output_name. Upload results are
             // unordered (buffer_unordered), and even the prior
             // sequential scan had undefined order (read_dir).
@@ -248,12 +242,12 @@ pub(super) async fn collect_outputs(
 
             // start/stop_time: nix-daemon's BuildResult already has
             // these as Unix epoch seconds (rio-nix/build.rs:118-120).
-            // Scheduler guards update_build_history on BOTH being
-            // Some (completion.rs:182) — without them, EMA duration
-            // can't be computed and the WHOLE build_history write
-            // is skipped (peak_memory_bytes included). VM tests
-            // bypass this via direct psql INSERT — only live
-            // scheduler-worker integration exercises it.
+            // Scheduler guards write_build_sample on BOTH being Some
+            // (completion.rs duration check) — without them, duration
+            // can't be computed and the WHOLE build_samples write is
+            // skipped (peak_memory_bytes included). VM tests bypass
+            // this via direct psql INSERT — only live scheduler-worker
+            // integration exercises it.
             //
             // 0 → None: nix-daemon sends 0 on some error paths.
             // A real build at 1970-01-01 doesn't exist.
@@ -272,7 +266,6 @@ pub(super) async fn collect_outputs(
                     stop_time: to_proto_ts(build_result.stop_time),
                     built_outputs,
                 },
-                output_size_bytes,
             })
         }
         Err(e) => {

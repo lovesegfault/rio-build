@@ -187,12 +187,12 @@ message CompletionReport {
   BuildResult result = 2;        // Build result details (status, outputs, timing)
   string assignment_token = 3;   // Echoed from WorkAssignment
   uint64 peak_memory_bytes = 4;  // memory.peak from per-build cgroup (tree-wide, single read at end)
-  uint64 output_size_bytes = 5;  // Sum of NAR sizes uploaded across all outputs
+  reserved 5;                    // was output_size_bytes
   double peak_cpu_cores = 6;     // Max of 1Hz-sampled cpu.stat delta (cores-equivalent; double for fractional cores)
 }
 ```
 
-`peak_memory_bytes` / `peak_cpu_cores` feed the `build_history` EMA columns for size-class memory-bump routing. Zero is the no-signal sentinel (cgroup setup failed or build failed before the cgroup was populated) — the scheduler keeps the prior EMA instead of dragging toward zero. cgroup v2 is a **hard requirement**; the executor fails startup if the delegated subtree is unavailable.
+`peak_memory_bytes` / `peak_cpu_cores` feed the `build_samples` table for the ADR-023 SLA fit. Zero is the no-signal sentinel (cgroup setup failed or build failed before the cgroup was populated). cgroup v2 is a **hard requirement**; the executor fails startup if the delegated subtree is unavailable.
 
 ### HeartbeatRequest
 
@@ -290,9 +290,7 @@ message DerivationNode {
   bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = executor fetches from store.
                                    // Populated by gateway's filter_and_inline_drv ONLY for nodes with
                                    // missing outputs (≤64KB per node, 16MB total DAG budget).
-  uint64 input_srcs_nar_size = 10; // Sum of nar_size of this node's input_srcs (direct static sources,
-                                   // NOT transitive). Estimator fallback for fresh (pname,system) with
-                                   // no build_history. 0 = no-signal (skip fallback, use 30s default).
+  reserved 10;                     // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
   bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
                                    // is_fixed_output(). Gates scheduler's hash-compare on completion.
   bytes ca_modular_hash = 12;      // 32-byte blake3 modular derivation hash (CA nodes from gateway BFS only;
