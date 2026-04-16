@@ -679,7 +679,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/state/` — State machines (DerivationStatus, BuildState), transition validation, RetryPolicy, newtypes (DrvHash, ExecutorId)
 - `rio-scheduler/src/queue.rs` — Priority BinaryHeap ReadyQueue (OrderedFloat + lazy invalidation)
 - `rio-scheduler/src/critical_path.rs` — Bottom-up priority: `est_duration + max(children's priority)`; incremental ancestor-walk on completion
-- `rio-scheduler/src/assignment.rs` — Hard-filter executor selection + size-class classify()
+- `rio-scheduler/src/assignment.rs` — Hard-filter executor selection (best_executor)
 - `rio-scheduler/src/actor/floor.rs` — D4 reactive `resource_floor` doubling (`bump_floor_or_count`)
 - `rio-scheduler/src/grpc/` — SchedulerService + ExecutorService gRPC implementations
 - `rio-scheduler/src/db/` — PostgreSQL persistence (derivations, assignments, build_samples telemetry; split into 9 domain modules per P0411)

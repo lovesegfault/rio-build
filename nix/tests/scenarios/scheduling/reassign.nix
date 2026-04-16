@@ -11,12 +11,11 @@ scope: with scope; ''
   # → redispatch → completes on a different worker.
   with subtest("reassign: SIGKILL mid-build, build completes elsewhere"):
       # Gate: prior subtests (setoptions-unreachable, cancel-timing)
-      # leave one-shot small workers in their RestartSec=1s + reconnect
-      # window. If BOTH smalls are unregistered at submit time the
-      # scheduler dispatches to wlarge immediately and the small_workers
-      # poll below never matches. workers_active==3 ⇒ wsmall1 + wsmall2
-      # + wlarge all registered. 30s budget covers RestartSec=1s +
-      # HEARTBEAT_INTERVAL=10s with slack.
+      # leave one-shot workers in their RestartSec=1s + reconnect
+      # window. classify() is gone so the poll below checks ALL
+      # workers; this gate now only ensures the full fleet is back
+      # so kill→redispatch has somewhere else to go. 30s budget
+      # covers RestartSec=1s + HEARTBEAT_INTERVAL=10s with slack.
       for _ in range(30):
           _wa = metric_value(
               scrape_metrics(${gatewayHost}, 9091),
@@ -46,15 +45,14 @@ scope: with scope; ''
       bg_thread = threading.Thread(target=_bg, daemon=True)
       bg_thread.start()
 
-      # Find which SMALL worker got the FIRST assignment. No-pname
-      # drv → estimator default → "small" class, floor=None. With
-      # 2 small workers idle and 0 builds in flight, it MUST go to
-      # wsmall1 or wsmall2. 60s: one-shot builders may both be in
-      # the RestartSec=1s gap when the build lands; worst case is
-      # one restart cycle + heartbeat + dispatch tick.
+      # Find which worker got the FIRST assignment. classify() is
+      # gone (hard_filter no longer matches size_class) → any
+      # registered worker may take it. 60s: one-shot builders may
+      # all be in the RestartSec=1s gap when the build lands; worst
+      # case is one restart cycle + heartbeat + dispatch tick.
       assigned = None
       for _ in range(60):
-          for w in small_workers:
+          for w in all_workers:
               c = w.succeed(
                   "journalctl -u rio-builder --no-pager | "
                   "grep -c 'rio-test-sched-reassign' || true"
@@ -66,7 +64,7 @@ scope: with scope; ''
               break
           _time.sleep(1)
       assert assigned is not None, (
-          "no small worker picked up rio-test-sched-reassign within 60s"
+          "no worker picked up rio-test-sched-reassign within 60s"
       )
       print(f"reassign: assigned to {assigned.name}, killing")
 

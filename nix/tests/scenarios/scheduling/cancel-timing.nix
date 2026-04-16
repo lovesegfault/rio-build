@@ -35,17 +35,18 @@ scope: with scope; ''
       # (executor/mod.rs:973) = basename with . → _, so the cgroup
       # name ends "-sched-cancel-timing_drv".
       #
-      # No-pname drv → default "small" class → wsmall1 OR wsmall2.
-      # Probe both; first hit wins. DelegateSubgroup=builds puts
-      # per-build cgroups as SIBLINGS of builds/ under the service
-      # cgroup (worker.nix:180). `find -print -quit` stops at first
-      # match; `| grep .` fails on empty output (find exits 0 on
-      # no-match) so the Python-side rc check works.
+      # classify() is gone (hard_filter no longer matches size_class)
+      # → cancelDrv can land on ANY worker. Probe all; first hit
+      # wins. DelegateSubgroup=builds puts per-build cgroups as
+      # SIBLINGS of builds/ under the service cgroup (worker.nix:180).
+      # `find -print -quit` stops at first match; `| grep .` fails on
+      # empty output (find exits 0 on no-match) so the Python-side rc
+      # check works.
       cgroup_parent = "/sys/fs/cgroup/system.slice/rio-builder.service"
       assigned = None
       cgroup_path = None
       for _ in range(30):
-          for w in small_workers:
+          for w in all_workers:
               rc, out = w.execute(
                   f"find {cgroup_parent} -maxdepth 1 -type d "
                   f"-name '*sched-cancel-timing_drv' -print -quit "
@@ -59,7 +60,7 @@ scope: with scope; ''
               break
           _time.sleep(1)
       assert assigned is not None, (
-          "no small worker created a cgroup for cancelDrv within 30s"
+          "no worker created a cgroup for cancelDrv within 30s"
       )
       print(f"cancel-timing: assigned={assigned.name}, cgroup={cgroup_path}")
 
