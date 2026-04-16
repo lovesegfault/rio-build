@@ -18,21 +18,36 @@ use crate::state::DerivationState;
 /// day is a runaway regardless of pod shape.
 pub(super) const DEADLINE_CAP_SECS: u32 = 86_400;
 
+/// Result of [`bump_floor_or_count`]. Two independent bits because
+/// callers need both: `promoted` gates the promotion-exempt path
+/// (`r[sched.retry.promotion-exempt+2]`); `counted` lets callers that
+/// ALSO own a fall-through increment (`handle_infrastructure_failure`
+/// `:1906`) skip it — without this the at-cap cgroup-OOM path
+/// double-counted (bump's at-cap increment + caller's generic-infra
+/// increment) and poisoned at half the configured budget.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FloorOutcome {
+    /// Floor changed; next dispatch will be larger. Promotion-exempt.
+    pub promoted: bool,
+    /// Floor was already at cap; the matching retry counter
+    /// (`infra_count` for mem/disk, `timeout_count` for deadline) was
+    /// incremented HERE. Caller MUST NOT increment again.
+    pub counted: bool,
+}
+
 // r[impl sched.sla.reactive-floor]
 // r[impl sched.retry.promotion-exempt+2]
 /// Double the relevant `resource_floor` dimension on an explicit
 /// resource-exhaustion signal, or — if already at the cap — increment
-/// the matching retry counter instead. Returns `true` iff the floor
-/// changed (i.e. the next dispatch will be larger). Callers treat
-/// `true` as "promotion exempt": no `retry_count`/`failure_count`
-/// increment, no `failed_builders` insert.
+/// the matching retry counter instead. See [`FloorOutcome`].
 ///
 /// `last_intent` (the doubling base) is `state.sched.est_*` —
 /// snapshotted at dispatch time alongside `est_memory_bytes`. The
 /// `max(floor, est)` form means a stale floor (lower than what was
 /// actually dispatched) doesn't under-double; if both are zero (cold
-/// start with the SLA gate skipped), the helper returns `false` so
-/// the caller's retry budget bounds it.
+/// start with the SLA gate skipped), the helper returns
+/// `{promoted:false, counted:false}` so the caller's retry budget
+/// bounds it.
 ///
 /// `infra_count` for OOM/DiskPressure (mem/disk under-provision are
 /// infrastructure failures); `timeout_count` for DeadlineExceeded
@@ -42,14 +57,17 @@ pub fn bump_floor_or_count(
     state: &mut DerivationState,
     reason: TerminationReason,
     ceil: &Ceilings,
-) -> bool {
+) -> FloorOutcome {
     use TerminationReason as R;
     let floor = &mut state.sched.resource_floor;
     match reason {
         R::OomKilled => {
             if floor.mem_bytes >= ceil.max_mem {
                 state.retry.infra_count += 1;
-                false
+                FloorOutcome {
+                    promoted: false,
+                    counted: true,
+                }
             } else {
                 let base = floor
                     .mem_bytes
@@ -57,13 +75,19 @@ pub fn bump_floor_or_count(
                 let next = base.saturating_mul(2).min(ceil.max_mem);
                 let changed = next > floor.mem_bytes;
                 floor.mem_bytes = next;
-                changed
+                FloorOutcome {
+                    promoted: changed,
+                    counted: false,
+                }
             }
         }
         R::EvictedDiskPressure => {
             if floor.disk_bytes >= ceil.max_disk {
                 state.retry.infra_count += 1;
-                false
+                FloorOutcome {
+                    promoted: false,
+                    counted: true,
+                }
             } else {
                 let base = floor
                     .disk_bytes
@@ -71,13 +95,19 @@ pub fn bump_floor_or_count(
                 let next = base.saturating_mul(2).min(ceil.max_disk);
                 let changed = next > floor.disk_bytes;
                 floor.disk_bytes = next;
-                changed
+                FloorOutcome {
+                    promoted: changed,
+                    counted: false,
+                }
             }
         }
         R::DeadlineExceeded => {
             if floor.deadline_secs >= DEADLINE_CAP_SECS {
                 state.retry.timeout_count += 1;
-                false
+                FloorOutcome {
+                    promoted: false,
+                    counted: true,
+                }
             } else {
                 let base = floor
                     .deadline_secs
@@ -85,12 +115,15 @@ pub fn bump_floor_or_count(
                 let next = base.saturating_mul(2).min(DEADLINE_CAP_SECS);
                 let changed = next > floor.deadline_secs;
                 floor.deadline_secs = next;
-                changed
+                FloorOutcome {
+                    promoted: changed,
+                    counted: false,
+                }
             }
         }
         // Non-resource reasons (pod-kill, node failure, expected
         // one-shot exit, unclassified) are not sizing signals.
-        R::EvictedOther | R::Completed | R::Error | R::Unknown => false,
+        R::EvictedOther | R::Completed | R::Error | R::Unknown => FloorOutcome::default(),
     }
 }
 
@@ -120,19 +153,13 @@ mod tests {
     fn oom_doubles_from_est_then_floor() {
         let mut s = st();
         s.sched.est_memory_bytes = Some(4 << 30);
-        assert!(bump_floor_or_count(
-            &mut s,
-            TerminationReason::OomKilled,
-            &DEFAULT_CEILINGS
-        ));
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &DEFAULT_CEILINGS);
+        assert!(o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.mem_bytes, 8 << 30);
         assert_eq!(s.retry.infra_count, 0);
         // Second bump: floor (8) > est (4) → base=8 → 16.
-        assert!(bump_floor_or_count(
-            &mut s,
-            TerminationReason::OomKilled,
-            &DEFAULT_CEILINGS
-        ));
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &DEFAULT_CEILINGS);
+        assert!(o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.mem_bytes, 16 << 30);
     }
 
@@ -140,11 +167,8 @@ mod tests {
     fn at_ceiling_increments_infra_not_floor() {
         let mut s = st();
         s.sched.resource_floor.mem_bytes = DEFAULT_CEILINGS.max_mem;
-        assert!(!bump_floor_or_count(
-            &mut s,
-            TerminationReason::OomKilled,
-            &DEFAULT_CEILINGS
-        ));
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &DEFAULT_CEILINGS);
+        assert!(!o.promoted && o.counted);
         assert_eq!(s.retry.infra_count, 1);
         assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
     }
@@ -153,20 +177,22 @@ mod tests {
     fn deadline_uses_timeout_count_and_24h_cap() {
         let mut s = st();
         s.sched.est_deadline_secs = Some(3600);
-        assert!(bump_floor_or_count(
+        let o = bump_floor_or_count(
             &mut s,
             TerminationReason::DeadlineExceeded,
-            &DEFAULT_CEILINGS
-        ));
+            &DEFAULT_CEILINGS,
+        );
+        assert!(o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.deadline_secs, 7200);
         assert_eq!(s.retry.timeout_count, 0, "below cap → no count");
         // At cap: timeout_count++, not infra_count.
         s.sched.resource_floor.deadline_secs = DEADLINE_CAP_SECS;
-        assert!(!bump_floor_or_count(
+        let o = bump_floor_or_count(
             &mut s,
             TerminationReason::DeadlineExceeded,
-            &DEFAULT_CEILINGS
-        ));
+            &DEFAULT_CEILINGS,
+        );
+        assert!(!o.promoted && o.counted);
         assert_eq!(s.retry.timeout_count, 1);
         assert_eq!(
             s.retry.infra_count, 0,
@@ -176,14 +202,12 @@ mod tests {
 
     #[test]
     fn cold_start_zero_base_is_noop_not_promote() {
-        // est=None, floor=0 → base=0 → next=0 → unchanged → false.
-        // Caller's retry budget bounds it instead of looping at floor=0.
+        // est=None, floor=0 → base=0 → next=0 → unchanged.
+        // {promoted:false, counted:false} → caller's retry budget
+        // bounds it instead of looping at floor=0.
         let mut s = st();
-        assert!(!bump_floor_or_count(
-            &mut s,
-            TerminationReason::OomKilled,
-            &DEFAULT_CEILINGS
-        ));
+        let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &DEFAULT_CEILINGS);
+        assert!(!o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.mem_bytes, 0);
         assert_eq!(s.retry.infra_count, 0, "below cap → not counted either");
     }
@@ -198,7 +222,8 @@ mod tests {
             TerminationReason::EvictedOther,
             TerminationReason::Unknown,
         ] {
-            assert!(!bump_floor_or_count(&mut s, r, &DEFAULT_CEILINGS));
+            let o = bump_floor_or_count(&mut s, r, &DEFAULT_CEILINGS);
+            assert!(!o.promoted && !o.counted);
         }
         assert_eq!(s.sched.resource_floor, Default::default());
         assert_eq!(s.retry.infra_count, 0);

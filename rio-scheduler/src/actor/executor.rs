@@ -457,7 +457,9 @@ impl DagActor {
             return false;
         };
 
-        self.bump_resource_floor(&drv_hash, reason, label).await
+        self.bump_resource_floor(&drv_hash, reason, label)
+            .await
+            .promoted
     }
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
@@ -497,7 +499,8 @@ impl DagActor {
 
         let promoted = self
             .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
-            .await;
+            .await
+            .promoted;
 
         let max = self.retry_policy.max_timeout_retries;
         if let Some(state) = self.dag.node(&drv_hash) {

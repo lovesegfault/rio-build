@@ -913,6 +913,101 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.promotion-exempt+2]
+/// Regression: at-cap cgroup-OOM (worker-reported InfrastructureFailure
+/// path) used to double-count `infra_count` — `bump_floor_or_count`
+/// incremented at-cap, THEN `handle_infrastructure_failure`'s
+/// fall-through generic-infra increment fired again. Poisoned at half
+/// the configured `max_infra_retries`.
+///
+/// With `max_infra_retries=4`, 3 at-cap cgroup-OOM cycles MUST leave
+/// `infra_count==3` (not 6), NOT poisoned; the 4th cycle poisons
+/// (bump's increment runs BEFORE the cap check, so cycle N sees
+/// `infra_count==N` at the gate).
+#[tokio::test]
+async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
+    use crate::sla::solve::DEFAULT_CEILINGS;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = size_classes(&[("tiny", 60.0)]);
+        c.retry_policy = crate::RetryPolicy {
+            max_infra_retries: 4,
+            ..Default::default()
+        };
+    });
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "cap-coom",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .debug_seed_sched_hint(
+            "cap-coom",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: DEFAULT_CEILINGS.max_mem,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let p = test_drv_path("cap-coom");
+
+    // ── Cycles 1..=3: each counts ONCE; not poisoned ────────────────
+    for i in 1..=3u32 {
+        let id = format!("b-coom-{i}");
+        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "tiny").await?;
+        let _ = recv_assignment(&mut rx).await;
+        complete_failure(
+            &handle,
+            &id,
+            &p,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            "cgroup OOM during build; promoting size class",
+        )
+        .await?;
+        drop(rx);
+        let s = expect_drv(&handle, "cap-coom").await;
+        assert_eq!(
+            s.retry.infra_count,
+            i,
+            "cycle {i}: at-cap cgroup-OOM counts ONCE (was double-counting → {})",
+            i * 2
+        );
+        assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
+        assert_ne!(
+            s.status,
+            DerivationStatus::Poisoned,
+            "cycle {i}: infra_count={i} < max_infra_retries=4 → NOT poisoned"
+        );
+    }
+
+    // ── Cycle 4: bump→infra_count=4; cap check 4>=4 → poison ────────
+    let mut rx = connect_builder_classed(&handle, "b-coom-4", "x86_64-linux", "tiny").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "b-coom-4",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "cgroup OOM during build; promoting size class",
+    )
+    .await?;
+    drop(rx);
+    let s = expect_drv(&handle, "cap-coom").await;
+    assert_eq!(s.retry.infra_count, 4);
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "cycle 4: infra_count=4 >= max_infra_retries=4 → poison"
+    );
+    Ok(())
+}
+
 // r[verify sched.fod.size-class-reactive]
 // r[verify sched.builder.size-class-reactive]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]

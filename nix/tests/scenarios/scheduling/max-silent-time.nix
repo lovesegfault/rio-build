@@ -5,7 +5,7 @@ scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
   # max-silent-time — silence arm kills at ~10s, NOT 60s wall-clock
   # ══════════════════════════════════════════════════════════════════
-  # silenceDrv echoes once then sleeps 60s. wlarge has worker-config
+  # silenceDrv echoes once then sleeps 60s. ALL scheduling workers have
   # RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The stderr-loop
   # silence select! arm fires ~10s after the echo → BuildStatus::TimedOut
   # → cgroup.kill() reaps the sleep. Wall-clock elapsed MUST be <<60s;
@@ -18,14 +18,11 @@ scope: with scope; ''
   # session. Worker config is the operator's fleet default until a
   # gateway-side propagation path lands (follow-up).
   #
-  # ROUTING: seed build_history with 120s EMA for pname rio-sched-silence
-  # → classify() picks "large" → dispatches to wlarge (the only worker
-  # with the silence config). Same pattern as sizeclass/bigthing.
+  # Decoupled from classify(): every worker has the silence config, so
+  # the test passes regardless of which class silenceDrv routes to.
+  # Previously this relied on cutoff_secs routing to wlarge — broke when
+  # the cutoff moved 30→60, and classify() is being deleted anyway.
   with subtest("max-silent-time: silence arm kills at ~10s, not 60s wall-clock"):
-      # est_duration defaults to 60s (DEFAULT_DURATION_SECS) for an
-      # unfitted SLA key, which classify() routes to "large" given the
-      # 30s small cutoff — no seed needed.
-
       # expect_fail=True: TimedOut is a build FAILURE (nix-build
       # exits nonzero). The timing wrap stays at the callsite —
       # measures end-to-end including ssh setup, not just build.
@@ -55,8 +52,7 @@ scope: with scope; ''
           f"expected silence kill at ~10s/attempt (per-attempt "
           f"~12-25s), got {per_attempt:.1f}s over {attempts} attempts "
           f"(total {elapsed:.1f}s). If ~60s/attempt: silence arm "
-          f"never fired, sleep ran to completion (routed to a worker "
-          f"without RIO_MAX_SILENT_TIME_SECS?). If <8s: failed "
+          f"never fired, sleep ran to completion. If <8s: failed "
           f"before silence deadline.\nBuild output:\n{out}"
       )
       # I-200 retry loop sanity: with default max_timeout_retries=4
@@ -69,29 +65,24 @@ scope: with scope; ''
           f"Build output:\n{out}"
       )
 
-      # wlarge must have logged the silence warn. journalctl grep is
-      # the end-to-end proof that RIO (not the local nix-daemon) fired.
-      # If this is 0 but elapsed is in-range, the nix-daemon enforced
-      # it instead — rio-side backstop didn't fire (impl bug).
-      warn_count = wlarge.succeed(
-          "journalctl -u rio-builder --no-pager | "
-          "grep -c 'silent for maxSilentTime' || true"
-      ).strip()
-      assert int(warn_count or "0") >= 1, (
-          f"wlarge did not log 'silent for maxSilentTime'. Either "
-          f"(a) routed to wrong worker (check classify), or (b) local "
-          f"nix-daemon enforced maxSilentTime before rio-side fired.\n"
-          f"Build output:\n{out}"
-      )
-
-      # Confirm NOT routed to small workers (proves build_history seed
-      # → classify → wlarge worked). If silenceDrv landed on a small
-      # worker, it would have run 60s and succeeded (no silence config).
-      for w in small_workers:
-          w.fail(
+      # SOME worker must have logged the silence warn. journalctl grep
+      # is the end-to-end proof that RIO (not the local nix-daemon)
+      # fired. If this is 0 but elapsed is in-range, the nix-daemon
+      # enforced it instead — rio-side backstop didn't fire (impl bug).
+      # Sum across all workers: I-200 retries may land on different
+      # workers each attempt.
+      warn_total = sum(
+          int(w.succeed(
               "journalctl -u rio-builder --no-pager | "
-              "grep 'rio-sched-silence'"
-          )
+              "grep -c 'silent for maxSilentTime' || true"
+          ).strip() or "0")
+          for w in all_workers
+      )
+      assert warn_total >= 1, (
+          f"no worker logged 'silent for maxSilentTime'. The local "
+          f"nix-daemon may have enforced maxSilentTime before the "
+          f"rio-side backstop fired.\nBuild output:\n{out}"
+      )
 
       print(f"max-silent-time PASS: {attempts} attempts, {per_attempt:.1f}s/attempt (drv sleep was 60s)")
 ''

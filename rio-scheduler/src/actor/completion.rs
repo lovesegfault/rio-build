@@ -434,11 +434,11 @@ impl DagActor {
         drv_hash: &DrvHash,
         reason: rio_proto::types::TerminationReason,
         reason_label: &'static str,
-    ) -> bool {
+    ) -> super::floor::FloorOutcome {
         let mut new_floor = None;
-        let promoted = if let Some(state) = self.dag.node_mut(drv_hash) {
-            let p = super::floor::bump_floor_or_count(state, reason, &self.sla_ceilings);
-            if p {
+        let outcome = if let Some(state) = self.dag.node_mut(drv_hash) {
+            let o = super::floor::bump_floor_or_count(state, reason, &self.sla_ceilings);
+            if o.promoted {
                 info!(
                     drv_hash = %drv_hash, reason = reason_label,
                     floor = ?state.sched.resource_floor,
@@ -451,9 +451,9 @@ impl DagActor {
                 .increment(1);
                 new_floor = Some(state.sched.resource_floor);
             }
-            p
+            o
         } else {
-            false
+            super::floor::FloorOutcome::default()
         };
         // M_044: persist the floor so failover doesn't reset it →
         // re-OOM at probe defaults. Outside the node_mut borrow
@@ -465,7 +465,7 @@ impl DagActor {
             error!(drv_hash = %drv_hash, ?floor, error = %e,
                    "failed to persist resource_floor");
         }
-        promoted
+        outcome
     }
 
     /// Record a worker failure for `drv_hash` (in-mem + PG
@@ -1813,7 +1813,7 @@ impl DagActor {
         //
         // Substring match on the `ExecutorError::CgroupOom` Display
         // impl ("cgroup OOM during build…").
-        let promoted = if error_msg.contains("cgroup OOM") {
+        let floor_outcome = if error_msg.contains("cgroup OOM") {
             self.bump_resource_floor(
                 drv_hash,
                 rio_proto::types::TerminationReason::OomKilled,
@@ -1821,7 +1821,7 @@ impl DagActor {
             )
             .await
         } else {
-            false
+            super::floor::FloorOutcome::default()
         };
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
@@ -1831,7 +1831,9 @@ impl DagActor {
         // D4: a floor bump that returned `promoted=true` is a sizing
         // signal — the next dispatch goes larger; the THIS-attempt
         // failure is not the build's fault. Exempt from the infra cap
-        // alongside the I-127 PutPath case below.
+        // alongside the I-127 PutPath case below. At-cap (`counted=
+        // true`) is NOT exempt — bump already incremented infra_count
+        // and the cap check below sees it.
         //
         // I-127: "concurrent PutPath" is NEVER counted toward the
         // infra cap. It means another builder is uploading the SAME
@@ -1848,7 +1850,7 @@ impl DagActor {
         // Substring match mirrors `is_concurrent_put_path` in
         // rio-builder/src/upload.rs (the store emits this exact
         // phrase in its Aborted status).
-        let exempt_from_cap = promoted || error_msg.contains("concurrent PutPath");
+        let exempt_from_cap = floor_outcome.promoted || error_msg.contains("concurrent PutPath");
 
         // I-127 time-window reset: if the last counted infra failure
         // was longer ago than `infra_retry_window_secs`, treat this as
@@ -1902,8 +1904,19 @@ impl DagActor {
         // Exempt errors (concurrent PutPath) don't increment — they
         // can't indicate a misclassified permanent failure, so the
         // hot-loop guard isn't needed for them.
+        //
+        // D4: `bump_floor_or_count` is the single source of truth for
+        // at-cap floor-reason counting (`floor_outcome.counted`). The
+        // increment here covers NON-floor-reason infra (FUSE EIO,
+        // store unreachable, …) AND the cgroup-OOM cold-start case
+        // (`{promoted:false, counted:false}` — Static-mode, est=None,
+        // floor=0). Without the `!counted` guard the at-cap cgroup-OOM
+        // path was double-counted (bump + here) → poisoned at half the
+        // configured `max_infra_retries`.
         if !exempt_from_cap {
-            state.retry.infra_count += 1;
+            if !floor_outcome.counted {
+                state.retry.infra_count += 1;
+            }
             state.retry.last_infra_failure_at = Some(Instant::now());
         }
         info!(
@@ -2006,7 +2019,8 @@ impl DagActor {
                 rio_proto::types::TerminationReason::DeadlineExceeded,
                 "timeout",
             )
-            .await;
+            .await
+            .promoted;
 
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;

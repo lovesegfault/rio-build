@@ -122,31 +122,37 @@ let
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
     workers = {
+      # maxSilentTime enforcement on ALL scheduling workers (not just
+      # wlarge). The max-silent-time subtest used to rely on classify()
+      # routing silenceDrv to wlarge via the small cutoff, but that
+      # coupling is brittle (cutoff_secs 30→60 broke it) and goes away
+      # entirely when classify() is deleted. Every drv that lands here
+      # now MUST stay non-silent for ≥10s — cancelDrv echoes every 5s
+      # (scheduling.nix); reassignDrv echoes every 5s; the rest sleep
+      # ≤3s or echo immediately.
+      #
+      # Worker-side config because the Nix ssh-ng client does NOT send
+      # wopSetOptions (protocol 1.38) — client --max-silent-time cannot
+      # propagate to the gateway.
       wsmall1 = {
         sizeClass = "small";
+        extraServiceEnv = {
+          RIO_MAX_SILENT_TIME_SECS = "10";
+        };
       };
       wsmall2 = {
         sizeClass = "small";
-        # Non-passthrough FUSE: exercises open_files tracking,
-        # userspace read(), release(). fuse/ops.rs read() at 33%
-        # coverage before this — passthrough bypasses the kernel
-        # callback entirely.
         extraServiceEnv = {
+          # Non-passthrough FUSE: exercises open_files tracking,
+          # userspace read(), release(). fuse/ops.rs read() at 33%
+          # coverage before this — passthrough bypasses the kernel
+          # callback entirely.
           RIO_FUSE_PASSTHROUGH = "false";
+          RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
       wlarge = {
         sizeClass = "large";
-        # maxSilentTime enforcement. Only wlarge: small workers run
-        # cancelDrv (300s silent sleep) which would trip a silence
-        # threshold. bigthing echoes immediately; reassignDrv echoes
-        # every 5s (I-177: it lands here after the SIGKILL promotes
-        # floor small→large). The max-silent-time subtest routes
-        # silenceDrv here via build_history seed.
-        #
-        # Worker-side config because the Nix ssh-ng client does NOT
-        # send wopSetOptions (protocol 1.38) — client --max-silent-time
-        # cannot propagate to the gateway.
         extraServiceEnv = {
           RIO_MAX_SILENT_TIME_SECS = "10";
         };

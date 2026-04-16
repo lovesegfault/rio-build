@@ -87,21 +87,33 @@ let
     '';
   };
 
-  # cancel-timing: 300s sleep — cancelled long before natural end. No
-  # pname → default "small" class → lands on wsmall1 OR wsmall2. 300s
-  # >> 5s budget: if cgroup-gone passes, the kill DID it (not sleep end).
-  cancelDrv = drvs.mkTrivial {
-    marker = "sched-cancel-timing";
-    sleepSecs = 300;
+  # cancel-timing: 60×5s echo loop (300s total) — cancelled long
+  # before natural end. No pname → default "small" class → lands on
+  # wsmall1 OR wsmall2. 300s >> 5s budget: if cgroup-gone passes, the
+  # kill DID it (not loop end). Echoes every 5s to feed
+  # RIO_MAX_SILENT_TIME_SECS=10 (set on ALL scheduling workers since
+  # max-silent-time was decoupled from classify routing); a single
+  # 300s silent sleep would TimedOut at ~10s and the cgroup-gone
+  # assertion would be vacuous (worker reaped it, not CancelBuild).
+  cancelDrv = drvs.mkCustom {
+    name = "rio-test-sched-cancel-timing";
+    script = ''
+      i=0
+      while [ $i -lt 60 ]; do
+        echo sched-cancel-timing-tick-$i
+        ''${busybox}/bin/busybox sleep 5
+        i=$((i+1))
+      done
+      echo sched-cancel-timing > $out
+    '';
   };
 
-  # max-silent-time: echoes ONCE then sleeps 60s. wlarge has
-  # RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The worker's
-  # silence select! arm fires ~10s after the echo → TimedOut → cgroup.kill
-  # reaps the sleep. 60s sleep proves the kill was at ~10s SILENCE, not
-  # 60s wall-clock. pname in env so the test can seed build_history and
-  # route to wlarge (same pattern as sizeclass/bigthing). mkTrivial echoes
-  # AFTER sleep, so inline a custom drv with echo-then-sleep ordering.
+  # max-silent-time: echoes ONCE then sleeps 60s. ALL scheduling
+  # workers have RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The
+  # worker's silence select! arm fires ~10s after the echo → TimedOut →
+  # cgroup.kill reaps the sleep. 60s sleep proves the kill was at ~10s
+  # SILENCE, not 60s wall-clock. mkTrivial echoes AFTER sleep, so
+  # inline a custom drv with echo-then-sleep ordering.
   silenceDrv = drvs.mkCustom {
     name = "rio-sched-silence";
     extraAttrs.pname = "rio-sched-silence";
