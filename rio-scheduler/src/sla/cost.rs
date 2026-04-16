@@ -416,6 +416,18 @@ fn parse_band_cap(s: &str) -> Option<(Band, Cap)> {
     Some((band, cap))
 }
 
+/// Recover `(Band, Cap)` from a [`super::solve::Candidate::selector`]
+/// nodeSelector. `None` for band-agnostic selectors (`solve_mvp` /
+/// `BestEffort` paths). Used by the actor's Pending-watch to map a
+/// stuck intent back to its ICE-backoff cell.
+pub fn parse_selector(ns: &std::collections::BTreeMap<String, String>) -> Option<(Band, Cap)> {
+    let band = parse_band(ns.get("rio.build/hw-band")?)?;
+    let cap = Cap::ALL
+        .into_iter()
+        .find(|c| Some(c.label()) == ns.get("karpenter.sh/capacity-type").map(String::as_str))?;
+    Some((band, cap))
+}
+
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -440,15 +452,17 @@ fn now_epoch() -> f64 {
 ///    capacity_exhausted}`; on exhaust at a non-terminal tier, demote
 ///    one tier and reset `attempted`.
 ///
-// TODO(ADR-023): step 2's Pending-watch. The controller already
-// watches builder pods (`node_informer::run_pod_annotator`); extending
-// it to fire `DrainExecutor{reason=ice}` after `hw_fallback_after_secs`
-// of `Pending` with `nodeSelector∋hw-band` is ~80 LoC but needs the
-// scheduler-side `attempted` map plumbed through `SpawnIntent` first.
-// Until wired, `IceBackoff` is populated only on explicit Karpenter
-// `InsufficientCapacity` events (none today) — the solve falls through
-// to band-agnostic BestEffort on its own when all 6 cells are
-// infeasible by envelope, so the un-wired ladder degrades gracefully.
+/// Step 2 is scheduler-side: the actor records `(drv_hash → (band,
+/// cap, emitted_at))` when `solve_intent_for` first emits a
+/// band-targeted SpawnIntent, clears the entry when a heartbeat with
+/// `intent_id == drv_hash` arrives (pod made it past Pending), and on
+/// each housekeeping tick marks ICE for entries older than
+/// `hw_fallback_after_secs ± 20%`. Tradeoff vs a controller-side Pod
+/// watch: less precise (cannot distinguish `phase=Pending` from
+/// "controller hasn't spawned yet" or "container crashed before first
+/// heartbeat") — but all three cases mean the `(band, cap)` failed to
+/// produce capacity within the window, and the 60s ICE TTL bounds the
+/// false-positive cost. Avoids a proto change + cross-component RPC.
 #[derive(Debug, Default)]
 pub struct IceBackoff(DashMap<(Band, Cap), Instant>);
 
@@ -775,6 +789,16 @@ mod tests {
         assert_eq!(band_of_hw_class("amd-6-ebs"), Some(Band::Lo));
         assert_eq!(band_of_hw_class("aws-5-ebs"), None);
         assert_eq!(band_of_hw_class("unknown-unknown-ebs"), None);
+    }
+
+    #[test]
+    fn parse_selector_roundtrips_candidate() {
+        let ns = std::collections::BTreeMap::from([
+            ("rio.build/hw-band".into(), "mid".into()),
+            ("karpenter.sh/capacity-type".into(), "spot".into()),
+        ]);
+        assert_eq!(parse_selector(&ns), Some((Band::Mid, Cap::Spot)));
+        assert_eq!(parse_selector(&Default::default()), None);
     }
 
     #[test]

@@ -1654,6 +1654,101 @@ async fn spawn_intent_from_sla_estimator() {
     assert_eq!(cold.mem_bytes, 8 << 30);
 }
 
+/// ADR-023 §2.8 Pending-watch: an entry in `pending_intents` past
+/// `hw_fallback_after_secs` marks its `(band, cap)` ICE-infeasible
+/// and is dropped; an entry whose drv left Ready is dropped without
+/// marking; a heartbeat with matching `intent_id` clears the entry.
+#[tokio::test]
+async fn pending_intent_timeout_marks_ice() {
+    use crate::sla::cost::{Band, Cap};
+    use std::time::{Duration, Instant};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0)]);
+    actor.sla_config = Some(crate::sla::config::SlaConfig {
+        hw_fallback_after_secs: 120.0,
+        ..test_sla_config()
+    });
+
+    // "stuck": Ready, backdated past max-jitter (1.2×120s).
+    actor.test_inject_ready("stuck", Some("p"), "x86_64-linux");
+    let old = Instant::now() - Duration::from_secs(200);
+    actor
+        .pending_intents
+        .insert("stuck".into(), (Band::Mid, Cap::Spot, old));
+    // "fresh": Ready, just emitted → kept.
+    actor.test_inject_ready("fresh", Some("p"), "x86_64-linux");
+    actor
+        .pending_intents
+        .insert("fresh".into(), (Band::Hi, Cap::Spot, Instant::now()));
+    // "gone": no DAG node → dropped without marking.
+    actor
+        .pending_intents
+        .insert("gone".into(), (Band::Lo, Cap::OnDemand, old));
+
+    actor.tick_sweep_pending_intents(Instant::now());
+
+    assert!(
+        actor.ice.is_infeasible(Band::Mid, Cap::Spot),
+        "stuck → marked"
+    );
+    assert!(
+        !actor.ice.is_infeasible(Band::Lo, Cap::OnDemand),
+        "gone → dropped without marking (drv left Ready)"
+    );
+    assert!(!actor.ice.is_infeasible(Band::Hi, Cap::Spot), "fresh kept");
+    assert_eq!(actor.pending_intents.len(), 1, "only fresh remains");
+    assert!(actor.pending_intents.contains_key("fresh"));
+
+    // Heartbeat with intent_id="fresh" clears it (pod made it past
+    // Pending). handle_heartbeat requires a stream entry first.
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    actor.handle_worker_connected(&"w0".into(), tx);
+    actor.handle_heartbeat(HeartbeatPayload {
+        executor_id: "w0".into(),
+        systems: vec!["x86_64-linux".into()],
+        supported_features: vec![],
+        running_build: None,
+        size_class: None,
+        resources: None,
+        store_degraded: false,
+        draining: false,
+        kind: rio_proto::types::ExecutorKind::Builder,
+        intent_id: Some("fresh".into()),
+    });
+    assert!(actor.pending_intents.is_empty(), "heartbeat clears entry");
+}
+
+fn test_sla_config() -> crate::sla::config::SlaConfig {
+    use crate::sla::{config, solve};
+    config::SlaConfig {
+        tiers: vec![config::Tier {
+            name: "normal".into(),
+            p50: None,
+            p90: Some(1200.0),
+            p99: None,
+        }],
+        default_tier: "normal".into(),
+        probe: config::ProbeShape {
+            cpu: 4.0,
+            mem_per_core: 1 << 30,
+            mem_base: 4 << 30,
+        },
+        feature_probes: Default::default(),
+        max_cores: solve::DEFAULT_CEILINGS.max_cores,
+        max_mem: solve::DEFAULT_CEILINGS.max_mem,
+        max_disk: solve::DEFAULT_CEILINGS.max_disk,
+        default_disk: solve::DEFAULT_CEILINGS.default_disk,
+        fuse_cache_budget: 0,
+        log_budget: 0,
+        ring_buffer: 32,
+        halflife_secs: 7.0 * 86400.0,
+        seed_corpus: None,
+        hw_cost_source: None,
+        hw_softmax_temp: 0.0,
+        hw_fallback_after_secs: 120.0,
+    }
+}
+
 /// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when
 /// it isn't FIFO-first. Proves the `find_executor_with_overflow` intent
 /// match preempts pick-from-queue. On miss (stale intent), the worker

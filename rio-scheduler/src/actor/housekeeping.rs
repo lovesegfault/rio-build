@@ -147,6 +147,7 @@ impl DagActor {
         let now = Instant::now();
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
+        self.tick_sweep_pending_intents(now);
 
         // Ordering is load-bearing: backstop-process runs before the
         // per-build-timeout check, poison-expire runs last — matches
@@ -193,6 +194,61 @@ impl DagActor {
     // -----------------------------------------------------------------------
     // handle_tick helpers — one per periodic check
     // -----------------------------------------------------------------------
+
+    /// ADR-023 §2.8 Pending-watch: sweep `pending_intents` entries
+    /// older than `hw_fallback_after_secs` (jittered ±20% per-entry,
+    /// derived from drv_hash so the threshold is stable across ticks)
+    /// → mark `(band, cap)` ICE-infeasible for 60s and drop the entry.
+    /// Next `compute_size_class_snapshot` re-runs `solve_full` for that
+    /// drv with the cell excluded.
+    ///
+    /// Also drops entries for drvs that have left Ready (dispatched
+    /// elsewhere, cancelled, completed-via-substitute) — those will
+    /// never see a heartbeat and shouldn't mark ICE.
+    ///
+    /// Scheduler-side approximation of the controller seeing
+    /// `phase=Pending`: less precise (cannot tell Pending from
+    /// "controller hasn't spawned yet" or "container crashed before
+    /// first heartbeat") but all three mean the `(band, cap)` failed to
+    /// produce capacity within the window, and the 60s ICE TTL bounds
+    /// the false-positive cost. See [`crate::sla::cost::IceBackoff`].
+    pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
+        let Some(fallback) = self.sla_config.as_ref().map(|c| c.hw_fallback_after_secs) else {
+            return;
+        };
+        self.pending_intents.retain(|drv_hash, (band, cap, since)| {
+            // Drop entries whose drv left Ready: they won't heartbeat
+            // and the timeout isn't a capacity signal.
+            if self
+                .dag
+                .node(drv_hash)
+                .is_none_or(|s| s.status() != crate::state::DerivationStatus::Ready)
+            {
+                return false;
+            }
+            // Stable per-drv jitter ∈ [0.8, 1.2): hash low byte → factor.
+            // Stable so a single entry doesn't flip in/out across ticks.
+            let h = drv_hash.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+            let jitter = 0.8 + 0.4 * f64::from(h) / 256.0;
+            if now.duration_since(*since).as_secs_f64() <= fallback * jitter {
+                return true;
+            }
+            self.ice.mark(*band, *cap);
+            metrics::counter!(
+                "rio_scheduler_sla_ice_backoff_total",
+                "band" => band.label(),
+                "cap" => cap.label(),
+            )
+            .increment(1);
+            debug!(
+                drv_hash = %drv_hash, band = band.label(), cap = cap.label(),
+                pending_secs = now.duration_since(*since).as_secs(),
+                "pending-watch: no heartbeat within hw_fallback_after; \
+                 marking (band, cap) ICE-infeasible for 60s"
+            );
+            false
+        });
+    }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have
     /// missed MAX_MISSED_HEARTBEATS consecutive checks.

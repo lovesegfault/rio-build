@@ -731,6 +731,17 @@ impl DagActor {
         let (reconciled, suspect, confirmed_phantoms) =
             self.reconcile_running_build(executor_id, hb.running_build);
 
+        // ADR-023 §2.8: pod made it past Pending → clear the
+        // Pending-watch entry so housekeeping doesn't mark its
+        // (band, cap) ICE-infeasible. Idempotent (DashMap remove on
+        // miss is a no-op); fires on the FIRST heartbeat from a
+        // band-targeted pod regardless of whether the intent_id is
+        // still Ready (the capacity signal is "pod scheduled", not
+        // "drv still wants it"). Runs BEFORE the not-Ready→None
+        // downgrade below for that reason.
+        if let Some(id) = &hb.intent_id {
+            self.pending_intents.remove(id.as_str());
+        }
         // intent_id: DOWNGRADE to None if it doesn't point at a
         // currently-Ready drv. Computed here (before `get_mut`) so the
         // dag read doesn't overlap the executors borrow. See the

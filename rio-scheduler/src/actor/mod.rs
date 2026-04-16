@@ -248,6 +248,20 @@ pub struct DagActor {
     /// probe shape and feature overrides. `None` ⇔ `[sla]` absent
     /// (explore falls back to a fixed probe).
     pub(crate) sla_config: Option<crate::sla::config::SlaConfig>,
+    /// In-process insufficient-capacity backoff. `solve_full` skips
+    /// marked cells; the Pending-watch marks them. Arc so the snapshot
+    /// path (`&self`) and housekeeping (`&mut self`) share one map.
+    pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
+    /// Pending-watch ledger: `drv_hash → (band, cap, first_emitted)`.
+    /// `solve_intent_for` records when it first emits a band-targeted
+    /// SpawnIntent for a Ready drv; `handle_heartbeat` removes when a
+    /// pod with `intent_id == drv_hash` checks in. Housekeeping sweeps
+    /// entries past `hw_fallback_after_secs` → [`ice`](Self::ice)
+    /// `.mark(band, cap)` and removes (next snapshot re-solves
+    /// excluding the cell). DashMap because `solve_intent_for` is
+    /// `&self` (admin-snapshot path).
+    pub(crate) pending_intents:
+        dashmap::DashMap<DrvHash, (crate::sla::cost::Band, crate::sla::cost::Cap, Instant)>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -434,6 +448,8 @@ impl DagActor {
                 .map(|s| s.ceilings())
                 .unwrap_or(crate::sla::solve::DEFAULT_CEILINGS),
             sla_config: cfg.sla.clone(),
+            ice: Arc::new(crate::sla::cost::IceBackoff::default()),
+            pending_intents: dashmap::DashMap::new(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
