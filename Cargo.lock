@@ -6283,7 +6283,6 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "crc32fast",
  "figment",
  "fuser",
  "futures-util",

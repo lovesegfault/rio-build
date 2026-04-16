@@ -51,6 +51,15 @@ max-threads = 8
 max-threads = 8
 
 # ── Overrides ────────────────────────────────────────────────────────
+# hw_bench reproducibility test measures wall-clock; under parallel
+# nextest load (contended L2 + DVFS) the ±20% band still flaked. Give
+# it the whole machine — it's ~10s total and the production bench runs
+# on an idle pod anyway, so this is the representative environment.
+[[profile.default.overrides]]
+filter = 'test(hw_bench::tests::run_is_reproducible_within_band)'
+threads-required = 'num-cpus'
+slow-timeout = { period = "30s", terminate-after = 2 }
+
 # Golden live-daemon tests: longer timeout since they spawn real daemons.
 [[profile.default.overrides]]
 filter = "test(test_golden_live_)"

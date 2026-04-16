@@ -636,6 +636,23 @@ pub const M_041: () = ();
 /// (ADR-019) isn't load-bearing yet.
 pub const M_042: () = ();
 
+/// `migrations/043_sla_hardening.sql`
+///
+/// ADR-023 hardening from adversarial review:
+///
+/// - `hw_perf_samples_recent_idx` + `hw_perf_factors` 7-day window —
+///   the 041 view aggregated all rows ever; a hw_class that ran 1000
+///   gen-6 pods six months ago and 3 gen-6a pods today reports the
+///   stale median. The window plus `(hw_class, measured_at DESC)`
+///   index keeps the median fresh and the view scan bounded as the
+///   append-only table grows.
+/// - `sla_ema_state.cluster` PK + `interrupt_samples.cluster` —
+///   ADR-023 §2.13 says these are per-cluster, but under the global-DB
+///   topology every region's scheduler upserted the SAME `key` and
+///   read every region's interrupt rows. `DEFAULT ''` keeps the
+///   greenfield single-cluster path working with no config.
+pub const M_043: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

@@ -19943,10 +19943,6 @@
           "packageId": "clap"
         },
         {
-          "name": "crc32fast",
-          "packageId": "crc32fast"
-        },
-        {
           "name": "fuser",
           "packageId": "fuser"
         },

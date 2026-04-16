@@ -256,10 +256,17 @@ const POOL_LABEL: &str = "rio.build/pool";
 /// watcher dies, builders skip the bench (`RIO_HW_CLASS` empty) and
 /// the hw_class stays at `factor=1.0` until ≥3 pods report.
 ///
-/// TODO: gate the stamp on `hw_class NOT IN (SELECT hw_class FROM
-/// hw_perf_factors)` so well-sampled classes skip the ~5s bench. Needs
-/// a PG handle here (controller is currently apiserver-only); deferred
-/// — the bench is cheap and runs concurrent with cold-start anyway.
+/// TODO: gate the stamp on `EXISTS(SELECT 1 FROM hw_perf_factors WHERE
+/// hw_class=$1)` so well-sampled classes skip the ~5s bench. Deferred:
+/// rio-controller has NO PG access today (apiserver-only — every other
+/// reconciler talks to the scheduler/store via gRPC, never PG
+/// directly). Adding a PgPool here means: config plumbing
+/// (`DATABASE_URL`), helm secret mount, IRSA policy, and a connection
+/// the controller otherwise doesn't need — >50 LoC of plumbing for a
+/// ~5s saving that already runs concurrent with the ~30s cold-start.
+/// If this becomes worth it, route through a new
+/// `SchedulerAdmin.HwClassSampled(hw_class) -> bool` RPC instead
+/// (controller already holds that channel).
 pub async fn run_pod_annotator(
     client: Client,
     cache: NodeLabelCache,
