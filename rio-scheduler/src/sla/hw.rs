@@ -54,6 +54,19 @@ impl HwTable {
         self.factors.iter()
     }
 
+    /// Smallest factor across all known hw_classes, or 1.0 when empty.
+    /// `ref_secs / min_factor()` is the worst-case (slowest-node)
+    /// wall-clock — used by `solve_intent_for`'s deadline de-norm so
+    /// `activeDeadlineSeconds` budgets for the slowest band a pod could
+    /// land on.
+    pub fn min_factor(&self) -> f64 {
+        self.factors
+            .values()
+            .copied()
+            .min_by(f64::total_cmp)
+            .unwrap_or(1.0)
+    }
+
     /// Distinct hw_classes with ≥3 pod samples. For SlaStatus.
     pub fn len(&self) -> usize {
         self.factors.len()

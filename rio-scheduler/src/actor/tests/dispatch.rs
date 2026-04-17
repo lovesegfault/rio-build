@@ -1813,6 +1813,92 @@ async fn work_assignment_carries_sla_cores() {
     );
 }
 
+/// `solve_intent_for`'s fitted-path `deadline_secs` is wall-clock, not
+/// ref-seconds. `t_at()` evaluates the ref-second fit; with a slow
+/// hw_class (factor < 1) in the table the wall-clock budget on that
+/// node is `ref / factor` — without de-normalization a build there is
+/// killed at `ref_q99 × 5` < `wall_q99 × 5`. Reverting the
+/// `/ hw.min_factor()` in `snapshot.rs` makes `slow > fast` fail.
+// r[verify sched.sla.hw-ref-seconds]
+#[tokio::test]
+async fn solve_intent_deadline_denormalized_to_slowest_hw() {
+    use crate::sla::{hw, types::*};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone());
+    // probe deadline 1s so the `c.max(probe_deadline)` floor doesn't
+    // mask the computed value.
+    actor.sla_config.probe.deadline_secs = 1;
+    // High-S Amdahl so c* clamps low and `T(c)` ≈ S regardless of how
+    // many cores the solve picks — keeps the deadline arithmetic
+    // independent of the cores decision.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "test-pkg".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(1000.0),
+            p: RefSeconds(10.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.0,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
+    let state = actor.dag.node("d").unwrap();
+
+    // Baseline: empty hw table → min_factor()=1.0 → deadline ≈ ref_q99×5.
+    let baseline = actor.solve_intent_for(state).deadline_secs;
+
+    // Fast-only table (factor 2.0): wall = ref/2 → deadline ≈ baseline/2.
+    let mut fast = HashMap::new();
+    fast.insert("aws-8-nvme".into(), 2.0);
+    actor.sla_estimator.seed_hw(hw::HwTable::from_map(fast));
+    let fast_dl = actor.solve_intent_for(state).deadline_secs;
+    assert!(
+        fast_dl < baseline,
+        "factor>1 → deadline shrinks (was over-budget): {fast_dl} < {baseline}"
+    );
+
+    // Slow class added (factor 0.5): worst-case wall = ref/0.5 = 2×ref.
+    // Deadline must budget for the slowest band → ≈ 2×baseline.
+    let mut mixed = HashMap::new();
+    mixed.insert("aws-8-nvme".into(), 2.0);
+    mixed.insert("aws-4-slow".into(), 0.5);
+    actor.sla_estimator.seed_hw(hw::HwTable::from_map(mixed));
+    let slow_dl = actor.solve_intent_for(state).deadline_secs;
+    assert!(
+        slow_dl > baseline && slow_dl > fast_dl,
+        "factor<1 in table → deadline budgets slowest wall: {slow_dl} > {baseline}"
+    );
+    // Ratio check: slow/fast ≈ (1/0.5)/(1/2.0) = 4. Allow slack for the
+    // p≠0 term in T(c) and integer truncation.
+    let ratio = f64::from(slow_dl) / f64::from(fast_dl);
+    assert!(
+        (3.5..=4.5).contains(&ratio),
+        "slow/fast deadline ratio ≈ min_factor inverse: {ratio}"
+    );
+}
+
 /// Connect+heartbeat+warm a builder against a bare (unspawned) actor.
 /// `resources=None` so the resource-fit gate is bypassed.
 fn bare_connect_builder(

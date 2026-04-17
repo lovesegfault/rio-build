@@ -1367,21 +1367,28 @@ impl DagActor {
                         peak_cpu_cores: peak_cpu,
                         // r[impl sched.sla.intent-match]
                         // The fit's independent variable is the
-                        // parallelism the build RAN at (NIX_BUILD_CORES
-                        // = assigned_cores), not the pod's cgroup
-                        // cpu.max. On intent-miss fallback a 2-core
-                        // solve can land on a 16-core wildcard pod;
-                        // recording cgroup limit there would place
-                        // (c=16, T(2)) on the curve and inflate the
-                        // fitted serial fraction. Cgroup limit is the
-                        // fallback only when no intent was recorded
-                        // (recovery / Static-mode).
-                        cpu_limit_cores: state
-                            .sched
-                            .last_intent
-                            .as_ref()
-                            .map(|i| f64::from(i.cores))
-                            .or_else(|| final_res.and_then(|r| r.cpu_limit_cores)),
+                        // parallelism the build RAN at — the builder
+                        // sets `NIX_BUILD_CORES = min(assigned_cores,
+                        // cgroup cpu.max)`. Intent-miss fallback can
+                        // land a 2-core solve on a 16-core wildcard pod
+                        // (cgroup > assigned); intent-match with a
+                        // dispatch-time re-solve can pick more cores
+                        // than the spawn-time pod's cgroup (assigned >
+                        // cgroup). Either direction places a point off
+                        // the true curve and inflates the fitted serial
+                        // fraction, so record `min(assigned, cgroup)`.
+                        // Fallback to whichever is present when one is
+                        // missing (recovery / Static-mode → no intent;
+                        // old executor → no cgroup).
+                        cpu_limit_cores: {
+                            let assigned =
+                                state.sched.last_intent.as_ref().map(|i| f64::from(i.cores));
+                            let cgroup = final_res.and_then(|r| r.cpu_limit_cores);
+                            match (assigned, cgroup) {
+                                (Some(a), Some(c)) => Some(a.min(c)),
+                                (a, c) => a.or(c),
+                            }
+                        },
                         cpu_seconds_total: final_res.and_then(|r| r.cpu_seconds_total),
                         peak_disk_bytes: final_res
                             .and_then(|r| r.peak_disk_bytes)

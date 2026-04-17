@@ -1855,6 +1855,61 @@ async fn test_completion_writes_hw_class_and_intent_cores() -> TestResult {
         "cpu_limit_cores = last_intent.cores ({assigned}), not cgroup cpu.max (99)"
     );
 
+    // ── Inverse: cgroup < assigned (dispatch-time re-solve picked more
+    // cores than the spawn-time pod has). Builder clamps NIX_BUILD_CORES
+    // to cgroup, so the recorded sample must be cgroup-bounded. One-shot
+    // worker drained on the first completion; connect a fresh one.
+    let mut stream_rx = connect_executor(&handle, "hw-worker-2", "x86_64-linux").await?;
+    let mut node = make_node("hw-drv2");
+    node.pname = "hw-pkg2".into();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let assignment2 = recv_assignment(&mut stream_rx).await;
+    let assigned2 = assignment2.assigned_cores.unwrap();
+    // cgroup strictly below assigned. assigned ≥ 1 under any config, so
+    // 0.5 guarantees min() picks cgroup.
+    let cgroup2 = f64::from(assigned2) - 0.5;
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "hw-worker-2".into(),
+            drv_key: test_drv_path("hw-drv2"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("hw-pkg2-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            peak_cpu_cores: 1.0,
+            node_name: None,
+            hw_class: None,
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_limit_cores: Some(cgroup2),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+    let (cores2,): (Option<f64>,) =
+        sqlx::query_as("SELECT cpu_limit_cores FROM build_samples WHERE pname = 'hw-pkg2'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        cores2,
+        Some(cgroup2),
+        "assigned > cgroup → cpu_limit_cores = min(assigned={assigned2}, cgroup={cgroup2})"
+    );
+
     Ok(())
 }
 

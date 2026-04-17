@@ -416,7 +416,16 @@ impl DagActor {
             .as_ref()
             .filter(|f| !matches!(f.fit, crate::sla::types::DurationFit::Probe))
             .map(|f| {
-                let t = f.fit.t_at(RawCores(f64::from(cores))).0;
+                // r[impl sched.sla.hw-ref-seconds]
+                // `t_at` is ref-seconds (fit ingests hw-normalized
+                // samples); `activeDeadlineSeconds` is wall-clock.
+                // De-normalize by the SLOWEST hw_class so the budget
+                // covers worst-case wall regardless of which band the
+                // pod lands on — band is unknown when `full` is None,
+                // and re-deriving the chosen band's factor when Some
+                // would duplicate `cost::h_dagger`. Empty table → 1.0
+                // (ref==wall, no normalization in effect).
+                let t = f.fit.t_at(RawCores(f64::from(cores))).0 / hw.min_factor();
                 (quantile::quantile(0.99, t, f.sigma_resid, 0.0) * 5.0) as u32
             })
             .map_or(probe_deadline, |c| c.max(probe_deadline));
