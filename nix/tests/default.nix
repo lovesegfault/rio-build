@@ -870,9 +870,11 @@ in
               # builtin:fetchurl FOD has system=builtin.
               systems: [x86_64-linux, builtin]
               maxConcurrent: 1
-              # CEL forbids privileged/hostUsers/seccomp for Fetcher.
+              # CEL forbids privileged/seccomp for Fetcher; null-clear
+              # so poolDefaults inheritance doesn't trip admission.
+              # hostUsers inherits poolDefaults.hostUsers:true (k3s
+              # containerd cgroup-chown gap; vmtest-full-nonpriv.yaml).
               privileged: null
-              hostUsers: null
               seccompProfile: null
         '')
       ];

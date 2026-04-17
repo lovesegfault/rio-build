@@ -29,13 +29,17 @@ spec:
   {{- with $p.deadlineSeconds }}
   deadlineSeconds: {{ . }}
   {{- end }}
+  {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
+         hostUsers:true (cgroup-chown gap); production EKS leaves it
+         unset → reconciler defaults to false (ADR-019). NOT CEL-gated
+         for Fetcher for this reason. */}}
+  {{- include "rio.optBool" (list $p "hostUsers" $p.hostUsers) | nindent 2 }}
   {{- if ne $p.kind "Fetcher" }}
   {{- /* CEL forbids these for Fetcher; the reconciler forces ADR-019
          hardening regardless. Render only for Builder so a Fetcher
-         entry inheriting poolDefaults.{privileged,hostUsers,seccomp}
-         isn't rejected at admission. */}}
+         entry inheriting poolDefaults.{privileged,seccomp} isn't
+         rejected at admission. */}}
   {{- include "rio.optBool" (list $p "privileged" $p.privileged) | nindent 2 }}
-  {{- include "rio.optBool" (list $p "hostUsers" $p.hostUsers) | nindent 2 }}
   {{- with $p.seccompProfile }}
   seccompProfile:
     {{- toYaml . | nindent 4 }}

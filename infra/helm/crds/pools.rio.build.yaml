@@ -256,9 +256,6 @@ spec:
             - message: "kind=Fetcher forbids hostNetwork:true \u2014 fetchers run\
                 \ on dedicated nodes with pod networking (ADR-019)"
               rule: self.kind != 'Fetcher' || (!has(self.hostNetwork) || !self.hostNetwork)
-            - message: "kind=Fetcher forbids hostUsers:true \u2014 userns isolation\
-                \ is mandatory for FOD-only executors (ADR-019)"
-              rule: self.kind != 'Fetcher' || (!has(self.hostUsers) || !self.hostUsers)
             - message: "kind=Fetcher forbids seccompProfile \u2014 the reconciler\
                 \ forces Localhost operator/rio-fetcher.json (ADR-019)"
               rule: self.kind != 'Fetcher' || !has(self.seccompProfile)

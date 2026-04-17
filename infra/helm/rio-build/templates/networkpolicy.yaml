@@ -195,9 +195,18 @@ spec:
         - matchLabels: {gateway.networking.k8s.io/gateway-name: rio-dashboard}
         # D3a: ns-agnostic match on the reconciler-stamped component
         # label. A misplaced Pool's pods are airgapped (CCNP above)
-        # AND can reach scheduler/store (here).
+        # AND can reach scheduler/store (here). CNP fromEndpoints
+        # WITHOUT a namespace key is implicitly same-namespace
+        # (Cilium scopes to the policy's ns) — builder/fetcher pods
+        # live in rio-builders/rio-fetchers, so the bare label match
+        # silently denied. `io.kubernetes.pod.namespace: Exists`
+        # opens it cluster-wide; the component label is the gate.
         - matchLabels: {app.kubernetes.io/component: rio-builder}
+          matchExpressions:
+            - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
+          matchExpressions:
+            - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
@@ -223,8 +232,14 @@ spec:
     - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+        # See scheduler-ingress D3a comment — bare label match is
+        # same-namespace-only under CNP; Exists opens cluster-wide.
         - matchLabels: {app.kubernetes.io/component: rio-builder}
+          matchExpressions:
+            - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
+          matchExpressions:
+            - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     - fromEntities: [host, remote-node, cluster]
       toPorts:

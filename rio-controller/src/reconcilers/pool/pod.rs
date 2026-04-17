@@ -398,6 +398,12 @@ pub fn build_executor_pod_spec(
             v
         }),
 
+        // `rio-builder` / `rio-fetcher` SA (helm rbac.yaml renders both
+        // unconditionally). Functionally inert (automount:false, no RBAC
+        // bindings) — set so `kubectl describe pod` shows the role-SA
+        // not `default`, and so future per-role IRSA annotations attach
+        // to the right SA without a controller change.
+        service_account_name: Some(p.role.component_label().into()),
         automount_service_account_token: Some(false),
         // r[impl ctrl.pod.tgps-default]
         termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),

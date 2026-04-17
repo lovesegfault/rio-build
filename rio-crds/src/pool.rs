@@ -110,13 +110,13 @@ pub enum ExecutorKind {
         "kind=Fetcher forbids hostNetwork:true — fetchers run on dedicated nodes with pod networking (ADR-019)"
     )
 )]
-#[x_kube(
-    validation = Rule::new(
-        "self.kind != 'Fetcher' || (!has(self.hostUsers) || !self.hostUsers)"
-    ).message(
-        "kind=Fetcher forbids hostUsers:true — userns isolation is mandatory for FOD-only executors (ADR-019)"
-    )
-)]
+// hostUsers NOT CEL-gated for Fetcher (unlike privileged/hostNetwork/
+// seccompProfile): k3s containerd doesn't chown the pod cgroup under
+// hostUsers:false → exit-1 EACCES on cgroup mkdir. VM tests need
+// hostUsers:true; production EKS gets the reconciler's default `false`
+// (executor_params Fetcher arm: spec.host_users.or(Some(false))). The
+// reconciler default is the safety net; CEL would make k3s fixtures
+// unrunnable.
 #[x_kube(
     validation = Rule::new(
         "self.kind != 'Fetcher' || !has(self.seccompProfile)"
@@ -379,10 +379,7 @@ mod tests {
                 "self.kind != 'Fetcher' || (!has(self.hostNetwork) || !self.hostNetwork)",
                 "kind=Fetcher forbids hostNetwork:true",
             ),
-            (
-                "self.kind != 'Fetcher' || (!has(self.hostUsers) || !self.hostUsers)",
-                "kind=Fetcher forbids hostUsers:true",
-            ),
+            // hostUsers intentionally NOT CEL-gated — k3s escape hatch.
             (
                 "self.kind != 'Fetcher' || !has(self.seccompProfile)",
                 "kind=Fetcher forbids seccompProfile",

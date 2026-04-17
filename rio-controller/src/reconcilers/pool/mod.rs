@@ -138,7 +138,8 @@ pub fn error_policy(pool: Arc<Pool>, err: &Error, ctx: Arc<Ctx>) -> Action {
 ///
 /// `ExecutorKind::Fetcher`: ADR-019 hardening — forced
 /// `read_only_root_fs: true`, `seccomp = Localhost
-/// operator/rio-fetcher.json`, `host_users = false`, default
+/// operator/rio-fetcher.json`, `host_users` default `false` (spec
+/// override honored — k3s escape hatch), default
 /// `node-role: fetcher` selector + toleration, `tgps = 600`. CEL on
 /// the CRD rejects fetcher specs that try to set the overridden
 /// fields at admission time; this is belt-and-suspenders for pre-
@@ -209,9 +210,16 @@ pub(super) fn executor_params(pool: &Pool) -> ExecutorPodParams {
                 systems: pool.spec.systems.clone(),
                 node_selector,
                 tolerations,
-                // Forced — CEL forbids `hostUsers: true` on Fetcher;
-                // override here for pre-CEL specs.
-                host_users: Some(false),
+                // Default `hostUsers: false` (ADR-019 userns isolation),
+                // but HONOR the spec override. k3s containerd doesn't
+                // chown the pod cgroup under hostUsers:false → rio-
+                // builder's `mkdir /sys/fs/cgroup/leaf` EACCES → exit 1
+                // in <200ms (vmtest-full-nonpriv.yaml). The k3s VM tests
+                // set `hostUsers: true`; production EKS (containerd 2.0+)
+                // gets the default `false`. Forcing Some(false) here
+                // (Phase-7 first cut) made fetcher pods unrunnable on
+                // every CI fixture.
+                host_users: pool.spec.host_users.or(Some(false)),
                 image_pull_policy: pool.spec.image_pull_policy.clone(),
                 // FODs route by is_fixed_output alone, not features.
                 features: vec![],

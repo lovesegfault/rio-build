@@ -79,7 +79,11 @@ fn fetcher_hardening_ignores_spec() {
     let params = executor_params(&pool);
     assert!(params.read_only_root_fs, "rootfs tampering blocked");
     assert!(!params.privileged, "fetchers never privileged");
-    assert_eq!(params.host_users, Some(false), "userns forced");
+    assert_eq!(
+        params.host_users,
+        Some(true),
+        "spec hostUsers:true honored (k3s escape hatch)"
+    );
     assert_eq!(
         params.features,
         Vec::<String>::new(),
@@ -97,7 +101,24 @@ fn fetcher_hardening_ignores_spec() {
     let spec = test_pod_spec(&pool);
     let sc = spec.containers[0].security_context.as_ref().unwrap();
     assert_eq!(sc.read_only_root_filesystem, Some(true));
-    assert_eq!(spec.host_users, Some(false));
+    assert_eq!(
+        spec.host_users,
+        Some(true),
+        "spec override flows to PodSpec"
+    );
+    assert_eq!(
+        spec.service_account_name.as_deref(),
+        Some("rio-fetcher"),
+        "role-SA wired (rbac.yaml renders it unconditionally)"
+    );
+
+    // Unset spec → ADR-019 default Some(false). Production EKS path.
+    pool.spec.host_users = None;
+    assert_eq!(
+        executor_params(&pool).host_users,
+        Some(false),
+        "Fetcher defaults hostUsers:false when spec is silent"
+    );
 
     // Default node placement targets the dedicated fetcher pool.
     pool.spec.node_selector = None;
