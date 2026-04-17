@@ -16,6 +16,13 @@ use std::collections::HashMap;
 
 use crate::db::SchedulerDb;
 
+/// Sanity floor for [`HwTable::min_factor`]. A pathological
+/// `hw_perf_samples` row (bad bench, clock skew) could yield a factor
+/// near 0; `ref_secs / min_factor()` would then blow the deadline up
+/// ~×100 (capped at 24h, but wasteful). Clamp at 0.25 — i.e., assume no
+/// admitted hw_class is more than 4× slower than the reference.
+const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
+
 /// Per-hw_class median microbench factor. Built from the
 /// `hw_perf_factors` view each [`super::SlaEstimator::refresh`] tick.
 /// Cheap to clone (a few dozen entries).
@@ -65,6 +72,8 @@ impl HwTable {
             .copied()
             .min_by(f64::total_cmp)
             .unwrap_or(1.0)
+            // Guard against pathological microbench rows; see const doc.
+            .max(HW_FACTOR_SANITY_FLOOR)
     }
 
     /// Distinct hw_classes with ≥3 pod samples. For SlaStatus.
@@ -141,5 +150,15 @@ mod tests {
         // Reference hw (factor=1.0) ran in 100s wall → 100 ref-seconds.
         assert_eq!(t.normalize(100.0, Some("aws-5-ebs")), 100.0);
         assert_eq!(t.reference, "aws-5-ebs");
+    }
+
+    #[test]
+    fn min_factor_clamped_at_sanity_floor() {
+        let mut m = HashMap::new();
+        m.insert("slow".into(), 0.01);
+        let t = HwTable::from_map(m);
+        assert_eq!(t.min_factor(), HW_FACTOR_SANITY_FLOOR);
+        // Empty table → 1.0 (above floor, unchanged).
+        assert_eq!(HwTable::default().min_factor(), 1.0);
     }
 }
