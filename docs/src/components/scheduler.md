@@ -8,7 +8,7 @@ Receives derivation build requests, analyzes the DAG, and publishes work to exec
 - Query rio-store for cache hits (already-built outputs)
 - Compute remaining work graph (subtract cached nodes)
 - Critical-path priority computation (bottom-up: priority = own\_duration + max(successor priorities)); recomputed incrementally on completion by walking ancestors with dirty-flag propagation
-- Duration estimation from historical build data in PostgreSQL (EMA with alpha=0.3)
+- Duration estimation from the SLA model's `T_min` (per-`(pname, system, tenant)` fit; see Duration Estimation)
 - Resource-aware scheduling: match derivation `requiredSystemFeatures` and resource needs to executor capabilities (subset matching: all required features must be present on the executor)
 - Auto-pin live build inputs: on dispatch, `pin_live_inputs` writes the derivation's input closure to the `scheduler_live_pins` table (used by rio-store's GC mark phase as a root seed); unpinned on completion
 - Proxy `AdminService.TriggerGC` to rio-store, first collecting live-build output paths via `ActorCommand::GcRoots` and forwarding them as `extra_roots`
@@ -42,7 +42,7 @@ r[sched.admin.snapshot-cached]
 
 ## Scheduling Algorithm
 
-**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, build-history Estimator with fallback chain, PrefetchHint (full `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, BuilderPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), per-derivation SLA sizing (`solve_intent_for` → `(cores, mem, disk, deadline)` per `r[sched.admin.spawn-intents]`), PrefetchHint (full `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, Pool CRD + one-shot Job reconciler. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
 
 ```
 1. Receive derivation DAG from gateway
@@ -54,16 +54,12 @@ r[sched.admin.snapshot-cached]
 5. If empty -> full cache hit, return results immediately
 6. Compute critical path priorities (bottom-up traversal)
 7. For each ready node (all deps satisfied):
-   a. Estimate duration (existing EMA / fallback chain, see Duration Estimation)
-   b. Classify into size class based on estimated duration vs configured cutoffs
-      (see Size-Class Routing below). If no size classes are configured, skip this step.
-      If ema_peak_memory_bytes exceeds the target class's memory limit, bump to the next class.
-   c. Filter executors to the target size class if applicable:
-      - Resource fit (hard filter): does executor have required features, enough CPU/memory?
-        Executors that fail this check are excluded entirely.
-        The hard filter also excludes busy executors (one build per pod); among
-        idle candidates that pass, dispatch falls through to first-fit.
-   d. Assign to the first eligible executor via the bidirectional BuildExecution stream.
+   a. Solve per-derivation (cores, mem, disk, deadline) via the SLA model
+      (solve_intent_for; ADR-023). The controller spawns one-shot pods sized
+      to the same SpawnIntent.
+   b. Hard-filter executors: required features present? executor idle (one build
+      per pod)? system match? Candidates that fail are excluded entirely.
+   c. Assign to the first eligible executor via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
       `executor_id`, `drv_hash`, `expected_outputs`, `is_ca`, `expiry_unix`). The store verifies
       the token on PutPath and rejects uploads for paths not in `expected_outputs`.
@@ -78,7 +74,7 @@ r[sched.admin.snapshot-cached]
       - If a downstream node is already running when cutoff is detected: let it finish
         and discard the result (see Preemption below)
    c. Release newly-ready downstream nodes
-   d. Update duration estimates with actual build time (EMA, alpha=0.3)
+   d. Record actual (cores, mem_peak, disk_peak, wall) into build_samples for SLA refit
    e. Recompute priorities incrementally: walk up ancestors only, using dirty-flag
       propagation -- only ancestors whose max-successor-priority changed need updating
 9. On failure: classify error (see errors.md), apply retry policy, reassign or mark as failed
@@ -170,7 +166,7 @@ r[sched.retry.promotion-exempt+2]
 Any failure path that bumps `resource_floor` (`r[sched.sla.reactive-floor]`) and returns `promoted=true` MUST NOT increment `retry_count` and MUST NOT record into `failed_builders` / `failure_count`. Doubling is bounded by `Ceilings`; once a dimension reaches its ceiling, `bump_floor_or_count` returns `promoted=false` and increments `infra_count` (or `timeout_count` for deadline) instead, so `RetryPolicy.max_{infra,timeout}_retries` become budgets for failures AT the ceiling. I-213: with promotion consuming the budget, the kubelet-eviction → SIGKILL → disconnect path recorded each rung as a poison-threshold failure and poisoned firefox-unwrapped before reaching a viable size.
 
 r[sched.admin.inspect-dag]
-`AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. Each derivation row includes `rejections` — a per-executor list of `{executor_id, reason}` veto strings from `dispatch_ready()` (e.g. `at-capacity`, `size-class-mismatch`, `stream-closed`, `feature-missing`) — so a stuck-Ready node is directly diagnosable without log diving. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
+`AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. Each derivation row includes `rejections` — a per-executor list of `{executor_id, reason}` veto strings from `dispatch_ready()` (e.g. `at-capacity`, `stream-closed`, `feature-missing`, `system-mismatch`) — so a stuck-Ready node is directly diagnosable without log diving. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
 
 r[sched.admin.debug-list-executors]
 `AdminService.DebugListExecutors` snapshots the in-memory executor map (`has_stream`, `warm`, `kind` per entry) — what `dispatch_ready()` filters on, not what PG `last_seen` claims. This RPC is **exempt from the leader-guard** by design: a stuck or partitioned standby replica can be queried directly to compare its view against the leader's.
@@ -188,10 +184,10 @@ r[sched.breaker.cache-check+2]
 The merge-time `FindMissingPaths` cache check goes through a circuit breaker that opens after 5 consecutive store-side failures and auto-closes after 30 s. While open, each `SubmitBuild` still attempts the cache check as a half-open probe; on probe failure the scheduler **rejects `SubmitBuild` with `UNAVAILABLE`** rather than queueing a 100%-miss DAG. A successful probe closes the breaker immediately and uses the result. Under threshold (failures 1–4): proceed as if the cache check missed. This fail-**closed** policy applies only to new submissions at merge time; the in-flight stale-completed re-verify path (`r[sched.merge.stale-completed-verify]`) remains fail-**open** so an already-admitted DAG is never retroactively rejected by a transient store outage.
 
 r[sched.freeze-detector]
-`dispatch_ready` WARNs once per minute when `fod_deferred > 0 && fetcher_streams == 0` (or `class_deferred > 0 && builder_streams == 0`) holds for ≥60s. The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
+`dispatch_ready` WARNs once per minute when `kind_deferred[k] > 0 && registered_streams[k] == 0` holds for ≥60s, for each `ExecutorKind k` (Builder, Fetcher). The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
 
 r[sched.dispatch.unroutable-system]
-When a Ready derivation's `system` is advertised by zero registered executors of the matching kind, dispatch defers it (same as no-capacity) but additionally counts it under `rio_scheduler_unroutable_ready{system=…}` and WARNs once when the system first becomes unroutable. The WARN re-arms after the system has been observed routable. This distinguishes "no capacity right now" (autoscaler resolves) from "no pool exists" (operator action: add the system to a Builder/FetcherPool's `systems` list, e.g. `i686-linux` on an x86_64 pool per `r[builder.platform.i686]`).
+When a Ready derivation's `system` is advertised by zero registered executors of the matching kind, dispatch defers it (same as no-capacity) but additionally counts it under `rio_scheduler_unroutable_ready{system=…}` and WARNs once when the system first becomes unroutable. The WARN re-arms after the system has been observed routable. This distinguishes "no capacity right now" (autoscaler resolves) from "no pool exists" (operator action: add the system to a `Pool`'s `systems` list, e.g. `i686-linux` on an x86_64 pool per `r[builder.platform.i686]`).
 
 ## Multi-Build DAG Merging
 
@@ -657,7 +653,7 @@ Critical-path priorities are maintained **incrementally**, not via full O(V+E) r
 
 - **On derivation completion:** Walk upward from the completed node to its ancestors, recalculating priorities only for nodes whose successor priorities changed. This is O(affected subgraph), which is typically much smaller than the full DAG.
 - **On DAG merge:** New nodes are inserted with initial priorities computed bottom-up from the merge point. Existing nodes' priorities are updated only if the new subgraph connects to them with a higher-priority path.
-- **Periodic full recomputation:** Every ~60 seconds (on the estimator-refresh cadence), the DAG actor performs a full bottom-up priority sweep **inline** inside `handle_tick`, ensuring consistency even if incremental updates accumulate rounding errors or miss edge cases. No separate background task or message is involved --- the actor owns the DAG and mutates it directly.
+- **Periodic full recomputation:** Every ~60 seconds (on the SLA-refit cadence), the DAG actor performs a full bottom-up priority sweep **inline** inside `handle_tick`, ensuring consistency even if incremental updates accumulate rounding errors or miss edge cases. No separate background task or message is involved --- the actor owns the DAG and mutates it directly.
 
 This approach keeps per-event processing well under the 1ms budget needed for 1000+ ops/sec throughput.
 

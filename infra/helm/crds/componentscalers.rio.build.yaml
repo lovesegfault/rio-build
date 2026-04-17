@@ -40,7 +40,7 @@ spec:
               \ ComponentScaler lives alongside its target\nDeployment (rio-store\
               \ namespace for the store scaler). The\nreconciler patches `deployments/scale`\
               \ in the SAME namespace.\n\n`KubeSchema` alongside `CustomResource`:\
-              \ same pattern as\nBuilderPoolSpec \u2014 KubeSchema processes `#[x_kube]`\
+              \ same pattern as\nPoolSpec \u2014 KubeSchema processes `#[x_kube]`\
               \ on nested\nstructs (Replicas, TargetRef, LoadThresholds) so their\
               \ CEL\nrules render."
             properties:

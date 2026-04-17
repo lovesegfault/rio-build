@@ -128,15 +128,9 @@ rio-builder's FUSE daemon runs in userspace via the `fuser` crate. FUSE context 
 
 Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but the production FUSE daemon must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. Full benchmark tables are preserved in git history (`docs/src/phases-archive/phase1a.md`, removed post-roadmap-retirement).
 
-## 14. Size-Class Cold Start and Misclassification
+## 14. SLA Sizing Cold Start
 
-> **Implemented:** `BuilderPoolSet` CRD (P0232), child-builder reconciler (P0233), per-class status refresh + autoscaler (P0234). See [controller.md](components/controller.md#builderpoolset). Alternative for simpler deployments: multiple independent `BuilderPool` CRs with operator-configured cutoffs in `scheduler.toml`.
-
-With size-class routing, two related challenges arise:
-
-**Cold start:** On a fresh deployment with no `build_history` data, all derivations use the operator-configured cutoffs or the default fallback (30s estimate). These initial cutoffs may be wildly wrong for the actual workload, leading to poor classification until sufficient data accumulates. Mitigation: allow operators to seed `build_history` from external sources (e.g., Hydra build logs, previous rio-build deployments), and use conservative initial cutoffs that over-classify into larger classes (wastes resources but avoids OOM kills).
-
-**Queue imbalance:** If all ready derivations happen to be "medium" but only "small" executors are idle, derivations queue unnecessarily. Mitigation: overflow routing allows small-class derivations to spill to medium executors when the small queue is empty, but never routes large derivations downward.
+On a fresh deployment with no `build_samples` data, `solve_intent_for` falls back to the configured `[sla]` floor for every derivation. The floor may be wrong for the actual workload, leading to OOM/deadline kills until sufficient samples accumulate for per-`(pname, system, tenant)` fits. Mitigation: the reactive `resource_floor` doubling (`r[sched.sla.reactive-floor]`) promotes a derivation on each kill without consuming retry budget, so the first build of a heavy package converges within `log2(ceiling/floor)` attempts; subsequent builds of the same `pname` reuse the fitted shape.
 
 ## 15. Schema Migration
 

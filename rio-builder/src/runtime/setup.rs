@@ -106,8 +106,8 @@ pub async fn setup(
 
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //
-    // FetcherPool forces readOnlyRootFilesystem:true (ADR-019
-    // §Sandbox hardening — reconcilers/fetcherpool/mod.rs:212).
+    // Pool kind: Fetcher forces readOnlyRootFilesystem:true (ADR-019
+    // §Sandbox hardening — reconcilers/pool/pod.rs).
     // Every write below MUST land on an emptyDir mount from
     // reconcilers/common/sts.rs, or the pod CrashLoops with EROFS.
     //

@@ -136,7 +136,7 @@ fn default_seed_ratio() -> f64 {
 /// reconciler patches `deployments/scale` in the SAME namespace.
 ///
 /// `KubeSchema` alongside `CustomResource`: same pattern as
-/// BuilderPoolSpec — KubeSchema processes `#[x_kube]` on nested
+/// PoolSpec — KubeSchema processes `#[x_kube]` on nested
 /// structs (Replicas, TargetRef, LoadThresholds) so their CEL
 /// rules render.
 // r[impl ctrl.crd.componentscaler]

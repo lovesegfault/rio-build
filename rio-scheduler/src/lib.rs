@@ -307,7 +307,7 @@ pub fn describe_metrics() {
         "Ready derivations whose `system` is advertised by zero registered \
          executors of the matching kind (labeled by system; snapshot per \
          dispatch pass). Nonzero = no pool exists for that system; add it \
-         to a Builder/FetcherPool's `systems` list."
+         to a Pool's `systems` list."
     );
     describe_gauge!(
         "rio_scheduler_utilization",

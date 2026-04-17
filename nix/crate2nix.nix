@@ -252,9 +252,9 @@ let
     CARGO = "${cargoMetadataStub}";
   };
 
-  # rio-controller's builderpool tests include_str! the seccomp profile
+  # rio-controller's pool tests include_str! the seccomp profile
   # from ../../../../../nix/nixos-node/seccomp/ (5 levels up from
-  # src/reconcilers/builderpool/tests/ = repo root). Same cross-directory
+  # src/reconcilers/pool/tests/ = repo root). Same cross-directory
   # compile-time-read problem as migrations: buildRustCrate's src is
   # just rio-controller/, so the relative path resolves outside the
   # unpacked sourceRoot. Symlink the seccomp/ dir at $NIX_BUILD_TOP/nix/
@@ -379,7 +379,7 @@ let
     rio-gateway = withMigrations;
 
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in
-    # builderpool tests — compile-time file read crossing crate
+    # pool tests — compile-time file read crossing crate
     # boundary. See `withSeccompProfiles` above.
     rio-controller = withSeccompProfiles;
 

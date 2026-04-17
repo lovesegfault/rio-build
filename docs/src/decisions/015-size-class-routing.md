@@ -1,13 +1,14 @@
 # ADR-015: Size-Class Routing with Adaptive Cutoffs
 
-## Status
-Accepted
+> **Superseded by ADR-023 (SLA-driven sizing).** Size-class routing,
+> the `BuilderPoolSet` CRD, the `CutoffRebalancer`, and the `build_history`
+> EMA estimator have been removed. Per-derivation sizing is now continuous
+> (`solve_intent_for` → `(cores, mem, disk, deadline)`); pods are one-shot
+> Jobs spawned per-SpawnIntent by the unified `Pool` reconciler. This file is
+> retained for archaeology.
 
-## Status update
-Builder pods are now one-shot (one build per pod), so the "8 builds/pod"
-concurrency consequence below no longer applies; size classes determine
-per-pod resource requests, not multi-build slot counts. Adaptive SITA-E
-cutoff learning and the `BuilderPoolSet` CRD remain as described.
+## Status
+Superseded
 
 ## Context
 

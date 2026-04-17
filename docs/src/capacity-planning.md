@@ -58,12 +58,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 - With 5min average (including large packages): ~480 derivations/hour = ~125 hours total
 - Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 40 executors.
 
-**With size-class routing:**
-- Small pool (~80 pods): handles 90% of builds (short-lived)
-- Large pool (~4 pods): handles 10% of builds (GCC, LLVM, Firefox)
-- Better utilization: small pods aren't blocked by multi-hour builds
-
-The `BuilderPoolSet` CRD wraps this: one BPS defines all size classes declaratively, spawns one child `BuilderPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
+**With per-derivation SLA sizing (ADR-023):** the controller spawns one-shot Jobs sized to each derivation's solved `(cores, mem, disk)`, so a `hello` build gets a 1-core/512Mi pod and `firefox` gets 16-core/32Gi without operator partitioning. Karpenter bin-packs the heterogeneous pods onto right-sized nodes. See [controller component spec](components/controller.md) for the reconciler flow.
 
 ## Gateway and Scheduler
 

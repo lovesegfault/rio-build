@@ -159,4 +159,4 @@ Migrations are managed via `sqlx migrate` with numbered migration files in each 
 
 ## Configuration via CRD (Runtime)
 
-The `BuilderPool` CRD provides runtime-configurable parameters that the controller reconciles without component restarts. See [controller.md](./components/controller.md) for the full CRD spec.
+The `Pool` CRD provides runtime-configurable parameters that the controller reconciles without component restarts. See [controller.md](./components/controller.md) for the full CRD spec.

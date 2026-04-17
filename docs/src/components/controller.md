@@ -131,7 +131,7 @@ the pool is gone.
 
 r[ctrl.pool.ephemeral-deadline]
 Jobs MUST set `spec.activeDeadlineSeconds` from
-`BuilderPoolSpec.deadlineSeconds` (default 3600). This is a backstop:
+`PoolSpec.deadlineSeconds` (default 3600). This is a backstop:
 the spawn decision reads the **cluster-wide**
 `ClusterStatus.queued_derivations`, not pool-matching depth. A queue
 full of `x86_64-linux` work on an `aarch64-darwin` pool triggers a Job
@@ -185,7 +185,7 @@ safety net.
 
 r[ctrl.pod.tgps-default]
 The Job pod spec MUST default `terminationGracePeriodSeconds` to
-`7200` (2h) when `BuilderPoolSpec.terminationGracePeriodSeconds` is
+`7200` (2h) when `PoolSpec.terminationGracePeriodSeconds` is
 unset. SIGTERM → executor drain (`r[ctrl.drain.sigterm]`) waits for
 the in-flight build to complete before exit; nix builds can
 legitimately take 2h (LLVM, full NixOS closure from cold cache).
@@ -255,8 +255,7 @@ in-cluster, and the controller already has the demand signal
 ## Reconciliation Loops
 
 r[ctrl.reconcile.owner-refs]
-- **BuilderPool reconciler**: spawn/reap builder Jobs based on scheduler queue depth. All Jobs carry `ownerReferences` to the BuilderPool CRD with `controller: true`, ensuring garbage collection on BuilderPool deletion.
-- **BuilderPoolSet reconciler**: manages multiple `BuilderPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `BuilderPoolSet` status.
+- **Pool reconciler**: spawn/reap one-shot Jobs (builder or fetcher per `spec.kind`) based on scheduler `SpawnIntent`s. All Jobs carry `ownerReferences` to the Pool CRD with `controller: true`, ensuring garbage collection on Pool deletion.
 - **GC reconciler**: trigger store garbage collection on schedule.
 
 r[ctrl.backoff.per-object]
@@ -271,7 +270,7 @@ for pools, 30s for ComponentScaler where 5min of no scaling under a
 builder burst is the I-105 cliff).
 
 r[ctrl.condition.sched-unreachable]
-BuilderPool and FetcherPool `.status.conditions[]` MUST carry a
+`Pool.status.conditions[]` MUST carry a
 `SchedulerUnreachable` condition reflecting the reconciler's poll-phase
 RPC result: `status="True", reason="ClusterStatusFailed"` with the gRPC
 error in `message` when the poll failed; `status="False",
@@ -427,7 +426,7 @@ delete it manually: `kubectl delete crd builds.rio.build`.
 ## Component Deployment Model
 
 The controller manages:
-- **BuilderPool** CRD → spawns/reaps builder Jobs (resources, security context)
+- **Pool** CRD → spawns/reaps one-shot builder/fetcher Jobs (per-intent resources, security context)
 
 The controller does **NOT** manage:
 - Scheduler or store Deployments --- these are deployed via Helm/kustomize as standard Deployments
@@ -435,7 +434,7 @@ The controller does **NOT** manage:
 
 ## Key Files
 
-- `rio-crds/src/` --- CRD type definitions (separate crate; BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)
+- `rio-crds/src/` --- CRD type definitions (separate crate; Pool, ComponentScaler)
 - `rio-controller/src/reconcilers/` --- Reconciliation loops
 - `rio-controller/src/scaling/` --- ComponentScaler (rio-store/rio-gateway Deployment scaling)
 
@@ -449,28 +448,27 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 
 | CRD | Rule | Reject reason |
 |---|---|---|
-| BuilderPool | `size(self.systems) > 0` | A builder pool with no target systems accepts no work. |
-| BuilderPool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
-| FetcherPool | `size(self.classes) == 0 ∨ ¬has(self.resources)` | `classes[]` and top-level `resources` are mutually exclusive. |
+| Pool | `size(self.systems) > 0` | A pool with no target systems accepts no work. |
+| Pool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
 | SeccompProfileKind | type ∈ allowed; `Localhost ⇔ has(localhostProfile)` | See `r[ctrl.crd.seccomp-cel]`. |
 | ComponentScaler.Replicas | `self.min <= self.max` | Clamp range must be non-empty. |
 | ComponentScaler.TargetRef | `self.kind == 'Deployment'` | Reconciler patches `apps/v1 deployments/scale` only. |
 | ComponentScaler.LoadThresholds | `0.0 < low < high <= 1.0` | Threshold ordering for ratio correction. |
 
 r[ctrl.crd.seccomp-cel]
-`SeccompProfileKind` is a struct (`{type, localhostProfile?}`), not a Rust enum: kube-core's structural-schema rewriter rejects oneOf-variant subschemas with non-identical shared properties, so the type/localhostProfile coupling is enforced by CEL instead of the Rust type system. Two rules: `self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']`, and `self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)`. The struct mirrors `pod.spec.securityContext.seccompProfile` exactly so operators can copy-paste; nested `KubeSchema` carries the rules through into both `BuilderPool` and `BuilderPoolSet` schemas.
+`SeccompProfileKind` is a struct (`{type, localhostProfile?}`), not a Rust enum: kube-core's structural-schema rewriter rejects oneOf-variant subschemas with non-identical shared properties, so the type/localhostProfile coupling is enforced by CEL instead of the Rust type system. Two rules: `self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']`, and `self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)`. The struct mirrors `pod.spec.securityContext.seccompProfile` exactly so operators can copy-paste; nested `KubeSchema` carries the rules through into the `Pool` schema.
 
 r[ctrl.crd.host-users-network-exclusive]
-The controller MUST reject `BuilderPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
+The controller MUST reject `Pool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
 
 r[ctrl.event.spec-degrade]
-The BuilderPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get bp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
+The Pool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get pool -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
 There is no `spec.fuseCacheSize` CRD field — the FUSE cache emptyDir `sizeLimit` is the hardcoded `BUILDER_FUSE_CACHE` (50Gi) / `FETCHER_FUSE_CACHE` constant; pods are one-shot so the cache never outlives one build's input closure.
 
-## BuilderPool Finalizer
+## Pool Finalizer
 
-BuilderPool CRDs carry a `builderpool.rio.build/drain` finalizer. The
+Pool CRDs carry a `pool.rio.build/drain` finalizer. The
 finalizer's `cleanup()` removes the finalizer immediately; in-flight Jobs
 finish their one build naturally and ownerRef GC removes them after the
 pool is gone. The reconciler's `apply()` path short-circuits when

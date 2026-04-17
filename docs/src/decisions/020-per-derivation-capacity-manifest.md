@@ -1,9 +1,9 @@
 # ADR-020: Per-Derivation Capacity Manifest
 
 ## Status
-Rejected (2026-04: Manifest path removed; never deployed, Static remains)
+Rejected (2026-04: Manifest path removed; never deployed)
 
-The Manifest sizing path described below was implemented (`GetCapacityManifest` RPC, `BuilderPool.spec.sizing` enum, manifest reconciler) but never deployed — no production helm values ever set `sizing: Manifest`. Removed in favor of keeping ADR-015 Static size-class routing as the only mode. This document is retained for history; design point 4 ("Pods are long-lived") and the "True one-pod-per-derivation" rejection were already superseded by one-shot pods before removal.
+The Manifest sizing path described below was implemented (`GetCapacityManifest` RPC, `BuilderPool.spec.sizing` enum, manifest reconciler) but never deployed — no production helm values ever set `sizing: Manifest`. Removed; per-derivation continuous sizing later landed via ADR-023 (SLA-driven sizing), which also superseded ADR-015 entirely. This document is retained for history; design point 4 ("Pods are long-lived") and the "True one-pod-per-derivation" rejection were already superseded by one-shot pods before removal.
 
 ## Context
 

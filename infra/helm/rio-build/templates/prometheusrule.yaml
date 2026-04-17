@@ -44,7 +44,7 @@ spec:
         # I-095/I-097 ghost-dispatch shape: workers registered but not
         # running anything. workers_active counts heartbeating executors;
         # derivations_running counts in-flight builds. A sustained gap
-        # >50 means dispatch is starved (closed-channel ghosts, sizeClass
+        # >50 means dispatch is starved (closed-channel ghosts, system/kind
         # mismatch, or the actor is wedged — cross-ref RioSchedulerActorSlow).
         - alert: RioDispatchStarved
           expr: rio_scheduler_workers_active - rio_scheduler_derivations_running > 50
@@ -55,7 +55,7 @@ spec:
             summary: ">50 idle executors with work queued"
             description: >-
               {{`{{ $value | humanize }}`}} executors are heartbeating but
-              idle for 5m. Check sizeClass routing and ghost-executor
+              idle for 5m. Check system/kind routing and ghost-executor
               accumulation.
 
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.

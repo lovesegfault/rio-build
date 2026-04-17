@@ -977,8 +977,7 @@ fn render_human(r: &Report) {
 
     for ns in &r.namespaces {
         // Skip empty namespaces (rio-builders/rio-fetchers only have
-        // ephemeral Job pods, which show under BuilderPools/FetcherPools
-        // below).
+        // ephemeral Job pods, which show under Pools below).
         if ns.deployments.is_empty() && ns.daemonsets.is_empty() && ns.problem_pods.is_empty() {
             continue;
         }

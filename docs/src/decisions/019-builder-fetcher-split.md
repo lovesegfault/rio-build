@@ -55,7 +55,7 @@ if drv.is_fixed_output != (executor.kind == ExecutorKind::Fetcher) {
 FODs route only to fetchers. Non-FODs route only to builders.
 
 
-The overflow chain (`find_executor_with_overflow()`) for FODs walks fetcher classes only --- never the builder size-class chain. If no fetcher of any class is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
+Dispatch hard-filters by `ExecutorKind`: a FOD only matches `kind: Fetcher` executors. If no fetcher is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
 The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bounded by `Pool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations` (no duration-EMA).
 
@@ -68,7 +68,7 @@ The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bo
 
 r[builder.netpol.airgap]
 
-`builder-egress` NetworkPolicy (in `rio-builders`) allows: CoreDNS:53, `rio-scheduler.rio-system:9001`, `rio-store.rio-store:9002`. Nothing else. The `fod-proxy:3128` rule is deleted. Optionally, if `BuilderPool.spec.s3Direct: true`, the S3 VPC endpoint CIDR is added (for direct chunk upload; default is store-proxied).
+`builder-egress` NetworkPolicy (in `rio-builders`) allows: CoreDNS:53, `rio-scheduler.rio-system:9001`, `rio-store.rio-store:9002`. Nothing else. The `fod-proxy:3128` rule is deleted. Optionally, if `Pool.spec.s3Direct: true`, the S3 VPC endpoint CIDR is added (for direct chunk upload; default is store-proxied).
 
 r[fetcher.netpol.egress-open]
 

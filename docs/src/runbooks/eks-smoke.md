@@ -67,38 +67,34 @@ echo "Gateway: $GATEWAY_HOST"
 
 **NLB target health is N/M, not M/M — this is correct.** `externalTrafficPolicy: Local` means only the N nodes hosting a rio-gateway pod pass the `healthCheckNodePort` probe; the rest are intentionally unhealthy. The dualstack NLB forwards to an IPv6-only target group; xtask sets `preserve_client_ip.enabled=false` and `enable-prefix-for-ipv6-source-nat=on` so IPv4 clients on the dualstack listener can reach IPv6 targets. Nodes set their own primary IPv6 at boot (`primary-ipv6-init.service` in the NixOS AMI).
 
-## Step 4: Create BuilderPoolSet
+## Step 4: Create Pool
 
 ```bash
 cat <<EOF | kubectl apply -f -
 apiVersion: rio.build/v1alpha1
-kind: BuilderPoolSet
+kind: Pool
 metadata:
   name: smoke-test
   namespace: rio-system
 spec:
-  poolTemplate:
-    image: rio-builder:latest
-    systems: [x86_64-linux]
-    features: []
-    nodeSelector:
-      rio.build/node-role: worker
-    tolerations:
-      - key: rio.build/worker
-        operator: Equal
-        value: "true"
-        effect: NoSchedule
-  classes:
-    - name: default
-      cutoffSecs: 600
-      maxConcurrent: 4
-      resources:
-        requests: { cpu: "2", memory: "4Gi" }
-        limits: { cpu: "4", memory: "8Gi" }
+  kind: Builder
+  image: rio-builder:latest
+  systems: [x86_64-linux]
+  features: []
+  maxConcurrent: 4
+  nodeSelector:
+    rio.build/node-role: worker
+  tolerations:
+    - key: rio.build/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
 EOF
 
 # Builder Jobs spawn on demand once a build is queued — no standing pods to wait for.
-kubectl -n rio-system get builderpool -l rio.build/owner-bps=smoke-test
+# Per-pod cpu/mem/disk come from the scheduler's per-drv SpawnIntent (ADR-023),
+# NOT from Pool.spec — there is no resources field.
+rio-cli pool describe smoke-test    # or: kubectl -n rio-system get pool smoke-test -o yaml
 ```
 
 **Troubleshooting if workers stuck ContainerCreating:**
@@ -159,7 +155,7 @@ cargo xtask k8s cli -p eks -- trigger-gc --dry-run --grace-period-hours 2
 ## Cleanup
 
 ```bash
-kubectl -n rio-system delete builderpoolset smoke-test
+kubectl -n rio-system delete pool smoke-test
 helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
 ```
 

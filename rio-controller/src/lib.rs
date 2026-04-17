@@ -1,21 +1,21 @@
 //! Kubernetes operator for rio-build.
 //!
-//! Watches `BuilderPool`/`FetcherPool` CRDs and spawns one-shot
-//! worker Jobs to match the scheduler's queue depth.
+//! Watches `Pool` CRDs and spawns one-shot worker Jobs sized to
+//! the scheduler's per-derivation `SpawnIntent`s.
 //!
 //! # Architecture
 //!
 //! ```text
 //!   kube-apiserver
 //!        │
-//!        │ watch: BuilderPool, FetcherPool, Job
+//!        │ watch: Pool, Job
 //!        ▼
 //! ┌──────────────────────────────────────┐
 //! │ rio-controller                        │
 //! │                                       │
 //! │  ┌─────────────────────────────────┐  │
-//! │  │ BuilderPool / FetcherPool        │  │
-//! │  │  - poll ClusterStatus / manifest │  │
+//! │  │ Pool reconciler                  │  │
+//! │  │  - poll GetSpawnIntents          │  │
 //! │  │  - spawn Jobs to match queue     │  │
 //! │  │  - reap completed/orphan Jobs    │  │
 //! │  │  - patch status.readyReplicas    │  │

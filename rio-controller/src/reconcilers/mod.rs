@@ -221,7 +221,7 @@ pub(crate) fn transient_backoff(n: u32) -> Duration {
 
 /// Build the error-count key for a namespaced K8s object.
 /// `{kind}/{ns}/{name}` — stable, distinct across reconcilers
-/// (BuilderPool vs BuilderPoolSet can't collide).
+/// (Pool vs ComponentScaler can't collide).
 pub(crate) fn error_key<K>(obj: &K) -> String
 where
     K: kube::Resource<DynamicType = ()> + kube::ResourceExt,
@@ -367,9 +367,9 @@ where
 /// reconciler module. Expands to the ~25L block that was repeated 4×
 /// in `main.rs`. The result is a future — caller `tokio::join!`s them.
 ///
-/// Two forms: with `owns: Type` (BuilderPool/BuilderPoolSet/
-/// FetcherPool watch a child resource) and without (ComponentScaler
-/// owns nothing — it patches `/scale` on a helm-owned Deployment).
+/// Two forms: with `owns: Type` (Pool watches child Jobs) and
+/// without (ComponentScaler owns nothing — it patches `/scale` on a
+/// helm-owned Deployment).
 ///
 /// The `for_each` body is debug-only: `error_policy` already logged
 /// the real error; the controller-runtime wrapper errors here

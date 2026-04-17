@@ -30,7 +30,7 @@ use rio_crds::pool::{Pool, PoolStatus};
 use super::pod::{POOL_LABEL, UpstreamAddrs};
 
 /// Field manager for server-side apply on Job-mode pool resources
-/// (BuilderPool/FetcherPool status, owned Jobs). K8s tracks which
+/// (Pool status, owned Jobs). K8s tracks which
 /// fields each manager owns; conflicting managers get a 409 unless
 /// `force`. We use `force: true` — this controller is authoritative
 /// for what it manages. Shared by both pool reconcilers so a Job's
@@ -297,13 +297,10 @@ pub(crate) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration
 
 // r[impl ctrl.ephemeral.reap-excess-pending]
 /// Delete Pending Jobs in excess of `queued`. Shared by the
-/// builderpool and fetcherpool ephemeral reconcilers (both had the
-/// spawn-only pattern before I-183; both now reap).
+/// builder and fetcher pool reconcilers (both had the spawn-only
+/// pattern before I-183; both now reap).
 ///
-/// `pool`/`class` feed the metric labels and log fields. For
-/// BuilderPool, `class` is `spec.size_class` (may be empty for
-/// standalone pools). For FetcherPool, `class` is the per-class
-/// `pool_name` from the class iteration.
+/// `pool` feeds the metric labels and log fields.
 ///
 /// warn+continue on delete failure — same posture as the spawn loop
 /// (P0516): one apiserver blip shouldn't skip the status patch. Next
@@ -672,13 +669,11 @@ where
     spawned
 }
 
-/// SSA-patch `.status.{replicas?,readyReplicas,desiredReplicas,
-/// conditions}` for a Job-mode pool CR (BuilderPool / FetcherPool).
+/// SSA-patch `.status.{replicas,readyReplicas,desiredReplicas,
+/// conditions}` for a Pool CR.
 ///
 /// "Replicas" means "active Jobs" — `kubectl get` columns are
-/// filled here from the Job inventory. `replicas: None` for CRs
-/// whose status doesn't carry that field (FetcherPool); the SSA
-/// body omits it so the apiserver doesn't reject an unknown field.
+/// filled here from the Job inventory.
 ///
 /// `conditions`: `SchedulerUnreachable` reflects the reconciler's
 /// poll-phase RPC result. `scheduler_err = Some` → status="True"

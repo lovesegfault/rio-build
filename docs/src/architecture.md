@@ -70,8 +70,8 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                   rio-controller (K8s Operator)                       │
 │                                                                      │
-│  Manages: BuilderPool Jobs, GC                                       │
-│  CRDs: Pool                      │
+│  Manages: Pool Jobs, GC                                              │
+│  CRDs: Pool, ComponentScaler                                         │
 │  Watches: K8s API -> reconciles Jobs                                 │
 │  Single-replica by design (not leader-elected)                       │
 └──────────────────────────────────────────────────────────────────────┘

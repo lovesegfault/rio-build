@@ -115,7 +115,7 @@ Worker cost scales with build load. Ephemeral Jobs exit on completion + Karpente
 cargo xtask k8s -p eks destroy    # ~15min
 ```
 
-This deletes BuilderPools/FetcherPools first (their finalizers hold pods → NLB
+This deletes Pool CRs first (their finalizers hold pods → NLB
 → tofu destroy blocks), then `tofu -chdir=infra/eks destroy`.
 
 The S3 bucket has `force_destroy = true` so it deletes even with

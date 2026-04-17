@@ -55,7 +55,7 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
    │  cgroup v2 per-build resource tracking       │
    └──────────────────────────────────────────────┘
 
-   rio-controller (K8s operator): BuilderPool/FetcherPool CRDs, one-shot Job
+   rio-controller (K8s operator): Pool CRD, one-shot Job
    reconciliation, demand-driven autoscaling, drain-aware termination.
 ```
 
@@ -73,10 +73,10 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-proto` | gRPC service definitions (tonic) |
 | `rio-common` | Shared config, observability, limits, Arc<str> newtypes |
 | `rio-gateway` | SSH server + Nix worker protocol frontend |
-| `rio-scheduler` | DAG scheduler, critical-path priority, size-class routing |
+| `rio-scheduler` | DAG scheduler, critical-path priority, SLA-driven per-drv sizing |
 | `rio-store` | Chunked CAS, narinfo signing, binary-cache HTTP server |
 | `rio-builder` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
-| `rio-controller` | Kubernetes operator (BuilderPool/FetcherPool CRDs, autoscaler) |
+| `rio-controller` | Kubernetes operator (Pool CRD, autoscaler) |
 | `rio-crds` | Kubernetes CRD types (kube-derive), shared between controller and CLI |
 | `rio-cli` | Admin CLI (trigger GC, tenant mgmt, backfill, dry-run introspection) |
 | `rio-test-support` | Ephemeral PostgreSQL bootstrap, mock gRPC, wire helpers |

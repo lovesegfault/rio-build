@@ -38,8 +38,7 @@ const KVM_NODE_LABEL: &str = "rio.build/kvm";
 pub const ROLE_LABEL: &str = "rio.build/role";
 
 /// Pod label carrying the owning pool name. Finalizer cleanup lists
-/// pods by this; ephemeral mode counts Jobs by it. Shared between
-/// BuilderPool and FetcherPool reconcilers.
+/// pods by this; ephemeral mode counts Jobs by it.
 pub const POOL_LABEL: &str = "rio.build/pool";
 
 /// emptyDir mounts that make `readOnlyRootFilesystem: true` workable

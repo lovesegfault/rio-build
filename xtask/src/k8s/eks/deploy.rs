@@ -225,16 +225,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // children: one Job per build, sized by class. Karpenter
             // bin-packs across c6a.large..c6a.32xlarge.
             //
-            // I-117b: one BuilderPoolSet per arch (same I-108 list/
-            // defaults split). Both arches get adaptive sizing — child
-            // pools are `x86-64-tiny`..`x86-64-xlarge` + `aarch64-tiny`
-            // ..`aarch64-xlarge`. Each child's `systems` propagates from
-            // its BPS, so I-098's kubernetes.io/arch nodeSelector lands
-            // arm pods on arm nodes. The scheduler's hard_filter checks
-            // BOTH systems AND size_class, so an aarch64 drv routes to
-            // aarch64-medium, never x86-64-medium.
+            // I-117b: one Pool per arch × kind (same I-108 list/
+            // defaults split). Per-pod sizing is continuous (ADR-023
+            // SpawnIntent), so there are no per-arch child pools.
+            // I-098's kubernetes.io/arch nodeSelector lands arm pods
+            // on arm nodes; the scheduler's hard_filter checks systems
+            // so an aarch64 drv routes only to aarch64 executors.
             //
-            // builderPoolDefaults stays the poolTemplate base (seccomp,
+            // poolDefaults stays the per-pool template base (seccomp,
             // tolerations, nodeSelector, hostUsers — deep-merged in the
             // chart).
             .set("poolDefaults.enabled", "true")

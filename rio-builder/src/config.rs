@@ -111,7 +111,7 @@ pub struct Config {
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     ///
-    /// NOT in BuilderPoolSpec (CRD): the defaults (10k lines/sec,
+    /// NOT in PoolSpec (CRD): the defaults (10k lines/sec,
     /// 100 MiB) are already generous enough that hitting them
     /// means the build is broken, not the limit. Operators
     /// shouldn't be tuning around a runaway log producer. See
