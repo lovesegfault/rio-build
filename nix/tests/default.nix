@@ -109,24 +109,20 @@ let
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
     workers = {
-      # maxSilentTime enforcement on ALL scheduling workers (not just
-      # wlarge). The max-silent-time subtest used to rely on classify()
-      # routing silenceDrv to wlarge via the small cutoff, but that
-      # coupling is brittle (cutoff_secs 30→60 broke it) and goes away
-      # entirely when classify() is deleted. Every drv that lands here
-      # now MUST stay non-silent for ≥10s — cancelDrv echoes every 5s
-      # (scheduling.nix); reassignDrv echoes every 5s; the rest sleep
-      # ≤3s or echo immediately.
+      # maxSilentTime enforcement on ALL scheduling workers. Every drv
+      # that lands here MUST stay non-silent for ≥10s — cancelDrv echoes
+      # every 5s (scheduling.nix); reassignDrv echoes every 5s; the rest
+      # sleep ≤3s or echo immediately.
       #
       # Worker-side config because the Nix ssh-ng client does NOT send
       # wopSetOptions (protocol 1.38) — client --max-silent-time cannot
       # propagate to the gateway.
-      wsmall1 = {
+      worker1 = {
         extraServiceEnv = {
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
-      wsmall2 = {
+      worker2 = {
         extraServiceEnv = {
           # Non-passthrough FUSE: exercises open_files tracking,
           # userspace read(), release(). fuse/ops.rs read() at 33%
@@ -136,7 +132,7 @@ let
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
       };
-      wlarge = {
+      worker3 = {
         extraServiceEnv = {
           RIO_MAX_SILENT_TIME_SECS = "10";
         };
@@ -144,6 +140,25 @@ let
     };
     extraSchedulerConfig = {
       tickIntervalSecs = 2;
+      # [sla] is mandatory; sized for 3× tiny VM workers (2 GiB each).
+      extraConfig = ''
+        [sla]
+        default_tier = "normal"
+        max_cores = 2
+        max_mem = 2147483648
+        max_disk = 6442450944
+        default_disk = 2147483648
+        fuse_cache_budget = 536870912
+        log_budget = 134217728
+
+        [[sla.tiers]]
+        name = "normal"
+
+        [sla.probe]
+        cpu = 1
+        mem_per_core = 1073741824
+        mem_base = 1073741824
+      '';
     };
     extraStoreConfig = {
       extraConfig = ''
@@ -405,8 +420,8 @@ in
       };
 
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
-  # Same 3-worker fixture (wsmall1/wsmall2/wlarge + size-classes) for
-  # both — the fragment architecture changes what RUNS, not what's BOOTED.
+  # Same 3-worker fixture (worker1/worker2/worker3) for both — the
+  # fragment architecture changes what RUNS, not what's BOOTED.
   # fanout→fuse-direct cache-state chain stays in core; reassign is
   # disruptive (SIGKILL) → own test.
   vm-scheduling-core-standalone =
@@ -465,16 +480,16 @@ in
           # r[verify builder.shutdown.sigint]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
-          # gentler sibling. Uses wsmall2 only — no cache-chain coupling.
+          # gentler sibling. Uses worker2 only — no cache-chain coupling.
           # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
           #
-          # sigint-graceful LAST: restarts wsmall2 (systemctl start) but
+          # sigint-graceful LAST: restarts worker2 (systemctl start) but
           # doesn't wait for scheduler re-registration (HEARTBEAT_INTERVAL
           # = 10s at rio-common/src/limits.rs:51). If load-50drv ran AFTER
           # it'd see 2 slots not 4 → ~26 waves instead of ~13 → ~2×
           # walltime. Placing sigint last makes the re-registration
           # window non-load-bearing (collectCoverage reads profraw from
-          # the host fs, doesn't need wsmall2 registered with scheduler).
+          # the host fs, doesn't need worker2 registered with scheduler).
           "sigint-graceful"
         ];
         # Default 600s is tight now: max-silent-time ~25s + cancel-timing

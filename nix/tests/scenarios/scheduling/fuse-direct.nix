@@ -10,10 +10,10 @@ scope: with scope; ''
   # reachable at all; if THIS is 0 hits, the problem is fuser/kernel,
   # not overlayfs.
   with subtest("fuse-direct: readdir/access on FUSE mount (overlay bypass)"):
-      # Both small workers fetched ≥1 path (asserted above). `ls` on
+      # All workers fetched ≥1 path (asserted above). `ls` on
       # /var/rio/fuse-store (the mount point, not /var/rio/cache) hits
       # FUSE readdir(ino=ROOT) → fs::read_dir(cache_dir).
-      for w in small_workers:
+      for w in all_workers:
           listing = w.succeed("ls -la /var/rio/fuse-store/ 2>&1")
           print(f"{w.name} fuse-store root:\n{listing}")
           # access(R_OK) via faccessat(2). make_fuse_config (fuse/mod.rs

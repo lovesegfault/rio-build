@@ -340,15 +340,6 @@ scheduler:
   # saturate. Raise if the store runs with a larger aws-sdk pool; lower
   # if you see "dispatch failure" demotes in scheduler logs.
   substituteMaxConcurrent: 16
-  # Size-class routing config. When non-empty, renders a
-  # rio-scheduler-config ConfigMap mounted at /etc/rio/scheduler.toml
-  # with [[size_classes]] entries; the scheduler's classify() routes
-  # each derivation to the smallest covering class. MUST agree with
-  # per-pool [sla] config
-  # spec.sizeClass) — the scheduler classifies, the controller
-  # provisions; mismatched names mean work classified into a class
-  # with no workers (queues forever).
-  #
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =
@@ -360,10 +351,10 @@ scheduler:
   softFeatures:
     - {name: big-parallel}
     - {name: benchmark}
-  # ADR-023 SLA-driven sizing. Renders the [sla] table in scheduler.toml.
-  # Absent (sla: null) → SLA-mode disabled, scheduler uses the phase-2
-  # const-tier path. Durations in seconds, sizes in bytes (the Rust
-  # SlaConfig deserializer is plain serde — no humantime/bytesize).
+  # ADR-023 SLA-driven sizing. Renders the [sla] table in scheduler.toml
+  # — mandatory (the SchedulerConfig has no Option arm). Durations in
+  # seconds, sizes in bytes (the Rust SlaConfig deserializer is plain
+  # serde — no humantime/bytesize).
   #
   # tiers: ladder of SLA targets. solve_mvp picks the TIGHTEST feasible
   #   tier (sorted by p50→p90→p99); a tier with no targets is best-effort.

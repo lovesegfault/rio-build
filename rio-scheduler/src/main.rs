@@ -136,12 +136,8 @@ async fn main() -> anyhow::Result<()> {
     // so a restart doesn't re-warm; lease-gated poller below keeps it
     // fresh on the leader. With `[sla].hw_cost_source` unset the
     // default seeds are used and the poller only runs the λ refresh.
-    let hw_cost_source = cfg.sla.as_ref().and_then(|s| s.hw_cost_source);
-    let sla_cluster = cfg
-        .sla
-        .as_ref()
-        .map(|s| s.cluster.clone())
-        .unwrap_or_default();
+    let hw_cost_source = cfg.sla.hw_cost_source;
+    let sla_cluster = cfg.sla.cluster.clone();
     let cost_table = std::sync::Arc::new(parking_lot::RwLock::new(
         rio_scheduler::sla::cost::CostTable::load(&SchedulerDb::new(pool.clone()), &sla_cluster)
             .await

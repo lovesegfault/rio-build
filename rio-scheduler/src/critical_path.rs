@@ -349,7 +349,7 @@ mod tests {
     /// SLA cache seeded with known T_min: a=10s, b=20s, c=30s, else
     /// [`DEFAULT_DURATION_SECS`].
     fn test_sla() -> SlaEstimator {
-        let e = SlaEstimator::new(7.0 * 86400.0, 32, None);
+        let e = SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
         seed(&e, "a", 10.0);
         seed(&e, "b", 20.0);
         seed(&e, "c", 30.0);
@@ -358,7 +358,7 @@ mod tests {
 
     /// Unfitted-key cache: every node falls back to [`DEFAULT_DURATION_SECS`].
     fn empty_sla() -> SlaEstimator {
-        SlaEstimator::new(7.0 * 86400.0, 32, None)
+        SlaEstimator::new(&crate::sla::config::SlaConfig::test_default())
     }
 
     fn no_builds() -> HashMap<Uuid, BuildInfo> {

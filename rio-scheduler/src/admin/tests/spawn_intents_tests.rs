@@ -38,7 +38,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.sla = Some(test_sla_config());
+        c.sla = test_sla_config();
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),

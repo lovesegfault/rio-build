@@ -773,6 +773,9 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             threshold: 99,
             ..Default::default()
         };
+        // 256 GiB ceiling so 5× doublings (2→4→8→16→32 GiB) stay below
+        // max_mem; the test asserts each rung promoted, not capped.
+        c.sla = crate::actor::tests::test_sla_config();
     });
     let mut rxs = Vec::new();
     for n in names {
@@ -788,8 +791,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     .await?;
     let p = test_drv_path("ladder-drv");
 
-    // Seed est_memory_bytes (no SLA config → solve_intent_for gated
-    // off → bump base would be zero).
+    // Seed est_memory_bytes (the doubling base).
     handle
         .debug_seed_sched_hint("ladder-drv", Some(2 << 30), None, None, None)
         .await?;

@@ -383,7 +383,7 @@ Not all state changes require synchronous PostgreSQL writes:
 | Write Type | Examples | Behavior |
 |-----------|---------|----------|
 | **Synchronous** (before responding) | Derivation completion state, assignment state transitions, build terminal status | Must be durable before acknowledging to executor/gateway |
-| **Async/batched** | `build_history` EMA updates, duration estimate refreshes, dashboard-facing status updates | Batched and flushed periodically (every 1-5s) |
+| **Async/batched** | `build_samples` inserts, SLA estimator refit, dashboard-facing status updates | Batched and flushed periodically (every 1-5s) |
 
 On crash, async writes may be lost but are non-critical: EMA re-converges after a few builds, and status is rebuilt from ground truth (derivation/assignment tables) during state recovery.
 
@@ -525,7 +525,7 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 | `derivation_edges` | DAG edges (parent_id, child_id) as a separate join table for concurrent merge safety |
 | `assignments` | Derivation -> executor mapping, status, assignment generation counter |
 | `build_derivations` | Many-to-many mapping: which builds are interested in which derivations |
-| `build_history` | Running EMA per (pname, system) for duration estimation (not per-build rows) |
+| `build_samples` | Per-completion telemetry rows feeding the ADR-023 SLA fit (ring-buffered per `(pname, system, tenant)`) |
 | `build_logs` | S3 blob metadata per (build_id, drv_hash) — `s3_key`, `line_count`, `is_complete` for log-flush UPSERTs |
 | `build_event_log` | Prost-encoded `BuildEvent` per (build_id, sequence) for gateway `since_sequence` replay across failover |
 | `scheduler_live_pins` | Auto-pinned live-build input closures (`store_path_hash`, `drv_hash`). Written by `pin_live_inputs` at dispatch; unpinned on completion. Used by rio-store's GC mark phase as a root seed. |
@@ -609,17 +609,6 @@ CREATE TABLE assignments (
 );
 CREATE UNIQUE INDEX assignments_active_uq ON assignments (derivation_id) WHERE status IN ('pending', 'acknowledged');
 CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
-
-CREATE TABLE build_history (
-    pname                   TEXT NOT NULL,
-    system                  TEXT NOT NULL,
-    ema_duration_secs       DOUBLE PRECISION NOT NULL,
-    sample_count            INT NOT NULL DEFAULT 0,
-    last_updated            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ema_peak_memory_bytes   DOUBLE PRECISION,       -- nullable: executor may not report cgroup memory.peak
-    ema_peak_cpu_cores      DOUBLE PRECISION,       -- nullable: polled executor-side from cgroup cpu.stat
-    PRIMARY KEY (pname, system)
-);
 ```
 
 > **Auxiliary tables omitted from pseudo-DDL above:** `build_logs` (S3 blob metadata per derivation) and `build_event_log` (Prost-encoded BuildEvent per sequence for gateway replay). See `migrations/` (workspace root) for full schema.

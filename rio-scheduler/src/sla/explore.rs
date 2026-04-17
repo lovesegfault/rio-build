@@ -7,7 +7,7 @@
 //! fit gate), or hits a wall (`max_cores` / `1`). At that point the
 //! ladder freezes and `intent_for` switches to the solve path.
 
-use super::config::{ProbeShape, SlaConfig};
+use super::config::SlaConfig;
 use super::metrics;
 use super::solve::DrvHints;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
@@ -90,17 +90,6 @@ fn tier_p90(fit: &FittedParams, cfg: &SlaConfig) -> f64 {
         .or_else(|| cfg.tiers.iter().find(|t| t.name == cfg.default_tier))
         .and_then(|t| t.p90)
         .unwrap_or(1200.0)
-}
-
-/// Probe shape for a feature set without a full config — used by the
-/// `[sla]`-unconfigured fallback in `intent_for`.
-pub(super) fn fallback_probe() -> ProbeShape {
-    ProbeShape {
-        cpu: 4.0,
-        mem_per_core: 1 << 30,
-        mem_base: 4 << 30,
-        deadline_secs: super::config::default_probe_deadline_secs(),
-    }
 }
 
 #[cfg(test)]

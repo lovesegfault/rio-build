@@ -111,14 +111,13 @@ pub enum ActorCommand {
         drv_key: String,
         result: rio_proto::types::BuildResult,
         /// Peak memory from cgroup `memory.peak`, bytes. 0 = no signal
-        /// (build failed before cgroup populated). Feeds
-        /// `build_history.ema_peak_memory_bytes` for size-class
-        /// memory-bump.
+        /// (build failed before cgroup populated). Feeds the
+        /// `build_samples` insert for the SLA mem fit.
         peak_memory_bytes: u64,
         /// Peak CPU cores-equivalent, polled 1Hz from cgroup
         /// `cpu.stat`. 0.0 = no signal (exited before first sample).
-        /// Feeds `build_history.ema_peak_cpu_cores` — not used for
-        /// routing yet (size-class bumps on memory only).
+        /// Feeds `build_samples.peak_cpu_cores` for the SLA saturation
+        /// detector.
         peak_cpu_cores: f64,
         /// k8s `spec.nodeName` the executor pod ran on (downward API
         /// → `RIO_NODE_NAME` → `CompletionReport.node_name`). For
@@ -385,11 +384,10 @@ pub enum AdminQuery {
         reply: oneshot::Sender<crate::sla::prior::SeedCorpus>,
     },
     /// `AdminService.ImportSlaCorpus`: merge a parsed corpus into the
-    /// seed-prior table. Reply is `Ok((entries, rescale_factor))` or
-    /// `Err` when `[sla]` is unconfigured.
+    /// seed-prior table. Reply is `(entries, rescale_factor)`.
     SlaImportCorpus {
         corpus: crate::sla::prior::SeedCorpus,
-        reply: oneshot::Sender<anyhow::Result<(usize, f64)>>,
+        reply: oneshot::Sender<(usize, f64)>,
     },
 }
 

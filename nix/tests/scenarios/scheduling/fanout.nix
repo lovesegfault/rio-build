@@ -29,20 +29,17 @@ scope: with scope; ''
       # would pass even if 4 leaves silently failed and only the
       # collector cache-hit. Deleted — the content check IS the test.
 
-      # Distribution: EACH SMALL worker executed ≥1 derivation.
-      # With size-classes configured, no-pname leaves route to the
-      # default class ("small") → wlarge gets nothing from this
-      # fanout. 4 parallel leaves across 2 small workers means
-      # BOTH get at least one leaf. If either sat idle, dispatch
-      # is broken (scheduler not round-robin, or worker
-      # registration metadata wrong). journald-counted because
-      # rio-builder is one-shot — per-process counters reset on
-      # every restart.
-      for w in small_workers:
+      # Distribution: EACH worker executed ≥1 derivation. 4 parallel
+      # leaves across 3 workers means every worker gets at least one
+      # leaf. If any sat idle, dispatch is broken (scheduler not
+      # round-robin, or worker registration metadata wrong).
+      # journald-counted because rio-builder is one-shot — per-process
+      # counters reset on every restart.
+      for w in all_workers:
           n = journal_builds_succeeded(w)
           assert n >= 1, (
               f"{w.name} did 0 builds (journald); fanout should "
-              f"hit every small worker"
+              f"hit every worker"
           )
 
       # Store: received 5 build outputs via PutPath (+ busybox seed).

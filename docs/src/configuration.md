@@ -29,7 +29,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token signing. Env: `RIO_HMAC_KEY_PATH`. Same file must be configured on the store. |
 | `store_admin_addr` | string | (unset) | Store admin gRPC endpoint (for `TriggerGC` proxy). If unset, `AdminService.TriggerGC` returns UNIMPLEMENTED. |
 
-> **Compile-time constants (not configurable):** `DEFAULT_DURATION_SECS = 30.0` --- fallback build-duration estimate when no `build_history` row exists.
+> **Compile-time constants (not configurable):** `DEFAULT_DURATION_SECS = 30.0` --- fallback build-duration estimate when no SLA fit exists for the `(pname, system, tenant)` key.
 
 ## Store
 

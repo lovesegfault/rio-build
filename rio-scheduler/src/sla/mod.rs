@@ -59,62 +59,59 @@ pub struct SlaEstimator {
     /// ADR-023 §2.10 prior inputs. `seed` is loaded from
     /// `[sla].seed_corpus` at startup and/or `ImportSlaCorpus` at
     /// runtime; `fleet` is recomputed each refresh tick from the cache;
-    /// `operator`/`default_tier_p90` are static from config. `None` ⇔
-    /// `[sla]` unconfigured (refit gets `None`, no blending).
-    priors: Option<Arc<RwLock<prior::PriorSources>>>,
+    /// `operator`/`default_tier_p90` are static from config.
+    priors: Arc<RwLock<prior::PriorSources>>,
     last_tick: RwLock<f64>,
     halflife_secs: f64,
     ring_buffer: u32,
 }
 
 impl SlaEstimator {
-    pub fn new(halflife_secs: f64, ring_buffer: u32, cfg: Option<&config::SlaConfig>) -> Self {
+    pub fn new(cfg: &config::SlaConfig) -> Self {
         // Seed corpus load is best-effort: a missing/malformed file
         // warns and falls back to an empty seed table rather than
         // refusing to start. The corpus is an optimization (skip the
         // probe ladder), not a correctness input.
-        let priors = cfg.map(|c| {
-            let seed = c
-                .seed_corpus
-                .as_deref()
-                .and_then(|p| match prior::SeedCorpus::load(p) {
-                    Ok(corpus) => {
-                        let (map, scale) = corpus.into_seed_map(&hw::HwTable::default());
-                        tracing::info!(
-                            entries = map.len(),
-                            rescale = scale,
-                            path = %p.display(),
-                            "sla seed corpus loaded"
-                        );
-                        Some(map)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "sla seed corpus load failed; starting empty");
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let default_tier_p90 = c
-                .tiers
-                .iter()
-                .find(|t| t.name == c.default_tier)
-                .and_then(|t| t.p90)
-                .unwrap_or(1200.0);
-            Arc::new(RwLock::new(prior::PriorSources {
-                seed,
-                fleet: None,
-                operator: c.probe.clone(),
-                default_tier_p90,
-            }))
-        });
+        let seed = cfg
+            .seed_corpus
+            .as_deref()
+            .and_then(|p| match prior::SeedCorpus::load(p) {
+                Ok(corpus) => {
+                    let (map, scale) = corpus.into_seed_map(&hw::HwTable::default());
+                    tracing::info!(
+                        entries = map.len(),
+                        rescale = scale,
+                        path = %p.display(),
+                        "sla seed corpus loaded"
+                    );
+                    Some(map)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "sla seed corpus load failed; starting empty");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let default_tier_p90 = cfg
+            .tiers
+            .iter()
+            .find(|t| t.name == cfg.default_tier)
+            .and_then(|t| t.p90)
+            .unwrap_or(1200.0);
+        let priors = Arc::new(RwLock::new(prior::PriorSources {
+            seed,
+            fleet: None,
+            operator: cfg.probe.clone(),
+            default_tier_p90,
+        }));
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             overrides: Arc::new(RwLock::new(Vec::new())),
             hw: Arc::new(RwLock::new(hw::HwTable::default())),
             priors,
             last_tick: RwLock::new(0.0),
-            halflife_secs,
-            ring_buffer,
+            halflife_secs: cfg.halflife_secs,
+            ring_buffer: cfg.ring_buffer,
         }
     }
 
@@ -126,8 +123,8 @@ impl SlaEstimator {
     /// Snapshot the prior-source inputs. For
     /// `AdminService.ExportSlaCorpus` (which needs `seed.len()` for the
     /// "already seeded" hint) and tests.
-    pub fn prior_sources(&self) -> Option<prior::PriorSources> {
-        self.priors.as_ref().map(|p| p.read().clone())
+    pub fn prior_sources(&self) -> prior::PriorSources {
+        self.priors.read().clone()
     }
 
     /// Dump every cached fit with `n_eff ≥ min_n` as a [`SeedCorpus`].
@@ -178,16 +175,12 @@ impl SlaEstimator {
 
     /// Merge a parsed corpus into the seed-prior table, rescaling
     /// time-domain params via the current hw table. Returns `(entries,
-    /// applied_factor)`. Err ⇔ `[sla]` unconfigured (no priors slot).
-    pub fn import_seed(&self, corpus: prior::SeedCorpus) -> anyhow::Result<(usize, f64)> {
-        let priors = self
-            .priors
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("[sla] not configured; nowhere to import seeds"))?;
+    /// applied_factor)`.
+    pub fn import_seed(&self, corpus: prior::SeedCorpus) -> (usize, f64) {
         let (map, scale) = corpus.into_seed_map(&self.hw.read());
         let n = map.len();
-        priors.write().seed.extend(map);
-        Ok((n, scale))
+        self.priors.write().seed.extend(map);
+        (n, scale)
     }
 
     /// Snapshot one cached fit. `None` for never-seen keys — caller falls
@@ -243,7 +236,7 @@ impl SlaEstimator {
     pub fn for_test(cfg: &config::SlaConfig) -> Self {
         let mut c = cfg.clone();
         c.seed_corpus = None;
-        Self::new(c.halflife_secs, c.ring_buffer, Some(&c))
+        Self::new(&c)
     }
 
     /// Seed the hw-factor table. Test-only: bypasses the
@@ -291,7 +284,7 @@ impl SlaEstimator {
             Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
         }
         let hw_snapshot = self.hw.read().clone();
-        let priors_snapshot = self.priors.as_ref().map(|p| p.read().clone());
+        let priors_snapshot = self.priors.read().clone();
 
         let since = *self.last_tick.read();
         let new_rows = db.read_build_samples_incremental(since).await?;
@@ -342,7 +335,7 @@ impl SlaEstimator {
                 prev.as_ref(),
                 tiers,
                 &hw_snapshot,
-                priors_snapshot.as_ref(),
+                Some(&priors_snapshot),
             );
             self.cache.write().insert(key.clone(), fit);
             // Trim AFTER refit so the fit always sees the full ring even
@@ -360,24 +353,22 @@ impl SlaEstimator {
         // fits feed the NEXT tick's prior (one-tick lag is fine — the
         // fleet aggregate moves slowly). Only Coupled-mem fits
         // contribute (FitParams.{a,b} are meaningless for Independent).
-        if let Some(priors) = &self.priors {
-            let coupled: Vec<(types::ModelKey, prior::FitParams)> = self
-                .cache
-                .read()
-                .values()
-                .filter_map(|f| {
-                    let (s, p, q) = f.fit.spq();
-                    if !s.is_finite() {
-                        return None;
-                    }
-                    let types::MemFit::Coupled { a, b, .. } = f.mem else {
-                        return None;
-                    };
-                    Some((f.key.clone(), prior::FitParams { s, p, q, a, b }))
-                })
-                .collect();
-            priors.write().fleet = prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS);
-        }
+        let coupled: Vec<(types::ModelKey, prior::FitParams)> = self
+            .cache
+            .read()
+            .values()
+            .filter_map(|f| {
+                let (s, p, q) = f.fit.spq();
+                if !s.is_finite() {
+                    return None;
+                }
+                let types::MemFit::Coupled { a, b, .. } = f.mem else {
+                    return None;
+                };
+                Some((f.key.clone(), prior::FitParams { s, p, q, a, b }))
+            })
+            .collect();
+        self.priors.write().fleet = prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS);
 
         Ok(touched.len())
     }
@@ -475,12 +466,12 @@ mod tests {
         // Fresh estimator, import the corpus.
         let dst = SlaEstimator::for_test(&cfg());
         let parsed: prior::SeedCorpus = serde_json::from_str(&json).unwrap();
-        let (n, _) = dst.import_seed(parsed).unwrap();
+        let (n, _) = dst.import_seed(parsed);
         assert_eq!(n, 5);
 
         // prior_for on a key from the corpus → Seed; on an unknown →
         // Operator (no fleet, seed miss).
-        let priors = dst.prior_sources().unwrap();
+        let priors = dst.prior_sources();
         let hit = ModelKey {
             pname: "pkg0".into(),
             system: "x86_64-linux".into(),
@@ -518,15 +509,5 @@ mod tests {
         src.seed(indep);
         src.seed(fitted("ok", 10.0));
         assert_eq!(src.export_corpus(None, 3).entries.len(), 1);
-    }
-
-    #[test]
-    fn import_fails_when_sla_unconfigured() {
-        let est = SlaEstimator::new(7.0 * 86400.0, 32, None);
-        let corpus = prior::SeedCorpus {
-            ref_hw_class: "x".into(),
-            entries: vec![],
-        };
-        assert!(est.import_seed(corpus).is_err());
     }
 }

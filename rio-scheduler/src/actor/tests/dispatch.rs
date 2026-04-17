@@ -1207,6 +1207,8 @@ async fn cgroup_oom_doubles_mem_floor(
             backoff_base_secs: 0.0,
             ..Default::default()
         };
+        // 256 GiB ceiling so the 2GiB→4GiB double isn't clamped.
+        c.sla = test_sla_config();
     });
 
     let mut rx = connect_executor_kind(&handle, "w-1", "x86_64-linux", kind).await?;
@@ -1330,43 +1332,14 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 // r[verify sched.sla.intent-from-solve]
 #[tokio::test]
 async fn spawn_intent_from_sla_estimator() {
-    use crate::sla::{config, solve, types::*};
+    use crate::sla::{solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    // `sla_config.is_some()` gates spawn_intent emission (Static-mode
-    // deployments must NOT emit intents — controller branches on
-    // `intents.is_empty()`). The actor derives `sla_tiers`/`sla_ceilings`
-    // from this in `new()`; here we set the actor fields directly so the
-    // probe values below stay independent of the config struct's defaults.
-    actor.sla_config = Some(config::SlaConfig {
-        tiers: vec![config::Tier {
-            name: "normal".into(),
-            p50: None,
-            p90: Some(1200.0),
-            p99: None,
-        }],
-        default_tier: "normal".into(),
-        probe: config::ProbeShape {
-            cpu: 4.0,
-            mem_per_core: 1 << 30,
-            mem_base: 4 << 30,
-            deadline_secs: 3600,
-        },
-        feature_probes: Default::default(),
-        max_cores: solve::DEFAULT_CEILINGS.max_cores,
-        max_mem: solve::DEFAULT_CEILINGS.max_mem,
-        max_disk: solve::DEFAULT_CEILINGS.max_disk,
-        default_disk: solve::DEFAULT_CEILINGS.default_disk,
-        fuse_cache_budget: 0,
-        log_budget: 0,
-        ring_buffer: 32,
-        halflife_secs: 7.0 * 86400.0,
-        seed_corpus: None,
-        hw_cost_source: None,
-        hw_softmax_temp: 0.3,
-        hw_fallback_after_secs: 120.0,
-        cluster: String::new(),
-    });
+    // The actor derives `sla_tiers`/`sla_ceilings` from `cfg.sla` in
+    // `new()`; here we set the actor fields directly so the probe values
+    // below stay independent of the config struct's defaults.
+    actor.sla_config = test_sla_config();
+    actor.sla_ceilings = actor.sla_config.ceilings();
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_mvp BestEffort at
     // p̄ capped at max_cores).
@@ -1456,10 +1429,10 @@ async fn pending_intent_timeout_marks_ice() {
     use std::time::{Duration, Instant};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = Some(crate::sla::config::SlaConfig {
+    actor.sla_config = crate::sla::config::SlaConfig {
         hw_fallback_after_secs: 120.0,
         ..test_sla_config()
-    });
+    };
 
     // "stuck": Ready, backdated past max-jitter (1.2×120s).
     actor.test_inject_ready("stuck", Some("p"), "x86_64-linux", false);
@@ -1519,12 +1492,13 @@ async fn spawn_intent_node_selector_from_solve_full() {
     use crate::sla::{cost, hw, types::*};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = Some(crate::sla::config::SlaConfig {
+    actor.sla_config = crate::sla::config::SlaConfig {
         hw_cost_source: Some(cost::HwCostSource::Static),
         // temp=0 → greedy argmin → deterministic pick.
         hw_softmax_temp: 0.0,
         ..test_sla_config()
-    });
+    };
+    actor.sla_ceilings = actor.sla_config.ceilings();
     actor.sla_tiers = vec![crate::sla::solve::Tier {
         name: "normal".into(),
         p50: None,
@@ -1613,7 +1587,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
     assert!(!actor.pending_intents.contains_key("cold"));
 
     // Gate: hw_cost_source unset → solve_full skipped even with hw table.
-    actor.sla_config.as_mut().unwrap().hw_cost_source = None;
+    actor.sla_config.hw_cost_source = None;
     actor.pending_intents.clear();
     let snap = actor.compute_spawn_intents(&Default::default());
     let fitted = snap
@@ -1629,15 +1603,15 @@ async fn spawn_intent_node_selector_from_solve_full() {
 
 /// SLA mode: `try_dispatch_one` writes `solve_intent_for().0` to
 /// `sched.est_cores`, and `build_assignment_proto` forwards it as
-/// `WorkAssignment.assigned_cores`. With `sla_config=None` the gate
-/// skips the solve → `est_cores` stays `None` → `assigned_cores=None`.
+/// `WorkAssignment.assigned_cores`.
 // r[verify sched.sla.cores-reach-nix-build-cores]
 #[tokio::test]
 async fn work_assignment_carries_sla_cores() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = Some(test_sla_config());
+    actor.sla_config = test_sla_config();
+    actor.sla_ceilings = actor.sla_config.ceilings();
     actor.sla_tiers = vec![crate::sla::solve::Tier {
         name: "normal".into(),
         p50: None,
@@ -1699,21 +1673,6 @@ async fn work_assignment_carries_sla_cores() {
         Some(expected_cores),
         "est_cores persisted on state for build_assignment_proto"
     );
-
-    // D2: sla_config=None → solve_intent_for falls back to probe
-    // defaults (NOT skipped). assigned_cores is always Some.
-    actor.sla_config = None;
-    actor.test_inject_ready("no-sla", Some("test-pkg"), "x86_64-linux", false);
-    actor.push_ready("no-sla".to_string().into());
-    let mut rx2 = bare_connect_builder(&mut actor, "w-nosla");
-    actor.dispatch_ready().await;
-
-    let assignment = recv_assignment(&mut rx2).await;
-    assert!(
-        assignment.assigned_cores.is_some(),
-        "D2: sla_config=None → probe-default cores (NOT None)"
-    );
-    assert!(actor.dag.node("no-sla").unwrap().sched.est_cores.is_some());
 }
 
 /// Connect+heartbeat+warm a builder against a bare (unspawned) actor.

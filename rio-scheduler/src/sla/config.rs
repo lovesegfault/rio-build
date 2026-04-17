@@ -1,7 +1,8 @@
 //! ADR-023 operator-facing SLA config: tier ladder, cold-start probe
 //! shapes, hard ceilings. Loaded from `[sla]` in `scheduler.toml` (helm
-//! `scheduler.sla`). Absent → SLA-mode disabled (Phase-2 const fallback
-//! path stays active).
+//! `scheduler.sla`). Mandatory — every deployment carries an `[sla]`
+//! block (helm renders it from chart defaults; tests use
+//! [`SlaConfig::test_default`]).
 //!
 //! [`Tier`] is intentionally a config-local mirror of
 //! [`super::solve::Tier`]: solve.rs is being reworked concurrently
@@ -145,6 +146,44 @@ pub(crate) fn default_probe_deadline_secs() -> u32 {
 }
 
 impl SlaConfig {
+    /// Minimal `[sla]` block for tests and `Default for DagActorConfig`:
+    /// single best-effort tier, 1-core probe, tiny ceilings sized for a
+    /// VM-test pool. Production deployments override every field via
+    /// helm `scheduler.sla`; this exists so a bare `DagActor::new(..,
+    /// Default::default(), ..)` produces a usable actor without each
+    /// test hand-rolling an `[sla]` literal.
+    pub fn test_default() -> Self {
+        Self {
+            tiers: vec![Tier {
+                name: "normal".into(),
+                p50: None,
+                p90: None,
+                p99: None,
+            }],
+            default_tier: "normal".into(),
+            probe: ProbeShape {
+                cpu: 1.0,
+                mem_per_core: 1 << 30,
+                mem_base: 1 << 30,
+                deadline_secs: default_probe_deadline_secs(),
+            },
+            feature_probes: HashMap::new(),
+            max_cores: 2.0,
+            max_mem: 2 << 30,
+            max_disk: 6 << 30,
+            default_disk: 2 << 30,
+            fuse_cache_budget: 512 << 20,
+            log_budget: 128 << 20,
+            ring_buffer: default_ring_buffer(),
+            halflife_secs: default_halflife(),
+            seed_corpus: None,
+            hw_cost_source: None,
+            hw_softmax_temp: default_hw_softmax_temp(),
+            hw_fallback_after_secs: default_hw_fallback_after_secs(),
+            cluster: String::new(),
+        }
+    }
+
     /// Startup-time bounds checks. `&self` (not `&mut`) so it composes
     /// with [`rio_common::config::ValidateConfig::validate`]; sorting
     /// is provided separately by [`Self::solve_tiers`].

@@ -18,19 +18,6 @@ use crate::k8s::provider::{DeployOpts, ProviderKind};
 use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::{git, helm, tofu, ui};
 
-/// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
-/// `builderPoolSetDefaults.classes` in values.yaml. `memLimitBytes` ≈ the
-/// class's `resources.limits.memory` (the bump threshold: a build
-/// whose EMA peak exceeds it routes to the next class up).
-/// `cpuLimitCores` mirrors `requests.cpu` for the same reason.
-const SIZE_CLASSES_JSON: &str = r#"[
-  {"name":"tiny","cutoffSecs":30,"memLimitBytes":4294967296,"cpuLimitCores":2.0},
-  {"name":"small","cutoffSecs":120,"memLimitBytes":17179869184,"cpuLimitCores":8.0},
-  {"name":"medium","cutoffSecs":600,"memLimitBytes":68719476736,"cpuLimitCores":32.0},
-  {"name":"large","cutoffSecs":1800,"memLimitBytes":137438953472,"cpuLimitCores":64.0},
-  {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":274877906944,"cpuLimitCores":128.0}
-]"#;
-
 /// `pools[]` (helm list — replaced wholesale, hence one const).
 /// Per-arch general builder pools, per-arch kvm builder pools (NixOS
 /// VM tests; the controller derives the metal nodeSelector +
@@ -262,7 +249,6 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // place (nix/nixos-node/eks-node.nix) so the flip is a
             // one-line revert here when P0560 lands.
             .set_json("pools", POOLS_JSON)
-            .set_json("scheduler.sizeClasses", SIZE_CLASSES_JSON)
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             // I-128: store.replicas was a fixed "8" here (I-105

@@ -740,8 +740,7 @@ impl AdminService for AdminServiceImpl {
         let (n, scale) = query_actor(&self.actor, |reply| {
             ActorCommand::Admin(AdminQuery::SlaImportCorpus { corpus, reply })
         })
-        .await?
-        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        .await?;
         Ok(Response::new(ImportSlaCorpusResponse {
             entries_loaded: n as u32,
             ref_hw_class,

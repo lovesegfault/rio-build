@@ -18,10 +18,8 @@ scope: with scope; ''
   # session. Worker config is the operator's fleet default until a
   # gateway-side propagation path lands (follow-up).
   #
-  # Decoupled from classify(): every worker has the silence config, so
-  # the test passes regardless of which class silenceDrv routes to.
-  # Previously this relied on cutoff_secs routing to wlarge — broke when
-  # the cutoff moved 30→60, and classify() is being deleted anyway.
+  # Every worker has the silence config, so the test passes regardless
+  # of which worker silenceDrv lands on.
   with subtest("max-silent-time: silence arm kills at ~10s, not 60s wall-clock"):
       # expect_fail=True: TimedOut is a build FAILURE (nix-build
       # exits nonzero). The timing wrap stays at the callsite —

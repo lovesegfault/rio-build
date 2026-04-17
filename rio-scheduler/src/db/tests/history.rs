@@ -200,7 +200,7 @@ async fn test_sla_estimator_incremental_refresh() -> anyhow::Result<()> {
         .execute(&test_db.pool)
         .await?;
 
-    let est = SlaEstimator::new(7.0 * 86400.0, 32, None);
+    let est = SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
     let n = est.refresh(&db, &[]).await?;
     assert_eq!(n, 1, "one (pname,system,tenant) key touched");
 

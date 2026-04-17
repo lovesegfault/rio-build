@@ -1,18 +1,18 @@
-# Scheduling scenario: fanout distribution, size-class routing, chunked
-# PutPath, worker-disconnect reassignment, cgroup→build_history.
+# Scheduling scenario: fanout distribution, chunked PutPath,
+# worker-disconnect reassignment, cgroup-tracking.
 #
 # Ports phase2a + phase2c + phase3a(cgroup) to the fixture architecture.
 # Needs the standalone fixture with 3 workers and chunk-backend TOML:
 #
 #   fixture = standalone {
 #     workers = {
-#       wsmall1 = { };
-#       wsmall2 = { };
-#       wlarge  = { };
+#       worker1 = { };
+#       worker2 = { };
+#       worker3  = { };
 #     };
 #     extraSchedulerConfig = { tickIntervalSecs = 2; };
 #     extraStoreConfig = { extraConfig = <chunk_backend filesystem>; };
-#     extraPackages = [ pkgs.postgresql ];  # psql for build_history queries
+#     extraPackages = [ pkgs.postgresql ];  # psql for build_samples queries
 #   };
 #
 #
@@ -49,7 +49,7 @@
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
 #
 # worker.shutdown.sigint — verify marker at default.nix:subtests[sigint-graceful]
-#   sigint-graceful sends SIGINT (not SIGTERM) to rio-builder on wsmall2
+#   sigint-graceful sends SIGINT (not SIGTERM) to rio-builder on worker2
 #   and asserts ExecMainCode=1 + ExecMainStatus=0 → main() RETURNED
 #   (stack unwound, Drop ran) rather than death-by-signal. Also guards
 #   .#coverage-full: main() returning → atexit fires → profraw flushes.
@@ -86,8 +86,7 @@ let
   };
 
   # cancel-timing: 60×5s echo loop (300s total) — cancelled long
-  # before natural end. No pname → default "small" class → lands on
-  # wsmall1 OR wsmall2. 300s >> 5s budget: if cgroup-gone passes, the
+  # before natural end. 300s >> 5s budget: if cgroup-gone passes, the
   # kill DID it (not loop end). Echoes every 5s to feed
   # RIO_MAX_SILENT_TIME_SECS=10 (set on ALL scheduling workers since
   # max-silent-time was decoupled from classify routing); a single
@@ -144,8 +143,7 @@ let
       withSeed = true;
     }}
 
-    all_workers = [wsmall1, wsmall2, wlarge]
-    small_workers = [wsmall1, wsmall2]
+    all_workers = [worker1, worker2, worker3]
 
     ${common.mkBuildHelperV2 {
       inherit gatewayHost;

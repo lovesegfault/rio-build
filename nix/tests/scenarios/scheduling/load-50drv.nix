@@ -4,9 +4,9 @@ scope: with scope; ''
   # load-50drv — 50-leaf fanout dispatches + completes cleanly
   # ══════════════════════════════════════════════════════════════════
   # 50 independent leaves + 1 collector = 51 derivations. All 50
-  # leaves Ready simultaneously on SubmitBuild. No-pname → default
-  # "small" class → 4 slots (wsmall1:2 + wsmall2:2; wlarge idle).
-  # ~13 dispatch waves. Proves: (a) scheduler doesn't stall or
+  # leaves Ready simultaneously on SubmitBuild. 6 slots (3 workers ×
+  # maxConcurrent=2) → ~9 dispatch waves. Proves: (a) scheduler
+  # doesn't stall or
   # deadlock under bulk-ready load, (b) every derivation gets
   # dispatched — no leaks in the ready-set, (c) store handles 50
   # near-back-to-back PutPath calls.

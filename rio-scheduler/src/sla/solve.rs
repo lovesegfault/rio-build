@@ -11,16 +11,6 @@ use super::r#override::ResolvedTarget;
 use super::quantile;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 
-/// Fallback ceilings when `[sla]` is unconfigured. The actor stores
-/// `cfg.sla.ceilings()` (or this) once at construction so dispatch and
-/// the snapshot read the same struct.
-pub const DEFAULT_CEILINGS: Ceilings = Ceilings {
-    max_cores: 64.0,
-    max_mem: 256 << 30,
-    max_disk: 200 << 30,
-    default_disk: 20 << 30,
-};
-
 /// `prefer_local_build = true` → trivially short. Smallest pod the
 /// controller will spawn.
 const LOCAL_CORES: u32 = 1;
@@ -154,14 +144,7 @@ pub struct DrvHints {
 ///   (the build is serial by declaration; exploring c is wasted).
 /// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → [`explore::next`]
 ///   drives the saturation-gated ×4/÷2 ladder from `cfg.probe`.
-/// - Otherwise → `solve_mvp` against `tiers` / `ceil`. Empty `tiers`
-///   (`[sla]` unconfigured) → `solve_mvp` returns `BestEffort` at
-///   `min(p̄, max_cores)`, so unconfigured deployments still get the
-///   fitted-curve cap instead of a hardcoded tier target.
-///
-/// `cfg=None` (`[sla]` absent) keeps the explore branch on a fixed
-/// fallback probe — the actor still constructs a `Ceilings` from
-/// [`DEFAULT_CEILINGS`] so the solve branch is unaffected.
+/// - Otherwise → `solve_mvp` against `tiers` / `ceil`.
 ///
 /// Cores are `ceil`-ed to a whole-core `u32` (k8s `resources.requests`
 /// granularity); mem/disk are byte-exact (controller rounds at the pod
@@ -180,10 +163,12 @@ pub fn intent_for(
     fit: Option<&FittedParams>,
     hints: &DrvHints,
     override_: Option<&ResolvedTarget>,
-    cfg: Option<&SlaConfig>,
+    cfg: &SlaConfig,
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> (u32, u64, u64) {
+    let probe_mem =
+        (cfg.probe.cpu * cfg.probe.mem_per_core as f64 + cfg.probe.mem_base as f64) as u64;
     // Operator override beats everything — including drv-declared hints.
     // If the operator forced 12 cores on a `prefer_local_build` drv,
     // they had a reason. Mem unset → fall back to the fit's M(c) at the
@@ -192,14 +177,9 @@ pub fn intent_for(
         && let Some(c) = o.forced_cores
     {
         let cores = (c.ceil() as u32).max(1);
-        let mem = o.forced_mem.unwrap_or_else(|| {
-            fit.map(|f| f.mem.at(RawCores(c)).0).unwrap_or_else(|| {
-                cfg.map(|s| {
-                    (s.probe.cpu * s.probe.mem_per_core as f64 + s.probe.mem_base as f64) as u64
-                })
-                .unwrap_or(8 << 30)
-            })
-        });
+        let mem = o
+            .forced_mem
+            .unwrap_or_else(|| fit.map(|f| f.mem.at(RawCores(c)).0).unwrap_or(probe_mem));
         let disk = fit
             .and_then(|f| f.disk_p90)
             .map_or(ceil.default_disk, |d| d.0);
@@ -208,9 +188,6 @@ pub fn intent_for(
     if hints.prefer_local_build == Some(true) {
         return (LOCAL_CORES, LOCAL_MEM_BYTES, ceil.default_disk);
     }
-    let probe_mem = cfg
-        .map(|c| (c.probe.cpu * c.probe.mem_per_core as f64 + c.probe.mem_base as f64) as u64)
-        .unwrap_or(8 << 30);
     if hints.enable_parallel_building == Some(false) {
         return (1, probe_mem, ceil.default_disk);
     }
@@ -221,18 +198,9 @@ pub fn intent_for(
             f
         }
         _ => {
-            // Explore ladder. With `[sla]` unconfigured, fall back to a
-            // fixed probe shape so the snapshot path stays deterministic.
-            return match cfg {
-                Some(cfg) => {
-                    let d = explore::next(fit, cfg, hints);
-                    ((d.c.0.ceil() as u32).max(1), d.mem.0, d.disk.0)
-                }
-                None => {
-                    let p = explore::fallback_probe();
-                    (p.cpu as u32, probe_mem, ceil.default_disk)
-                }
-            };
+            // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
+            let d = explore::next(fit, cfg, hints);
+            return ((d.c.0.ceil() as u32).max(1), d.mem.0, d.disk.0);
         }
     };
     let r = solve_mvp(fit, tiers, ceil);
@@ -591,6 +559,21 @@ mod tests {
             default_disk: 20 << 30,
         }
     }
+    fn cfg() -> SlaConfig {
+        SlaConfig {
+            probe: super::super::config::ProbeShape {
+                cpu: 4.0,
+                mem_per_core: 1 << 30,
+                mem_base: 4 << 30,
+                deadline_secs: 3600,
+            },
+            max_cores: 64.0,
+            max_mem: 256 << 30,
+            max_disk: 200 << 30,
+            default_disk: 20 << 30,
+            ..SlaConfig::test_default()
+        }
+    }
 
     #[test]
     fn envelope_degenerates_to_amdahl_at_q0() {
@@ -718,7 +701,7 @@ mod tests {
     // ─── intent_for branching ───────────────────────────────────────
 
     fn intent(fit: Option<&FittedParams>, hints: &DrvHints) -> (u32, u64, u64) {
-        intent_for(fit, hints, None, None, &[t("normal", 1200.0)], &ceil())
+        intent_for(fit, hints, None, &cfg(), &[t("normal", 1200.0)], &ceil())
     }
 
     // r[verify sched.sla.override-precedence]
@@ -735,7 +718,7 @@ mod tests {
             Some(&fit),
             &DrvHints::default(),
             Some(&o),
-            None,
+            &cfg(),
             &[t("normal", 1200.0)],
             &ceil(),
         );
@@ -756,7 +739,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&o),
-            None,
+            &cfg(),
             &[],
             &ceil(),
         );
@@ -770,8 +753,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            intent_for(None, &DrvHints::default(), Some(&o), None, &[], &ceil()).0,
-            4, // fallback probe
+            intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil()).0,
+            4, // probe.cpu
         );
     }
 
@@ -803,18 +786,19 @@ mod tests {
     }
     #[test]
     fn intent_for_cold_start_is_probe() {
-        // No [sla] config → fixed fallback probe (4 cores, 8 GiB).
+        // No fit → explore::next emits cfg.probe (4 cores, 4×1+4=8 GiB).
         assert_eq!(
             intent(None, &DrvHints::default()),
             (4, 8 << 30, ceil().default_disk)
         );
-        // n_eff < 3 → still explore/probe path. mk_fit's explore state
-        // is min=4/max=32 → frozen() = true (span 8) → solve gate would
-        // pass if n_eff≥3; below that, explore::next emits max_c=32 with
-        // a config or fallback 4 without one.
+        // n_eff < 3 → still explore path. mk_fit's explore state is
+        // min=4/max=32 → frozen() = true (span 8) → solve gate would
+        // pass if n_eff≥3; below that, explore::next walks the ladder
+        // from the fit's existing range.
         let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         fit.n_eff = 2.0;
-        assert_eq!(intent(Some(&fit), &DrvHints::default()).0, 4);
+        let (c, _, _) = intent(Some(&fit), &DrvHints::default());
+        assert!(c >= 4, "explore ladder ≥ probe.cpu, got {c}");
     }
     // ─── solve_full / softmax (Algorithm 4) ─────────────────────────
 

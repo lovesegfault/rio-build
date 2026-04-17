@@ -1,9 +1,8 @@
 # 50 parallel leaves + 1 collector. Scaled-up fanout.nix for load testing.
 #
 # Shape: 50 independent leaves all ready at once + 1 collector that cat's
-# all 50 stamps. With 4 small slots (scheduling fixture: wsmall1:2 +
-# wsmall2:2; no-pname leaves route to "small" class so wlarge sits idle)
-# this is ~13 dispatch waves.
+# all 50 stamps. With 6 slots (scheduling fixture: 3 workers ×
+# maxConcurrent=2) this is ~9 dispatch waves.
 #
 # Proves the scheduler handles bulk-parallel ready-sets without stalling,
 # dropping, or deadlocking. The collector's stamp has exactly 50

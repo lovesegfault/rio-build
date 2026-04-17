@@ -430,8 +430,8 @@ pub const M_031: () = ();
 /// `migrations/032_derivations_size_class_floor.sql`
 ///
 /// Nullable `size_class_floor TEXT` on `derivations` — persists the
-/// I-170 reactive FOD promotion (`r[sched.fod.size-class-reactive]`)
-/// across scheduler restart. P0556: without this, a scheduler failover
+/// I-170 reactive FOD promotion (legacy class-name floor) across
+/// scheduler restart. P0556: without this, a scheduler failover
 /// between an OOMKilled tiny-fetcher attempt and the retry resets
 /// `DerivationState.size_class_floor` to `None` → the FOD goes back
 /// to tiny → OOMs again. With ephemeral FetcherPools (one Job per
@@ -448,6 +448,10 @@ pub const M_031: () = ();
 ///
 /// Nullable, no default — existing rows read NULL → `None` →
 /// "smallest class" (same as fresh state). No backfill needed.
+///
+/// **Superseded by 044/045:** the per-dimension `resource_floor_*`
+/// columns (M_044) replace the class-name string; M_045 drops
+/// `size_class_floor`.
 pub const M_032: () = ();
 
 /// `migrations/033_chunks_uploaded_at.sql`
@@ -551,6 +555,11 @@ pub const M_036: () = ();
 /// `CompletionReport.output_size_bytes` (proto field 5) is kept for
 /// wire compatibility — the builder still measures and sends it; the
 /// scheduler simply stops persisting it.
+///
+/// **Superseded by 044/045:** the remaining `build_history` EMAs were
+/// only read by the legacy size-class estimator; ADR-023's
+/// `build_samples` (M_039) feeds the SLA fit instead. M_045 drops the
+/// table.
 pub const M_037: () = ();
 
 /// `migrations/039_sla_telemetry.sql`
@@ -666,6 +675,23 @@ pub const M_043: () = ();
 /// once the SLA-only dispatch path lands and no recovery code reads
 /// the legacy column.
 pub const M_044: () = ();
+
+/// `migrations/045_drop_legacy_sizer.sql`
+///
+/// Legacy-sizer removal Phase 8: `[sla]` is now mandatory (no
+/// `Option<SlaConfig>` arm), so the pre-ADR-023 sizing inputs are
+/// dead.
+///
+/// - `build_history` — per-`(pname,system)` EMA table (M_001/M_037
+///   shape: `ema_duration_secs`/`ema_peak_memory_bytes`/
+///   `ema_peak_cpu_cores`). The legacy `classify()` read it; the SLA
+///   fit reads `build_samples` (M_039). The actor still emits the
+///   `rio_scheduler_build_actual_vs_predicted` metric from the
+///   in-memory fit; nothing reads the table.
+/// - `derivations.size_class_floor` (M_032) — class-name reactive
+///   floor. Replaced by the per-dimension `resource_floor_*` columns
+///   (M_044); recovery loads those, not this.
+pub const M_045: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

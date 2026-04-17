@@ -1,7 +1,7 @@
 //! PostgreSQL persistence for scheduler state.
 //!
 //! Synchronous writes: state transitions, assignment changes, build terminal status.
-//! Async/batched: build_history EMA updates.
+//! Async/batched: build_samples inserts (SLA fit feed).
 //!
 //! UUIDs are bound natively via the sqlx `uuid` feature — no `::uuid` casts or
 //! `.to_string()` conversions needed.

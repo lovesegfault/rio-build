@@ -36,7 +36,7 @@ use crate::state::{
 
 // `impl DagActor` is sharded across these submodules by concern.
 // Cohesive field clusters live in sub-structs (`events: BuildEventBus`,
-// `leader: LeaderState`, `sizing: SizingConfig`); the genuinely
+// `leader: LeaderState`); the genuinely
 // cross-cutting fields (`dag`, `executors`, `builds`, `db`,
 // `ready_queue`) remain flat — every handler reads/writes them. Keep
 // ALL `mod` decls here so the submodule list is discoverable in one
@@ -58,7 +58,7 @@ mod snapshot;
 
 pub(super) use breaker::CacheCheckBreaker;
 pub use command::*;
-pub(crate) use config::SizingConfig;
+use config::apply_soft_features;
 pub use config::{DagActorConfig, DagActorPlumbing};
 use event::BuildEventBus;
 #[cfg(test)]
@@ -234,16 +234,13 @@ pub struct DagActor {
     pub(crate) sla_estimator: crate::sla::SlaEstimator,
     /// Tier ladder from `cfg.sla.solve_tiers()` (sorted tightest-first).
     /// Shared between the tick `refresh()` (Schmitt-trigger reassign)
-    /// and `solve_intent_for` so both see the SAME ladder. Empty when
-    /// `[sla]` is unconfigured.
+    /// and `solve_intent_for` so both see the SAME ladder.
     pub(crate) sla_tiers: Vec<crate::sla::solve::Tier>,
-    /// Hard ceilings from `cfg.sla.ceilings()` (or
-    /// [`crate::sla::solve::DEFAULT_CEILINGS`]).
+    /// Hard ceilings from `cfg.sla.ceilings()`.
     pub(crate) sla_ceilings: crate::sla::solve::Ceilings,
     /// Full `[sla]` config — feeds [`crate::sla::explore::next`]'s
-    /// probe shape and feature overrides. `None` ⇔ `[sla]` absent
-    /// (explore falls back to a fixed probe).
-    pub(crate) sla_config: Option<crate::sla::config::SlaConfig>,
+    /// probe shape and feature overrides.
+    pub(crate) sla_config: crate::sla::config::SlaConfig,
     /// ADR-023 phase-13 hw-band cost table — `$/vCPU·hr` per
     /// `(band, cap)` + per-band λ. `Arc<RwLock<_>>` shared with
     /// `spot_price_poller` (lease-gated, 10min tick); the actor reads a
@@ -294,8 +291,11 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
-    /// Soft-feature config. See [`SizingConfig`].
-    pub(crate) sizing: SizingConfig,
+    /// I-204: capability-hint features stripped at DAG insertion.
+    /// Stored on the actor (not just the DAG) because
+    /// `clear_persisted_state` replaces `self.dag` on every leader
+    /// transition — this copy is what survives.
+    pub(crate) soft_features: Vec<crate::assignment::SoftFeature>,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -404,13 +404,8 @@ impl DagActor {
     /// are `Default`-able — tests / non-K8s spawns can
     /// `..Default::default()` and override one or two fields.
     pub fn new(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
-        let sizing = SizingConfig::new(&cfg);
-        // I-204: soft-feature stripping is configured on the DAG. Stored
-        // on the actor (not just the DAG) because `clear_persisted_state`
-        // replaces `self.dag` on every leader transition — the
-        // `SizingConfig` copy is what survives.
         let mut dag = DerivationDag::new();
-        sizing.apply_to_dag(&mut dag);
+        apply_soft_features(&mut dag, &cfg.soft_features);
 
         Self {
             dag,
@@ -430,22 +425,10 @@ impl DagActor {
                 cfg.substitute_max_concurrent.max(1),
             )),
             cache_breaker: CacheCheckBreaker::default(),
-            sla_estimator: crate::sla::SlaEstimator::new(
-                cfg.sla.as_ref().map_or(7.0 * 86400.0, |s| s.halflife_secs),
-                cfg.sla.as_ref().map_or(32, |s| s.ring_buffer),
-                cfg.sla.as_ref(),
-            ),
-            sla_tiers: cfg
-                .sla
-                .as_ref()
-                .map(|s| s.solve_tiers())
-                .unwrap_or_default(),
-            sla_ceilings: cfg
-                .sla
-                .as_ref()
-                .map(|s| s.ceilings())
-                .unwrap_or(crate::sla::solve::DEFAULT_CEILINGS),
-            sla_config: cfg.sla.clone(),
+            sla_estimator: crate::sla::SlaEstimator::new(&cfg.sla),
+            sla_tiers: cfg.sla.solve_tiers(),
+            sla_ceilings: cfg.sla.ceilings(),
+            sla_config: cfg.sla,
             cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::default()),
             pending_intents: dashmap::DashMap::new(),
@@ -453,7 +436,7 @@ impl DagActor {
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
             self_tx: None,
-            sizing,
+            soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
@@ -487,7 +470,7 @@ impl DagActor {
     /// `self.executors` — those are live connections, not persisted.
     pub(super) fn clear_persisted_state(&mut self) {
         self.dag = DerivationDag::new();
-        self.sizing.apply_to_dag(&mut self.dag);
+        apply_soft_features(&mut self.dag, &self.soft_features);
         self.ready_queue.clear();
         self.builds.clear();
         self.events.clear();

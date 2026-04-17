@@ -472,27 +472,6 @@ fn req_features(f: Option<&[&str]>) -> SpawnIntentsRequest {
     }
 }
 
-/// Static-mode gate: `[sla]` absent → `intents` is empty (the
-/// controller stays on the scalar `spawn_n` path), but
-/// `queued_by_system` is still populated (the ComponentScaler reads
-/// it).
-#[tokio::test]
-async fn spawn_intents_empty_when_sla_unconfigured() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor(db.pool.clone());
-    actor.test_inject_ready("a", None, "x86_64-linux", false);
-    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
-    assert!(
-        snap.intents.is_empty(),
-        "[sla] absent → empty intents (Static-mode gate)"
-    );
-    assert_eq!(
-        snap.queued_by_system.get("x86_64-linux"),
-        Some(&1),
-        "queued_by_system populated regardless"
-    );
-}
-
 /// I-176: `features` filters Ready derivations by
 /// `required_features ⊆ features` — the same subset check
 /// `rejection_reason()` applies. A kvm derivation MUST appear in the
@@ -624,7 +603,7 @@ async fn spawn_intents_soft_features_strip() {
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            sla: Some(test_sla_config()),
+            sla: test_sla_config(),
             soft_features: vec![crate::assignment::SoftFeature {
                 name: "big-parallel".into(),
             }],

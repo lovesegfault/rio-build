@@ -186,7 +186,6 @@ impl DagActor {
     pub(crate) fn compute_spawn_intents(&self, req: &SpawnIntentsRequest) -> SpawnIntentsSnapshot {
         let mut intents = Vec::new();
         let mut queued_by_system: HashMap<String, u64> = HashMap::new();
-        let sla_on = self.sla_config.is_some();
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {
@@ -234,15 +233,6 @@ impl DagActor {
                 if !state.required_features.iter().all(|f| pf.contains(f)) {
                     continue;
                 }
-            }
-
-            // Static-mode gate: with `[sla]` absent the controller
-            // MUST stay on the scalar `spawn_n` path (fixed
-            // `spec.resources`); emitting fallback-probe intents here
-            // would divert it to `spawn_for_each` with shapes that
-            // don't match any class.
-            if !sla_on {
-                continue;
             }
 
             // r[impl sched.sla.intent-from-solve]
@@ -354,32 +344,30 @@ impl DagActor {
         // the band-agnostic path). The hw_table snapshot is one
         // RwLock-read clone (~dozens of entries); cost_table same.
         let hw = self.sla_estimator.hw_table();
-        let full = self
-            .sla_config
-            .as_ref()
-            .filter(|c| c.hw_cost_source.is_some())
-            .filter(|_| !hw.is_empty())
-            .filter(|_| override_.as_ref().is_none_or(|o| o.forced_cores.is_none()))
-            .filter(|_| hints.prefer_local_build != Some(true))
-            .and_then(|c| {
-                let f = fit.as_ref()?;
-                if f.n_eff < 3.0
-                    || (f.span < 4.0
-                        && !crate::sla::explore::frozen(&f.explore, self.sla_ceilings.max_cores))
-                {
-                    return None;
-                }
-                Some(solve::solve_full(
-                    f,
-                    &self.sla_tiers,
-                    &hw,
-                    &self.cost_table.read(),
-                    &self.sla_ceilings,
-                    &self.ice,
-                    c.hw_softmax_temp,
-                    &mut rand::rng(),
-                ))
-            });
+        let full = (self.sla_config.hw_cost_source.is_some()
+            && !hw.is_empty()
+            && override_.as_ref().is_none_or(|o| o.forced_cores.is_none())
+            && hints.prefer_local_build != Some(true))
+        .then_some(())
+        .and_then(|()| {
+            let f = fit.as_ref()?;
+            if f.n_eff < 3.0
+                || (f.span < 4.0
+                    && !crate::sla::explore::frozen(&f.explore, self.sla_ceilings.max_cores))
+            {
+                return None;
+            }
+            Some(solve::solve_full(
+                f,
+                &self.sla_tiers,
+                &hw,
+                &self.cost_table.read(),
+                &self.sla_ceilings,
+                &self.ice,
+                self.sla_config.hw_softmax_temp,
+                &mut rand::rng(),
+            ))
+        });
 
         let (cores, mem, disk, node_selector) = match &full {
             Some(r) => (
@@ -393,7 +381,7 @@ impl DagActor {
                     fit.as_ref(),
                     &hints,
                     override_.as_ref(),
-                    self.sla_config.as_ref(),
+                    &self.sla_config,
                     &self.sla_tiers,
                     &self.sla_ceilings,
                 );
@@ -418,11 +406,7 @@ impl DagActor {
         // `bump_floor_or_count(DeadlineExceeded)` doubles
         // `floor.deadline_secs`; the next solve must honor it), then
         // 24h ceiling so a doubled floor cannot run away.
-        let probe_deadline = self
-            .sla_config
-            .as_ref()
-            .map(|c| c.probe.deadline_secs)
-            .unwrap_or_else(crate::sla::config::default_probe_deadline_secs);
+        let probe_deadline = self.sla_config.probe.deadline_secs;
         let computed = fit
             .as_ref()
             .map(|f| {

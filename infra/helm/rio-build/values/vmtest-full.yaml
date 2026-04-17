@@ -79,26 +79,22 @@ scheduler:
   replicas: 2
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
-  # ADR-023: [sla] is REQUIRED — compute_spawn_intents emits no
-  # intents when sla_on=false → controller spawns zero Jobs. Chart
-  # defaults (probe.cpu=4, memBase=4Gi+2Gi/core = 12Gi) don't fit the
-  # 4GB k3s agent VM. Override with a tiny probe (1 core, 1Gi, 6Gi
-  # disk) matching the old `tiny` size class. Single best-effort tier:
-  # no p50/p90/p99 targets → solve falls back to probe shape (no
-  # learned-model scaling in VM tests).
+  # ADR-023 [sla] is mandatory; chart-default values.yaml's block is
+  # sized for prod (probe.cpu=4 → 12 GiB cold-start), which the
+  # resource-fit gate rejects on a 2 GiB k3s agent VM. Override with a
+  # tiny single-tier block sized for the VM-test pool. The sla-sizing
+  # scenario overlays a larger block separately.
   sla:
     tiers:
-      - {name: vm}
-    defaultTier: vm
-    probe: {cpu: 1, memPerCore: 0, memBase: 1073741824, deadlineSecs: 3600}
+      - {name: normal}
+    defaultTier: normal
+    probe: {cpu: 1, memPerCore: 1073741824, memBase: 1073741824, deadlineSecs: 3600}
     maxCores: 2
-    maxMem: 2147483648       # 2 GiB
-    # Tiny disk: controller adds a fixed 9GiB on top (FUSE_CACHE_
-    # BUDGET 8Gi + LOG_BUDGET 1Gi at jobs.rs) → pod requests ~10GiB.
-    maxDisk: 1073741824      # 1 GiB
-    defaultDisk: 1073741824  # 1 GiB
-    fuseCacheBudget: 268435456  # 256 MiB
-    logBudget: 67108864         # 64 MiB
+    maxMem: 2147483648         # 2 GiB
+    maxDisk: 6442450944        # 6 GiB
+    defaultDisk: 2147483648    # 2 GiB
+    fuseCacheBudget: 536870912 # 512 MiB
+    logBudget: 134217728       # 128 MiB
 
 gateway:
   enabled: true

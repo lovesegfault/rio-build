@@ -15,34 +15,14 @@ use crate::dag::DerivationDag;
 use crate::lease::LeaderState;
 use crate::state::{PoisonConfig, RetryPolicy};
 
-/// Soft-feature config. Sub-struct of [`super::DagActor`] —
-/// centralizes the DAG soft-feature setup
-/// ([`apply_to_dag`](Self::apply_to_dag)) that was previously
-/// open-coded at both construction and leader-transition reset.
-pub(crate) struct SizingConfig {
-    /// I-204: capability-hint features stripped at DAG insertion.
-    /// Re-applied by [`apply_to_dag`](Self::apply_to_dag) on every
-    /// fresh DAG (recovery replaces `DagActor.dag` on each leader
-    /// transition).
-    pub(super) soft_features: Vec<SoftFeature>,
-}
-
-impl SizingConfig {
-    pub(super) fn new(cfg: &DagActorConfig) -> Self {
-        Self {
-            soft_features: cfg.soft_features.clone(),
-        }
-    }
-
-    /// Configure soft-feature stripping on `dag`. Called from
-    /// `DagActor::new` and `clear_persisted_state` — the latter
-    /// replaces `self.dag` on every leader transition and would
-    /// otherwise drop soft_features (regression: the original
-    /// open-coded reset at each site meant the first prod deploy of
-    /// I-204 was a no-op after the lease acquired).
-    pub(super) fn apply_to_dag(&self, dag: &mut DerivationDag) {
-        dag.set_soft_features(self.soft_features.clone());
-    }
+/// Configure soft-feature stripping on `dag`. Called from
+/// `DagActor::new` and `clear_persisted_state` — the latter replaces
+/// `self.dag` on every leader transition and would otherwise drop
+/// soft_features (regression: the original open-coded reset at each
+/// site meant the first prod deploy of I-204 was a no-op after the
+/// lease acquired).
+pub(super) fn apply_soft_features(dag: &mut DerivationDag, soft_features: &[SoftFeature]) {
+    dag.set_soft_features(soft_features.to_vec());
 }
 
 /// Immutable-after-init configuration for [`super::DagActor`]. All
@@ -72,11 +52,10 @@ pub struct DagActorConfig {
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
     pub soft_features: Vec<crate::assignment::SoftFeature>,
-    /// ADR-023 SLA-driven sizing config (`[sla]` table). `None` =
-    /// SLA-mode unconfigured: dispatch falls back to
-    /// [`crate::sla::solve::DEFAULT_CEILINGS`] and an empty tier ladder
-    /// (`solve_mvp` returns `BestEffort` at the fitted curve's `p̄`).
-    pub sla: Option<crate::sla::config::SlaConfig>,
+    /// ADR-023 SLA-driven sizing config (`[sla]` table). Mandatory —
+    /// `Default` uses [`crate::sla::config::SlaConfig::test_default`]
+    /// (single best-effort tier, tiny ceilings).
+    pub sla: crate::sla::config::SlaConfig,
 }
 
 impl Default for DagActorConfig {
@@ -87,7 +66,7 @@ impl Default for DagActorConfig {
             grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             soft_features: Vec::new(),
-            sla: None,
+            sla: crate::sla::config::SlaConfig::test_default(),
         }
     }
 }

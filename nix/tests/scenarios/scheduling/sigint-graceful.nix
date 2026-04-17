@@ -24,8 +24,8 @@ scope: with scope; ''
   #      refactor breaking the cancellation arm would silently
   #      zero worker VM coverage.
   #
-  # Uses wsmall2: wsmall1 holds FUSE cache state for fuse-direct
-  # (core-test cache-chain coupling). wsmall2 is disposable here —
+  # Uses worker2: worker1 holds FUSE cache state for fuse-direct
+  # (core-test cache-chain coupling). worker2 is disposable here —
   # disrupt split only.
   #
   # Standalone fixture only (k3s worker pods are distroless, no
@@ -35,7 +35,7 @@ scope: with scope; ''
       # Baseline: mount IS present (worker running, FUSE alive).
       # One-shot builder restarts between builds — wait for the
       # next instance to be up and mounted (RestartSec=1s).
-      wsmall2.wait_until_succeeds(
+      worker2.wait_until_succeeds(
           "mountpoint -q /var/rio/fuse-store", timeout=15
       )
 
@@ -50,19 +50,19 @@ scope: with scope; ''
       # printf '%s\n' on empty → one blank line → wc -l = 1, so use
       # a for-loop counter instead. Plain ls fails under pipefail;
       # find fails if dir doesn't exist. This form is pipefail-safe.
-      profraw_before = int(wsmall2.succeed(
+      profraw_before = int(worker2.succeed(
           "shopt -s nullglob; "
           "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
           "echo $n"
       ).strip())
 
       # Prior subtests (reassign) may have landed a sleepSecs=25 build
-      # on wsmall2. SIGINT-drain waits for in-flight builds; without
+      # on worker2. SIGINT-drain waits for in-flight builds; without
       # waiting for idle first, the 30s timeout can't cover 25s+drain.
       # One-shot: a fresh-restarted builder hasn't registered the
       # gauge yet, so "absent" = idle. Invert: fail only if gauge
       # is present AND ≥1.
-      wsmall2.wait_until_succeeds(
+      worker2.wait_until_succeeds(
           "! curl -sf localhost:9093/metrics 2>/dev/null | "
           "grep -qE '^rio_builder_builds_active\\{role=\"builder\"\\} [1-9]'",
           timeout=60,
@@ -79,14 +79,14 @@ scope: with scope; ''
       # (running) by the time we check. Temporarily disable
       # restart via a runtime drop-in, observe the exit, then
       # restore.
-      wsmall2.succeed(
+      worker2.succeed(
           "mkdir -p /run/systemd/system/rio-builder.service.d && "
           "printf '[Service]\\nRestart=no\\n' "
           "  > /run/systemd/system/rio-builder.service.d/norestart.conf && "
           "systemctl daemon-reload"
       )
-      wsmall2.succeed("systemctl kill -s INT rio-builder.service")
-      wsmall2.wait_until_succeeds(
+      worker2.succeed("systemctl kill -s INT rio-builder.service")
+      worker2.wait_until_succeeds(
           "systemctl show rio-builder.service -p ActiveState "
           "| grep -qx ActiveState=inactive",
           timeout=30,
@@ -95,7 +95,7 @@ scope: with scope; ''
       # PRIMARY: exit code. main() returning Ok(()) → CLD_EXITED
       # (Code=1) + Status=0. SIGINT default handler →
       # CLD_KILLED (Code=2) + Status=2.
-      exit_info = wsmall2.succeed(
+      exit_info = worker2.succeed(
           "systemctl show rio-builder.service "
           "-p ExecMainCode -p ExecMainStatus"
       )
@@ -113,7 +113,7 @@ scope: with scope; ''
 
       # SECONDARY: FUSE mount gone. Observable now (Restart=no
       # drop-in in effect).
-      wsmall2.succeed("! mountpoint -q /var/rio/fuse-store")
+      worker2.succeed("! mountpoint -q /var/rio/fuse-store")
 
       # TERTIARY [coverage mode only]: fresh profraw appeared.
       # LLVM registers __llvm_profile_write_file in atexit —
@@ -128,7 +128,7 @@ scope: with scope; ''
       # at nixos-test-driver-rio-scheduling-disrupt).
       _cov_mode = ${if common.coverage then "True" else "False"}
       if _cov_mode:
-          profraw_after = int(wsmall2.succeed(
+          profraw_after = int(worker2.succeed(
               "shopt -s nullglob; "
               "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
               "echo $n"
@@ -146,22 +146,22 @@ scope: with scope; ''
 
       # Restore Restart=always (drop the runtime override) and
       # bring the service back.
-      wsmall2.succeed(
+      worker2.succeed(
           "rm -f /run/systemd/system/rio-builder.service.d/norestart.conf && "
           "systemctl daemon-reload && "
           "systemctl start rio-builder.service"
       )
-      wsmall2.wait_for_unit("rio-builder.service")
+      worker2.wait_for_unit("rio-builder.service")
       # Wait for FUSE remount so subsequent fragments (none
       # currently, but collectCoverage + future additions) see
       # a consistent state. FUSE mount happens early in main().
-      wsmall2.wait_until_succeeds(
+      worker2.wait_until_succeeds(
           "mountpoint -q /var/rio/fuse-store", timeout=30
       )
       # Wait for scheduler re-registration. Worker heartbeats every
       # HEARTBEAT_INTERVAL_SECS=10 (rio-common/src/limits.rs:51).
       # Without this, any fragment inserted after sigint-graceful
-      # sees 2 slots (wsmall1 only) until wsmall2's first heartbeat.
+      # sees 2 slots (worker1 only) until worker2's first heartbeat.
       # Timeout 30s: 1 heartbeat interval + TCG slop.
       ${gatewayHost}.wait_until_succeeds(
           "curl -sf http://localhost:9091/metrics | "

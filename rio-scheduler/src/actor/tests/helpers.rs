@@ -794,10 +794,12 @@ pub(crate) async fn report_termination(
     Ok(promoted)
 }
 
-/// Minimal `[sla]` config for tests that need `compute_spawn_intents`
-/// to emit (gated on `sla_config.is_some()`). One tier, probe = 4c.
+/// `[sla]` config for tests that exercise the solve/explore branch
+/// with realistic ceilings (the `SlaConfig::test_default()` ceilings
+/// are tiny — sized for VM-test pools). One tier, probe = 4c, 64-core
+/// / 256 GiB / 200 GiB ceilings (the former `DEFAULT_CEILINGS`).
 pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
-    use crate::sla::{config, solve};
+    use crate::sla::config;
     config::SlaConfig {
         tiers: vec![config::Tier {
             name: "normal".into(),
@@ -813,10 +815,10 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
             deadline_secs: 3600,
         },
         feature_probes: Default::default(),
-        max_cores: solve::DEFAULT_CEILINGS.max_cores,
-        max_mem: solve::DEFAULT_CEILINGS.max_mem,
-        max_disk: solve::DEFAULT_CEILINGS.max_disk,
-        default_disk: solve::DEFAULT_CEILINGS.default_disk,
+        max_cores: 64.0,
+        max_mem: 256 << 30,
+        max_disk: 200 << 30,
+        default_disk: 20 << 30,
         fuse_cache_budget: 0,
         log_budget: 0,
         ring_buffer: 32,
@@ -829,26 +831,24 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
     }
 }
 
-/// Bare (unspawned) actor with `[sla]` configured (default config).
-/// For `compute_spawn_intents` tests — intent emission is gated on
-/// `sla_config.is_some()`.
+/// Bare (unspawned) actor with the realistic-ceiling `[sla]` config.
+/// For `compute_spawn_intents` / solve-branch tests.
 pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
     bare_actor_cfg(
         pool,
         DagActorConfig {
-            sla: Some(test_sla_config()),
+            sla: test_sla_config(),
             ..Default::default()
         },
     )
 }
 
-/// Bootstrap PG + spawned actor with `[sla]` configured. For
-/// end-to-end `GetSpawnIntents` tests via [`ActorHandle`].
+/// Bootstrap PG + spawned actor with the realistic-ceiling `[sla]`
+/// config. For end-to-end `GetSpawnIntents` tests via [`ActorHandle`].
 pub(crate) async fn setup_with_sla() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.sla = Some(test_sla_config())
-    });
+    let (handle, task) =
+        setup_actor_configured(db.pool.clone(), None, |c, _| c.sla = test_sla_config());
     (db, handle, task)
 }
 

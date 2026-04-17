@@ -78,11 +78,13 @@ pub(super) struct Config {
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
     pub(super) dashboard: DashboardConfig,
-    /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml.
-    /// `None` = SLA-mode disabled (Phase-2 const-tier path stays
-    /// active). No env override — structured config only. Validated
-    /// via [`rio_scheduler::sla::config::SlaConfig::validate`].
-    pub(super) sla: Option<rio_scheduler::sla::config::SlaConfig>,
+    /// ADR-023 SLA-driven sizing. `[sla]` table in scheduler.toml —
+    /// mandatory (helm always renders it; absent → figment falls back
+    /// to [`rio_scheduler::sla::config::SlaConfig::test_default`] via
+    /// `Default for Config`). No env override — structured config
+    /// only. Validated via
+    /// [`rio_scheduler::sla::config::SlaConfig::validate`].
+    pub(super) sla: rio_scheduler::sla::config::SlaConfig,
 }
 
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
@@ -134,7 +136,7 @@ impl Default for Config {
             retry: rio_scheduler::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
-            sla: None,
+            sla: rio_scheduler::sla::config::SlaConfig::test_default(),
         }
     }
 }
@@ -266,9 +268,7 @@ impl rio_common::config::ValidateConfig for Config {
          every derivation poisons immediately)",
             cfg.poison.threshold
         );
-        if let Some(sla) = &cfg.sla {
-            sla.validate()?;
-        }
+        cfg.sla.validate()?;
         Ok(())
     }
 }

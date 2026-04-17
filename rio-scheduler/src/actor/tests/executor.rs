@@ -742,7 +742,7 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup().await;
+    let (_db, handle, _task) = setup_with_sla().await;
 
     let _ev = merge_single_node(
         &handle,
@@ -817,7 +817,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
 /// I-213).
 #[tokio::test]
 async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
-    use crate::sla::solve::DEFAULT_CEILINGS;
+    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
     use rio_proto::types::TerminationReason as R;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
@@ -836,7 +836,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
             None,
             None,
             Some(crate::state::ResourceFloor {
-                mem_bytes: DEFAULT_CEILINGS.max_mem,
+                mem_bytes: max_mem,
                 ..Default::default()
             }),
         )
@@ -850,7 +850,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let promoted = report_termination(&handle, "b-cap-0", R::OomKilled).await?;
     assert!(!promoted, "floor at ceiling → promoted=false");
     let s = expect_drv(&handle, "cap-mem").await;
-    assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
+    assert_eq!(s.sched.resource_floor.mem_bytes, max_mem);
     assert_eq!(s.retry.infra_count, 1, "at-cap OOM → infra_count++");
     assert_eq!(s.retry.timeout_count, 0);
 
@@ -1005,7 +1005,7 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
 /// `infra_count==N` at the gate).
 #[tokio::test]
 async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
-    use crate::sla::solve::DEFAULT_CEILINGS;
+    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
@@ -1028,7 +1028,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
             None,
             None,
             Some(crate::state::ResourceFloor {
-                mem_bytes: DEFAULT_CEILINGS.max_mem,
+                mem_bytes: max_mem,
                 ..Default::default()
             }),
         )
@@ -1056,7 +1056,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
             "cycle {i}: at-cap cgroup-OOM counts ONCE (was double-counting → {})",
             i * 2
         );
-        assert_eq!(s.sched.resource_floor.mem_bytes, DEFAULT_CEILINGS.max_mem);
+        assert_eq!(s.sched.resource_floor.mem_bytes, max_mem);
         assert_ne!(
             s.status,
             DerivationStatus::Poisoned,
@@ -1100,7 +1100,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
 /// reason. ONLY OomKilled/EvictedDiskPressure promote.
 ///
 /// - **fod** (I-173): FOD on a tiny fetcher.
-/// - **builder** (I-177): non-FOD on a builder `size_classes` tiny.
+/// - **builder** (I-177): non-FOD on a tiny builder.
 ///
 /// Also asserts dedup: a SECOND report for the same executor_id
 /// returns `promoted=false` (entry already removed); and a non-
@@ -1116,7 +1116,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     #[case] tag: &str,
 ) -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup().await;
+    let (_db, handle, _task) = setup_with_sla().await;
 
     let mut rx = connect_executor_kind(&handle, "w-tiny", "x86_64-linux", kind).await?;
 

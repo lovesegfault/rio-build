@@ -1,10 +1,5 @@
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
-{{- /* ConfigMap renders if any of [[size_classes]] / [[soft_features]]
-       / [sla] is configured — all are structured (can't env-encode). The
-       FOD floor walk derives from [[size_classes]] (fetcher tiers ARE
-       builder tiers). */ -}}
-{{- $hasClasses := or $s.softFeatures $s.sla -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,14 +29,12 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
-      {{- if $hasClasses }}
       annotations:
         # Scheduler reads /etc/rio/scheduler.toml once at boot; kubelet
         # CM-remount alone doesn't trigger reload. Roll on any
         # ConfigMap-rendered field change (subPath mounts don't
         # live-update either way).
         checksum/scheduler-toml: {{ list (toJson $s.softFeatures) (toJson $s.sla) | join "" | sha256sum }}
-      {{- end }}
     spec:
       serviceAccountName: rio-scheduler
       {{- include "rio.podSecurityContext" . | nindent 6 }}
@@ -108,20 +101,18 @@ spec:
               value: {{ .Values.dashboard.cors.allowOrigins | join "," | quote }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
-            {{- if $hasClasses }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
-            # ConfigMap carries [[size_classes]] entries; everything else
-            # stays env-driven (figment merges TOML under env).
-            # subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a whole-dir
-            # CM mount here would race their visibility. subPath puts
-            # just the one file. Tradeoff: subPath mounts don't pick
-            # up CM updates — fine, the checksum annotation rolls the
-            # pod anyway.
+            # ConfigMap carries the [sla] table + [[soft_features]];
+            # everything else stays env-driven (figment merges TOML under
+            # env). subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a
+            # whole-dir CM mount here would race their visibility.
+            # subPath puts just the one file. Tradeoff: subPath mounts
+            # don't pick up CM updates — fine, the checksum annotation
+            # rolls the pod anyway.
             - name: config
               mountPath: /etc/rio/scheduler.toml
               subPath: scheduler.toml
               readOnly: true
-            {{- end }}
           # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
           # — that's the whole design point. Both pods Ready; clients route
           # via health-aware balancer which DOES check is_leader (via
@@ -152,24 +143,23 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
-        {{- if $hasClasses }}
         - name: config
           configMap:
             name: rio-scheduler-config
-        {{- end }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Headless: balanced-
 # channel clients (gateway, worker) resolve pod IPs, probe each via
 # grpc.health.v1, route to the SERVING one (= leader). ClusterIP: per-call
 # connects (controller reconcilers, rio-cli, tests) — UNAVAILABLE ~50% and
 # retry, fine off the hot path.
 {{ include "rio.grpcServicePair" (dict "root" . "name" "rio-scheduler" "ns" .Values.namespaces.system.name "component" "scheduler" "port" 9001) }}
-{{- if $hasClasses }}
 ---
 # Mounted at /etc/rio/scheduler.toml. figment merges this UNDER env (RIO_*
-# wins), so only [[size_classes]] lives here — array-of-tables can't be
-# env-encoded. classify() reads this; an empty/absent file = feature off.
-# checksum annotation on the pod template triggers rollout when classes
-# change (kubelet remounts the CM but the scheduler reads it once at boot).
+# wins). The [sla] table is mandatory — the SchedulerConfig has no
+# Option<SlaConfig> arm; an absent block falls back to the tiny
+# test_default ceilings, which under-spawn for any real workload.
+# checksum annotation on the pod template triggers rollout when [sla]/
+# [[soft_features]] change (kubelet remounts the CM but the scheduler
+# reads it once at boot).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -229,5 +219,4 @@ data:
     {{- end }}
     {{- end }}
     {{- end }}
-{{- end }}
 {{- end }}

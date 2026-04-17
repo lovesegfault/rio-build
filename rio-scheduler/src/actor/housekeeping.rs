@@ -82,26 +82,18 @@ impl DagActor {
         }
 
         // VM-test sync barrier: increments on every refresh tick
-        // regardless of `[sla]` gate so non-SLA fixtures can poll it
-        // as "≥2 ticks since INSERT" without configuring `[sla]`.
+        // (counter increments per tick so fixtures can poll it as
+        // "≥2 ticks since INSERT").
         metrics::counter!("rio_scheduler_sla_refit_total").increment(1);
 
         // ADR-023 SLA estimator: incremental refit of touched
         // (pname, system, tenant) keys. Log-and-keep-stale on PG
         // failure; the cache holds the previous fit. The tier ladder
         // feeds the Schmitt-trigger reassignment inside refit.
-        //
-        // Gated on `[sla]` configured: in Static mode the cache is
-        // never read (snapshot.rs / dispatch.rs both gate on
-        // `sla_config.is_some()`), so the per-key PG round-trips +
-        // NNLS refit are pure overhead. Keeps Static-mode tick latency
-        // identical to pre-ADR-023.
-        if self.sla_config.is_some() {
-            match self.sla_estimator.refresh(&self.db, &self.sla_tiers).await {
-                Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
-                Err(e) => {
-                    warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
-                }
+        match self.sla_estimator.refresh(&self.db, &self.sla_tiers).await {
+            Ok(n) => debug!(keys_refit = n, "sla estimator refreshed"),
+            Err(e) => {
+                warn!(error = %e, "sla estimator refresh failed; keeping previous fits");
             }
         }
 
@@ -196,9 +188,7 @@ impl DagActor {
     /// produce capacity within the window, and the 60s ICE TTL bounds
     /// the false-positive cost. See [`crate::sla::cost::IceBackoff`].
     pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
-        let Some(fallback) = self.sla_config.as_ref().map(|c| c.hw_fallback_after_secs) else {
-            return;
-        };
+        let fallback = self.sla_config.hw_fallback_after_secs;
         self.pending_intents.retain(|drv_hash, (band, cap, since)| {
             // Drop entries whose drv left Ready: they won't heartbeat
             // and the timeout isn't a capacity signal.
