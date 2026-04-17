@@ -356,7 +356,10 @@ in
           ];
           script = ''
             set -euo pipefail
-            devs=(/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*)
+            # udev (≥v250) creates two by-id symlinks per NVMe namespace
+            # (`…_<serial>` and `…_<serial>_<nsid>`); resolve and dedup so
+            # mdadm doesn't get the same /dev/nvmeXn1 twice → EBUSY.
+            mapfile -t devs < <(readlink -f /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage* | sort -u)
             # Single-device families (e.g. m6id.large) skip md and format
             # the NVMe directly — mdadm RAID0 over one disk is pure
             # overhead.

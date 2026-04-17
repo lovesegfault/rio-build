@@ -386,6 +386,13 @@ data "aws_iam_policy_document" "rio_scheduler_s3" {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.chunks.arn]
   }
+  # ADR-023 spot-price poller (rio-scheduler/src/sla/cost.rs poll_spot_once).
+  # EC2 Describe* doesn't support resource-level permissions.
+  statement {
+    effect    = "Allow"
+    actions   = ["ec2:DescribeSpotPriceHistory", "ec2:DescribeInstanceTypes"]
+    resources = ["*"]
+  }
 }
 
 module "rio_scheduler_irsa" {
