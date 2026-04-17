@@ -490,27 +490,51 @@ impl DagActor {
         // Dispatch-time prediction snapshot for completion's
         // actual-vs-predicted scoring. Only meaningful when there's a
         // fitted curve to evaluate `T(c)` against — cold-start probes
-        // and forced-cores overrides leave `wall_secs=None` so the
-        // prediction-ratio histogram isn't poisoned by guesses.
-        // `Probe` is filtered: `Probe.t_at(_) = ∞` would record
-        // `actual/∞ = 0` into `sla_prediction_ratio{dim=wall}`.
+        // leave `wall_secs=None` so the prediction-ratio histogram
+        // isn't poisoned by guesses. `Probe` is filtered:
+        // `Probe.t_at(_) = ∞` would record `actual/∞ = 0` into
+        // `sla_prediction_ratio{dim=wall}`.
+        //
+        // `(tier, tier_p90)` mirrors `intent_for`'s resolution so the
+        // recorded tier matches what dispatch actually sized against:
+        // forced-cores / serial / prefer-local short-circuit before
+        // any solve (no tier); a `--tier` override solves against
+        // ONLY that tier. Re-solving the full ladder here recorded a
+        // tighter tier than the build was sized for → false
+        // `sla_envelope_result_total{result="miss"}` on a build that
+        // ran exactly as sized for its operator-pinned slow tier.
         let predicted = fit
             .as_ref()
             .filter(|f| !matches!(f.fit, crate::sla::types::DurationFit::Probe))
             .map(|f| {
-                let (tier, tier_p90) = match full
-                    .as_ref()
-                    .map(|r| r as &solve::SolveResult)
-                    .unwrap_or(&solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings))
-                {
-                    solve::SolveResult::Feasible { tier, .. } => (
-                        Some(tier.clone()),
-                        self.sla_tiers
-                            .iter()
-                            .find(|t| t.name == *tier)
-                            .and_then(|t| t.p90),
-                    ),
-                    solve::SolveResult::BestEffort { .. } => (None, None),
+                let no_tier = override_.as_ref().is_some_and(|o| o.forced_cores.is_some())
+                    || hints.prefer_local_build == Some(true)
+                    || hints.enable_parallel_building == Some(false);
+                let pinned = override_.as_ref().and_then(|o| o.tier.as_deref()).map(|n| {
+                    self.sla_tiers
+                        .iter()
+                        .filter(|t| t.name == n)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                let tiers = pinned.as_deref().unwrap_or(&self.sla_tiers);
+                let (tier, tier_p90) = if no_tier {
+                    (None, None)
+                } else {
+                    match full
+                        .as_ref()
+                        .map(|r| r as &solve::SolveResult)
+                        .unwrap_or(&solve::solve_mvp(f, tiers, &self.sla_ceilings))
+                    {
+                        solve::SolveResult::Feasible { tier, .. } => (
+                            Some(tier.clone()),
+                            self.sla_tiers
+                                .iter()
+                                .find(|t| t.name == *tier)
+                                .and_then(|t| t.p90),
+                        ),
+                        solve::SolveResult::BestEffort { .. } => (None, None),
+                    }
                 };
                 solve::SlaPrediction {
                     wall_secs: Some(f.fit.t_at(RawCores(f64::from(cores))).0),
