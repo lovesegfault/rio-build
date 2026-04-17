@@ -693,8 +693,14 @@ rec {
             print(k3s_server.execute(
                 f"k3s kubectl -n {ns} get pool,job,pod -o wide 2>&1; "
                 f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} 2>&1; "
-                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=60 2>&1; "
-                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=40 2>&1"
+                f"echo '--- pod logs ---'; "
+                f"k3s kubectl -n {ns} logs -l rio.build/pool={pool} --tail=80 2>&1; "
+                "echo '--- controller (INFO+) ---'; "
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=400 2>&1 "
+                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30; "
+                "echo '--- scheduler (INFO+) ---'; "
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=400 2>&1 "
+                "  | grep -E '\"level\":\"(INFO|WARN|ERROR)\"' | tail -30"
             )[1])
             raise
         return worker_pod(pool=pool, ns=ns)

@@ -38,11 +38,16 @@ poolDefaults:
   # sec.pod.host-users-false spec marker stays verified by the
   # builders.rs unit test (renders-shape check).
   hostUsers: true
-  # seccompProfile inherits the chart default (Localhost,
-  # operator/rio-builder.json). k3s's containerd RuntimeDefault does
-  # NOT allowlist pivot_root even with CAP_SYS_ADMIN — nix-daemon's
-  # sandbox does pivot_root → EPERM under RuntimeDefault. The
-  # Localhost profile (RuntimeDefault + pivot_root − ptrace/bpf/setns)
-  # is delivered via systemd-tmpfiles by k3sBase before k3s starts
-  # (fixtures/k3s-full.nix — same path as the NixOS AMI), so the file
-  # is guaranteed present before any pod schedules.
+  # vmtest-full.yaml sets `seccompProfile: null` (privileged path
+  # ignores seccomp); Helm `null` DELETES the key from the merge so
+  # the chart-values default does NOT survive. Re-set it explicitly.
+  # k3s's containerd RuntimeDefault does NOT allowlist pivot_root even
+  # with CAP_SYS_ADMIN — nix-daemon's sandbox does pivot_root → EPERM
+  # under RuntimeDefault. The Localhost profile (RuntimeDefault +
+  # pivot_root − ptrace/bpf/setns) is delivered via systemd-tmpfiles by
+  # k3sBase before k3s starts (fixtures/k3s-full.nix — same path as the
+  # NixOS AMI), so the file is guaranteed present before any pod
+  # schedules.
+  seccompProfile:
+    type: Localhost
+    localhostProfile: operator/rio-builder.json

@@ -29,16 +29,16 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::ListParams;
+use kube::api::{Api, DeleteParams, ListParams};
 use kube::runtime::controller::Action;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::job::JOB_TTL_SECS;
@@ -49,7 +49,7 @@ use super::job::{
 };
 use super::pod::{self, UpstreamAddrs, executor_kind_to_proto};
 use crate::error::Result;
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::pool::{ExecutorKind, Pool};
 use rio_proto::types::SpawnIntent;
 
@@ -161,6 +161,23 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     let headroom = ceiling.map_or(u32::MAX, |c| c.saturating_sub(active).max(0) as u32);
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
+    // ---- Reap terminal Jobs blocking respawn ----
+    // intent_suffix(drv_hash) is deterministic so a re-polled intent
+    // for a STILL-ACTIVE Job NameCollisions (the intended dedupe).
+    // But a drv that re-enters Ready after its prior Job went
+    // Complete/Failed (resubmit-after-TimedOut, transient retry,
+    // Cancel-then-resubmit) would NameCollision against the stale
+    // terminal Job for JOB_TTL_SECS (600s) — the re-queued drv
+    // never gets a worker. Delete those before the spawn pass.
+    reap_terminal_for_intents(
+        &jobs_api,
+        &jobs.items,
+        intents.iter().take(to_spawn as usize),
+        &name,
+        pool.spec.kind,
+    )
+    .await;
+
     // One pod per intent with that intent's resources + annotation.
     // `take(to_spawn)` truncates; the remainder is picked up next
     // tick after `active` decreases. Under mandatory `[sla]` (Phase
@@ -251,6 +268,60 @@ fn intent_suffix(intent_id: &str) -> String {
     // Degenerate (all-filtered) — pad so the resulting Job name is
     // still valid DNS-1123 (no trailing hyphen).
     if s.is_empty() { "0".into() } else { s }
+}
+
+/// Delete NOT-active Jobs whose name collides with an intent we are
+/// about to spawn. The deterministic `intent_suffix` makes a
+/// Completed/Failed Job for drv X block respawn of X for
+/// [`JOB_TTL_SECS`]; this clears that window so the immediate
+/// `spawn_for_each` (or worst-case the next tick) succeeds.
+///
+/// Background-propagation delete: terminal ⇒ `status.{succeeded,
+/// failed} > 0` ⇒ the Job controller has already cleared the pod's
+/// `batch.kubernetes.io/job-tracking` finalizer, so the orphan-
+/// finalizer race that forces foreground on the Pending/Running reaps
+/// does not apply. Background lets the Job object vanish before the
+/// pod (TTL would have done the same), so the create that follows
+/// has the best chance of landing in the SAME tick.
+async fn reap_terminal_for_intents<'a, I>(
+    jobs_api: &Api<Job>,
+    existing: &[Job],
+    intents: I,
+    pool: &str,
+    kind: ExecutorKind,
+) where
+    I: Iterator<Item = &'a SpawnIntent>,
+{
+    let want: HashSet<String> = intents
+        .map(|i| pod::job_name(pool, kind, &intent_suffix(&i.intent_id)))
+        .collect();
+    if want.is_empty() {
+        return;
+    }
+    for j in existing.iter().filter(|j| !is_active_job(j)) {
+        let Some(jn) = j.metadata.name.as_deref() else {
+            continue;
+        };
+        if !want.contains(jn) {
+            continue;
+        }
+        match jobs_api.delete(jn, &DeleteParams::background()).await {
+            Ok(_) => {
+                info!(
+                    pool, job = %jn,
+                    "reaped terminal Job blocking re-queued intent respawn"
+                );
+            }
+            Err(e) if e.is_not_found() => {}
+            Err(e) => {
+                warn!(
+                    pool, job = %jn, error = %e,
+                    "failed to reap terminal Job; spawn will NameCollision \
+                     this tick, retried next"
+                );
+            }
+        }
+    }
 }
 
 /// Build a K8s Job for one ephemeral worker pod.

@@ -47,6 +47,14 @@ let
     marker = "netpol-warmup";
     sleepSecs = 300;
   };
+  # Distinct drv for the cross-ns subtest. With ADR-023 SpawnIntent-
+  # driven Jobs, resubmitting the SAME warmupDrv (already Running on
+  # the x86-64 pool's pod → not Ready) emits no intent, so the
+  # misplaced pool would never spawn. Fresh marker = fresh Ready node.
+  crossNsDrv = drvs.mkTrivial {
+    marker = "netpol-cross-ns";
+    sleepSecs = 300;
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
@@ -353,7 +361,13 @@ pkgs.testers.runNixOSTest {
     # ns-agnostically: a misplaced builder is STILL airgapped (egress
     # to apiserver blocked) AND can reach store (label-match ingress).
     with subtest("netpol-cross-ns: misplaced builder Pool is airgapped"):
-        # Spawn a builder Pool in the FETCHER namespace.
+        # Spawn a builder Pool in the FETCHER namespace. Builder pods
+        # set serviceAccountName=rio-builder, which the chart creates
+        # only in rio-builders; create it here so the Job's pod admits.
+        k3s_server.succeed(
+            "k3s kubectl -n ${fixture.nsFetchers} create sa rio-builder "
+            "--dry-run=client -o yaml | k3s kubectl apply -f -"
+        )
         k3s_server.succeed(
             "k3s kubectl apply -f - <<'EOF'\n"
             "apiVersion: rio.build/v1alpha1\n"
@@ -361,7 +375,8 @@ pkgs.testers.runNixOSTest {
             "metadata: {name: misplaced, namespace: ${fixture.nsFetchers}}\n"
             "spec:\n"
             "  kind: Builder\n"
-            "  image: rio-builder\n"
+            "  image: rio-builder:dev\n"
+            "  imagePullPolicy: IfNotPresent\n"
             "  systems: [x86_64-linux]\n"
             "  privileged: true\n"
             "  maxConcurrent: 1\n"
@@ -370,12 +385,14 @@ pkgs.testers.runNixOSTest {
         client.succeed(
             "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
             "--arg busybox '(builtins.storePath ${common.busybox})' "
-            "${warmupDrv} >/tmp/warmup-x.log 2>&1 &"
+            "${crossNsDrv} >/tmp/warmup-x.log 2>&1 &"
         )
-        # Wait for the misplaced pod (label rio.build/pool=misplaced).
+        # Wait for the misplaced pod (label rio.build/pool=misplaced)
+        # to be RUNNING — crictl ps below needs the container started.
         mp = k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${fixture.nsFetchers} get pod "
             "-l rio.build/pool=misplaced "
+            "--field-selector=status.phase=Running "
             "-o jsonpath='{.items[0].metadata.name}' | grep .",
             timeout=120,
         ).strip()
