@@ -125,13 +125,11 @@ pub struct ExecutorPodParams {
     /// `securityContext.readOnlyRootFilesystem` on the executor
     /// container. Fetchers: `true` (overlay upperdir is a tmpfs
     /// emptyDir; rootfs tampering blocked). Builders: `false`.
-    /// Fetcher hardening anchor lives at
-    /// `fetcherpool::executor_params`.
     pub read_only_root_fs: bool,
     /// Extra env vars appended after the base set. Builders pass
-    /// their tuning knobs (daemon_timeout, fuse_passthrough,
-    /// size_class) here so the shared builder doesn't need fields
-    /// for every BuilderPool-only knob.
+    /// their tuning knobs (daemon_timeout, fuse_passthrough) here so
+    /// the shared builder doesn't need fields for every builder-only
+    /// knob.
     pub extra_env: Vec<EnvVar>,
 
     // ── metadata ─────────────────────────────────────────────────
@@ -236,8 +234,7 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }
 
-/// The Job pod spec — shared by `builderpool::build_job` and
-/// `fetcherpool::build_job`.
+/// The Job pod spec — shared by both pool kinds.
 pub fn build_executor_pod_spec(
     p: &ExecutorPodParams,
     scheduler: &UpstreamAddrs,
@@ -539,9 +536,8 @@ fn build_executor_container(
             if let Ok(level) = std::env::var("RUST_LOG") {
                 e.push(env("RUST_LOG", &level));
             }
-            // Role-specific extras: builders pass size_class,
-            // daemon_timeout_secs, fuse_passthrough here. Fetchers
-            // pass nothing.
+            // Role-specific extras: builders pass daemon_timeout_secs,
+            // fuse_passthrough here. Fetchers pass nothing.
             e.extend(p.extra_env.iter().cloned());
             e
         }),

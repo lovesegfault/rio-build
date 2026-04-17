@@ -1036,20 +1036,19 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 }
 
 // r[verify sched.timeout.promote-on-exceed+2]
-/// I-200: `TimedOut` promotes `size_class_floor` AND resets to Ready
+/// I-200: `TimedOut` promotes `resource_floor` AND resets to Ready
 /// (bounded by `max_timeout_retries`), then goes terminal `Cancelled`.
 ///
 /// Before I-200, `TimedOut` went straight to Cancelled without
-/// promoting — so a worker-side `daemon_timeout_secs` hit on tiny
-/// gave up immediately instead of retrying on a larger class with a
-/// longer deadline. Mutation check: revert `handle_timeout_failure`
-/// to the pre-I-200 terminal-only path → first `assert_eq!(status,
-/// Ready)` fails (gets Cancelled).
+/// promoting — so a worker-side `daemon_timeout_secs` hit on a small
+/// pod gave up immediately instead of retrying with more resources
+/// and a longer deadline. Mutation check: revert
+/// `handle_timeout_failure` to the pre-I-200 terminal-only path →
+/// first `assert_eq!(status, Ready)` fails (gets Cancelled).
 ///
 /// Shape mirrors `test_infrastructure_failure_max_infra_retries_
-/// poisons` (cap behavior) + `builder_size_class_floor_skips_smaller`
-/// (size-class setup): `max_timeout_retries=2` so the test walks
-/// tiny→small→medium then terminals.
+/// poisons` (cap behavior): `max_timeout_retries=2` so the test walks
+/// two floor doublings then terminals.
 #[tokio::test]
 async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

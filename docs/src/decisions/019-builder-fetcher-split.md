@@ -57,7 +57,7 @@ FODs route only to fetchers. Non-FODs route only to builders.
 
 Dispatch hard-filters by `ExecutorKind`: a FOD only matches `kind: Fetcher` executors. If no fetcher is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
-The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bounded by `Pool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations` (no duration-EMA).
+Fetcher concurrency is bounded by `Pool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations`.
 
 ### Executor enforcement
 

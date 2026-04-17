@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "CustomResourceDefinition types for rio-build (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)"
+description = "CustomResourceDefinition types for rio-build (Pool, ComponentScaler)"
 
 # CRD types + thin kube::Error classification helpers, extracted from
 # rio-controller so rio-cli (P0237) and rio-scheduler can depend on

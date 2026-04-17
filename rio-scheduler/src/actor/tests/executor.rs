@@ -1088,7 +1088,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
 
 // r[verify sched.sla.reactive-floor]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
-/// Bare disconnect does NOT promote `size_class_floor`; the
+/// Bare disconnect does NOT promote `resource_floor`; the
 /// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
 /// Live QA bug: cmake went medium→large→xlarge from a pod-kill +
 /// store-replica-restart with zero builds run, because disconnect
@@ -1299,7 +1299,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 /// `activeDeadlineSeconds` backstop fired (worker too wedged to report
 /// `TimedOut` itself). Controller reports `DeadlineExceeded` by JOB
 /// name; scheduler prefix-matches the disconnected pod, promotes
-/// `size_class_floor`, and bumps `timeout_count` so the ladder is
+/// `resource_floor`, and bumps `timeout_count` so the ladder is
 /// bounded. Second report for the same Job dedups (entry removed).
 ///
 /// Regression for the medium-shallow-32x infinite tiny-retry loop:

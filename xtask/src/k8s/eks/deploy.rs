@@ -216,15 +216,6 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
             .set("karpenter.amiTag", ami_tag)
-            // I-117: BuilderPoolSet supersedes the flat builderPools[] —
-            // five size classes (tiny..xlarge, chart default) with
-            // per-class resource requests. The scheduler's classify()
-            // routes each derivation to the smallest covering class by
-            // (est_duration, peak_memory) so a 50MB hello build gets a
-            // 2-core/4Gi pod and llvm gets 128-core/256Gi. Ephemeral
-            // children: one Job per build, sized by class. Karpenter
-            // bin-packs across c6a.large..c6a.32xlarge.
-            //
             // I-117b: one Pool per arch × kind (same I-108 list/
             // defaults split). Per-pod sizing is continuous (ADR-023
             // SpawnIntent), so there are no per-arch child pools.

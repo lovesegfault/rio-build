@@ -108,7 +108,7 @@ pub fn envelope_result(tier: &str, result: &'static str, constraint: &'static st
 }
 
 /// Actual-vs-predicted score for one completion. Pure so the
-/// `record_build_history` call site stays a one-liner and the
+/// `record_build_sample` call site stays a one-liner and the
 /// hit/miss/ratio rules are unit-testable without a metrics recorder.
 #[derive(Debug, PartialEq)]
 pub struct CompletionScore {

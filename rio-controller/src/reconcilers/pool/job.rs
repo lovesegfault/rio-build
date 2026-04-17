@@ -1,9 +1,7 @@
-//! Shared plumbing for the Job-mode reconcilers (`builderpool::
-//! jobs` and `fetcherpool::jobs`). Both follow the
-//! same skeleton: list Jobs by label, filter active, diff against
-//! demand, spawn deficit, reap excess, patch status. The diff is
-//! different (per-bucket vs flat-ceiling); the plumbing around it is
-//! the same.
+//! Shared plumbing for the Job-mode Pool reconciler. Both kinds
+//! (Builder, Fetcher) follow the same skeleton: list Jobs by label,
+//! filter active, diff against demand, spawn deficit, reap excess,
+//! patch status.
 //!
 //! Extracted (P0513) after the mc=60 consolidator pass found 4
 //! byte-identical-or-near segments (~50L) reaching across siblings
@@ -74,14 +72,13 @@ pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 /// LONG-drain case; ephemeral pods don't drain, they finish and die.)
 pub(crate) const EPHEMERAL_TGPS: i64 = 30;
 
-/// The shared one-shot Job literal for executor pods. Both
-/// Job-mode reconcilers (`builderpool::jobs`,
-/// `fetcherpool::jobs`) route through this so the load-bearing
+/// The shared one-shot Job literal for executor pods. Both pool
+/// kinds (Builder, Fetcher) route through this so the load-bearing
 /// invariants can't drift per call site:
 ///
 ///   - `restartPolicy: Never` + `backoffLimit: 0` — the SCHEDULER
-///     owns retry (reassign to a different worker / pool / size
-///     class). K8s retrying the same pod on the same node risks
+///     owns retry (reassign to a different worker / pool / floor).
+///     K8s retrying the same pod on the same node risks
 ///     tight-loop on a node-local problem.
 ///   - `parallelism/completions: 1` — one pod per Job. >1 would
 ///     mean N pods sharing one Job → N workers heartbeat with the
@@ -176,12 +173,11 @@ pub(crate) fn ephemeral_job(
 /// "isolation > throughput" ephemeral use case, the latency cost is
 /// acceptable; the resource waste is not.
 ///
-/// Global-Q caveat: for unclassified pools, `queued` is cluster-
-/// wide (per-system filtered). With multiple unclassified pools,
+/// Global-Q caveat: `queued` is cluster-wide (filtered by kind/
+/// system/features). With multiple pools claiming the same filter,
 /// each over-counts need by what the others will claim — but
 /// headroom caps it, and the others draining Q on the next tick
-/// self-corrects. Pools with `size_class` set use per-class depth
-/// so this caveat doesn't apply to them.
+/// self-corrects.
 pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
 }
@@ -440,9 +436,8 @@ pub(crate) fn select_orphan_running<'a>(
 
 // r[impl ctrl.ephemeral.reap-orphan-running]
 /// Delete Running ephemeral Jobs the scheduler doesn't consider busy
-/// after [`ORPHAN_REAP_GRACE`]. Shared by the builderpool and
-/// fetcherpool ephemeral reconcilers — same I-165 stuck-process
-/// failure mode applies to both.
+/// after [`ORPHAN_REAP_GRACE`]. Same I-165 stuck-process failure
+/// mode applies to both builder and fetcher pools.
 ///
 /// Lazy RPC: `ListExecutors` is only called if there are Running Jobs
 /// past the grace. The common case (all Jobs young or none Running)
@@ -826,7 +821,7 @@ pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
 }
 
 /// Report each terminated Pod's k8s reason to the scheduler so it can
-/// gate `size_class_floor` promotion on actual OOMKilled/DiskPressure
+/// gate `resource_floor` promotion on actual OOMKilled/DiskPressure
 /// (not bare disconnect). Called from the Job-mode reconcilers' tick
 /// after the spawn/reap steps.
 ///

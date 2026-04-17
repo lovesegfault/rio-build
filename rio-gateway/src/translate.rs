@@ -366,10 +366,10 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         // pname → name fallback: stdenv's mkDerivation sets both;
         // raw derivation{} calls typically only set name. Without
         // the fallback, raw derivations get pname="" → never match
-        // build_history (keyed on pname,system) → 30s default →
-        // wrong size-class routing. name includes version suffix so
-        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
-        // different rows), but some history beats none.
+        // build_samples (keyed on pname,system) → cold-start probe
+        // sizing every time. name includes version suffix so it's a
+        // LESS stable key (hello-2.12 vs hello-2.13 are different
+        // rows), but some history beats none.
         pname: env
             .get("pname")
             .or_else(|| env.get("name"))
@@ -768,8 +768,8 @@ mod tests {
     }
 
     /// pname falls back to name for raw derivation{} calls that only
-    /// set name. Without this, pname="" → no build_history match →
-    /// 30s default estimate → wrong size-class.
+    /// set name. Without this, pname="" → no build_samples match →
+    /// cold-start probe sizing every time.
     #[test]
     fn test_pname_fallback_to_name() -> anyhow::Result<()> {
         // pname wins when both set (stdenv mkDerivation case).
@@ -790,7 +790,7 @@ mod tests {
             "name fallback — less stable (includes version) but beats empty"
         );
 
-        // neither → empty (no build_history key possible).
+        // neither → empty (no build_samples key possible).
         let drv = make_basic_drv(BTreeMap::new())?;
         let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
         assert_eq!(nodes[0].pname, "");

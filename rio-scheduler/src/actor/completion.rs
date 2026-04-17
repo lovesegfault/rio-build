@@ -801,7 +801,7 @@ impl DagActor {
             .await;
         self.unpin_best_effort(drv_hash).await;
 
-        self.record_build_history(
+        self.record_build_sample(
             drv_hash,
             result,
             (peak_memory_bytes, peak_cpu_cores),
@@ -1150,10 +1150,10 @@ impl DagActor {
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
             // Sum of estimated durations — lower-bound on wall-clock
-            // saved. est_duration is the Estimator's EMA (set at
-            // merge time from build_history); for a derivation that
-            // has never run, it's the fallback (closure-size proxy
-            // or 30s default). Counter not gauge: cumulative across
+            // saved. est_duration is the SLA estimator's prediction
+            // (set at merge time from build_samples); for a
+            // derivation that has never run, it's the cold-start
+            // probe default. Counter not gauge: cumulative across
             // all cascades, like saves_total.
             let seconds_saved: f64 = skipped
                 .iter()
@@ -1302,7 +1302,7 @@ impl DagActor {
     /// Phase 7 of success completion: build_samples insert (SLA-fit
     /// feed) and actual-vs-predicted scoring. All best-effort
     /// statistics — never fails completion.
-    async fn record_build_history(
+    async fn record_build_sample(
         &mut self,
         drv_hash: &DrvHash,
         result: &crate::domain::BuildResult,

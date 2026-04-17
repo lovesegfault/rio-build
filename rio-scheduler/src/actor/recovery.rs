@@ -813,7 +813,7 @@ impl DagActor {
     /// reuse [`release_downstream`](Self::release_downstream) for the
     /// newly-ready cascade + per-build completion check. Skips the
     /// `handle_success_completion` steps that need worker-result data
-    /// (build_history, CA bookkeeping, ancestor priorities — full_sweep
+    /// (build_samples, CA bookkeeping, ancestor priorities — full_sweep
     /// on next tick handles the latter).
     async fn adopt_orphan_completion(
         &mut self,

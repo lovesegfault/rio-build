@@ -64,7 +64,7 @@ The scheduler's `RetryPolicy` struct (see `rio-scheduler/src/state/executor.rs`)
 
 Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `PermanentFailure` and `DependencyFailed` are terminal.
 
-**Delayed re-queue (Phase 3b):** The computed backoff is stored in `DerivationState.backoff_until`. `dispatch_ready` defers the derivation until `Instant::now() >= backoff_until` using the same defer-and-requeue pattern as size-class mismatch. Cleared on successful dispatch. Stateless — no timer tasks to clean up on cancel.
+**Delayed re-queue (Phase 3b):** The computed backoff is stored in `DerivationState.backoff_until`. `dispatch_ready` defers the derivation until `Instant::now() >= backoff_until` using a defer-and-requeue pattern (push back onto the ready queue, skip on next tick if still early). Cleared on successful dispatch. Stateless — no timer tasks to clean up on cancel.
 
 **Executor avoidance (Phase 3b):** Dispatch's `best_executor()` filter excludes executors in `DerivationState.failed_builders`. Combined with the backoff above: a transient fail → Ready + backoff_until set + failed_builders.insert(executor) → next dispatch goes to a DIFFERENT executor after the backoff. `reassign_derivations` (executor disconnect) also feeds failed_builders, so an executor crashing mid-build counts as a distinct-executor failure for poison detection.
 

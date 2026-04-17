@@ -250,13 +250,12 @@ futures-util = "0.3"
 arc-swap = "1"
 
 # Sync primitives. parking_lot::RwLock for shared hot-path state where
-# writes are rare (rebalancer → size_classes at 1/hour, reads per-dispatch).
-# Sync (no .await across guard) keeps classify() sync.
+# writes are rare and reads are per-dispatch (no .await across guard).
 parking_lot = "0.12"
 
-# --- ADR-023: SLA-driven sizing fit (rio-scheduler rebalancer) ---
+# --- ADR-023: SLA-driven sizing fit (rio-scheduler) ---
 # Dense linear algebra for the NNLS (non-negative least squares) solver
-# that fits mem=M(cores) per size class. default-features off drops
+# that fits mem=M(cores) per (pname,system) key. default-features off drops
 # rand/serde/macros — we only need DMatrix/DVector + decompositions.
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 # Normal/Student-t CDF (Φ, t.ppf) for the SLA quantile bounds.

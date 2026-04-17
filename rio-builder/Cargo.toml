@@ -30,7 +30,7 @@ rio-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
-# Scheduler guards update_build_history on these being Some.
+# Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }

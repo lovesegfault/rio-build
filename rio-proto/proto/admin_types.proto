@@ -376,8 +376,8 @@ message SpawnIntent {
   // bin-packs cheapest.
   map<string, string> node_selector = 5;
   // D5: Builder vs Fetcher. Controller filters by `intent.kind ==
-  // pool.spec.kind` so a single flat intents stream serves both
-  // BuilderPool and FetcherPool reconcilers.
+  // pool.spec.kind` so a single flat intents stream serves all Pool
+  // reconcilers regardless of kind.
   ExecutorKind kind = 6;
   // D5: target system (e.g. "x86_64-linux"). Controller filters by
   // `intent.system ∈ pool.spec.systems`.
@@ -395,13 +395,14 @@ message SpawnIntent {
 
 message GetSpawnIntentsRequest {
   // Filter by executor kind. Absent = unfiltered. Controller pool
-  // reconcilers set this to `pool.spec.kind` so a BuilderPool sees
-  // only `kind=Builder` intents and a FetcherPool sees only
-  // `kind=Fetcher` (the ADR-019 airgap boundary). `optional` because
-  // ExecutorKind has no UNSPECIFIED variant (Builder is wire-0).
+  // reconcilers set this to `pool.spec.kind` so a kind=Builder Pool
+  // sees only `kind=Builder` intents and a kind=Fetcher Pool sees
+  // only `kind=Fetcher` (the ADR-019 airgap boundary). `optional`
+  // because ExecutorKind has no UNSPECIFIED variant (Builder is
+  // wire-0).
   optional ExecutorKind kind = 1;
   // Filter by `intent.system ∈ systems`. Empty = unfiltered (the
-  // server-side analogue of `BuilderPool.spec.systems`; I-107/I-143).
+  // server-side analogue of `Pool.spec.systems`; I-107/I-143).
   repeated string systems = 2;
   // I-176: when `filter_features=true`, only emit intents whose
   // `required_features ⊆ features` — derivations a worker advertising

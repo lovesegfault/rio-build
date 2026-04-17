@@ -90,11 +90,11 @@ sha2 = { workspace = true }
 # P0253: ca/resolve.rs hex-encodes modular hashes for ResolveError
 # messages and instrument span fields.
 hex = { workspace = true }
-# P0230: Arc<parking_lot::RwLock<Vec<SizeClassConfig>>> for rebalancer
-# writes. Sync lock — writes hourly, reads per-dispatch. Keeps classify() sync.
+# Sync RwLock for SLA fit-cache hot-swap (refit-hourly write, per-
+# dispatch read; no .await across guard).
 parking_lot = { workspace = true }
-# ADR-023: NNLS fit + Φ/Student-t quantiles for SLA-driven size-class
-# rebalancer. See sizing/fit.rs.
+# ADR-023: NNLS fit + Φ/Student-t quantiles for SLA-driven sizing.
+# See sla/fit.rs.
 nalgebra = { workspace = true }
 statrs = { workspace = true }
 # ADR-023 §4.2: weighted-case-pairs bootstrap for T_min CI (sla/bootstrap.rs).

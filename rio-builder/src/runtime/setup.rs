@@ -354,7 +354,7 @@ pub(super) fn resolve_executor_identity(
     // internally, no real process forked. Bootstrap derivations
     // (busybox, bootstrap-tools) have system="builtin"; without
     // this, a cold store permanently stalls at the DAG leaves.
-    // With per-arch FetcherPools, this is what makes a `builtin`
+    // With per-arch fetcher Pools, this is what makes a `builtin`
     // FOD eligible on either arch's fetchers (hard_filter matches
     // on the union; best_executor scores across both).
     if !systems.iter().any(|s| s == "builtin") {

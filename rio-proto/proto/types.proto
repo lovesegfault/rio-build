@@ -6,7 +6,7 @@ package rio.types;
 //
 //   - dag.proto          — DerivationNode/Edge/Event*, GraphNode/Edge, GetBuildGraph*
 //   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Executor/Scheduler stream, Heartbeat*
-//   - admin_types.proto  — ClusterStatus*, ListExecutors*/Builds*/Tenants*, Drain/Poison/SizeClass*
+//   - admin_types.proto  — ClusterStatus*, ListExecutors*/Builds*/Tenants*, Drain/Poison/SpawnIntent*
 //   - types.proto (this) — ResourceUsage, PathInfo, store/chunk/GC/realisation RPCs
 //
 // All four share `package rio.types;` → prost merges into one `rio.types.rs`.

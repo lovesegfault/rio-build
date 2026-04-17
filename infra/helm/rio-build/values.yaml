@@ -432,9 +432,8 @@ gateway:
   drainGraceSecs: 6       # readinessProbe.periodSeconds (5) + 1
   # sessionDrainSecs bounds how long a rollout waits on in-flight
   # `nix-store --realise` sessions. SLA: deploys may interrupt builds
-  # running >1h on the evicted gateway replica — covers the `large`
-  # size-class cutoff (1800s) with margin. Builds past this still get
-  # CancelBuild before exit so the scheduler hears it (vs. waiting
+  # running >1h on the evicted gateway replica. Builds past this still
+  # get CancelBuild before exit so the scheduler hears it (vs. waiting
   # for its own session-timeout). Surge-first means the new pod is
   # already serving; cost of a long drain is only the old pod's
   # resources, not availability.
