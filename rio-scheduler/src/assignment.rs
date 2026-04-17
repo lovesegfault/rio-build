@@ -84,10 +84,20 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     if drv.retry.failed_builders.contains(&w.executor_id) {
         return Some("failed-on");
     }
+    // resource-fit is skipped when this worker was spawned FOR this
+    // drv (`intent_id == drv_hash`): its cgroup limits ARE the
+    // spawn-time `solve_intent_for` output, but `last_intent` here is
+    // a fresh dispatch-time re-solve. solve_full's softmax (rng) — or
+    // an estimator refit / cost-table update / ICE mark between the
+    // controller poll and this tick — can yield a higher `mem_bytes`,
+    // and the purpose-built pod would reject itself. The
+    // intent-reserved gate above already handles the inverse (worker
+    // for X never gets Y).
     if let Some(intent) = &drv.sched.last_intent
         && let Some(r) = &w.last_resources
         && r.memory_total_bytes != 0
         && r.memory_total_bytes < intent.mem_bytes
+        && w.intent_id.as_deref() != Some(drv.drv_hash.as_ref())
     {
         return Some("resource-fit");
     }
@@ -423,6 +433,30 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(rejection_reason(&tight, &big_drv), Some("resource-fit"));
+
+        // resource-fit skipped on intent-match: a worker spawned FOR
+        // this drv (intent_id == drv_hash) was sized by the spawn-time
+        // solve. The dispatch-time re-solve in `last_intent` may yield
+        // a higher mem (softmax rng / estimator drift) — must not
+        // self-reject.
+        let mut intent_tight = make_worker("w", 0);
+        intent_tight.last_resources = Some(rio_proto::types::ResourceUsage {
+            memory_total_bytes: 4 << 30,
+            ..Default::default()
+        });
+        intent_tight.intent_id = Some(big_drv.drv_hash.to_string());
+        assert_eq!(
+            rejection_reason(&intent_tight, &big_drv),
+            None,
+            "intent-matched worker bypasses resource-fit"
+        );
+        // intent for a DIFFERENT drv → still gated (intent-reserved
+        // fires first, but if that were absent resource-fit would).
+        intent_tight.intent_id = Some("other-drv".into());
+        assert_eq!(
+            rejection_reason(&intent_tight, &big_drv),
+            Some("intent-reserved")
+        );
 
         // hard_filter == rejection_reason.is_none() for every case
         // above. Spot-check one of each polarity.

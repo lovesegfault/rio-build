@@ -1596,6 +1596,150 @@ async fn spawn_intent_node_selector_from_solve_full() {
     );
 }
 
+/// `solve_full` gate predicates: each of FOD / `required_features` /
+/// `enableParallelBuilding=false` / `--tier` override falls through to
+/// the band-agnostic `intent_for` path even with `hw_cost_source` set
+/// and a usable fit. The first three would otherwise emit a
+/// `rio.build/hw-band` selector that no fetcher / metal NodePool
+/// carries → permanently Pending. `--mem`-only override does NOT gate
+/// it off — solve_full runs and the override overlays the result.
+// r[verify sched.sla.solve-per-band-cap]
+#[tokio::test]
+async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
+    use crate::sla::{cost, hw, types::*};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone());
+    actor.sla_config = crate::sla::config::SlaConfig {
+        hw_cost_source: Some(cost::HwCostSource::Static),
+        hw_softmax_temp: 0.0,
+        ..test_sla_config()
+    };
+    actor.sla_ceilings = actor.sla_config.ceilings();
+    actor.sla_tiers = vec![crate::sla::solve::Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(1200.0),
+        p99: None,
+    }];
+    let mut m = HashMap::new();
+    m.insert("aws-7-ebs".into(), 1.0);
+    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
+    // One fitted key reused by every variant below.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "pkg".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(6 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+
+    // Baseline (non-FOD, no features) — proves the fixture DOES route
+    // through solve_full so the negative assertions below are
+    // meaningful.
+    actor.test_inject_ready("base", Some("pkg"), "x86_64-linux", false);
+    // FOD with the same fitted pname.
+    actor.test_inject_ready("fod", Some("pkg"), "x86_64-linux", true);
+    // required_features non-empty (kvm pool).
+    actor.test_inject_ready_with_features("kvm", Some("pkg"), "x86_64-linux", &["kvm"]);
+    // enableParallelBuilding=false — set on the state directly
+    // (RecoveryDerivationRow has no column for it).
+    actor.test_inject_ready("serial", Some("pkg"), "x86_64-linux", false);
+    actor
+        .dag
+        .node_mut("serial")
+        .unwrap()
+        .enable_parallel_building = Some(false);
+
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let by_id = |id: &str| snap.intents.iter().find(|i| i.intent_id == id).unwrap();
+
+    assert!(
+        by_id("base")
+            .node_selector
+            .contains_key("rio.build/hw-band"),
+        "fixture sanity: baseline routes through solve_full"
+    );
+    assert!(
+        by_id("fod").node_selector.is_empty(),
+        "FOD must not get hw-band selector (fetcher NodePool has none)"
+    );
+    assert!(
+        by_id("kvm").node_selector.is_empty(),
+        "required_features must not get hw-band selector (metal pool has none)"
+    );
+    let serial = by_id("serial");
+    assert!(
+        serial.node_selector.is_empty(),
+        "enableParallelBuilding=false stays band-agnostic"
+    );
+    assert_eq!(
+        serial.cores, 1,
+        "serial drv pinned to 1 core via intent_for (r[sched.sla.intent-from-solve])"
+    );
+
+    // ── override gating (deferred from 2b6001b7) ────────────────────
+    // `tier` override → solve_full skipped (intent_for honors tier).
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "pkg".into(),
+            tier: Some("normal".into()),
+            ..Default::default()
+        }]);
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let base = snap.intents.iter().find(|i| i.intent_id == "base").unwrap();
+    assert!(
+        base.node_selector.is_empty(),
+        "tier override gates solve_full off"
+    );
+
+    // `mem`-only override → solve_full RUNS (selector populated), mem
+    // overlaid post-solve.
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "pkg".into(),
+            mem_bytes: Some(32 << 30),
+            ..Default::default()
+        }]);
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let base = snap.intents.iter().find(|i| i.intent_id == "base").unwrap();
+    assert!(
+        base.node_selector.contains_key("rio.build/hw-band"),
+        "mem-only override does NOT gate solve_full off"
+    );
+    assert_eq!(
+        base.mem_bytes,
+        32 << 30,
+        "forced_mem overlays solve_full result"
+    );
+}
+
 /// SLA mode: `try_dispatch_one` writes `solve_intent_for().0` to
 /// `sched.est_cores`, and `build_assignment_proto` forwards it as
 /// `WorkAssignment.assigned_cores`.

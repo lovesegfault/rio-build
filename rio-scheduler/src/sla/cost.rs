@@ -499,8 +499,13 @@ impl IceBackoff {
     /// Whether `(band, cap)` is currently backed off. Expired entries
     /// are reaped lazily on read.
     pub fn is_infeasible(&self, band: Band, cap: Cap) -> bool {
-        match self.0.get(&(band, cap)) {
-            Some(until) if *until > Instant::now() => true,
+        // `.map(|r| *r)` copies the `Instant` and drops the `Ref` guard
+        // BEFORE the match arms run. `get()` then `remove()` while the
+        // guard is live deadlocks (DashMap shard RwLock is non-
+        // reentrant) — this fired the first time any cell crossed the
+        // 60s TTL and froze the single-threaded actor.
+        match self.0.get(&(band, cap)).map(|r| *r) {
+            Some(until) if until > Instant::now() => true,
             Some(_) => {
                 self.0.remove(&(band, cap));
                 false
@@ -957,6 +962,29 @@ mod tests {
         assert!(ice.is_infeasible(Band::Hi, Cap::Spot));
         assert!(!ice.is_infeasible(Band::Hi, Cap::OnDemand));
         assert_eq!(ice.live(), 1);
+    }
+
+    /// Regression: the lazy-reap arm previously called `remove()` while
+    /// the match scrutinee's `Ref` guard was still live → DashMap shard
+    /// deadlock. Seed a past-expiry entry directly so the test doesn't
+    /// wait `ICE_TTL`; if the deadlock is reintroduced, this hangs and
+    /// nextest's per-test timeout catches it.
+    #[test]
+    fn ice_expired_entry_reaped_without_deadlock() {
+        let ice = IceBackoff::default();
+        ice.0.insert((Band::Hi, Cap::Spot), Instant::now());
+        assert!(!ice.is_infeasible(Band::Hi, Cap::Spot), "expired → false");
+        assert!(
+            ice.0.get(&(Band::Hi, Cap::Spot)).is_none(),
+            "expired entry removed on read"
+        );
+        // exhausted() walks all 6 cells via is_infeasible — same hazard.
+        for b in Band::ALL {
+            for c in Cap::ALL {
+                ice.0.insert((b, c), Instant::now());
+            }
+        }
+        assert!(!ice.exhausted(), "all expired → not exhausted, no deadlock");
     }
 
     #[test]

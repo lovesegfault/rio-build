@@ -312,16 +312,29 @@ impl DagActor {
         // band-agnostic path). A `forced_cores` OR `tier` override
         // also gates it off: solve_full doesn't take `override_`, so
         // those fall through to `intent_for` which honors both.
-        // `forced_mem` is overlaid below regardless of arm. The
-        // hw_table snapshot is one RwLock-read clone (~dozens of
-        // entries); cost_table same.
+        // `forced_mem` is overlaid below regardless of arm.
+        //
+        // FOD / required_features / serial drvs MUST stay band-
+        // agnostic: solve_full emits a `rio.build/hw-band` selector
+        // that `apply_intent_resources` merges unconditionally, but the
+        // `rio-fetcher` and `rio-builder-metal` NodePools carry no
+        // hw-band label — `{node-role:fetcher, hw-band:X}` matches zero
+        // templates and the pod is permanently Pending. Serial drvs
+        // additionally need `intent_for`'s 1-core pin
+        // (`r[sched.sla.intent-from-solve]`); solve_full ignores
+        // `hints` and would multi-core a `enableParallelBuilding=false`
+        // build. The hw_table snapshot is one RwLock-read clone
+        // (~dozens of entries); cost_table same.
         let hw = self.sla_estimator.hw_table();
         let full = (self.sla_config.hw_cost_source.is_some()
             && !hw.is_empty()
             && override_
                 .as_ref()
                 .is_none_or(|o| o.forced_cores.is_none() && o.tier.is_none())
-            && hints.prefer_local_build != Some(true))
+            && hints.prefer_local_build != Some(true)
+            && hints.enable_parallel_building != Some(false)
+            && !state.is_fixed_output
+            && state.required_features.is_empty())
         .then_some(())
         .and_then(|()| {
             let f = fit.as_ref()?;
