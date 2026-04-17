@@ -121,6 +121,13 @@ pub fn describe_metrics() {
          Equals compute_input_closure's output count for this build."
     );
     describe_counter!(
+        "rio_builder_log_lines_suppressed_total",
+        "Log lines dropped by rate suppression (log_rate_limit). Build \
+         continues with a `[rio: N lines suppressed …]` marker. Nonzero is \
+         normal for bursty builds (kernel oldconfig, autoconf); sustained \
+         high rate = pathological producer."
+    );
+    describe_counter!(
         "rio_builder_cgroup_oom_total",
         "Builds killed by the cgroup OOM watcher (memory.events oom_kill \
          incremented during build). Reported as InfrastructureFailure for \

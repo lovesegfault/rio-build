@@ -234,8 +234,8 @@ Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, 
 r[builder.stderr.forward-set-phase]
 The builder's stderr loop forwards the daemon's `STDERR_RESULT{SetPhase}` (result type 104) as a `BuildPhase{derivation_path, phase}` `ExecutorMessage`. Phase is a state edge, not log content --- it is sent unbatched and does not reset the max-silent-time deadline.
 
-r[builder.log-limit]
-The log batcher enforces per-build `LogLimits`: `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) and `total_bytes` (cumulative across flushed batches). Both check the PROSPECTIVE total before buffering --- a line that would exceed the limit is rejected, not half-accepted. Either limit set to `0` means unlimited. On trip, `add_line` returns `LimitExceeded{reason}`; the stderr loop flushes any already-buffered lines (so the client sees output right up to the limit) and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (the same build on a different executor spews the same logs). Maps to `rio_builder_builds_total{outcome="log_limit"}`.
+r[builder.log-limit+2]
+The log batcher enforces per-build `LogLimits`. `total_bytes` (cumulative across flushed batches) is a hard cap: a line whose PROSPECTIVE total would exceed it is rejected, `add_line` returns `LimitExceeded{reason}`, the stderr loop flushes already-buffered lines and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (same build on a different executor spews the same logs). Maps to `rio_builder_builds_total{outcome="log_limit"}`. `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) is a suppression threshold: excess lines within a window are DROPPED, and a single `[rio: N lines suppressed by log_rate_limit (M lines/s)]` marker is injected at the next window reset. The build continues. Dropped lines do not count toward `total_bytes`. Maps to `rio_builder_log_lines_suppressed_total`. Either limit set to `0` means unlimited.
 
 ## Overlay Store Architecture
 

@@ -111,11 +111,11 @@ pub struct Config {
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     ///
-    /// NOT in PoolSpec (CRD): the defaults (10k lines/sec,
-    /// 100 MiB) are already generous enough that hitting them
-    /// means the build is broken, not the limit. Operators
-    /// shouldn't be tuning around a runaway log producer. See
-    /// plan 21 Batch E `cfg-builder-knobs-unreachable-in-k8s`.
+    /// NOT in PoolSpec (CRD): rate-exceeded lines are suppressed
+    /// (not failed), so there's no per-workload tuning need; size
+    /// is the hard cap and 100 MiB is large enough that hitting it
+    /// means the build is broken. See plan 21 Batch E
+    /// `cfg-builder-knobs-unreachable-in-k8s`.
     pub log_rate_limit: u64,
     pub log_size_limit: u64,
     /// k8s `spec.nodeName` (downward API → `RIO_NODE_NAME`). Attached
@@ -193,7 +193,7 @@ impl Default for Config {
             // on their gRPC ports; builder+gateway have no gRPC server.
             health_addr: rio_common::default_addr(9193),
             // configuration.md:68-69 specs these defaults.
-            log_rate_limit: 10_000,
+            log_rate_limit: 250_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             node_name: String::new(),
             hw_class: String::new(),
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9093");
         assert_eq!(d.health_addr.to_string(), "[::]:9193");
         // Spec values from configuration.md:68-69.
-        assert_eq!(d.log_rate_limit, 10_000);
+        assert_eq!(d.log_rate_limit, 250_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
     }
 

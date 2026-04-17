@@ -225,7 +225,7 @@ impl<'a> StderrLoop<'a> {
                     ))))
                 }
             }
-            // r[impl builder.log-limit]
+            // r[impl builder.log-limit+2]
             AddLineResult::LimitExceeded { reason } => {
                 // Flush what's buffered so client sees output up to
                 // the limit. Best-effort: channel-closed is moot,
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Log limiting (LogLimitExceeded path through the stderr loop)
+    // Log limiting (rate suppression + size LogLimitExceeded)
     // -----------------------------------------------------------------------
 
     /// Run the stderr loop with a batcher that has the given limits.
@@ -1101,20 +1101,19 @@ mod tests {
         (result, batches)
     }
 
-    /// Rate limit trip → BuildStatus::LogLimitExceeded (terminal, non-retry).
-    /// The pre-trip lines must be flushed to the scheduler — the user wants
-    /// to see output right up to the limit, not have 5 lines disappear.
+    /// Rate limit suppresses excess lines; build continues to completion.
     #[tokio::test]
-    async fn test_stderr_loop_rate_limit_exceeded() -> anyhow::Result<()> {
+    async fn test_stderr_loop_rate_limit_suppresses() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
-            // 10 lines: 5 accepted, 6th trips a rate_limit=5.
+            // 10 lines: 5 accepted, 5 dropped (rate=5, single window).
             for i in 0..10 {
                 w.log(&format!("spew {i}")).await?;
             }
-            // No finish() — loop breaks on LimitExceeded before reaching here.
+            w.finish().await?;
         }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let (result, batches) = run_loop_with_limits(
             buf,
@@ -1125,24 +1124,18 @@ mod tests {
         )
         .await;
 
-        let br = result.expect("limit-exceeded is Ok(failure), not Err");
+        let br = result.expect("rate suppression is not a failure");
         assert_eq!(
             br.status,
-            BuildStatus::LogLimitExceeded,
-            "should map to Nix-native BuildStatus=11"
+            BuildStatus::Built,
+            "rate limit drops lines, does NOT abort the build"
         );
-        assert!(
-            br.error_msg.contains("log_rate_limit"),
-            "error_msg should name the limit: {}",
-            br.error_msg
-        );
-        // The 5 pre-trip lines MUST have been flushed. The LimitExceeded arm
-        // in the loop explicitly flushes before breaking — if it didn't, a
-        // build that trips at line 63 would lose lines 0-62.
+        // 5 buffered, 5 dropped. No marker — window never reset (test
+        // completes in <1s).
         assert_eq!(
             count_log_lines(&batches),
             5,
-            "pre-trip lines must be flushed; the tripping line is NOT buffered"
+            "5 lines accepted within rate window; 5 dropped"
         );
         Ok(())
     }
@@ -1412,8 +1405,8 @@ mod tests {
         Ok(())
     }
 
-    /// BuildLogLine via STDERR_RESULT is subject to the same rate/size
-    /// limits as STDERR_NEXT.
+    /// BuildLogLine via STDERR_RESULT is subject to the same rate
+    /// suppression as STDERR_NEXT.
     #[tokio::test]
     async fn test_stderr_loop_result_build_log_line_subject_to_limits() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::{ResultField, ResultType};
@@ -1428,7 +1421,9 @@ mod tests {
                 )
                 .await?;
             }
+            w.finish().await?;
         }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let (result, batches) = run_loop_with_limits(
             buf,
@@ -1439,9 +1434,9 @@ mod tests {
         )
         .await;
 
-        let br = result.expect("limit-exceeded is Ok(failure)");
-        assert_eq!(br.status, BuildStatus::LogLimitExceeded);
-        assert_eq!(count_log_lines(&batches), 5, "pre-trip lines flushed");
+        let br = result.expect("rate suppression is not a failure");
+        assert_eq!(br.status, BuildStatus::Built);
+        assert_eq!(count_log_lines(&batches), 5, "5 within rate, 5 dropped");
         Ok(())
     }
 }

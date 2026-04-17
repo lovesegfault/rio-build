@@ -4,12 +4,15 @@
 //! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first).
 //! Batches are sent on the scheduler `BuildExecution` stream.
 //!
-//! Also enforces per-build log limits (rate + total size). When a limit
-//! trips, [`add_line`](LogBatcher::add_line) returns
-//! [`AddLineResult::LimitExceeded`] and the caller (executor/daemon.rs)
-//! aborts the build with `BuildStatus::LogLimitExceeded` — a terminal,
-//! non-retryable failure (the same build on a different worker will just
-//! spew the same logs).
+//! Also enforces per-build log limits. `total_bytes` is a hard cap:
+//! exceeding it returns [`AddLineResult::LimitExceeded`] and the caller
+//! aborts the build with `BuildStatus::LogLimitExceeded`. `rate_lines_per_sec`
+//! is a suppression threshold: excess lines in a 1s window are DROPPED
+//! (not failed), and a single `[rio: N lines suppressed …]` marker is
+//! injected at the next window reset. The size limit bounds infrastructure
+//! cost; the rate limit bounds per-tick scheduler load without killing
+//! legitimate bursty builds (kernel `make oldconfig` emits ~18k prompts in
+//! one burst).
 
 use std::time::{Duration, Instant};
 
@@ -23,23 +26,19 @@ pub(crate) const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Per-build log limits, enforced by [`LogBatcher`].
 ///
-/// Both limits are **soft-off at 0** (unlimited). The defaults
-/// (`configuration.md:68-69`: 10k lines/s, 100 MiB total) are large enough
-/// that only pathological builds — `set -x` in a tight loop, `yes` piped
-/// somewhere — will hit them. Normal builds (even very verbose ones like
-/// the linux kernel) stay well under.
+/// Both limits are **soft-off at 0** (unlimited).
 #[derive(Debug, Clone, Copy)]
 pub struct LogLimits {
-    /// Max log lines per second. 0 = unlimited.
+    /// Max log lines per second before suppression kicks in. 0 = unlimited.
     ///
-    /// Enforced via a simple 1-second tumbling window (no token bucket).
-    /// Rationale: the only case that matters is sustained spew — a
-    /// millisecond-scale burst of 11k lines that then quiets down is
-    /// fine, but 10k+/s *sustained* for more than a second is always
-    /// a bug. A tumbling window catches exactly that with zero state
-    /// beyond one counter + one Instant.
+    /// Enforced via a 1-second tumbling window. Lines beyond the
+    /// threshold within a window are dropped; a marker line is
+    /// injected at the next window reset showing the drop count.
+    /// `total_bytes` is the hard cap; this only bounds per-second
+    /// scheduler-stream load.
     pub rate_lines_per_sec: u64,
     /// Max total log bytes across the whole build. 0 = unlimited.
+    /// Exceeding this aborts the build (`BuildStatus::LogLimitExceeded`).
     pub total_bytes: u64,
 }
 
@@ -54,11 +53,12 @@ impl LogLimits {
 /// Result of [`LogBatcher::add_line`].
 #[derive(Debug)]
 pub enum AddLineResult {
-    /// Line buffered; batch not yet full.
+    /// Line accepted (buffered, or dropped by rate suppression — either
+    /// way the caller continues). Batch not yet full.
     Buffered,
     /// Line completed a batch. Caller must send it.
     BatchReady(BuildLogBatch),
-    /// A log limit tripped. Caller must abort the build with
+    /// `total_bytes` limit tripped. Caller must abort the build with
     /// `BuildStatus::LogLimitExceeded` and the given reason in `error_msg`.
     ///
     /// The line that tripped the limit is **not** buffered (we're done
@@ -84,8 +84,10 @@ pub struct LogBatcher {
 
     // --- limits ---
     limits: LogLimits,
-    /// Lines added in the current rate window.
+    /// Lines accepted in the current rate window.
     lines_this_window: u64,
+    /// Lines dropped (rate-suppressed) in the current rate window.
+    lines_dropped_this_window: u64,
     /// Start of the current rate window.
     window_start: Instant,
     /// Total bytes across all lines ever added (including flushed batches).
@@ -111,6 +113,7 @@ impl LogBatcher {
             batch_start: now,
             limits,
             lines_this_window: 0,
+            lines_dropped_this_window: 0,
             window_start: now,
             total_bytes: 0,
         }
@@ -121,7 +124,7 @@ impl LogBatcher {
     ///
     /// Limit checks happen BEFORE buffering — a line that would exceed the
     /// size limit is rejected, not half-accepted.
-    // r[impl builder.log-limit]
+    // r[impl builder.log-limit+2]
     pub fn add_line(&mut self, line: Vec<u8>) -> AddLineResult {
         // --- Size limit ---
         // Check the PROSPECTIVE total, not the current one. A 100 MiB limit
@@ -141,26 +144,34 @@ impl LogBatcher {
             }
         }
 
-        // --- Rate limit ---
-        // Tumbling window: if > 1s has elapsed since window_start, reset.
-        // We use Instant (monotonic, not wall-clock) so NTP jumps don't
-        // spuriously trip or un-trip the limit.
+        // --- Rate limit (suppression, not abort) ---
+        // Tumbling window: if ≥ 1s has elapsed since window_start, reset.
+        // Instant (monotonic) so NTP jumps don't spuriously trip/un-trip.
         if self.limits.rate_lines_per_sec > 0 {
             if self.window_start.elapsed() >= Duration::from_secs(1) {
+                let dropped = std::mem::take(&mut self.lines_dropped_this_window);
                 self.window_start = Instant::now();
                 self.lines_this_window = 0;
+                if dropped > 0 {
+                    metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
+                    // Marker is pushed directly (not via add_line) so
+                    // it can't recurse and always lands ahead of `line`.
+                    // It counts toward this window's quota and total_bytes
+                    // (may overshoot the size limit by ~one marker; the
+                    // very next line correctly trips LimitExceeded).
+                    let marker = format!(
+                        "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
+                        self.limits.rate_lines_per_sec
+                    )
+                    .into_bytes();
+                    self.total_bytes += marker.len() as u64;
+                    self.lines.push(marker);
+                    self.lines_this_window += 1;
+                }
             }
-            // Check BEFORE incrementing (same prospective-check logic as size).
             if self.lines_this_window >= self.limits.rate_lines_per_sec {
-                return AddLineResult::LimitExceeded {
-                    reason: format!(
-                        "log_rate_limit exceeded: > {} lines/sec \
-                         (window started {}ms ago, {} lines total so far)",
-                        self.limits.rate_lines_per_sec,
-                        self.window_start.elapsed().as_millis(),
-                        self.next_line_number
-                    ),
-                };
+                self.lines_dropped_this_window += 1;
+                return AddLineResult::Buffered;
             }
             self.lines_this_window += 1;
         }
@@ -312,60 +323,77 @@ mod tests {
     // Rate limiting
     // -----------------------------------------------------------------------
 
-    // r[verify builder.log-limit]
+    // r[verify builder.log-limit+2]
     #[test]
-    fn rate_limit_trips_at_threshold() {
+    fn rate_limit_drops_excess_within_window() {
         let mut batcher = mk(LogLimits {
             rate_lines_per_sec: 5,
             total_bytes: 0,
         });
-        // First 5 lines accepted.
-        for i in 0..5 {
+        // 10 lines in <1s: first 5 buffered, next 5 dropped. ALL return
+        // Buffered (drop is not an error).
+        for i in 0..10 {
             match batcher.add_line(vec![i as u8]) {
                 AddLineResult::Buffered => {}
-                other => panic!("line {i} should be accepted, got {other:?}"),
+                other => panic!("line {i} should be Buffered, got {other:?}"),
             }
         }
-        // 6th line trips.
-        match batcher.add_line(b"sixth".to_vec()) {
-            AddLineResult::LimitExceeded { reason } => {
-                assert!(
-                    reason.contains("log_rate_limit"),
-                    "reason should name the limit: {reason}"
-                );
-                assert!(reason.contains("5"), "reason should mention the threshold");
-            }
-            other => panic!("6th line should trip rate limit, got {other:?}"),
-        }
-        // The tripping line is NOT buffered. 5 lines should be pending.
-        assert_eq!(batcher.flush().lines.len(), 5);
+        let batch = batcher.flush();
+        assert_eq!(batch.lines.len(), 5, "5 buffered, 5 dropped");
+        assert_eq!(batch.lines[4], vec![4u8], "last buffered is index 4");
     }
 
     #[test]
-    fn rate_limit_resets_after_window() {
+    fn rate_limit_marker_on_window_reset() {
         let mut batcher = mk(LogLimits {
             rate_lines_per_sec: 3,
             total_bytes: 0,
         });
-        // Fill the window.
-        for _ in 0..3 {
+        // Fill the window: 3 accepted, 4 dropped.
+        for _ in 0..7 {
             assert!(matches!(
                 batcher.add_line(b"l".to_vec()),
                 AddLineResult::Buffered
             ));
         }
-        // 4th would trip...
-        // But sleep > 1s → window resets. (Real-time test — Instant doesn't
-        // advance under paused tokio-time, and rate limiting against real
-        // wall-clock is the point.)
+        // Real-time sleep > 1s → window resets. (Instant doesn't advance
+        // under paused tokio-time; rate limiting against wall-clock is
+        // the point.)
         std::thread::sleep(Duration::from_millis(1100));
-        // Now 3 more lines should be accepted.
-        for i in 0..3 {
-            match batcher.add_line(b"l".to_vec()) {
+        // Next line: marker injected first (counts toward this window's
+        // quota), then the line. Window quota is 3 → marker + 2 lines fit.
+        for i in 0..2 {
+            match batcher.add_line(b"m".to_vec()) {
                 AddLineResult::Buffered => {}
                 other => panic!("post-reset line {i} should be accepted, got {other:?}"),
             }
         }
+        let batch = batcher.flush();
+        // 3 (window 1) + 1 marker + 2 (window 2) = 6.
+        assert_eq!(batch.lines.len(), 6);
+        let marker = std::str::from_utf8(&batch.lines[3]).unwrap();
+        assert!(
+            marker.contains("4 lines suppressed") && marker.contains("log_rate_limit"),
+            "marker at index 3 should report 4 drops: {marker}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_no_marker_when_nothing_dropped() {
+        let mut batcher = mk(LogLimits {
+            rate_lines_per_sec: 3,
+            total_bytes: 0,
+        });
+        for _ in 0..3 {
+            batcher.add_line(b"l".to_vec());
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        for _ in 0..3 {
+            batcher.add_line(b"m".to_vec());
+        }
+        let batch = batcher.flush();
+        assert_eq!(batch.lines.len(), 6, "no marker injected — nothing dropped");
+        assert!(batch.lines.iter().all(|l| l == b"l" || l == b"m"));
     }
 
     #[test]
@@ -481,20 +509,39 @@ mod tests {
     }
 
     #[test]
-    fn both_limits_size_checked_first() {
-        // If both would trip on the same line, we get a size reason (checked
-        // first in the code). This isn't a contract, just documents current
-        // behavior — either reason is valid, but consistency helps log grep.
+    fn rate_dropped_lines_dont_count_toward_size() {
+        // A rate-suppressed line is never buffered or transmitted, so it
+        // costs nothing — it must NOT count toward total_bytes.
         let mut batcher = mk(LogLimits {
             rate_lines_per_sec: 1,
-            total_bytes: 1,
+            total_bytes: 10,
         });
-        batcher.add_line(vec![b'x'; 1]); // uses rate quota AND size quota
-        match batcher.add_line(vec![b'y'; 1]) {
+        // First line (5 bytes) buffered.
+        assert!(matches!(
+            batcher.add_line(vec![b'x'; 5]),
+            AddLineResult::Buffered
+        ));
+        // 100 dropped lines (rate=1, window full). None counted toward size.
+        for _ in 0..100 {
+            assert!(matches!(
+                batcher.add_line(vec![b'y'; 5]),
+                AddLineResult::Buffered
+            ));
+        }
+        // total_bytes is still 5. A 5-byte line fits (5+5=10 ≤ limit) —
+        // but the rate window is still full so it's dropped too.
+        // Prove via size: a 6-byte line would trip size if total_bytes
+        // had been polluted by drops; since it's only 5, the size check
+        // passes (5+6=11 > 10 → trips, which is CORRECT for the 5 real
+        // bytes, not 505 phantom bytes).
+        match batcher.add_line(vec![b'z'; 6]) {
             AddLineResult::LimitExceeded { reason } => {
-                assert!(reason.contains("log_size_limit"), "size checked first");
+                assert!(
+                    reason.contains("11"),
+                    "prospective should be 5+6=11: {reason}"
+                );
             }
-            other => panic!("expected limit exceeded, got {other:?}"),
+            other => panic!("expected size trip at 11 bytes, got {other:?}"),
         }
     }
 }

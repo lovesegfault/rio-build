@@ -76,8 +76,8 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
 | `metrics_addr` | socket addr | `[::]:9093` | Prometheus metrics listen address |
 | `health_addr` | socket addr | `[::]:9193` | HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server) |
-| `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
-| `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
+| `log_rate_limit` | u64 | 250000 | Log lines/sec suppression threshold per build. Excess lines in a 1s window are dropped with a marker injected at the next window; build continues. (0 = unlimited) |
+| `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build. Exceeding aborts the build with `LogLimitExceeded`. (0 = unlimited) |
 | `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
 | `executor_kind` | enum | `builder` | `builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs only). Set via `RIO_EXECUTOR_KIND`. See [ADR-019](./decisions/019-builder-fetcher-split.md). |
 
