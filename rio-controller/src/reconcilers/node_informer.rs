@@ -322,9 +322,13 @@ pub async fn run_pod_annotator(
 /// (interrupted or not) contributes its lifetime to the denominator.
 ///
 /// `field_selector` narrows the watch server-side so we don't churn
-/// on the cluster's full event firehose. Karpenter's event is on the
-/// NodeClaim object; `involvedObject.kind=NodeClaim` + `reason=
-/// SpotInterrupted` is the tightest filter the apiserver supports.
+/// on the cluster's full event firehose. Karpenter's interruption
+/// controller emits the `SpotInterrupted` event on BOTH the NodeClaim
+/// and the Node; we watch the **Node** event so `involvedObject.name`
+/// is the Node `metadata.name` — the same key [`NodeLabelCache`] is
+/// indexed by. The NodeClaim event's `involvedObject.name` is the
+/// NodeClaim name (`{nodepool}-{hash}` on EKS), which would always
+/// miss the IP-derived-Node-name-keyed cache.
 pub async fn run_spot_interrupt_watcher(
     client: Client,
     cache: NodeLabelCache,
@@ -332,8 +336,7 @@ pub async fn run_spot_interrupt_watcher(
     shutdown: rio_common::signal::Token,
 ) {
     let events: Api<Event> = Api::all(client);
-    let cfg =
-        watcher::Config::default().fields("reason=SpotInterrupted,involvedObject.kind=NodeClaim");
+    let cfg = watcher::Config::default().fields("reason=SpotInterrupted,involvedObject.kind=Node");
     let mut stream = watcher(events, cfg)
         .default_backoff()
         .applied_objects()
@@ -351,11 +354,8 @@ pub async fn run_spot_interrupt_watcher(
                 None => { warn!("spot-interrupt: stream ended (unexpected)"); return; }
             },
         };
-        // NodeClaim → Node: Karpenter sets the NodeClaim's
-        // `status.nodeName` once the node registers; the Event's
-        // `involvedObject.name` IS the NodeClaim name, which Karpenter
-        // also uses as the Node name. Fall back to a direct cache
-        // lookup by that name.
+        // involvedObject.kind=Node ⇒ involvedObject.name IS the Node
+        // metadata.name — the cache key.
         let Some(node) = ev.involved_object.name else {
             continue;
         };

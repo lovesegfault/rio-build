@@ -126,16 +126,27 @@ pub struct CompletionScore {
 /// gated on `pred.wall_secs.is_some()` so probe-path dispatches (no
 /// fitted curve → no `T(c)`) don't emit.
 ///
+/// `hw_factor` is the completion's `HwTable.factor(hw_class)`: the
+/// prediction (`pred.wall_secs`) is in **reference-seconds** — `t_at()`
+/// evaluates the ref-second-denominated fit — so `ratio_wall` first maps
+/// `actual_wall` to the same timeline. The envelope check stays
+/// wall-vs-wall (`tier_p90` is the operator-facing wall-second SLA).
+/// Pass `1.0` for unknown/absent hw_class.
+///
 /// Envelope: `miss` if wall blew the tier's p90 OR memory blew the
 /// reservation (`constraint` names which). Memory-miss is the
 /// OOM-adjacent case — the build fit because the controller's headroom
 /// pad absorbed it, but the model under-predicted.
 pub fn score_completion(
     actual_wall: f64,
+    hw_factor: f64,
     actual_mem: u64,
     pred: &SlaPrediction,
 ) -> CompletionScore {
-    let ratio_wall = pred.wall_secs.filter(|p| *p > 0.0).map(|p| actual_wall / p);
+    let ratio_wall = pred
+        .wall_secs
+        .filter(|p| *p > 0.0)
+        .map(|p| (actual_wall * hw_factor) / p);
     let ratio_mem =
         (actual_mem > 0 && pred.mem_bytes > 0).then(|| actual_mem as f64 / pred.mem_bytes as f64);
     let envelope = pred.tier.as_ref().map(|tier| {
@@ -186,27 +197,27 @@ mod tests {
     #[test]
     fn ratio_wall_and_mem() {
         // wall=100, predicted=90 → ~1.11
-        let s = score_completion(100.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
+        let s = score_completion(100.0, 1.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
         assert!((s.ratio_wall.unwrap() - 1.111).abs() < 0.01);
         assert!((s.ratio_mem.unwrap() - 0.5).abs() < 0.01);
     }
 
     #[test]
     fn envelope_hit_within_p90() {
-        let s = score_completion(100.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
+        let s = score_completion(100.0, 1.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
         assert_eq!(s.envelope, Some(("normal".into(), "hit", "-")));
     }
 
     #[test]
     fn envelope_miss_wall() {
         // wall > tier.p90 → result=miss, constraint=wall
-        let s = score_completion(1500.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
+        let s = score_completion(1500.0, 1.0, 1 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
         assert_eq!(s.envelope, Some(("normal".into(), "miss", "wall")));
     }
 
     #[test]
     fn envelope_miss_mem() {
-        let s = score_completion(100.0, 4 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
+        let s = score_completion(100.0, 1.0, 4 << 30, &pred(90.0, 2 << 30, "normal", 1200.0));
         assert_eq!(s.envelope, Some(("normal".into(), "miss", "mem")));
     }
 
@@ -218,14 +229,33 @@ mod tests {
             tier: None,
             tier_p90: None,
         };
-        assert_eq!(score_completion(100.0, 1 << 30, &p).envelope, None);
+        assert_eq!(score_completion(100.0, 1.0, 1 << 30, &p).envelope, None);
     }
 
     #[test]
     fn zero_mem_is_no_signal() {
-        let s = score_completion(100.0, 0, &pred(90.0, 2 << 30, "normal", 1200.0));
+        let s = score_completion(100.0, 1.0, 0, &pred(90.0, 2 << 30, "normal", 1200.0));
         assert!(s.ratio_mem.is_none());
         // 0 mem shouldn't trip a mem-miss either.
         assert_eq!(s.envelope, Some(("normal".into(), "hit", "-")));
+    }
+
+    // r[verify sched.sla.hw-ref-seconds]
+    #[test]
+    fn ratio_wall_normalizes_by_hw_factor_but_envelope_stays_wall() {
+        // Fast hw (factor=2.0): wall=50s, ref=100s; predicted ref=100s.
+        // ratio_wall = (50 × 2.0) / 100 = 1.0 (perfect prediction).
+        // Without normalization the ratio would read 0.5 — the bug
+        // that made sla_prediction_ratio{dim=wall} multimodal at
+        // 1/factor[band] under heterogeneous hardware.
+        let p = pred(100.0, 2 << 30, "normal", 60.0);
+        let s = score_completion(50.0, 2.0, 1 << 30, &p);
+        assert!((s.ratio_wall.unwrap() - 1.0).abs() < 1e-9);
+        // Envelope is wall-vs-wall: 50s wall < 60s p90 → hit. The
+        // hw_factor must NOT leak into the SLA envelope check.
+        assert_eq!(s.envelope, Some(("normal".into(), "hit", "-")));
+        // Same wall on slow hw (factor=1.0) at p90=40s → miss.
+        let s2 = score_completion(50.0, 1.0, 1 << 30, &pred(100.0, 2 << 30, "normal", 40.0));
+        assert_eq!(s2.envelope, Some(("normal".into(), "miss", "wall")));
     }
 }

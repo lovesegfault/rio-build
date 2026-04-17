@@ -15,6 +15,11 @@ use crate::executor::{ExecutionResult, ExecutorError};
 /// [`panic_completion`] don't each grow a parameter per ADR-023 field.
 pub(super) struct CompletionStamp {
     pub node_name: Option<String>,
+    /// `RIO_HW_CLASS` (controller-stamped pod annotation). Written
+    /// through to `build_samples.hw_class` so the SLA fit can normalize
+    /// this sample's wall-seconds to reference-seconds. `None` outside
+    /// k8s / before the annotator stamps.
+    pub hw_class: Option<String>,
     /// Cgroup-poll snapshot at completion time. `None` only if the
     /// caller has no `ResourceSnapshotHandle` (panic-catcher fallback).
     pub final_resources: Option<ResourceUsage>,
@@ -32,6 +37,7 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
         peak_memory_bytes: r.peak_memory_bytes,
         peak_cpu_cores: r.peak_cpu_cores,
         node_name: stamp.node_name,
+        hw_class: stamp.hw_class,
         final_resources: r.fixture_resources.or(stamp.final_resources),
     }
 }
@@ -88,6 +94,7 @@ pub(super) fn err_completion(
         peak_memory_bytes: 0,
         peak_cpu_cores: 0.0,
         node_name: stamp.node_name,
+        hw_class: stamp.hw_class,
         // Carry the snapshot even on executor error: cpu_seconds_total
         // and peak_disk_bytes from a build that OOMed are exactly what
         // the SLA model needs to bump resource_floor next time.
@@ -115,6 +122,7 @@ pub(super) fn panic_completion(
         peak_memory_bytes: 0,
         peak_cpu_cores: 0.0,
         node_name: stamp.node_name,
+        hw_class: stamp.hw_class,
         final_resources: stamp.final_resources,
     }
 }

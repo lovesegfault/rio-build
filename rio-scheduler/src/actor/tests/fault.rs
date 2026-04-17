@@ -51,6 +51,7 @@ async fn test_completion_db_fault_build_sample_logged() -> TestResult {
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;

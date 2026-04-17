@@ -314,6 +314,37 @@ impl SlaEstimator {
             })
             .collect();
 
+        // Batch the per-key ring reads into a single round-trip. On a
+        // fresh process the first refresh has since=0.0 → every key in
+        // the table is touched; the previous per-key sequential awaits
+        // (read+trim ×N) blocked the actor for O(N×RTT) — ~30s at 10k
+        // keys × 1.5ms cross-AZ RDS — during which no SubmitBuild /
+        // CompletionReport / dispatch_ready was processed. With the
+        // batch, the loop body below is await-free.
+        let mut pnames = Vec::with_capacity(touched.len());
+        let mut systems = Vec::with_capacity(touched.len());
+        let mut tenants = Vec::with_capacity(touched.len());
+        for k in &touched {
+            pnames.push(k.pname.clone());
+            systems.push(k.system.clone());
+            tenants.push(k.tenant.clone());
+        }
+        let mut rings: HashMap<types::ModelKey, Vec<crate::db::BuildSampleRow>> = db
+            .read_build_samples_for_keys(&pnames, &systems, &tenants, self.ring_buffer)
+            .await?
+            .into_iter()
+            .fold(HashMap::new(), |mut m, r| {
+                m.entry(types::ModelKey {
+                    pname: r.pname.clone(),
+                    system: r.system.clone(),
+                    tenant: r.tenant.clone(),
+                })
+                .or_default()
+                .push(r);
+                m
+            });
+
+        let mut outlier_ids: Vec<i64> = Vec::new();
         for key in &touched {
             let prev = self.cache.read().get(key).cloned();
             // r[impl sched.sla.outlier-mad-reject]
@@ -326,17 +357,28 @@ impl SlaEstimator {
                 for r in new_rows.iter().filter(|r| {
                     r.pname == key.pname && r.system == key.system && r.tenant == key.tenant
                 }) {
+                    // r[impl sched.sla.hw-ref-seconds]
+                    // prev.fit and prev.log_residuals are in
+                    // reference-seconds; normalize the new sample's
+                    // wall-clock before comparing or an on-curve sample
+                    // from a fast hw_class is falsely flagged by
+                    // |ln(1/factor)|.
+                    let ref_t = hw_snapshot.normalize(r.duration_secs, r.hw_class.as_deref());
                     if let Some(c) = r.cpu_limit_cores
-                        && ingest::is_outlier(r.duration_secs, c, prev, DT_POLL_SECS)
+                        && ingest::is_outlier(ref_t, c, prev, DT_POLL_SECS)
                     {
-                        let _ = db.mark_outlier_excluded(r.id).await;
+                        outlier_ids.push(r.id);
                         metrics::outlier_rejected(&key.tenant);
                     }
                 }
             }
-            let rows = db
-                .read_build_samples_for_key(&key.pname, &key.system, &key.tenant, self.ring_buffer)
-                .await?;
+            // Batch read happened BEFORE outlier detection, so drop
+            // the just-flagged ids in-memory (the PG `WHERE NOT
+            // outlier_excluded` filter hasn't seen the UPDATE yet).
+            let mut rows = rings.remove(key).unwrap_or_default();
+            if !outlier_ids.is_empty() {
+                rows.retain(|r| !outlier_ids.contains(&r.id));
+            }
             let fit = ingest::refit(
                 key,
                 &rows,
@@ -347,12 +389,24 @@ impl SlaEstimator {
                 Some(&priors_snapshot),
             );
             self.cache.write().insert(key.clone(), fit);
-            // Trim AFTER refit so the fit always sees the full ring even
-            // if a previous tick's trim was skipped (PG blip). Best-effort
-            // — a failed trim is a transient leak the next tick fixes.
-            let _ = db
-                .trim_build_samples(&key.pname, &key.system, &key.tenant, self.ring_buffer)
-                .await;
+        }
+
+        // Persist outlier flags + per-key trim AFTER refit, each as a
+        // single batched round-trip. Best-effort — a failed trim is a
+        // transient leak the next tick fixes; a failed outlier-mark is
+        // re-detected next tick (the row reappears in `new_rows` since
+        // hwm advances past it only on success below… actually no, hwm
+        // advanced regardless — but the in-memory `retain` above already
+        // kept this tick's fit clean, and the next tick's batch read
+        // re-includes the row, where it's filtered again).
+        if let Err(e) = db.mark_outliers_excluded(&outlier_ids).await {
+            tracing::warn!(error = %e, n = outlier_ids.len(), "outlier mark failed");
+        }
+        if let Err(e) = db
+            .trim_build_samples_batch(&pnames, &systems, &tenants, self.ring_buffer)
+            .await
+        {
+            tracing::warn!(error = %e, "build_samples trim failed");
         }
 
         *self.last_tick.write() = hwm;

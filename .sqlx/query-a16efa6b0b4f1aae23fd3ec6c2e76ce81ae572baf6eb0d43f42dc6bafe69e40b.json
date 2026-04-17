@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ranked AS (\n              SELECT id, ROW_NUMBER() OVER\n                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn\n              FROM build_samples\n              WHERE (pname, system, tenant) IN\n                (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))\n            )\n            DELETE FROM build_samples\n            WHERE id IN (SELECT id FROM ranked WHERE rn > $4)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a16efa6b0b4f1aae23fd3ec6c2e76ce81ae572baf6eb0d43f42dc6bafe69e40b"
+}

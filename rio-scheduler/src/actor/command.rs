@@ -123,6 +123,12 @@ pub enum ActorCommand {
         /// → `RIO_NODE_NAME` → `CompletionReport.node_name`). For
         /// ADR-023's hw_class join. `None` = old executor / non-k8s.
         node_name: Option<String>,
+        /// `RIO_HW_CLASS` (controller-stamped pod annotation →
+        /// `CompletionReport.hw_class`). Written through to
+        /// `build_samples.hw_class`; the scheduler has no Node informer
+        /// so this is the only path. `None` = old executor / non-k8s /
+        /// annotator hadn't stamped yet.
+        hw_class: Option<String>,
         /// Builder's final cgroup-poll snapshot. Carries the ADR-023
         /// telemetry (`cpu_limit_cores`, `cpu_seconds_total`,
         /// `peak_io_pressure_pct`, `peak_disk_bytes`) for the

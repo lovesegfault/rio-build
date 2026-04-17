@@ -147,7 +147,7 @@ async fn test_write_build_sample_full_telemetry() -> anyhow::Result<()> {
     assert_eq!(got.2, Some(1 << 30), "peak_disk_bytes");
     assert_eq!(got.3, Some(12.5), "peak_io_pressure_pct");
     assert_eq!(got.4.as_deref(), Some("2.12.1"), "version");
-    assert_eq!(got.5, None, "hw_class stays NULL (controller fills)");
+    assert_eq!(got.5, None, "hw_class NULL (row didn't set it)");
     assert_eq!(
         got.6.as_deref(),
         Some("ip-10-0-1-42.ec2.internal"),
@@ -338,6 +338,202 @@ async fn test_read_build_samples_tenant_scoped() -> anyhow::Result<()> {
     assert_eq!(rows_b.len(), 1, "tenant-b should see only its own row");
     assert_eq!(rows_b[0].tenant, "tenant-b");
     assert!((rows_b[0].duration_secs - 999.0).abs() < 1e-9);
+
+    Ok(())
+}
+
+/// Batch read + batch trim: 3 keys × 5 rows each, request limit=3. One
+/// query returns 9 rows (3 per key, ASC, newest 3). Batch-trim to 3
+/// deletes 6 (2 per key); a fourth key not in the batch is untouched.
+/// Covers the single-round-trip refresh path that replaces the per-key
+/// sequential awaits.
+#[tokio::test]
+async fn test_build_samples_batch_read_and_trim() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    for key in ["a", "b", "c", "d"] {
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO build_samples
+                   (pname, system, tenant, duration_secs, peak_memory_bytes,
+                    cpu_limit_cores, completed_at)
+                 VALUES ($1, 'x86_64-linux', 't', $2, 0, 4, to_timestamp($3))",
+            )
+            .bind(key)
+            .bind(i as f64)
+            .bind(i as f64)
+            .execute(&test_db.pool)
+            .await?;
+        }
+    }
+    // Mark one row outlier_excluded — batch read filters it.
+    sqlx::query(
+        "UPDATE build_samples SET outlier_excluded = TRUE
+         WHERE pname = 'a' AND duration_secs = 4",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    let pnames: Vec<String> = ["a", "b", "c"].into_iter().map(String::from).collect();
+    let systems = vec!["x86_64-linux".to_string(); 3];
+    let tenants = vec!["t".to_string(); 3];
+
+    let rows = db
+        .read_build_samples_for_keys(&pnames, &systems, &tenants, 3)
+        .await?;
+    // 3 keys × 3 rows = 9, minus 1 outlier-excluded for 'a' (its newest
+    // 3 are i=4,3,2 but i=4 is excluded → returns i=3,2,1). Per-key
+    // limit applies BEFORE the outlier filter? No — `WHERE NOT
+    // outlier_excluded` is inside the subquery before ROW_NUMBER, so
+    // 'a' returns 3 of its 4 remaining (i=3,2,1).
+    assert_eq!(rows.len(), 9, "3 keys × limit 3 each, single round-trip");
+    // Per-key ASC ordering + key 'd' not requested.
+    for r in &rows {
+        assert!(["a", "b", "c"].contains(&r.pname.as_str()));
+    }
+    let a_rows: Vec<_> = rows.iter().filter(|r| r.pname == "a").collect();
+    assert_eq!(a_rows.len(), 3);
+    assert!(a_rows[0].completed_at <= a_rows[2].completed_at, "ASC");
+    assert!(
+        !a_rows.iter().any(|r| (r.duration_secs - 4.0).abs() < 1e-9),
+        "outlier_excluded row filtered"
+    );
+
+    // Batch trim to 3 → 2 deleted per key for a/b/c; 'd' untouched.
+    let deleted = db
+        .trim_build_samples_batch(&pnames, &systems, &tenants, 3)
+        .await?;
+    assert_eq!(deleted, 6, "3 keys × (5-3) = 6 rows deleted");
+    let (d_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM build_samples WHERE pname = 'd'")
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(d_count, 5, "key not in batch untouched");
+
+    // Batch outlier-mark roundtrip.
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM build_samples WHERE pname = 'b'")
+        .fetch_all(&test_db.pool)
+        .await?;
+    db.mark_outliers_excluded(&ids).await?;
+    let (b_excl,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM build_samples WHERE pname = 'b' AND outlier_excluded")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(b_excl, 3);
+    // Empty slice → no-op (no error, no round-trip).
+    db.mark_outliers_excluded(&[]).await?;
+
+    Ok(())
+}
+
+/// MAD outlier gate normalizes by hw_class before comparing against
+/// the ref-second-denominated previous fit. An on-curve sample from a
+/// fast hw_class (factor=2.0) has wall=ref/2; without normalization
+/// `|ln(wall/ref)| = |ln(0.5)| ≈ 0.69` would falsely trip the 3·MAD
+/// gate and the row would be permanently excluded.
+// r[verify sched.sla.hw-ref-seconds]
+// r[verify sched.sla.outlier-mad-reject]
+#[tokio::test]
+async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
+    use crate::sla::{
+        SlaEstimator,
+        types::{
+            DurationFit, ExploreState, FittedParams, MemBytes, MemFit, ModelKey, RawCores,
+            RefSeconds, WallSeconds,
+        },
+    };
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // hw_perf_factors view needs ≥3 distinct pod_ids per hw_class.
+    for (h, f) in [("ref", 1.0), ("fast", 2.0)] {
+        for p in 0..3 {
+            sqlx::query(
+                "INSERT INTO hw_perf_samples (hw_class, pod_id, factor)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(h)
+            .bind(format!("{h}-{p}"))
+            .bind(f)
+            .execute(&test_db.pool)
+            .await?;
+        }
+    }
+
+    let key = ModelKey {
+        pname: "ff".into(),
+        system: "x86_64-linux".into(),
+        tenant: "t".into(),
+    };
+    let est = SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
+    // Seed a tight prev fit directly (refit() partial-pools toward the
+    // operator prior at low n_eff, which would skew predicted away from
+    // T(c)=30+2000/c and confound the test). MAD([±0.02])=0.02 →
+    // gate=3·1.4826·0.02≈0.089; |ln 0.5|=0.693 falsely trips that
+    // without normalization, |ln 1.0|=0 with.
+    est.seed(FittedParams {
+        key: key.clone(),
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent { p90: MemBytes(0) },
+        disk_p90: None,
+        sigma_resid: 0.02,
+        log_residuals: vec![0.02, -0.02, 0.02, -0.02, 0.02],
+        n_eff: 8.0,
+        span: 16.0,
+        explore: ExploreState {
+            distinct_c: 5,
+            min_c: RawCores(2.0),
+            max_c: RawCores(32.0),
+            frozen: true,
+            saturated: true,
+            last_wall: WallSeconds(100.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: std::collections::HashMap::new(),
+        prior_source: None,
+    });
+
+    let row = |c: f64, t: f64, hw: &str| BuildSampleRow {
+        pname: "ff".into(),
+        system: "x86_64-linux".into(),
+        tenant: "t".into(),
+        duration_secs: t,
+        cpu_limit_cores: Some(c),
+        hw_class: Some(hw.into()),
+        peak_memory_bytes: 256 << 20,
+        ..Default::default()
+    };
+    // T_ref(16)=155s; on `fast` (factor 2.0) wall=77.5s — exactly on
+    // the curve in ref-seconds, |ln 0.5| off in raw wall.
+    db.write_build_sample(&row(16.0, 77.5, "fast")).await?;
+    // Control: genuine 10× outlier on ref hw.
+    db.write_build_sample(&row(16.0, 1550.0, "ref")).await?;
+
+    est.refresh(&db, &[]).await?;
+
+    // Precondition: HwTable loaded both classes (the gate is the test
+    // subject; don't let a view-shape mismatch silently degrade to
+    // factor=1.0 and "pass" by coincidence).
+    let hw = est.hw_table();
+    assert_eq!(hw.factor("fast"), 2.0, "hw_perf_factors view → HwTable");
+    assert_eq!(hw.factor("ref"), 1.0);
+
+    let excluded: Vec<f64> = sqlx::query_scalar(
+        "SELECT duration_secs FROM build_samples WHERE outlier_excluded ORDER BY duration_secs",
+    )
+    .fetch_all(&test_db.pool)
+    .await?;
+    assert_eq!(
+        excluded,
+        vec![1550.0],
+        "on-curve fast-hw sample kept; only the 10× outlier flagged"
+    );
 
     Ok(())
 }

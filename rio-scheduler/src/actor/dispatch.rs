@@ -1420,9 +1420,9 @@ impl DagActor {
             // Intent for this drv (matches the SpawnIntent that spawned the
             // pod). Builder clamps to cgroup cpu.max so a wildcard worker
             // (different intent) still gets ground-truth. Populating this
-            // makes resolve_build_opts override client `--cores N`, closing
-            // the model-corruption vector where the build runs at N but
-            // telemetry records cgroup limit.
+            // makes resolve_build_opts override client `--cores N`. The
+            // telemetry side (build_samples.cpu_limit_cores) records this
+            // same value at completion — see record_build_sample.
             assigned_cores: state.sched.last_intent.as_ref().map(|i| i.cores),
             assigned_mem_bytes: None,
             assigned_disk_bytes: None,

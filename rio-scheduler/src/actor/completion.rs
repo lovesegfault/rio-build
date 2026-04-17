@@ -530,9 +530,10 @@ impl DagActor {
         // "resource measurements from the cgroup" with identical
         // zero-means-no-signal semantics; unpacked immediately.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
-        // CompletionReport.node_name (downward API spec.nodeName).
-        // For ADR-023 build_samples.node_name → controller hw_class join.
-        node_name: Option<String>,
+        // CompletionReport.{node_name, hw_class} (downward API). Tupled
+        // — both are pod-identity stamps that flow straight to
+        // build_samples; bundling stays under clippy's 7-arg limit.
+        (node_name, hw_class): (Option<String>, Option<String>),
         // CompletionReport.final_resources — builder's last cgroup-poll
         // snapshot. Feeds build_samples ADR-023 columns. None = old executor.
         final_resources: Option<rio_proto::types::ResourceUsage>,
@@ -677,7 +678,7 @@ impl DagActor {
                     &result,
                     executor_id,
                     (peak_memory_bytes, peak_cpu_cores),
-                    node_name,
+                    (node_name, hw_class),
                     final_resources,
                 )
                 .await;
@@ -743,7 +744,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
-        node_name: Option<String>,
+        (node_name, hw_class): (Option<String>, Option<String>),
         final_resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
@@ -798,7 +799,7 @@ impl DagActor {
             drv_hash,
             result,
             (peak_memory_bytes, peak_cpu_cores),
-            node_name,
+            (node_name, hw_class),
             final_resources,
         )
         .await;
@@ -1300,7 +1301,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         result: &crate::domain::BuildResult,
         (peak_memory_bytes, peak_cpu_cores): (u64, f64),
-        node_name: Option<String>,
+        (node_name, hw_class): (Option<String>, Option<String>),
         final_resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         let final_res = final_resources.as_ref();
@@ -1364,11 +1365,23 @@ impl DagActor {
                         // costs nothing and prevents silent corruption.
                         peak_memory_bytes: peak_memory_bytes.min(i64::MAX as u64) as i64,
                         peak_cpu_cores: peak_cpu,
-                        // ADR-023 cgroup telemetry: builder attaches its
-                        // final ResourceUsage snapshot to CompletionReport.
-                        // None → old executor → NULL columns; SLA fit
-                        // tolerates them.
-                        cpu_limit_cores: final_res.and_then(|r| r.cpu_limit_cores),
+                        // r[impl sched.sla.intent-match]
+                        // The fit's independent variable is the
+                        // parallelism the build RAN at (NIX_BUILD_CORES
+                        // = assigned_cores), not the pod's cgroup
+                        // cpu.max. On intent-miss fallback a 2-core
+                        // solve can land on a 16-core wildcard pod;
+                        // recording cgroup limit there would place
+                        // (c=16, T(2)) on the curve and inflate the
+                        // fitted serial fraction. Cgroup limit is the
+                        // fallback only when no intent was recorded
+                        // (recovery / Static-mode).
+                        cpu_limit_cores: state
+                            .sched
+                            .last_intent
+                            .as_ref()
+                            .map(|i| f64::from(i.cores))
+                            .or_else(|| final_res.and_then(|r| r.cpu_limit_cores)),
                         cpu_seconds_total: final_res.and_then(|r| r.cpu_seconds_total),
                         peak_disk_bytes: final_res
                             .and_then(|r| r.peak_disk_bytes)
@@ -1379,9 +1392,14 @@ impl DagActor {
                         enable_parallel_building: state.enable_parallel_building,
                         prefer_local_build: state.prefer_local_build,
                         node_name,
-                        // Controller backfills hw_class from the Node
-                        // informer (joins on node_name) — Task 1.9.
-                        hw_class: None,
+                        // r[impl sched.sla.hw-ref-seconds]
+                        // From CompletionReport.hw_class (builder reads
+                        // RIO_HW_CLASS from the controller-stamped pod
+                        // annotation). The scheduler has no Node
+                        // informer, so this is the only path; None →
+                        // factor=1.0 (old executor / non-k8s /
+                        // annotator race).
+                        hw_class: hw_class.clone(),
                         // Read-side only; write_build_sample uses now().
                         completed_at: 0.0,
                         id: 0,
@@ -1402,8 +1420,20 @@ impl DagActor {
                         .as_ref()
                         .and_then(|i| i.predicted.as_ref())
                     {
+                        // r[impl sched.sla.hw-ref-seconds]
+                        // pred.wall_secs is reference-seconds (t_at()
+                        // evaluates the ref-second-denominated fit);
+                        // normalize the actual wall-clock by this
+                        // completion's hw_class so the ratio is
+                        // ref/ref. Envelope check (tier_p90) stays
+                        // wall-vs-wall — handled inside.
+                        let hw_factor = hw_class
+                            .as_deref()
+                            .map(|h| self.sla_estimator.hw_table().factor(h))
+                            .unwrap_or(1.0);
                         let score = crate::sla::metrics::score_completion(
                             duration_secs,
+                            hw_factor,
                             peak_memory_bytes,
                             pred,
                         );

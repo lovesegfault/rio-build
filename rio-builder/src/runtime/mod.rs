@@ -122,6 +122,12 @@ pub struct BuildSpawnContext {
     /// Attached to every `CompletionReport` for ADR-023's hw_class
     /// join. `None` outside k8s (empty config string).
     pub node_name: Option<String>,
+    /// `RIO_HW_CLASS` (controller-stamped pod annotation, downward
+    /// API). Attached to every `CompletionReport` so the scheduler can
+    /// write `build_samples.hw_class` directly — the scheduler has no
+    /// Node informer, so this is the only path. `None` outside k8s /
+    /// before the annotator stamps.
+    pub hw_class: Option<String>,
     /// Shared handle to the cgroup-poll `ResourceUsage` snapshot
     /// (same `Arc` as the heartbeat loop). Read once at completion
     /// time to populate `CompletionReport.final_resources` — the
@@ -137,6 +143,7 @@ impl BuildSpawnContext {
     fn completion_stamp(&self) -> result::CompletionStamp {
         result::CompletionStamp {
             node_name: self.node_name.clone(),
+            hw_class: self.hw_class.clone(),
             final_resources: Some(*self.resources.read().unwrap_or_else(|e| e.into_inner())),
         }
     }
@@ -223,6 +230,7 @@ pub async fn spawn_build_task(
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
     let panic_node_name = ctx.node_name.clone();
+    let panic_hw_class = ctx.hw_class.clone();
     let panic_resources = Arc::clone(&ctx.resources);
 
     // The spawned task needs 'static; clone the whole context once and
@@ -335,6 +343,7 @@ pub async fn spawn_build_task(
                     panic_token,
                     result::CompletionStamp {
                         node_name: panic_node_name,
+                        hw_class: panic_hw_class,
                         final_resources: Some(
                             *panic_resources.read().unwrap_or_else(|e| e.into_inner()),
                         ),

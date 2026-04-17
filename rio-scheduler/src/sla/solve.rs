@@ -113,8 +113,12 @@ impl Candidate {
 /// [`SchedHint::last_intent`]: crate::state::SchedHint::last_intent
 #[derive(Debug, Clone, Default)]
 pub struct SlaPrediction {
-    /// `T(c)` at the dispatched core count. `None` for cold-start /
-    /// override / drv-hint paths where there is no fitted curve.
+    /// `T(c)` at the dispatched core count, in **reference-seconds**
+    /// (the fit is built from hw-normalized samples; `t_at()` returns
+    /// `RefSeconds`). [`super::metrics::score_completion`] normalizes
+    /// the actual wall-clock by the completion's hw_class factor before
+    /// dividing. `None` for cold-start / override / drv-hint paths
+    /// where there is no fitted curve.
     pub wall_secs: Option<f64>,
     /// `M(c)` (post-headroom) the controller was asked to reserve.
     pub mem_bytes: u64,

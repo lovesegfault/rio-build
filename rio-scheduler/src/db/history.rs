@@ -8,15 +8,15 @@ use super::SchedulerDb;
 ///
 /// All telemetry columns are `Option` — old executors / recovered
 /// derivations / non-k8s test runs leave them `None` → SQL NULL.
-/// `hw_class` is always `None` from the scheduler; the controller
-/// backfills it from the Node informer (joins on `node_name`).
+/// `hw_class` comes from `CompletionReport.hw_class` (builder reads
+/// `RIO_HW_CLASS` from the controller-stamped pod annotation).
 ///
 /// `Default` so tests can `BuildSampleRow { pname: "x".into(),
 /// ..Default::default() }` without spelling out 15 Nones.
 #[derive(Debug, Clone, Default)]
 pub struct BuildSampleRow {
     /// `BIGSERIAL` PK. Ignored on write (server-assigned); populated on
-    /// read so the MAD outlier sweep can `mark_outlier_excluded(id)`
+    /// read so the MAD outlier sweep can `mark_outliers_excluded([id])`
     /// without re-keying on `(pname, system, tenant, completed_at)`.
     pub id: i64,
     pub pname: String,
@@ -158,14 +158,18 @@ impl SchedulerDb {
         .await
     }
 
-    /// Flip `outlier_excluded = TRUE` for one row by PK. Idempotent.
-    /// The row stays for forensics; both per-key and incremental reads
-    /// already filter `WHERE NOT outlier_excluded`, so a flagged sample
-    /// drops out of the next refit without a DELETE.
-    pub async fn mark_outlier_excluded(&self, id: i64) -> Result<(), sqlx::Error> {
+    /// Flip `outlier_excluded = TRUE` for a batch of rows by PK.
+    /// Idempotent. Rows stay for forensics; both per-key and
+    /// incremental reads already filter `WHERE NOT outlier_excluded`,
+    /// so flagged samples drop out of the next refit without a DELETE.
+    /// Empty `ids` → no-op (skips the round-trip).
+    pub async fn mark_outliers_excluded(&self, ids: &[i64]) -> Result<(), sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         sqlx::query!(
-            "UPDATE build_samples SET outlier_excluded = TRUE WHERE id = $1",
-            id,
+            "UPDATE build_samples SET outlier_excluded = TRUE WHERE id = ANY($1::bigint[])",
+            ids,
         )
         .execute(&self.pool)
         .await?;
@@ -243,6 +247,99 @@ impl SchedulerDb {
             pname,
             system,
             tenant,
+            keep_n as i64,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Batch [`Self::read_build_samples_for_key`]: most-recent `limit`
+    /// rows per `(pname, system, tenant)` for every key in the parallel
+    /// arrays, in a single round-trip. Returned ASC per key; keys are
+    /// interleaved — caller groups in-memory.
+    ///
+    /// `unnest($1,$2,$3)` zips three `text[]` binds into a row-set so
+    /// the composite IN doesn't need a custom record-array type.
+    /// `ROW_NUMBER() OVER (PARTITION BY key ORDER BY completed_at
+    /// DESC)` gives per-key top-N in one scan; `build_samples_key_idx`
+    /// (migration 039) covers both the key match and the partition
+    /// sort. Used by [`SlaEstimator::refresh`] so a cold-start refit
+    /// of N keys is one query, not N sequential awaits on the actor.
+    ///
+    /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
+    pub async fn read_build_samples_for_keys(
+        &self,
+        pnames: &[String],
+        systems: &[String],
+        tenants: &[String],
+        limit: u32,
+    ) -> Result<Vec<BuildSampleRow>, sqlx::Error> {
+        debug_assert_eq!(pnames.len(), systems.len());
+        debug_assert_eq!(pnames.len(), tenants.len());
+        if pnames.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as!(
+            BuildSampleRow,
+            r#"
+            SELECT id, pname, system, tenant, duration_secs, peak_memory_bytes,
+                   cpu_limit_cores, peak_cpu_cores, cpu_seconds_total,
+                   peak_disk_bytes, peak_io_pressure_pct, version, hw_class,
+                   node_name, enable_parallel_building, prefer_local_build,
+                   EXTRACT(EPOCH FROM completed_at)::float8 AS "completed_at!"
+            FROM (
+              SELECT *, ROW_NUMBER() OVER
+                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn
+              FROM build_samples
+              WHERE (pname, system, tenant) IN
+                (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+                AND NOT outlier_excluded
+            ) t
+            WHERE rn <= $4
+            ORDER BY pname, system, tenant, completed_at ASC
+            "#,
+            pnames,
+            systems,
+            tenants,
+            limit as i64,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Batch [`Self::trim_build_samples`]: delete all but the `keep_n`
+    /// most-recent rows for every `(pname, system, tenant)` in the
+    /// parallel arrays, in a single round-trip. Returns total rows
+    /// deleted across all keys. Same window-function shape as
+    /// [`Self::read_build_samples_for_keys`].
+    pub async fn trim_build_samples_batch(
+        &self,
+        pnames: &[String],
+        systems: &[String],
+        tenants: &[String],
+        keep_n: u32,
+    ) -> Result<u64, sqlx::Error> {
+        debug_assert_eq!(pnames.len(), systems.len());
+        debug_assert_eq!(pnames.len(), tenants.len());
+        if pnames.is_empty() {
+            return Ok(0);
+        }
+        let r = sqlx::query!(
+            r#"
+            WITH ranked AS (
+              SELECT id, ROW_NUMBER() OVER
+                (PARTITION BY pname, system, tenant ORDER BY completed_at DESC) AS rn
+              FROM build_samples
+              WHERE (pname, system, tenant) IN
+                (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+            )
+            DELETE FROM build_samples
+            WHERE id IN (SELECT id FROM ranked WHERE rn > $4)
+            "#,
+            pnames,
+            systems,
+            tenants,
             keep_n as i64,
         )
         .execute(&self.pool)

@@ -1527,6 +1527,7 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;
@@ -1596,6 +1597,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;
@@ -1646,6 +1648,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
             peak_memory_bytes: 0,
             peak_cpu_cores: 0.0,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;
@@ -1741,6 +1744,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
             peak_memory_bytes: 8 * 1024 * 1024,
             peak_cpu_cores: 1.5,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;
@@ -1770,6 +1774,85 @@ async fn test_completion_writes_build_sample() -> TestResult {
         *mem,
         8 * 1024 * 1024,
         "peak_memory_bytes round-trips as i64"
+    );
+
+    Ok(())
+}
+
+/// `build_samples.{hw_class, cpu_limit_cores}` are populated from the
+/// `CompletionReport.hw_class` and `state.sched.last_intent.cores`
+/// respectively — NOT left NULL and NOT taken from the cgroup
+/// `final_resources.cpu_limit_cores`. On intent-miss fallback a
+/// 2-core solve can land on a 16-core wildcard pod; the fit's
+/// independent variable must be the parallelism the build RAN at
+/// (assigned_cores), not the pod ceiling.
+// r[verify sched.sla.hw-ref-seconds]
+// r[verify sched.sla.intent-match]
+#[tokio::test]
+async fn test_completion_writes_hw_class_and_intent_cores() -> TestResult {
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("hw-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_node("hw-drv");
+    node.pname = "hw-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let assignment = recv_assignment(&mut stream_rx).await;
+    // Dispatch sets last_intent → assigned_cores; capture it so the
+    // assertion is robust to whatever solve_intent_for picks under the
+    // test config.
+    let assigned = assignment
+        .assigned_cores
+        .expect("dispatch sets assigned_cores from last_intent");
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "hw-worker".into(),
+            drv_key: test_drv_path("hw-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("hw-pkg-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2010,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 1 << 20,
+            peak_cpu_cores: 1.0,
+            node_name: Some("ip-10-0-1-5.ec2.internal".into()),
+            hw_class: Some("aws-7-ebs".into()),
+            // Cgroup says 99 cores — the intent-miss case where the pod
+            // is bigger than the solve. Stored value must be `assigned`.
+            final_resources: Some(rio_proto::types::ResourceUsage {
+                cpu_limit_cores: Some(99.0),
+                ..Default::default()
+            }),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let (hw, cores): (Option<String>, Option<f64>) = sqlx::query_as(
+        "SELECT hw_class, cpu_limit_cores FROM build_samples WHERE pname = 'hw-pkg'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        hw.as_deref(),
+        Some("aws-7-ebs"),
+        "hw_class written through from CompletionReport (not NULL)"
+    );
+    assert_eq!(
+        cores,
+        Some(f64::from(assigned)),
+        "cpu_limit_cores = last_intent.cores ({assigned}), not cgroup cpu.max (99)"
     );
 
     Ok(())
@@ -1861,6 +1944,7 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             peak_memory_bytes: u64::MAX,
             peak_cpu_cores: 0.0,
             node_name: None,
+            hw_class: None,
             final_resources: None,
         })
         .await?;

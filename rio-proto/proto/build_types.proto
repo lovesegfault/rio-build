@@ -232,6 +232,13 @@ message CompletionReport {
   // — fields 4/6 above remain the only source for those
   // (memory_used_bytes here is memory.current, near-zero post-exit).
   optional ResourceUsage final_resources = 8;
+
+  // ADR-023 phase-10 hw_class (controller-stamped pod annotation
+  // `rio.build/hw-class` → downward-API → RIO_HW_CLASS). Written
+  // through to build_samples.hw_class so HwTable.normalize can map this
+  // sample's wall-seconds to reference-seconds. The scheduler has no
+  // Node informer, so this is the only path; absent → factor=1.0.
+  optional string hw_class = 9;
 }
 
 // Result of building a single derivation.
