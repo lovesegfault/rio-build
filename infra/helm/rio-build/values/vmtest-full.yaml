@@ -93,8 +93,6 @@ scheduler:
     maxMem: 2147483648         # 2 GiB
     maxDisk: 6442450944        # 6 GiB
     defaultDisk: 2147483648    # 2 GiB
-    fuseCacheBudget: 536870912 # 512 MiB
-    logBudget: 134217728       # 128 MiB
 
 gateway:
   enabled: true

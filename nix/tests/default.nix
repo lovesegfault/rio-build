@@ -87,8 +87,6 @@ let
         max_mem = 274877906944
         max_disk = 214748364800
         default_disk = 21474836480
-        fuse_cache_budget = 8589934592
-        log_budget = 1073741824
 
         [[sla.tiers]]
         name = "normal"
@@ -148,8 +146,6 @@ let
         max_mem = 2147483648
         max_disk = 6442450944
         default_disk = 2147483648
-        fuse_cache_budget = 536870912
-        log_budget = 134217728
 
         [[sla.tiers]]
         name = "normal"

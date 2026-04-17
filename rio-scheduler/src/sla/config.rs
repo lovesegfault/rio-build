@@ -37,11 +37,6 @@ pub struct SlaConfig {
     pub max_disk: u64,
     /// Disk request when no `disk_p90` sample exists yet.
     pub default_disk: u64,
-    /// Slice of the per-pod ephemeral-storage budget reserved for the
-    /// FUSE page cache (rio-mountd warm path).
-    pub fuse_cache_budget: u64,
-    /// Slice reserved for build-log ring buffer.
-    pub log_budget: u64,
     /// Per-key sample ring (rows kept for refit). Feeds
     /// [`super::SlaEstimator::new`].
     #[serde(default = "default_ring_buffer")]
@@ -141,8 +136,6 @@ impl SlaConfig {
             max_mem: 2 << 30,
             max_disk: 6 << 30,
             default_disk: 2 << 30,
-            fuse_cache_budget: 512 << 20,
-            log_budget: 128 << 20,
             ring_buffer: default_ring_buffer(),
             halflife_secs: default_halflife(),
             seed_corpus: None,
@@ -240,8 +233,6 @@ mod tests {
             max_mem: 256 << 30,
             max_disk: 200 << 30,
             default_disk: 20 << 30,
-            fuse_cache_budget: 8 << 30,
-            log_budget: 1 << 30,
             ring_buffer: default_ring_buffer(),
             halflife_secs: default_halflife(),
             seed_corpus: None,

@@ -182,8 +182,6 @@ data:
     max_mem = {{ int64 .maxMem }}
     max_disk = {{ int64 .maxDisk }}
     default_disk = {{ int64 .defaultDisk }}
-    fuse_cache_budget = {{ int64 .fuseCacheBudget }}
-    log_budget = {{ int64 .logBudget }}
 
     [sla.probe]
     cpu = {{ printf "%.1f" (float64 .probe.cpu) }}

@@ -310,43 +310,69 @@ in
           };
         };
 
-        # ── rio-nvme-mount: oneshot, before kubelet ──────────────────
-        # ADR-023 phase-10: rio-nvme EC2NodeClass sets
-        # instanceStorePolicy=RAID0 → Karpenter's userData has nodeadm
-        # mdadm-stripe all instance-store NVMe into /dev/md0. THIS unit
-        # mkfs.xfs (instance store is ephemeral — fresh fs every boot)
-        # and mounts at /var/lib/kubelet with prjquota so kubelet's
+        # ── rio-nvme-mount: oneshot, EARLY boot ──────────────────────
+        # ADR-023 phase-10: stripe all instance-store NVMe into /dev/md0,
+        # mkfs.xfs, mount at /var/lib/kubelet with prjquota so kubelet's
         # per-pod ephemeral-storage limit is enforced via XFS project
         # quotas (the default du-walk is unusable at NVMe write rates).
         #
-        # ConditionPathExists gates on /dev/md0: ebs-only nodes (rio-
-        # default NodeClass) skip cleanly. Baked into the AMI because
-        # nodeadm only consumes the NodeConfig MIME part — there is no
-        # shell userData on this image (ADR-021).
+        # Ordering is the load-bearing part. This unit MUST mount before
+        # BOTH systemd-tmpfiles-setup (hardening.nix writes the seccomp
+        # profiles into /var/lib/kubelet/seccomp/) AND nodeadm-init
+        # (writes /var/lib/kubelet/kubeconfig) — otherwise the fresh
+        # empty XFS overmounts and shadows them → kubelet can't register
+        # / builder pods CreateContainerError on the Localhost profile.
+        # That rules out delegating assembly to nodeadm
+        # (instanceStorePolicy=RAID0): nodeadm's LocalDisk aspect would
+        # mkfs.ext4 + mount /dev/md0 itself, AND nodeadm-init runs after
+        # tmpfiles. So this unit owns the whole mdadm→mkfs→mount chain
+        # and the rio-nvme EC2NodeClass leaves instanceStorePolicy unset.
+        #
+        # ConditionPathExistsGlob gates on the EC2 instance-store by-id
+        # link: ebs-only nodes (rio-default/rio-metal NodeClass) skip
+        # cleanly. Baked into the AMI because nodeadm only consumes the
+        # NodeConfig MIME part — there is no shell userData on this
+        # image (ADR-021).
         rio-nvme-mount = {
           description = "Mount instance-store NVMe RAID0 at /var/lib/kubelet (prjquota)";
-          wantedBy = [ "multi-user.target" ];
-          before = [ "kubelet.service" ];
-          # nodeadm-init assembles /dev/md0 (instanceStorePolicy=RAID0
-          # → nodeadm's local-disks step). Order-after so the device
-          # exists when ConditionPathExists is evaluated.
-          after = [
+          wantedBy = [ "sysinit.target" ];
+          before = [
+            "systemd-tmpfiles-setup.service"
             "nodeadm-init.service"
-            "local-fs.target"
+            "kubelet.service"
           ];
-          unitConfig.ConditionPathExists = "/dev/md0";
+          # local-fs.target: udev has settled, by-id symlinks exist.
+          after = [ "local-fs.target" ];
+          unitConfig = {
+            # Early boot: drop the implicit After=basic.target so this
+            # can slot between local-fs and tmpfiles-setup.
+            DefaultDependencies = false;
+            ConditionPathExistsGlob = "/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*";
+          };
           path = [
+            pkgs.mdadm
             pkgs.xfsprogs
             pkgs.util-linux
           ];
           script = ''
             set -euo pipefail
+            devs=(/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage*)
+            # Single-device families (e.g. m6id.large) skip md and format
+            # the NVMe directly — mdadm RAID0 over one disk is pure
+            # overhead.
+            if [ "''${#devs[@]}" -eq 1 ]; then
+              dev="''${devs[0]}"
+            else
+              mdadm --create /dev/md0 --run --level=0 --force \
+                --raid-devices="''${#devs[@]}" "''${devs[@]}"
+              dev=/dev/md0
+            fi
             # Instance store is wiped on stop/terminate → always fresh.
             # -K: don't TRIM (instance-store NVMe is pre-zeroed; mkfs
             # discard adds ~30s on multi-TB stripes for nothing).
-            mkfs.xfs -K -f /dev/md0
+            mkfs.xfs -K -f "$dev"
             mkdir -p /var/lib/kubelet
-            mount -o prjquota,noatime /dev/md0 /var/lib/kubelet
+            mount -o prjquota,noatime "$dev" /var/lib/kubelet
           '';
           serviceConfig = {
             Type = "oneshot";

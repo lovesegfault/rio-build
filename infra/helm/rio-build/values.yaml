@@ -365,8 +365,6 @@ scheduler:
   # featureProbes: per-requiredSystemFeatures override (e.g. kvm builds
   #   want a high mem floor regardless of cores).
   # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
-  # fuseCacheBudget/logBudget: slices of the per-pod ephemeral-storage
-  #   budget reserved for rio-mountd page cache + build-log ring.
   sla:
     tiers:
       - {name: normal, p50: 120, p90: 300, p99: 1200}
@@ -377,8 +375,6 @@ scheduler:
     maxMem: 274877906944       # 256 GiB
     maxDisk: 214748364800      # 200 GiB
     defaultDisk: 107374182400  # 100 GiB
-    fuseCacheBudget: 8589934592  # 8 GiB
-    logBudget: 1073741824        # 1 GiB
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
@@ -737,6 +733,11 @@ pools:
     image: rio-fetcher
     # `builtin` so the spawn-signal intent is self-describing.
     systems: [x86_64-linux, i686-linux, builtin]
+    # null-clear so the reconciler injects the rio.build/fetcher default
+    # (poolDefaults carries the builder toleration; without this the
+    # fetcher pod selects fetcher nodes but tolerates only the builder
+    # taint → permanently Pending).
+    tolerations: null
     nodeSelector:
       rio.build/node-role: fetcher
       kubernetes.io/arch: amd64
@@ -744,7 +745,7 @@ pools:
   # --set-json pools):
   #   - {name: aarch64, kind: Builder, systems: [aarch64-linux]}
   #   - {name: aarch64-fetcher, kind: Fetcher, image: rio-fetcher,
-  #      systems: [aarch64-linux, builtin],
+  #      systems: [aarch64-linux, builtin], tolerations: null,
   #      nodeSelector: {rio.build/node-role: fetcher, kubernetes.io/arch: arm64}}
 
 # Base for every Pool. The pool.yaml template deep-merges each

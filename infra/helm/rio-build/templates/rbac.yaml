@@ -98,10 +98,25 @@ rules:
     resources: [deployments/scale]
     verbs: [get, patch, update]
   # Reconciler inventories live worker pods by label to compute Job
-  # deficit; no mutation — pod lifecycle is the Job controller's.
+  # deficit. `patch`: node_informer's run_pod_annotator stamps the
+  # rio.build/hw-class annotation (Patch::Merge) so the builder's
+  # downward-API → RIO_HW_CLASS feeds hw_perf_samples. Pod lifecycle
+  # itself stays the Job controller's.
   - apiGroups: [""]
     resources: [pods]
+    verbs: [get, list, watch, patch]
+  # node_informer: Node watch → NodeLabelCache (hw-band label join for
+  # the per-(band,cap) cost solve). Cluster-scoped.
+  - apiGroups: [""]
+    resources: [nodes]
     verbs: [get, list, watch]
+  # node_informer: core/v1 Event watch for reason=SpotInterrupted
+  # (Karpenter posts on the NodeClaim) → λ[h] spot-rate self-
+  # calibration. core "" — the watcher uses k8s_openapi::api::core::
+  # v1::Event, not events.k8s.io.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list, watch]
   # `kubectl describe pool` shows events. create/patch for
   # aggregation (K8s dedups by key). events.k8s.io (NOT core "")
   # — kube-runtime's Recorder uses the events.k8s.io/v1 API. K8s

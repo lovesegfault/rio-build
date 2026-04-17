@@ -295,7 +295,9 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `rio.build` | pools/finalizers | update — `OwnerReferencesPermissionEnforcement` checks this when creating children with `blockOwnerDeletion: true` |
 | `apps` | deployments | get, list, watch — ComponentScaler reads current `.spec.replicas` |
 | `apps` | deployments/scale | get, patch, update — ComponentScaler `/scale` subresource patch |
-| `""` (core) | pods | get, list, watch |
+| `""` (core) | pods | get, list, watch, patch — `patch` for node_informer's `rio.build/hw-class` annotation stamp |
+| `""` (core) | nodes | get, list, watch — node_informer `NodeLabelCache` (hw-band label join) |
+| `""` (core) | events | list, watch — node_informer spot-interrupt watcher (`reason=SpotInterrupted`) |
 | `events.k8s.io` | events | create, patch |
 | `batch` | jobs | get, list, watch, create, delete |
 

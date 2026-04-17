@@ -411,8 +411,6 @@ mod tests {
             max_mem: 256 << 30,
             max_disk: 200 << 30,
             default_disk: 20 << 30,
-            fuse_cache_budget: 0,
-            log_budget: 0,
             ring_buffer: 32,
             halflife_secs: 7.0 * 86400.0,
             seed_corpus: None,
