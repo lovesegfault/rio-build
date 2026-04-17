@@ -29,7 +29,7 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
@@ -188,23 +188,38 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     //     Pending Job whose selector no longer matches the scheduler's
     //     re-solve (ICE-backoff) NameCollision-blocks the new intent
     //     forever. Delete both before the spawn pass.
-    reap_stale_for_intents(
-        &jobs_api,
-        &jobs.items,
-        to_spawn_intents,
-        &name,
-        pool.spec.kind,
-    )
-    .await;
+    //
+    // Reap sees the FULL intent set, NOT the headroom-truncated
+    // slice: when `ceiling` is set and every active slot is a
+    // selector-drifted Pending, headroom=0 → truncated slice is empty
+    // → reap's `want.is_empty()` early-return fires → nothing freed →
+    // headroom stays 0 forever. Reaping frees slots; it doesn't
+    // consume headroom, so the cap doesn't apply.
+    let reaped =
+        reap_stale_for_intents(&jobs_api, &jobs.items, &intents, &name, pool.spec.kind).await;
+
+    // Names already present (minus what we just reaped) are skipped
+    // in the spawn pass to avoid a create()→409 per still-Ready
+    // intent every tick.
+    let existing_names: HashSet<String> = jobs
+        .items
+        .iter()
+        .filter_map(|j| j.metadata.name.clone())
+        .filter(|n| !reaped.contains(n))
+        .collect();
 
     // One pod per intent with that intent's resources + annotation.
     // Headroom truncates; the remainder is picked up next tick after
     // `active` decreases. Under mandatory `[sla]` (Phase 5) the
     // scheduler ALWAYS populates intents — empty list means empty
     // queue → spawns nothing.
-    spawn_for_each(&jobs_api, to_spawn_intents, &name, |intent| {
-        build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent)
-    })
+    spawn_for_each(
+        &jobs_api,
+        to_spawn_intents,
+        &existing_names,
+        &name,
+        |intent| build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent),
+    )
     .await;
     if to_spawn_intents.is_empty() {
         debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
@@ -325,8 +340,9 @@ pub(super) async fn reap_stale_for_intents(
     intents: &[SpawnIntent],
     pool: &str,
     kind: ExecutorKind,
-) {
+) -> HashSet<String> {
     use std::collections::HashMap;
+    let mut reaped = HashSet::new();
     let want: HashMap<String, String> = intents
         .iter()
         .map(|i| {
@@ -337,7 +353,7 @@ pub(super) async fn reap_stale_for_intents(
         })
         .collect();
     if want.is_empty() {
-        return;
+        return reaped;
     }
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
@@ -366,8 +382,11 @@ pub(super) async fn reap_stale_for_intents(
                     pool, job = %jn, why,
                     "reaped stale Job blocking re-queued intent respawn"
                 );
+                reaped.insert(jn.to_owned());
             }
-            Err(e) if e.is_not_found() => {}
+            Err(e) if e.is_not_found() => {
+                reaped.insert(jn.to_owned());
+            }
             Err(e) => {
                 warn!(
                     pool, job = %jn, why, error = %e,
@@ -377,6 +396,7 @@ pub(super) async fn reap_stale_for_intents(
             }
         }
     }
+    reaped
 }
 
 /// Build a K8s Job for one ephemeral worker pod.

@@ -537,6 +537,7 @@ pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 pub(super) async fn spawn_for_each(
     jobs_api: &Api<Job>,
     intents: &[SpawnIntent],
+    skip_existing: &std::collections::HashSet<String>,
     pool: &str,
     mut build: impl FnMut(&SpawnIntent) -> Result<Job>,
 ) -> u32 {
@@ -550,6 +551,16 @@ pub(super) async fn spawn_for_each(
             }
         };
         let job_name = job.metadata.name.clone().unwrap_or_default();
+        // Pre-filter against the Job list already fetched this tick:
+        // a still-Ready intent whose Job is already Running would
+        // otherwise issue a create() that 409s every JOB_REQUEUE.
+        // Names reaped this tick are excluded from `skip_existing`
+        // by the caller so the post-reap respawn attempt still goes
+        // out (worst-case 409 → next tick).
+        if skip_existing.contains(&job_name) {
+            debug!(pool, job = %job_name, "Job already exists; skipping create");
+            continue;
+        }
         match try_spawn_job(jobs_api, &job).await {
             SpawnOutcome::Spawned => {
                 spawned += 1;

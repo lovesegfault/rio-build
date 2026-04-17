@@ -10,14 +10,16 @@
 //! contains no `return Err`, so the caller's status patch runs even
 //! when every spawn fails.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use k8s_openapi::api::batch::v1::{Job, JobStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
-use crate::reconcilers::pool::job::{SpawnOutcome, reap_excess_pending, try_spawn_job};
+use crate::reconcilers::pool::job::{
+    SpawnOutcome, reap_excess_pending, spawn_for_each, try_spawn_job,
+};
 use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
 use rio_crds::pool::ExecutorKind;
 use rio_proto::types::SpawnIntent;
@@ -334,7 +336,152 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
         },
     ]);
 
-    reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    let reaped =
+        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    guard.verified().await;
+    assert_eq!(
+        reaped,
+        HashSet::from([
+            "rio-builder-p-aaa".into(),
+            "rio-builder-p-ddd".into(),
+            "rio-builder-p-eee".into(),
+        ]),
+        "reaped set feeds spawn_for_each skip-filter exclusion"
+    );
+}
+
+/// Ceiling-saturation livelock: with `ceiling=2` and BOTH active
+/// slots occupied by selector-drifted Pending Jobs, headroom=0. The
+/// reconciler used to pass the headroom-truncated (empty) slice to
+/// `reap_stale_for_intents`, hitting its `want.is_empty()` early-
+/// return → nothing reaped → headroom stays 0 forever.
+///
+/// Fix: reap sees the FULL intent set (reaping frees slots, doesn't
+/// consume headroom). This test drives reap+spawn the way the
+/// reconciler now does: reap over full intents → both DELETEs fire →
+/// reaped names excluded from skip-set → spawn issues both creates.
+#[tokio::test]
+async fn reap_stale_at_ceiling_saturation() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let drifted = |name: &str| Job {
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            annotations: Some(BTreeMap::from([(
+                INTENT_SELECTOR_ANNOTATION.into(),
+                "karpenter.sh/capacity-type=spot".into(),
+            )])),
+            ..Default::default()
+        },
+        status: Some(JobStatus {
+            ready: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // ceiling=2, active=2 → headroom=0; both drifted vs on-demand.
+    let existing = vec![drifted("rio-builder-p-aaa"), drifted("rio-builder-p-bbb")];
+    let intent = |id: &str| SpawnIntent {
+        intent_id: id.into(),
+        node_selector: [("karpenter.sh/capacity-type".into(), "on-demand".into())].into(),
+        ..Default::default()
+    };
+    let intents = vec![intent("aaa"), intent("bbb")];
+
+    let guard = verifier.run(vec![
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-p-aaa",
+            body_contains: Some(r#""propagationPolicy":"Foreground""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-p-bbb",
+            body_contains: Some(r#""propagationPolicy":"Foreground""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+    ]);
+
+    // Reap over the FULL intent set (NOT a headroom-truncated slice).
+    let reaped =
+        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    assert_eq!(reaped.len(), 2, "both drifted Pending reaped");
+
+    // Skip-set = existing names minus reaped → empty → spawn fires
+    // for both intents this tick.
+    let skip: HashSet<String> = existing
+        .iter()
+        .filter_map(|j| j.metadata.name.clone())
+        .filter(|n| !reaped.contains(n))
+        .collect();
+    let spawned = spawn_for_each(&jobs_api, &intents, &skip, "p", |i| {
+        Ok(Job {
+            metadata: ObjectMeta {
+                name: Some(format!("rio-builder-p-{}", i.intent_id)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    })
+    .await;
+    assert_eq!(spawned, 2, "spawn fires post-reap (skip-set empty)");
+    guard.verified().await;
+}
+
+/// `spawn_for_each` skips intents whose Job name is already in the
+/// existing-names set: no `create()` issued → no per-tick 409 churn
+/// for steady-state Running Jobs. The verifier's strict scenario
+/// sequence proves exactly ONE POST goes out (for the new intent).
+#[tokio::test]
+async fn spawn_for_each_skips_existing_names() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let intents = vec![
+        SpawnIntent {
+            intent_id: "exists".into(),
+            ..Default::default()
+        },
+        SpawnIntent {
+            intent_id: "fresh".into(),
+            ..Default::default()
+        },
+    ];
+    let skip = HashSet::from(["rio-builder-p-exists".to_owned()]);
+
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::POST,
+        path_contains: "/namespaces/rio/jobs",
+        body_contains: Some(r#""name":"rio-builder-p-fresh""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+
+    let spawned = spawn_for_each(&jobs_api, &intents, &skip, "p", |i| {
+        Ok(Job {
+            metadata: ObjectMeta {
+                name: Some(format!("rio-builder-p-{}", i.intent_id)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    })
+    .await;
+    assert_eq!(spawned, 1, "existing skipped; only fresh spawned");
     guard.verified().await;
 }
 
