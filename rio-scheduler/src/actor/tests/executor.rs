@@ -938,7 +938,7 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    // NO debug_seed_sched_hint: est_deadline_secs stays None, floor=0.
+    // NO debug_seed_sched_hint: last_intent stays None, floor=0.
 
     for n in 1..=2u32 {
         let ok = handle.debug_force_assign(drv_hash, "cs-w").await?;

@@ -1655,7 +1655,7 @@ async fn work_assignment_carries_sla_cores() {
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
     let expected_cores = {
         let state = actor.dag.node("fitted").unwrap();
-        actor.solve_intent_for(Some("test-pkg"), state).0
+        actor.solve_intent_for(state).cores
     };
     actor.push_ready("fitted".to_string().into());
 
@@ -1666,12 +1666,19 @@ async fn work_assignment_carries_sla_cores() {
     assert_eq!(
         assignment.assigned_cores,
         Some(expected_cores),
-        "SLA mode: WorkAssignment.assigned_cores == solve_intent_for().0"
+        "SLA mode: WorkAssignment.assigned_cores == solve_intent_for().cores"
     );
     assert_eq!(
-        actor.dag.node("fitted").unwrap().sched.est_cores,
+        actor
+            .dag
+            .node("fitted")
+            .unwrap()
+            .sched
+            .last_intent
+            .as_ref()
+            .map(|i| i.cores),
         Some(expected_cores),
-        "est_cores persisted on state for build_assignment_proto"
+        "last_intent.cores persisted on state for build_assignment_proto"
     );
 }
 

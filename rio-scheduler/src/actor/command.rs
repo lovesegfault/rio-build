@@ -22,8 +22,8 @@ pub struct HeartbeatPayload {
     pub executor_id: ExecutorId,
     /// Systems this worker can build for. Usually single-element
     /// but multi-arch workers (e.g., qemu-user-static) declare
-    /// multiple. can_build() any-matches against the derivation's
-    /// target. Empty vec is rejected at the gRPC layer
+    /// multiple. `rejection_reason` any-matches against the
+    /// derivation's target. Empty vec is rejected at the gRPC layer
     /// (handle_heartbeat treats empty systems as "not registered").
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
@@ -446,9 +446,9 @@ pub enum DebugCmd {
         n: u32,
         reply: oneshot::Sender<bool>,
     },
-    /// Seed `state.sched.est_*` and/or `resource_floor` for D4 floor
-    /// tests — fixtures without `[sla]` skip `solve_intent_for` so the
-    /// doubling base would otherwise be zero.
+    /// Seed `state.sched.last_intent` and/or `resource_floor` for D4
+    /// floor tests. Per-field `Option` (builder-style); any `Some`
+    /// field materializes a `last_intent`.
     SeedSchedHint {
         drv_hash: String,
         est_memory_bytes: Option<u64>,

@@ -1228,13 +1228,16 @@ impl DagActor {
         // prior run's failures. Only newly_inserted: nodes already in
         // memory have a floor ≥ DB (recovery loaded it; any promotion
         // since then wrote both in-mem and DB), so overwriting would
-        // downgrade. `ResourceFloor::max` only RAISES so a stale DB
+        // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
                 if newly_inserted.contains(hash.as_str()) {
-                    state.sched.resource_floor = state.sched.resource_floor.max(*floor);
+                    let f = &mut state.sched.resource_floor;
+                    f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
+                    f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
+                    f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
                 }
             }
         }

@@ -44,24 +44,18 @@ use crate::state::{BuildInfo, DerivationState, DrvHash};
 /// the first completion.
 pub const DEFAULT_DURATION_SECS: f64 = 60.0;
 
-/// Build the SLA [`ModelKey`] for `state`, using the same tenant
-/// attribution as `solve_intent_for` / `write_build_sample` — first
-/// interested build's `tenant_id`, stringified, `""` on none. The two
-/// MUST agree or the cache key never matches the rows that fed it.
-/// `None` when `pname` is absent (raw/FOD derivation) — nothing to key on.
+/// Build the SLA [`ModelKey`] for `state` via
+/// [`DerivationState::attributed_tenant`] (shared with
+/// `solve_intent_for` / `write_build_sample`). `None` when `pname` is
+/// absent (raw/FOD derivation) — nothing to key on.
 fn model_key_for(state: &DerivationState, builds: &HashMap<Uuid, BuildInfo>) -> Option<ModelKey> {
-    let pname = state.pname.as_ref()?;
-    let tenant = state
-        .interested_builds
-        .iter()
-        .filter_map(|id| builds.get(id)?.tenant_id)
-        .next()
-        .map(|u| u.to_string())
-        .unwrap_or_default();
     Some(ModelKey {
-        pname: pname.clone(),
+        pname: state.pname.as_ref()?.clone(),
         system: state.system.clone(),
-        tenant,
+        tenant: state
+            .attributed_tenant(builds)
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
     })
 }
 

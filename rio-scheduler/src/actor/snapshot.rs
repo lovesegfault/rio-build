@@ -5,10 +5,9 @@
 
 use std::collections::HashMap;
 
-use rio_proto::types::ExecutorKind;
 use uuid::Uuid;
 
-use crate::state::{BuildState, DerivationStatus};
+use crate::state::{BuildState, DerivationStatus, SolvedIntent};
 
 use super::{
     AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
@@ -197,11 +196,7 @@ impl DagActor {
             // pool asked).
             *queued_by_system.entry(state.system.clone()).or_default() += 1;
 
-            let kind = if state.is_fixed_output {
-                ExecutorKind::Fetcher
-            } else {
-                ExecutorKind::Builder
-            };
+            let kind = crate::state::kind_for_drv(state.is_fixed_output);
             // r[impl sched.admin.spawn-intents.feature-filter]
             // ── request filter ────────────────────────────────────
             // kind: Unknown (None) = unfiltered. Otherwise must match
@@ -243,14 +238,13 @@ impl DagActor {
             // intent→drv map to keep in sync; if the drv leaves Ready
             // before the pod heartbeats, the match misses and dispatch
             // falls through to pick-from-queue.
-            let (cores, mem_bytes, disk_bytes, deadline_secs, _, node_selector) =
-                self.solve_intent_for(state.pname.as_deref(), state);
+            let intent = self.solve_intent_for(state);
             // ADR-023 §2.8: arm the Pending-watch the FIRST time a
             // band-targeted selector is emitted for this drv.
             // or_insert keeps the original timestamp across re-emits
             // (snapshot runs each tick). Band-agnostic intents don't
             // enter the ladder.
-            if let Some((band, cap)) = crate::sla::cost::parse_selector(&node_selector) {
+            if let Some((band, cap)) = crate::sla::cost::parse_selector(&intent.node_selector) {
                 self.pending_intents.entry(drv_hash.into()).or_insert((
                     band,
                     cap,
@@ -259,14 +253,14 @@ impl DagActor {
             }
             intents.push(rio_proto::types::SpawnIntent {
                 intent_id: drv_hash.to_string(),
-                cores,
-                mem_bytes,
-                disk_bytes,
-                node_selector: node_selector.into_iter().collect(),
+                cores: intent.cores,
+                mem_bytes: intent.mem_bytes,
+                disk_bytes: intent.disk_bytes,
+                node_selector: intent.node_selector.into_iter().collect(),
                 kind: kind.into(),
                 system: state.system.clone(),
                 required_features: state.required_features.clone(),
-                deadline_secs,
+                deadline_secs: intent.deadline_secs,
             });
         }
 
@@ -276,11 +270,10 @@ impl DagActor {
         }
     }
 
-    /// `(cores, mem, disk, predicted, node_selector)` for one queued
-    /// derivation via the SLA estimator. Shared between
-    /// [`Self::compute_spawn_intents`] (SpawnIntent population) and
-    /// dispatch's resource-fit filter so the controller spawns and the
-    /// scheduler accepts the SAME shape.
+    /// [`SolvedIntent`] for one queued derivation via the SLA estimator.
+    /// Shared between [`Self::compute_spawn_intents`] (SpawnIntent
+    /// population) and dispatch's resource-fit filter so the controller
+    /// spawns and the scheduler accepts the SAME shape.
     ///
     /// When `[sla].hw_cost_source` is set AND the hw-factor table is
     /// populated, the fitted-key branch routes through
@@ -290,37 +283,16 @@ impl DagActor {
     /// override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (band-agnostic `solve_mvp`) and returns
     /// an empty selector.
-    ///
-    /// `pname` is taken separately so the dispatch caller can pass the
-    /// borrow it already holds.
-    pub(crate) fn solve_intent_for(
-        &self,
-        pname: Option<&str>,
-        state: &crate::state::DerivationState,
-    ) -> (
-        u32,
-        u64,
-        u64,
-        u32,
-        Option<crate::sla::solve::SlaPrediction>,
-        std::collections::BTreeMap<String, String>,
-    ) {
+    pub(crate) fn solve_intent_for(&self, state: &crate::state::DerivationState) -> SolvedIntent {
         use crate::sla::{
             quantile, solve,
             types::{ModelKey, RawCores},
         };
-        // Tenant: same attribution as completion.rs's write_build_sample
-        // — first interested build's tenant_id, stringified, "" on
-        // None. The two MUST agree or the cache key never matches the
-        // rows that fed it.
         let tenant = state
-            .interested_builds
-            .iter()
-            .filter_map(|id| self.builds.get(id)?.tenant_id)
-            .next()
+            .attributed_tenant(&self.builds)
             .map(|u| u.to_string())
             .unwrap_or_default();
-        let key = pname.map(|p| ModelKey {
+        let key = state.pname.as_deref().map(|p| ModelKey {
             pname: p.to_string(),
             system: state.system.clone(),
             tenant,
@@ -444,7 +416,14 @@ impl DagActor {
                 tier_p90,
             }
         });
-        (cores, mem, disk, deadline_secs, predicted, node_selector)
+        SolvedIntent {
+            cores,
+            mem_bytes: mem,
+            disk_bytes: disk,
+            deadline_secs,
+            predicted,
+            node_selector,
+        }
     }
 
     pub(super) fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {

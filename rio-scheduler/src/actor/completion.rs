@@ -166,15 +166,8 @@ impl DagActor {
         if state.output_paths.is_empty() {
             return;
         }
-        // tenant_id: Option<Uuid> — filter_map drops None
-        // (single-tenant mode; empty SSH-key comment → gateway sends
-        // "" → scheduler stores None). Only builds with a resolved
-        // tenant contribute.
-        let tenant_ids: Vec<Uuid> = state
-            .interested_builds
-            .iter()
-            .filter_map(|id| self.builds.get(id)?.tenant_id)
-            .collect();
+        // Only builds with a resolved tenant contribute.
+        let tenant_ids: Vec<Uuid> = state.attributed_tenants(&self.builds).collect();
         if tenant_ids.is_empty() {
             return;
         }
@@ -1397,14 +1390,18 @@ impl DagActor {
                         warn!(?e, %pname, system = %state.system, "write_build_sample failed");
                     }
                     // ADR-023 phase-7: actual-vs-predicted scoring.
-                    // `sla_predicted` was snapshotted at dispatch time
-                    // (the SAME `solve_intent_for` call that produced
-                    // `est_memory_bytes`), so the ratio reflects the
-                    // curve we sized against, not whatever the
-                    // estimator has refit to since. None on cold-
-                    // start / FOD / recovery — the histogram only
-                    // sees model-backed dispatches.
-                    if let Some(pred) = &state.sched.sla_predicted {
+                    // `last_intent.predicted` was snapshotted at
+                    // dispatch time, so the ratio reflects the curve
+                    // we sized against, not whatever the estimator
+                    // has refit to since. None on cold-start /
+                    // recovery — the histogram only sees model-backed
+                    // dispatches.
+                    if let Some(pred) = state
+                        .sched
+                        .last_intent
+                        .as_ref()
+                        .and_then(|i| i.predicted.as_ref())
+                    {
                         let score = crate::sla::metrics::score_completion(
                             duration_secs,
                             peak_memory_bytes,
@@ -1688,9 +1685,7 @@ impl DagActor {
         // on both builders never tripped it — fetchers aren't in
         // failed_builders. The kind-aware predicate is shared with the
         // dispatch-time check.
-        let is_fod = self.dag.node(drv_hash).is_some_and(|s| s.is_fixed_output);
-        let reached_poison =
-            reached_poison || self.failed_builders_exhausts_fleet(drv_hash, is_fod);
+        let reached_poison = reached_poison || self.failed_builders_exhausts_fleet(drv_hash);
 
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
             // r[impl sched.retry.promotion-exempt+2]

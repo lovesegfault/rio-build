@@ -86,7 +86,7 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     {
         return Some("intent-reserved");
     }
-    // can_build()'s two checks, separated.
+    // System: any-match (multi-arch executor); features: all-match.
     if !w.systems.iter().any(|s| s == &drv.system) {
         return Some("system-mismatch");
     }
@@ -100,10 +100,10 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     if drv.retry.failed_builders.contains(&w.executor_id) {
         return Some("failed-on");
     }
-    if let Some(est) = drv.sched.est_memory_bytes
+    if let Some(intent) = &drv.sched.last_intent
         && let Some(r) = &w.last_resources
         && r.memory_total_bytes != 0
-        && r.memory_total_bytes < est
+        && r.memory_total_bytes < intent.mem_bytes
     {
         return Some("resource-fit");
     }
@@ -130,8 +130,8 @@ fn hard_filter(w: &ExecutorState, drv: &DerivationState) -> bool {
 
 /// Select the best worker for a derivation.
 ///
-/// Hard filter first (has_capacity, can_build, resource-fit), then
-/// score the survivors, return the lowest. `None` if nobody passes the
+/// Hard filter first (kind, capacity, system/feature, resource-fit),
+/// then score the survivors, return the lowest. `None` if nobody passes
 /// filter — caller defers the derivation.
 pub fn best_executor(
     workers: &HashMap<ExecutorId, ExecutorState>,
@@ -222,6 +222,7 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SolvedIntent;
     use rio_test_support::fixtures::make_derivation_node;
 
     fn make_worker(id: &str, running: u32) -> ExecutorState {
@@ -433,13 +434,16 @@ mod tests {
             ..Default::default()
         });
         let mut big_drv = make_drv();
-        big_drv.sched.est_memory_bytes = Some(8 << 30);
+        big_drv.sched.last_intent = Some(SolvedIntent {
+            mem_bytes: 8 << 30,
+            ..Default::default()
+        });
         assert_eq!(rejection_reason(&tight, &big_drv), Some("resource-fit"));
 
         // hard_filter == rejection_reason.is_none() for every case
         // above. Spot-check one of each polarity.
         assert!(!hard_filter(&busy, &drv));
-        assert!(hard_filter(&tight, &drv)); // est=None → fits
+        assert!(hard_filter(&tight, &drv)); // last_intent=None → fits
     }
 
     #[test]
@@ -540,7 +544,7 @@ mod tests {
     }
 
     // r[verify sched.assign.resource-fit]
-    // ADR-020 §5: worker.memory_total_bytes >= drv.sched.est_memory_bytes
+    // ADR-020 §5: worker.memory_total_bytes >= last_intent.mem_bytes
     // as a hard filter. Uses `hard_filter` directly (not
     // `best_executor`) to isolate the resource-fit arm from the
     // warm-gate — the filter's pass/fail is what's under test.
@@ -549,7 +553,7 @@ mod tests {
         const GIB: u64 = 1 << 30;
 
         // Plan T3 case matrix. Worker memory via last_resources;
-        // drv estimate via est_memory_bytes.
+        // drv estimate via last_intent.mem_bytes.
         let mk_worker = |mem_total: u64| {
             let mut w = make_worker("w", 0);
             w.last_resources = Some(rio_proto::types::ResourceUsage {
@@ -560,7 +564,10 @@ mod tests {
         };
         let mk_drv = |est: Option<u64>| {
             let mut d = make_drv();
-            d.sched.est_memory_bytes = est;
+            d.sched.last_intent = est.map(|m| SolvedIntent {
+                mem_bytes: m,
+                ..Default::default()
+            });
             d
         };
 
@@ -612,7 +619,10 @@ mod tests {
         let w = make_worker("fresh", 0); // last_resources defaults to None
         assert!(w.last_resources.is_none(), "precondition: no resources");
         let mut d = make_drv();
-        d.sched.est_memory_bytes = Some(128 << 30); // 128Gi
+        d.sched.last_intent = Some(SolvedIntent {
+            mem_bytes: 128 << 30, // 128Gi
+            ..Default::default()
+        });
 
         assert!(
             hard_filter(&w, &d),

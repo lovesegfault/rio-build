@@ -73,14 +73,22 @@ impl DagActor {
                 reply,
             } => {
                 let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
-                    if let Some(v) = est_memory_bytes {
-                        s.sched.est_memory_bytes = Some(v);
-                    }
-                    if let Some(v) = est_disk_bytes {
-                        s.sched.est_disk_bytes = Some(v);
-                    }
-                    if let Some(v) = est_deadline_secs {
-                        s.sched.est_deadline_secs = Some(v);
+                    // Builder-style: any seeded field materializes a
+                    // last_intent (other dimensions zero).
+                    if est_memory_bytes.is_some()
+                        || est_disk_bytes.is_some()
+                        || est_deadline_secs.is_some()
+                    {
+                        let i = s.sched.last_intent.get_or_insert_with(Default::default);
+                        if let Some(v) = est_memory_bytes {
+                            i.mem_bytes = v;
+                        }
+                        if let Some(v) = est_disk_bytes {
+                            i.disk_bytes = v;
+                        }
+                        if let Some(v) = est_deadline_secs {
+                            i.deadline_secs = v;
+                        }
                     }
                     if let Some(f) = floor {
                         s.sched.resource_floor = f;

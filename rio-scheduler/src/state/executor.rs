@@ -12,6 +12,17 @@ use rio_proto::types::ExecutorKind;
 
 use super::{DrvHash, ExecutorId};
 
+/// FOD ⇔ Fetcher airgap boundary (ADR-019). Every site that derives
+/// `ExecutorKind` from a derivation's `is_fixed_output` goes through
+/// this so adding a third kind doesn't miss one.
+pub fn kind_for_drv(is_fixed_output: bool) -> ExecutorKind {
+    if is_fixed_output {
+        ExecutorKind::Fetcher
+    } else {
+        ExecutorKind::Builder
+    }
+}
+
 /// In-memory state for a connected executor.
 #[derive(Debug)]
 pub struct ExecutorState {
@@ -27,8 +38,8 @@ pub struct ExecutorState {
     pub kind: ExecutorKind,
     /// Target systems (e.g., ["x86_64-linux", "aarch64-linux"] for
     /// a multi-arch executor). Populated on first heartbeat. Empty
-    /// vec = no heartbeat yet (not registered). can_build() does
-    /// any-match against the derivation's singular target system.
+    /// vec = no heartbeat yet (not registered). `rejection_reason`
+    /// any-matches against the derivation's singular target system.
     pub systems: Vec<String>,
     /// Features this executor supports.
     pub supported_features: Vec<String>,
@@ -226,28 +237,6 @@ impl ExecutorState {
     pub fn is_draining(&self) -> bool {
         self.draining || self.draining_hb
     }
-
-    /// Whether this executor can build the given derivation based on
-    /// system and features. The derivation has a SINGLE target
-    /// system; the executor may support multiple (any-match). All
-    /// required features must be present (all-match).
-    pub fn can_build(&self, system: &str, required_features: &[String]) -> bool {
-        if !self.is_registered() {
-            return false;
-        }
-        // Derivation's target system must be among the executor's
-        // supported systems. iter().any() — a multi-arch executor
-        // can build either arch.
-        if !self.systems.iter().any(|s| s == system) {
-            return false;
-        }
-        // All required features must be present on the executor.
-        // iter().all() — a derivation needing [kvm, big-parallel]
-        // needs BOTH; an executor with just [kvm] can't build it.
-        required_features
-            .iter()
-            .all(|f| self.supported_features.contains(f))
-    }
 }
 
 /// Retry policy configuration.
@@ -391,36 +380,6 @@ mod tests {
         w
     }
 
-    /// Multi-arch executor: any-match on system. A executor declaring
-    /// both archs can build derivations for either.
-    #[test]
-    fn can_build_multi_system_any_match() {
-        let w = registered_executor(vec!["x86_64-linux", "aarch64-linux"], vec![]);
-        assert!(w.can_build("x86_64-linux", &[]));
-        assert!(w.can_build("aarch64-linux", &[]));
-        assert!(
-            !w.can_build("riscv64-linux", &[]),
-            "not in executor's systems"
-        );
-    }
-
-    /// Features: all-match. Derivation needing [kvm, big-parallel]
-    /// dispatches only to executors with BOTH. This test proves the
-    /// scheduler side correctly honors features when they flow
-    /// through from the executor heartbeat.
-    #[test]
-    fn can_build_features_all_match() {
-        let w = registered_executor(vec!["x86_64-linux"], vec!["kvm", "big-parallel"]);
-        assert!(w.can_build("x86_64-linux", &["kvm".into()]));
-        assert!(w.can_build("x86_64-linux", &["kvm".into(), "big-parallel".into()]));
-        assert!(
-            !w.can_build("x86_64-linux", &["kvm".into(), "nixos-test".into()]),
-            "executor missing one required feature → can't build"
-        );
-        // Executor with features can still build featureless derivs.
-        assert!(w.can_build("x86_64-linux", &[]));
-    }
-
     /// store_degraded gates has_capacity() regardless of running state.
     /// Set every OTHER capacity input favorably (not draining, fully
     /// registered, running empty) so the only reason has_capacity can
@@ -460,13 +419,12 @@ mod tests {
     /// executor (no systems to build for) from being treated as a
     /// wildcard.
     #[test]
-    fn can_build_empty_systems_not_registered() {
+    fn empty_systems_not_registered() {
         let mut w = ExecutorState::new("test".into());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         w.stream_tx = Some(tx);
         // systems still empty
         assert!(!w.is_registered(), "stream but no systems → not ready");
-        assert!(!w.can_build("x86_64-linux", &[]));
     }
 
     #[test]

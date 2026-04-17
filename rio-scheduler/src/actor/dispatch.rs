@@ -40,18 +40,6 @@ struct DispatchTickCtx {
     n_assigned: u64,
 }
 
-/// Result of [`DagActor::try_dispatch_one`]. Only the outer drain
-/// loop's `dispatched_any` flag depends on this — all other
-/// accumulators are mutated through [`DispatchTickCtx`].
-enum DispatchOutcome {
-    /// Assigned to a worker, or short-circuited a Ready FOD from
-    /// store. Triggers another drain cycle.
-    Progressed,
-    /// Stale entry / backoff / deferred / poisoned. May have pushed
-    /// into `ctx.deferred`.
-    NoProgress,
-}
-
 /// I-025 freeze detector: state machine that WARNs when derivations are
 /// queued but zero streams of the matching kind exist for >60s.
 ///
@@ -183,10 +171,7 @@ impl DagActor {
 
             while let Some(drv_hash) = self.ready_queue.pop() {
                 n_popped += 1;
-                if matches!(
-                    self.try_dispatch_one(drv_hash, &mut ctx).await,
-                    DispatchOutcome::Progressed
-                ) {
+                if self.try_dispatch_one(drv_hash, &mut ctx).await {
                     dispatched_any = true;
                 }
             }
@@ -219,19 +204,16 @@ impl DagActor {
     /// One iteration of the dispatch drain loop: stale guards, backoff
     /// check, SLA solve, store short-circuit, executor placement,
     /// assign or defer or poison. Mutates `ctx` for deferral/count
-    /// accumulators; returns whether progress was made (drives the
-    /// outer `dispatched_any` cycle).
-    async fn try_dispatch_one(
-        &mut self,
-        drv_hash: DrvHash,
-        ctx: &mut DispatchTickCtx,
-    ) -> DispatchOutcome {
+    /// accumulators; returns `true` if progress was made (assigned, or
+    /// short-circuited a Ready FOD from store) — drives the outer
+    /// `dispatched_any` cycle.
+    async fn try_dispatch_one(&mut self, drv_hash: DrvHash, ctx: &mut DispatchTickCtx) -> bool {
         // Stale-entry guards: drop if not in DAG or not Ready.
         let Some(state) = self.dag.node(&drv_hash) else {
-            return DispatchOutcome::NoProgress;
+            return false;
         };
         if state.status() != DerivationStatus::Ready {
-            return DispatchOutcome::NoProgress;
+            return false;
         }
         // Retry backoff: if set and not yet elapsed, defer.
         // The derivation stays Ready + in queue (re-pushed
@@ -244,7 +226,7 @@ impl DagActor {
             && Instant::now() < deadline
         {
             ctx.deferred.push(drv_hash);
-            return DispatchOutcome::NoProgress;
+            return false;
         }
 
         // SLA-solved (cores, mem, disk, deadline) for the resource-fit
@@ -254,50 +236,21 @@ impl DagActor {
         // through the identical pipeline — the `hard_filter` kind gate
         // routes them to fetchers.
         //
-        // `is_fixed_output` is captured into a local so the `state`
+        // `want_kind`/`system` captured into locals so the `state`
         // borrow ends here — `node_mut` below needs exclusive access
         // to `self.dag`.
-        let (
-            est_cores,
-            est_memory_bytes,
-            est_disk_bytes,
-            est_deadline_secs,
-            sla_predicted,
-            is_fixed_output,
-            system,
-        ) = {
-            let pname = state.pname.as_deref();
-            let (cores, mem, disk, deadline, pred, _) = self.solve_intent_for(pname, state);
-            (
-                Some(cores),
-                Some(mem),
-                Some(disk),
-                Some(deadline),
-                pred,
-                state.is_fixed_output,
-                state.system.clone(),
-            )
-        };
+        let intent = self.solve_intent_for(state);
+        let want_kind = crate::state::kind_for_drv(state.is_fixed_output);
+        let system = state.system.clone();
 
-        // Write the estimate onto the state BEFORE placement
-        // so `hard_filter` (via find_executor → best_executor)
-        // reads the fresh value. Refreshed each dispatch pass —
-        // picks up estimator Tick updates.
+        // Write the intent onto the state BEFORE placement so
+        // `hard_filter` (via find_executor → best_executor) reads the
+        // fresh value. Refreshed each dispatch pass — picks up
+        // estimator Tick updates. ADR-023 phase-7: completion scores
+        // actual-vs-predicted on the curve captured here, not whatever
+        // the estimator has refit to since.
         if let Some(state) = self.dag.node_mut(&drv_hash) {
-            state.sched.est_cores = est_cores;
-            state.sched.est_memory_bytes = est_memory_bytes;
-            // D4: `bump_floor_or_count` reads est_{disk,deadline} as
-            // `last_intent` for the doubling base.
-            state.sched.est_disk_bytes = est_disk_bytes;
-            // D7: same `solve_intent_for` value the snapshot stamps
-            // onto SpawnIntent.deadline_secs (was P3's stopgap
-            // `wall_secs as u32`; now the floor-clamped 5×p99).
-            state.sched.est_deadline_secs = est_deadline_secs;
-            // ADR-023 phase-7: capture the dispatch-time prediction so
-            // completion can score actual-vs-predicted on the SAME
-            // curve we sized against (the estimator may have refit by
-            // then).
-            state.sched.sla_predicted = sla_predicted;
+            state.sched.last_intent = Some(intent);
         }
 
         // I-067: a Ready FOD whose output already exists in
@@ -317,7 +270,7 @@ impl DagActor {
         // nodes (Ready AFTER the batch ran) hit the per-drv path.
         // Best-effort: store unreachable → dispatch as before.
         if !ctx.batch_checked.contains(&drv_hash) && self.ready_check_or_spawn(&drv_hash).await {
-            return DispatchOutcome::Progressed;
+            return true;
         }
 
         // Intent-match (worker spawned FOR this drv) first, else
@@ -326,14 +279,14 @@ impl DagActor {
             Some(executor_id) => {
                 if self.assign_to_worker(&drv_hash, &executor_id).await {
                     ctx.n_assigned += 1;
-                    DispatchOutcome::Progressed
+                    true
                 } else {
                     // Assignment send failed (worker stream full or
                     // disconnected). Defer — retrying immediately in
                     // the same pass would spin: the channel won't
                     // drain until we yield to the runtime.
                     ctx.deferred.push(drv_hash);
-                    DispatchOutcome::NoProgress
+                    false
                 }
             }
             None => {
@@ -352,21 +305,16 @@ impl DagActor {
                 // worker replacement: failed_builders may hold
                 // stale IDs that don't count against the
                 // current fleet.
-                if self.failed_builders_exhausts_fleet(&drv_hash, is_fixed_output) {
+                if self.failed_builders_exhausts_fleet(&drv_hash) {
                     self.poison_and_cascade(&drv_hash).await;
-                    return DispatchOutcome::NoProgress;
+                    return false;
                 }
-                let want_kind = if is_fixed_output {
-                    rio_proto::types::ExecutorKind::Fetcher
-                } else {
-                    rio_proto::types::ExecutorKind::Builder
-                };
                 // I-056: distinguish "no capacity right now" (defer,
                 // autoscaler handles it) from "no pool advertises this
                 // system at all" (operator action — add the pool or
                 // its `systems` entry). The latter sat silently Ready
                 // for hours; surface it via gauge + a one-shot WARN.
-                if !self.any_executor_advertises_system(&system, is_fixed_output) {
+                if !self.any_executor_advertises_system(&system, want_kind) {
                     *ctx.unroutable_systems.entry(system).or_insert(0) += 1;
                 }
                 // Defer and track by kind.
@@ -401,7 +349,7 @@ impl DagActor {
                     }
                 }
                 ctx.deferred.push(drv_hash);
-                DispatchOutcome::NoProgress
+                false
             }
         }
     }
@@ -485,19 +433,18 @@ impl DagActor {
             .extend(unroutable_systems.into_keys());
     }
 
-    /// Any registered executor of the matching kind advertises
-    /// `system`. Ignores busy/warm — distinguishes "no capacity
-    /// right now" (transient, autoscaler handles it) from "no such
-    /// pool exists" (operator action; the I-056 silent-stuck case).
-    fn any_executor_advertises_system(&self, system: &str, is_fixed_output: bool) -> bool {
-        let want_kind = if is_fixed_output {
-            rio_proto::types::ExecutorKind::Fetcher
-        } else {
-            rio_proto::types::ExecutorKind::Builder
-        };
-        self.executors.values().any(|w| {
-            w.kind == want_kind && w.is_registered() && w.systems.iter().any(|s| s == system)
-        })
+    /// Any registered executor of `kind` advertises `system`. Ignores
+    /// busy/warm — distinguishes "no capacity right now" (transient,
+    /// autoscaler handles it) from "no such pool exists" (operator
+    /// action; the I-056 silent-stuck case).
+    fn any_executor_advertises_system(
+        &self,
+        system: &str,
+        kind: rio_proto::types::ExecutorKind,
+    ) -> bool {
+        self.executors
+            .values()
+            .any(|w| w.kind == kind && w.is_registered() && w.systems.iter().any(|s| s == system))
     }
 
     /// I-067: best-effort store check for a Ready IA derivation's
@@ -1020,22 +967,14 @@ impl DagActor {
     /// registered — that's "no workers connected", a transient that the
     /// freeze detector + autoscaler handle. Poisoning then would brick
     /// builds during a deployment rollout.
-    pub(super) fn failed_builders_exhausts_fleet(
-        &self,
-        drv_hash: &DrvHash,
-        is_fixed_output: bool,
-    ) -> bool {
+    pub(super) fn failed_builders_exhausts_fleet(&self, drv_hash: &DrvHash) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;
         };
         if state.retry.failed_builders.is_empty() {
             return false;
         }
-        let want_kind = if is_fixed_output {
-            rio_proto::types::ExecutorKind::Fetcher
-        } else {
-            rio_proto::types::ExecutorKind::Builder
-        };
+        let want_kind = crate::state::kind_for_drv(state.is_fixed_output);
         let mut fleet = self
             .executors
             .values()
@@ -1071,14 +1010,13 @@ impl DagActor {
         // spawned FOR this derivation (controller stamped the SpawnIntent
         // on its pod resources). Prefer it over best_executor — its
         // (cores, mem, disk) were sized by `solve_intent_for` for this
-        // exact drv. Re-check `can_build` (system/feature) so a pool
-        // misconfig doesn't bypass the airgap/feature gates; on miss
-        // (drv re-planned, scheduler restarted, intent stale) fall
-        // through to pick-from-queue.
+        // exact drv. Re-check `rejection_reason` (kind/system/feature/
+        // capacity) so a pool misconfig doesn't bypass the airgap/
+        // feature gates; on miss (drv re-planned, scheduler restarted,
+        // intent stale) fall through to pick-from-queue.
         if let Some(w) = self.executors.values().find(|w| {
             w.intent_id.as_deref() == Some(drv_hash.as_ref())
-                && w.has_capacity()
-                && w.can_build(&drv_state.system, &drv_state.required_features)
+                && crate::assignment::rejection_reason(w, drv_state).is_none()
         }) {
             return Some(w.executor_id.clone());
         }
@@ -1086,7 +1024,7 @@ impl DagActor {
         // D2: builds and FODs share this path. The kind boundary in
         // `hard_filter` (`r[sched.dispatch.fod-to-fetcher]`) routes
         // FODs to fetcher executors and non-FODs to builders; the
-        // resource-fit clause (fed by `est_memory_bytes` ←
+        // resource-fit clause (fed by `last_intent.mem_bytes` ←
         // `solve_intent_for` ← `resource_floor`) handles sizing.
         crate::assignment::best_executor(&self.executors, drv_state)
     }
@@ -1480,7 +1418,7 @@ impl DagActor {
             // makes resolve_build_opts override client `--cores N`, closing
             // the model-corruption vector where the build runs at N but
             // telemetry records cgroup limit.
-            assigned_cores: state.sched.est_cores,
+            assigned_cores: state.sched.last_intent.as_ref().map(|i| i.cores),
             assigned_mem_bytes: None,
             assigned_disk_bytes: None,
         })
@@ -1916,16 +1854,6 @@ impl DagActor {
     // [`crate::dag::DerivationDag`]; the helpers below stay on
     // `DagActor` because they cross-reference `self.builds`.
 
-    /// Whether any interested build for this derivation is interactive (IFD).
-    /// Interactive derivations get a priority boost in the queue.
-    fn should_prioritize(&self, drv_hash: &DrvHash) -> bool {
-        self.get_interested_builds(drv_hash).iter().any(|build_id| {
-            self.builds
-                .get(build_id)
-                .is_some_and(|b| b.priority_class.is_interactive())
-        })
-    }
-
     /// Compute the effective queue priority for a derivation: its
     /// critical-path priority + interactive boost if applicable.
     ///
@@ -1942,7 +1870,14 @@ impl DagActor {
             .node(drv_hash)
             .map(|n| n.sched.priority)
             .unwrap_or(0.0);
-        if self.should_prioritize(drv_hash) {
+        // Any interested build is interactive (IFD) → priority boost
+        // dwarfing any critical-path value.
+        let interactive = self.get_interested_builds(drv_hash).iter().any(|id| {
+            self.builds
+                .get(id)
+                .is_some_and(|b| b.priority_class.is_interactive())
+        });
+        if interactive {
             base + crate::queue::INTERACTIVE_BOOST
         } else {
             base

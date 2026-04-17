@@ -102,11 +102,11 @@ impl Candidate {
 }
 
 /// Dispatch-time prediction snapshot. Stored on
-/// [`SchedHint::sla_predicted`] when the derivation is dispatched so
+/// [`SchedHint::last_intent`] when the derivation is dispatched so
 /// completion can score actual-vs-predicted without re-reading the
 /// estimator (which may have refit on a different curve by then).
 ///
-/// [`SchedHint::sla_predicted`]: crate::state::SchedHint::sla_predicted
+/// [`SchedHint::last_intent`]: crate::state::SchedHint::last_intent
 #[derive(Debug, Clone, Default)]
 pub struct SlaPrediction {
     /// `T(c)` at the dispatched core count. `None` for cold-start /

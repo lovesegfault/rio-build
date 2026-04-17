@@ -41,11 +41,10 @@ pub struct FloorOutcome {
 /// resource-exhaustion signal, or — if already at the cap — increment
 /// the matching retry counter instead. See [`FloorOutcome`].
 ///
-/// `last_intent` (the doubling base) is `state.sched.est_*` —
-/// snapshotted at dispatch time alongside `est_memory_bytes`. The
-/// `max(floor, est)` form means a stale floor (lower than what was
-/// actually dispatched) doesn't under-double; if both are zero (cold
-/// start with the SLA gate skipped), the helper returns
+/// The doubling base is `state.sched.last_intent` — snapshotted at
+/// dispatch time. The `max(floor, last)` form means a stale floor
+/// (lower than what was actually dispatched) doesn't under-double; if
+/// both are zero (cold start, never dispatched), the helper returns
 /// `{promoted:false, counted:false}` — the caller MUST increment its
 /// own retry counter when `!counted` so cold-start is bounded (I-200:
 /// `if promoted` here looped forever).
@@ -61,6 +60,7 @@ pub fn bump_floor_or_count(
 ) -> FloorOutcome {
     use TerminationReason as R;
     let floor = &mut state.sched.resource_floor;
+    let last = state.sched.last_intent.as_ref();
     match reason {
         R::OomKilled => {
             if floor.mem_bytes >= ceil.max_mem {
@@ -70,9 +70,7 @@ pub fn bump_floor_or_count(
                     counted: true,
                 }
             } else {
-                let base = floor
-                    .mem_bytes
-                    .max(state.sched.est_memory_bytes.unwrap_or(0));
+                let base = floor.mem_bytes.max(last.map_or(0, |i| i.mem_bytes));
                 let next = base.saturating_mul(2).min(ceil.max_mem);
                 let changed = next > floor.mem_bytes;
                 floor.mem_bytes = next;
@@ -90,9 +88,7 @@ pub fn bump_floor_or_count(
                     counted: true,
                 }
             } else {
-                let base = floor
-                    .disk_bytes
-                    .max(state.sched.est_disk_bytes.unwrap_or(0));
+                let base = floor.disk_bytes.max(last.map_or(0, |i| i.disk_bytes));
                 let next = base.saturating_mul(2).min(ceil.max_disk);
                 let changed = next > floor.disk_bytes;
                 floor.disk_bytes = next;
@@ -110,9 +106,7 @@ pub fn bump_floor_or_count(
                     counted: true,
                 }
             } else {
-                let base = floor
-                    .deadline_secs
-                    .max(state.sched.est_deadline_secs.unwrap_or(0));
+                let base = floor.deadline_secs.max(last.map_or(0, |i| i.deadline_secs));
                 let next = base.saturating_mul(2).min(DEADLINE_CAP_SECS);
                 let changed = next > floor.deadline_secs;
                 floor.deadline_secs = next;
@@ -156,10 +150,19 @@ mod tests {
         DerivationState::from_recovery_row(row, crate::state::DerivationStatus::Ready).unwrap()
     }
 
+    fn intent(mem: u64, disk: u64, deadline: u32) -> crate::state::SolvedIntent {
+        crate::state::SolvedIntent {
+            mem_bytes: mem,
+            disk_bytes: disk,
+            deadline_secs: deadline,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn oom_doubles_from_est_then_floor() {
         let mut s = st();
-        s.sched.est_memory_bytes = Some(4 << 30);
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0));
         let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
         assert!(o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.mem_bytes, 8 << 30);
@@ -183,7 +186,7 @@ mod tests {
     #[test]
     fn deadline_uses_timeout_count_and_24h_cap() {
         let mut s = st();
-        s.sched.est_deadline_secs = Some(3600);
+        s.sched.last_intent = Some(intent(0, 0, 3600));
         let o = bump_floor_or_count(&mut s, TerminationReason::DeadlineExceeded, &CEIL);
         assert!(o.promoted && !o.counted);
         assert_eq!(s.sched.resource_floor.deadline_secs, 7200);
@@ -201,7 +204,7 @@ mod tests {
 
     #[test]
     fn cold_start_zero_base_is_noop_not_promote() {
-        // est=None, floor=0 → base=0 → next=0 → unchanged.
+        // last_intent=None, floor=0 → base=0 → next=0 → unchanged.
         // {promoted:false, counted:false} → caller's retry budget
         // bounds it instead of looping at floor=0.
         let mut s = st();
@@ -214,7 +217,7 @@ mod tests {
     #[test]
     fn non_resource_reasons_noop() {
         let mut s = st();
-        s.sched.est_memory_bytes = Some(4 << 30);
+        s.sched.last_intent = Some(intent(4 << 30, 0, 0));
         for r in [
             TerminationReason::Error,
             TerminationReason::Completed,

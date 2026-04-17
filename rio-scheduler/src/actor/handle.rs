@@ -299,9 +299,9 @@ impl ActorHandle {
         self.debug(|reply| DebugCmd::TripBreaker { n, reply }).await
     }
 
-    /// Seed `state.sched.est_*` for D4 floor tests — fixtures without
-    /// `[sla]` skip `solve_intent_for` so the doubling base is
-    /// otherwise zero. `None` fields are left unchanged.
+    /// Seed `state.sched.last_intent` for D4 floor tests. `None`
+    /// fields are left unchanged; any `Some` materializes a
+    /// `last_intent`.
     pub async fn debug_seed_sched_hint(
         &self,
         drv_hash: &str,

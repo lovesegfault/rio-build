@@ -407,17 +407,24 @@ pub struct ResourceFloor {
     pub deadline_secs: u32,
 }
 
-impl ResourceFloor {
-    /// Per-dimension max (only RAISES — a hydration source with a
-    /// lower value never demotes an in-memory floor already promoted
-    /// past it).
-    pub fn max(self, other: Self) -> Self {
-        Self {
-            mem_bytes: self.mem_bytes.max(other.mem_bytes),
-            disk_bytes: self.disk_bytes.max(other.disk_bytes),
-            deadline_secs: self.deadline_secs.max(other.deadline_secs),
-        }
-    }
+/// Output of `solve_intent_for`: per-derivation `(cores, mem, disk,
+/// deadline)` SpawnIntent shape + the dispatch-time SLA prediction
+/// snapshot + the cost-routed nodeSelector. Stored on
+/// [`SchedHint::last_intent`] at dispatch so `hard_filter` /
+/// `build_assignment_proto` / `bump_floor_or_count` /
+/// `record_build_sample` all read the SAME solve.
+#[derive(Debug, Clone, Default)]
+pub struct SolvedIntent {
+    pub cores: u32,
+    pub mem_bytes: u64,
+    pub disk_bytes: u64,
+    pub deadline_secs: u32,
+    /// `None` on cold-start / probe / forced-cores override — the
+    /// prediction-ratio histogram only sees model-backed dispatches.
+    pub predicted: Option<crate::sla::solve::SlaPrediction>,
+    /// `rio.build/hw-band` + `karpenter.sh/capacity-type` when
+    /// `solve_full` ran; empty for the band-agnostic path.
+    pub node_selector: std::collections::BTreeMap<String, String>,
 }
 
 /// Scheduling-hint sub-state of a [`DerivationState`].
@@ -430,40 +437,19 @@ impl ResourceFloor {
 pub struct SchedHint {
     /// D4: per-dimension reactive floor. See [`ResourceFloor`].
     pub resource_floor: ResourceFloor,
-    /// SLA-solved memory estimate for the resource-fit placement
-    /// filter. `hard_filter` checks `worker.memory_total_bytes >=
-    /// est`.
+    /// Dispatch-time `solve_intent_for` output. `hard_filter` reads
+    /// `mem_bytes` (resource-fit), `build_assignment_proto` reads
+    /// `cores` (`WorkAssignment.assigned_cores`), `bump_floor_or_count`
+    /// reads `mem/disk/deadline` as the doubling base,
+    /// `record_build_sample` reads `predicted` for actual-vs-predicted
+    /// scoring.
     ///
-    /// Populated at DISPATCH time (`dispatch_ready`, from
-    /// `solve_intent_for`), not merge time — the estimator refreshes
-    /// on Tick, so a long-queued derivation picks up fresh history.
-    /// `None` = filter treats it as "any worker fits".
-    pub est_memory_bytes: Option<u64>,
-    /// SLA-solved core count for this dispatch (same `solve_intent_for`
-    /// call as `est_memory_bytes`). `build_assignment_proto` forwards it
-    /// as `WorkAssignment.assigned_cores` so the builder's
-    /// `resolve_build_opts` overrides client `--cores N` with the value
-    /// the SpawnIntent actually requested. `None` = FOD / SLA off /
-    /// classes empty (same gate as `est_memory_bytes`). In-memory only.
-    pub est_cores: Option<u32>,
-    /// SLA-solved disk request for this dispatch (same `solve_intent_for`
-    /// call as `est_memory_bytes`). D4: `bump_floor_or_count` reads this
-    /// as `last_intent.disk` so the doubled floor starts from what was
-    /// actually requested, not zero. In-memory only.
-    pub est_disk_bytes: Option<u64>,
-    /// SLA-predicted wall time for this dispatch (from
-    /// `SlaPrediction.wall_secs`). D4: `bump_floor_or_count` reads this
-    /// as `last_intent.deadline` for the `DeadlineExceeded` doubling.
-    /// `None` on cold start / no fit — the helper falls back to floor
-    /// alone. In-memory only.
-    pub est_deadline_secs: Option<u32>,
-    /// ADR-023 phase-7: dispatch-time SLA prediction snapshot. Set
-    /// alongside `est_memory_bytes` (same `solve_intent_for` call);
-    /// `record_build_sample` reads it back to emit
-    /// `rio_scheduler_sla_prediction_ratio` / `_envelope_result_total`
-    /// without re-consulting the estimator (which may have refit on a
-    /// different curve by then). In-memory only — zero on recovery.
-    pub sla_predicted: Option<crate::sla::solve::SlaPrediction>,
+    /// Populated at DISPATCH time (`dispatch_ready`), not merge time —
+    /// the estimator refreshes on Tick, so a long-queued derivation
+    /// picks up fresh history. `None` = never dispatched (cold start /
+    /// recovery) — `hard_filter` treats it as "any worker fits".
+    /// In-memory only.
+    pub last_intent: Option<SolvedIntent>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;
     /// stale is fine (a build taking longer than estimated doesn't
@@ -779,6 +765,31 @@ impl DerivationState {
     /// Callers using `&str` auto-deref via `StorePath::Deref<Target=str>`.
     pub fn drv_path(&self) -> &rio_nix::store_path::StorePath {
         &self.drv_path
+    }
+
+    /// Tenant IDs of all interested builds. Base iterator for
+    /// [`Self::attributed_tenant`] (first) and the path-tenant upsert
+    /// (collect-all). `filter_map` drops `None` (single-tenant mode;
+    /// empty SSH-key comment → gateway sends "" → scheduler stores
+    /// `None`).
+    pub fn attributed_tenants<'a>(
+        &'a self,
+        builds: &'a std::collections::HashMap<Uuid, super::BuildInfo>,
+    ) -> impl Iterator<Item = Uuid> + 'a {
+        self.interested_builds
+            .iter()
+            .filter_map(|id| builds.get(id)?.tenant_id)
+    }
+
+    /// First interested build's tenant — the SLA model-key attribution
+    /// shared by `solve_intent_for` / `model_key_for` /
+    /// `write_build_sample` so the estimator's cache key matches the
+    /// rows that fed it.
+    pub fn attributed_tenant(
+        &self,
+        builds: &std::collections::HashMap<Uuid, super::BuildInfo>,
+    ) -> Option<Uuid> {
+        self.attributed_tenants(builds).next()
     }
 
     /// Attempt to transition to a new status. Returns the old status on success.
