@@ -22,15 +22,12 @@ pub(super) fn row_from_proto(o: &SlaOverride) -> Result<SlaOverrideRow, Status> 
         tenant: o.tenant.clone(),
         cluster: o.cluster.clone(),
         tier: o.tier.clone(),
-        p50_secs: o.p50_secs,
-        p90_secs: o.p90_secs,
-        p99_secs: o.p99_secs,
         cores: o.cores,
         mem_bytes: o.mem_bytes,
-        capacity_type: o.capacity_type.clone(),
         expires_at: o.expires_at_epoch,
         created_at: 0.0,
         created_by: o.created_by.clone(),
+        ..Default::default()
     })
 }
 
@@ -44,12 +41,8 @@ pub(super) fn row_to_proto(r: &SlaOverrideRow) -> SlaOverride {
         tenant: r.tenant.clone(),
         cluster: r.cluster.clone(),
         tier: r.tier.clone(),
-        p50_secs: r.p50_secs,
-        p90_secs: r.p90_secs,
-        p99_secs: r.p99_secs,
         cores: r.cores,
         mem_bytes: r.mem_bytes,
-        capacity_type: r.capacity_type.clone(),
         expires_at_epoch: r.expires_at,
         created_at_epoch: r.created_at,
         created_by: r.created_by.clone(),

@@ -144,8 +144,9 @@ pub struct DrvHints {
 /// two cannot diverge.
 ///
 /// - `prefer_local_build = Some(true)` → minimal (1 core), no learning.
-/// - `enable_parallel_building = Some(false)` → 1 core, probe mem/disk
-///   (the build is serial by declaration; exploring c is wasted).
+/// - `enable_parallel_building = Some(false)` → 1 core, fitted mem/disk
+///   (the build is serial by declaration; exploring c is wasted, but
+///   mem/disk still come from the per-key fit when available).
 /// - No fit / `n_eff < 3` / `span < 4 ∧ !frozen` → [`explore::next`]
 ///   drives the saturation-gated ×4/÷2 ladder from `cfg.probe`.
 /// - Otherwise → `solve_mvp` against `tiers` / `ceil`.
@@ -155,10 +156,9 @@ pub struct DrvHints {
 /// template).
 ///
 /// `override_` (from [`SlaEstimator::resolved_override`]) is consulted
-/// FIRST: `forced_cores`/`forced_mem` short-circuit the model entirely
-/// — the operator pinned this key, learning is suspended. A pin with
-/// only `tier`/`capacity` set falls through to the normal branch (the
-/// tier filter happens at solve, not here; phase-7 wires it).
+/// FIRST: `forced_cores` short-circuits the model entirely; `forced_mem`
+/// applies in any branch (with or without `forced_cores`). A `tier`
+/// override restricts the solve ladder to that tier.
 ///
 /// [`SpawnIntent`]: rio_proto::types::SpawnIntent
 /// [`SlaEstimator::resolved_override`]: super::SlaEstimator::resolved_override
@@ -189,11 +189,19 @@ pub fn intent_for(
             .map_or(ceil.default_disk, |d| d.0);
         return (cores, mem, disk);
     }
+    // Drv hints pin ONLY cores; mem/disk fall back to the fit when
+    // available. `resource_floor` is per-drv_hash, so a new version of
+    // a known disk-heavy serial pname must start at the observed p90,
+    // not re-climb the OOM/DiskPressure ladder from probe defaults.
+    let fit_disk = fit
+        .and_then(|f| f.disk_p90)
+        .map_or(ceil.default_disk, |d| d.0);
     if hints.prefer_local_build == Some(true) {
-        return (LOCAL_CORES, LOCAL_MEM_BYTES, ceil.default_disk);
+        return (LOCAL_CORES, LOCAL_MEM_BYTES, fit_disk);
     }
     if hints.enable_parallel_building == Some(false) {
-        return (1, probe_mem, ceil.default_disk);
+        let mem = fit.map(|f| f.mem.at(RawCores(1.0)).0).unwrap_or(probe_mem);
+        return (1, mem, fit_disk);
     }
     let fit = match fit {
         Some(f)
@@ -204,14 +212,27 @@ pub fn intent_for(
         _ => {
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
             let d = explore::next(fit, cfg, hints);
-            return ((d.c.0.ceil() as u32).max(1), d.mem.0, d.disk.0);
+            let mem = override_.and_then(|o| o.forced_mem).unwrap_or(d.mem.0);
+            return ((d.c.0.ceil() as u32).max(1), mem, d.disk.0);
         }
+    };
+    // tier override: solve against ONLY that tier's bounds. An unknown
+    // name yields an empty ladder → BestEffort (operator error surfaces
+    // via `sla explain`, not a silent fallback to the default ladder).
+    let pinned: Vec<Tier>;
+    let tiers = match override_.and_then(|o| o.tier.as_deref()) {
+        Some(name) => {
+            pinned = tiers.iter().filter(|t| t.name == name).cloned().collect();
+            &pinned
+        }
+        None => tiers,
     };
     let r = solve_mvp(fit, tiers, ceil);
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
     let cores = (r.cores().0.ceil() as u32).max(1);
-    (cores, r.mem().0, r.disk().0)
+    let mem = override_.and_then(|o| o.forced_mem).unwrap_or(r.mem().0);
+    (cores, mem, r.disk().0)
 }
 
 // r[impl sched.sla.tier-envelope]
@@ -236,7 +257,11 @@ pub fn solve_envelope(
         .filter_map(|(q, b)| b.map(|b| (q, b)))
         .collect();
     if bounds.is_empty() {
-        return Some(RawCores(c_lo)); // best-effort tier
+        // No-bounds tier: max useful cores. Returning `c_lo` (=1 in
+        // `solve_mvp`) made the post-loop `BestEffort` arm unreachable
+        // under helm-default `tiers=[..., {best-effort}]` and dispatched
+        // chromium-class builds at 1 core → 24h-deadline-loop.
+        return Some(RawCores(cap_c));
     }
     let feasible = |c: f64| -> bool {
         let t = fit.fit.t_at(RawCores(c)).0 / hw_factor;
@@ -310,16 +335,16 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
             node_selector: None,
         };
     }
-    let c = fit.fit.p_bar().0.min(ceil.max_cores);
-    // D4: clamp at `ceil.max_mem` — pre-existing gap; the BestEffort
-    // term `M(p̄) × headroom` could exceed the ceiling independent of
-    // the reactive floor. The Feasible arm above already gates on
-    // `mem > ceil.max_mem` (reject-not-clamp).
-    let mem = ((fit.mem.at(RawCores(c)).0 as f64 * h) as u64).min(ceil.max_mem);
+    // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
+    // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
+    // `solve_intent_for`'s floor.max() composes (a `disk_p90 > max_disk`
+    // here used to spawn a permanently-Pending pod). `cap_c` already
+    // includes `c_opt` so a USL fit isn't pushed into its slowdown region.
+    let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
-        c: RawCores(c),
+        c: RawCores(cap_c),
         mem: MemBytes(mem),
-        disk: DiskBytes(disk),
+        disk: DiskBytes(disk.min(ceil.max_disk)),
         node_selector: None,
     }
 }
@@ -424,16 +449,16 @@ pub fn solve_full(
             };
         }
     }
-    let c = fit.fit.p_bar().0.min(ceil.max_cores);
-    // D4: clamp at `ceil.max_mem` — pre-existing gap; the BestEffort
-    // term `M(p̄) × headroom` could exceed the ceiling independent of
-    // the reactive floor. The Feasible arm above already gates on
-    // `mem > ceil.max_mem` (reject-not-clamp).
-    let mem = ((fit.mem.at(RawCores(c)).0 as f64 * h) as u64).min(ceil.max_mem);
+    // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
+    // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
+    // `solve_intent_for`'s floor.max() composes. `cap_c` already
+    // includes `c_opt` so a USL fit isn't pushed into its slowdown
+    // region (e.g. p̄=∞ with c_opt=20 must NOT return 64).
+    let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
-        c: RawCores(c),
+        c: RawCores(cap_c),
         mem: MemBytes(mem),
-        disk: DiskBytes(disk),
+        disk: DiskBytes(disk.min(ceil.max_disk)),
         node_selector: None,
     }
 }
@@ -604,11 +629,27 @@ mod tests {
     }
     #[test]
     fn discriminant_negative_rejects_tier() {
+        // USL fit, q=5 → c_opt=√(2000/5)=20. Tier infeasible → BestEffort
+        // at cap_c=min(p̄,c_opt,max_cores)=20, NOT min(p̄,max_cores)=64
+        // (T(20)≈230s vs T(64)≈381s — past c_opt is slower AND wider).
         let fit = mk_fit(30.0, 2000.0, 5.0, f64::INFINITY, 0.1);
-        assert!(matches!(
-            solve_mvp(&fit, &[t("t0", 50.0)], &ceil()),
-            SolveResult::BestEffort { .. }
-        ));
+        let SolveResult::BestEffort { c, .. } = solve_mvp(&fit, &[t("t0", 50.0)], &ceil()) else {
+            panic!()
+        };
+        assert_eq!(c.0, 20.0, "BestEffort caps at c_opt, not max_cores");
+    }
+    #[test]
+    fn best_effort_clamps_disk_at_ceiling() {
+        // disk_p90 > max_disk: every tier rejects (disk gate) →
+        // BestEffort. Unclamped, this used to emit a 300Gi
+        // ephemeral-storage request → permanently-Pending pod.
+        let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(300 << 30)); // > ceil.max_disk=200Gi
+        let SolveResult::BestEffort { disk, .. } = solve_mvp(&fit, &[t("t0", 300.0)], &ceil())
+        else {
+            panic!()
+        };
+        assert_eq!(disk.0, 200 << 30, "clamped to ceil.max_disk");
     }
     // r[verify sched.sla.tier-envelope]
     #[test]
@@ -678,7 +719,10 @@ mod tests {
         assert!(solve_envelope(&fit, &t("x", 300.0), 1.0, 64.0, 1.0, 0.0).is_none());
     }
     #[test]
-    fn envelope_no_bounds_is_best_effort_floor() {
+    fn envelope_no_bounds_returns_cap_c() {
+        // No-bounds tier → max useful cores (cap_c), not c_lo. Under
+        // helm-default tiers=[fast,normal,slow,{best-effort}] a build
+        // infeasible at the bounded tiers must land at cap_c, not 1.
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let tier = Tier {
             name: "be".into(),
@@ -688,7 +732,13 @@ mod tests {
         };
         assert_eq!(
             solve_envelope(&fit, &tier, 1.0, 64.0, 1.0, 0.0).unwrap().0,
-            1.0
+            64.0
+        );
+        // USL fit: cap_c = c_opt = 20.
+        let usl = mk_fit(30.0, 2000.0, 5.0, f64::INFINITY, 0.1);
+        assert_eq!(
+            solve_envelope(&usl, &tier, 1.0, 20.0, 1.0, 0.0).unwrap().0,
+            20.0
         );
     }
 
@@ -750,43 +800,95 @@ mod tests {
         assert_eq!(c, 12);
     }
     #[test]
-    fn override_without_cores_falls_through() {
-        // tier-only override (no forced_cores) → normal solve path.
+    fn override_tier_filters_solve_ladder() {
+        // Against [fast(p90=300), slow(p90=1200)] this fit lands on
+        // fast at c≈9. With tier=slow pinned, fast is filtered out →
+        // c≈2. With tier=unknown → empty ladder → BestEffort at cap_c.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let tiers = [t("fast", 300.0), t("slow", 1200.0)];
+        let with = |tier: &str| {
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                Some(&ResolvedTarget {
+                    tier: Some(tier.into()),
+                    ..Default::default()
+                }),
+                &cfg(),
+                &tiers,
+                &ceil(),
+            )
+            .0
+        };
+        let unpinned = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            None,
+            &cfg(),
+            &tiers,
+            &ceil(),
+        )
+        .0;
+        assert_eq!(unpinned, 9);
+        assert_eq!(with("slow"), 2, "pinned tier=slow skips fast");
+        assert_eq!(with("fast"), 9);
+        assert_eq!(with("nope"), 64, "unknown tier → BestEffort cap_c");
+    }
+    #[test]
+    fn override_mem_applies_without_cores() {
+        // forced_mem alone: solve runs for cores, mem is forced.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let o = ResolvedTarget {
-            tier: Some("fast".into()),
+            forced_mem: Some(64 << 30),
             ..Default::default()
         };
-        assert_eq!(
-            intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil()).0,
-            4, // probe.cpu
+        let (c, m, _) = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            Some(&o),
+            &cfg(),
+            &[t("normal", 1200.0)],
+            &ceil(),
         );
+        assert_eq!(c, 2, "cores still solved");
+        assert_eq!(m, 64 << 30, "mem forced");
+        // Also applies on the explore path (no fit).
+        let (c, m, _) = intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil());
+        assert_eq!(c, 4, "probe.cpu");
+        assert_eq!(m, 64 << 30);
     }
 
     #[test]
     fn intent_for_prefer_local_is_minimal() {
-        let (c, m, _) = intent(
-            None,
-            &DrvHints {
-                prefer_local_build: Some(true),
-                ..Default::default()
-            },
-        );
-        assert_eq!(c, 1);
-        assert_eq!(m, LOCAL_MEM_BYTES);
+        let hints = DrvHints {
+            prefer_local_build: Some(true),
+            ..Default::default()
+        };
+        let (c, m, d) = intent(None, &hints);
+        assert_eq!((c, m, d), (1, LOCAL_MEM_BYTES, ceil().default_disk));
+        // With a fit: cores/mem stay minimal (semantic: trivial build),
+        // but disk follows disk_p90 — `resource_floor` is per-drv_hash
+        // so a fresh version would otherwise re-climb DiskPressure.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let (c, m, d) = intent(Some(&fit), &hints);
+        assert_eq!((c, m, d), (1, LOCAL_MEM_BYTES, 10 << 30));
     }
     #[test]
     fn intent_for_serial_pins_one_core() {
-        // enable_parallel_building=false beats a fitted curve.
+        // enable_parallel_building=false pins ONLY cores=1; mem/disk
+        // come from the fit (M(1), disk_p90), not probe defaults.
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
-        let (c, m, _) = intent(
-            Some(&fit),
-            &DrvHints {
-                enable_parallel_building: Some(false),
-                ..Default::default()
-            },
-        );
+        let hints = DrvHints {
+            enable_parallel_building: Some(false),
+            ..Default::default()
+        };
+        let (c, m, d) = intent(Some(&fit), &hints);
         assert_eq!(c, 1);
-        assert_eq!(m, 8 << 30); // fallback probe mem (no [sla])
+        assert_eq!(m, 2 << 30, "MemFit::Independent.p90, not probe_mem");
+        assert_eq!(d, 10 << 30, "fit.disk_p90, not default_disk");
+        // No fit → probe defaults.
+        let (c, m, d) = intent(None, &hints);
+        assert_eq!((c, m, d), (1, 8 << 30, ceil().default_disk));
     }
     #[test]
     fn intent_for_cold_start_is_probe() {

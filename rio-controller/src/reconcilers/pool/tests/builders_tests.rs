@@ -606,6 +606,7 @@ fn disruption_filter_false_or_absent_returns_none() {
     assert_eq!(disruption::is_disruption_target(&healthy), None);
 }
 
+// r[verify ctrl.pod.tgps-default]
 #[test]
 fn job_pod_termination_grace() {
     let wp = test_wp();
@@ -619,6 +620,27 @@ fn job_pod_termination_grace() {
         pod.automount_service_account_token,
         Some(false),
         "workers use gRPC, not K8s API — no SA token needed"
+    );
+    // The Job wrapper must NOT overwrite the pod-spec value: previously
+    // ephemeral_job stamped a flat 30s, making the CRD field +
+    // 7200/600 defaults dead.
+    let job = job::ephemeral_job(
+        "j".into(),
+        None,
+        crate::fixtures::oref(&wp),
+        Default::default(),
+        3600,
+        pod,
+    );
+    assert_eq!(
+        job.spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .termination_grace_period_seconds,
+        Some(7200),
+        "ephemeral_job preserves build_executor_pod_spec's TGPS"
     );
 }
 

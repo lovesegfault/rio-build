@@ -35,11 +35,15 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
         .find_map(|f| cfg.feature_probes.get(f))
         .unwrap_or(&cfg.probe);
     let mem_for = |c: f64| MemBytes((c * probe.mem_per_core as f64 + probe.mem_base as f64) as u64);
-    let disk = DiskBytes(cfg.default_disk);
 
     let Some(f) = fit else {
-        return decision(probe.cpu, mem_for, disk);
+        return decision(probe.cpu, mem_for, DiskBytes(cfg.default_disk));
     };
+    // Disk is core-independent (r[sched.sla.disk-scalar]): if the key
+    // already has an observed p90, use it even while the cores ladder
+    // is still walking — `resource_floor` is per-drv_hash so a fresh
+    // version would otherwise re-climb DiskPressure from default_disk.
+    let disk = DiskBytes(f.disk_p90.map(|d| d.0).unwrap_or(cfg.default_disk));
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
     if st.max_c.0 <= 0.0 {
@@ -223,6 +227,26 @@ mod tests {
     fn halve_floors_at_1() {
         let f = fit(st(2.0, 3.0, 2, false, 100.0));
         assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 1.0);
+    }
+
+    #[test]
+    fn disk_uses_fit_p90_when_present() {
+        // disk_p90=None → cfg.default_disk.
+        let f = fit(st(4.0, 4.0, 1, true, 1500.0));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).disk.0,
+            20 << 30
+        );
+        // disk_p90=Some → that value, even mid-ladder. Core-independent
+        // scalar; no reason to re-climb DiskPressure on a fresh drv_hash.
+        let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
+        f.disk_p90 = Some(DiskBytes(75 << 30));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).disk.0,
+            75 << 30
+        );
+        // No fit → cfg.default_disk.
+        assert_eq!(next(None, &cfg(), &DrvHints::default()).disk.0, 20 << 30);
     }
 
     #[test]

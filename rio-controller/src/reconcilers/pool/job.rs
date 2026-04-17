@@ -59,13 +59,6 @@ pub(super) const JOB_TTL_SECS: i32 = 600;
 /// not the Job's: karpenter reads pod annotations.
 pub(super) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 
-/// `terminationGracePeriodSeconds` for ephemeral Job pods. I-120: one
-/// build per pod; on SIGTERM exit fast. 30s covers FUSE unmount and
-/// completion report. (`spec.termination_grace_period_seconds` is for
-/// the LONG-drain case; ephemeral pods don't drain, they finish and
-/// die.)
-pub(super) const EPHEMERAL_TGPS: i64 = 30;
-
 /// The shared one-shot Job literal for executor pods. Both pool
 /// kinds (Builder, Fetcher) route through this so the load-bearing
 /// invariants can't drift per call site:
@@ -85,12 +78,16 @@ pub(super) const EPHEMERAL_TGPS: i64 = 30;
 ///     fetchers) and pass it in.
 ///   - [`KARPENTER_DO_NOT_DISRUPT`] on the pod template — I-126
 ///     mid-build eviction protection.
-///   - [`EPHEMERAL_TGPS`] — fast SIGTERM exit (one-build-per-pod
-///     means no drain to wait for).
+///
+/// `termination_grace_period_seconds` is left to
+/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default]`:
+/// 7200s builders, 600s fetchers, or `PoolSpec` override). The
+/// builder's SIGTERM handler blocks on its single in-flight build, so
+/// "ephemeral" ≠ "fast exit".
 ///
 /// Consolidated here so the Job-lifecycle invariants (karpenter
-/// annotation, fast tgps, deadline backstop) can't drift between
-/// callers — pre-P0513 they had.
+/// annotation, deadline backstop) can't drift between callers —
+/// pre-P0513 they had.
 ///
 /// `pod_spec` arrives with role-specific content (volumes, env,
 /// resources) already filled by `build_executor_pod_spec`; this
@@ -106,7 +103,6 @@ pub(super) fn ephemeral_job(
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0 ("Always" — the PodSpec default — is rejected).
     pod_spec.restart_policy = Some("Never".into());
-    pod_spec.termination_grace_period_seconds = Some(EPHEMERAL_TGPS);
 
     Job {
         metadata: ObjectMeta {

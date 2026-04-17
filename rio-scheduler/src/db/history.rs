@@ -55,6 +55,10 @@ pub struct SlaOverrideRow {
     pub tenant: Option<String>,
     pub cluster: Option<String>,
     pub tier: Option<String>,
+    // p50/p90/p99_secs + capacity_type: schema-only. Never wired into
+    // the solver and dropped from proto/CLI; kept here so the
+    // `query_as!` SELECT/INSERT round-trip stays compile-checked
+    // without a `.sqlx` regen. Column GC is a future migration.
     pub p50_secs: Option<f64>,
     pub p90_secs: Option<f64>,
     pub p99_secs: Option<f64>,

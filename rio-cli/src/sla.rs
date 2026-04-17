@@ -38,9 +38,6 @@ pub enum SlaCmd {
         /// Forced memory. Accepts `8Gi`, `512Mi`, or raw bytes.
         #[arg(long)]
         mem: Option<String>,
-        /// Capacity hint for the controller (e.g. `on-demand`, `spot`).
-        #[arg(long)]
-        capacity: Option<String>,
         /// Expiry as a duration from now (e.g. `2h`, `7d`). Unset =
         /// never expires.
         #[arg(long)]
@@ -114,7 +111,6 @@ pub(crate) async fn run(
             tier,
             cores,
             mem,
-            capacity,
             ttl,
         } => {
             let mem_bytes = mem.as_deref().map(parse_bytes).transpose()?;
@@ -127,7 +123,6 @@ pub(crate) async fn run(
                     tier,
                     cores,
                     mem_bytes,
-                    capacity_type: capacity,
                     expires_at_epoch,
                     // Audit stamp. Best-effort — empty if $USER unset.
                     created_by: std::env::var("USER").ok(),

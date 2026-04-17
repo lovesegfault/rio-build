@@ -1,11 +1,12 @@
 //! ADR-023 phase-6 operator override resolution.
 //!
 //! An override row pins a `(pname, system?, tenant?)` key to a forced
-//! tier / `(cores, mem)` / capacity_type. NULL `system`/`tenant` are
-//! wildcards. [`resolve`] picks the most-specific matching row;
+//! tier / `cores` / `mem`. NULL `system`/`tenant` are wildcards.
+//! [`resolve`] picks the most-specific matching row;
 //! [`super::solve::intent_for`] consults the result BEFORE the
-//! fit/explore branch — `forced_cores`/`forced_mem` short-circuit the
-//! model entirely.
+//! fit/explore branch — `forced_cores` short-circuits the model;
+//! `forced_mem` overrides mem in any branch; `tier` filters the
+//! solve ladder.
 
 use crate::db::SlaOverrideRow;
 
@@ -13,14 +14,13 @@ use super::types::ModelKey;
 
 /// Resolved override for one [`ModelKey`]. All fields `Option`: a row
 /// may force only a tier (solve still runs against that tier's targets)
-/// OR only `(cores, mem)` (solve bypassed) OR a `capacity_type` hint
-/// for the controller, in any combination.
+/// OR only `cores` (solve bypassed) OR only `mem` (solve runs for
+/// cores, mem is forced), in any combination.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedTarget {
     pub tier: Option<String>,
     pub forced_cores: Option<f64>,
     pub forced_mem: Option<u64>,
-    pub forced_capacity: Option<String>,
 }
 
 impl From<&SlaOverrideRow> for ResolvedTarget {
@@ -32,7 +32,6 @@ impl From<&SlaOverrideRow> for ResolvedTarget {
             // is a config error, clamp to 0 rather than panic in the
             // dispatch path.
             forced_mem: r.mem_bytes.map(|b| b.max(0) as u64),
-            forced_capacity: r.capacity_type.clone(),
         }
     }
 }
