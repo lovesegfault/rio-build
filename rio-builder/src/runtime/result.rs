@@ -90,7 +90,7 @@ pub(super) fn err_completion(
         node_name: stamp.node_name,
         // Carry the snapshot even on executor error: cpu_seconds_total
         // and peak_disk_bytes from a build that OOMed are exactly what
-        // the SLA model needs to NOT pick that size class again.
+        // the SLA model needs to bump resource_floor next time.
         final_resources: stamp.final_resources,
     }
 }

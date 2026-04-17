@@ -7,8 +7,8 @@
 #     DerivedPath suffix; the old unit test used .contains() which masked it.
 #
 #   system="builtin" — cold-bootstrap's busybox FOD has system=builtin;
-#     if workers don't advertise it, can_build() is always false and the
-#     DAG leaf never dispatches. Build-completes assertion catches this.
+#     if workers don't advertise it, hard_filter() rejects every executor
+#     and the DAG leaf never dispatches. Build-completes assertion catches this.
 #
 #   BuildResult builtOutputs outPath basename — opcode 47
 #     (wopBuildPathsWithResults). Build succeeding requires the client to
@@ -79,8 +79,8 @@ let
         #   wopQueryMissing `!out` → client fails StorePath parse on '!'
         #     before dispatch. Stderr: "invalid character in store path".
         #
-        #   system="builtin" not advertised → busybox FOD can_build()
-        #     always false → DAG leaf never dispatches → hang (globalTimeout).
+        #   system="builtin" not advertised → busybox FOD rejected by
+        #     hard_filter() → DAG leaf never dispatches → hang (globalTimeout).
         #
         #   BuildResult builtOutputs outPath full-path (opcode 47) →
         #     client's BuildResult parser rejects with "illegal base-32

@@ -137,7 +137,7 @@ pub(super) fn spawn_cgroup_monitors(
     // typically respawns it → loop that burns the silence timeout.
     // Detect the first kill, cgroup.kill the build to break the loop,
     // and flag it so the result becomes CgroupOom (→ Infrastructure-
-    // Failure → scheduler promotes size class) instead of a confusing
+    // Failure → scheduler bumps resource_floor) instead of a confusing
     // Wire(UnexpectedEof) or silence-timeout BuildFailed.
     //
     // Baseline captured at spawn: a prior build's OOM (or the FUSE

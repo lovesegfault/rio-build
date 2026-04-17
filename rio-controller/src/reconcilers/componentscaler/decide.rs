@@ -86,7 +86,7 @@ pub struct Decision {
     pub scaled_up: bool,
 }
 
-/// Sum `Σ(class.queued + class.running)` across all size classes.
+/// Sum queued + running derivations across all systems.
 ///
 /// Reads `queued_by_system` (Ready-only) — a queued builder is the
 /// store's load source (FUSE reads on input prefetch, output

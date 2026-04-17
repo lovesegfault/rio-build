@@ -174,9 +174,9 @@ pub enum ExecutorError {
     /// hitting `memory.max`; make typically respawns it → OOM-loop that
     /// never converges (I-196). Distinct from `BuildFailed` because the
     /// derivation isn't broken — this builder is undersized. Maps to
-    /// `InfrastructureFailure` so the scheduler reassigns to a larger
-    /// size class instead of marking the drv permanently failed.
-    #[error("cgroup OOM during build; promoting size class")]
+    /// `InfrastructureFailure` so the scheduler bumps the drv's
+    /// `resource_floor` instead of marking it permanently failed.
+    #[error("cgroup OOM during build; bumping resource floor")]
     CgroupOom,
     #[error(
         "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
@@ -611,7 +611,7 @@ fn resolve_build_opts(
     let effective_cores = u64::from(effective_cores);
     // r[impl sched.sla.cores-reach-nix-build-cores]
     // ADR-023: scheduler-assigned cores are authoritative when set. The
-    // scheduler picked a size class with N cores and provisioned the pod
+    // scheduler solved cores=N for the SLA target and provisioned the pod
     // accordingly; passing exactly N to wopSetOptions makes
     // NIX_BUILD_CORES deterministic so the SLA model's
     // cpu_seconds_total / assigned_cores ratio is meaningful. Still
@@ -750,7 +750,7 @@ async fn run_daemon_lifecycle(
     // some Err (Wire(UnexpectedEof) from the cgroup.kill, or possibly
     // a daemon-reported MiscFailure if the daemon caught the child
     // death first). Replace it with CgroupOom so runtime.rs reports
-    // InfrastructureFailure with the size-class hint, NOT a transient-
+    // InfrastructureFailure with the resource-floor hint, NOT a transient-
     // retry (UnexpectedEof would hit `is_daemon_transient` → 3× local
     // retry → 3× more OOM-loops) and NOT BuildFailed (drv isn't broken).
     let build_result = if oom_detected {
@@ -1066,7 +1066,7 @@ mod tests {
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
         // NOT retryable: cgroup OOM. Retrying on the same undersized
         // pod just OOM-loops again — must escalate to scheduler for
-        // size-class promotion (I-196).
+        // resource_floor bump (I-196).
         assert!(!ExecutorError::CgroupOom.is_daemon_transient());
     }
 

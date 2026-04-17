@@ -294,7 +294,7 @@ message DerivationNode {
   bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
                                    // is_fixed_output(). Gates scheduler's hash-compare on completion.
   bytes ca_modular_hash = 12;      // 32-byte blake3 modular derivation hash (CA nodes from gateway BFS only;
-                                   // empty for IA and single_node_from_basic fallback)
+                                   // empty for IA and single-node BasicDerivation fallback)
   bool needs_resolve = 13;         // ADR-018 shouldResolve: this node needs dispatch-time placeholder resolution
                                    // (CA floating OR IA with a CA-floating input's placeholder in env/args)
 }

@@ -804,7 +804,7 @@ in
   # name="x86-64-fetcher" and image=rio-fetcher (per-component ref
   # from the vmTestSeed preload). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
-  # the hard_filter can_build check. nodeSelector/tolerations left
+  # hard_filter(). nodeSelector/tolerations left
   # at reconciler defaults — scenario labels k3s-agent at runtime.
   #
   # r[verify sched.dispatch.fod-to-fetcher]

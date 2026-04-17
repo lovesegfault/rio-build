@@ -6,8 +6,8 @@
 // r[impl builder.cgroup.sibling-layout]
 // r[impl builder.cgroup.memory-peak]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
-//! (daemon + builder + every compiler sub-process), which is what
-//! size-class memory-bump actually needs.
+//! (daemon + builder + every compiler sub-process), which is what the
+//! resource_floor memory-bump actually needs.
 //!
 //! Bonus: `cpu.stat usage_usec` gives us cumulative tree-wide CPU
 //! time, enabling `peak_cpu_cores` (build_samples) with the same mechanism.

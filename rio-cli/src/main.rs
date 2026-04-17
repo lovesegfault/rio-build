@@ -220,7 +220,7 @@ enum Cmd {
     Status,
     /// Detailed worker list. `Status` shows a one-line summary per
     /// worker; this shows everything `ListExecutors` returns — features,
-    /// size class, current build — for operational drill-down.
+    /// resources, current build — for operational drill-down.
     ///
     /// `--actor` reads the scheduler's IN-MEMORY map instead of PG —
     /// what `dispatch_ready()` sees, not what `last_seen` claims.

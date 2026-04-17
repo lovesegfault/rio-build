@@ -135,7 +135,7 @@ let
 
   # ── testScript prelude: bootstrap + Python helpers ────────────────────
   # Shared by all fragment compositions. start_all + waitReady + SSH +
-  # seed + build() helper + size-class precondition asserts.
+  # seed + build() helper + resource-floor precondition asserts.
   prelude = ''
     ${common.mkBootstrap {
       inherit fixture gatewayHost;

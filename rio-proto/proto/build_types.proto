@@ -275,9 +275,9 @@ message WorkAssignment {
   // current span's traceparent here and the executor extracts it to
   // parent the spawned build task's span. Empty = fresh root span.
   string traceparent = 9;
-  // ADR-023 SLA-sizing: the size class the scheduler picked for this
-  // assignment, expressed as the resource triple it requested on the
-  // executor pod. assigned_cores reaches nix-daemon as
+  // ADR-023 SLA-sizing: the resource triple the scheduler solved for
+  // this assignment and requested on the executor pod.
+  // assigned_cores reaches nix-daemon as
   // wopSetOptions.buildCores → NIX_BUILD_CORES → make -jN. Without this
   // the SLA model fits noise: build_options.build_cores is the CLIENT's
   // request (almost always 0 = "all"), and the cgroup-clamp ceil()s

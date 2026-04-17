@@ -1232,7 +1232,7 @@ async fn cgroup_oom_doubles_mem_floor(
         "w-1",
         tag,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        "cgroup OOM during build; promoting size class",
+        "cgroup OOM during build; bumping resource floor",
     )
     .await?;
     tick(&handle).await?;

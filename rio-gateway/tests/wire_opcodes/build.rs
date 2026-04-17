@@ -453,8 +453,9 @@ async fn test_build_paths_with_results_dag_reject_clean_stderr_last() -> anyhow:
 /// inline BasicDerivation, so the inline check passes and validate_dag fires
 /// on the drv_cache entry. THIS test poisons the inline wire bytes directly
 /// and seeds NOTHING in the store — the inline check is the only thing that
-/// can catch it (resolve_derivation would fail-missing, falling back to
-/// single_node_from_basic, which puts nothing in drv_cache).
+/// can catch it (resolve_derivation would fail-missing, falling back to a
+/// single-node DAG built from the inline BasicDerivation, which puts nothing
+/// in drv_cache).
 ///
 /// Wire behavior differs from the validate_dag path: the inline check uses
 /// stderr_err! which sends STDERR_ERROR and returns Err from the handler.
@@ -467,7 +468,7 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
     let mut h = GatewaySession::new_with_handshake().await?;
 
     // Store is EMPTY — no seeded .drv. If the inline check were missing,
-    // resolve_derivation would fail → single_node_from_basic fallback →
+    // resolve_derivation would fail → single-node BasicDerivation fallback →
     // validate_dag finds nothing in drv_cache → __noChroot slips through
     // to the scheduler. The inline check is the ONLY barrier for this
     // attack shape (client sends a pre-parsed poisoned BasicDerivation).

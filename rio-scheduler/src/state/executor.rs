@@ -162,7 +162,8 @@ pub struct ExecutorState {
     pub phantom_suspect: Option<DrvHash>,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward-API → `RIO_INTENT_ID` →
-    /// HeartbeatRequest.intent_id). `None` = Static-sized pod.
+    /// HeartbeatRequest.intent_id). `None` = pod spawned without an
+    /// intent annotation (recovery-reconciled or pre-ADR-023 pod).
     /// Dispatch (Phase-2) prefers the pre-computed assignment for
     /// this intent; falls through to pick-from-queue if no match.
     pub intent_id: Option<String>,
@@ -264,11 +265,11 @@ pub struct RetryPolicy {
     /// Maximum number of `TimedOut` re-dispatches before the
     /// derivation goes terminal (`Cancelled`). Each `TimedOut` retry
     /// bumps `resource_floor.deadline` (I-200, `r[sched.timeout.promote-
-    /// on-exceed]`), so this caps how many size-class steps a build
+    /// on-exceed]`), so this caps how many floor doublings a build
     /// can climb on timeout before the operator gets a visible
-    /// failure. Default 4: tiny→small→medium→large→xlarge is 4
-    /// promotions; a build that times out on xlarge is genuinely
-    /// stuck. Separate counter from `max_retries` (timeouts don't
+    /// failure. Default 4 (16× the initial deadline); a build that
+    /// times out at 16× is genuinely stuck. Separate counter from
+    /// `max_retries` (timeouts don't
     /// eat the transient budget) and from `max_infra_retries` (no
     /// time-window reset — sparse timeouts over hours are still the
     /// same hung build).

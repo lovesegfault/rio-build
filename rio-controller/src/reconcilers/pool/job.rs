@@ -868,8 +868,8 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 }
 
 /// Report each `DeadlineExceeded` Job to the scheduler so the
-/// `activeDeadlineSeconds` backstop still climbs the size-class ladder
-/// when the worker is too wedged to fire its own `daemon_timeout`
+/// `activeDeadlineSeconds` backstop still climbs the resource_floor
+/// ladder when the worker is too wedged to fire its own `daemon_timeout`
 /// (`r[ctrl.terminated.deadline-exceeded]`). Defense-in-depth behind
 /// the worker-side `BuildResultStatus::TimedOut` primary path.
 ///

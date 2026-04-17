@@ -15,7 +15,7 @@ Nix derivations form a pure, deterministic DAG — theoretically ideal for distr
 rio-build fills the gap:
 
 - **Protocol-native** — implements the Nix worker protocol directly; zero custom client tooling
-- **DAG-aware scheduling** — critical-path priority, transfer-cost-weighted locality, size-class routing
+- **DAG-aware scheduling** — critical-path priority, transfer-cost-weighted locality, SLA-driven per-derivation sizing
 - **Chunked CAS** — FastCDC + BLAKE3 cross-build deduplication, inline fast-path for small NARs
 - **FUSE builder stores** — lazy on-demand fetch from CAS, local SSD caching, per-build overlay isolation
 - **CA-ready** — store schema and scheduler support content-addressed derivations from day one

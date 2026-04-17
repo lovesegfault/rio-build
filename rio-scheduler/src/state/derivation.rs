@@ -337,8 +337,8 @@ pub struct CaState {
     /// (`hashDerivationModulo` SHA-256). Realisations table PK half.
     /// Set at DAG merge from proto `DerivationNode.ca_modular_hash`
     /// (the gateway computes it post-BFS from the full drv_cache).
-    /// `None` for IA derivations AND for the `single_node_from_basic`
-    /// fallback (no transitive closure to compute over).
+    /// `None` for IA derivations AND for the single-node
+    /// `BasicDerivation` fallback (no transitive closure to compute over).
     ///
     /// Consumed by:
     /// - `collect_ca_inputs` ([`crate::actor`] dispatch) — this node
@@ -503,7 +503,7 @@ pub struct DerivationState {
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
     pub assigned_executor: Option<ExecutorId>,
-    /// Scheduling hints (estimator outputs, size-class, critical-path priority).
+    /// Scheduling hints (estimator outputs, resource_floor, critical-path priority).
     pub sched: SchedHint,
     /// ATerm-serialized .drv content, inlined by the gateway for
     /// nodes that will actually dispatch (outputs missing from store).

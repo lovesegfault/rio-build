@@ -810,7 +810,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             &format!("b-{c}"),
             &p,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
-            "cgroup OOM during build; promoting size class",
+            "cgroup OOM during build; bumping resource floor",
         )
         .await?;
         let s = expect_drv(&handle, "ladder-drv").await;

@@ -222,15 +222,15 @@ message DerivationDiagnostic {
   // cases where PG looked clean but the actor's in-memory state was
   // unobservable. Same lesson as I-056b's draining/degraded: every
   // field hard_filter reads must be in the diagnostic.
-  string system = 11;                     // can_build() any-match against executor.systems
-  repeated string required_features = 12; // can_build() all-match against executor.features
+  string system = 11;                     // rejection_reason() any-match against executor.systems
+  repeated string required_features = 12; // rejection_reason() all-match against executor.features
   repeated string failed_builders = 13;   // executors hard_filter excludes for this drv
   // I-062: simulated hard_filter against EVERY executor in the live
   // pool, with the FIRST failing clause named. Only populated for
   // status=Ready (the question "why isn't this dispatching" is only
   // meaningful then). Reasons: kind-mismatch, draining, store-degraded,
-  // not-registered, at-capacity, system-mismatch, feature-missing,
-  // failed-on, size-class-{undeclared,mismatch}, resource-fit, or
+  // not-registered, stream-closed, at-capacity, intent-reserved,
+  // system-mismatch, feature-missing, failed-on, resource-fit, or
   // ACCEPT (would dispatch — if EVERY executor shows ACCEPT and the
   // drv stays Ready, the rejection is outside hard_filter; that's the
   // load-bearing finding for I-062).
@@ -418,8 +418,6 @@ message GetSpawnIntentsRequest {
 
 message GetSpawnIntentsResponse {
   // One intent per Ready derivation that passed the request filter.
-  // Empty when `[sla]` is unconfigured on the scheduler (Static-mode
-  // gate) — the controller falls back to `ClusterStatus`.
   repeated SpawnIntent intents = 1;
   // Per-system breakdown of Ready derivations (same population the
   // intent filter sees, before the kind/feature filters apply). Sum

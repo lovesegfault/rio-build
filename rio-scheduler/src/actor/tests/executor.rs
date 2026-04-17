@@ -867,7 +867,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
         "b-cap-1",
         &p,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        "cgroup OOM during build; promoting size class",
+        "cgroup OOM during build; bumping resource floor",
     )
     .await?;
     drop(rx);
@@ -1045,7 +1045,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
             &id,
             &p,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
-            "cgroup OOM during build; promoting size class",
+            "cgroup OOM during build; bumping resource floor",
         )
         .await?;
         drop(rx);
@@ -1072,7 +1072,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
         "b-coom-4",
         &p,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        "cgroup OOM during build; promoting size class",
+        "cgroup OOM during build; bumping resource floor",
     )
     .await?;
     drop(rx);

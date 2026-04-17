@@ -124,7 +124,7 @@ pub fn describe_metrics() {
         "rio_builder_cgroup_oom_total",
         "Builds killed by the cgroup OOM watcher (memory.events oom_kill \
          incremented during build). Reported as InfrastructureFailure for \
-         scheduler size-class promotion (I-196). Nonzero = pool's memory \
+         scheduler resource_floor bump (I-196). Nonzero = pool's memory \
          limit is undersized for its workload."
     );
     describe_counter!(
