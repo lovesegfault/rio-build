@@ -224,10 +224,10 @@ pub struct PoolSpec {
     /// `fuse-cache` emptyDir sizeLimit AND the matching addend to the
     /// container's `ephemeral-storage` request/limit (kubelet sums
     /// disk-backed emptyDirs against that limit, so the two MUST agree).
-    /// `None` = per-kind default (50Gi builder, 10Gi fetcher). Override
-    /// downward on small-disk clusters (k3s VM tests) where the prod
-    /// default makes every worker pod Unschedulable. Applies to BOTH
-    /// kinds — NOT CEL-gated for Fetcher.
+    /// `None` = per-kind safe-minimum default (8Gi builder, 4Gi fetcher)
+    /// so non-helm Pools schedule on small-disk clusters. Helm prod
+    /// `poolDefaults.fuseCacheBytes` overrides upward (50Gi). Applies
+    /// to BOTH kinds — NOT CEL-gated for Fetcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_cache_bytes: Option<u64>,
 

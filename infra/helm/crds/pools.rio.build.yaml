@@ -82,10 +82,10 @@ spec:
                 description: "`fuse-cache` emptyDir sizeLimit AND the matching addend\
                   \ to the\ncontainer's `ephemeral-storage` request/limit (kubelet\
                   \ sums\ndisk-backed emptyDirs against that limit, so the two MUST\
-                  \ agree).\n`None` = per-kind default (50Gi builder, 10Gi fetcher).\
-                  \ Override\ndownward on small-disk clusters (k3s VM tests) where\
-                  \ the prod\ndefault makes every worker pod Unschedulable. Applies\
-                  \ to BOTH\nkinds \u2014 NOT CEL-gated for Fetcher."
+                  \ agree).\n`None` = per-kind safe-minimum default (8Gi builder,\
+                  \ 4Gi fetcher)\nso non-helm Pools schedule on small-disk clusters.\
+                  \ Helm prod\n`poolDefaults.fuseCacheBytes` overrides upward (50Gi).\
+                  \ Applies\nto BOTH kinds \u2014 NOT CEL-gated for Fetcher."
                 format: uint64
                 minimum: 0.0
                 nullable: true

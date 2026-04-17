@@ -231,20 +231,39 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         |intent| build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent),
     )
     .await;
-    if to_spawn_intents.is_empty() {
-        debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
+    // Ack to the scheduler so it arms the Pending-watch (ICE-backoff)
+    // timer for intents that have a Pending Job — both newly spawned
+    // AND already-Pending-before-this-tick. The latter covers scheduler
+    // restart: `pending_intents` is in-memory, so without re-ack a
+    // pre-restart Pending Job under deterministic softmax (same
+    // selector → no reap → no respawn → no fresh ack) never re-arms.
+    // Scheduler-side `or_insert` makes re-ack of a live timer a no-op.
+    let pending_job_names: HashSet<String> = jobs
+        .items
+        .iter()
+        .filter(|j| is_pending_job(j))
+        .filter_map(|j| j.metadata.name.clone())
+        .filter(|n| !reaped.contains(n))
+        .collect();
+    let to_ack: Vec<SpawnIntent> = intents
+        .iter()
+        .filter(|i| {
+            pending_job_names.contains(&pod::job_name(
+                &name,
+                pool.spec.kind,
+                &intent_suffix(&i.intent_id),
+            ))
+        })
+        .cloned()
+        .chain(to_spawn_intents)
+        .collect();
+    if to_ack.is_empty() {
+        debug!(pool = %name, queued, active, ?ceiling, "no Pending intents to ack");
     } else {
-        // Ack to the scheduler so it arms the Pending-watch
-        // (ICE-backoff) timer ONLY for intents we created Jobs for.
-        // GetSpawnIntents is read-only; without this ack the timer
-        // never arms. Best-effort: a dropped ack means delayed ICE
-        // detection (next spawn re-acks), not a false mark.
         if let Err(e) = ctx
             .admin
             .clone()
-            .ack_spawned_intents(rio_proto::types::AckSpawnedIntentsRequest {
-                spawned: to_spawn_intents,
-            })
+            .ack_spawned_intents(rio_proto::types::AckSpawnedIntentsRequest { spawned: to_ack })
             .await
         {
             warn!(pool = %name, error = %e, "ack_spawned_intents failed; ICE-timer not armed this tick");

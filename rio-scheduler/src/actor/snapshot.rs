@@ -301,11 +301,14 @@ impl DagActor {
     ///    cells ICE every `hw_fallback_after_secs` until the solve
     ///    degraded to band-agnostic.
     ///
-    /// `insert` (not `or_insert`): a re-ack after ICE-timeout reap →
-    /// respawn lands the NEW `(band, cap)` and a fresh timestamp. The
-    /// controller's filter-existing-before-truncate means an
-    /// already-spawned still-Pending intent isn't re-acked, so this
-    /// doesn't reset a live timer.
+    /// `or_insert`: the controller re-acks the FULL still-Pending set
+    /// every tick (covers scheduler restart, where in-memory
+    /// `pending_intents` is empty and existing Pending Jobs would
+    /// otherwise never re-arm under deterministic softmax). A live
+    /// timer is NOT reset by re-ack. After ICE-sweep removes a
+    /// timed-out entry, the controller's reap-on-selector-drift +
+    /// respawn + ack lands the NEW `(band, cap)` here as a fresh
+    /// insert.
     pub(super) fn handle_ack_spawned_intents(&self, spawned: &[rio_proto::types::SpawnIntent]) {
         let now = std::time::Instant::now();
         for i in spawned {
@@ -316,7 +319,8 @@ impl DagActor {
                 .collect();
             if let Some((band, cap)) = crate::sla::cost::parse_selector(&sel) {
                 self.pending_intents
-                    .insert(i.intent_id.clone().into(), (band, cap, now));
+                    .entry(i.intent_id.clone().into())
+                    .or_insert((band, cap, now));
             }
         }
     }

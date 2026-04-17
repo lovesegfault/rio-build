@@ -30,7 +30,7 @@ spec:
   deadlineSeconds: {{ . }}
   {{- end }}
   {{- with $p.fuseCacheBytes }}
-  fuseCacheBytes: {{ . }}
+  fuseCacheBytes: {{ int64 . }}
   {{- end }}
   {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
          hostUsers:true (cgroup-chown gap); production EKS leaves it
