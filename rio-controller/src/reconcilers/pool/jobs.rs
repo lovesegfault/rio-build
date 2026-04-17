@@ -29,7 +29,7 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
@@ -43,9 +43,9 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 use super::job::JOB_TTL_SECS;
 use super::job::{
-    JOB_REQUEUE, ephemeral_job, is_active_job, patch_job_pool_status, reap_excess_pending,
-    reap_orphan_running, report_deadline_exceeded_jobs, report_terminated_pods, spawn_count,
-    spawn_for_each,
+    JOB_REQUEUE, ephemeral_job, is_active_job, is_pending_job, patch_job_pool_status,
+    reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
+    report_terminated_pods, spawn_for_each,
 };
 use super::pod::{self, UpstreamAddrs};
 use crate::error::{Error, Result};
@@ -56,6 +56,13 @@ use rio_proto::types::SpawnIntent;
 /// Pod-template annotation carrying `SpawnIntent.intent_id`. Read by
 /// the builder via downward-API → `RIO_INTENT_ID` → heartbeat.
 pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
+
+/// Job-metadata annotation carrying a fingerprint of
+/// `SpawnIntent.node_selector`. Compared on each tick so a Pending Job
+/// whose selector no longer matches the scheduler's current solve
+/// (ICE-backoff spot→on-demand fallback) is reaped instead of
+/// NameCollision-blocking the re-solved intent forever.
+pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 
 /// ADR-023 ephemeral-storage budget for the FUSE cache emptyDir. Added
 /// to `SpawnIntent.disk_bytes` so the kubelet's disk-pressure eviction
@@ -160,21 +167,28 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .unwrap_or(i32::MAX);
 
     // ---- Spawn decision ----
-    // `ceiling = None` → uncapped: headroom = MAX, so spawn_count
-    // reduces to `queued - active`.
-    let headroom = ceiling.map_or(u32::MAX, |c| c.saturating_sub(active).max(0) as u32);
-    let to_spawn = spawn_count(queued, active as u32, headroom);
+    // Attempt every intent up to `headroom`. Dedup is structural:
+    // `intent_suffix(drv_hash)` is deterministic, so a re-polled
+    // still-Ready intent re-creates the SAME Job name and the
+    // apiserver's NameCollision is a debug-logged no-op.
+    //
+    // We do NOT subtract `active`: `queued` counts only Ready intents
+    // but `active` counts ALL non-terminal Jobs (incl. Running, whose
+    // drvs have left the Ready set). Under per-size-class pools that
+    // mismatch was bounded by class cutoff (~30s); under one Pool it's
+    // bounded by the slowest build, so `queued.sub(active)` starved
+    // new Ready drvs for hours (bug_045). `ceiling = None` → uncapped.
+    let headroom = ceiling.map_or(usize::MAX, |c| c.saturating_sub(active).max(0) as usize);
+    let to_spawn_intents = &intents[..headroom.min(intents.len())];
 
-    // ---- Reap terminal Jobs blocking respawn ----
-    // intent_suffix(drv_hash) is deterministic so a re-polled intent
-    // for a STILL-ACTIVE Job NameCollisions (the intended dedupe).
-    // But a drv that re-enters Ready after its prior Job went
-    // Complete/Failed (resubmit-after-TimedOut, transient retry,
-    // Cancel-then-resubmit) would NameCollision against the stale
-    // terminal Job for JOB_TTL_SECS (600s) — the re-queued drv
-    // never gets a worker. Delete those before the spawn pass.
-    let to_spawn_intents = &intents[..(to_spawn as usize).min(intents.len())];
-    reap_terminal_for_intents(
+    // ---- Reap stale Jobs blocking respawn ----
+    // (a) Terminal: a drv that re-enters Ready after its prior Job
+    //     went Complete/Failed would NameCollision against the stale
+    //     terminal Job for JOB_TTL_SECS (600s). (b) Selector-drift: a
+    //     Pending Job whose selector no longer matches the scheduler's
+    //     re-solve (ICE-backoff) NameCollision-blocks the new intent
+    //     forever. Delete both before the spawn pass.
+    reap_stale_for_intents(
         &jobs_api,
         &jobs.items,
         to_spawn_intents,
@@ -184,15 +198,15 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     .await;
 
     // One pod per intent with that intent's resources + annotation.
-    // `to_spawn` truncates; the remainder is picked up next tick
-    // after `active` decreases. Under mandatory `[sla]` (Phase 5) the
+    // Headroom truncates; the remainder is picked up next tick after
+    // `active` decreases. Under mandatory `[sla]` (Phase 5) the
     // scheduler ALWAYS populates intents — empty list means empty
-    // queue → `to_spawn=0` → spawns nothing.
+    // queue → spawns nothing.
     spawn_for_each(&jobs_api, to_spawn_intents, &name, |intent| {
         build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent)
     })
     .await;
-    if to_spawn == 0 {
+    if to_spawn_intents.is_empty() {
         debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
     }
 
@@ -258,6 +272,17 @@ async fn queued_for_pool(
     Ok(resp.intents)
 }
 
+/// Stable fingerprint of `SpawnIntent.node_selector`: `k=v,k=v` over
+/// sorted keys. Empty map → "". Only the intent-supplied selector is
+/// fingerprinted (NOT the pool's base selector that
+/// `build_executor_pod_spec` merges in) so drift detection compares
+/// scheduler decisions, not pool config.
+fn selector_fingerprint(sel: &std::collections::HashMap<String, String>) -> String {
+    let mut kv: Vec<_> = sel.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    kv.sort_unstable();
+    kv.join(",")
+}
+
 /// DNS-1123-safe deterministic suffix from `intent_id`. In production
 /// `intent_id == drv_hash` (nixbase32, already lowercase-alnum); the
 /// filter is belt-and-suspenders for the proto's "opaque" contract.
@@ -272,52 +297,81 @@ fn intent_suffix(intent_id: &str) -> String {
     if s.is_empty() { "0".into() } else { s }
 }
 
-/// Delete NOT-active Jobs whose name collides with an intent we are
-/// about to spawn. The deterministic `intent_suffix` makes a
-/// Completed/Failed Job for drv X block respawn of X for
-/// [`JOB_TTL_SECS`]; this clears that window so the immediate
-/// `spawn_for_each` (or worst-case the next tick) succeeds.
+/// Delete Jobs whose name collides with an intent we are about to
+/// spawn AND would block that spawn:
 ///
-/// Background-propagation delete: terminal ⇒ `status.{succeeded,
-/// failed} > 0` ⇒ the Job controller has already cleared the pod's
-/// `batch.kubernetes.io/job-tracking` finalizer, so the orphan-
-/// finalizer race that forces foreground on the Pending/Running reaps
-/// does not apply. Background lets the Job object vanish before the
-/// pod (TTL would have done the same), so the create that follows
-/// has the best chance of landing in the SAME tick.
-async fn reap_terminal_for_intents(
+///   - **Terminal** (Complete/Failed): the deterministic `intent_
+///     suffix` makes a finished Job for drv X block respawn of X for
+///     [`JOB_TTL_SECS`]; clear that window so the immediate
+///     `spawn_for_each` (or worst-case next tick) succeeds.
+///     Background-propagation delete — terminal ⇒ `status.{succeeded,
+///     failed} > 0` ⇒ the Job controller has already cleared the
+///     pod's `batch.kubernetes.io/job-tracking` finalizer, so the
+///     orphan-finalizer race does not apply and the Job object can
+///     vanish before the pod.
+///   - **Pending with stale selector**: the scheduler re-solved
+///     (ICE-backoff spot→on-demand) but the prior Pending Job sits
+///     unschedulable on the OLD selector and NameCollision-blocks the
+///     new intent forever — `reap_excess_pending` won't catch it
+///     because `pending == queued`. Foreground-propagation delete —
+///     the pod's `job-tracking` finalizer is still live (same
+///     reasoning as `reap_excess_pending`).
+///
+/// A Pending Job whose selector MATCHES the current intent is NOT
+/// reaped — that's the intended NameCollision dedupe.
+pub(super) async fn reap_stale_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
     intents: &[SpawnIntent],
     pool: &str,
     kind: ExecutorKind,
 ) {
-    let want: HashSet<String> = intents
+    use std::collections::HashMap;
+    let want: HashMap<String, String> = intents
         .iter()
-        .map(|i| pod::job_name(pool, kind, &intent_suffix(&i.intent_id)))
+        .map(|i| {
+            (
+                pod::job_name(pool, kind, &intent_suffix(&i.intent_id)),
+                selector_fingerprint(&i.node_selector),
+            )
+        })
         .collect();
     if want.is_empty() {
         return;
     }
-    for j in existing.iter().filter(|j| !is_active_job(j)) {
+    for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
         };
-        if !want.contains(jn) {
+        let Some(want_sel) = want.get(jn) else {
             continue;
-        }
-        match jobs_api.delete(jn, &DeleteParams::background()).await {
+        };
+        let (params, why) = if !is_active_job(j) {
+            (DeleteParams::background(), "terminal")
+        } else if is_pending_job(j)
+            && j.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
+                .map(String::as_str)
+                != Some(want_sel.as_str())
+        {
+            (DeleteParams::foreground(), "selector-drift")
+        } else {
+            continue;
+        };
+        match jobs_api.delete(jn, &params).await {
             Ok(_) => {
                 info!(
-                    pool, job = %jn,
-                    "reaped terminal Job blocking re-queued intent respawn"
+                    pool, job = %jn, why,
+                    "reaped stale Job blocking re-queued intent respawn"
                 );
             }
             Err(e) if e.is_not_found() => {}
             Err(e) => {
                 warn!(
-                    pool, job = %jn, error = %e,
-                    "failed to reap terminal Job; spawn will NameCollision \
+                    pool, job = %jn, why, error = %e,
+                    "failed to reap stale Job; spawn will NameCollision \
                      this tick, retried next"
                 );
             }
@@ -369,6 +423,16 @@ pub(super) fn build_job(
         .and_then(|m| m.annotations.as_mut())
         .expect("ephemeral_job sets template.metadata.annotations")
         .insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+    // Stamp the selector fingerprint on the JOB metadata (not pod
+    // template) so `reap_stale_for_intents` can compare without
+    // dereferencing `spec.template`.
+    job.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            INTENT_SELECTOR_ANNOTATION.into(),
+            selector_fingerprint(&intent.node_selector),
+        );
     Ok(job)
 }
 
@@ -585,6 +649,90 @@ mod tests {
             DEFAULT_FETCHER_DEADLINE_SECS,
             "default 5min, not Builder's 1h — stuck download is the failure mode"
         );
+    }
+
+    /// `selector_fingerprint` is deterministic over key order. Empty
+    /// → "". `build_job` stamps it on Job metadata.annotations so
+    /// `reap_stale_for_intents` can compare without dereferencing
+    /// `spec.template`.
+    #[test]
+    fn build_job_stamps_selector_fingerprint() {
+        use std::collections::HashMap;
+        let a: HashMap<_, _> = [
+            ("karpenter.sh/capacity-type".into(), "spot".into()),
+            ("rio.build/hw-band".into(), "mid".into()),
+        ]
+        .into();
+        let b: HashMap<_, _> = [
+            ("rio.build/hw-band".into(), "mid".into()),
+            ("karpenter.sh/capacity-type".into(), "spot".into()),
+        ]
+        .into();
+        assert_eq!(selector_fingerprint(&a), selector_fingerprint(&b));
+        assert_eq!(
+            selector_fingerprint(&a),
+            "karpenter.sh/capacity-type=spot,rio.build/hw-band=mid"
+        );
+        assert_eq!(selector_fingerprint(&HashMap::new()), "");
+
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let i = SpawnIntent {
+            intent_id: "abc".into(),
+            node_selector: a,
+            ..Default::default()
+        };
+        let job = build_job(
+            &pool,
+            crate::fixtures::oref(&pool),
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            &i,
+        )
+        .unwrap();
+        assert_eq!(
+            job.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
+                .map(String::as_str),
+            Some("karpenter.sh/capacity-type=spot,rio.build/hw-band=mid"),
+        );
+    }
+
+    /// bug_074: fetcher overlay emptyDir is disk-backed (NOT
+    /// `medium: Memory`). Under ADR-023 `limits.memory` is RSS-only
+    /// and `disk_bytes` budgets `ephemeral-storage`; a tmpfs overlay
+    /// charged the unpack against memory → OOM while the disk
+    /// reservation sat unused.
+    #[test]
+    fn fetcher_overlay_is_disk_backed() {
+        let pool = test_pool("f", ExecutorKind::Fetcher);
+        let job = build_job(
+            &pool,
+            crate::fixtures::oref(&pool),
+            &test_sched_addrs(),
+            &test_store_addrs(),
+            &SpawnIntent {
+                intent_id: "abc".into(),
+                disk_bytes: 8 << 30,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let overlay = job
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|p| p.volumes.as_ref())
+            .and_then(|v| v.iter().find(|v| v.name == "overlays"))
+            .and_then(|v| v.empty_dir.as_ref())
+            .expect("fetcher pod has overlays emptyDir");
+        assert_eq!(
+            overlay.medium, None,
+            "fetcher overlay must be disk-backed so disk_bytes budgets \
+             ephemeral-storage and quota::peak_bytes() sees prjquota"
+        );
+        assert!(overlay.size_limit.is_some(), "sizeLimit still applied");
     }
 
     /// `intent_suffix` is deterministic and DNS-1123-safe.

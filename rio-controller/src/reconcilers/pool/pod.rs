@@ -351,21 +351,20 @@ pub fn build_executor_pod_spec(
                 //
                 // When `read_only_root_fs` is true (fetchers), this
                 // is the ONLY writable path — overlay writes still
-                // work, rootfs tampering does not. ADR-019 §Sandbox
-                // hardening specs a tmpfs emptyDir; Memory medium
-                // gives that (writes hit RAM, not disk — faster
-                // for short-lived FOD fetches, and the pod's memory
-                // limit bounds it).
+                // work, rootfs tampering does not. Disk-backed for
+                // BOTH kinds: ADR-019 originally specced tmpfs for
+                // fetchers ("FOD fetches are short, fits in pod
+                // memory limit"), but under ADR-023 `limits.memory`
+                // is SLA-computed from RSS alone while overlay writes
+                // are budgeted under `ephemeral-storage` from
+                // `disk_bytes` — `medium: Memory` made a 6+ GiB
+                // unpack OOM the pod while the disk reservation sat
+                // unused, AND `quota::peak_bytes()` (XFS prjquota)
+                // returned None on tmpfs so `peak_disk_bytes` never
+                // fitted (bug_074).
                 Volume {
                     name: "overlays".into(),
-                    empty_dir: Some(if read_only_root_fs {
-                        EmptyDirVolumeSource {
-                            medium: Some("Memory".into()),
-                            ..Default::default()
-                        }
-                    } else {
-                        EmptyDirVolumeSource::default()
-                    }),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
                     ..Default::default()
                 },
             ];

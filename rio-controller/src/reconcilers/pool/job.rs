@@ -135,43 +135,6 @@ pub(super) fn ephemeral_job(
     }
 }
 
-/// Compute how many Jobs to spawn this tick.
-///
-/// `(queued - active).min(headroom)` — each active Job is treated as
-/// already claiming one queued derivation. This prevents the runaway
-/// where a single queued derivation triggers a fresh Job every 10s
-/// tick until the ceiling is hit:
-///
-///   - t=0:  queued=1, active=0 → spawn Job-A
-///   - t=10: queued=1, active=1 → old formula spawned Job-B (wrong);
-///     new formula: 1-1=0 → no spawn
-///   - t=20: Job-A's pod heartbeats, dispatch fires, queued→0
-///
-/// `queued_derivations` is `ready_queue.len()` on the scheduler side
-/// (actor/mod.rs compute_cluster_snapshot). A derivation stays in the
-/// ready_queue until a worker heartbeats and `dispatch_ready` pops it
-/// — NOT when we spawn the Job. Pod startup (schedule + pull + FUSE
-/// mount + first heartbeat) is ~10-30s; with a 10s requeue interval
-/// the old `queued.min(headroom)` formula fired 2-4 extra Jobs per
-/// build before the first pod came online.
-///
-/// Conservative bias: if some active Jobs are already busy (dispatched
-/// work, not starting), subtracting them under-spawns by that count.
-/// Next tick after those Jobs succeed corrects it. Under-spawn = one
-/// requeue interval of latency; over-spawn = wasted pod starts +
-/// idle workers heartbeating for work that doesn't exist. For the
-/// "isolation > throughput" ephemeral use case, the latency cost is
-/// acceptable; the resource waste is not.
-///
-/// Global-Q caveat: `queued` is cluster-wide (filtered by kind/
-/// system/features). With multiple pools claiming the same filter,
-/// each over-counts need by what the others will claim — but
-/// headroom caps it, and the others draining Q on the next tick
-/// self-corrects.
-pub(super) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
-    queued.saturating_sub(active).min(headroom)
-}
-
 /// Neither Succeeded nor Failed → still active (running or pending).
 /// `None` status treated as active — fresh Job before the Job
 /// controller populates; don't double-spawn on the next tick just
@@ -248,9 +211,10 @@ pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 /// claimed by a queued derivation). `pending.len() > queued` → the
 /// `pending - queued` oldest are surplus: even if every queued
 /// derivation lands on a Pending pod, these will never get one. The
-/// spawn formula's active-subtraction means we never spawn more than
-/// `queued`, so this only fires when `queued` DROPS after spawn (user
-/// cancel, build completes elsewhere, gateway disconnect).
+/// spawn loop's NameCollision dedupe means we never spawn more than
+/// one Job per intent, so this only fires when `queued` DROPS after
+/// spawn (user cancel, build completes elsewhere, gateway disconnect)
+/// or when overlapping pools double-spawned for the same intent.
 ///
 /// `min_age`: Jobs younger than this are excluded — see
 /// [`REAP_PENDING_GRACE`]. Passing `Duration::ZERO` disables the
@@ -1159,48 +1123,6 @@ mod tests {
     }
 
     const NO_GRACE: Duration = Duration::ZERO;
-
-    /// Spawn-count formula: active Jobs claim queued derivations.
-    ///
-    /// Regression for the KVM-speed runaway: under the old formula
-    /// `queued.min(headroom)`, a single queued derivation spawned a
-    /// fresh Job every 10s tick until the ceiling. With pod startup
-    /// ~10-30s and ceiling=4, one build produced 3-4 Jobs; two
-    /// sequential builds produced 9+ (lifecycle.nix ephemeral-pool
-    /// subtest observed this under KVM).
-    ///
-    /// Mutation check: revert to `queued.min(headroom)` → the
-    /// `q1_a1_no_spawn` case fails (expects 0, gets 1).
-    #[test]
-    fn spawn_count_subtracts_active() {
-        // The bug case: 1 queued, 1 Job already in flight (pod
-        // starting, hasn't heartbeated). Old formula: min(1,3)=1
-        // → runaway. New: 1-1=0 → wait for the in-flight Job.
-        assert_eq!(spawn_count(1, 1, 3), 0, "q1_a1_no_spawn");
-
-        // Cold start: nothing active, spawn up to queued.
-        assert_eq!(spawn_count(1, 0, 4), 1, "cold start single");
-        assert_eq!(spawn_count(3, 0, 4), 3, "cold start multi");
-
-        // Ceiling clamp: 10 queued, 0 active, ceiling 4 → spawn 4.
-        assert_eq!(spawn_count(10, 0, 4), 4, "headroom caps");
-
-        // Steady state at ceiling: headroom=0 → no spawn regardless.
-        assert_eq!(spawn_count(10, 4, 0), 0, "ceiling reached");
-
-        // Recovery after a Job completes: 5 queued, 3 active (one
-        // succeeded and dropped out of the filter), headroom=1.
-        // Need = 5-3=2, but headroom caps at 1.
-        assert_eq!(spawn_count(5, 3, 1), 1, "post-complete refill");
-
-        // Saturating: active > queued (some Jobs are running
-        // dispatched work, Q already drained). Don't underflow.
-        assert_eq!(spawn_count(0, 3, 1), 0, "drained queue");
-        assert_eq!(spawn_count(1, 3, 1), 0, "more active than queued");
-
-        // Empty everything.
-        assert_eq!(spawn_count(0, 0, 4), 0, "idle");
-    }
 
     // r[verify ctrl.ephemeral.reap-excess-pending]
     /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →

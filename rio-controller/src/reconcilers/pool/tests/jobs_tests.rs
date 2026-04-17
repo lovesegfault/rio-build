@@ -10,12 +10,17 @@
 //! contains no `return Err`, so the caller's status patch runs even
 //! when every spawn fails.
 
+use std::collections::BTreeMap;
+
 use k8s_openapi::api::batch::v1::{Job, JobStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{SpawnOutcome, reap_excess_pending, try_spawn_job};
+use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
+use rio_crds::pool::ExecutorKind;
+use rio_proto::types::SpawnIntent;
 
 // r[verify ctrl.pool.ephemeral]
 #[test]
@@ -232,6 +237,105 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         "metric incremented with pool label; saw keys: {:?}",
         recorder.all_keys(),
     );
+}
+
+/// m027 deferral: a Pending Job whose `rio.build/intent-selector`
+/// annotation no longer matches the scheduler's current solve (ICE-
+/// backoff spot→on-demand) is foreground-deleted; a terminal Job for
+/// a wanted intent is background-deleted; a Pending Job whose
+/// selector still matches and a Running Job are NOT deleted (the
+/// verifier's strict scenario sequence proves no extra DELETE calls
+/// go out). bug_045 prerequisite: `reap_stale_for_intents` sees all
+/// intents, not a `queued.sub(active)` prefix.
+#[tokio::test]
+async fn reap_stale_for_intents_selector_drift_and_terminal() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    fn job(name: &str, sel: Option<&str>, ready: i32, succeeded: i32) -> Job {
+        Job {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                annotations: sel
+                    .map(|s| BTreeMap::from([(INTENT_SELECTOR_ANNOTATION.into(), s.into())])),
+                ..Default::default()
+            },
+            status: Some(JobStatus {
+                ready: Some(ready),
+                succeeded: Some(succeeded),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+    // Pool=p, kind=Builder → job names "rio-builder-p-{suffix}".
+    let existing = vec![
+        // Pending, selector=spot → drift vs intent's on-demand.
+        job(
+            "rio-builder-p-aaa",
+            Some("karpenter.sh/capacity-type=spot"),
+            0,
+            0,
+        ),
+        // Pending, selector=on-demand → matches; the intended dedupe.
+        job(
+            "rio-builder-p-bbb",
+            Some("karpenter.sh/capacity-type=on-demand"),
+            0,
+            0,
+        ),
+        // Running, selector=spot → NOT reaped (may hold assignment).
+        job(
+            "rio-builder-p-ccc",
+            Some("karpenter.sh/capacity-type=spot"),
+            1,
+            0,
+        ),
+        // Terminal (succeeded=1), name matches → background-reaped.
+        job("rio-builder-p-ddd", None, 0, 1),
+        // Pending, NO annotation → drift vs "" (pre-fix Job; reap so
+        // it gets re-stamped).
+        job("rio-builder-p-eee", None, 0, 0),
+    ];
+    let intent = |id: &str, cap: &str| SpawnIntent {
+        intent_id: id.into(),
+        node_selector: [("karpenter.sh/capacity-type".into(), cap.into())].into(),
+        ..Default::default()
+    };
+    let intents = vec![
+        intent("aaa", "on-demand"),
+        intent("bbb", "on-demand"),
+        intent("ccc", "on-demand"),
+        intent("ddd", "on-demand"),
+        intent("eee", "on-demand"),
+    ];
+
+    let guard = verifier.run(vec![
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-p-aaa",
+            body_contains: Some(r#""propagationPolicy":"Foreground""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-p-ddd",
+            body_contains: Some(r#""propagationPolicy":"Background""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-p-eee",
+            body_contains: Some(r#""propagationPolicy":"Foreground""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
+    ]);
+
+    reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    guard.verified().await;
 }
 
 // r[verify ctrl.ephemeral.reap-excess-pending]

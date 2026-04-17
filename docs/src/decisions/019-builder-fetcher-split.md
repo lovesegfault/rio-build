@@ -84,7 +84,7 @@ The Squid `fod-proxy` is deleted. The FOD hash check is the integrity boundary; 
 
 r[fetcher.sandbox.strict-seccomp]
 
-Fetchers get a stricter seccomp profile (`rio-fetcher.json`) than builders: deny `ptrace`, `bpf`, `setns`, `process_vm_readv`/`writev`, `keyctl`, `add_key`. `mount` stays allowed (FUSE needs it). Pod `securityContext` sets `readOnlyRootFilesystem: true` --- the overlay upper-dir is a `tmpfs` emptyDir, so writes still work but rootfs tampering does not.
+Fetchers get a stricter seccomp profile (`rio-fetcher.json`) than builders: deny `ptrace`, `bpf`, `setns`, `process_vm_readv`/`writev`, `keyctl`, `add_key`. `mount` stays allowed (FUSE needs it). Pod `securityContext` sets `readOnlyRootFilesystem: true` --- the overlay upper-dir is a disk-backed emptyDir (the only writable mount), so writes still work but rootfs tampering does not. (Originally tmpfs; changed to disk-backed under ADR-023 so `SpawnIntent.disk_bytes` budgets `ephemeral-storage` correctly and XFS prjquota telemetry works.)
 
 Rationale: fetchers face the open internet; the threat is a compromised upstream serving an exploit payload. The FOD hash check catches content tampering, but a fetcher that is itself rooted during the fetch (via a curl/git CVE) could pivot to the node. The stricter profile shrinks that surface.
 
