@@ -568,11 +568,11 @@ let
       # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
       # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
       # headroom. Coverage: +2GB for instrumented-image bloat.
-      # diskSize 24GB: Phase-7 controller adds a fixed 9GiB
-      # ephemeral-storage floor (FUSE_CACHE_BUDGET 8Gi + LOG_BUDGET
-      # 1Gi at jobs.rs) on top of SpawnIntent.disk_bytes — every
-      # worker pod requests ≥10GiB. qemu disk image is sparse so the
-      # bump is ~free until builds actually write.
+      # diskSize 24GB: controller adds PoolSpec.fuseCacheBytes (4Gi
+      # via vmtest-full.yaml; prod default 50Gi) + LOG_BUDGET 1Gi on
+      # top of SpawnIntent.disk_bytes (sla.defaultDisk 2Gi) — every
+      # worker pod requests ≥7GiB ephemeral-storage. qemu disk image
+      # is sparse so the bump is ~free until builds actually write.
       virtualisation = {
         memorySize = 8192 + k3sCovMemBump;
         cores = 8;
@@ -605,10 +605,10 @@ let
       # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi
       # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
       # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
-      # diskSize 24GB: see serverNode comment — controller's 9GiB
-      # ephemeral-storage floor means worker pods need ≥10GiB
-      # allocatable; the prior 12GB → ~11GiB allocatable left zero
-      # headroom for fetcher pods (nodeSelector pins them here).
+      # diskSize 24GB: see serverNode comment — worker pods request
+      # ≥7GiB ephemeral-storage (fuseCacheBytes 4Gi + log 1Gi + disk
+      # 2Gi); the prior 12GB → ~11GiB allocatable left zero headroom
+      # for fetcher pods (nodeSelector pins them here).
       virtualisation = {
         memorySize = 6144 + k3sCovMemBump;
         cores = 8;

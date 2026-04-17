@@ -134,6 +134,12 @@ pools:
 poolDefaults:
   enabled: true
   image: rio-builder
+  # 4Gi (prod default 50Gi/10Gi). The reconciler adds this verbatim to
+  # every worker pod's ephemeral-storage request; at 50Gi the request
+  # floor is ≥51Gi, which never fits the 24G node disks below
+  # (~21Gi allocatable) → every builder Unschedulable. Layered nonpriv
+  # overlay inherits via deep-merge.
+  fuseCacheBytes: 4294967296
   # k3s escape hatch. Most scenarios don't care about pod security
   # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;

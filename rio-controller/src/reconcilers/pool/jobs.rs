@@ -451,7 +451,7 @@ pub(super) fn build_job(
     let suffix = intent_suffix(&intent.intent_id);
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
-    apply_intent_resources(&mut pod_spec, pool.spec.kind, intent);
+    apply_intent_resources(&mut pod_spec, pool, intent);
     let mut job = ephemeral_job(
         job_name,
         pool.namespace(),
@@ -490,17 +490,17 @@ pub(super) fn build_job(
 /// bare integers as base-unit and they roundtrip exactly.
 ///
 /// `ephemeral-storage` = `disk_bytes` (overlay writes, from the SLA
-/// model's prjquota fit) + the per-kind FUSE cache budget (input
+/// model's prjquota fit) + the per-pool FUSE cache budget (input
 /// closure, NOT captured by `disk_p90`) + log/scratch headroom. The
-/// FUSE budget is [`pod::fuse_cache_bytes`] — the SAME constant that
+/// FUSE budget is [`pod::fuse_cache_bytes`] — the SAME value that
 /// sets the `fuse-cache` emptyDir sizeLimit, so kubelet's pod-level
 /// sum (writable-layer + logs + disk-backed emptyDirs) cannot exceed
 /// the limit before the volume-level limit fires.
 // r[impl sched.sla.disk-reaches-ephemeral-storage]
-fn apply_intent_resources(pod_spec: &mut PodSpec, kind: ExecutorKind, i: &SpawnIntent) {
+fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) {
     let ephemeral = i
         .disk_bytes
-        .saturating_add(pod::fuse_cache_bytes(kind))
+        .saturating_add(pod::fuse_cache_bytes(pool))
         .saturating_add(LOG_BUDGET_BYTES);
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
         ("cpu".into(), Quantity(i.cores.to_string())),
@@ -858,19 +858,26 @@ mod tests {
 
     /// The `fuse-cache` emptyDir sizeLimit and the FUSE-cache addend in
     /// the container's `ephemeral-storage` limit MUST come from the
-    /// same per-kind constant. Kubelet sums disk-backed emptyDirs
-    /// against the container limit, so a sizeLimit larger than the
-    /// budget evicts on the pod-level limit before the volume cap —
-    /// and `disk_p90` (overlay prjquota only) never learns the input-
+    /// same per-pool value. Kubelet sums disk-backed emptyDirs against
+    /// the container limit, so a sizeLimit larger than the budget
+    /// evicts on the pod-level limit before the volume cap — and
+    /// `disk_p90` (overlay prjquota only) never learns the input-
     /// closure size, so every fresh drv_hash re-climbs the floor.
+    ///
+    /// Third arm: `PoolSpec.fuse_cache_bytes` override is honoured for
+    /// BOTH sites — the 50Gi builder default makes every pod request
+    /// ≥51Gi ephemeral-storage, which is Unschedulable on small-disk
+    /// nodes (k3s VM tests).
     #[test]
     fn fuse_cache_budget_matches_sizelimit() {
         const GI: u64 = 1 << 30;
-        for (kind, expect) in [
-            (ExecutorKind::Builder, pod::BUILDER_FUSE_CACHE_BYTES),
-            (ExecutorKind::Fetcher, pod::FETCHER_FUSE_CACHE_BYTES),
+        for (kind, override_, expect) in [
+            (ExecutorKind::Builder, None, pod::BUILDER_FUSE_CACHE_BYTES),
+            (ExecutorKind::Fetcher, None, pod::FETCHER_FUSE_CACHE_BYTES),
+            (ExecutorKind::Builder, Some(4 * GI), 4 * GI),
         ] {
-            let pool = test_pool("p", kind);
+            let mut pool = test_pool("p", kind);
+            pool.spec.fuse_cache_bytes = override_;
             let job = build_job(
                 &pool,
                 crate::fixtures::oref(&pool),

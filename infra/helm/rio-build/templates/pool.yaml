@@ -29,6 +29,9 @@ spec:
   {{- with $p.deadlineSeconds }}
   deadlineSeconds: {{ . }}
   {{- end }}
+  {{- with $p.fuseCacheBytes }}
+  fuseCacheBytes: {{ . }}
+  {{- end }}
   {{- /* hostUsers rendered for BOTH kinds — k3s containerd needs
          hostUsers:true (cgroup-chown gap); production EKS leaves it
          unset → reconciler defaults to false (ADR-019). NOT CEL-gated

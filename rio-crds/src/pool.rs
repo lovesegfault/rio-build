@@ -221,6 +221,16 @@ pub struct PoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_passthrough: Option<bool>,
 
+    /// `fuse-cache` emptyDir sizeLimit AND the matching addend to the
+    /// container's `ephemeral-storage` request/limit (kubelet sums
+    /// disk-backed emptyDirs against that limit, so the two MUST agree).
+    /// `None` = per-kind default (50Gi builder, 10Gi fetcher). Override
+    /// downward on small-disk clusters (k3s VM tests) where the prod
+    /// default makes every worker pod Unschedulable. Applies to BOTH
+    /// kinds — NOT CEL-gated for Fetcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_cache_bytes: Option<u64>,
+
     /// Timeout (seconds) for the local nix-daemon subprocess when
     /// the client didn't specify `BuildOptions.build_timeout`.
     /// Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
@@ -436,6 +446,7 @@ mod tests {
         assert!(json.contains("localhostProfile"));
         assert!(json.contains("fuseThreads"));
         assert!(json.contains("fusePassthrough"));
+        assert!(json.contains("fuseCacheBytes"));
         assert!(json.contains("daemonTimeoutSecs"));
         assert!(json.contains("deadlineSeconds"));
         assert!(json.contains("nodeSelector"));

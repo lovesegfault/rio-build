@@ -67,29 +67,32 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("nix-var", "/nix/var", None, None),
 ];
 
-/// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
-/// overshoot. No CRD knob: pods are one-shot so the cache never
-/// outlives one build's input closure.
+/// Default FUSE cache emptyDir sizeLimit for builder pods. Kubelet
+/// evicts on overshoot. Pods are one-shot so the cache never outlives
+/// one build's input closure.
 ///
-/// Single source of truth — also added verbatim to the container's
-/// `ephemeral-storage` request/limit by [`super::jobs`]. Kubelet sums
-/// disk-backed emptyDirs against that limit, so a sizeLimit larger
-/// than the budget evicts large-closure builds (chromium/LLVM-class)
-/// on the pod-level limit before the volume-level one fires.
+/// Also added verbatim to the container's `ephemeral-storage`
+/// request/limit by [`super::jobs`]. Kubelet sums disk-backed
+/// emptyDirs against that limit, so a sizeLimit larger than the budget
+/// evicts large-closure builds (chromium/LLVM-class) on the pod-level
+/// limit before the volume-level one fires.
 pub(super) const BUILDER_FUSE_CACHE_BYTES: u64 = 50 * (1 << 30);
 
-/// FUSE cache size for fetchers. FODs are typically small (source
-/// tarballs, git clones) — 10Gi is plenty.
+/// Default FUSE cache size for fetchers. FODs are typically small
+/// (source tarballs, git clones) — 10Gi is plenty.
 pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 10 * (1 << 30);
 
-/// Per-kind FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
+/// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
 /// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift.
-pub(super) fn fuse_cache_bytes(kind: ExecutorKind) -> u64 {
-    match kind {
+/// drift. `PoolSpec.fuse_cache_bytes` overrides the per-kind default —
+/// the prod 50Gi default makes every builder pod request ≥51Gi of
+/// ephemeral-storage, which is Unschedulable on small-disk nodes (k3s
+/// VM tests, ~21Gi allocatable).
+pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
+    pool.spec.fuse_cache_bytes.unwrap_or(match pool.spec.kind {
         ExecutorKind::Builder => BUILDER_FUSE_CACHE_BYTES,
         ExecutorKind::Fetcher => FETCHER_FUSE_CACHE_BYTES,
-    }
+    })
 }
 
 /// Upstream gRPC addresses injected into executor pod env: a
@@ -349,7 +352,7 @@ pub fn build_executor_pod_spec(
                 Volume {
                     name: "fuse-cache".into(),
                     empty_dir: Some(EmptyDirVolumeSource {
-                        size_limit: Some(Quantity(fuse_cache_bytes(pool.spec.kind).to_string())),
+                        size_limit: Some(Quantity(fuse_cache_bytes(pool).to_string())),
                         ..Default::default()
                     }),
                     ..Default::default()
