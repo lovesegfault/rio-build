@@ -64,11 +64,6 @@ pub(crate) const INTENT_ID_ANNOTATION: &str = "rio.build/intent-id";
 /// NameCollision-blocking the re-solved intent forever.
 pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 
-/// ADR-023 ephemeral-storage budget for the FUSE cache emptyDir. Added
-/// to `SpawnIntent.disk_bytes` so the kubelet's disk-pressure eviction
-/// accounts for both the build's overlay writes AND the input-closure
-/// cache. Same 8 GiB as the per-pod cache cap in the SLA model.
-const FUSE_CACHE_BUDGET_BYTES: u64 = 8 * (1 << 30);
 /// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
 /// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
 /// the daemon's own state live outside. 1 GiB headroom.
@@ -425,7 +420,7 @@ pub(super) fn build_job(
     let suffix = intent_suffix(&intent.intent_id);
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
-    apply_intent_resources(&mut pod_spec, intent);
+    apply_intent_resources(&mut pod_spec, pool.spec.kind, intent);
     let mut job = ephemeral_job(
         job_name,
         pool.namespace(),
@@ -462,11 +457,19 @@ pub(super) fn build_job(
 /// `requests == limits` (hard caps, no burst) — ADR-023 §sizing-model.
 /// Quantities rendered as raw byte counts (no SI suffix): k8s parses
 /// bare integers as base-unit and they roundtrip exactly.
+///
+/// `ephemeral-storage` = `disk_bytes` (overlay writes, from the SLA
+/// model's prjquota fit) + the per-kind FUSE cache budget (input
+/// closure, NOT captured by `disk_p90`) + log/scratch headroom. The
+/// FUSE budget is [`pod::fuse_cache_bytes`] — the SAME constant that
+/// sets the `fuse-cache` emptyDir sizeLimit, so kubelet's pod-level
+/// sum (writable-layer + logs + disk-backed emptyDirs) cannot exceed
+/// the limit before the volume-level limit fires.
 // r[impl sched.sla.disk-reaches-ephemeral-storage]
-fn apply_intent_resources(pod_spec: &mut PodSpec, i: &SpawnIntent) {
+fn apply_intent_resources(pod_spec: &mut PodSpec, kind: ExecutorKind, i: &SpawnIntent) {
     let ephemeral = i
         .disk_bytes
-        .saturating_add(FUSE_CACHE_BUDGET_BYTES)
+        .saturating_add(pod::fuse_cache_bytes(kind))
         .saturating_add(LOG_BUDGET_BYTES);
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
         ("cpu".into(), Quantity(i.cores.to_string())),
@@ -800,7 +803,8 @@ mod tests {
         assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
         assert_eq!(
             req["ephemeral-storage"],
-            Quantity(((40 + 8 + 1) * GI).to_string())
+            Quantity(((40 + 50 + 1) * GI).to_string()),
+            "disk_bytes + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
         );
         assert_eq!(
             res.limits.as_ref(),
@@ -819,5 +823,60 @@ mod tests {
             overlay.empty_dir.as_ref().unwrap().size_limit,
             Some(Quantity((60 * GI).to_string()))
         );
+    }
+
+    /// The `fuse-cache` emptyDir sizeLimit and the FUSE-cache addend in
+    /// the container's `ephemeral-storage` limit MUST come from the
+    /// same per-kind constant. Kubelet sums disk-backed emptyDirs
+    /// against the container limit, so a sizeLimit larger than the
+    /// budget evicts on the pod-level limit before the volume cap —
+    /// and `disk_p90` (overlay prjquota only) never learns the input-
+    /// closure size, so every fresh drv_hash re-climbs the floor.
+    #[test]
+    fn fuse_cache_budget_matches_sizelimit() {
+        const GI: u64 = 1 << 30;
+        for (kind, expect) in [
+            (ExecutorKind::Builder, pod::BUILDER_FUSE_CACHE_BYTES),
+            (ExecutorKind::Fetcher, pod::FETCHER_FUSE_CACHE_BYTES),
+        ] {
+            let pool = test_pool("p", kind);
+            let job = build_job(
+                &pool,
+                crate::fixtures::oref(&pool),
+                &test_sched_addrs(),
+                &test_store_addrs(),
+                &SpawnIntent {
+                    intent_id: "abc".into(),
+                    disk_bytes: 5 * GI,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let pod_spec = job
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .unwrap();
+            let fuse = pod_spec
+                .volumes
+                .as_ref()
+                .and_then(|v| v.iter().find(|v| v.name == "fuse-cache"))
+                .and_then(|v| v.empty_dir.as_ref())
+                .and_then(|e| e.size_limit.as_ref())
+                .expect("fuse-cache emptyDir has sizeLimit");
+            assert_eq!(fuse, &Quantity(expect.to_string()), "{kind:?} sizeLimit");
+            let eph = pod_spec.containers[0]
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .map(|l| l["ephemeral-storage"].clone())
+                .unwrap();
+            assert_eq!(
+                eph,
+                Quantity((5 * GI + expect + LOG_BUDGET_BYTES).to_string()),
+                "{kind:?} ephemeral-storage budget must include the SAME \
+                 fuse-cache bytes as the emptyDir sizeLimit"
+            );
+        }
     }
 }

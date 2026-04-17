@@ -70,11 +70,27 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 /// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
 /// overshoot. No CRD knob: pods are one-shot so the cache never
 /// outlives one build's input closure.
-const BUILDER_FUSE_CACHE: &str = "50Gi";
+///
+/// Single source of truth — also added verbatim to the container's
+/// `ephemeral-storage` request/limit by [`super::jobs`]. Kubelet sums
+/// disk-backed emptyDirs against that limit, so a sizeLimit larger
+/// than the budget evicts large-closure builds (chromium/LLVM-class)
+/// on the pod-level limit before the volume-level one fires.
+pub(super) const BUILDER_FUSE_CACHE_BYTES: u64 = 50 * (1 << 30);
 
-/// Default FUSE cache size for fetchers. FODs are typically small
-/// (source tarballs, git clones) — 10Gi is plenty.
-const FETCHER_FUSE_CACHE: &str = "10Gi";
+/// FUSE cache size for fetchers. FODs are typically small (source
+/// tarballs, git clones) — 10Gi is plenty.
+pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 10 * (1 << 30);
+
+/// Per-kind FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
+/// sizeLimit and the `ephemeral-storage` budget addend so they cannot
+/// drift.
+pub(super) fn fuse_cache_bytes(kind: ExecutorKind) -> u64 {
+    match kind {
+        ExecutorKind::Builder => BUILDER_FUSE_CACHE_BYTES,
+        ExecutorKind::Fetcher => FETCHER_FUSE_CACHE_BYTES,
+    }
+}
 
 /// Upstream gRPC addresses injected into executor pod env: a
 /// ClusterIP `addr` for single-channel mode plus an optional
@@ -333,14 +349,7 @@ pub fn build_executor_pod_spec(
                 Volume {
                     name: "fuse-cache".into(),
                     empty_dir: Some(EmptyDirVolumeSource {
-                        size_limit: Some(Quantity(
-                            if fetcher {
-                                FETCHER_FUSE_CACHE
-                            } else {
-                                BUILDER_FUSE_CACHE
-                            }
-                            .into(),
-                        )),
+                        size_limit: Some(Quantity(fuse_cache_bytes(pool.spec.kind).to_string())),
                         ..Default::default()
                     }),
                     ..Default::default()

@@ -735,10 +735,15 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         let msg = status.message.as_deref().unwrap_or("");
         // kubelet's per-pod limit message is "ephemeral local storage"
         // (spaces); the hyphenated "ephemeral-storage" is the resource
-        // NAME and only appears in node-condition messages. Match both.
+        // NAME and only appears in node-condition messages. The
+        // emptyDir-sizeLimit eviction (`emptyDirLimit` in kubelet's
+        // eviction manager) says `Usage of EmptyDir volume "<name>"
+        // exceeds the limit "<N>".` — neither of the above substrings.
+        // Match all three; all should bump the disk floor.
         if msg.contains("DiskPressure")
             || msg.contains("ephemeral-storage")
             || msg.contains("ephemeral local storage")
+            || msg.contains("EmptyDir volume")
         {
             return TerminationReason::EvictedDiskPressure;
         }
@@ -995,6 +1000,18 @@ mod tests {
         // Node-condition DiskPressure eviction.
         assert_eq!(
             pod_termination_reason(&pod_evicted("The node was low on resource: DiskPressure.")),
+            TerminationReason::EvictedDiskPressure
+        );
+        // emptyDir-sizeLimit eviction (kubelet `emptyDirLimit` check —
+        // pkg/kubelet/eviction/helpers.go `emptyDirMessageFmt`). Fires
+        // when the overlay sizeLimit (1.5×disk_bytes) is tighter than
+        // the container's ephemeral-storage limit. Must bump the disk
+        // floor, else the build loops at the same undersized overlay.
+        assert_eq!(
+            pod_termination_reason(&pod_evicted(
+                "Usage of EmptyDir volume \"overlays\" exceeds the limit \
+                 \"8053063680\". "
+            )),
             TerminationReason::EvictedDiskPressure
         );
         // MemoryPressure eviction (node-level, NOT a per-drv signal).
