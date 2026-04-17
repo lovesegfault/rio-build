@@ -56,8 +56,8 @@ use crate::{tofu, ui};
 /// helper's error is just `"{argv}: exit status N"` (stderr is printed
 /// but not in the chain), so the benign-match below would never fire.
 /// First exposed by destroying a cluster that never had the rio chart
-/// installed → no `builderpool` CRD → kubectl exits 1 with "the server
-/// doesn't have a resource type" on stderr → match missed → hard fail.
+/// installed → no `pool` CRD → kubectl exits 1 with "the server doesn't
+/// have a resource type" on stderr → match missed → hard fail.
 async fn k(args: &[&str]) -> Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -163,14 +163,14 @@ pub async fn run() -> Result<()> {
     // strips it (controller will be gone after step 2). Deleting now
     // lets the controller START draining while it's still up — best-
     // effort graceful, not blocking.
-    const POOL_KINDS: &[(&str, &str)] = &[(NS_BUILDERS, "pool"), (NS_FETCHERS, "pool")];
+    const POOL_NAMESPACES: &[&str] = &[NS_BUILDERS, NS_FETCHERS];
     ui::step("delete Pool CRs (non-blocking)", || async {
-        for &(ns, kind) in POOL_KINDS {
+        for &ns in POOL_NAMESPACES {
             k(&[
                 "-n",
                 ns,
                 "delete",
-                kind,
+                "pool",
                 "--all",
                 "--wait=false",
                 "--ignore-not-found",
@@ -212,14 +212,14 @@ pub async fn run() -> Result<()> {
     // delete to complete so step 5's namespace delete doesn't see
     // dangling CRs.
     ui::step("strip pool drain finalizers", || async {
-        for &(ns, kind) in POOL_KINDS {
-            k_patch_all(ns, kind, r#"{"metadata":{"finalizers":[]}}"#).await?;
+        for &ns in POOL_NAMESPACES {
+            k_patch_all(ns, "pool", r#"{"metadata":{"finalizers":[]}}"#).await?;
             k(&[
                 "-n",
                 ns,
                 "wait",
                 "--for=delete",
-                kind,
+                "pool",
                 "--all",
                 "--timeout=120s",
             ])
@@ -403,7 +403,7 @@ mod tests {
     fn benign_covers_missing_crd_and_namespace() {
         // Literal kubectl outputs observed in the field.
         for msg in [
-            r#"error: the server doesn't have a resource type "builderpool""#,
+            r#"error: the server doesn't have a resource type "pool""#,
             "Error from server (NotFound): namespaces \"rio-builders\" not found",
             "error: no matches for kind \"NodeClaim\" in version \"karpenter.sh/v1\"",
             "Unable to connect to the server: dial tcp: lookup B26.gr7.us-east-2.eks.amazonaws.com: no such host",
@@ -413,7 +413,7 @@ mod tests {
         // Real failures must NOT be swallowed.
         for msg in [
             "error: timed out waiting for the condition on nodeclaims",
-            "Error from server (Forbidden): builderpools.rio.build is forbidden",
+            "Error from server (Forbidden): pools.rio.build is forbidden",
         ] {
             assert!(!is_benign_destroy_failure(msg), "must NOT be benign: {msg}");
         }

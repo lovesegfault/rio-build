@@ -53,7 +53,8 @@ struct DispatchTickCtx {
 /// once/dispatch-pass (~once/tick = every 10s would spam).
 ///
 /// Free function (not `&mut self`) so the call site can borrow
-/// `&mut self.freeze_since[kind]` while also reading `self.executors`.
+/// `&mut self.freeze_{builders,fetchers}_since` while also reading
+/// `self.executors`.
 fn check_freeze(
     since: &mut Option<Instant>,
     frozen: bool,
@@ -398,8 +399,12 @@ impl DagActor {
 
             // I-025 freeze detector: WARN if queue pressure + zero
             // streams >60s.
+            let since = match kind {
+                ExecutorKind::Builder => &mut self.freeze_builders_since,
+                ExecutorKind::Fetcher => &mut self.freeze_fetchers_since,
+            };
             check_freeze(
-                self.freeze_since.entry(kind).or_insert(None),
+                since,
                 queued > 0 && total == 0,
                 label,
                 queued,

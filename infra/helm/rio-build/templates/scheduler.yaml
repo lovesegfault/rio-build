@@ -174,7 +174,7 @@ data:
     {{- /* ADR-023 [sla]: scalar block first, then nested tables, then
            array-of-tables — TOML requires tables after the scalars of
            their parent. p50/p90/p99 are optional per-tier. */ -}}
-    {{- with $s.sla }}
+    {{- with required "scheduler.sla mandatory (ADR-023)" $s.sla }}
     [sla]
     cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
     default_tier = {{ .defaultTier | quote }}

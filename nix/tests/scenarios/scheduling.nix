@@ -88,9 +88,8 @@ let
   # cancel-timing: 60×5s echo loop (300s total) — cancelled long
   # before natural end. 300s >> 5s budget: if cgroup-gone passes, the
   # kill DID it (not loop end). Echoes every 5s to feed
-  # RIO_MAX_SILENT_TIME_SECS=10 (set on ALL scheduling workers since
-  # max-silent-time was decoupled from classify routing); a single
-  # 300s silent sleep would TimedOut at ~10s and the cgroup-gone
+  # RIO_MAX_SILENT_TIME_SECS=10 (set on ALL scheduling workers); a
+  # single 300s silent sleep would TimedOut at ~10s and the cgroup-gone
   # assertion would be vacuous (worker reaped it, not CancelBuild).
   cancelDrv = drvs.mkCustom {
     name = "rio-test-sched-cancel-timing";

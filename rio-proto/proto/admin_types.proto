@@ -26,7 +26,6 @@ message ClusterStatusResponse {
   uint32 running_derivations = 7;
   uint64 store_size_bytes = 8;           // Total store usage
   google.protobuf.Timestamp uptime_since = 9;
-  reserved 10;                           // was queued_fod_derivations (D2: FODs go through GetSpawnIntents)
   // Per-system breakdown of queued_derivations (Ready-only, same
   // semantics as the scalar). Sum across all keys == queued_derivations.
   // Pool autoscalers sum the entries matching pool.spec.systems
@@ -54,7 +53,6 @@ message ExecutorInfo {
   ResourceUsage resources = 7;           // (types.proto)
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;
-  reserved 10;                           // was size_class (legacy sizer removed)
   ExecutorKind kind = 11;                // builder or fetcher (build_types.proto)
   bool busy = 12;                        // A build is in flight (P0537: at most one per executor)
 }
@@ -163,7 +161,6 @@ message ReportExecutorTerminationRequest {
   // running at disconnect via its recently_disconnected map.
   string executor_id = 1;
   TerminationReason reason = 2;
-  reserved 3;  // was size_class (D4: resource_floor needs no class label)
 }
 
 message ReportExecutorTerminationResponse {

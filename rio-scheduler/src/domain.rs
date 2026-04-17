@@ -159,8 +159,6 @@ impl From<proto::BuildResult> for BuildResult {
         Self {
             status,
             error_msg: r.error_msg,
-            // `times_built` dropped: scheduler never reads it
-            // (repeat-build counting is gateway-side).
             start_time: r.start_time.and_then(to_system_time),
             stop_time: r.stop_time.and_then(to_system_time),
             built_outputs: r.built_outputs.into_iter().map(Into::into).collect(),

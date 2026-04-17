@@ -7,8 +7,8 @@
 #
 # `mkDrv name script extra` builds `derivation { name; builder=sh;
 # args=["-c" script]; system=currentSystem; } // extra`. Every chain/
-# fanout/sizeclass step is this shape; only the script body and (for
-# ca-chain) extra attrs vary.
+# fanout step is this shape; only the script body and (for ca-chain)
+# extra attrs vary.
 { busybox }:
 rec {
   sh = "${busybox}/bin/sh";

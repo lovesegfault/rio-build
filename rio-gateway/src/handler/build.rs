@@ -929,8 +929,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // r[impl gw.reject.nochroot]
     // Check __noChroot on the BasicDerivation DIRECTLY. validate_dag
     // (called below) checks drv_cache entries, but if the full drv
-    // isn't available (falls back to single_node_from_basic), the drv
-    // is never in the cache → __noChroot check is skipped. The
+    // isn't available (single-node fallback below), the drv is never
+    // in the cache → __noChroot check is skipped. The
     // BasicDerivation wire format DOES include env; we have it here.
     //
     // A malicious client could send __noChroot=1 via wopBuildDerivation
@@ -972,7 +972,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Err(e) => {
             debug!(error = %e, "full derivation not available, using single-node DAG");
             (
-                translate::single_node_from_basic(&drv_path_str, &basic_drv),
+                vec![translate::build_node(&drv_path_str, &basic_drv)],
                 Vec::new(),
             )
         }

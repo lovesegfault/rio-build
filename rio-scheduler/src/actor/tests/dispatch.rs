@@ -1334,12 +1334,7 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 async fn spawn_intent_from_sla_estimator() {
     use crate::sla::{solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    // The actor derives `sla_tiers`/`sla_ceilings` from `cfg.sla` in
-    // `new()`; here we set the actor fields directly so the probe values
-    // below stay independent of the config struct's defaults.
-    actor.sla_config = test_sla_config();
-    actor.sla_ceilings = actor.sla_config.ceilings();
+    let mut actor = bare_actor_sla(db.pool.clone());
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_mvp BestEffort at
     // p̄ capped at max_cores).
@@ -1609,15 +1604,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
 async fn work_assignment_carries_sla_cores() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = test_sla_config();
-    actor.sla_ceilings = actor.sla_config.ceilings();
-    actor.sla_tiers = vec![crate::sla::solve::Tier {
-        name: "normal".into(),
-        p50: None,
-        p90: Some(1200.0),
-        p99: None,
-    }];
+    let mut actor = bare_actor_sla(db.pool.clone());
     // Same Amdahl fit as `spawn_intent_from_sla_estimator` → c*≈1.95 → 2.
     actor.sla_estimator.seed(FittedParams {
         key: ModelKey {

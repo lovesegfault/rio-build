@@ -80,7 +80,8 @@ message BuildProgress {
   uint32 queued = 3;                        // Derivations waiting
   uint32 total = 4;                         // Total derivations
   // Estimated seconds remaining on the critical path (longest chain of
-  // incomplete derivations weighted by ema_duration_secs). Decreases
+  // incomplete derivations; per-node weight from SLA T_min via
+  // critical_path.rs est_duration). Decreases
   // as derivations complete — root's priority drops when a child goes
   // terminal (update_ancestors excludes terminal children from the max).
   // Dashboard (P0278) shows this in the progress column.
@@ -237,7 +238,7 @@ message CompletionReport {
 message BuildResult {
   BuildResultStatus status = 1;
   string error_msg = 2;                    // Non-empty on failure
-  uint64 times_built = 3;                  // Number of times built (for repeat builds)
+  reserved 3;                              // was times_built (repeat builds; scheduler never read it)
   google.protobuf.Timestamp start_time = 4;
   google.protobuf.Timestamp stop_time = 5;
   repeated BuiltOutput built_outputs = 6;  // Realized output paths with hashes
@@ -339,7 +340,6 @@ message HeartbeatRequest {
   repeated string systems = 5;
   repeated string supported_features = 6; // requiredSystemFeatures this executor supports
   reserved 7;                             // was max_builds (P0537: always 1)
-  reserved 8;                             // was size_class (ADR-023: SLA per-drv sizing)
   // FUSE circuit breaker open — executor cannot fetch from store.
   // Scheduler treats like `draining`: `has_capacity()` returns false.
   // Cleared when breaker closes/half-opens. Default false — wire-compatible

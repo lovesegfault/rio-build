@@ -35,8 +35,7 @@ scope: with scope; ''
       # (executor/mod.rs:973) = basename with . → _, so the cgroup
       # name ends "-sched-cancel-timing_drv".
       #
-      # classify() is gone (hard_filter no longer matches size_class)
-      # → cancelDrv can land on ANY worker. Probe all; first hit
+      # cancelDrv can land on ANY worker. Probe all; first hit
       # wins. DelegateSubgroup=builds puts per-build cgroups as
       # SIBLINGS of builds/ under the service cgroup (worker.nix:180).
       # `find -print -quit` stops at first match; `| grep .` fails on

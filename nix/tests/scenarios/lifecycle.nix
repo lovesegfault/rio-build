@@ -82,10 +82,6 @@
 #   patched status, ephemeral.rs:220-228) and the Job-spawn-on-queue path
 #   end-to-end. Subtest deletes the default x86-64 Pool first
 #   so its child pool's reconciler doesn't steal dispatch.
-#
-#   `{bps}-{class}` with sizeClass=class.name + ownerReferences[0]→BPS
-#   + controller=true. Delete BPS → finalizer cleanup explicitly
-#   deletes each child (mod.rs:375), ownerRef GC as fallback.
 {
   pkgs,
   common,

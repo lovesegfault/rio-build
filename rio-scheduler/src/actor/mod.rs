@@ -338,7 +338,8 @@ pub struct DagActor {
     /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
     /// with zero ERROR/WARN while queue_depth{fetcher}=41 and fetcher
     /// streams=0. Per-kind so builder/fetcher freeze independently.
-    freeze_since: HashMap<rio_proto::types::ExecutorKind, Option<Instant>>,
+    freeze_builders_since: Option<Instant>,
+    freeze_fetchers_since: Option<Instant>,
     /// Systems already WARNed as unroutable. Edge-triggers the
     /// `r[sched.dispatch.unroutable-system]` log: WARN once when a
     /// system first has Ready drvs but zero advertising executors;
@@ -439,7 +440,8 @@ impl DagActor {
             hmac_signer: plumbing.hmac_signer,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
-            freeze_since: HashMap::new(),
+            freeze_builders_since: None,
+            freeze_fetchers_since: None,
             unroutable_warned: HashSet::new(),
             dispatch_dirty: false,
             probe_generation: 1,

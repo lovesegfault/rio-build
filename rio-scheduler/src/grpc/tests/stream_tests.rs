@@ -107,7 +107,6 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
                     result: Some(rio_proto::types::BuildResult {
                         status: rio_proto::types::BuildResultStatus::Built.into(),
                         error_msg: String::new(),
-                        times_built: 1,
                         start_time: None,
                         stop_time: None,
                         built_outputs: vec![rio_proto::types::BuiltOutput {

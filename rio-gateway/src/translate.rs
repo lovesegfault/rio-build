@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::{BasicDerivation, Derivation, DerivationLike};
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;
@@ -77,7 +77,7 @@ pub async fn reconstruct_dag(
                      (max {cap}; raise RIO_MAX_TRANSITIVE_INPUTS to allow larger DAGs)"
                 ));
             }
-            nodes.push(derivation_to_node(&drv_path, &drv));
+            nodes.push(build_node(drv_path.as_str(), &drv));
 
             for child_path_str in drv.input_drvs().keys() {
                 edges.push(types::DerivationEdge {
@@ -248,7 +248,7 @@ fn populate_ca_modular_hashes(
 /// env/args reference that placeholder, so dispatch-time resolve must
 /// rewrite it to the realized path.
 ///
-/// `build_node` already set `needs_resolve = has_ca_floating_outputs()`
+/// [`build_node`] already set `needs_resolve = has_ca_floating_outputs()`
 /// (self-floating always resolves). This pass ORs in the any-child-is-
 /// floating-CA case. AFTER BFS so every child drv is in `drv_cache`.
 ///
@@ -332,7 +332,8 @@ pub fn validate_dag(
 
 /// Build the proto `DerivationNode` for any [`DerivationLike`].
 ///
-/// Both [`Derivation`] (full BFS path) and [`BasicDerivation`]
+/// Both [`Derivation`] (full BFS path) and
+/// [`BasicDerivation`](rio_nix::derivation::BasicDerivation)
 /// (single-node fallback) route through here — the
 /// [`DerivationLike`] trait (P0384) unifies the accessor surface so
 /// the struct-literal is written once. Before the trait existed the
@@ -351,7 +352,7 @@ pub fn validate_dag(
 // Both CA kinds: floating (hash_algo set, hash empty) and
 // fixed-output (hash also set). Cutoff applies to either — the
 // output's nar_hash is what gets compared, not the input addressing.
-fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNode {
+pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNode {
     let (output_names, expected_output_paths): (Vec<_>, Vec<_>) = drv
         .outputs()
         .iter()
@@ -406,27 +407,6 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         // drv_cache to look up children's addressing mode.
         needs_resolve: drv.has_ca_floating_outputs(),
     }
-}
-
-/// Create a single-node DAG from a [`BasicDerivation`] (no inputDrvs).
-/// Used as fallback when the full [`Derivation`] is not available.
-///
-/// Wraps the generic `build_node`. `drv_content` stays zeroed — this
-/// is the "full drv not available" fallback; the worker fetches from
-/// store.
-pub fn single_node_from_basic(
-    drv_path: &str,
-    basic_drv: &BasicDerivation,
-) -> Vec<types::DerivationNode> {
-    vec![build_node(drv_path, basic_drv)]
-}
-
-/// Convert a full [`Derivation`] into a proto `DerivationNode`.
-///
-/// Wraps [`build_node`]. `drv_content` is populated AFTER by
-/// [`filter_and_inline_drv`] (batched FindMissingPaths).
-fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
-    build_node(drv_path.as_str(), drv)
 }
 
 /// Inline .drv content into nodes whose outputs are missing from the
@@ -603,6 +583,7 @@ pub fn build_submit_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_nix::derivation::BasicDerivation;
     use std::collections::{BTreeMap, BTreeSet};
 
     use rio_nix::derivation::DerivationOutput;
@@ -636,10 +617,9 @@ mod tests {
     // r[verify sched.ca.detect]
     /// `is_content_addressed` + `is_fixed_output` detection across both
     /// `DerivationLike` impls. Three drv shapes × two source paths
-    /// (`BasicDerivation` via `single_node_from_basic`, full `Derivation`
-    /// via `derivation_to_node`). Both route through `build_node<D>` so the
-    /// matrix proves trait dispatch is correct, not that the builder logic
-    /// differs (it doesn't).
+    /// (`BasicDerivation` fallback, full `Derivation`). Both route through
+    /// `build_node<D>` so the matrix proves trait dispatch is correct, not
+    /// that the builder logic differs (it doesn't).
     ///
     /// Regression guard for the pre-P0388 divergence shape: same proto
     /// field, two hand-rolled struct literals, drift on every
@@ -659,17 +639,17 @@ mod tests {
         #[case] want_ca: bool,
         #[case] want_fod: bool,
     ) -> anyhow::Result<()> {
-        // BasicDerivation path (single_node_from_basic fallback).
+        // BasicDerivation path (single-node fallback).
         let basic = make_basic_drv_with_output(basic_algo, hash)?;
-        let nodes = single_node_from_basic("/nix/store/test.drv", &basic);
-        assert_eq!(nodes[0].is_content_addressed, want_ca, "basic: is_ca");
-        assert_eq!(nodes[0].is_fixed_output, want_fod, "basic: strict is_fod");
+        let node = build_node("/nix/store/test.drv", &basic);
+        assert_eq!(node.is_content_addressed, want_ca, "basic: is_ca");
+        assert_eq!(node.is_fixed_output, want_fod, "basic: strict is_fod");
 
-        // Full Derivation path (derivation_to_node via ATerm parse).
+        // Full Derivation path (via ATerm parse).
         let aterm = format!(
             r#"Derive([("out","/nix/store/aaa-out","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
         );
-        let node = derivation_to_node(&sp(&test_drv_path("ca-test")), &Derivation::parse(&aterm)?);
+        let node = build_node(&test_drv_path("ca-test"), &Derivation::parse(&aterm)?);
         assert_eq!(node.is_content_addressed, want_ca, "full: is_ca");
         assert_eq!(node.is_fixed_output, want_fod, "full: strict is_fod");
         Ok(())
@@ -697,10 +677,9 @@ mod tests {
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
         let drv = make_basic_drv(env)?;
 
-        let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
-        assert_eq!(nodes.len(), 1);
+        let node = build_node("/nix/store/test.drv", &drv);
         assert_eq!(
-            nodes[0].required_features,
+            node.required_features,
             vec!["kvm".to_string(), "big-parallel".to_string()],
             "requiredSystemFeatures should be extracted from BasicDerivation env"
         );
@@ -761,9 +740,8 @@ mod tests {
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {
         let drv = make_basic_drv(BTreeMap::new())?;
-        let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
-        assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].required_features.is_empty());
+        let node = build_node("/nix/store/test.drv", &drv);
+        assert!(node.required_features.is_empty());
         Ok(())
     }
 
@@ -777,23 +755,23 @@ mod tests {
         env.insert("pname".into(), "hello".into());
         env.insert("name".into(), "hello-2.12".into());
         let drv = make_basic_drv(env)?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
-        assert_eq!(nodes[0].pname, "hello", "pname preferred over name");
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname, "hello", "pname preferred over name");
 
         // name fallback when pname absent (raw derivation{} case).
         let mut env = BTreeMap::new();
         env.insert("name".into(), "rawbuild-1.0".into());
         let drv = make_basic_drv(env)?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/x.drv", &drv);
         assert_eq!(
-            nodes[0].pname, "rawbuild-1.0",
+            node.pname, "rawbuild-1.0",
             "name fallback — less stable (includes version) but beats empty"
         );
 
         // neither → empty (no build_samples key possible).
         let drv = make_basic_drv(BTreeMap::new())?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
-        assert_eq!(nodes[0].pname, "");
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname, "");
 
         Ok(())
     }
@@ -810,10 +788,10 @@ mod tests {
         env.insert("enableParallelBuilding".into(), "1".into());
         env.insert("preferLocalBuild".into(), "true".into());
         let drv = make_basic_drv(env)?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
-        assert_eq!(nodes[0].version.as_deref(), Some("2.12"));
-        assert_eq!(nodes[0].enable_parallel_building, Some(true));
-        assert_eq!(nodes[0].prefer_local_build, Some(true));
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.version.as_deref(), Some("2.12"));
+        assert_eq!(node.enable_parallel_building, Some(true));
+        assert_eq!(node.prefer_local_build, Some(true));
 
         // Explicit false: "" and "false" both → Some(false), distinct
         // from absent. enableParallelBuilding="" is how older stdenv
@@ -822,9 +800,9 @@ mod tests {
         env.insert("enableParallelBuilding".into(), "".into());
         env.insert("preferLocalBuild".into(), "false".into());
         let drv = make_basic_drv(env)?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
-        assert_eq!(nodes[0].enable_parallel_building, Some(false));
-        assert_eq!(nodes[0].prefer_local_build, Some(false));
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.enable_parallel_building, Some(false));
+        assert_eq!(node.prefer_local_build, Some(false));
         Ok(())
     }
 
@@ -838,13 +816,13 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
-        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
-        assert_eq!(nodes[0].version, None);
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.version, None);
         assert_eq!(
-            nodes[0].enable_parallel_building, None,
+            node.enable_parallel_building, None,
             "absent ≠ false: None means explore, Some(false) means fix p̄=1"
         );
-        assert_eq!(nodes[0].prefer_local_build, None);
+        assert_eq!(node.prefer_local_build, None);
         Ok(())
     }
 
@@ -1064,8 +1042,8 @@ mod tests {
         cache.insert(missing_path.clone(), missing_drv.clone());
 
         let mut nodes = vec![
-            derivation_to_node(&cached_path, &cached_drv),
-            derivation_to_node(&missing_path, &missing_drv),
+            build_node(cached_path.as_str(), &cached_drv),
+            build_node(missing_path.as_str(), &missing_drv),
         ];
 
         // Pre: both empty.
@@ -1108,7 +1086,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(drv_path.clone(), drv.clone());
 
-        let mut nodes = vec![derivation_to_node(&drv_path, &drv)];
+        let mut nodes = vec![build_node(drv_path.as_str(), &drv)];
 
         // Dead store — FindMissingPaths will fail.
         let mut dead_store = unreachable_store();
@@ -1124,13 +1102,13 @@ mod tests {
     }
 
     /// Empty expected_output_paths → nothing to gate on → skip.
-    /// (single_node_from_basic fallback has no expected outputs.)
+    /// (BasicDerivation single-node fallback has no expected outputs.)
     #[tokio::test]
     async fn test_filter_and_inline_drv_no_expected_outputs_skips() {
         let mut dead_store = unreachable_store();
         let cache = HashMap::new();
 
-        // Node with no expected_output_paths (like single_node_from_basic).
+        // Node with no expected_output_paths (like the single-node fallback).
         let mut nodes = vec![types::DerivationNode {
             drv_path: test_drv_path("x"),
             drv_hash: "x".into(),
@@ -1171,9 +1149,9 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(ca_path.clone(), ca_drv.clone());
 
-        // derivation_to_node produces expected_output_paths=[""] for
+        // build_node produces expected_output_paths=[""] for
         // the floating-CA output (DerivationOutput::path() = "").
-        let mut nodes = vec![derivation_to_node(&ca_path, &ca_drv)];
+        let mut nodes = vec![build_node(ca_path.as_str(), &ca_drv)];
         assert_eq!(
             nodes[0].expected_output_paths,
             vec![String::new()],
@@ -1221,8 +1199,8 @@ mod tests {
         cache.insert(ca_path.clone(), ca_drv.clone());
 
         let mut nodes = vec![
-            derivation_to_node(&ia_path, &ia_drv),
-            derivation_to_node(&ca_path, &ca_drv),
+            build_node(ia_path.as_str(), &ia_drv),
+            build_node(ca_path.as_str(), &ca_drv),
         ];
 
         filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
@@ -1333,10 +1311,10 @@ mod tests {
         drv_cache.insert(ia_pure_path.clone(), ia_pure.clone());
 
         let mut nodes = vec![
-            derivation_to_node(&ca_child_path, &ca_child),
-            derivation_to_node(&ia_child_path, &ia_child),
-            derivation_to_node(&ia_parent_path, &ia_parent),
-            derivation_to_node(&ia_pure_path, &ia_pure),
+            build_node(ca_child_path.as_str(), &ca_child),
+            build_node(ia_child_path.as_str(), &ia_child),
+            build_node(ia_parent_path.as_str(), &ia_parent),
+            build_node(ia_pure_path.as_str(), &ia_pure),
         ];
 
         // build_node already set needs_resolve from self.

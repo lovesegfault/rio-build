@@ -769,7 +769,7 @@ pub(crate) async fn report_termination(
 /// `[sla]` config for tests that exercise the solve/explore branch
 /// with realistic ceilings (the `SlaConfig::test_default()` ceilings
 /// are tiny — sized for VM-test pools). One tier, probe = 4c, 64-core
-/// / 256 GiB / 200 GiB ceilings (the former `DEFAULT_CEILINGS`).
+/// / 256 GiB / 200 GiB ceilings.
 pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
     use crate::sla::{config, solve};
     config::SlaConfig {

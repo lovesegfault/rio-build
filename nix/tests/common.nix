@@ -262,7 +262,7 @@ rec {
       memorySize ? 1024,
       diskSize ? 4096,
       # Merged into services.rio.scheduler via // — e.g. extraConfig +
-      # tickIntervalSecs for size-class TOML routing.
+      # tickIntervalSecs for [sla] TOML.
       extraSchedulerConfig ? { },
       # Merged into services.rio.store via // — e.g. extraConfig for
       # [chunk_backend] TOML.

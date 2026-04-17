@@ -43,7 +43,7 @@ in
   # services. For scenarios/observability.nix.
   withOtel ? false,
 
-  # Pass-through to mkControlNode (size-class TOML, tick interval, etc).
+  # Pass-through to mkControlNode ([sla] TOML, tick interval, etc).
   extraSchedulerConfig ? { },
   extraStoreConfig ? { },
   extraPackages ? [ ],

@@ -261,7 +261,6 @@ pub(super) async fn collect_outputs(
                 proto_result: ProtoBuildResult {
                     status: BuildResultStatus::Built.into(),
                     error_msg: String::new(),
-                    times_built: build_result.times_built,
                     start_time: to_proto_ts(build_result.start_time),
                     stop_time: to_proto_ts(build_result.stop_time),
                     built_outputs,

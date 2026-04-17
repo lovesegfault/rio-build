@@ -1902,8 +1902,8 @@ impl DagActor {
         // at-cap floor-reason counting (`floor_outcome.counted`). The
         // increment here covers NON-floor-reason infra (FUSE EIO,
         // store unreachable, …) AND the cgroup-OOM cold-start case
-        // (`{promoted:false, counted:false}` — Static-mode, est=None,
-        // floor=0). Without the `!counted` guard the at-cap cgroup-OOM
+        // (`{promoted:false, counted:false}` — est=None, floor=0).
+        // Without the `!counted` guard the at-cap cgroup-OOM
         // path was double-counted (bump + here) → poisoned at half the
         // configured `max_infra_retries`.
         if !exempt_from_cap {
