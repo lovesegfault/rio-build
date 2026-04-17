@@ -14,7 +14,7 @@ service ExecutorService {
   // Bidirectional stream for build execution.
   // Scheduler sends: WorkAssignment, CancelSignal, PrefetchHint
   // Executor sends: ExecutorRegister (first), then WorkAssignmentAck,
-  //   BuildLogBatch, CompletionReport, ProgressUpdate
+  //   BuildLogBatch, CompletionReport
   // The first message MUST be ExecutorRegister{executor_id} — the scheduler
   // uses this to associate the stream with the executor's identity.
   rpc BuildExecution(stream rio.types.ExecutorMessage) returns (stream rio.types.SchedulerMessage);

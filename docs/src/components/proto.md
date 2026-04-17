@@ -133,11 +133,11 @@ The `BuildExecution` RPC replaces the previous `PullWork` + `ReportCompletion` d
 
 ```protobuf
 message ExecutorMessage {
+  reserved 4;                         // was ProgressUpdate
   oneof msg {
     WorkAssignmentAck ack = 1;       // Executor confirms receipt of assignment
     BuildLogBatch log_batch = 2;      // Batched log lines (not per-line)
     CompletionReport completion = 3;  // Build result
-    ProgressUpdate progress = 4;      // Resource usage, build phase
     ExecutorRegister register = 5;    // First message on BuildExecution stream:
                                       //   executor_id identity. Scheduler reads this
                                       //   to associate stream + heartbeat by same ID.

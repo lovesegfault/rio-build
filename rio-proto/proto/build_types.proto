@@ -12,7 +12,6 @@ import "google/protobuf/timestamp.proto";
 import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
                       // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
 import "types.proto"; // HeartbeatRequest → ResourceUsage;
-                      // ProgressUpdate → ResourceUsage;
                       // BuildResult.status → BuildResultStatus
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -112,20 +111,12 @@ message BuildCancelled {
 
 // Executor -> Scheduler messages on the BuildExecution stream.
 message ExecutorMessage {
+  reserved 4;  // was ProgressUpdate (mid-build ema; consumer removed with legacy sizer)
   oneof msg {
     WorkAssignmentAck ack = 1;              // Executor confirms receipt of assignment
     BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
     BuildPhase phase = 7;                   // Build phase change (forwarded resSetPhase)
-    // Mid-build resource sample (memory.peak so far). Proactive ema:
-    // scheduler captures peak memory BEFORE completion so the
-    // next submit of that drv is right-sized without waiting for an
-    // OOM→retry cycle. Emitted every 10s by the executor's build task.
-    // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
-    // never triggers kill/migrate. Field 4 restored from 190a5060
-    // (same type/name, wire-compatible); the "needs checkpoint first"
-    // blocker applied to preemption, not to advisory ema.
-    ProgressUpdate progress = 4;
     ExecutorRegister register = 5;          // First message: identifies the executor
     PrefetchComplete prefetch_complete = 6; // Warm-gate ACK: FUSE cache warmed the hinted paths
   }
@@ -234,12 +225,11 @@ message CompletionReport {
 
   // Final cgroup-poll snapshot at completion time. Carries the ADR-023
   // telemetry (cpu_limit_cores, cpu_seconds_total, peak_io_pressure_pct,
-  // peak_disk_bytes) that otherwise only flows on the ProgressUpdate
-  // side-channel. The scheduler's completion handler reads THIS — not
-  // the last ProgressUpdate — when writing build_samples (ProgressUpdate
-  // is best-effort/droppable; CompletionReport is not). Does NOT carry
-  // peak memory/cpu — fields 4/6 above remain the only source for
-  // those (memory_used_bytes here is memory.current, near-zero post-exit).
+  // peak_disk_bytes) — the scheduler's completion handler reads this
+  // when writing build_samples. This is the ONLY telemetry channel
+  // (CompletionReport is not droppable). Does NOT carry peak memory/cpu
+  // — fields 4/6 above remain the only source for those
+  // (memory_used_bytes here is memory.current, near-zero post-exit).
   optional ResourceUsage final_resources = 8;
 }
 
@@ -330,13 +320,6 @@ message PrefetchHint {
 message PrefetchComplete {
   uint32 paths_fetched = 1;              // How many hint paths were actually fetched
   uint32 paths_cached = 2;               // How many were already in FUSE cache (0 for fresh executor)
-}
-
-// Executor progress update (resource usage, current build phase).
-message ProgressUpdate {
-  string drv_path = 1;                   // Which derivation this is for
-  ResourceUsage resources = 2;           // Current resource consumption (types.proto)
-  string build_phase = 3;               // e.g. "unpackPhase", "buildPhase", "installPhase"
 }
 
 // ───────────────────────────────────────────────────────────────────────────

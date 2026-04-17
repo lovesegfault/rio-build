@@ -3,6 +3,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true);
 
+    // CompletionReport (~312B) dwarfs the other ExecutorMessage oneof
+    // arms (~80B). Generated code; boxing would ripple through every
+    // construction/match site for a stack-slot win we don't need on
+    // this stream's hot path.
+    b = b.type_attribute(
+        "rio.types.ExecutorMessage.msg",
+        "#[allow(clippy::large_enum_variant)]",
+    );
+
     // Derive `serde::Serialize` on the admin-facing response types so
     // rio-cli can `serde_json::to_string_pretty(&resp)` directly instead
     // of hand-rolling per-subcommand `*Json` projection structs.

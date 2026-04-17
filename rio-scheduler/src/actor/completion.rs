@@ -1372,9 +1372,7 @@ impl DagActor {
                         peak_memory_bytes: peak_memory_bytes.min(i64::MAX as u64) as i64,
                         peak_cpu_cores: peak_cpu,
                         // ADR-023 cgroup telemetry: builder attaches its
-                        // final ResourceUsage snapshot to CompletionReport
-                        // (NOT the last ProgressUpdate — those are
-                        // best-effort/droppable; CompletionReport isn't).
+                        // final ResourceUsage snapshot to CompletionReport.
                         // None → old executor → NULL columns; SLA fit
                         // tolerates them.
                         cpu_limit_cores: final_res.and_then(|r| r.cpu_limit_cores),

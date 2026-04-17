@@ -175,12 +175,6 @@ impl ExecutorService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::executor_message::Msg::Progress(_) => {
-                            // ADR-023 SLA sizing reads cgroup telemetry
-                            // from CompletionReport.final_resources, not
-                            // mid-build Progress. The arm stays for
-                            // protocol compat (worker still sends it).
-                        }
                         rio_proto::types::executor_message::Msg::Phase(phase) => {
                             // Same try_send semantics as ForwardLogBatch:
                             // a dropped phase update is cosmetic (nom
