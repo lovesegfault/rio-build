@@ -162,11 +162,6 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .unwrap_or(i32::MAX);
 
     // ---- Spawn decision ----
-    // Attempt every intent up to `headroom`. Dedup is structural:
-    // `intent_suffix(drv_hash)` is deterministic, so a re-polled
-    // still-Ready intent re-creates the SAME Job name and the
-    // apiserver's NameCollision is a debug-logged no-op.
-    //
     // We do NOT subtract `active`: `queued` counts only Ready intents
     // but `active` counts ALL non-terminal Jobs (incl. Running, whose
     // drvs have left the Ready set). Under per-size-class pools that
@@ -174,7 +169,6 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // bounded by the slowest build, so `queued.sub(active)` starved
     // new Ready drvs for hours (bug_045). `ceiling = None` → uncapped.
     let headroom = ceiling.map_or(usize::MAX, |c| c.saturating_sub(active).max(0) as usize);
-    let to_spawn_intents = &intents[..headroom.min(intents.len())];
 
     // ---- Reap stale Jobs blocking respawn ----
     // (a) Terminal: a drv that re-enters Ready after its prior Job
@@ -203,6 +197,27 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .filter(|n| !reaped.contains(n))
         .collect();
 
+    // Filter-existing BEFORE truncate: `headroom = ceiling - active`
+    // already accounts for still-Pending Jobs, but those Jobs' drvs
+    // (still Ready, not yet heartbeated) ALSO appear in `intents`. A
+    // positional `intents[..headroom]` slice spent slots on them then
+    // skipped them in `spawn_for_each` — new intents past index
+    // `headroom` were never considered even with free slots. Intents
+    // are scheduler-side priority-sorted, so `take(headroom)` over
+    // genuinely-new work drops lowest-priority, not HashMap-order.
+    let to_spawn_intents: Vec<SpawnIntent> = intents
+        .iter()
+        .filter(|i| {
+            !existing_names.contains(&pod::job_name(
+                &name,
+                pool.spec.kind,
+                &intent_suffix(&i.intent_id),
+            ))
+        })
+        .take(headroom)
+        .cloned()
+        .collect();
+
     // One pod per intent with that intent's resources + annotation.
     // Headroom truncates; the remainder is picked up next tick after
     // `active` decreases. Under mandatory `[sla]` (Phase 5) the
@@ -210,7 +225,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // queue → spawns nothing.
     spawn_for_each(
         &jobs_api,
-        to_spawn_intents,
+        &to_spawn_intents,
         &existing_names,
         &name,
         |intent| build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent),
@@ -218,6 +233,22 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     .await;
     if to_spawn_intents.is_empty() {
         debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
+    } else {
+        // Ack to the scheduler so it arms the Pending-watch
+        // (ICE-backoff) timer ONLY for intents we created Jobs for.
+        // GetSpawnIntents is read-only; without this ack the timer
+        // never arms. Best-effort: a dropped ack means delayed ICE
+        // detection (next spawn re-acks), not a false mark.
+        if let Err(e) = ctx
+            .admin
+            .clone()
+            .ack_spawned_intents(rio_proto::types::AckSpawnedIntentsRequest {
+                spawned: to_spawn_intents,
+            })
+            .await
+        {
+            warn!(pool = %name, error = %e, "ack_spawned_intents failed; ICE-timer not armed this tick");
+        }
     }
 
     // ---- Reap excess Pending ----

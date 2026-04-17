@@ -235,34 +235,89 @@ impl DagActor {
             // before the pod heartbeats, the match misses and dispatch
             // falls through to pick-from-queue.
             let intent = self.solve_intent_for(state);
-            // ADR-023 §2.8: arm the Pending-watch the FIRST time a
-            // band-targeted selector is emitted for this drv.
-            // or_insert keeps the original timestamp across re-emits
-            // (snapshot runs each tick). Band-agnostic intents don't
-            // enter the ladder.
-            if let Some((band, cap)) = crate::sla::cost::parse_selector(&intent.node_selector) {
-                self.pending_intents.entry(drv_hash.into()).or_insert((
-                    band,
-                    cap,
-                    std::time::Instant::now(),
-                ));
-            }
-            intents.push(rio_proto::types::SpawnIntent {
-                intent_id: drv_hash.to_string(),
-                cores: intent.cores,
-                mem_bytes: intent.mem_bytes,
-                disk_bytes: intent.disk_bytes,
-                node_selector: intent.node_selector.into_iter().collect(),
-                kind: kind.into(),
-                system: state.system.clone(),
-                required_features: state.required_features.clone(),
-                deadline_secs: intent.deadline_secs,
-            });
+            // ADR-023 §2.8 selector pin: if a Pending-watch entry
+            // already exists for this drv (controller acked a spawn),
+            // REUSE its `(band, cap)` for the returned selector instead
+            // of the freshly-solved one. `solve_full`'s softmax re-rolls
+            // on every poll (default temp=0.3 → ~15% per-tick flip);
+            // without the pin the controller's `reap_stale_for_intents`
+            // sees fingerprint drift and reap-respawns a still-Pending
+            // Job each tick. The ICE-timeout sweep DROPS the entry, so
+            // a deliberate re-solve (excluding the marked cell) flows
+            // through unpinned and the reaper correctly replaces the
+            // stale Pending Job.
+            //
+            // Read-only: this method NEVER writes `pending_intents`
+            // (the timer is armed by `handle_ack_spawned_intents` only
+            // for intents the controller actually created Jobs for —
+            // see that method for why arm-on-emit was wrong).
+            let node_selector = self
+                .pending_intents
+                .get(drv_hash)
+                .map(|e| crate::sla::cost::selector_for(e.0, e.1))
+                .unwrap_or(intent.node_selector);
+            intents.push((
+                state.sched.priority,
+                rio_proto::types::SpawnIntent {
+                    intent_id: drv_hash.to_string(),
+                    cores: intent.cores,
+                    mem_bytes: intent.mem_bytes,
+                    disk_bytes: intent.disk_bytes,
+                    node_selector: node_selector.into_iter().collect(),
+                    kind: kind.into(),
+                    system: state.system.clone(),
+                    required_features: state.required_features.clone(),
+                    deadline_secs: intent.deadline_secs,
+                },
+            ));
         }
 
+        // Priority-sort (critical-path first): `dag.iter_nodes()` is
+        // HashMap-order, but the controller truncates to `[..headroom]`
+        // under `maxConcurrent`. Unsorted, a high-priority large drv
+        // past the prefix gets no pod and fails resource-fit on the
+        // small ones spawned for low-priority work (large→small can't
+        // overflow; small→large can). Descending so the prefix is the
+        // work whose pods matter most.
+        intents.sort_unstable_by(|(a, _), (b, _)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         SpawnIntentsSnapshot {
-            intents,
+            intents: intents.into_iter().map(|(_, i)| i).collect(),
             queued_by_system,
+        }
+    }
+
+    /// Arm the Pending-watch for intents the controller just created
+    /// Jobs for. Separated from [`Self::compute_spawn_intents`] so that
+    /// RPC stays a pure read:
+    ///
+    ///  - dashboard/CLI/ComponentScaler polls of `GetSpawnIntents` no
+    ///    longer mutate scheduler state;
+    ///  - intents the controller TRUNCATES under `maxConcurrent` are
+    ///    not armed — under sustained saturation those would never
+    ///    heartbeat, so arm-on-emit false-marked their `(band, cap)`
+    ///    cells ICE every `hw_fallback_after_secs` until the solve
+    ///    degraded to band-agnostic.
+    ///
+    /// `insert` (not `or_insert`): a re-ack after ICE-timeout reap →
+    /// respawn lands the NEW `(band, cap)` and a fresh timestamp. The
+    /// controller's filter-existing-before-truncate means an
+    /// already-spawned still-Pending intent isn't re-acked, so this
+    /// doesn't reset a live timer.
+    pub(super) fn handle_ack_spawned_intents(&self, spawned: &[rio_proto::types::SpawnIntent]) {
+        let now = std::time::Instant::now();
+        for i in spawned {
+            let sel: std::collections::BTreeMap<_, _> = i
+                .node_selector
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Some((band, cap)) = crate::sla::cost::parse_selector(&sel) {
+                self.pending_intents
+                    .insert(i.intent_id.clone().into(), (band, cap, now));
+            }
         }
     }
 

@@ -251,14 +251,19 @@ pub struct DagActor {
     /// marked cells; the Pending-watch marks them. Arc so the snapshot
     /// path (`&self`) and housekeeping (`&mut self`) share one map.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
-    /// Pending-watch ledger: `drv_hash → (band, cap, first_emitted)`.
-    /// `solve_intent_for` records when it first emits a band-targeted
-    /// SpawnIntent for a Ready drv; `handle_heartbeat` removes when a
-    /// pod with `intent_id == drv_hash` checks in. Housekeeping sweeps
-    /// entries past `hw_fallback_after_secs` → [`ice`](Self::ice)
-    /// `.mark(band, cap)` and removes (next snapshot re-solves
-    /// excluding the cell). DashMap because `solve_intent_for` is
-    /// `&self` (admin-snapshot path).
+    /// Pending-watch ledger: `drv_hash → (band, cap, armed_at)`.
+    /// Inserted by `handle_ack_spawned_intents` when the CONTROLLER
+    /// confirms it created a Job for a band-targeted intent (NOT at
+    /// emit time — `compute_spawn_intents` is read-only so dashboard
+    /// polls and headroom-gated intents don't false-arm).
+    /// `compute_spawn_intents` LOOKS UP entries to pin the returned
+    /// selector across re-emits (softmax re-roll would otherwise drift
+    /// it and trip the controller's selector-drift reaper).
+    /// `handle_heartbeat` removes when the pod checks in. Housekeeping
+    /// sweeps entries past `hw_fallback_after_secs` →
+    /// [`ice`](Self::ice) `.mark(band, cap)` and removes (next snapshot
+    /// re-solves excluding the cell). DashMap because the snapshot
+    /// lookup is `&self`.
     pub(crate) pending_intents:
         dashmap::DashMap<DrvHash, (crate::sla::cost::Band, crate::sla::cost::Cap, Instant)>,
     /// Tick counter for periodic tasks that run less often than every
@@ -600,6 +605,9 @@ impl DagActor {
                 } => {
                     let promoted = self.handle_executor_termination(&executor_id, reason).await;
                     let _ = reply.send(promoted);
+                }
+                ActorCommand::AckSpawnedIntents { spawned } => {
+                    self.handle_ack_spawned_intents(&spawned);
                 }
                 ActorCommand::PrefetchComplete {
                     executor_id,

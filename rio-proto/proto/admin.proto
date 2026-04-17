@@ -95,6 +95,13 @@ service AdminService {
   // ComponentScaler reads `queued_by_system`.
   rpc GetSpawnIntents(rio.types.GetSpawnIntentsRequest) returns (rio.types.GetSpawnIntentsResponse);
 
+  // Controller reports which SpawnIntents it actually created Jobs for
+  // this tick. Arms the scheduler's Pending-watch (ICE-backoff) timer
+  // for each — separated from GetSpawnIntents so that RPC stays
+  // read-only (dashboard/CLI polls don't arm) and so headroom-gated
+  // intents the controller truncates aren't falsely marked ICE.
+  rpc AckSpawnedIntents(rio.types.AckSpawnedIntentsRequest) returns (google.protobuf.Empty);
+
   // ─── ADR-023 SLA overrides ────────────────────────────────────────
 
   // Pin a (pname, system?, tenant?) key to a forced tier / cores / mem,

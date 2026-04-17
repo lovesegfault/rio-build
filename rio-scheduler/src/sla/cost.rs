@@ -440,6 +440,17 @@ fn parse_band_cap(s: &str) -> Option<(Band, Cap)> {
     Some((band, cap))
 }
 
+/// Build the `(band, cap)` nodeSelector — inverse of
+/// [`parse_selector`]. Same shape as
+/// [`super::solve::Candidate::selector`] but usable from a bare
+/// `(Band, Cap)` (the Pending-watch pin reuses this on re-emit).
+pub fn selector_for(band: Band, cap: Cap) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        ("rio.build/hw-band".into(), band.label().into()),
+        ("karpenter.sh/capacity-type".into(), cap.label().into()),
+    ])
+}
+
 /// Recover `(Band, Cap)` from a [`super::solve::Candidate::selector`]
 /// nodeSelector. `None` for band-agnostic selectors (`solve_mvp` /
 /// `BestEffort` paths). Used by the actor's Pending-watch to map a

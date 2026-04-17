@@ -1570,8 +1570,8 @@ async fn spawn_intent_node_selector_from_solve_full() {
         fitted.node_selector
     );
     assert!(
-        actor.pending_intents.contains_key("fitted"),
-        "Pending-watch armed on first emit"
+        !actor.pending_intents.contains_key("fitted"),
+        "compute_spawn_intents is read-only: Pending-watch NOT armed on emit"
     );
 
     let cold = snap.intents.iter().find(|i| i.intent_id == "cold").unwrap();
@@ -1580,6 +1580,50 @@ async fn spawn_intent_node_selector_from_solve_full() {
         "no fit → band-agnostic intent_for path"
     );
     assert!(!actor.pending_intents.contains_key("cold"));
+
+    // Ack arms it; band-agnostic ack is ignored.
+    actor.handle_ack_spawned_intents(&snap.intents);
+    assert!(
+        actor.pending_intents.contains_key("fitted"),
+        "Pending-watch armed on controller ack"
+    );
+    assert!(
+        !actor.pending_intents.contains_key("cold"),
+        "band-agnostic selector → ack ignored (no ICE ladder)"
+    );
+
+    // Selector pin: a re-emit reuses the acked (band, cap) — overwrite
+    // the entry to a sentinel cell and assert the next snapshot
+    // returns THAT, not a fresh solve_full pick.
+    actor.pending_intents.insert(
+        "fitted".into(),
+        (
+            cost::Band::Hi,
+            cost::Cap::OnDemand,
+            std::time::Instant::now(),
+        ),
+    );
+    let snap2 = actor.compute_spawn_intents(&Default::default());
+    let fitted2 = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "fitted")
+        .unwrap();
+    assert_eq!(
+        fitted2
+            .node_selector
+            .get("rio.build/hw-band")
+            .map(String::as_str),
+        Some("hi"),
+        "re-emit reuses pinned selector, not fresh softmax roll"
+    );
+    assert_eq!(
+        fitted2
+            .node_selector
+            .get("karpenter.sh/capacity-type")
+            .map(String::as_str),
+        Some("on-demand"),
+    );
 
     // Gate: hw_cost_source unset → solve_full skipped even with hw table.
     actor.sla_config.hw_cost_source = None;

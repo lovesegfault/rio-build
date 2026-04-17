@@ -27,9 +27,9 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
-    AppendInterruptSampleRequest, BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse,
-    ClusterStatusResponse, CreateTenantRequest, CreateTenantResponse, DebugExecutorState,
-    DebugListExecutorsResponse, DrainExecutorRequest, DrainExecutorResponse,
+    AckSpawnedIntentsRequest, AppendInterruptSampleRequest, BuildLogChunk, ClearPoisonRequest,
+    ClearPoisonResponse, ClusterStatusResponse, CreateTenantRequest, CreateTenantResponse,
+    DebugExecutorState, DebugListExecutorsResponse, DrainExecutorRequest, DrainExecutorResponse,
     ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
     GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
     ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
@@ -497,6 +497,29 @@ impl AdminService for AdminServiceImpl {
         self.check_actor_alive()?;
         let resp = spawn_intents::get_spawn_intents(&self.actor, request.into_inner()).await?;
         Ok(Response::new(resp))
+    }
+
+    /// Controller acked it created Jobs for these intents → arm the
+    /// Pending-watch (ICE-backoff) timer for each band-targeted one.
+    /// Fire-and-forget: a dropped ack means delayed ICE detection,
+    /// not a false mark, so `send_unchecked` is correct under
+    /// backpressure.
+    #[instrument(skip(self, request), fields(rpc = "AckSpawnedIntents"))]
+    async fn ack_spawned_intents(
+        &self,
+        request: Request<AckSpawnedIntentsRequest>,
+    ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        self.actor
+            .send_unchecked(ActorCommand::AckSpawnedIntents {
+                spawned: req.spawned,
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
     }
 
     /// Actor in-memory DAG snapshot for a build — the exact view

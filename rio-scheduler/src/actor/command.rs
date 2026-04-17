@@ -174,6 +174,19 @@ pub enum ActorCommand {
         reply: oneshot::Sender<bool>,
     },
 
+    /// Controller acked it created Jobs for these intents → arm the
+    /// Pending-watch (ICE-backoff) timer for each band-targeted one.
+    /// Separated from `GetSpawnIntents` so that path stays read-only:
+    /// dashboard/CLI polls and headroom-gated intents the controller
+    /// truncated don't false-mark `(band, cap)` ICE-infeasible.
+    ///
+    /// `send_unchecked`: a dropped ack means the timer doesn't arm →
+    /// no false-ICE, just delayed detection until the next spawn —
+    /// acceptable under backpressure.
+    AckSpawnedIntents {
+        spawned: Vec<rio_proto::types::SpawnIntent>,
+    },
+
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
     /// Flips `ExecutorState.warm = true` so `best_executor()` starts
     /// considering this worker on the warm-pass. Spec:
@@ -496,6 +509,7 @@ impl ActorCommand {
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
             Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
+            Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
             Self::Heartbeat(_) => "Heartbeat",
             Self::Tick => "Tick",

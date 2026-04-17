@@ -234,6 +234,13 @@ impl DagActor {
         self.dag.insert_recovered_node(state);
     }
 
+    /// Set `sched.priority` on an already-injected node. For
+    /// `compute_spawn_intents` priority-sort assertions — recovery
+    /// rows default to priority 0.0.
+    pub(crate) fn test_set_priority(&mut self, hash: &str, p: f64) {
+        self.dag.node_mut(hash).expect("node exists").sched.priority = p;
+    }
+
     /// Inject a Ready derivation with default fields. `is_fod` sets
     /// `is_fixed_output` so the kind boundary in `hard_filter` /
     /// `compute_spawn_intents` routes it to fetcher executors.

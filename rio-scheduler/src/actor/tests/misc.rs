@@ -1014,6 +1014,31 @@ async fn spawn_intents_kind_and_system_filter() {
     assert_eq!(arm.queued_by_system.get("builtin"), Some(&1));
 }
 
+/// `compute_spawn_intents` returns priority-sorted (critical-path
+/// first), not `dag.iter_nodes()` HashMap order. The controller
+/// truncates to `[..headroom]` under `maxConcurrent` — unsorted, a
+/// high-priority drv past the prefix would get no pod and fail
+/// resource-fit on the small ones spawned for low-priority work.
+#[tokio::test]
+async fn compute_spawn_intents_priority_sorted() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("lo", Some("p"), "x86_64-linux", false);
+    actor.test_inject_ready("hi", Some("p"), "x86_64-linux", false);
+    actor.test_inject_ready("mid", Some("p"), "x86_64-linux", false);
+    actor.test_set_priority("lo", 1.0);
+    actor.test_set_priority("hi", 100.0);
+    actor.test_set_priority("mid", 50.0);
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let order: Vec<_> = snap.intents.iter().map(|i| i.intent_id.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["hi", "mid", "lo"],
+        "priority desc, not HashMap order"
+    );
+}
+
 /// End-to-end actor path: merge → Ready → intent shows up; dispatch →
 /// Assigned → intent drops (only Ready emits intents). Also covers
 /// `solve_intent_for`'s `deadline_secs` clamp:
