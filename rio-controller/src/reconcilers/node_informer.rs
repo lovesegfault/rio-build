@@ -311,9 +311,10 @@ pub async fn run_pod_annotator(
 }
 
 /// ADR-023 phase-13 λ\[h\] self-calibration: watch `core/v1.Event` for
-/// `reason=SpotInterrupted` (Karpenter posts one on the NodeClaim when
-/// AWS sends the 2-minute spot interruption notice), resolve the
-/// referenced node's hw_class via [`NodeLabelCache`], and append
+/// `reason=SpotInterrupted` (Karpenter emits this on BOTH the NodeClaim
+/// and the Node when AWS sends the 2-minute spot interruption notice;
+/// we watch the Node event because [`NodeLabelCache`] is keyed by Node
+/// name), resolve the referenced node's hw_class, and append
 /// `interrupt_samples(hw_class, kind='interrupt', value=1)` via
 /// `AdminService.AppendInterruptSample`.
 ///

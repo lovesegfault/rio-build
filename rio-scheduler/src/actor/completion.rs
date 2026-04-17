@@ -1427,10 +1427,7 @@ impl DagActor {
                         // completion's hw_class so the ratio is
                         // ref/ref. Envelope check (tier_p90) stays
                         // wall-vs-wall — handled inside.
-                        let hw_factor = hw_class
-                            .as_deref()
-                            .map(|h| self.sla_estimator.hw_table().factor(h))
-                            .unwrap_or(1.0);
+                        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref());
                         let score = crate::sla::metrics::score_completion(
                             duration_secs,
                             hw_factor,

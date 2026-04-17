@@ -120,6 +120,14 @@ impl SlaEstimator {
         self.hw.read().clone()
     }
 
+    /// Look up the normalization factor for one `hw_class` without
+    /// cloning the whole table. `None` or unknown class → 1.0.
+    /// Hot-path equivalent of `hw_table().factor(h)` for the
+    /// per-completion ref-seconds normalization.
+    pub fn hw_factor(&self, hw_class: Option<&str>) -> f64 {
+        hw_class.map_or(1.0, |h| self.hw.read().factor(h))
+    }
+
     /// Snapshot the prior-source inputs. For
     /// `AdminService.ExportSlaCorpus` (which needs `seed.len()` for the
     /// "already seeded" hint) and tests.
@@ -344,7 +352,7 @@ impl SlaEstimator {
                 m
             });
 
-        let mut outlier_ids: Vec<i64> = Vec::new();
+        let mut outlier_ids: HashSet<i64> = HashSet::new();
         for key in &touched {
             let prev = self.cache.read().get(key).cloned();
             // r[impl sched.sla.outlier-mad-reject]
@@ -367,7 +375,7 @@ impl SlaEstimator {
                     if let Some(c) = r.cpu_limit_cores
                         && ingest::is_outlier(ref_t, c, prev, DT_POLL_SECS)
                     {
-                        outlier_ids.push(r.id);
+                        outlier_ids.insert(r.id);
                         metrics::outlier_rejected(&key.tenant);
                     }
                 }
@@ -399,6 +407,7 @@ impl SlaEstimator {
         // advanced regardless — but the in-memory `retain` above already
         // kept this tick's fit clean, and the next tick's batch read
         // re-includes the row, where it's filtered again).
+        let outlier_ids: Vec<i64> = outlier_ids.into_iter().collect();
         if let Err(e) = db.mark_outliers_excluded(&outlier_ids).await {
             tracing::warn!(error = %e, n = outlier_ids.len(), "outlier mark failed");
         }
