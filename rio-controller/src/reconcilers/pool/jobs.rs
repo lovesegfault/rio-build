@@ -35,21 +35,21 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::runtime::controller::Action;
+use kube::{Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::job::JOB_TTL_SECS;
 use super::job::{
-    JOB_REQUEUE, JobReconcilePrologue, ephemeral_job, is_active_job, job_reconcile_prologue,
-    patch_job_pool_status, reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
-    report_terminated_pods, spawn_count, spawn_for_each,
+    JOB_REQUEUE, ephemeral_job, is_active_job, patch_job_pool_status, reap_excess_pending,
+    reap_orphan_running, report_deadline_exceeded_jobs, report_terminated_pods, spawn_count,
+    spawn_for_each,
 };
-use super::pod::{self, UpstreamAddrs, executor_kind_to_proto};
-use crate::error::Result;
-use crate::reconcilers::{Ctx, KubeErrorExt};
+use super::pod::{self, UpstreamAddrs};
+use crate::error::{Error, Result};
+use crate::reconcilers::{Ctx, KubeErrorExt, require_namespace};
 use rio_crds::pool::{ExecutorKind, Pool};
 use rio_proto::types::SpawnIntent;
 
@@ -112,14 +112,18 @@ pub(super) fn ephemeral_deadline(spec: &rio_crds::pool::PoolSpec, intent: &Spawn
 /// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
 /// (`spec.maxConcurrent`).
 pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
-    let JobReconcilePrologue {
-        ns,
-        name,
-        jobs_api,
-        oref,
-        scheduler,
-        store,
-    } = job_reconcile_prologue(pool, ctx)?;
+    // Namespace-missing is `InvalidSpec` not `NotFound` — a Pool CR
+    // without `.metadata.namespace` is a cluster-scoped apply error
+    // (the CRD is `Namespaced`), not a transient condition.
+    let ns = require_namespace(pool)?;
+    let name = pool.name_any();
+    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+    // The no-`.metadata.uid` error only happens on a CR not read from
+    // the apiserver — tests that construct one in memory forget this;
+    // production reconcile always has it.
+    let oref = pool.controller_owner_ref(&()).ok_or_else(|| {
+        Error::InvalidSpec("Pool has no metadata.uid (not from apiserver?)".into())
+    })?;
     let ceiling = pool.spec.max_concurrent.map(|c| c as i32);
 
     // ---- Poll spawn intents ----
@@ -169,26 +173,24 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // Cancel-then-resubmit) would NameCollision against the stale
     // terminal Job for JOB_TTL_SECS (600s) — the re-queued drv
     // never gets a worker. Delete those before the spawn pass.
+    let to_spawn_intents = &intents[..(to_spawn as usize).min(intents.len())];
     reap_terminal_for_intents(
         &jobs_api,
         &jobs.items,
-        intents.iter().take(to_spawn as usize),
+        to_spawn_intents,
         &name,
         pool.spec.kind,
     )
     .await;
 
     // One pod per intent with that intent's resources + annotation.
-    // `take(to_spawn)` truncates; the remainder is picked up next
-    // tick after `active` decreases. Under mandatory `[sla]` (Phase
-    // 5) the scheduler ALWAYS populates intents — empty list means
-    // empty queue → `to_spawn=0` → `take(0)` spawns nothing.
-    spawn_for_each(
-        &jobs_api,
-        intents.iter().take(to_spawn as usize),
-        &name,
-        |intent| build_job(pool, oref.clone(), &scheduler, &store, intent),
-    )
+    // `to_spawn` truncates; the remainder is picked up next tick
+    // after `active` decreases. Under mandatory `[sla]` (Phase 5) the
+    // scheduler ALWAYS populates intents — empty list means empty
+    // queue → `to_spawn=0` → spawns nothing.
+    spawn_for_each(&jobs_api, to_spawn_intents, &name, |intent| {
+        build_job(pool, oref.clone(), &ctx.scheduler, &ctx.store, intent)
+    })
     .await;
     if to_spawn == 0 {
         debug!(pool = %name, queued, active, ?ceiling, "no ephemeral Jobs to spawn");
@@ -246,7 +248,7 @@ async fn queued_for_pool(
         .admin
         .clone()
         .get_spawn_intents(rio_proto::types::GetSpawnIntentsRequest {
-            kind: Some(executor_kind_to_proto(pool.spec.kind).into()),
+            kind: Some(super::executor_kind_to_proto(pool.spec.kind).into()),
             systems: pool.spec.systems.clone(),
             features: pool.spec.features.clone(),
             filter_features: true,
@@ -283,16 +285,15 @@ fn intent_suffix(intent_id: &str) -> String {
 /// does not apply. Background lets the Job object vanish before the
 /// pod (TTL would have done the same), so the create that follows
 /// has the best chance of landing in the SAME tick.
-async fn reap_terminal_for_intents<'a, I>(
+async fn reap_terminal_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
-    intents: I,
+    intents: &[SpawnIntent],
     pool: &str,
     kind: ExecutorKind,
-) where
-    I: Iterator<Item = &'a SpawnIntent>,
-{
+) {
     let want: HashSet<String> = intents
+        .iter()
         .map(|i| pod::job_name(pool, kind, &intent_suffix(&i.intent_id)))
         .collect();
     if want.is_empty() {
@@ -349,13 +350,13 @@ pub(super) fn build_job(
     // NameCollision dedupes.
     let suffix = intent_suffix(&intent.intent_id);
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
-    let mut pod_spec = super::build_pod_spec(pool, scheduler, store);
+    let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
     apply_intent_resources(&mut pod_spec, intent);
     let mut job = ephemeral_job(
         job_name,
         pool.namespace(),
         oref,
-        super::labels(pool),
+        pod::executor_labels(pool),
         ephemeral_deadline(&pool.spec, intent),
         pod_spec,
     );
@@ -509,7 +510,7 @@ mod tests {
         let env = pod_spec.containers[0].env.as_ref().unwrap();
         assert!(
             env.iter().any(|e| e.name == "RIO_SCHEDULER__ADDR"),
-            "build_pod_spec env should be preserved"
+            "build_executor_pod_spec env should be preserved"
         );
     }
 

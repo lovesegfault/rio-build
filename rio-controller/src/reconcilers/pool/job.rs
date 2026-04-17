@@ -1,13 +1,7 @@
-//! Shared plumbing for the Job-mode Pool reconciler. Both kinds
-//! (Builder, Fetcher) follow the same skeleton: list Jobs by label,
+//! Job-mode plumbing for the Pool reconciler: list Jobs by label,
 //! filter active, diff against demand, spawn deficit, reap excess,
-//! patch status.
-//!
-//! Extracted (P0513) after the mc=60 consolidator pass found 4
-//! byte-identical-or-near segments (~50L) reaching across siblings
-//! for helpers that belong in neither. Moved from `builderpool/` to
-//! `common/` once the fetcher reconciler started importing through
-//! the sibling reconciler.
+//! patch status. Consumed only by `jobs.rs`; kept as a separate file
+//! because the merged module would top 2000 LoC.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -15,17 +9,17 @@ use std::time::Duration;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{Pod, PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::CustomResourceExt;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
-use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use rio_proto::types::{ReportExecutorTerminationRequest, TerminationReason};
+use rio_proto::types::{ReportExecutorTerminationRequest, SpawnIntent, TerminationReason};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::pool::{Pool, PoolStatus};
 
-use super::pod::{POOL_LABEL, UpstreamAddrs};
+use super::pod::POOL_LABEL;
 
 /// Field manager for server-side apply on Job-mode pool resources
 /// (Pool status, owned Jobs). K8s tracks which
@@ -34,7 +28,7 @@ use super::pod::{POOL_LABEL, UpstreamAddrs};
 /// for what it manages. Shared by both pool reconcilers so a Job's
 /// SSA history shows one consistent manager regardless of which
 /// reconciler touched it.
-pub(crate) const MANAGER: &str = "rio-controller";
+pub(super) const MANAGER: &str = "rio-controller";
 
 /// Requeue interval for Job-mode reconcilers. Job spawning is reactive
 /// to queue depth, not just spec drift. 10s: one queue-depth poll per
@@ -43,7 +37,7 @@ pub(crate) const MANAGER: &str = "rio-controller";
 /// load). Longer lengthens dispatch latency: a worker needs one
 /// requeue interval + pod scheduling + container pull + FUSE mount +
 /// heartbeat (~10s + 10-30s) before the scheduler sees it.
-pub(crate) const JOB_REQUEUE: Duration = Duration::from_secs(10);
+pub(super) const JOB_REQUEUE: Duration = Duration::from_secs(10);
 
 /// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
 /// deletes the Job (and its pod, via ownerRef) this many seconds
@@ -53,7 +47,7 @@ pub(crate) const JOB_REQUEUE: Duration = Duration::from_secs(10);
 /// has already observed the completion (worker sent CompletionReport
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
-pub(crate) const JOB_TTL_SECS: i32 = 600;
+pub(super) const JOB_TTL_SECS: i32 = 600;
 
 /// Pod-template annotation that opts a pod out of karpenter
 /// consolidation/drift eviction. I-126: I-090's bin-packing +
@@ -63,14 +57,14 @@ pub(crate) const JOB_TTL_SECS: i32 = 600;
 /// EVERY ephemeral Job pod via [`ephemeral_job`] — the node
 /// consolidates AFTER Job completion. Goes on POD TEMPLATE metadata,
 /// not the Job's: karpenter reads pod annotations.
-pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
+pub(super) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 
 /// `terminationGracePeriodSeconds` for ephemeral Job pods. I-120: one
 /// build per pod; on SIGTERM exit fast. 30s covers FUSE unmount and
-/// completion report. (The role-level default in
-/// `ExecutorPodParams::termination_grace_period_seconds` is for the
-/// LONG-drain case; ephemeral pods don't drain, they finish and die.)
-pub(crate) const EPHEMERAL_TGPS: i64 = 30;
+/// completion report. (`spec.termination_grace_period_seconds` is for
+/// the LONG-drain case; ephemeral pods don't drain, they finish and
+/// die.)
+pub(super) const EPHEMERAL_TGPS: i64 = 30;
 
 /// The shared one-shot Job literal for executor pods. Both pool
 /// kinds (Builder, Fetcher) route through this so the load-bearing
@@ -101,7 +95,7 @@ pub(crate) const EPHEMERAL_TGPS: i64 = 30;
 /// `pod_spec` arrives with role-specific content (volumes, env,
 /// resources) already filled by `build_executor_pod_spec`; this
 /// fn only stamps the Job-lifecycle fields on top.
-pub(crate) fn ephemeral_job(
+pub(super) fn ephemeral_job(
     name: String,
     namespace: Option<String>,
     oref: OwnerReference,
@@ -178,7 +172,7 @@ pub(crate) fn ephemeral_job(
 /// each over-counts need by what the others will claim — but
 /// headroom caps it, and the others draining Q on the next tick
 /// self-corrects.
-pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
+pub(super) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
 }
 
@@ -193,7 +187,7 @@ pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 /// won't heartbeat again. Counting only active Jobs prevents
 /// over-spawn (counting a Failed Job as supply would under-spawn;
 /// counting a Complete Job is moot — TTL reaps it).
-pub(crate) fn is_active_job(j: &Job) -> bool {
+pub(super) fn is_active_job(j: &Job) -> bool {
     let s = j.status.as_ref();
     s.and_then(|st| st.succeeded).unwrap_or(0) == 0 && s.and_then(|st| st.failed).unwrap_or(0) == 0
 }
@@ -217,7 +211,7 @@ pub(crate) fn is_active_job(j: &Job) -> bool {
 /// terminating (foreground-delete in flight). Re-selecting it would
 /// be a no-op apiserver round-trip + log spam every tick until the
 /// pod's `job-tracking` finalizer clears.
-pub(crate) fn is_pending_job(j: &Job) -> bool {
+pub(super) fn is_pending_job(j: &Job) -> bool {
     j.metadata.deletion_timestamp.is_none()
         && is_active_job(j)
         && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) == 0
@@ -228,7 +222,7 @@ pub(crate) fn is_pending_job(j: &Job) -> bool {
 /// The orphan-reap boundary for `r[ctrl.ephemeral.reap-orphan-
 /// running]`: only Running Jobs are candidates (Pending is handled by
 /// `reap_excess_pending`; Complete/Failed by TTL).
-pub(crate) fn is_running_job(j: &Job) -> bool {
+pub(super) fn is_running_job(j: &Job) -> bool {
     is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) > 0
 }
 
@@ -239,7 +233,7 @@ pub(crate) fn is_running_job(j: &Job) -> bool {
 /// well before this fires. The reap targets pods that CANNOT
 /// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
 /// burn `activeDeadlineSeconds` (default 1h) holding a node.
-pub(crate) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
+pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
 /// set by the K8s Job controller AFTER it observes pod readiness — a
@@ -249,7 +243,7 @@ pub(crate) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 /// requeue tick of grace makes the false-positive window negligible
 /// without materially delaying the I-183 reap (the bug is Jobs sitting
 /// for an HOUR; 10s grace is noise).
-pub(crate) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
+pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
 /// Pending Jobs in excess of `queued`, oldest-first — the reap set
 /// for `r[ctrl.ephemeral.reap-excess-pending]`.
@@ -275,7 +269,7 @@ pub(crate) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 /// them. A Running pod may already hold an assignment; the scheduler's
 /// cancel-on-disconnect handles those when the gateway session that
 /// queued the work closes.
-pub(crate) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration) -> Vec<&Job> {
+pub(super) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration) -> Vec<&Job> {
     let mut pending: Vec<&Job> = jobs
         .iter()
         .filter(|j| is_pending_job(j) && job_older_than(j, min_age))
@@ -309,7 +303,7 @@ pub(crate) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration
 /// immediately.
 ///
 /// Returns the count actually deleted (for the reconcile summary log).
-pub(crate) async fn reap_excess_pending(
+pub(super) async fn reap_excess_pending(
     jobs_api: &Api<Job>,
     jobs: &[Job],
     queued: Option<u32>,
@@ -401,7 +395,7 @@ fn job_older_than(j: &Job, min_age: Duration) -> bool {
 ///
 /// Pending Jobs are excluded ([`is_running_job`] requires `ready >
 /// 0`) — those are [`reap_excess_pending`]'s territory.
-pub(crate) fn select_orphan_running<'a>(
+pub(super) fn select_orphan_running<'a>(
     jobs: &'a [Job],
     executors: &[rio_proto::types::ExecutorInfo],
     min_age: Duration,
@@ -449,7 +443,7 @@ pub(crate) fn select_orphan_running<'a>(
 /// must not nuke every Running ephemeral Job.
 ///
 /// Returns the count actually deleted (for the reconcile summary log).
-pub(crate) async fn reap_orphan_running(
+pub(super) async fn reap_orphan_running(
     jobs_api: &Api<Job>,
     jobs: &[Job],
     ctx: &Ctx,
@@ -523,52 +517,6 @@ pub(crate) async fn reap_orphan_running(
     reaped
 }
 
-/// Per-reconcile derived state every Job-mode reconciler needs up
-/// front. Replaces the previous split into `job_reconcile_prologue`
-/// (ns/name/api) + `spawn_prerequisites` (oref/addrs) — both took
-/// the same two args and every caller used both within a few dozen
-/// lines of each other; the split was indirection without dedup.
-pub(crate) struct JobReconcilePrologue {
-    pub ns: String,
-    pub name: String,
-    pub jobs_api: Api<Job>,
-    /// `controller_owner_ref` for the pool CR. The no-`.metadata.uid`
-    /// error only happens on a CR not read from the apiserver — tests
-    /// that construct one in memory forget this; production reconcile
-    /// always has it.
-    pub oref: OwnerReference,
-    pub scheduler: UpstreamAddrs,
-    pub store: UpstreamAddrs,
-}
-
-/// Extract namespaced identity, Job API handle, ownerRef and
-/// upstream addresses. The namespace-missing case is `InvalidSpec`
-/// not `NotFound` — a pool CR without `.metadata.namespace` is a
-/// cluster-scoped apply error (the CRD is `Namespaced`), not a
-/// transient condition.
-pub(crate) fn job_reconcile_prologue<K>(wp: &K, ctx: &Ctx) -> Result<JobReconcilePrologue>
-where
-    K: Resource<DynamicType = ()>,
-{
-    let ns = crate::reconcilers::require_namespace(wp)?;
-    let name = wp.name_any();
-    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
-    let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec(format!(
-            "{} has no metadata.uid (not from apiserver?)",
-            K::kind(&())
-        ))
-    })?;
-    Ok(JobReconcilePrologue {
-        ns,
-        name,
-        jobs_api,
-        oref,
-        scheduler: ctx.scheduler.clone(),
-        store: ctx.store.clone(),
-    })
-}
-
 /// Outcome of a single `jobs_api.create` attempt. Caller decides
 /// what to do on `Failed` — both ephemeral reconcilers warn+continue.
 ///
@@ -577,7 +525,7 @@ where
 /// `Result<_, kube::Error>` with `?` at the call site would
 /// re-introduce the bail this was extracted to eliminate. The enum
 /// forces exhaustive handling.
-pub(crate) enum SpawnOutcome {
+pub(super) enum SpawnOutcome {
     Spawned,
     /// 409 AlreadyExists — name collision. Next tick picks a fresh
     /// name. Not worth propagating — would trigger error_policy
@@ -606,7 +554,7 @@ pub(crate) enum SpawnOutcome {
 /// to match spec," the Job is immutable after create (K8s rejects
 /// most spec edits). A 409 is retried next tick with a fresh random
 /// name.
-pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
+pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,
         Err(e) if e.is_conflict() => SpawnOutcome::NameCollision,
@@ -626,18 +574,15 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// guard at `pool/tests/jobs_tests.rs::
 /// ephemeral_spawn_fail_still_patches_status` asserts this body
 /// contains no `return Err`.
-pub(crate) async fn spawn_for_each<I, T>(
+pub(super) async fn spawn_for_each(
     jobs_api: &Api<Job>,
-    items: I,
+    intents: &[SpawnIntent],
     pool: &str,
-    mut build: impl FnMut(T) -> Result<Job>,
-) -> u32
-where
-    I: IntoIterator<Item = T>,
-{
+    mut build: impl FnMut(&SpawnIntent) -> Result<Job>,
+) -> u32 {
     let mut spawned = 0;
-    for item in items {
-        let job = match build(item) {
+    for intent in intents {
+        let job = match build(intent) {
             Ok(j) => j,
             Err(e) => {
                 warn!(pool, error = %e, "build_job failed; continuing tick");
@@ -682,7 +627,7 @@ where
 /// `prev_status`: the CR's `.status` (for `lastTransitionTime`
 /// preservation).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn patch_job_pool_status(
+pub(super) async fn patch_job_pool_status(
     ctx: &Ctx,
     prev_status: Option<&PoolStatus>,
     ns: &str,
@@ -694,7 +639,15 @@ pub(crate) async fn patch_job_pool_status(
 ) -> Result<()> {
     let api: Api<Pool> = Api::namespaced(ctx.client.clone(), ns);
     let ar = Pool::api_resource();
-    let prev = super::conditions::find_condition(prev_status, "SchedulerUnreachable");
+    // Find the existing SchedulerUnreachable condition so its
+    // `lastTransitionTime` can be preserved on non-transitions.
+    let prev = prev_status
+        .and_then(|s| {
+            s.conditions
+                .iter()
+                .find(|c| c.type_ == "SchedulerUnreachable")
+        })
+        .and_then(|c| serde_json::to_value(c).ok());
     let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
     let status = serde_json::json!({
         "replicas": replicas,
@@ -728,9 +681,8 @@ pub(crate) async fn patch_job_pool_status(
 /// with our field manager owns this condition — omitting it would
 /// leave a stale True after the scheduler comes back.
 ///
-/// Same json!-not-struct pattern as `scaling::scaling_condition`:
-/// k8s_openapi's Condition struct requires observedGeneration which
-/// we don't track.
+/// json!-not-struct: k8s_openapi's Condition struct requires
+/// observedGeneration which we don't track.
 ///
 /// `prev`: existing SchedulerUnreachable condition (if any). Its
 /// `lastTransitionTime` is preserved when `status` hasn't changed —
@@ -741,7 +693,7 @@ pub(crate) async fn patch_job_pool_status(
 // TODO(P0304): T505 adds an `rpc_name` param so the message names
 // which RPC failed (ClusterStatus vs ListExecutors). Apply here
 // post-extraction.
-pub(crate) fn scheduler_unreachable_condition(
+pub(super) fn scheduler_unreachable_condition(
     err: Option<&str>,
     prev: Option<&serde_json::Value>,
 ) -> serde_json::Value {
@@ -757,12 +709,25 @@ pub(crate) fn scheduler_unreachable_condition(
             "scheduler reachable".to_string(),
         ),
     };
+    // K8s convention: preserve `lastTransitionTime` if `status` is
+    // unchanged, stamp now() on an actual transition (or first write).
+    // Without this, writing the same condition every 10s tick makes
+    // `lastTransitionTime` always read "~10s ago" — useless for "when
+    // did the scheduler become unreachable."
+    let transition_time = if let Some(p) = prev
+        && p.get("status").and_then(|s| s.as_str()) == Some(status)
+        && let Some(ts) = p.get("lastTransitionTime").and_then(|t| t.as_str())
+    {
+        ts.to_string()
+    } else {
+        k8s_openapi::jiff::Timestamp::now().to_string()
+    };
     serde_json::json!({
         "type": "SchedulerUnreachable",
         "status": status,
         "reason": reason,
         "message": message,
-        "lastTransitionTime": super::conditions::transition_time(status, prev),
+        "lastTransitionTime": transition_time,
     })
 }
 
@@ -791,7 +756,7 @@ pub(crate) fn scheduler_unreachable_condition(
 /// uses that phrase, not "DiskPressure" (DiskPressure is the NODE
 /// condition; the per-pod limit eviction is the production firefox
 /// I-213 case).
-pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
+pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
     let Some(status) = &pod.status else {
         return TerminationReason::Unknown;
     };
@@ -840,7 +805,7 @@ pub(crate) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
 /// the reconcile continues. A missed report degrades to "one OOM
 /// doesn't promote"; the next OOM on the same drv will (floor is
 /// sticky). Never blocks the spawn/reap loop.
-pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
+pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     let list = match pods
         .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool}")))
@@ -893,7 +858,7 @@ pub(crate) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
 /// `activeDeadlineSeconds` fired. The Job controller deletes the Pod
 /// immediately, so [`report_terminated_pods`] never observes a
 /// terminated container; this reads the Job condition instead.
-pub(crate) fn job_deadline_exceeded(job: &Job) -> bool {
+pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
     job.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
@@ -919,7 +884,7 @@ pub(crate) fn job_deadline_exceeded(job: &Job) -> bool {
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
 // r[impl ctrl.terminated.deadline-exceeded]
-pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
+pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
         if !job_deadline_exceeded(job) {
@@ -957,6 +922,7 @@ pub(crate) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::ResourceExt;
 
     /// SchedulerUnreachable condition: status flips True/False based
     /// on whether the ClusterStatus RPC failed. Operators need this

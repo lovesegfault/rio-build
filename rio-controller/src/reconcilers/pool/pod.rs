@@ -1,11 +1,13 @@
-//! Shared Job pod-spec builder for executor pods (builders + fetchers).
+//! Job pod-spec builder for executor pods (builders + fetchers).
 //!
-//! Extracted from `builderpool/builders.rs` when ADR-019 introduced
-//! the builder/fetcher split. The 600-line pod-spec — FUSE volumes,
-//! pod-level seccomp, TLS mounts,
-//! capability set, probes, coverage propagation — is role-agnostic.
-//! Parameterizing on [`ExecutorPodParams`] (instead of `&BuilderPool`)
-//! lets both reconcilers call the same builder.
+//! The 600-line pod-spec — FUSE volumes, pod-level seccomp, TLS
+//! mounts, capability set, probes, coverage propagation — is
+//! role-agnostic and reads `&Pool` directly. `spec.kind == Fetcher`
+//! gates the ADR-019 hardening overrides (read-only rootfs, forced
+//! Localhost seccomp, never-privileged, dedicated node selector). CEL
+//! on the CRD rejects fetcher specs that try to set the overridden
+//! fields at admission time; the overrides here are belt-and-
+//! suspenders for pre-CEL specs the apiserver already accepted.
 
 use std::collections::BTreeMap;
 
@@ -15,8 +17,9 @@ use k8s_openapi::api::core::v1::{
     SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use kube::ResourceExt;
 
-use rio_crds::pool::{ExecutorKind, SeccompProfileKind};
+use rio_crds::pool::{ExecutorKind, Pool, SeccompProfileKind};
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
@@ -64,42 +67,14 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("nix-var", "/nix/var", None, None),
 ];
 
-/// Lowercase string repr for the `rio.build/role` label and
-/// `RIO_EXECUTOR_KIND` env (matches the deserializer in
-/// `rio-builder/src/config.rs`); plus the `app.kubernetes.io/
-/// component` label value used by the D3a CCNP selectors.
-pub trait ExecutorKindExt {
-    fn as_str(&self) -> &'static str;
-    /// `rio-builder` / `rio-fetcher` — the canonical
-    /// `app.kubernetes.io/component` label that the cluster-wide
-    /// network policies select on (D3a).
-    fn component_label(&self) -> &'static str;
-}
+/// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
+/// overshoot. No CRD knob: pods are one-shot so the cache never
+/// outlives one build's input closure.
+const BUILDER_FUSE_CACHE: &str = "50Gi";
 
-impl ExecutorKindExt for ExecutorKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Builder => "builder",
-            Self::Fetcher => "fetcher",
-        }
-    }
-    fn component_label(&self) -> &'static str {
-        match self {
-            Self::Builder => "rio-builder",
-            Self::Fetcher => "rio-fetcher",
-        }
-    }
-}
-
-/// CRD `ExecutorKind` → proto `ExecutorKind` (for the
-/// `GetSpawnIntents` request filter). The CRD enum is local because
-/// rio-crds stays kube-only (no prost).
-pub fn executor_kind_to_proto(k: ExecutorKind) -> rio_proto::types::ExecutorKind {
-    match k {
-        ExecutorKind::Builder => rio_proto::types::ExecutorKind::Builder,
-        ExecutorKind::Fetcher => rio_proto::types::ExecutorKind::Fetcher,
-    }
-}
+/// Default FUSE cache size for fetchers. FODs are typically small
+/// (source tarballs, git clones) — 10Gi is plenty.
+const FETCHER_FUSE_CACHE: &str = "10Gi";
 
 /// Upstream gRPC addresses injected into executor pod env: a
 /// ClusterIP `addr` for single-channel mode plus an optional
@@ -109,87 +84,117 @@ pub fn executor_kind_to_proto(k: ExecutorKind) -> rio_proto::types::ExecutorKind
 /// (figment-deserialized) — see [`rio_common::config::UpstreamAddrs`].
 pub use rio_common::config::UpstreamAddrs;
 
-/// Every spec field the pod-spec builder reads. Both reconcilers
-/// construct this from their respective CRD spec and call
-/// [`build_executor_pod_spec`].
-///
-/// Optional fields with `None` get the builder's compiled-in
-/// default. The fetcher reconciler leaves most `None` — its spec
-/// is minimal (replicas, image, systems, nodeSelector, tolerations,
-/// resources).
-pub struct ExecutorPodParams {
-    // ── role-varying knobs (the ADR-019 diff) ────────────────────
-    /// Builder or Fetcher. Sets the `rio.build/role` label and
-    /// `RIO_EXECUTOR_KIND` env.
-    pub role: ExecutorKind,
-    /// `securityContext.readOnlyRootFilesystem` on the executor
-    /// container. Fetchers: `true` (overlay upperdir is a tmpfs
-    /// emptyDir; rootfs tampering blocked). Builders: `false`.
-    pub read_only_root_fs: bool,
-    /// Extra env vars appended after the base set. Builders pass
-    /// their tuning knobs (daemon_timeout, fuse_passthrough) here so
-    /// the shared builder doesn't need fields for every builder-only
-    /// knob.
-    pub extra_env: Vec<EnvVar>,
+// ── per-kind effective values ────────────────────────────────────
+//
+// The builder/fetcher diff is small: fetchers force ADR-019 hardening
+// (read-only rootfs, never privileged, Localhost seccomp, dedicated
+// node placement, hostUsers:false default, no features) regardless of
+// spec. Each helper below returns the effective value for one
+// pod-spec field. Builder reads spec verbatim; Fetcher overrides.
 
-    // ── metadata ─────────────────────────────────────────────────
-    /// Pool CR name. Feeds [`job_name`] (`rio-{role}-{pool_name}-…`).
-    pub pool_name: String,
-
-    // ── deployment knobs ─────────────────────────────────────────
-    pub image: String,
-    pub systems: Vec<String>,
-    pub node_selector: Option<BTreeMap<String, String>>,
-    pub tolerations: Option<Vec<Toleration>>,
-    pub host_users: Option<bool>,
-    pub image_pull_policy: Option<String>,
-
-    // ── capacity ─────────────────────────────────────────────────
-    /// Comma-joined → `RIO_FEATURES`. Empty for fetchers.
-    pub features: Vec<String>,
-
-    // ── FUSE ─────────────────────────────────────────────────────
-    /// Raw Quantity for the emptyDir sizeLimit.
-    pub fuse_cache_quantity: Quantity,
-    pub fuse_threads: Option<u32>,
-
-    // ── security ─────────────────────────────────────────────────
-    /// `true` = full privileged (escape hatch). Disables seccomp,
-    /// hostUsers:false.
-    pub privileged: bool,
-    /// CRD seccomp profile. Converted via [`build_seccomp_profile`].
-    pub seccomp_profile: Option<SeccompProfileKind>,
-    pub host_network: Option<bool>,
-
-    // ── misc ─────────────────────────────────────────────────────
-    /// `None` → 7200s (2h).
-    pub termination_grace_period_seconds: Option<i64>,
+#[inline]
+fn is_fetcher(pool: &Pool) -> bool {
+    pool.spec.kind == ExecutorKind::Fetcher
 }
 
-impl ExecutorPodParams {
-    /// Pool advertises the `kvm` Nix system-feature → pod needs a host
-    /// with working `/dev/kvm` (metal nodeSelector + toleration). See
-    /// `r[ctrl.pool.kvm-device]`.
-    fn wants_kvm(&self) -> bool {
-        self.features.iter().any(|f| f == KVM_FEATURE)
+/// Fetchers face the open internet — never privileged. Builders honor
+/// the spec escape hatch.
+#[inline]
+fn effective_privileged(pool: &Pool) -> bool {
+    !is_fetcher(pool) && pool.spec.privileged == Some(true)
+}
+
+/// ADR-019 §Sandbox hardening: fetchers force the stricter Localhost
+/// profile (`operator/rio-fetcher.json` — extra denies for ptrace/bpf/
+/// setns/process_vm_*/keyctl/add_key) written by systemd-tmpfiles on
+/// every node before kubelet starts.
+// r[impl fetcher.sandbox.strict-seccomp]
+fn effective_seccomp(pool: &Pool) -> Option<SeccompProfileKind> {
+    if is_fetcher(pool) {
+        Some(SeccompProfileKind {
+            type_: "Localhost".into(),
+            localhost_profile: Some("operator/rio-fetcher.json".into()),
+        })
+    } else {
+        pool.spec.seccomp_profile.clone()
     }
+}
+
+/// Default `hostUsers: false` for fetchers (ADR-019 userns isolation),
+/// but HONOR the spec override. k3s containerd doesn't chown the pod
+/// cgroup under hostUsers:false → rio-builder's `mkdir
+/// /sys/fs/cgroup/leaf` EACCES → exit 1 in <200ms (vmtest-full-
+/// nonpriv.yaml). The k3s VM tests set `hostUsers: true`; production
+/// EKS (containerd 2.0+) gets the default `false`. Forcing Some(false)
+/// here (Phase-7 first cut) made fetcher pods unrunnable on every CI
+/// fixture.
+#[inline]
+fn effective_host_users(pool: &Pool) -> Option<bool> {
+    if is_fetcher(pool) {
+        pool.spec.host_users.or(Some(false))
+    } else {
+        pool.spec.host_users
+    }
+}
+
+/// ADR-019 §Node isolation: fetchers land on dedicated nodes via the
+/// `rio.build/fetcher=true:NoSchedule` taint + matching selector. If
+/// the operator supplies their own, honor those instead — lets them
+/// override for dev clusters without dedicated node pools.
+// r[impl fetcher.node.dedicated]
+fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
+    if is_fetcher(pool) {
+        pool.spec.node_selector.clone().or_else(|| {
+            Some(BTreeMap::from([(
+                "rio.build/node-role".into(),
+                "fetcher".into(),
+            )]))
+        })
+    } else {
+        pool.spec.node_selector.clone()
+    }
+}
+
+fn effective_tolerations(pool: &Pool) -> Option<Vec<Toleration>> {
+    if is_fetcher(pool) {
+        pool.spec.tolerations.clone().or_else(|| {
+            Some(vec![Toleration {
+                key: Some("rio.build/fetcher".into()),
+                operator: Some("Exists".into()),
+                effect: Some("NoSchedule".into()),
+                ..Default::default()
+            }])
+        })
+    } else {
+        pool.spec.tolerations.clone()
+    }
+}
+
+/// Pool advertises the `kvm` Nix system-feature → pod needs a host
+/// with working `/dev/kvm` (metal nodeSelector + toleration). FODs
+/// route by `is_fixed_output` alone, never by features, so fetchers
+/// never want kvm. See `r[ctrl.pool.kvm-device]`.
+#[inline]
+fn wants_kvm(pool: &Pool) -> bool {
+    !is_fetcher(pool) && pool.spec.features.iter().any(|f| f == KVM_FEATURE)
 }
 
 /// Labels for Job + pod template. Includes the ADR-019
 /// `rio.build/role` label so
 /// NetworkPolicies and `kubectl get pods -l rio.build/role=fetcher`
 /// can target by role.
-pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
+pub fn executor_labels(pool: &Pool) -> BTreeMap<String, String> {
+    let kind = pool.spec.kind;
     BTreeMap::from([
-        (POOL_LABEL.into(), p.pool_name.clone()),
-        (ROLE_LABEL.into(), p.role.as_str().into()),
+        (POOL_LABEL.into(), pool.name_any()),
+        (ROLE_LABEL.into(), kind.as_str().into()),
         ("app.kubernetes.io/name".into(), "rio-builder".into()),
         // D3a: cluster-wide netpols select on this label (ns-agnostic
         // airgap). Value is `rio-builder` / `rio-fetcher` — matches
         // the helm component naming convention.
         (
             "app.kubernetes.io/component".into(),
-            p.role.component_label().into(),
+            kind.component_label().into(),
         ),
         ("app.kubernetes.io/part-of".into(), "rio-build".into()),
     ])
@@ -235,8 +240,9 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
 }
 
 /// The Job pod spec — shared by both pool kinds.
+// r[impl ctrl.pool.fetcher-hardening]
 pub fn build_executor_pod_spec(
-    p: &ExecutorPodParams,
+    pool: &Pool,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
 ) -> PodSpec {
@@ -247,7 +253,17 @@ pub fn build_executor_pod_spec(
     // namespaced mount is RW — no hostPath needed, and a hostPath
     // would clobber host systemd.
 
-    let privileged = p.privileged;
+    let fetcher = is_fetcher(pool);
+    let privileged = effective_privileged(pool);
+    let seccomp = effective_seccomp(pool);
+    // Fetchers: rootfs tampering blocked (overlay upperdir is a tmpfs
+    // emptyDir). Builders: false. ADR-019 §Sandbox hardening.
+    let read_only_root_fs = fetcher;
+    let host_network = if fetcher {
+        None
+    } else {
+        pool.spec.host_network
+    };
     // Localhost seccomp: profile lives on node disk, written by
     // systemd-tmpfiles BEFORE kubelet starts on every supported target
     // (NixOS AMI: nix/nixos-node/hardening.nix; k3s VM tests:
@@ -257,17 +273,23 @@ pub fn build_executor_pod_spec(
     // executor container enforces Localhost). Gated on !privileged
     // (privileged disables seccomp at runtime).
     let seccomp_localhost = (!privileged)
-        .then_some(p.seccomp_profile.as_ref())
+        .then_some(seccomp.as_ref())
         .flatten()
         .filter(|k| k.type_ == "Localhost")
         .is_some();
 
     PodSpec {
-        containers: vec![build_executor_container(p, scheduler, store)],
+        containers: vec![build_executor_container(
+            pool,
+            scheduler,
+            store,
+            privileged,
+            read_only_root_fs,
+            seccomp.as_ref(),
+        )],
 
-        host_network: p.host_network.filter(|&h| h),
-        dns_policy: p
-            .host_network
+        host_network: host_network.filter(|&h| h),
+        dns_policy: host_network
             .filter(|&h| h)
             .map(|_| "ClusterFirstWithHostNet".into()),
 
@@ -276,9 +298,8 @@ pub fn build_executor_pod_spec(
         // privileged, hostNetwork, and hostPath /dev/fuse. The
         // spec.hostUsers override handles containerd<2.1 cgroup
         // ownership issues (cgroup_writable knob).
-        host_users: p
-            .host_users
-            .or_else(|| (!privileged && p.host_network != Some(true)).then_some(false)),
+        host_users: effective_host_users(pool)
+            .or_else(|| (!privileged && host_network != Some(true)).then_some(false)),
 
         // Pod-level seccomp. RuntimeDefault when Localhost is
         // requested — the pod sandbox (pause container) doesn't need
@@ -296,7 +317,7 @@ pub fn build_executor_pod_spec(
                         ..Default::default()
                     }
                 } else {
-                    build_seccomp_profile(p.seccomp_profile.as_ref())
+                    build_seccomp_profile(seccomp.as_ref())
                 }),
                 ..Default::default()
             })
@@ -312,7 +333,14 @@ pub fn build_executor_pod_spec(
                 Volume {
                     name: "fuse-cache".into(),
                     empty_dir: Some(EmptyDirVolumeSource {
-                        size_limit: Some(p.fuse_cache_quantity.clone()),
+                        size_limit: Some(Quantity(
+                            if fetcher {
+                                FETCHER_FUSE_CACHE
+                            } else {
+                                BUILDER_FUSE_CACHE
+                            }
+                            .into(),
+                        )),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -330,7 +358,7 @@ pub fn build_executor_pod_spec(
                 // limit bounds it).
                 Volume {
                     name: "overlays".into(),
-                    empty_dir: Some(if p.read_only_root_fs {
+                    empty_dir: Some(if read_only_root_fs {
                         EmptyDirVolumeSource {
                             medium: Some("Memory".into()),
                             ..Default::default()
@@ -341,7 +369,7 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 },
             ];
-            if p.read_only_root_fs {
+            if read_only_root_fs {
                 for (name, _, medium, size_limit) in READ_ONLY_ROOT_MOUNTS {
                     v.push(Volume {
                         name: (*name).into(),
@@ -400,12 +428,17 @@ pub fn build_executor_pod_spec(
         // bindings) — set so `kubectl describe pod` shows the role-SA
         // not `default`, and so future per-role IRSA annotations attach
         // to the right SA without a controller change.
-        service_account_name: Some(p.role.component_label().into()),
+        service_account_name: Some(pool.spec.kind.component_label().into()),
         automount_service_account_token: Some(false),
         // r[impl ctrl.pod.tgps-default]
-        termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
+        // Fetchers: 10min — fetches are short. Builders: spec or 2h.
+        termination_grace_period_seconds: Some(
+            pool.spec
+                .termination_grace_period_seconds
+                .unwrap_or(if fetcher { 600 } else { 7200 }),
+        ),
         node_selector: {
-            let mut ns = p.node_selector.clone().unwrap_or_default();
+            let mut ns = effective_node_selector(pool).unwrap_or_default();
             // r[impl ctrl.pod.arch-selector]
             // I-098: a pool with systems=[x86_64-linux] landed pods on an
             // arm64 node (fallback NodePool unconstrained) — builder
@@ -415,9 +448,7 @@ pub fn build_executor_pod_spec(
             // Builder-only: fetchers run `builtin` (arch-agnostic) and
             // benefit from cheaper Graviton; rio-builder's startup arch
             // check is the safety net for builders that slip through.
-            if p.role == ExecutorKind::Builder
-                && let Some(arch) = nix_systems_to_k8s_arch(&p.systems)
-            {
+            if !fetcher && let Some(arch) = nix_systems_to_k8s_arch(&pool.spec.systems) {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
             // r[impl ctrl.pool.kvm-device]
@@ -426,19 +457,19 @@ pub fn build_executor_pod_spec(
             // different kvm-capable label can override. Unconditional
             // wrt privileged: even a privileged pod needs a host that
             // actually has /dev/kvm.
-            if p.wants_kvm() {
+            if wants_kvm(pool) {
                 ns.entry(KVM_NODE_LABEL.into()).or_insert("true".into());
             }
             if ns.is_empty() { None } else { Some(ns) }
         },
         tolerations: {
-            let mut t = p.tolerations.clone().unwrap_or_default();
+            let mut t = effective_tolerations(pool).unwrap_or_default();
             // r[impl ctrl.pool.kvm-device]
             // Metal NodePool is tainted rio.build/kvm=true:NoSchedule so
             // non-kvm builders don't bin-pack onto $$ metal. Append
             // (don't replace) — the operator-set rio.build/builder
             // toleration must survive.
-            if p.wants_kvm() {
+            if wants_kvm(pool) {
                 t.push(Toleration {
                     key: Some(KVM_NODE_LABEL.into()),
                     operator: Some("Equal".into()),
@@ -454,19 +485,24 @@ pub fn build_executor_pod_spec(
     }
 }
 
-/// The executor container.
+/// The executor container. `privileged` / `read_only_root_fs` /
+/// `seccomp` are passed in (already computed by the caller) so the
+/// pod-level and container-level views can't drift.
 fn build_executor_container(
-    p: &ExecutorPodParams,
+    pool: &Pool,
     scheduler: &UpstreamAddrs,
     store: &UpstreamAddrs,
+    privileged: bool,
+    read_only_root_fs: bool,
+    seccomp: Option<&SeccompProfileKind>,
 ) -> Container {
-    let privileged = p.privileged;
+    let fetcher = is_fetcher(pool);
 
     Container {
-        name: p.role.as_str().into(),
-        image: Some(p.image.clone()),
+        name: pool.spec.kind.as_str().into(),
+        image: Some(pool.spec.image.clone()),
         command: Some(vec!["/bin/rio-builder".into()]),
-        image_pull_policy: p.image_pull_policy.clone(),
+        image_pull_policy: pool.spec.image_pull_policy.clone(),
         env: Some({
             let mut e = vec![
                 env("RIO_SCHEDULER__ADDR", &scheduler.addr),
@@ -475,8 +511,17 @@ fn build_executor_container(
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
-                env("RIO_SYSTEMS", &p.systems.join(",")),
-                env("RIO_FEATURES", &p.features.join(",")),
+                env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
+                // FODs route by is_fixed_output alone, not features —
+                // fetchers always advertise empty.
+                env(
+                    "RIO_FEATURES",
+                    &if fetcher {
+                        String::new()
+                    } else {
+                        pool.spec.features.join(",")
+                    },
+                ),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
                 // Job pods are `<job-name>-<suffix>` — unique per
@@ -506,7 +551,7 @@ fn build_executor_container(
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
                 // §Executor enforcement — a builder receiving a FOD
                 // returns WrongKind without spawning).
-                env("RIO_EXECUTOR_KIND", p.role.as_str()),
+                env("RIO_EXECUTOR_KIND", pool.spec.kind.as_str()),
             ];
             if let Some(host) = &scheduler.balance_host {
                 e.push(env("RIO_SCHEDULER__BALANCE_HOST", host));
@@ -522,8 +567,20 @@ fn build_executor_container(
                     &store.balance_port.to_string(),
                 ));
             }
-            if let Some(n) = p.fuse_threads {
-                e.push(env("RIO_FUSE_THREADS", &n.to_string()));
+            // Builder-only tuning knobs. Fetchers leave all unset.
+            if !fetcher {
+                if let Some(n) = pool.spec.fuse_threads {
+                    e.push(env("RIO_FUSE_THREADS", &n.to_string()));
+                }
+                if let Some(p) = pool.spec.fuse_passthrough {
+                    e.push(env(
+                        "RIO_FUSE_PASSTHROUGH",
+                        if p { "true" } else { "false" },
+                    ));
+                }
+                if let Some(s) = pool.spec.daemon_timeout_secs {
+                    e.push(env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
+                }
             }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively).
@@ -536,9 +593,6 @@ fn build_executor_container(
             if let Ok(level) = std::env::var("RUST_LOG") {
                 e.push(env("RUST_LOG", &level));
             }
-            // Role-specific extras: builders pass daemon_timeout_secs,
-            // fuse_passthrough here. Fetchers pass nothing.
-            e.extend(p.extra_env.iter().cloned());
             e
         }),
 
@@ -555,7 +609,7 @@ fn build_executor_container(
                     ..Default::default()
                 },
             ];
-            if p.read_only_root_fs {
+            if read_only_root_fs {
                 for (name, mount_path, _, _) in READ_ONLY_ROOT_MOUNTS {
                     m.push(VolumeMount {
                         name: (*name).into(),
@@ -617,15 +671,13 @@ fn build_executor_container(
             // Container-level seccomp: set ONLY when Localhost is
             // requested. Pod-level stays RuntimeDefault in that case
             // (see build_executor_pod_spec security_context).
-            seccomp_profile: p
-                .seccomp_profile
-                .as_ref()
+            seccomp_profile: seccomp
                 .filter(|k| k.type_ == "Localhost")
-                .map(|_| build_seccomp_profile(p.seccomp_profile.as_ref())),
+                .map(|_| build_seccomp_profile(seccomp)),
             // Fetcher hardening: rootfs tampering blocked. The
             // overlay upperdir (tmpfs emptyDir) is still writable.
             // ADR-019 §Sandbox hardening.
-            read_only_root_filesystem: p.read_only_root_fs.then_some(true),
+            read_only_root_filesystem: read_only_root_fs.then_some(true),
             ..Default::default()
         }),
 

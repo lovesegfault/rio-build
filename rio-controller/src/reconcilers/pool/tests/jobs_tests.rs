@@ -35,7 +35,7 @@ fn ephemeral_spawn_fail_still_patches_status() {
     // caller's status patch can be skipped.
     let src = include_str!("../job.rs");
     let fn_start = src
-        .find("pub(crate) async fn spawn_for_each<")
+        .find("pub(super) async fn spawn_for_each(")
         .expect("spawn_for_each present in job.rs");
     let fn_end = src[fn_start..]
         .find("\n}\n")

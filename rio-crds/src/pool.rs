@@ -5,7 +5,7 @@
 //! size-classes were deleted — same binary, same scheduler, same Job
 //! lifecycle, with `RIO_EXECUTOR_KIND` toggled. The remaining
 //! difference (ADR-019 fetcher hardening) is a `match spec.kind` in
-//! the reconciler's `executor_params` plus admission-time CEL on
+//! `pod::build_executor_pod_spec` plus admission-time CEL on
 //! the spec fields the hardening would otherwise silently override.
 //!
 //! `BuilderPoolSet` is gone: it existed solely to fan out one child
@@ -28,6 +28,28 @@ use serde::{Deserialize, Serialize};
 pub enum ExecutorKind {
     Builder,
     Fetcher,
+}
+
+impl ExecutorKind {
+    /// Lowercase string repr for the `rio.build/role` pod label and
+    /// `RIO_EXECUTOR_KIND` env var (matches the deserializer in
+    /// `rio-builder/src/config.rs`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Builder => "builder",
+            Self::Fetcher => "fetcher",
+        }
+    }
+    /// `rio-builder` / `rio-fetcher` — the canonical
+    /// `app.kubernetes.io/component` label that the cluster-wide
+    /// network policies select on (D3a). Also used as the per-role
+    /// ServiceAccount name.
+    pub fn component_label(&self) -> &'static str {
+        match self {
+            Self::Builder => "rio-builder",
+            Self::Fetcher => "rio-fetcher",
+        }
+    }
 }
 
 /// Spec for a pool. The derive generates a `Pool` struct with
@@ -88,7 +110,7 @@ pub enum ExecutorKind {
 // ── D3 fetcher CEL ────────────────────────────────────────────────
 // Admission-time rejection (NOT silent reconciler override) of spec
 // fields that ADR-019 forces for fetchers. The reconciler's
-// `executor_params` Fetcher arm hardcodes the safe values regardless
+// `pod.rs` fetcher hardening hardcodes the safe values regardless
 // (belt-and-suspenders for pre-CEL specs the apiserver already
 // accepted); these rules surface the misconfig at `kubectl apply`
 // time so the operator KNOWS their spec is being ignored.
@@ -114,7 +136,7 @@ pub enum ExecutorKind {
 // seccompProfile): k3s containerd doesn't chown the pod cgroup under
 // hostUsers:false → exit-1 EACCES on cgroup mkdir. VM tests need
 // hostUsers:true; production EKS gets the reconciler's default `false`
-// (executor_params Fetcher arm: spec.host_users.or(Some(false))). The
+// (`pod::effective_host_users`: spec.host_users.or(Some(false))). The
 // reconciler default is the safety net; CEL would make k3s fixtures
 // unrunnable.
 #[x_kube(
@@ -369,7 +391,7 @@ mod tests {
         // r[verify ctrl.crd.pool]
         // D3: fetcher hardening rules. Admission-time rejection of
         // spec fields ADR-019 forces — the reconciler's belt-and-
-        // suspenders override is `pool/mod.rs::executor_params`.
+        // suspenders override is `pool/pod.rs` fetcher hardening.
         for (rule, msg) in [
             (
                 "self.kind != 'Fetcher' || (!has(self.privileged) || !self.privileged)",

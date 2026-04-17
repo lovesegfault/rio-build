@@ -4,7 +4,7 @@
 //! Reconcile (10s tick): poll scheduler `GetSpawnIntents` →
 //! `Σ(queued+running)` builders; poll each `loadEndpoint` pod's
 //! `StoreAdminService.GetLoad` → max `pg_pool_utilization`; feed
-//! both into `crate::scaling::component::decide`; patch the target
+//! both into `decide::decide`; patch the target
 //! Deployment's `/scale` subresource; write `.status` (which
 //! persists `learnedRatio` across controller restarts).
 //!
@@ -27,10 +27,12 @@ use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, error_key, standard_error_policy, timed};
-use crate::scaling::component::{self, Decision};
 use rio_crds::componentscaler::{
     ComponentScaler, ComponentScalerSpec, ComponentScalerStatus, Signal,
 };
+
+mod decide;
+use decide::Decision;
 
 /// Reconcile interval. 10s: fast enough that scale-up beats the
 /// I-105 cliff (a 200-builder burst takes ~30s from queued to all-
@@ -83,7 +85,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
                     "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
                 ))
             })?;
-            component::total_builders(&resp)
+            decide::total_builders(&resp)
                 .saturating_add(u64::from(cs.into_inner().running_derivations))
         }
     };
@@ -116,7 +118,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     let since_up = status.last_scale_up_time.as_ref().and_then(since);
     let mut status_in = status.clone();
     status_in.low_load_ticks = low_ticks_in;
-    let decision = component::decide(spec, &status_in, current, builders, max_load, since_up);
+    let decision = decide::decide(spec, &status_in, current, builders, max_load, since_up);
     ctx.scaler
         .low_ticks
         .lock()

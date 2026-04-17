@@ -436,8 +436,8 @@ The controller does **NOT** manage:
 ## Key Files
 
 - `rio-crds/src/` --- CRD type definitions (separate crate; Pool, ComponentScaler)
-- `rio-controller/src/reconcilers/` --- Reconciliation loops
-- `rio-controller/src/scaling/` --- ComponentScaler (rio-store/rio-gateway Deployment scaling)
+- `rio-controller/src/reconcilers/pool/` --- Pool reconcile loop + Job/pod-spec builders
+- `rio-controller/src/reconcilers/componentscaler/` --- ComponentScaler (rio-store/rio-gateway Deployment scaling)
 
 ## CRD Versioning
 

@@ -418,19 +418,17 @@ src/
 │   └── crdgen.rs      # Emit Pool/ComponentScaler CRD YAML
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
-├── scaling/
-│   ├── mod.rs
-│   ├── component.rs   # ComponentScaler: predictive Σ(queued+running) → Deployment /scale patch
-│   └── tests.rs
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
     ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
+    ├── componentscaler/
+    │   ├── mod.rs     # ComponentScaler reconciler: GetLoad fan-out + /scale patch
+    │   └── decide.rs  # Predictive Σ(queued+running) → desired-replicas decision
     └── pool/
-        ├── mod.rs     # Pool reconcile: executor_params kind branch + drain finalizer
-        ├── pod.rs     # Pod-spec builder (security context, volumes, labels)
+        ├── mod.rs     # Pool reconcile entry: drain finalizer + crds↔proto ExecutorKind bridge
+        ├── pod.rs     # Pod-spec builder (security context, volumes, labels, fetcher hardening)
         ├── job.rs     # Job-mode plumbing: spawn_for_each, reap_excess_pending, reap_orphan_running
         ├── jobs.rs    # Reconcile loop: GetSpawnIntents → build_job → status patch
-        ├── conditions.rs # K8s Condition helpers (transition_time)
         ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
         └── tests/
 ```

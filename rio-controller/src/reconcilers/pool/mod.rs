@@ -19,27 +19,21 @@
 //! K8s ownerRef-GC cascades to the Jobs → their pods get SIGTERM and
 //! drain at the executor level.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::{PodSpec, Toleration};
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
 use kube::runtime::controller::Action;
 use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
-use rio_crds::pool::{ExecutorKind, Pool, SeccompProfileKind};
+use rio_crds::pool::{ExecutorKind, Pool};
 
-pub(super) mod conditions;
 pub mod disruption;
 pub(super) mod job;
 pub(super) mod jobs;
 pub mod pod;
-
-use pod::{ExecutorPodParams, UpstreamAddrs};
 
 #[cfg(test)]
 pub(super) mod tests;
@@ -50,19 +44,26 @@ pub(super) mod tests;
 /// `metadata.finalizers`; delete blocks until we remove it.
 const FINALIZER: &str = "pool.rio.build/drain";
 
-/// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
-/// overshoot. No CRD knob: pods are one-shot so the cache never
-/// outlives one build's input closure.
-pub(crate) const BUILDER_FUSE_CACHE: &str = "50Gi";
-
-/// Default FUSE cache size for fetchers. FODs are typically small
-/// (source tarballs, git clones) — 10Gi is plenty.
-const FETCHER_FUSE_CACHE: &str = "10Gi";
-
 /// Label every Pool-owned pod carries. `executor_labels()` sets it;
 /// `disruption::run` filters on it; `jobs` + cleanup list-selectors
 /// match on it.
 pub(crate) use pod::POOL_LABEL;
+
+/// Canonical CRD-enum → proto-enum bridge.
+///
+/// `rio_crds::ExecutorKind` and `rio_proto::types::ExecutorKind` are
+/// value-identical 2-variant enums kept separate so `rio-crds` stays
+/// kube-only (no prost/tonic in the CRD codegen path) and so the
+/// proto enum doesn't need `JsonSchema`/`KubeSchema` derives. A
+/// `From` impl would violate the orphan rule (both types foreign), so
+/// this free fn — defined in rio-controller, the only crate that
+/// depends on both — is the single conversion point.
+pub(super) fn executor_kind_to_proto(k: ExecutorKind) -> rio_proto::types::ExecutorKind {
+    match k {
+        ExecutorKind::Builder => rio_proto::types::ExecutorKind::Builder,
+        ExecutorKind::Fetcher => rio_proto::types::ExecutorKind::Fetcher,
+    }
+}
 
 /// Top-level reconcile. [`timed`] opens the `reconcile{reconciler,
 /// name, ns}` span and records the duration histogram; `finalized`
@@ -128,134 +129,4 @@ async fn cleanup(pool: Arc<Pool>, _ctx: Arc<Ctx>) -> Result<Action> {
 /// exponential backoff (5s → 300s). InvalidSpec → fixed 5min.
 pub fn error_policy(pool: Arc<Pool>, err: &Error, ctx: Arc<Ctx>) -> Action {
     standard_error_policy("pool", pool, err, ctx, Duration::from_secs(300))
-}
-
-/// Convert `Pool` → `ExecutorPodParams`, branching on `spec.kind`.
-///
-/// `ExecutorKind::Builder`: spec fields pass through verbatim; the
-/// builder-only tuning knobs (daemon_timeout, fuse_passthrough)
-/// become `extra_env` entries.
-///
-/// `ExecutorKind::Fetcher`: ADR-019 hardening — forced
-/// `read_only_root_fs: true`, `seccomp = Localhost
-/// operator/rio-fetcher.json`, `host_users` default `false` (spec
-/// override honored — k3s escape hatch), default
-/// `node-role: fetcher` selector + toleration, `tgps = 600`. CEL on
-/// the CRD rejects fetcher specs that try to set the overridden
-/// fields at admission time; this is belt-and-suspenders for pre-
-/// CEL specs the apiserver already accepted.
-pub(super) fn executor_params(pool: &Pool) -> ExecutorPodParams {
-    match pool.spec.kind {
-        ExecutorKind::Builder => {
-            let mut extra_env = vec![];
-            if let Some(p) = pool.spec.fuse_passthrough {
-                extra_env.push(pod::env(
-                    "RIO_FUSE_PASSTHROUGH",
-                    if p { "true" } else { "false" },
-                ));
-            }
-            if let Some(s) = pool.spec.daemon_timeout_secs {
-                extra_env.push(pod::env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
-            }
-            ExecutorPodParams {
-                role: ExecutorKind::Builder,
-                read_only_root_fs: false,
-                extra_env,
-                pool_name: pool.name_any(),
-                image: pool.spec.image.clone(),
-                systems: pool.spec.systems.clone(),
-                node_selector: pool.spec.node_selector.clone(),
-                tolerations: pool.spec.tolerations.clone(),
-                host_users: pool.spec.host_users,
-                image_pull_policy: pool.spec.image_pull_policy.clone(),
-                features: pool.spec.features.clone(),
-                fuse_cache_quantity: Quantity(BUILDER_FUSE_CACHE.into()),
-                fuse_threads: pool.spec.fuse_threads,
-                privileged: pool.spec.privileged == Some(true),
-                seccomp_profile: pool.spec.seccomp_profile.clone(),
-                host_network: pool.spec.host_network,
-                termination_grace_period_seconds: pool.spec.termination_grace_period_seconds,
-            }
-        }
-        // r[impl ctrl.pool.fetcher-hardening]
-        // r[impl fetcher.node.dedicated]
-        // r[impl fetcher.sandbox.strict-seccomp]
-        ExecutorKind::Fetcher => {
-            // ADR-019 §Node isolation: fetchers land on dedicated
-            // nodes via the `rio.build/fetcher=true:NoSchedule` taint
-            // + matching selector. If the operator supplies their
-            // own, honor those instead — lets them override for dev
-            // clusters without dedicated node pools.
-            let node_selector = pool.spec.node_selector.clone().or_else(|| {
-                Some(BTreeMap::from([(
-                    "rio.build/node-role".into(),
-                    "fetcher".into(),
-                )]))
-            });
-            let tolerations = pool.spec.tolerations.clone().or_else(|| {
-                Some(vec![Toleration {
-                    key: Some("rio.build/fetcher".into()),
-                    operator: Some("Exists".into()),
-                    effect: Some("NoSchedule".into()),
-                    ..Default::default()
-                }])
-            });
-            ExecutorPodParams {
-                role: ExecutorKind::Fetcher,
-                // ADR-019 §Sandbox hardening: rootfs tampering blocked.
-                read_only_root_fs: true,
-                extra_env: vec![],
-                pool_name: pool.name_any(),
-                image: pool.spec.image.clone(),
-                systems: pool.spec.systems.clone(),
-                node_selector,
-                tolerations,
-                // Default `hostUsers: false` (ADR-019 userns isolation),
-                // but HONOR the spec override. k3s containerd doesn't
-                // chown the pod cgroup under hostUsers:false → rio-
-                // builder's `mkdir /sys/fs/cgroup/leaf` EACCES → exit 1
-                // in <200ms (vmtest-full-nonpriv.yaml). The k3s VM tests
-                // set `hostUsers: true`; production EKS (containerd 2.0+)
-                // gets the default `false`. Forcing Some(false) here
-                // (Phase-7 first cut) made fetcher pods unrunnable on
-                // every CI fixture.
-                host_users: pool.spec.host_users.or(Some(false)),
-                image_pull_policy: pool.spec.image_pull_policy.clone(),
-                // FODs route by is_fixed_output alone, not features.
-                features: vec![],
-                fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),
-                fuse_threads: None,
-                // Never privileged — fetchers face the open internet.
-                privileged: false,
-                // ADR-019 §Sandbox hardening: stricter Localhost
-                // profile with extra denies (ptrace/bpf/setns/
-                // process_vm_*/keyctl/add_key). Written by systemd-
-                // tmpfiles on every node before kubelet starts.
-                seccomp_profile: Some(SeccompProfileKind {
-                    type_: "Localhost".into(),
-                    localhost_profile: Some("operator/rio-fetcher.json".into()),
-                }),
-                host_network: None,
-                // 10 minutes — fetches are short.
-                termination_grace_period_seconds: pool
-                    .spec
-                    .termination_grace_period_seconds
-                    .or(Some(600)),
-            }
-        }
-    }
-}
-
-/// Labels applied to Jobs and pods for this pool.
-pub(super) fn labels(pool: &Pool) -> BTreeMap<String, String> {
-    pod::executor_labels(&executor_params(pool))
-}
-
-/// The pod spec. Re-exported for `jobs::build_job`.
-pub(super) fn build_pod_spec(
-    pool: &Pool,
-    scheduler: &UpstreamAddrs,
-    store: &UpstreamAddrs,
-) -> PodSpec {
-    pod::build_executor_pod_spec(&executor_params(pool), scheduler, store)
 }

@@ -13,7 +13,7 @@ use console::style;
 use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret};
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-use rio_crds::pool::{ExecutorKind, Pool};
+use rio_crds::pool::Pool;
 use serde::Serialize;
 use tracing::{debug, info};
 
@@ -234,14 +234,8 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         release: helm::release_status("rio", NS).ok().flatten(),
         namespaces,
         pools: {
-            let mut v = list_pools(client, NS_BUILDERS, ExecutorKind::Builder)
-                .await
-                .unwrap_or_default();
-            v.extend(
-                list_pools(client, NS_FETCHERS, ExecutorKind::Fetcher)
-                    .await
-                    .unwrap_or_default(),
-            );
+            let mut v = list_pools(client, NS_BUILDERS).await.unwrap_or_default();
+            v.extend(list_pools(client, NS_FETCHERS).await.unwrap_or_default());
             v
         },
         subnets,
@@ -811,13 +805,12 @@ pub(super) fn nodeclaim_api(client: &k::Client) -> Api<DynamicObject> {
     Api::all_with(client.clone(), &ar)
 }
 
-async fn list_pools(client: &k::Client, ns: &str, kind: ExecutorKind) -> Result<Vec<PlStatus>> {
+async fn list_pools(client: &k::Client, ns: &str) -> Result<Vec<PlStatus>> {
     let api: Api<Pool> = Api::namespaced(client.clone(), ns);
     let mut out: Vec<_> = api
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .filter(|p| p.spec.kind == kind)
         .map(|p| {
             let name = p.metadata.name.unwrap_or_default();
             let st = p.status.unwrap_or_default();

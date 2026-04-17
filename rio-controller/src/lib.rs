@@ -45,7 +45,6 @@ pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod reconcilers;
-pub(crate) mod scaling;
 
 /// Histogram bucket boundaries for controller reconcile latency (seconds).
 ///
