@@ -39,10 +39,12 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     let Some(f) = fit else {
         return decision(probe.cpu, mem_for, DiskBytes(cfg.default_disk));
     };
-    // Disk is core-independent (r[sched.sla.disk-scalar]): if the key
-    // already has an observed p90, use it even while the cores ladder
-    // is still walking — `resource_floor` is per-drv_hash so a fresh
-    // version would otherwise re-climb DiskPressure from default_disk.
+    // `resource_floor` is per-drv_hash so a fresh version would
+    // otherwise re-climb OOM/DiskPressure from probe defaults. Disk is
+    // a core-independent scalar (r[sched.sla.disk-scalar]); mem
+    // evaluates `MemFit::at(c)` at the explore-chosen c. `.max(probe
+    // shape)` guards the Independent{p90:0} sentinel (no prior sample).
+    let mem_for = move |c: f64| MemBytes(mem_for(c).0.max(f.mem.at(RawCores(c)).0));
     let disk = DiskBytes(f.disk_p90.map(|d| d.0).unwrap_or(cfg.default_disk));
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
@@ -245,6 +247,24 @@ mod tests {
         );
         // No fit → cfg.default_disk.
         assert_eq!(next(None, &cfg(), &DrvHints::default()).disk.0, 20 << 30);
+    }
+
+    #[test]
+    fn mem_uses_fit_when_above_probe_shape() {
+        // ÷2 path: c=32 unsaturated → c_down=16. Probe shape at 16 =
+        // 16·2Gi + 4Gi = 36Gi. Observed Independent{p90:80Gi} must win
+        // (a fresh drv_hash would otherwise OOM and re-climb floor.mem).
+        let mut f = fit(st(32.0, 32.0, 1, false, 200.0));
+        f.mem = MemFit::Independent {
+            p90: MemBytes(80 << 30),
+        };
+        let d = next(Some(&f), &cfg(), &DrvHints::default());
+        assert_eq!(d.c.0, 16.0);
+        assert_eq!(d.mem.0, 80 << 30, "fit mem, not probe shape");
+        // Independent{p90:0} sentinel → probe shape wins via .max().
+        let f = fit(st(32.0, 32.0, 1, false, 200.0));
+        let d = next(Some(&f), &cfg(), &DrvHints::default());
+        assert_eq!(d.mem.0, 16 * (2 << 30) + (4 << 30));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 /// controller will spawn.
 const LOCAL_CORES: u32 = 1;
 const LOCAL_MEM_BYTES: u64 = 2 << 30;
+const LOCAL_DISK_BYTES: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tier {
@@ -201,12 +202,19 @@ pub fn intent_for(
     // (the doc-promise above) — `rio sla override --mem` on a serial
     // drv was silently dropped before.
     let forced_mem = override_.and_then(|o| o.forced_mem);
+    if hints.prefer_local_build == Some(true) {
+        // Trivial builders (writeText, runCommand, symlinkJoin) have no
+        // pname → never fitted → must NOT fall back to ceil.default_disk
+        // (100 GiB chart default, sized for cold-probe of an unknown
+        // package). Mirror LOCAL_MEM_BYTES with a minimal disk const.
+        let disk = fit
+            .and_then(|f| f.disk_p90)
+            .map_or(LOCAL_DISK_BYTES, |d| d.0);
+        return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), disk);
+    }
     let fit_disk = fit
         .and_then(|f| f.disk_p90)
         .map_or(ceil.default_disk, |d| d.0);
-    if hints.prefer_local_build == Some(true) {
-        return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), fit_disk);
-    }
     if hints.enable_parallel_building == Some(false) {
         let mem = forced_mem
             .or_else(|| fit.map(|f| f.mem.at(RawCores(1.0)).0))
@@ -875,7 +883,7 @@ mod tests {
             ..Default::default()
         };
         let (c, m, d) = intent(None, &hints);
-        assert_eq!((c, m, d), (1, LOCAL_MEM_BYTES, ceil().default_disk));
+        assert_eq!((c, m, d), (1, LOCAL_MEM_BYTES, LOCAL_DISK_BYTES));
         // With a fit: cores/mem stay minimal (semantic: trivial build),
         // but disk follows disk_p90 — `resource_floor` is per-drv_hash
         // so a fresh version would otherwise re-climb DiskPressure.
