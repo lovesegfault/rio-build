@@ -1777,7 +1777,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
 /// completion.rs:285 `let (Some(start), Some(stop)) = ...` rejects
 /// Default::default() timestamps (None, None). Proves the gate is
 /// live — if someone removes it, this test catches the regression
-/// (spurious 0.0s samples would poison the rebalancer's percentiles).
+/// (spurious 0.0s samples would poison the SLA estimator's percentiles).
 #[tokio::test]
 async fn test_completion_no_timestamps_no_sample() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("nt-worker", "x86_64-linux").await?;

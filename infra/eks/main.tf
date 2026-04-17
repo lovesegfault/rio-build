@@ -276,7 +276,7 @@ module "eks" {
 
   # Managed node groups. System only — worker nodes are
   # Karpenter-provisioned (karpenter.tf). rio-controller spawns one
-  # ephemeral Job per dispatched derivation (gated by BuilderPool
+  # ephemeral Job per dispatched derivation (gated by Pool
   # maxConcurrent); Karpenter provisions nodes for Pending pods.
   # Scale-to-zero: Jobs exit on completion → Karpenter consolidates.
   eks_managed_node_groups = {

@@ -288,10 +288,11 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 
 | API Group | Resources | Verbs |
 |---|---|---|
-| `rio.build` | builderpools, fetcherpools | get, list, watch, create, update, patch, delete |
-| `rio.build` | builderpoolsets, componentscalers | get, list, watch, patch, update |
-| `rio.build` | {builderpools,builderpoolsets,fetcherpools,componentscalers}/status | get, patch[, update] |
-| `rio.build` | {builderpools,builderpoolsets,fetcherpools}/finalizers | update — `OwnerReferencesPermissionEnforcement` checks this when creating children with `blockOwnerDeletion: true` |
+| `rio.build` | pools | get, list, watch, create, update, patch, delete |
+| `rio.build` | componentscalers | get, list, watch |
+| `rio.build` | pools/status | get, patch |
+| `rio.build` | componentscalers/status | get, patch, update |
+| `rio.build` | pools/finalizers | update — `OwnerReferencesPermissionEnforcement` checks this when creating children with `blockOwnerDeletion: true` |
 | `apps` | deployments | get, list, watch — ComponentScaler reads current `.spec.replicas` |
 | `apps` | deployments/scale | get, patch, update — ComponentScaler `/scale` subresource patch |
 | `""` (core) | pods | get, list, watch |

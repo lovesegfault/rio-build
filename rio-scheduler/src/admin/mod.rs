@@ -306,7 +306,7 @@ impl AdminService for AdminServiceImpl {
     /// Mark a worker draining: `has_capacity()` returns false, dispatch
     /// skips it. In-flight builds continue. Called by:
     ///   - Worker's SIGTERM handler (step 1 of drain)
-    ///   - Controller's BuilderPool finalizer cleanup
+    ///   - Controller's Pool finalizer cleanup
     ///
     /// `force=true` reassigns in-flight builds — the worker's nix-daemon
     /// keeps running them (we can't reach into its process tree) but the

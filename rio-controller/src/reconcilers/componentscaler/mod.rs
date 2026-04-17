@@ -46,7 +46,7 @@ const REQUEUE: Duration = Duration::from_secs(10);
 const LOAD_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// SSA field-manager for `deployments/scale` patches AND status
-/// writes. One manager (not split like the BuilderPool reconciler/
+/// writes. One manager (not split like the Pool reconciler/
 /// autoscaler) because there's no second writer here — this
 /// reconciler owns both. Distinct from `rio-controller` (helm's
 /// Deployment apply) so a `helm upgrade` doesn't fight the replica

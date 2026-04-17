@@ -238,7 +238,7 @@ fn now_epoch() -> f64 {
 
 /// Builder/fetcher pod label selector — same value `disruption.rs`
 /// filters on. Re-declared here (not re-exported) to keep this module
-/// dependency-free of `builderpool`.
+/// dependency-free of `pool`.
 const POOL_LABEL: &str = "rio.build/pool";
 
 /// Pod-watcher: stamp `rio.build/hw-class` on each builder pod once

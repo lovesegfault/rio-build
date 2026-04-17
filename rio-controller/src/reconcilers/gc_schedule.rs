@@ -1,7 +1,7 @@
 //! GC cron reconciler. Calls StoreAdminService.TriggerGC on an
 //! interval (default 24h, `gc_interval_hours` config; 0 = disabled).
 //!
-//! Unlike the BuilderPool reconciler (event-driven, watches CRDs),
+//! Unlike the Pool reconciler (event-driven, watches CRDs),
 //! this is a plain interval loop — no K8s resource to watch, so not
 //! a kube-rs `Controller::run`.
 //!

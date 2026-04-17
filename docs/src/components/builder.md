@@ -64,7 +64,7 @@ Each builder runs a FUSE filesystem that presents store paths to the build. The 
 - **Lifetime**: Pod-scoped. The cache holds one build's input closure and is discarded with the `emptyDir` when the pod terminates; no eviction is needed. Node-level FSx caching survives pod churn, so common paths (glibc, coreutils, etc.) stay warm at the storage layer even though every pod-level FUSE cache is fresh.
 
 r[builder.platform.i686]
-The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's resolved `RIO_SYSTEMS` (minus the `builtin` pseudo-system). This keeps daemon acceptance consistent with what the heartbeat advertises to the scheduler: an x86_64 BuilderPool with `systems: [x86_64-linux, i686-linux]` routes i686 derivations to its pods, and the daemon accepts them because `extra-platforms = x86_64-linux i686-linux`. The host system appearing in `extra-platforms` is a no-op; on aarch64 builders the line contains only `aarch64-linux` so the setting is inert.
+The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's resolved `RIO_SYSTEMS` (minus the `builtin` pseudo-system). This keeps daemon acceptance consistent with what the heartbeat advertises to the scheduler: an x86_64 Pool with `systems: [x86_64-linux, i686-linux]` routes i686 derivations to its pods, and the daemon accepts them because `extra-platforms = x86_64-linux i686-linux`. The host system appearing in `extra-platforms` is a no-op; on aarch64 builders the line contains only `aarch64-linux` so the setting is inert.
 
 r[builder.fuse.cache-ephemeral-memory]
 The SQLite cache index is `:memory:` — the pod's filesystem is discarded after the single build, so persistence is pointless, and on tiny-class node storage on-disk writes cost >1s each (I-141).
@@ -348,7 +348,7 @@ On any error exit after the build cgroup is populated, the executor MUST write `
 
 ### Build Resource Limits
 
-A builder pod runs **one** build, then exits. The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; the next queued derivation gets a fresh Job. Operators size the pod via `BuilderPool.spec.resources`.
+A builder pod runs **one** build, then exits. The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; the next queued derivation gets a fresh Job. Operators size the pod via `Pool.spec.resources`.
 
 The per-build sub-cgroup is **measurement and cancellation only**: cgroup v2 `memory.peak` + polled `cpu.stat` for resource accounting (`r[builder.cgroup.memory-peak]`), and `cgroup.kill` for clean teardown (`r[builder.cgroup.kill-on-teardown]`) without touching the rio-builder process or its FUSE threads.
 

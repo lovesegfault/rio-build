@@ -243,7 +243,7 @@ pub enum ActorCommand {
     /// Mark a worker draining: stop sending new assignments.
     ///
     /// Called by the worker itself (step 1 of SIGTERM drain) or by
-    /// the controller (BuilderPool finalizer cleanup). Idempotent: an
+    /// the controller (Pool finalizer cleanup). Idempotent: an
     /// already-draining worker replies `accepted=true` with the same
     /// running count. Unknown worker → `accepted=false, running=0`
     /// (not an error; the worker may have already disconnected).
@@ -609,7 +609,7 @@ pub struct ClusterSnapshot {
     /// across keys == `queued_derivations`. Populated from
     /// `DerivationState.system` during the same DAG iteration that
     /// computes `running_derivations`. Consumed by the controller's
-    /// BuilderPool autoscaler so per-arch pools scale on their own
+    /// Pool autoscaler so per-arch pools scale on their own
     /// backlog (I-107).
     pub queued_by_system: std::collections::HashMap<String, u32>,
 }

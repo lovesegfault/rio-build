@@ -278,7 +278,8 @@ async fn main() -> anyhow::Result<()> {
         rio_scheduler::admin::spawn_store_size_refresh(pool.clone(), shutdown.clone());
 
     // build_samples retention: delete rows older than 30 days, hourly.
-    // 30d > rebalancer's 7d query window (P0229) with margin.
+    // 30d bounds the SLA estimator's sample set (ADR-023) with margin
+    // for cold-restart refresh + operator forensics.
     //
     // Fresh SchedulerDb from pool.clone() — `db` was moved into the
     // actor at ActorHandle::spawn above. PgPool is

@@ -341,7 +341,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
                  likely owned by an unmapped UID (nobody). runc only \
                  chowns it when containerd sets cgroup_writable=true on \
                  the runc runtime (v2.1+); without that, set \
-                 hostUsers:true on the BuilderPool spec"
+                 hostUsers:true on the Pool spec"
             } else {
                 ""
             };

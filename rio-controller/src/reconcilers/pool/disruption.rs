@@ -58,7 +58,7 @@ pub async fn run(
     mut admin: AdminServiceClient<Channel>,
     shutdown: rio_common::signal::Token,
 ) {
-    // All-namespaces: BuilderPool is namespaced, so pods can be in
+    // All-namespaces: Pool is namespaced, so pods can be in
     // any ns. Label selector filters to OUR pods at the apiserver
     // (not client-side) — cheap.
     let pods: Api<Pod> = Api::all(client);

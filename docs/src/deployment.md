@@ -17,7 +17,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 | rio-scheduler | Deployment | 2 (leader-elected) | Leader election via Kubernetes Lease. One leader, one hot standby. ~15s failover. |
 | rio-store | Deployment | 1 | Stateless at runtime (PG + S3 hold everything), but concurrent startup migrations from multiple replicas would race. Scale horizontally later after adding a migration-lock mechanism. |
 | rio-controller | Deployment | 1 | K8s operator. **Single replica, not leader-elected** --- two controllers would fight over SSA patches (conflicting fieldManager). Add leader election later if the ~30s pod-reschedule gap during restart becomes a problem. |
-| rio-builder | Job (ephemeral) | 0+ (autoscaled) | Managed by rio-controller via BuilderPool CRD. Requires dedicated node pool. |
+| rio-builder | Job (ephemeral) | 0+ (autoscaled) | Managed by rio-controller via Pool CRD (`kind: Builder`). Requires dedicated node pool. |
 
 ## Deployment Order
 
@@ -26,7 +26,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 3. **rio-store** (needs PostgreSQL and S3)
 4. **rio-scheduler** (needs PostgreSQL and rio-store)
 5. **rio-gateway** (needs rio-scheduler and rio-store)
-6. **BuilderPool CRD** (rio-controller creates and manages builder Jobs)
+6. **Pool CRD** (rio-controller creates and manages builder/fetcher Jobs)
 
 `helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
 
@@ -39,7 +39,7 @@ For development or evaluation, a minimal deployment needs:
 1x rio-scheduler
 1x rio-store
 1x rio-controller
-1x BuilderPool (maxConcurrent: 2)
+1x Pool (kind: Builder, maxConcurrent: 2)
 1x PostgreSQL (single instance, e.g., via CloudNativePG)
 1x MinIO (for S3-compatible storage)
 ```
@@ -69,7 +69,7 @@ The AMI also bakes a `rio-executor-seed.oci.tar` (builder+fetcher images, dedupl
 
 ### Node autoscaling
 
-Builder pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller spawns BuilderPool Jobs based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
+Builder pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller spawns Pool Jobs based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
 
 The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on builder NodePools means Karpenter never evicts a node with a builder pod on it --- ephemeral Jobs terminate on completion, then Karpenter consolidates the empty node. Scale-to-zero is the default: cold start from zero is ~50-80s (node boot + pod start).
 

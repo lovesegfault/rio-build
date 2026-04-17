@@ -60,7 +60,7 @@ pub struct Ctx {
     /// K8s client. Shared (clone per `Api<T>` call --- cheap, it's
     /// an Arc internally).
     pub client: Client,
-    /// Balanced AdminServiceClient (DrainExecutor in builderpool
+    /// Balanced AdminServiceClient (DrainExecutor in pool
     /// finalizer).
     pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
     /// rio-scheduler addresses. For builder pod env injection ONLY
@@ -88,7 +88,7 @@ pub struct Ctx {
     /// panic in one reconciler can't wedge another's error_policy.
     pub error_counts: Mutex<HashMap<String, u32>>,
     /// TTL-cached unfiltered `GetSpawnIntents` response. The
-    /// builderpoolset reconciler and the ComponentScaler reconciler
+    /// pool reconciler and the ComponentScaler reconciler
     /// both poll this on ~10s ticks; without the cache they'd
     /// double-poll the scheduler. 5s TTL: short enough that a
     /// reconciler never acts on data more than half a tick stale,

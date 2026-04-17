@@ -1207,7 +1207,7 @@
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
-            # documents (BuilderPool + Build) to $out. Kustomize
+            # documents (Pool + ComponentScaler) to $out. Kustomize
             # references this via `nix build .#crds` → result is a
             # file; `cargo xtask regen crds` splits it into
             # one-file-per-CRD under infra/helm/crds/.

@@ -370,7 +370,7 @@ pub(super) fn resolve_executor_identity(
 }
 
 /// I-098: refuse to start when the host arch isn't in `RIO_SYSTEMS`.
-/// A BuilderPool with `systems=[x86_64-linux]` whose pod lands on an
+/// A Pool with `systems=[x86_64-linux]` whose pod lands on an
 /// arm64 node would otherwise register as x86_64, accept x86_64 drvs,
 /// and have nix-daemon refuse them at build time. CrashLoopBackOff is
 /// the right shape — visible in `kubectl get pods`, doesn't poison drvs.

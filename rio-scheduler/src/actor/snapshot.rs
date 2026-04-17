@@ -137,7 +137,7 @@ impl DagActor {
                 }
                 DerivationStatus::Ready => {
                     // I-107: per-system queued breakdown so per-arch
-                    // BuilderPools scale on their own backlog. Ready-only
+                    // Pools scale on their own backlog. Ready-only
                     // to match `queued_derivations` (= ready_queue.len())
                     // semantics — sum across keys equals the scalar.
                     *queued_by_system.entry(s.system.clone()).or_default() += 1;
@@ -206,7 +206,7 @@ impl DagActor {
             // ── request filter ────────────────────────────────────
             // kind: Unknown (None) = unfiltered. Otherwise must match
             // — the ADR-019 airgap boundary (FOD ⇔ Fetcher) means a
-            // BuilderPool never sees a Fetcher intent and vice-versa.
+            // Builder pool never sees a Fetcher intent and vice-versa.
             if req.kind.is_some_and(|k| k != kind) {
                 continue;
             }

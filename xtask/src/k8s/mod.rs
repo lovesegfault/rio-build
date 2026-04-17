@@ -58,7 +58,7 @@ pub const NAMESPACES: &[(&str, bool)] = &[
 
 /// Ensure all four rio namespaces exist with the right PSA label.
 /// Called at the start of every provider's deploy() so cross-ns chart
-/// resources (store.yaml → rio-store, builderpool.yaml → rio-builders,
+/// resources (store.yaml → rio-store, pool.yaml → rio-builders,
 /// etc.) have somewhere to land.
 pub async fn ensure_namespaces(client: &kube::Client) -> anyhow::Result<()> {
     for &(ns, privileged) in NAMESPACES {

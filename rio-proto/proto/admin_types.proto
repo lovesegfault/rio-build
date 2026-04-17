@@ -29,7 +29,7 @@ message ClusterStatusResponse {
   reserved 10;                           // was queued_fod_derivations (D2: FODs go through GetSpawnIntents)
   // Per-system breakdown of queued_derivations (Ready-only, same
   // semantics as the scalar). Sum across all keys == queued_derivations.
-  // BuilderPool autoscalers sum the entries matching pool.spec.systems
+  // Pool autoscalers sum the entries matching pool.spec.systems
   // so an aarch64 pool doesn't scale on x86_64 backlog (I-107). Empty
   // map from old schedulers → controller falls back to the scalar.
   map<string, uint32> queued_by_system = 11;

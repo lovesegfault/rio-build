@@ -88,7 +88,7 @@ cargo xtask k8s -p eks up --push --deploy
 
 Two layers, chained:
 
-1. **Pod layer** (`rio-controller`): builders are ephemeral one-shot Jobs — one pod per derivation, spawned on dispatch, deleted on completion. The controller gates spawn rate against each BuilderPool's `spec.maxConcurrent`; there is no replica count to scale.
+1. **Pod layer** (`rio-controller`): builders are ephemeral one-shot Jobs — one pod per derivation, spawned on dispatch, deleted on completion. The controller gates spawn rate against each Pool's `spec.maxConcurrent`; there is no replica count to scale.
 2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When builds complete and pods exit, empty nodes are consolidated after `consolidateAfter` (30s for builders, 5m for general).
 
 The chain: build submitted → scheduler dispatches → controller creates a Job → pod Pending (no builder node exists) → Karpenter provisions a node → pod Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a builder mid-build — only consolidates after the Job has exited.

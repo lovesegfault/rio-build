@@ -86,7 +86,7 @@ fn check_freeze(
                  Worker gRPC bidi-streams may have disconnected. \
                  Run `rio-cli derivations --all-active --stuck` to diagnose. \
                  Workers are ephemeral Jobs — check controller reconcile: \
-                 `kubectl get builderpool,fetcherpool -A` and `rio-cli executors`"
+                 `kubectl get pool -A` and `rio-cli executors`"
             );
             // Rate-limit: reset so we WARN once/minute, not once/pass.
             *since = Some(Instant::now());
