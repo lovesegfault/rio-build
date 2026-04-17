@@ -568,10 +568,15 @@ let
       # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
       # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
       # headroom. Coverage: +2GB for instrumented-image bloat.
+      # diskSize 24GB: Phase-7 controller adds a fixed 9GiB
+      # ephemeral-storage floor (FUSE_CACHE_BUDGET 8Gi + LOG_BUDGET
+      # 1Gi at jobs.rs) on top of SpawnIntent.disk_bytes — every
+      # worker pod requests ≥10GiB. qemu disk image is sparse so the
+      # bump is ~free until builds actually write.
       virtualisation = {
         memorySize = 8192 + k3sCovMemBump;
         cores = 8;
-        diskSize = 16384;
+        diskSize = 24576;
       };
     };
 
@@ -600,10 +605,14 @@ let
       # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi
       # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
       # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
+      # diskSize 24GB: see serverNode comment — controller's 9GiB
+      # ephemeral-storage floor means worker pods need ≥10GiB
+      # allocatable; the prior 12GB → ~11GiB allocatable left zero
+      # headroom for fetcher pods (nodeSelector pins them here).
       virtualisation = {
         memorySize = 6144 + k3sCovMemBump;
         cores = 8;
-        diskSize = 12288;
+        diskSize = 24576;
       };
     };
 
@@ -658,7 +667,7 @@ rec {
             "-o jsonpath='{.spec.holderIdentity}'"
         ).strip()
 
-    def worker_pod(pool="x86-64-tiny", ns="${nsBuilders}", node=k3s_server):
+    def worker_pod(pool="x86-64", ns="${nsBuilders}", node=k3s_server):
         """First Running worker pod for a pool. Ephemeral Jobs have no
         stable ordinal — resolve by label. Raises if none found."""
         name = node.succeed(
@@ -669,7 +678,7 @@ rec {
         assert name, f"no Running pod for rio.build/pool={pool} in ns={ns}"
         return name
 
-    def wait_worker_pod(pool="x86-64-tiny", ns="${nsBuilders}", timeout=180):
+    def wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=180):
         """Poll until a worker pod is Running for the pool; return its
         name. With ephemeral Jobs, a build must be queued first."""
         try:
@@ -682,8 +691,8 @@ rec {
         except Exception:
             print(f"=== wait_worker_pod TIMEOUT pool={pool} ns={ns} ===")
             print(k3s_server.execute(
-                f"k3s kubectl -n {ns} get builderpool,fetcherpool,job,pod -o wide 2>&1; "
-                f"k3s kubectl -n {ns} describe builderpool 2>&1; "
+                f"k3s kubectl -n {ns} get pool,job,pod -o wide 2>&1; "
+                f"k3s kubectl -n {ns} describe pod -l rio.build/pool={pool} 2>&1; "
                 "k3s kubectl -n rio-system logs deploy/rio-controller --tail=60 2>&1; "
                 "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=40 2>&1"
             )[1])
@@ -848,7 +857,7 @@ rec {
         timeout=30,
     )
 
-    # ── BuilderPool reconciled ──────────────────────────────────────
+    # ── Pool reconciled ─────────────────────────────────────────────
     # All worker pods are ephemeral Jobs — no standing pod to wait
     # for. The reconciler patches `.status` on first reconcile;
     # presence of status confirms the controller has seen the CR and
@@ -856,15 +865,15 @@ rec {
     # Job spawn (~10s reconcile tick + ~10s pod schedule).
     try:
         k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${nsBuilders} get builderpool x86-64-tiny "
+            "k3s kubectl -n ${nsBuilders} get pool x86-64 "
             "-o jsonpath='{.status}' | grep -q .",
             timeout=60,
         )
     except Exception:
-        print("=== builderpool .status TIMEOUT — diagnostic dump ===")
+        print("=== pool .status TIMEOUT — diagnostic dump ===")
         print(k3s_server.execute(
-            "k3s kubectl -n ${nsBuilders} get builderpool,job,pod -o wide 2>&1; "
-            "k3s kubectl -n ${nsBuilders} describe builderpool 2>&1; "
+            "k3s kubectl -n ${nsBuilders} get pool,job,pod -o wide 2>&1; "
+            "k3s kubectl -n ${nsBuilders} describe pool 2>&1; "
             "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 2>&1"
         )[1])
         raise

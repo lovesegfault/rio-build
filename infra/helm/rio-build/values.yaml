@@ -625,7 +625,7 @@ karpenter:
         # classes now mirror builder tiers (up to 128cpu xlarge for
         # chromium-source-class FODs), so use the same c/m/r gen6+
         # selector as rio-builder-preferred and let Karpenter pick
-        # cheapest-fit. Per-FetcherPool kubernetes.io/arch nodeSelector
+        # cheapest-fit. Per-Pool kubernetes.io/arch nodeSelector
         # still picks arch; single NodePool keeps the
         # rio.build/node-role:fetcher taint+label model intact
         # (NetworkPolicy keys on that, not arch).

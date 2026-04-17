@@ -55,8 +55,11 @@ scope: with scope; ''
 
       # ── CEL: Fetcher rejects privileged ───────────────────────────
       # Admission-time rejection of an ADR-019-forbidden field.
+      # --dry-run=server: CEL evaluates without persisting. 2>&1
+      # before the heredoc: kubectl writes the rejection to stderr;
+      # execute() only captures stdout.
       rc, out = k3s_server.execute(
-          "k3s kubectl apply -f - <<'EOF'\n"
+          "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
           "apiVersion: rio.build/v1alpha1\n"
           "kind: Pool\n"
           "metadata: {name: cel-reject, namespace: ${nsFetchers}}\n"

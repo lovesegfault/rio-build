@@ -6,8 +6,8 @@
 # outside RFC1918 → passes fetcher-egress NetPol, fails builder-egress).
 #
 # One nix-build pulls BOTH through the scheduler — the FOD routes to a
-# FetcherPool pod (hard_filter at assignment.rs gates on is_fixed_output
-# XOR ExecutorKind::Fetcher), the consumer routes to a BuilderPool pod.
+# kind=Fetcher pod (hard_filter at assignment.rs gates on is_fixed_output
+# XOR ExecutorKind::Fetcher), the consumer routes to a kind=Builder pod.
 # Both completing proves sched.dispatch.fod-to-fetcher end-to-end.
 #
 # Evaluated IN THE VM via nix-build. Do not reference host-eval paths.

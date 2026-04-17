@@ -794,17 +794,16 @@ in
   };
 
   # ADR-019 builder/fetcher split end-to-end. FIRST test running both
-  # BuilderPool + FetcherPool pods. Proves: FOD→fetcher routing, non-
+  # kind=Builder + kind=Fetcher pods. Proves: FOD→fetcher routing, non-
   # FOD→builder routing, builder airgap holds, fetcher egress open but
   # IMDS-blocked, fetcher node-dedication wired.
   #
   # Fetcher pod needs the nonpriv path (hard-coded privileged:false +
-  # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
+  # Localhost seccomp at reconcilers/pool/mod.rs Fetcher arm) — same
   # nonpriv overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered via systemd-tmpfiles (k3sBase, same as the NixOS
-  # AMI). fetcherPools[] enabled via extraValues with name=
-  # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pool
-  # label `x86-64-tiny`) and image=rio-fetcher (per-component ref
+  # AMI). The kind=Fetcher pool is enabled via extraValuesFiles with
+  # name="x86-64-fetcher" and image=rio-fetcher (per-component ref
   # from the vmTestSeed preload). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left

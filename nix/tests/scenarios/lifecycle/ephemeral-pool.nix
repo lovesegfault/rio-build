@@ -1,11 +1,10 @@
 # lifecycle subtest fragment — composed by scenarios/lifecycle.nix mkTest.
 scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
-  # ephemeral-pool — ephemeral BuilderPool → Job/build
+  # ephemeral-pool — ephemeral kind=Builder Pool → Job/build
   # ══════════════════════════════════════════════════════════════════
   # REQUIRES: no other workers alive. Subtest deletes the default
-  # x86-64 Pool first so it's reconciler
-  # doesn't steal dispatch.
+  # x86-64 Pool first so its reconciler doesn't steal dispatch.
   #
   # Proves end-to-end:
   #   - reconciler polls ClusterStatus + spawns Jobs when queued > 0
@@ -18,9 +17,8 @@ scope: with scope; ''
   # overlapping closures with one malicious. The "fresh pod = fresh
   # emptyDir" property is structural — K8s guarantees it.
   with subtest("ephemeral-pool: Job spawned, pod reaped, second build = new Job"):
-      # Precondition: no other BuilderPool may serve this subtest's
-      # builds. Delete the default `x86-64` BuilderPoolSet here (which
-      # cascades to its `x86-64-tiny` child), otherwise that pool's
+      # Precondition: no other Pool may serve this subtest's builds.
+      # Delete the default `x86-64` Pool here, otherwise that pool's
       # ephemeral reconciler ALSO sees queued>0 and spawns — build 2
       # may dispatch there, leaving no `rio.build/pool=ephemeral` Job.
       kubectl(
@@ -47,7 +45,7 @@ scope: with scope; ''
           "hostNetwork:true requires privileged:true",
       )
 
-      # Apply ephemeral BuilderPool. Spec mirrors vmtest-full.yaml's
+      # Apply ephemeral kind=Builder Pool. Spec mirrors vmtest-full.yaml's
       # default pool (image, privileged, resources, grace) except:
       # ephemeral=true, replicas.min=0 (CEL enforced), max=4.
       # Heredoc via stdin: kubectl apply -f - with EOF. The YAML
@@ -56,11 +54,12 @@ scope: with scope; ''
       k3s_server.succeed(
           "k3s kubectl apply -f - <<'EOF'\n"
           "apiVersion: rio.build/v1alpha1\n"
-          "kind: BuilderPool\n"
+          "kind: Pool\n"
           "metadata:\n"
           "  name: ephemeral\n"
           "  namespace: ${nsBuilders}\n"
           "spec:\n"
+          "  kind: Builder\n"
           "  maxConcurrent: 4\n"
           "  systems: [x86_64-linux]\n"
           # rio-builder:dev — MUST match the ref from nix/docker.nix
@@ -97,7 +96,7 @@ scope: with scope; ''
       # ceiling). reconcile_ephemeral runs on first apply even with
       # queued=0 — it patches status then requeues at 10s.
       k3s_server.wait_until_succeeds(
-          "test \"$(k3s kubectl -n ${nsBuilders} get builderpool ephemeral "
+          "test \"$(k3s kubectl -n ${nsBuilders} get pool ephemeral "
           "-o jsonpath='{.status.desiredReplicas}')\" = 4",
           timeout=180,
       )
@@ -224,11 +223,11 @@ scope: with scope; ''
       # Delete the pool. cleanup() removes the finalizer
       # immediately; in-flight Jobs finish naturally and
       # ownerRef GC deletes them.
-      kubectl("delete builderpool ephemeral --wait=false", ns="${nsBuilders}")
+      kubectl("delete pool ephemeral --wait=false", ns="${nsBuilders}")
       # CR gone quickly — finalizer removed on first cleanup() call.
       # 30s is generous; should be <5s in practice.
       k3s_server.wait_until_succeeds(
-          "! k3s kubectl -n ${nsBuilders} get builderpool ephemeral 2>/dev/null",
+          "! k3s kubectl -n ${nsBuilders} get pool ephemeral 2>/dev/null",
           timeout=30,
       )
       # ALL ephemeral-pool pods gone. CR-gone above does NOT imply

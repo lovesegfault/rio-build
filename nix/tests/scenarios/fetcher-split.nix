@@ -1,7 +1,7 @@
 # ADR-019 builder/fetcher split end-to-end.
 #
-# FIRST test exercising both pool types in one fixture. Proves the full
-# chain: FOD → FetcherPool pod, non-FOD → BuilderPool pod, builder airgap
+# FIRST test exercising both pool kinds in one fixture. Proves the full
+# chain: FOD → kind=Fetcher pod, non-FOD → kind=Builder pod, builder airgap
 # holds, fetcher egress open but IMDS-blocked.
 #
 # Fixture gotchas — fetcher pods have NO privileged escape hatch (hard-
@@ -60,10 +60,10 @@ let
 
   # Ephemeral workers: pod names are Job-generated, not STS ordinals.
   # Resolved at runtime via wait_worker_pod() after the build is
-  # queued. Pool "x86-64"
-  # label `x86-64`; same scheme for fetcherPools[].
-  builderPool = "x86-64-tiny";
-  fetcherPool = "x86-64-tiny";
+  # queued. Pool names match the extraValuesFiles overlay in
+  # default.nix (vm-fetcher-split-k3s).
+  builderPool = "x86-64";
+  fetcherPool = "x86-64-fetcher";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fetcher-split";
@@ -90,7 +90,7 @@ pkgs.testers.runNixOSTest {
 
     # ── Seccomp profiles already on both nodes via tmpfiles ───────────
     # Fetcher reconciler hard-codes Localhost operator/rio-fetcher.json
-    # (fetcherpool/mod.rs). k3sBase (fixtures/k3s-full.nix) writes both
+    # (reconcilers/pool/mod.rs). k3sBase (fixtures/k3s-full.nix) writes both
     # profiles via systemd-tmpfiles before k3s starts — same delivery
     # as the NixOS AMI. Assert presence so a fixture regression surfaces
     # here and not as a CreateContainerError 60s downstream.
@@ -102,7 +102,7 @@ pkgs.testers.runNixOSTest {
 
     # ── Label k3s-agent as the dedicated fetcher node ─────────────────
     # Reconciler defaults nodeSelector rio.build/node-role=fetcher
-    # (fetcherpool/mod.rs:189). Without a matching node, the STS pod
+    # (reconcilers/pool/mod.rs Fetcher arm). Without a matching node, the pod
     # stays Pending forever. Labeling ONE node also makes the
     # fetcher-node-dedicated subtest meaningful: fetcher lands on
     # agent, builder (no nodeSelector in vmtest-full.yaml) lands
@@ -149,10 +149,12 @@ pkgs.testers.runNixOSTest {
     # ── NetworkPolicies rendered + applied ────────────────────────────
     # networkPolicy.enabled=true in extraValues → helm-render puts
     # builder-egress + fetcher-egress in 02-workloads.yaml → k3s
-    # auto-applied at boot. If either get fails, the override didn't
-    # take or the template if-gate is miswired.
-    kubectl("get ciliumnetworkpolicy builder-egress -o name", ns="${nsBuilders}")
-    kubectl("get ciliumnetworkpolicy fetcher-egress -o name", ns="${nsFetchers}")
+    # auto-applied at boot. D3a: cluster-scoped CCNP (not namespaced
+    # CNP) so a Pool{kind=Builder} in ANY namespace is selected. If
+    # either get fails, the override didn't take or the template
+    # if-gate is miswired.
+    k3s_server.succeed("k3s kubectl get ccnp builder-egress -o name")
+    k3s_server.succeed("k3s kubectl get ccnp fetcher-egress -o name")
     # kube-router watch latency (same 10s margin as netpol.nix:78).
     time.sleep(10)
 
@@ -308,7 +310,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # Full Karpenter NodePool isolation isn't testable in k3s (no
     # Karpenter). Shape-check the pod spec: reconciler's default
-    # toleration + nodeSelector (fetcherpool/mod.rs:189-202). The
+    # toleration + nodeSelector (reconcilers/pool/mod.rs Fetcher arm). The
     # node-label above means the selector MATCHES → pod scheduled on
     # k3s-agent. Proves the params→podspec chain; actual node-pool
     # enforcement is EKS-only.

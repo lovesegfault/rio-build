@@ -79,14 +79,26 @@ scheduler:
   replicas: 2
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
-  # ADR-023 [sla] block is set in chart-default values.yaml; VM tests
-  # exercise Static-mode dispatch (no per-drv SpawnIntent), so opt out.
-  # With [sla] inherited, dispatch.rs computes est_memory_bytes from the
-  # cold-start probe (12 GiB at chart defaults) → resource-fit gate
-  # rejects the 2 GiB tiny pool below — flakily, because the gate only
-  # fires once the builder's cgroup poll has populated last_resources.
-  # The sla-sizing scenario sets its own [sla] block via overlay.
-  sla: null
+  # ADR-023: [sla] is REQUIRED — compute_spawn_intents emits no
+  # intents when sla_on=false → controller spawns zero Jobs. Chart
+  # defaults (probe.cpu=4, memBase=4Gi+2Gi/core = 12Gi) don't fit the
+  # 4GB k3s agent VM. Override with a tiny probe (1 core, 1Gi, 6Gi
+  # disk) matching the old `tiny` size class. Single best-effort tier:
+  # no p50/p90/p99 targets → solve falls back to probe shape (no
+  # learned-model scaling in VM tests).
+  sla:
+    tiers:
+      - {name: vm}
+    defaultTier: vm
+    probe: {cpu: 1, memPerCore: 0, memBase: 1073741824, deadlineSecs: 3600}
+    maxCores: 2
+    maxMem: 2147483648       # 2 GiB
+    # Tiny disk: controller adds a fixed 9GiB on top (FUSE_CACHE_
+    # BUDGET 8Gi + LOG_BUDGET 1Gi at jobs.rs) → pod requests ~10GiB.
+    maxDisk: 1073741824      # 1 GiB
+    defaultDisk: 1073741824  # 1 GiB
+    fuseCacheBudget: 268435456  # 256 MiB
+    logBudget: 67108864         # 64 MiB
 
 gateway:
   enabled: true

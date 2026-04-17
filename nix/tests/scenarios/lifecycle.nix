@@ -77,7 +77,7 @@
 #   semantics) end-to-end with completion-hook-produced rows.
 #
 # ctrl.pool.ephemeral — verify marker at default.nix:subtests[ephemeral-pool]
-#   ephemeral-pool: applies an ephemeral BuilderPool; asserts
+#   ephemeral-pool: applies an ephemeral kind=Builder Pool; asserts
 #   status.desiredReplicas == replicas.max (reconcile_ephemeral ran and
 #   patched status, ephemeral.rs:220-228) and the Job-spawn-on-queue path
 #   end-to-end. Subtest deletes the default x86-64 Pool first
@@ -394,31 +394,32 @@ let
             )
             raise
 
-    # Negative-apply a deliberately-invalid BuilderPool spec. CRD CEL
-    # rules (rio-crds/src/builderpool.rs x_kube validations) are
-    # cross-field constraints that fire at kubectl-apply admission.
+    # Negative-apply a deliberately-invalid Pool spec. CRD CEL rules
+    # (rio-crds/src/pool.rs x_kube validations) are cross-field
+    # constraints that fire at kubectl-apply admission.
     # --dry-run=server sends to the apiserver (CEL evaluates) without
     # persisting. fail() asserts non-zero exit; the message-assert
     # proves it failed at the RIGHT rule — not, say, a schema error or
     # the wrong CEL rule. Quoted heredoc (<<'EOF') prevents shell
     # expansion inside the spec body.
-    def assert_cel_rejects(name, spec_body, expected_msg):
+    def assert_cel_rejects(name, spec_body, expected_msg, kind="Builder"):
         """spec_body is the YAML body UNDER `spec:` (2-space leading
-        indent, no trailing newline on the last line). expected_msg
-        is a substring of the CEL rule's .message() at builderpool.rs."""
+        indent, no trailing newline on the last line). `kind` fills the
+        required spec.kind (Builder/Fetcher); expected_msg is a
+        substring of the CEL rule's .message() at rio-crds/src/pool.rs."""
         result = k3s_server.fail(
             "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
             "apiVersion: rio.build/v1alpha1\n"
-            "kind: BuilderPool\n"
+            "kind: Pool\n"
             f"metadata:\n  name: {name}\n  namespace: ${nsBuilders}\n"
-            f"spec:\n{spec_body}\n"
+            f"spec:\n  kind: {kind}\n{spec_body}\n"
             "EOF"
         )
         assert expected_msg in result, (
             f"CEL should reject {name!r} with {expected_msg!r} in the "
             f"message, got: {result!r}. If the apply succeeded or "
             f"failed for a different reason, the CEL rule at "
-            f"rio-crds/src/builderpool.rs isn't in the deployed CRD — "
+            f"rio-crds/src/pool.rs isn't in the deployed CRD — "
             f"check `helm template | grep x-kubernetes-validations`."
         )
         print(f"{name}: CEL rejected with {expected_msg!r} ✓")

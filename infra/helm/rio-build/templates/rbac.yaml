@@ -9,8 +9,8 @@
 # eks.amazonaws.com/role-arn via projected token — NO static AWS keys.
 #
 # builder/fetcher SAs always rendered (vmtest profile needs them even when
-# nothing else in this chart is enabled); BuilderPool/FetcherPool
-# reconcilers reference them from the per-build Jobs they create.
+# nothing else in this chart is enabled); the Pool reconciler references
+# them from the per-build Jobs it creates.
 {{- range $sa := list
       (dict "name" "rio-controller" "ns" $ns                              "comp" "controller" "on" .Values.controller.enabled "automount" true)
       (dict "name" "rio-gateway"    "ns" $ns                              "comp" "gateway"    "on" .Values.gateway.enabled    "automount" false)
@@ -61,15 +61,10 @@ rules:
   # resource).
   #
   # Per-CRD verb sets:
-  #   builderpools/fetcherpools — full lifecycle. Reconciler SSA-applies
-  #     per-build/per-FOD Jobs into rio-builders/rio-fetchers (ADR-019);
-  #     the ClusterRoleBinding below grants batch/jobs cluster-wide so
+  #   pools — full lifecycle. Reconciler SSA-applies per-build/per-FOD
+  #     Jobs into rio-builders/rio-fetchers (ADR-019); the
+  #     ClusterRoleBinding below grants batch/jobs cluster-wide so
   #     no per-namespace RoleBinding needed.
-  #   builderpoolsets — aggregating CRD; one WPS spawns one child
-  #     BuilderPool per size class. No create/delete (operators
-  #     `kubectl apply` the WPS); reconciler reads it + patches
-  #     metadata.finalizers and per-class status (queued from
-  #     scheduler's GetSpawnIntents joined with child WP replicas).
   #   componentscalers — predictive store autoscaling. No create/delete
   #     (operators apply the CR via this chart); reconciler reads spec,
   #     writes status (learnedRatio persists across restarts), patches
@@ -94,8 +89,8 @@ rules:
   {{- end }}
   {{- end }}
   # Deployment read for current .spec.replicas + /scale subresource
-  # for the patch. BuilderPool/FetcherPool reconcilers don't touch
-  # Deployments — this is ComponentScaler-only.
+  # for the patch. Pool reconcilers don't touch Deployments — this is
+  # ComponentScaler-only.
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, watch]
@@ -107,7 +102,7 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
-  # `kubectl describe builderpool` shows events. create/patch for
+  # `kubectl describe pool` shows events. create/patch for
   # aggregation (K8s dedups by key). events.k8s.io (NOT core "")
   # — kube-runtime's Recorder uses the events.k8s.io/v1 API. K8s
   # mirrors events to core/v1 automatically for kubectl describe.
@@ -117,8 +112,7 @@ rules:
   # Owned children: one Job per build/FOD. reconcile_* lists Jobs by
   # label for inventory, creates new Jobs for deficit. `delete`:
   # excess-Pending reap (r[ctrl.ephemeral.reap-excess-pending]) and
-  # orphan-Running reap; ownerRef GC handles BuilderPool-delete
-  # cleanup.
+  # orphan-Running reap; ownerRef GC handles Pool-delete cleanup.
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]
