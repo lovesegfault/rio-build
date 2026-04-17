@@ -966,7 +966,10 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     let (_db, handle, _task) = setup().await;
 
     // 4 workers so re-dispatch always has a candidate.
-    let _rxs = connect_n_executors(&handle, "infra-w", "x86_64-linux", 4).await?;
+    let mut _rxs = Vec::with_capacity(4);
+    for i in 1..=4 {
+        _rxs.push(connect_executor(&handle, &format!("infra-w{i}"), "x86_64-linux").await?);
+    }
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-drv";
@@ -1680,7 +1683,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
 ///   - result.stop_time.is_some()   ← set below
 ///   - 0 < duration_secs < 30 days  ← 5.25s, trivially in-range
 ///
-/// Without ALL of these, insert_build_sample is never reached — the
+/// Without ALL of these, write_build_sample is never reached — the
 /// complete_success_empty() helper (no timestamps) silently skips.
 #[tokio::test]
 async fn test_completion_writes_build_sample() -> TestResult {

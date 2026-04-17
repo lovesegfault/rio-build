@@ -60,9 +60,9 @@ let
 
   # Ephemeral workers: pod names are Job-generated, not STS ordinals.
   # Resolved at runtime via wait_worker_pod() after the build is
-  # queued. Pool names match the extraValuesFiles overlay in
-  # default.nix (vm-fetcher-split-k3s).
-  builderPool = "x86-64";
+  # queued. Pool name matches the extraValuesFiles overlay in
+  # default.nix (vm-fetcher-split-k3s); builder pool is the
+  # wait_worker_pod default ("x86-64").
   fetcherPool = "x86-64-fetcher";
 in
 pkgs.testers.runNixOSTest {
@@ -281,9 +281,7 @@ pkgs.testers.runNixOSTest {
     # consumer drv keeps it alive for these probes. Positive control
     # first: scheduler ClusterIP MUST connect (builder-egress explicitly
     # allows it). Then the origin probe.
-    builder_pod = wait_worker_pod(
-        pool="${builderPool}", ns="${nsBuilders}", timeout=180
-    )
+    builder_pod = wait_worker_pod()
     builder_vm, builder_pid = netns_handle(builder_pod, "${nsBuilders}")
     print(f"fetcher-split: fetcher={fetcher_pod} builder={builder_pod}")
     def builder_exec(cmd):

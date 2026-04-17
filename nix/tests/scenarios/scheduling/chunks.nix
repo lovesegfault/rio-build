@@ -21,7 +21,7 @@ scope: with scope; ''
       ).strip())
       bytes_before = scrape_metrics(${gatewayHost}, 9092)
 
-      build("${drvs.sizeclass}", attr="bigblob")
+      build("${drvs.bigblob}")
 
       chunk_after = int(${gatewayHost}.succeed(
           "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"

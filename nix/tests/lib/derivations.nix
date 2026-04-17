@@ -38,9 +38,9 @@ rec {
   # submit. Drives vm-ca-cutoff-standalone.
   caChain = "${dir}/ca-chain.nix";
 
-  # Multi-attr set: `all` (chain+solo for critical-path), `bigthing`
-  # (pname in env for estimator lookup), `bigblob` (300KiB → chunked).
-  sizeclass = "${dir}/sizeclass.nix";
+  # 300KiB single-file output → exceeds INLINE_THRESHOLD, forces the
+  # chunked PutPath. Drives the chunks.nix chunk-count assertion.
+  bigblob = "${dir}/bigblob.nix";
 
   # Overlay-readdir correctness probe: 5-file dep + consumer that ls's
   # it FIRST (no prior lookup of child names). Asserts count=5.

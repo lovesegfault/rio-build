@@ -382,21 +382,6 @@ pub(crate) async fn connect_executor_kind(
     .await
 }
 
-/// [`connect_executor_kind`] with `kind = Fetcher`.
-pub(crate) async fn connect_fetcher(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_kind(
-        handle,
-        executor_id,
-        system,
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await
-}
-
 /// [`connect_executor_kind`] with `kind = Builder`.
 pub(crate) async fn connect_builder(
     handle: &ActorHandle,
@@ -435,19 +420,6 @@ pub(crate) async fn send_heartbeat(
 pub(crate) async fn tick(handle: &ActorHandle) -> anyhow::Result<()> {
     handle.send_unchecked(ActorCommand::Tick).await?;
     barrier(handle).await;
-    Ok(())
-}
-
-/// I-063: heartbeat with `draining=true` then `Tick`. For tests that
-/// verify the worker-authoritative drain semantics — heartbeat is the
-/// only reader/writer of a worker's own drain state.
-pub(crate) async fn send_heartbeat_draining(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<()> {
-    send_heartbeat_with(handle, executor_id, system, |hb| hb.draining = true).await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
     Ok(())
 }
 
@@ -807,27 +779,20 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
             p90: Some(1200.0),
             p99: None,
         }],
-        default_tier: "normal".into(),
         probe: config::ProbeShape {
             cpu: 4.0,
             mem_per_core: 1 << 30,
             mem_base: 4 << 30,
             deadline_secs: 3600,
         },
-        feature_probes: Default::default(),
         max_cores: 64.0,
         max_mem: 256 << 30,
         max_disk: 200 << 30,
         default_disk: 20 << 30,
         fuse_cache_budget: 0,
         log_budget: 0,
-        ring_buffer: 32,
-        halflife_secs: 7.0 * 86400.0,
-        seed_corpus: None,
-        hw_cost_source: None,
         hw_softmax_temp: 0.0,
-        hw_fallback_after_secs: 120.0,
-        cluster: String::new(),
+        ..config::SlaConfig::test_default()
     }
 }
 
@@ -845,7 +810,8 @@ pub(crate) fn bare_actor_sla(pool: sqlx::PgPool) -> DagActor {
 
 /// Bootstrap PG + spawned actor with the realistic-ceiling `[sla]`
 /// config. For end-to-end `GetSpawnIntents` tests via [`ActorHandle`].
-pub(crate) async fn setup_with_sla() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
+pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>)
+{
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, task) =
         setup_actor_configured(db.pool.clone(), None, |c, _| c.sla = test_sla_config());
@@ -926,23 +892,6 @@ pub(crate) async fn seed_poisoned(handle: &ActorHandle, drv_hash: &str) -> anyho
     .await?;
     barrier(handle).await;
     Ok(())
-}
-
-/// Connect N executors named `{prefix}{1..=n}` on `system`. Absorbs the
-/// `let _rxN = connect_executor(...)` × N pattern (15× across actor
-/// tests). The receivers are returned in a Vec — bind as `_rxs` to keep
-/// streams alive.
-pub(crate) async fn connect_n_executors(
-    handle: &ActorHandle,
-    prefix: &str,
-    system: &str,
-    n: usize,
-) -> anyhow::Result<Vec<mpsc::Receiver<rio_proto::types::SchedulerMessage>>> {
-    let mut rxs = Vec::with_capacity(n);
-    for i in 1..=n {
-        rxs.push(connect_executor(handle, &format!("{prefix}{i}"), system).await?);
-    }
-    Ok(rxs)
 }
 
 /// Force-assign + send `status` failure for `drv_hash` on each of

@@ -341,8 +341,8 @@ pub(super) fn resolve_executor_identity(
     };
 
     // systems: auto-detect single element when not configured.
-    // A worker with zero systems is useless (scheduler's can_build
-    // always false) — auto-detect is a sensible default, not a
+    // A worker with zero systems is useless (scheduler's hard_filter
+    // never matches) — auto-detect is a sensible default, not a
     // silent fallback for misconfiguration.
     let mut systems = if systems.is_empty() {
         vec![detect_system()]

@@ -882,7 +882,7 @@ async fn spawn_intents_kind_and_system_filter() {
 // r[verify sched.admin.spawn-intents]
 #[tokio::test]
 async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
-    let (_db, handle, _task) = setup_with_sla().await;
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
 
     // Merge 3 single-node DAGs. All three → Ready immediately (no
     // deps). No workers connected yet → all 3 emit intents.

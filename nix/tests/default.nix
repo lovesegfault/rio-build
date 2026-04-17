@@ -222,12 +222,7 @@ in
 
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
-    fixture = standalone {
-      workers = {
-        worker = {
-        };
-      };
-    };
+    fixture = standalone { };
     cold = false;
   };
 
@@ -242,10 +237,6 @@ in
     inherit pkgs common;
     nameSuffix = "-lix";
     fixture = standalone {
-      workers = {
-        worker = {
-        };
-      };
       clientNixPackage = lixPackage;
       extraClientModules = [
         {
@@ -277,10 +268,6 @@ in
   vm-ca-cutoff-standalone = ca-cutoff {
     inherit pkgs common;
     fixture = standalone {
-      workers = {
-        worker = {
-        };
-      };
       # GAP-1 regression guard: floating-CA output paths are computed
       # post-build, so the scheduler's HMAC token has
       # expected_outputs=[""]. Without Claims.is_ca, the store's
@@ -510,10 +497,6 @@ in
   #   subtest proves each rule.
   vm-security-standalone = security.standalone {
     fixture = standalone {
-      workers = {
-        worker = {
-        };
-      };
       withHmac = true;
       extraPackages = [
         pkgs.grpcurl

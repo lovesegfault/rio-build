@@ -84,7 +84,7 @@ pub enum OverlayError {
 }
 
 /// Shorthand: wrap `fs::create_dir_all` with path context.
-fn mkdir_all(path: &Path) -> Result<(), OverlayError> {
+pub(crate) fn mkdir_all(path: &Path) -> Result<(), OverlayError> {
     fs::create_dir_all(path).map_err(|source| OverlayError::DirCreate {
         path: path.to_path_buf(),
         source,
@@ -353,34 +353,11 @@ pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
     Ok(())
 }
 
-/// Create the Nix state directory structure in the overlay upper layer.
-///
-/// Takes `synth_db` directly (caller passes [`OverlayMount::upper_synth_db`])
-/// — symmetric with how `setup_nix_conf` takes `upper_nix_conf()` instead of
-/// re-deriving the path. Centralizes the `nix/var/nix/db` path construction
-/// in one place (the `upper_synth_db` accessor).
-pub fn prepare_nix_state_dirs(synth_db: &Path) -> Result<PathBuf, OverlayError> {
-    mkdir_all(synth_db)?;
-    Ok(synth_db.to_path_buf())
-}
-
 // r[verify builder.overlay.per-build]
 // r[verify builder.overlay.upper-not-overlayfs]
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_prepare_nix_state_dirs() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let synth_db = dir.path().join("nix/var/nix/db");
-        let db_dir = prepare_nix_state_dirs(&synth_db)?;
-
-        assert!(db_dir.exists());
-        assert!(db_dir.is_dir());
-        assert_eq!(db_dir, synth_db);
-        Ok(())
-    }
 
     #[test]
     fn test_overlay_mount_paths() {

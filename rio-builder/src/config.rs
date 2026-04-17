@@ -69,10 +69,10 @@ pub struct Config {
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     pub systems: Vec<String>,
     /// requiredSystemFeatures this builder supports (e.g., "kvm",
-    /// "big-parallel"). Scheduler's can_build() all-matches the
+    /// "big-parallel"). Scheduler's `hard_filter()` all-matches the
     /// derivation's required_features against this. Must be populated
-    /// or the scheduler's can_build() check fails for any derivation
-    /// with requiredSystemFeatures.
+    /// or `rejection_reason()` rejects any derivation with
+    /// requiredSystemFeatures.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     pub features: Vec<String>,
     pub fuse_mount_point: PathBuf,

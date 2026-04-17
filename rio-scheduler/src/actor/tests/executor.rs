@@ -742,7 +742,7 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup_with_sla().await;
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
 
     let _ev = merge_single_node(
         &handle,
@@ -1116,7 +1116,7 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     #[case] tag: &str,
 ) -> TestResult {
     use rio_proto::types::TerminationReason;
-    let (_db, handle, _task) = setup_with_sla().await;
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
 
     let mut rx = connect_executor_kind(&handle, "w-tiny", "x86_64-linux", kind).await?;
 

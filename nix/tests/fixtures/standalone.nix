@@ -31,8 +31,9 @@ in
   # Attrset of worker-node-name → mkWorkerNode args. Keys become
   # hostname + node var in testScript. scenarios/scheduling.nix uses
   # this to pass distinct service env per worker.
-  # For the common 1-worker case: workers = { worker = { }; }
-  workers,
+  workers ? {
+    worker = { };
+  },
 
   # HMAC keys for assignment+service tokens (lib/hmac-keys.nix).
   withHmac ? false,

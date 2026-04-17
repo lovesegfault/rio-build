@@ -170,10 +170,6 @@ impl DagActor {
     /// [`compute_cluster_snapshot`]; the autoscaler polls every ~10s so
     /// even 10k Ready derivations is sub-ms.
     ///
-    /// Intent emission is gated on `[sla]` configured: the controller's
-    /// `jobs.rs` branches on `intents.is_empty()` — Static mode ⇒
-    /// empty intents ⇒ the `spawn_n` scalar path stays in force.
-    ///
     /// `queued_by_system` is populated regardless of the
     /// kind/feature filters (it's the same population as
     /// `ClusterSnapshot.queued_by_system`) so the ComponentScaler reads

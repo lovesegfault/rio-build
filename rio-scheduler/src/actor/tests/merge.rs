@@ -470,7 +470,13 @@ async fn test_fixed_ca_fod_path_based_lane(
     #[case] expect_cached: u32,
 ) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut fetcher_rx = connect_fetcher(&handle, "f-ca-fod", "x86_64-linux").await?;
+    let mut fetcher_rx = connect_executor_kind(
+        &handle,
+        "f-ca-fod",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
 
     let fod_out = test_store_path("ca-fod-out");
     if substitutable {

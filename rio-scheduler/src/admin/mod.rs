@@ -487,8 +487,6 @@ impl AdminService for AdminServiceImpl {
 
     /// ADR-023 spawn-intent stream: one `SpawnIntent` per Ready
     /// derivation, filtered server-side by `{kind, systems, features}`.
-    /// Returns empty `intents` if `[sla]` is unconfigured (Static-mode
-    /// gate) — controller falls back to `ClusterStatus`.
     #[instrument(skip(self, request), fields(rpc = "GetSpawnIntents"))]
     async fn get_spawn_intents(
         &self,

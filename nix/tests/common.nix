@@ -370,11 +370,6 @@ rec {
       # Merged into systemd.services.rio-builder.environment. Composed
       # with the optional RIO_OTEL_ENDPOINT below via //.
       extraServiceEnv ? { },
-      # Arbitrary store paths to pull into this VM's /nix/store. Used
-      # by scenarios/protocol (cold) to pre-stage the busybox file for
-      # builtin:fetchurl (workers are airgapped; file:// URL needs the
-      # file to already be in /nix/store for the sandbox to read it).
-      extraStorePaths ? [ ],
     }:
     {
       imports = [ rioModules.worker ];
@@ -405,9 +400,6 @@ rec {
 
       # curl for metric scraping.
       environment.systemPackages = [ pkgs.curl ];
-      # Force extraStorePaths into the VM's store closure via a
-      # string-context reference. The etc file is never read.
-      environment.etc."rio/worker-extra-paths".text = lib.concatMapStrings (p: "${p}\n") extraStorePaths;
 
       # 4 cores: tokio multi_thread runtime uses num_cpus worker threads.
       # FUSE callbacks doing Handle::block_on(gRPC) need spare worker

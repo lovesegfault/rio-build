@@ -8,25 +8,6 @@
 
 use super::*;
 
-/// Static-mode: no `[sla]` configured → empty `intents`, not an error.
-/// `queued_by_system` is still populated (the ComponentScaler reads it
-/// independent of intent emission).
-#[tokio::test]
-async fn test_get_spawn_intents_empty_when_sla_off() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc_default().await;
-
-    let resp = svc
-        .get_spawn_intents(Request::new(GetSpawnIntentsRequest::default()))
-        .await?
-        .into_inner();
-
-    assert!(
-        resp.intents.is_empty(),
-        "[sla] unconfigured → empty intents (not error)"
-    );
-    Ok(())
-}
-
 // r[verify sched.admin.spawn-intents]
 /// `[sla]` on: each Ready derivation emits one intent. Proves the gRPC
 /// handler threads `ActorCommand::Admin(AdminQuery::GetSpawnIntents)`

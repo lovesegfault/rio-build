@@ -104,25 +104,6 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Minimal-row convenience for tests / admin probes that don't have
-    /// full telemetry to hand. Thin wrapper over [`Self::write_build_sample`].
-    pub async fn insert_build_sample(
-        &self,
-        pname: &str,
-        system: &str,
-        duration_secs: f64,
-        peak_memory_bytes: i64,
-    ) -> Result<(), sqlx::Error> {
-        self.write_build_sample(&BuildSampleRow {
-            pname: pname.into(),
-            system: system.into(),
-            duration_secs,
-            peak_memory_bytes,
-            ..Default::default()
-        })
-        .await
-    }
-
     /// Delete samples older than `days`. Returns rows deleted.
     /// Called by the retention task on a 1h interval.
     ///
