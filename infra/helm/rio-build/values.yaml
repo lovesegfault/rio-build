@@ -762,6 +762,12 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
+  # 50Gi. Reconciler adds this verbatim to every worker pod's
+  # ephemeral-storage request/limit AND the fuse-cache emptyDir
+  # sizeLimit. CRD-side default when unset is the safe minimum
+  # (8Gi/4Gi) so non-helm Pools schedule on small-disk nodes; prod
+  # overrides UP here.
+  fuseCacheBytes: 53687091200
   # privileged:true is an ESCAPE HATCH for clusters whose containerd
   # lacks base_runtime_spec device injection. It disables seccomp
   # entirely (ADR-012) and is unacceptable for multi-tenant.

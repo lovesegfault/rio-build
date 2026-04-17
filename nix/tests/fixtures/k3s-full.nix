@@ -569,8 +569,9 @@ let
       # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
       # headroom. Coverage: +2GB for instrumented-image bloat.
       # diskSize 24GB: controller adds PoolSpec.fuseCacheBytes (4Gi
-      # via vmtest-full.yaml; prod default 50Gi) + LOG_BUDGET 1Gi on
-      # top of SpawnIntent.disk_bytes (sla.defaultDisk 2Gi) — every
+      # via vmtest-full.yaml; CRD default 8Gi for non-helm Pools;
+      # helm prod 50Gi) + LOG_BUDGET 1Gi on top of
+      # SpawnIntent.disk_bytes (sla.defaultDisk 2Gi) — every
       # worker pod requests ≥7GiB ephemeral-storage. qemu disk image
       # is sparse so the bump is ~free until builds actually write.
       virtualisation = {
@@ -606,8 +607,9 @@ let
       # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
       # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
       # diskSize 24GB: see serverNode comment — worker pods request
-      # ≥7GiB ephemeral-storage (fuseCacheBytes 4Gi + log 1Gi + disk
-      # 2Gi); the prior 12GB → ~11GiB allocatable left zero headroom
+      # ≥7GiB ephemeral-storage (fuseCacheBytes 4Gi via vmtest-full
+      # + log 1Gi + disk 2Gi; non-helm Pools get CRD default 8Gi →
+      # ≥11GiB); the prior 12GB → ~11GiB allocatable left zero headroom
       # for fetcher pods (nodeSelector pins them here).
       virtualisation = {
         memorySize = 6144 + k3sCovMemBump;

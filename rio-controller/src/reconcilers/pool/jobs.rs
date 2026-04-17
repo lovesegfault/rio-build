@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
         assert_eq!(
             req["ephemeral-storage"],
-            Quantity(((40 + 50 + 1) * GI).to_string()),
+            Quantity(((40 + 8 + 1) * GI).to_string()),
             "disk_bytes + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
         );
         assert_eq!(
@@ -865,9 +865,9 @@ mod tests {
     /// closure size, so every fresh drv_hash re-climbs the floor.
     ///
     /// Third arm: `PoolSpec.fuse_cache_bytes` override is honoured for
-    /// BOTH sites — the 50Gi builder default makes every pod request
-    /// ≥51Gi ephemeral-storage, which is Unschedulable on small-disk
-    /// nodes (k3s VM tests).
+    /// BOTH sites — helm-rendered prod Pools set 50Gi, which would make
+    /// every pod request ≥51Gi ephemeral-storage on small-disk nodes
+    /// (k3s VM tests) without the override.
     #[test]
     fn fuse_cache_budget_matches_sizelimit() {
         const GI: u64 = 1 << 30;

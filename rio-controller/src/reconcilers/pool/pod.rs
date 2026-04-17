@@ -76,18 +76,23 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 /// emptyDirs against that limit, so a sizeLimit larger than the budget
 /// evicts large-closure builds (chromium/LLVM-class) on the pod-level
 /// limit before the volume-level one fires.
-pub(super) const BUILDER_FUSE_CACHE_BYTES: u64 = 50 * (1 << 30);
+///
+/// CRD-side default is the SAFE MINIMUM (fits ~21Gi-allocatable k3s
+/// nodes) so a Pool created via raw `kubectl apply` without
+/// `spec.fuseCacheBytes` schedules anywhere. Prod gets 50Gi via the
+/// helm chart's `poolDefaults.fuseCacheBytes`.
+pub(super) const BUILDER_FUSE_CACHE_BYTES: u64 = 8 * (1 << 30);
 
 /// Default FUSE cache size for fetchers. FODs are typically small
-/// (source tarballs, git clones) — 10Gi is plenty.
-pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 10 * (1 << 30);
+/// (source tarballs, git clones). Safe-minimum CRD default; prod
+/// inherits the helm `poolDefaults.fuseCacheBytes` 50Gi.
+pub(super) const FETCHER_FUSE_CACHE_BYTES: u64 = 4 * (1 << 30);
 
 /// Per-pool FUSE cache budget. Drives BOTH the `fuse-cache` emptyDir
 /// sizeLimit and the `ephemeral-storage` budget addend so they cannot
-/// drift. `PoolSpec.fuse_cache_bytes` overrides the per-kind default —
-/// the prod 50Gi default makes every builder pod request ≥51Gi of
-/// ephemeral-storage, which is Unschedulable on small-disk nodes (k3s
-/// VM tests, ~21Gi allocatable).
+/// drift. `PoolSpec.fuse_cache_bytes` overrides the per-kind default;
+/// helm-rendered Pools always set it (50Gi prod), so the consts above
+/// only apply to non-helm Pools (vm-netpol misplaced-builder, etc.).
 pub(super) fn fuse_cache_bytes(pool: &Pool) -> u64 {
     pool.spec.fuse_cache_bytes.unwrap_or(match pool.spec.kind {
         ExecutorKind::Builder => BUILDER_FUSE_CACHE_BYTES,
