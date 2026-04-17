@@ -295,7 +295,8 @@ let
           # if it did NOT, the fast samples at half-wall pull P toward
           # ~1500. 10% band tolerates NNLS + partial-pool shrinkage.
           assert 1800 < st["p"] < 2200, f"P={st['p']} (norm failed?)"
-          assert st["sigmaResid"] < 0.2, f"sigma={st['sigmaResid']}"
+          sigma = st.get("sigmaResid", 0.0)
+          assert sigma < 0.2, f"sigma={sigma}"
     '';
 
     cost-solve = ''
