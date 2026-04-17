@@ -47,7 +47,7 @@ message ResourceUsage {
   uint64 disk_total_bytes = 5;            // Total disk capacity
   reserved 6;                             // was uint32 running_builds (P0537: → bool busy)
   reserved 7;                             // was available_build_slots (P0537: derivable as !busy)
-  bool busy = 8;                          // A build is in flight (P0537: at most one per executor)
+  reserved 8;                             // was bool busy (redundant with HeartbeatRequest.running_build)
   // ── ADR-023 SLA-sizing telemetry (oceansprint-build-sizing). All optional
   // for wire-compat: old executors omit, scheduler treats absent as no-signal.
   optional double cpu_limit_cores = 9;       // cgroup cpu.max as fractional cores; absent = "max" (unbounded)

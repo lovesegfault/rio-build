@@ -95,7 +95,8 @@ fn tier_p90(fit: &FittedParams, cfg: &SlaConfig) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sla::config::{ProbeShape, Tier};
+    use crate::sla::config::ProbeShape;
+    use crate::sla::solve::Tier;
     use crate::sla::types::{DurationFit, ExploreState, MemFit, ModelKey, WallSeconds};
     use std::collections::HashMap;
 

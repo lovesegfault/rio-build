@@ -31,7 +31,7 @@ pub(super) struct Config {
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
     /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
-    pub(super) soft_features: Vec<rio_scheduler::SoftFeature>,
+    pub(super) soft_features: Vec<String>,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.

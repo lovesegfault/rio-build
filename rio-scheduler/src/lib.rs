@@ -34,10 +34,7 @@ pub(crate) mod queue;
 pub mod sla;
 pub mod state;
 
-// Re-export for main.rs — `assignment` is pub(crate) but the config struct
-// is part of the binary's TOML schema.
-pub use assignment::SoftFeature;
-// Same pattern for PoisonConfig + RetryPolicy: main.rs's `Config`
+// Re-exports for PoisonConfig + RetryPolicy: main.rs's `Config`
 // struct embeds them as `#[serde(default)]` sub-tables. `state` IS
 // pub, but the re-export keeps main.rs's imports uniform
 // (crate-root path, no deep-module reach-in).

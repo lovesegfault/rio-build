@@ -81,7 +81,7 @@ pub struct DerivationDag {
     /// D6: `floor_hint` seeding removed (legacy size-class names);
     /// SLA `solve_intent_for` + `resource_floor` clamp own initial
     /// sizing now. Strip-only.
-    soft_features: Vec<crate::assignment::SoftFeature>,
+    soft_features: Vec<String>,
 }
 
 impl DerivationDag {
@@ -93,7 +93,7 @@ impl DerivationDag {
     /// Set soft features. Called once from `DagActor::with_soft_features`
     /// before any merge/recovery; stripping in `insert_recovered_node`
     /// and the merge path read this. No-op if called with an empty vec.
-    pub fn set_soft_features(&mut self, soft: Vec<crate::assignment::SoftFeature>) {
+    pub fn set_soft_features(&mut self, soft: Vec<String>) {
         self.soft_features = soft;
     }
 
@@ -107,7 +107,7 @@ impl DerivationDag {
         }
         state
             .required_features
-            .retain(|f| !self.soft_features.iter().any(|sf| sf.name == *f));
+            .retain(|f| !self.soft_features.iter().any(|sf| sf == f));
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle

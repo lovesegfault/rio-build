@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use rand::{Rng, RngExt};
+use serde::{Deserialize, Serialize};
 
 use super::config::SlaConfig;
 use super::cost::{Band, Cap, CostTable, IceBackoff};
@@ -16,11 +17,14 @@ use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 const LOCAL_CORES: u32 = 1;
 const LOCAL_MEM_BYTES: u64 = 2 << 30;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tier {
     pub name: String,
+    #[serde(default)]
     pub p50: Option<f64>,
+    #[serde(default)]
     pub p90: Option<f64>,
+    #[serde(default)]
     pub p99: Option<f64>,
 }
 

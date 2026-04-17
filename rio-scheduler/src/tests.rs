@@ -83,25 +83,20 @@ fn poison_and_retry_load_from_toml() {
     assert_eq!(cfg.retry.jitter_fraction, 0.1);
 }
 
-/// `[[soft_features]]` array-of-tables (the helm-rendered shape)
-/// parses into `Vec<SoftFeature>`.
+/// `soft_features = [..]` string array (the helm-rendered shape)
+/// parses into `Vec<String>`.
 #[test]
 fn soft_features_load_from_toml() {
     use figment::providers::{Format, Toml};
     let toml = r#"
-        [[soft_features]]
-        name = "big-parallel"
-        [[soft_features]]
-        name = "benchmark"
+        soft_features = ["big-parallel", "benchmark"]
     "#;
     let cfg: Config =
         figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
             .merge(Toml::string(toml))
             .extract()
             .expect("toml parses into Config");
-    assert_eq!(cfg.soft_features.len(), 2);
-    assert_eq!(cfg.soft_features[0].name, "big-parallel");
-    assert_eq!(cfg.soft_features[1].name, "benchmark");
+    assert_eq!(cfg.soft_features, ["big-parallel", "benchmark"]);
 }
 
 /// Empty TOML → `#[serde(default)]` on Config + sub-struct

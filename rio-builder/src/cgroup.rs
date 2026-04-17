@@ -682,8 +682,6 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 /// on multi-core). `memory_total_bytes` is the cgroup `memory.max`
 /// limit — 0 means unbounded ("max"); the scheduler treats 0 as
 /// "unknown ceiling" and won't compute a fraction from it.
-/// `busy` is left false by the sampler — the heartbeat caller
-/// overwrites it (it has the running slot; the cgroup sampler doesn't).
 ///
 /// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
 /// overlay upper dirs accumulate — the relevant quota for "is there room
@@ -854,7 +852,6 @@ pub async fn utilization_reporter_loop_with_shutdown(
             memory_total_bytes: mem_max.unwrap_or(0),
             disk_used_bytes: disk_used,
             disk_total_bytes: disk_total,
-            busy: false,
             cpu_limit_cores,
             // Cumulative since cgroup creation (== since pod start). The
             // SLA model wants total CPU-seconds per build; with one build

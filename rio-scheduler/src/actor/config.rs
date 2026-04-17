@@ -10,20 +10,8 @@ use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 
-use crate::assignment::SoftFeature;
-use crate::dag::DerivationDag;
 use crate::lease::LeaderState;
 use crate::state::{PoisonConfig, RetryPolicy};
-
-/// Configure soft-feature stripping on `dag`. Called from
-/// `DagActor::new` and `clear_persisted_state` — the latter replaces
-/// `self.dag` on every leader transition and would otherwise drop
-/// soft_features (regression: the original open-coded reset at each
-/// site meant the first prod deploy of I-204 was a no-op after the
-/// lease acquired).
-pub(super) fn apply_soft_features(dag: &mut DerivationDag, soft_features: &[SoftFeature]) {
-    dag.set_soft_features(soft_features.to_vec());
-}
 
 /// Immutable-after-init configuration for [`super::DagActor`]. All
 /// fields are operator deploy config (scheduler.toml or env) and are
@@ -51,7 +39,7 @@ pub struct DagActorConfig {
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
-    pub soft_features: Vec<crate::assignment::SoftFeature>,
+    pub soft_features: Vec<String>,
     /// ADR-023 SLA-driven sizing config (`[sla]` table). Mandatory —
     /// `Default` uses [`crate::sla::config::SlaConfig::test_default`]
     /// (single best-effort tier, tiny ceilings).

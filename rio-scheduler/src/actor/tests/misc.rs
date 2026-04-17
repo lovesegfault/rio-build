@@ -604,9 +604,7 @@ async fn spawn_intents_soft_features_strip() {
         db.pool.clone(),
         DagActorConfig {
             sla: test_sla_config(),
-            soft_features: vec![crate::assignment::SoftFeature {
-                name: "big-parallel".into(),
-            }],
+            soft_features: vec!["big-parallel".into()],
             ..Default::default()
         },
     );
@@ -657,19 +655,11 @@ async fn spawn_intents_soft_features_strip() {
 /// preserved: stripping survives leader transition.
 #[tokio::test]
 async fn soft_feature_strip_only() {
-    use crate::assignment::SoftFeature;
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            soft_features: vec![
-                SoftFeature {
-                    name: "big-parallel".into(),
-                },
-                SoftFeature {
-                    name: "benchmark".into(),
-                },
-            ],
+            soft_features: vec!["big-parallel".into(), "benchmark".into()],
             ..Default::default()
         },
     );

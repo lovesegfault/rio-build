@@ -102,7 +102,7 @@ spec:
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
-            # ConfigMap carries the [sla] table + [[soft_features]];
+            # ConfigMap carries the [sla] table + soft_features;
             # everything else stays env-driven (figment merges TOML under
             # env). subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a
             # whole-dir CM mount here would race their visibility.
@@ -158,7 +158,7 @@ spec:
 # Option<SlaConfig> arm; an absent block falls back to the tiny
 # test_default ceilings, which under-spawn for any real workload.
 # checksum annotation on the pod template triggers rollout when [sla]/
-# [[soft_features]] change (kubelet remounts the CM but the scheduler
+# soft_features change (kubelet remounts the CM but the scheduler
 # reads it once at boot).
 apiVersion: v1
 kind: ConfigMap
@@ -169,18 +169,12 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 data:
   scheduler.toml: |
-    {{- /* I-213: [[soft_features]] array-of-tables. */ -}}
-    {{- range $s.softFeatures }}
-    [[soft_features]]
-    name = {{ .name | quote }}
-    {{- end }}
+    {{- /* I-213: soft_features string array. */}}
+    soft_features = [{{ range $i, $f := $s.softFeatures }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
     {{- /* ADR-023 [sla]: scalar block first, then nested tables, then
            array-of-tables — TOML requires tables after the scalars of
-           their parent. p50/p90/p99 are optional per-tier. The leading
-           "" | nindent forces a newline so [sla] never glues onto the
-           last [[soft_features]] line. */ -}}
+           their parent. p50/p90/p99 are optional per-tier. */ -}}
     {{- with $s.sla }}
-    {{- "" | nindent 4 }}
     [sla]
     cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
     default_tier = {{ .defaultTier | quote }}

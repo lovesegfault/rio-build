@@ -58,7 +58,6 @@ mod snapshot;
 
 pub(super) use breaker::CacheCheckBreaker;
 pub use command::*;
-use config::apply_soft_features;
 pub use config::{DagActorConfig, DagActorPlumbing};
 use event::BuildEventBus;
 #[cfg(test)]
@@ -295,7 +294,7 @@ pub struct DagActor {
     /// Stored on the actor (not just the DAG) because
     /// `clear_persisted_state` replaces `self.dag` on every leader
     /// transition — this copy is what survives.
-    pub(crate) soft_features: Vec<crate::assignment::SoftFeature>,
+    pub(crate) soft_features: Vec<String>,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -405,7 +404,7 @@ impl DagActor {
     /// `..Default::default()` and override one or two fields.
     pub fn new(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
         let mut dag = DerivationDag::new();
-        apply_soft_features(&mut dag, &cfg.soft_features);
+        dag.set_soft_features(cfg.soft_features.clone());
 
         Self {
             dag,
@@ -470,7 +469,7 @@ impl DagActor {
     /// `self.executors` — those are live connections, not persisted.
     pub(super) fn clear_persisted_state(&mut self) {
         self.dag = DerivationDag::new();
-        apply_soft_features(&mut self.dag, &self.soft_features);
+        self.dag.set_soft_features(self.soft_features.clone());
         self.ready_queue.clear();
         self.builds.clear();
         self.events.clear();

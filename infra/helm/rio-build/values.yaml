@@ -349,8 +349,8 @@ scheduler:
   # firefox/chromium. SLA `solve_intent_for` + `resource_floor` doubling
   # own initial sizing for these (D6).
   softFeatures:
-    - {name: big-parallel}
-    - {name: benchmark}
+    - big-parallel
+    - benchmark
   # ADR-023 SLA-driven sizing. Renders the [sla] table in scheduler.toml
   # — mandatory (the SchedulerConfig has no Option arm). Durations in
   # seconds, sizes in bytes (the Rust SlaConfig deserializer is plain

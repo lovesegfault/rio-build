@@ -384,7 +384,7 @@ mod tests {
 
     fn cfg() -> config::SlaConfig {
         config::SlaConfig {
-            tiers: vec![config::Tier {
+            tiers: vec![solve::Tier {
                 name: "normal".into(),
                 p50: None,
                 p90: Some(1200.0),

@@ -7,26 +7,10 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
 use rio_proto::types::ExecutorKind;
 
 use crate::dag::DerivationDag;
 use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
-
-/// One soft-feature entry (`[[soft_features]]` in scheduler.toml).
-/// `name` is stripped from `requiredSystemFeatures` at DAG-insert
-/// (`r[sched.dispatch.soft-features]`).
-///
-/// D6: legacy `floor_hint` removed — SLA `solve_intent_for` +
-/// `resource_floor` doubling own initial sizing now; the I-213 firefox
-/// case (`big-parallel` → xlarge) is handled by the SLA model fitting on
-/// prior firefox samples + reactive doubling on cold start.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SoftFeature {
-    pub name: String,
-}
 
 /// First clause of [`hard_filter`] that rejects, or `None` if it
 /// accepts. Used by `InspectBuildDag` to answer "why is this Ready drv

@@ -1481,7 +1481,7 @@ mod tests {
     /// case varies one input; the body asserts the full proto so a
     /// hardcoded literal in any position fails every row.
     ///
-    /// Covers: running_build/busy from slot, store_degraded from
+    /// Covers: running_build from slot, store_degraded from
     /// CircuitBreaker::is_open() (P0211 has_capacity gate),
     /// supported_features from CRD config (regression: hardcoded-empty
     /// silently ignored requiredSystemFeatures).
@@ -1515,7 +1515,6 @@ mod tests {
         assert_eq!(req.running_build.as_deref(), claim);
         assert_eq!(req.store_degraded, store_degraded);
         assert_eq!(req.supported_features, features);
-        assert_eq!(req.resources.unwrap().busy, claim.is_some());
     }
 
     /// I-212: when the JIT allowlist is armed, `handle_prefetch_hint`

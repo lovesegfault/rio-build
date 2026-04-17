@@ -799,9 +799,9 @@ pub(crate) async fn report_termination(
 /// are tiny — sized for VM-test pools). One tier, probe = 4c, 64-core
 /// / 256 GiB / 200 GiB ceilings (the former `DEFAULT_CEILINGS`).
 pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
-    use crate::sla::config;
+    use crate::sla::{config, solve};
     config::SlaConfig {
-        tiers: vec![config::Tier {
+        tiers: vec![solve::Tier {
             name: "normal".into(),
             p50: None,
             p90: Some(1200.0),

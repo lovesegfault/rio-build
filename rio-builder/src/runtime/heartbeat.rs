@@ -45,15 +45,8 @@ pub async fn build_heartbeat_request(
 
     // Read lock held for one struct clone. First heartbeat (before
     // first 10s poll) sends zeros — same as ResourceUsage::default(),
-    // converges after one tick. Override `busy` here: the cgroup
-    // sampler doesn't know the running slot. Redundant with the
-    // top-level HeartbeatRequest field but filling it keeps the
-    // ResourceUsage message self-contained for ListExecutors consumers.
-    let resources = {
-        let mut ru = *resources.read().ignore_poison();
-        ru.busy = current.is_some();
-        ru
-    };
+    // converges after one tick.
+    let resources = *resources.read().ignore_poison();
 
     HeartbeatRequest {
         executor_id: executor_id.to_string(),

@@ -3,19 +3,13 @@
 //! `scheduler.sla`). Mandatory — every deployment carries an `[sla]`
 //! block (helm renders it from chart defaults; tests use
 //! [`SlaConfig::test_default`]).
-//!
-//! [`Tier`] is intentionally a config-local mirror of
-//! [`super::solve::Tier`]: solve.rs is being reworked concurrently
-//! (Phase-2.7) so this module keeps its own serde-carrying copy and
-//! converts at the boundary via [`SlaConfig::solve_tiers`]. Once both
-//! land the two collapse into one.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::solve::Ceilings;
+use super::solve::{Ceilings, Tier};
 
 /// `[sla]` table. `deny_unknown_fields` so a typo'd key under `[sla]`
 /// fails loud at startup instead of silently defaulting.
@@ -101,31 +95,6 @@ fn default_ring_buffer() -> u32 {
 }
 fn default_halflife() -> f64 {
     7.0 * 86400.0
-}
-
-/// Config-side tier descriptor. Mirrors [`super::solve::Tier`] but
-/// carries serde derives + per-field `#[serde(default)]` so a tier
-/// like `{name: best-effort}` (no targets) deserializes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tier {
-    pub name: String,
-    #[serde(default)]
-    pub p50: Option<f64>,
-    #[serde(default)]
-    pub p90: Option<f64>,
-    #[serde(default)]
-    pub p99: Option<f64>,
-}
-
-impl From<&Tier> for super::solve::Tier {
-    fn from(t: &Tier) -> Self {
-        Self {
-            name: t.name.clone(),
-            p50: t.p50,
-            p90: t.p90,
-            p99: t.p99,
-        }
-    }
 }
 
 /// Cold-start probe shape: `mem = mem_base + cpu × mem_per_core`.
@@ -219,13 +188,13 @@ impl SlaConfig {
         Ok(())
     }
 
-    /// Tiers converted to [`super::solve::Tier`] and sorted
-    /// tightest-first (lowest target wins; a tier with no targets sorts
-    /// last). [`super::solve::solve_mvp`] iterates in order and returns
-    /// the first feasible tier, so tightest-first means a build that
-    /// CAN hit `fast` does, instead of settling for `normal`.
-    pub fn solve_tiers(&self) -> Vec<super::solve::Tier> {
-        let mut tiers: Vec<super::solve::Tier> = self.tiers.iter().map(Into::into).collect();
+    /// Tiers sorted tightest-first (lowest target wins; a tier with no
+    /// targets sorts last). [`super::solve::solve_mvp`] iterates in
+    /// order and returns the first feasible tier, so tightest-first
+    /// means a build that CAN hit `fast` does, instead of settling for
+    /// `normal`.
+    pub fn solve_tiers(&self) -> Vec<Tier> {
+        let mut tiers = self.tiers.clone();
         tiers.sort_by_key(|t| {
             t.p50
                 .or(t.p90)
