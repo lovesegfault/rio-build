@@ -2043,11 +2043,13 @@ impl DagActor {
             // would succeed). NO retry_count++ (separate counter).
             // NO backoff (next dispatch's longer deadline IS the
             // backoff). I-200: every TimedOut consumes budget UNLESS
-            // bump already counted (at-cap). Symmetric with
-            // `handle_infrastructure_failure`'s `!counted` guard —
-            // covers cold-start (no [sla], est=None, floor=0 →
-            // {false,false}) where `if promoted` would never increment
-            // → infinite retry until globalTimeout.
+            // bump already counted (at-cap). NOT symmetric with
+            // `handle_infrastructure_failure` — infra has an outer
+            // `!promoted` exemption (via `exempt_from_cap`); timeout
+            // deliberately does not, so `max_timeout_retries` bounds
+            // TOTAL attempts. Covers cold-start (no [sla], est=None,
+            // floor=0 → {false,false}) where `if promoted` would never
+            // increment → infinite retry until globalTimeout.
             if !floor_outcome.counted {
                 state.retry.timeout_count += 1;
             }

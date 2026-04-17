@@ -193,14 +193,20 @@ pub fn intent_for(
     // available. `resource_floor` is per-drv_hash, so a new version of
     // a known disk-heavy serial pname must start at the observed p90,
     // not re-climb the OOM/DiskPressure ladder from probe defaults.
+    // `forced_mem` is hoisted so it overrides mem in EVERY branch below
+    // (the doc-promise above) — `rio sla override --mem` on a serial
+    // drv was silently dropped before.
+    let forced_mem = override_.and_then(|o| o.forced_mem);
     let fit_disk = fit
         .and_then(|f| f.disk_p90)
         .map_or(ceil.default_disk, |d| d.0);
     if hints.prefer_local_build == Some(true) {
-        return (LOCAL_CORES, LOCAL_MEM_BYTES, fit_disk);
+        return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), fit_disk);
     }
     if hints.enable_parallel_building == Some(false) {
-        let mem = fit.map(|f| f.mem.at(RawCores(1.0)).0).unwrap_or(probe_mem);
+        let mem = forced_mem
+            .or_else(|| fit.map(|f| f.mem.at(RawCores(1.0)).0))
+            .unwrap_or(probe_mem);
         return (1, mem, fit_disk);
     }
     let fit = match fit {
@@ -212,7 +218,7 @@ pub fn intent_for(
         _ => {
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
             let d = explore::next(fit, cfg, hints);
-            let mem = override_.and_then(|o| o.forced_mem).unwrap_or(d.mem.0);
+            let mem = forced_mem.unwrap_or(d.mem.0);
             return ((d.c.0.ceil() as u32).max(1), mem, d.disk.0);
         }
     };
@@ -231,7 +237,7 @@ pub fn intent_for(
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
     let cores = (r.cores().0.ceil() as u32).max(1);
-    let mem = override_.and_then(|o| o.forced_mem).unwrap_or(r.mem().0);
+    let mem = forced_mem.unwrap_or(r.mem().0);
     (cores, mem, r.disk().0)
 }
 
@@ -889,6 +895,27 @@ mod tests {
         // No fit → probe defaults.
         let (c, m, d) = intent(None, &hints);
         assert_eq!((c, m, d), (1, 8 << 30, ceil().default_disk));
+    }
+    #[test]
+    fn serial_honors_forced_mem() {
+        // forced_mem (no forced_cores) must override mem in the
+        // prefer_local / serial early-return branches too — the
+        // doc-promise on `intent_for` says "any branch".
+        let o = ResolvedTarget {
+            forced_mem: Some(64 << 30),
+            ..Default::default()
+        };
+        let go = |hints| intent_for(None, &hints, Some(&o), &cfg(), &[], &ceil());
+        let (c, m, _) = go(DrvHints {
+            enable_parallel_building: Some(false),
+            ..Default::default()
+        });
+        assert_eq!((c, m), (1, 64 << 30), "serial: cores pinned, mem forced");
+        let (c, m, _) = go(DrvHints {
+            prefer_local_build: Some(true),
+            ..Default::default()
+        });
+        assert_eq!((c, m), (1, 64 << 30), "prefer_local: mem forced");
     }
     #[test]
     fn intent_for_cold_start_is_probe() {
