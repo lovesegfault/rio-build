@@ -1086,6 +1086,201 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.promotion-exempt+2]
+/// m044 regression: at-cap cgroup-OOM with the I-127 retry window
+/// ELAPSED used to reset `infra_count` to 0 — `bump_floor_or_count`
+/// incremented (counted=true) BEFORE the window-reset zeroed it, then
+/// the `!counted` guard skipped the re-increment. Net `infra_count=0`
+/// every cycle → never poisoned. Any 256GiB build (LLVM, chromium)
+/// trivially runs >5min before peak RSS, so window-elapsed is the
+/// NORMAL case at the ceiling.
+///
+/// `infra_retry_window_secs=0.0` makes the window always-elapsed
+/// without sleeping. With `max_infra_retries=2`: cycle 1 → count=1,
+/// cycle 2 → count=2 → poison (NOT count=0 forever).
+#[tokio::test]
+async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
+    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_infra_retries: 2,
+            infra_retry_window_secs: 0.0,
+            ..Default::default()
+        };
+    });
+
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "cap-win", PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(
+            "cap-win",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: max_mem,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let p = test_drv_path("cap-win");
+
+    // Cycle 1: at-cap → bump counts (infra=1); window-elapsed reset
+    // MUST NOT wipe it.
+    let mut rx = connect_builder(&handle, "b-win-1", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "b-win-1",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "cgroup OOM during build; bumping resource floor",
+    )
+    .await?;
+    drop(rx);
+    let s = expect_drv(&handle, "cap-win").await;
+    assert_eq!(
+        s.retry.infra_count, 1,
+        "m044: at-cap counted increment must survive window-elapsed reset \
+         (was: bump→1, reset→0, !counted skip → 0)"
+    );
+    assert_ne!(s.status, DerivationStatus::Poisoned);
+
+    // Cycle 2: bump → infra=2 ≥ max=2 → poison.
+    let mut rx = connect_builder(&handle, "b-win-2", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "b-win-2",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "cgroup OOM during build; bumping resource floor",
+    )
+    .await?;
+    drop(rx);
+    let s = expect_drv(&handle, "cap-win").await;
+    assert_eq!(s.retry.infra_count, 2);
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "m044: window-elapsed at-cap cgroup-OOM must still reach poison \
+         (was: infra_count stuck at 0 → infinite loop at max_mem)"
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.promotion-exempt+2]
+/// m044 regression: PURE controller-reported termination at the
+/// ceiling (kubelet OOMKilled / EvictedDiskPressure → pod dead, no
+/// worker `CompletionReport`) used to loop forever —
+/// `handle_executor_termination` returned `.promoted` only and never
+/// checked `infra_count >= max_infra_retries`. The worker-reported
+/// path (`handle_infrastructure_failure`) owns that check, but it
+/// never fires when the pod itself dies.
+///
+/// With `max_infra_retries=2`: 2 disconnect+report(OomKilled) cycles
+/// at floor==max_mem → poison on cycle 2. Contrast
+/// `floor_caps_at_ceiling_then_poisons`, which mixes controller +
+/// worker paths and so masked this.
+#[tokio::test]
+async fn controller_oom_at_ceiling_poisons() -> TestResult {
+    let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
+    use rio_proto::types::TerminationReason as R;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy = crate::RetryPolicy {
+            max_infra_retries: 2,
+            ..Default::default()
+        };
+    });
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ctrl-cap",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .debug_seed_sched_hint(
+            "ctrl-cap",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: max_mem,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    // Cycle 1: disconnect (re-queues Ready) → controller reports
+    // OomKilled → bump at-cap → infra_count=1. Under cap → not poisoned.
+    let mut rx = connect_builder(&handle, "b-ctrl-1", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    disconnect(&handle, "b-ctrl-1").await?;
+    drop(rx);
+    let promoted = report_termination(&handle, "b-ctrl-1", R::OomKilled).await?;
+    assert!(!promoted, "at ceiling → promoted=false");
+    let s = expect_drv(&handle, "ctrl-cap").await;
+    assert_eq!(s.retry.infra_count, 1);
+    assert_ne!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "cycle 1: infra_count=1 < max=2 → not poisoned"
+    );
+
+    // Cycle 2: same again → infra_count=2 ≥ max=2 → poison.
+    let mut rx = connect_builder(&handle, "b-ctrl-2", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    disconnect(&handle, "b-ctrl-2").await?;
+    drop(rx);
+    let promoted = report_termination(&handle, "b-ctrl-2", R::OomKilled).await?;
+    assert!(!promoted);
+    let s = expect_drv(&handle, "ctrl-cap").await;
+    assert_eq!(s.retry.infra_count, 2);
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "m044: controller-reported at-cap OOM must poison at \
+         max_infra_retries (was: only worker-reported path checked cap → \
+         pod-level OOM looped at ceiling forever)"
+    );
+
+    // ── DiskPressure variant: same path, same poison ──────────────────
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "ctrl-dp", PriorityClass::Scheduled).await?;
+    let max_disk = crate::sla::config::SlaConfig::test_default().max_disk;
+    handle
+        .debug_seed_sched_hint(
+            "ctrl-dp",
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                disk_bytes: max_disk,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    for i in 1..=2u32 {
+        let id = format!("b-dp-{i}");
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        disconnect(&handle, &id).await?;
+        drop(rx);
+        report_termination(&handle, &id, R::EvictedDiskPressure).await?;
+    }
+    let s = expect_drv(&handle, "ctrl-dp").await;
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "m044: EvictedDiskPressure at max_disk → same cap-then-poison"
+    );
+    Ok(())
+}
+
 // r[verify sched.sla.reactive-floor]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// Bare disconnect does NOT promote `resource_floor`; the

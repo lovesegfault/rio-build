@@ -1851,7 +1851,17 @@ impl DagActor {
         // Sparse failures over a long build (4 fails over an hour)
         // are independent; only a tight burst (4 fails in 2min)
         // suggests a misclassified permanent error.
-        if let Some(last) = state.retry.last_infra_failure_at
+        //
+        // `!counted` guard: when the bump above already counted
+        // (at-cap cgroup-OOM), the increment is in `infra_count`
+        // ALREADY — resetting here wipes it, then the `!counted` guard
+        // below skips the re-increment, and the build loops at max_mem
+        // forever (m044). At-cap resource exhaustion is deterministic
+        // (build needs > max_mem regardless of when the last attempt
+        // ran), so the sparse-vs-burst window doesn't apply — same
+        // rationale as `timeout_count` having no window reset.
+        if !floor_outcome.counted
+            && let Some(last) = state.retry.last_infra_failure_at
             && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
         {
             debug!(

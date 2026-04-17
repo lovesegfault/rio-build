@@ -448,9 +448,41 @@ impl DagActor {
             return false;
         };
 
-        self.bump_resource_floor(&drv_hash, reason, label)
-            .await
-            .promoted
+        let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
+
+        // m044: at the ceiling (`counted=true`), bump incremented
+        // `infra_count`; this path MUST own the cap check + poison.
+        // Kubelet-level OOMKilled / EvictedDiskPressure means the pod
+        // died — there is no worker-reported `CompletionReport`, so
+        // `handle_infrastructure_failure`'s cap check never fires and
+        // the build loops at the ceiling forever otherwise. Mirrors
+        // completion.rs `handle_infrastructure_failure` cap check.
+        // Guard on `counted` (resource reasons only — non-resource
+        // returned early via reason_label=None) AND a poison-able
+        // status: the disconnect already re-queued (Ready), but a
+        // dispatch tick may have raced (Assigned/Running); any other
+        // state (Completed elsewhere, already Poisoned) → skip.
+        let max = self.retry_policy.max_infra_retries;
+        if outcome.counted
+            && let Some(state) = self.dag.node(&drv_hash)
+            && state.retry.infra_count >= max
+            && matches!(
+                state.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            )
+        {
+            warn!(
+                drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
+                infra_retry_count = state.retry.infra_count, max,
+                resource_floor = ?state.sched.resource_floor,
+                "controller-reported termination: max_infra_retries \
+                 exhausted at ceiling, poisoning"
+            );
+            self.poison_and_cascade(&drv_hash).await;
+            return false;
+        }
+
+        outcome.promoted
     }
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
