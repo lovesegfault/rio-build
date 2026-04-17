@@ -70,8 +70,8 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
 
   # k3s bring-up ~4min + fetcher pod ~30s + build ~60s + 6 probe
-  # subtests ~30s.
-  globalTimeout = 900 + common.covTimeoutHeadroom;
+  # subtests ~30s + fod-dir/fod-fail ~90s.
+  globalTimeout = 1100 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -373,6 +373,53 @@ pkgs.testers.runNixOSTest {
             )
         assert "rio-mirror-probe" in out, f"unexpected output {out!r}"
         print(f"fod-dead-origin PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-dir — recursive-hash FOD with directory output
+    # ══════════════════════════════════════════════════════════════════
+    # The build runs `mkdir $out`. busybox FOD is already cached (the
+    # dispatch subtest above built it), so the only fresh build is the
+    # dir-output FOD itself — routes to a fetcher pod.
+    with subtest("fod-dir: recursive-hash FOD with directory output"):
+        rc, out = client.execute(
+            "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodDir} 2>&1"
+        )
+        if rc != 0:
+            raise AssertionError(
+                f"fod-dir build failed (rc={rc}). 'Input/output error' on "
+                f"mkdir means a whiteout was placed at the output path "
+                f"(prepare_sandbox regression).\n{out}"
+            )
+        assert "rio-fod-dir" in out, f"unexpected output {out!r}"
+        print(f"fod-dir PASS: {out.strip().splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # fod-fail — failing FOD propagates without FUSE-lookup hang (P0308)
+    # ══════════════════════════════════════════════════════════════════
+    # Origin 404s, hashed-mirror has no entry → builtin:fetchurl exits
+    # nonzero with $out absent. nix-daemon's post-build deletePath($out)
+    # stat falls through to FUSE lower; JitClass::NotInput → ENOENT
+    # without store contact. Asserting elapsed bounds the hang the
+    # whiteout once papered over: a regression here means lookup() fell
+    # through to gRPC and blocked.
+    with subtest("fod-fail: failing FOD propagates without hang"):
+        t0 = time.monotonic()
+        rc, out = client.execute(
+            "timeout 90 nix-build --no-out-link --store ssh-ng://k3s-server "
+            "${drvs.fodFail} 2>&1"
+        )
+        elapsed = time.monotonic() - t0
+        assert rc != 0, (
+            f"fod-fail unexpectedly SUCCEEDED — origin /nonexistent 404s "
+            f"and hashed-mirror has no entry for its hash:\n{out}"
+        )
+        assert elapsed < 60, (
+            f"fod-fail took {elapsed:.1f}s (>60s) — daemon post-fail "
+            f"stat($out) likely blocked in FUSE lookup (JitClass::NotInput "
+            f"fast-path not firing).\n{out}"
+        )
+        print(f"fod-fail PASS: rc={rc} in {elapsed:.1f}s")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

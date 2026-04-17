@@ -122,8 +122,7 @@ impl OverlayMount {
     }
 
     /// `{upper}/nix/store` — the overlayfs upperdir itself. Build outputs
-    /// materialize here. scan_new_outputs + upload_output read this;
-    /// executor's FOD-whiteout (mknod) writes here.
+    /// materialize here. scan_new_outputs + upload_output read this.
     pub fn upper_store(&self) -> PathBuf {
         self.upper.join("nix/store")
     }

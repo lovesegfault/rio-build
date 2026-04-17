@@ -62,6 +62,15 @@ rec {
   # fetcher-split fod-dead-origin subtest.
   fodDeadOrigin = "${dir}/fod-dead-origin.nix";
 
+  # Recursive-hash FOD whose output is a directory (`mkdir $out`).
+  # Regression: whiteout-on-output → EIO on mkdir. fetcher-split fod-dir.
+  fodDir = "${dir}/fod-dir.nix";
+
+  # Flat-hash FOD that always fails (404 origin, no mirror entry).
+  # P0308 regression: failure must propagate without FUSE-lookup hang.
+  # fetcher-split fod-fail.
+  fodFail = "${dir}/fod-fail.nix";
+
   # sha256 hex of the body fod-dead-origin.nix expects. Computed from
   # the same literal so the served path and the FOD's outputHash agree.
   hashedMirrorProbeHex = builtins.hashString "sha256" "rio-hashed-mirror-probe\n";

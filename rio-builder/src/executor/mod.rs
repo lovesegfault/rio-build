@@ -15,7 +15,7 @@
 //!
 //! Phase modules (each owns one step of the flow above):
 //! - `inputs`: drv fetch, input-closure BFS, FOD hash verify
-//! - `sandbox`: synth DB, nix.conf, FOD output whiteouts
+//! - `sandbox`: synth DB, nix.conf
 //! - `daemon`: nix-daemon spawn + STDERR loop
 //! - `monitors`: per-build cgroup CPU/OOM watchers + drain
 //! - `outputs`: FOD verify gate, upload, daemon→proto result mapping
@@ -436,13 +436,12 @@ pub async fn execute_build(
         return Ok(r);
     }
 
-    // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
+    // 4. Populate sandbox: synth DB, nix.conf.
     prepare_sandbox(
         &overlay_mount,
         &drv,
         drv_path,
         input_metadata,
-        is_fod,
         effective_cores,
         &env.systems,
     )

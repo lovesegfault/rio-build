@@ -192,7 +192,7 @@ pub trait DerivationLike {
     /// Outputs with a statically-known store path. Floating-CA outputs
     /// have an empty path (computed post-build from the NAR hash) and
     /// must be excluded from any pre-build path bookkeeping — synth-db
-    /// rows, overlay whiteouts, reference scanning. See
+    /// rows, reference scanning. See
     /// `rio-builder/src/executor/sandbox.rs` for the daemon-crash
     /// rationale (parseStorePath("") aborts nix-daemon).
     fn static_outputs(&self) -> impl Iterator<Item = &DerivationOutput> {

@@ -1,9 +1,7 @@
-//! Sandbox setup: synthetic SQLite DB, nix.conf, FOD output whiteouts.
+//! Sandbox setup: synthetic SQLite DB, nix.conf.
 //!
 //! Side-effects on the overlay's upper layer only — runs after overlay
-//! mount + input resolution, before daemon spawn. Separated from
-//! `mod.rs` so the FOD-whiteout commentary block (P0308 hang fix) lives
-//! next to the mknod call instead of mid-orchestrator.
+//! mount + input resolution, before daemon spawn.
 
 use std::path::Path;
 
@@ -53,7 +51,7 @@ hashed-mirrors = http://tarballs.nixos.org/
 /// experimental-features, sandbox paths, etc without image rebuild.
 const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix-conf/nix.conf";
 
-/// Populate the sandbox: synthetic SQLite DB, nix.conf, FOD whiteouts.
+/// Populate the sandbox: synthetic SQLite DB, nix.conf.
 ///
 /// Runs after overlay mount setup and input resolution. All side-effects
 /// on the overlay's upper layer — no state returned. The overlay_mount
@@ -65,15 +63,12 @@ const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix-conf/nix.conf";
 ///    DerivationOutputs) so nix-daemon's isValidPath()/queryPartial
 ///    DerivationOutputMap() work without a real store.
 /// 2. Write nix.conf (sandbox=true, substitute=false).
-/// 3. For FODs: mknod whiteout char-devs for declared output paths so
-///    daemon post-fail stat gets ENOENT from upper without probing FUSE.
-#[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
+#[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn prepare_sandbox(
     overlay_mount: &overlay::OverlayMount,
     drv: &Derivation,
     drv_path: &str,
     synth_paths: Vec<ValidatedPathInfo>,
-    is_fod: bool,
     effective_cores: u32,
     systems: &[String],
 ) -> Result<(), ExecutorError> {
@@ -105,131 +100,6 @@ pub(super) async fn prepare_sandbox(
 
     // Set up nix.conf in overlay
     setup_nix_conf(&overlay_mount.upper_nix_conf(), effective_cores, systems)?;
-
-    // Whiteout declared output paths in the overlay upper layer.
-    //
-    // r[impl builder.fod.verify-hash]
-    //
-    // P0308: FOD BuildResult propagation hang. When a builder exits
-    // nonzero WITHOUT creating `$out` (wget 403 → exit 1, typical FOD
-    // failure), nix-daemon's post-build cleanup — `deletePath(outputPath)`
-    // in LocalDerivationGoal — stats `/nix/store/<output-basename>`.
-    //
-    // The overlay resolves this lookup layer by layer:
-    //   upper ({upper}/nix/store/)  → ENOENT (builder never wrote it)
-    //   lower (FUSE)                → lookup() → ensure_cached() → gRPC
-    //
-    // The FUSE gRPC should return ENOENT quickly, but empirically in the
-    // k3s fixture it blocks — the daemon's stat syscall hangs, the daemon
-    // never writes STDERR_LAST, and nix-build waits until `timeout 90`.
-    //
-    // Success path is unaffected: builder wrote `$out` → upper has it →
-    // overlay resolves immediately, FUSE never probed.
-    //
-    // r[impl builder.fod.output-whiteout]
-    // The whiteout fix: mknod a char device 0/0 for each output path
-    // DIRECTLY IN THE UPPER DIR — bypassing overlay semantics entirely.
-    //
-    // Why not create-then-delete via the merged dir? Overlayfs only
-    // writes a whiteout when `ovl_lower_positive()` returns true, i.e.
-    // when at least one lower has the name. Here the FUSE lower ENOENTs
-    // (output not yet in rio-store), so unlink via merged takes the
-    // `ovl_remove_upper` path — plain unlink, no whiteout.
-    // Empirically verified on Linux 6.12: create+rm via
-    // merged for a name absent from all lowers leaves upper EMPTY.
-    //
-    // A char device 0/0 placed directly in the upperdir IS the
-    // whiteout format (Documentation/filesystems/overlayfs.rst). The
-    // kernel's merged-view lookup sees it and returns ENOENT without
-    // consulting lowers — regardless of what lowers would say.
-    // Post-whiteout:
-    //
-    //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
-    //     → nothing to delete → returns. Whiteout survives.
-    //   - Builder creates $out as FILE: open(O_CREAT)/link()/rename-file via
-    //     merged → overlayfs replaces the whiteout with a real file in upper.
-    //     Success path unchanged. **mkdir() onto a whiteout → EIO** (verified
-    //     Linux 6.12; rename-dir → EXDEV) — the whiteout SURVIVES. Hence the
-    //     is_fod guard below: fod-fetch.nix (the hang's repro) uses
-    //     outputHashMode=flat → `wget -O $out` → file. Non-FOD `mkdir $out`
-    //     callers (lifecycle.nix:171,218,227) skip the whiteout entirely.
-    //     Recursive-mode FODs (NAR-hash dir outputs) are a known gap; not
-    //     the plan's target, and the FUSE-spin hang is FOD-hash-verify-path
-    //     specific — non-FOD failures don't probe $out the same way, so
-    //     they never needed this whiteout.
-    //   - Builder fails, $out never created: whiteout remains → daemon's
-    //     post-fail stat gets ENOENT from upper → FUSE never probed →
-    //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
-    //
-    // mknod(S_IFCHR) needs CAP_MKNOD. We hold it: this runs in the
-    // worker's initial namespace before spawn_daemon_in_namespace, with
-    // the same caps that mount the overlay (CAP_SYS_ADMIN ⊇ CAP_MKNOD
-    // in practice; both granted to the worker pod). The syscall goes
-    // straight to the upper's backing fs (local SSD) — the overlay and
-    // FUSE are never consulted, so no spawn_blocking needed.
-    //
-    // `{upper}/nix/store/` is the overlayfs upperdir (overlay.rs:201).
-    // It's a fresh empty dir per-build (mkdir_all at overlay setup),
-    // so EEXIST is impossible here.
-    if is_fod {
-        let upper_store = overlay_mount.upper_store();
-        // drv.is_fixed_output() ⇒ exactly one output named "out"
-        // (derivation/mod.rs:211); loop body runs once.
-        for out in drv.outputs() {
-            // Output paths are always absolute store paths. An empty
-            // path (CA derivations with unknown output paths) can't be
-            // whitedout — skip and let the daemon's own logic handle it.
-            let Some(basename) =
-                rio_nix::store_path::basename(out.path()).filter(|b| !b.is_empty())
-            else {
-                continue;
-            };
-            let whiteout = upper_store.join(basename);
-            nix::sys::stat::mknod(
-                &whiteout,
-                nix::sys::stat::SFlag::S_IFCHR,
-                nix::sys::stat::Mode::empty(),
-                0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
-            )
-            .map_err(|errno| {
-                // EPERM → missing CAP_MKNOD (pod securityContext regression).
-                // EROFS → upper not writable (overlay misconfigured).
-                // Either way the daemon spawn would fail; fail early with context.
-                ExecutorError::DaemonSetup(format!(
-                    "mknod whiteout for output {basename:?} at {}: {errno}",
-                    whiteout.display()
-                ))
-            })?;
-            // Diagnostic: verify the whiteout is visible as ENOENT through
-            // the MERGED view. The mknod above writes directly to the
-            // upperdir backing fs; this stat goes through overlayfs. If it
-            // doesn't return ENOENT, the char-dev-0/0 whiteout approach
-            // isn't being honored in this environment (nested overlay,
-            // unusual mount options, kernel quirk) — the build will still
-            // proceed but the FOD-failure hang fix won't take effect.
-            // See TODO(P0311-T10) in netpol.nix (pre-ADR-019).
-            let merged_check = overlay_mount.merged_dir().join(basename);
-            match std::fs::symlink_metadata(&merged_check) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::debug!(
-                        output = basename,
-                        upper = %whiteout.display(),
-                        "FOD output whiteout created and visible as ENOENT via merged"
-                    );
-                }
-                other => {
-                    tracing::warn!(
-                        output = basename,
-                        upper = %whiteout.display(),
-                        merged = %merged_check.display(),
-                        result = ?other,
-                        "FOD output whiteout NOT visible as ENOENT via merged — \
-                         daemon post-fail stat may fall through to FUSE and hang"
-                    );
-                }
-            }
-        }
-    }
 
     Ok(())
 }

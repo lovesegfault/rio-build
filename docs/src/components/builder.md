@@ -372,9 +372,6 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 3. **Output verification**: After the build completes, the executor computes the hash of the output and verifies it matches the declared `outputHash`. A mismatch is reported as `BuildResultStatus::OutputRejected` (NOT `BuildFailed`) and the output is discarded locally without entering the store.
 4. **Caching**: FODs are cached by their output hash, not their derivation hash. Two FODs with different `src` attributes but the same `outputHash` share the same cached output.
 
-r[builder.fod.output-whiteout]
-For each declared FOD output path, sandbox-populate `mknod`s a char device `0/0` (the overlayfs whiteout signature) at `{upper_store}/{basename}` BEFORE daemon spawn. Through the merged view this presents as `ENOENT`: the daemon's pre-build `deletePath(output)` `lstat` returns ENOENT (skips); the builder's `creat()`/`open(O_CREAT)` of `$out` replaces the whiteout with a real file in upper; on builder failure with no `$out` created, the whiteout remains and post-build cleanup is a no-op. Rationale: overlayfs only writes a whiteout on unlink when `ovl_lower_positive()` is true (the lower's `lookup` returned a real entry), but the FUSE lower returns ENOENT for output paths (they're not in the input closure) --- so a daemon-issued unlink takes the `ovl_remove_upper` path with no whiteout, and a stale lower-positive could shadow the upper. Known limit: `mkdir()` onto a whiteout returns `EIO` (verified Linux 6.12) and the whiteout survives --- non-FOD outputs (which are never whiteouted) and FODs that produce a single regular file are unaffected.
-
 ## Namespace Ordering
 
 r[builder.ns.order+2]

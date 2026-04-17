@@ -1228,9 +1228,9 @@ mod tests {
     /// `logger->stopWork()` (STDERR_LAST) call. Root cause: the daemon's
     /// post-fail cleanup probes the never-created `$out` at
     /// `/nix/store/<fod-output>`, which falls through the overlay
-    /// (upper → host → FUSE) to a FUSE `lookup()` → `ensure_cached()` →
-    /// gRPC. See P0308 T2 for the whiteout fix that short-circuits this
-    /// overlay fall-through.
+    /// (upper → host → FUSE) to a FUSE `lookup()`. JIT FUSE lookup
+    /// classifies output basenames as `JitClass::NotInput` → ENOENT
+    /// without store contact, so the daemon's stat returns immediately.
     #[tokio::test]
     async fn test_fod_failure_buildresult_propagates_promptly() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::ResultField;

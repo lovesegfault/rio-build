@@ -831,6 +831,14 @@ in
   #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
   #   points the rio-nix-conf ConfigMap at the in-VM TEST-NET-3
   #   server (only "public" IP the fetcher netpol passes).
+  # r[verify builder.fod.verify-hash]
+  #   fod-dir subtest: recursive-hash FOD with directory output
+  #   (`mkdir $out`). Regression: a whiteout at the output path
+  #   makes overlayfs mkdir return EIO.
+  # r[verify builder.fuse.jit-lookup]
+  #   fod-fail subtest: failing FOD propagates within 60s. Daemon's
+  #   post-fail stat($out) hits FUSE; NotInput → ENOENT without
+  #   store contact. P0308 hang would push elapsed past timeout 90.
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
