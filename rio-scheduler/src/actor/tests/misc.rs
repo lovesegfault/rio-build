@@ -713,6 +713,145 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     let _ = intent.disk_bytes;
 }
 
+/// D7: `solve_intent_for` deadline_secs falls back to
+/// `probe.deadline_secs` for `DurationFit::Probe` (the n_eff<3 ∨
+/// span<4 explore phase). The bug: `Some(Probe)` entered the fitted
+/// `.map()` branch, `t_at()=∞ → q99×5 as u32` saturated → clamped to
+/// the 24h cap instead of the configured 1h probe deadline. Same
+/// regression poisoned `predicted.wall_secs` with ∞.
+#[tokio::test]
+async fn solve_intent_for_probe_fit_uses_probe_deadline() {
+    use crate::sla::types::*;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone());
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "exploring".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Probe,
+        mem: MemFit::Independent {
+            p90: MemBytes(4 << 30),
+        },
+        disk_p90: None,
+        sigma_resid: 0.2,
+        log_residuals: Vec::new(),
+        n_eff: 1.0,
+        span: 1.0,
+        explore: ExploreState {
+            distinct_c: 1,
+            min_c: RawCores(4.0),
+            max_c: RawCores(4.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(800.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("p", Some("exploring"), "x86_64-linux", false);
+    let intent = actor.solve_intent_for(actor.dag.node("p").unwrap());
+    assert_eq!(
+        intent.deadline_secs, 3600,
+        "Probe fit → probe.deadline_secs, not 86400 (∞→u32::MAX→cap)"
+    );
+    assert!(
+        intent.predicted.is_none(),
+        "Probe fit → no prediction snapshot (wall_secs would be ∞)"
+    );
+}
+
+/// D7: a sub-second fitted curve (trivial-builders) must not produce a
+/// tiny `activeDeadlineSeconds` that kills the Job before pod startup
+/// completes. `q99×5` for a 0.5s build is ~3; the fix floors the
+/// fitted-path computation at `probe.deadline_secs` so the spawn-kill
+/// loop can't form (no heartbeat → no `recently_disconnected` → no
+/// `bump_floor_or_count`).
+#[tokio::test]
+async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
+    use crate::sla::types::*;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone());
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "trivial".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        // s+p/c ≈ 0.5s at any c.
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(0.4),
+            p: RefSeconds(0.1),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(1 << 30),
+        },
+        disk_p90: None,
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(8.0),
+            frozen: true,
+            saturated: false,
+            last_wall: WallSeconds(0.5),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("t", Some("trivial"), "x86_64-linux", false);
+    let intent = actor.solve_intent_for(actor.dag.node("t").unwrap());
+    assert_eq!(
+        intent.deadline_secs, 3600,
+        "sub-second fit floored at probe.deadline_secs (got {})",
+        intent.deadline_secs
+    );
+    // Prediction snapshot IS recorded for a real fit (finite wall_secs).
+    let p = intent.predicted.expect("fitted → prediction recorded");
+    assert!(p.wall_secs.is_some_and(|w| w.is_finite() && w < 10.0));
+}
+
+/// D7: `feature_probes.{feat}.deadline_secs` is honoured for unfitted
+/// builds with that feature — same lookup `explore::next` uses.
+#[tokio::test]
+async fn solve_intent_for_feature_probe_deadline() {
+    use crate::sla::config;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut cfg = test_sla_config();
+    cfg.feature_probes.insert(
+        "kvm".into(),
+        config::ProbeShape {
+            cpu: 8.0,
+            mem_per_core: 2 << 30,
+            mem_base: 8 << 30,
+            deadline_secs: 7200,
+        },
+    );
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: cfg,
+            ..Default::default()
+        },
+    );
+    actor.test_inject_ready_with_features("k", Some("vm-test"), "x86_64-linux", &["kvm"]);
+    let intent = actor.solve_intent_for(actor.dag.node("k").unwrap());
+    assert_eq!(
+        intent.deadline_secs, 7200,
+        "feature_probes.kvm.deadline_secs (not the default probe's 3600)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 
 /// `handle_inspect_build_dag` cross-references derivation state

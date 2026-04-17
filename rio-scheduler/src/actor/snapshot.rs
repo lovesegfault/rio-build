@@ -308,13 +308,19 @@ impl DagActor {
         // r[impl sched.sla.solve-per-band-cap]
         // solve_full path: gated on hw_cost_source set ∧ hw-factor
         // table populated ∧ a usable fit (same n_eff/span gate as
-        // intent_for's solve branch — override/probe/explore stay on
-        // the band-agnostic path). The hw_table snapshot is one
-        // RwLock-read clone (~dozens of entries); cost_table same.
+        // intent_for's solve branch — probe/explore stay on the
+        // band-agnostic path). A `forced_cores` OR `tier` override
+        // also gates it off: solve_full doesn't take `override_`, so
+        // those fall through to `intent_for` which honors both.
+        // `forced_mem` is overlaid below regardless of arm. The
+        // hw_table snapshot is one RwLock-read clone (~dozens of
+        // entries); cost_table same.
         let hw = self.sla_estimator.hw_table();
         let full = (self.sla_config.hw_cost_source.is_some()
             && !hw.is_empty()
-            && override_.as_ref().is_none_or(|o| o.forced_cores.is_none())
+            && override_
+                .as_ref()
+                .is_none_or(|o| o.forced_cores.is_none() && o.tier.is_none())
             && hints.prefer_local_build != Some(true))
         .then_some(())
         .and_then(|()| {
@@ -356,6 +362,11 @@ impl DagActor {
                 (c, m, d, Default::default())
             }
         };
+        // `forced_mem` overlays whichever arm fired — `intent_for`
+        // already applies it internally so this is a no-op there;
+        // `solve_full` doesn't see `override_`, so without this a
+        // `--mem`-only override is dead under `hw_cost_source`.
+        let mem = override_.as_ref().and_then(|o| o.forced_mem).unwrap_or(mem);
         // r[impl sched.sla.reactive-floor]
         // D4: clamp at the reactive floor. A derivation that OOM'd at
         // its solved mem (cold-start probe or fit under-estimate) had
@@ -370,18 +381,32 @@ impl DagActor {
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
         // — k8s-kill-then-reactive-floor IS the retry). Unfitted
         // (probe/explore/override-with-no-fit) ⇒ `[sla].probe.
-        // deadline_secs`. Clamp order: floor first (D4 — a
-        // `bump_floor_or_count(DeadlineExceeded)` doubles
-        // `floor.deadline_secs`; the next solve must honor it), then
-        // 24h ceiling so a doubled floor cannot run away.
-        let probe_deadline = self.sla_config.probe.deadline_secs;
+        // deadline_secs` — or the matching `feature_probes` entry, same
+        // lookup `explore::next` uses for the cores/mem ladder. The
+        // fitted-path `q99×5` is FLOORED at the probe deadline: a
+        // sub-second fit (trivial-builders) would otherwise yield
+        // `activeDeadlineSeconds≈3`, killing the Job before the pod
+        // ever heartbeats — and with no heartbeat there's no
+        // `recently_disconnected` entry, so `bump_floor_or_count`
+        // never runs and the next solve emits the same 3s. Clamp
+        // order: floor first (D4 — a `bump_floor_or_count
+        // (DeadlineExceeded)` doubles `floor.deadline_secs`; the next
+        // solve must honor it), then 24h ceiling so a doubled floor
+        // cannot run away.
+        let probe_deadline = hints
+            .required_features
+            .iter()
+            .find_map(|f| self.sla_config.feature_probes.get(f))
+            .unwrap_or(&self.sla_config.probe)
+            .deadline_secs;
         let computed = fit
             .as_ref()
+            .filter(|f| !matches!(f.fit, crate::sla::types::DurationFit::Probe))
             .map(|f| {
                 let t = f.fit.t_at(RawCores(f64::from(cores))).0;
                 (quantile::quantile(0.99, t, f.sigma_resid, 0.0) * 5.0) as u32
             })
-            .unwrap_or(probe_deadline);
+            .map_or(probe_deadline, |c| c.max(probe_deadline));
         let deadline_secs = computed
             .max(floor.deadline_secs)
             .min(crate::actor::floor::DEADLINE_CAP_SECS);
@@ -390,28 +415,33 @@ impl DagActor {
         // fitted curve to evaluate `T(c)` against — cold-start probes
         // and forced-cores overrides leave `wall_secs=None` so the
         // prediction-ratio histogram isn't poisoned by guesses.
-        let predicted = fit.as_ref().map(|f| {
-            let (tier, tier_p90) = match full
-                .as_ref()
-                .map(|r| r as &solve::SolveResult)
-                .unwrap_or(&solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings))
-            {
-                solve::SolveResult::Feasible { tier, .. } => (
-                    Some(tier.clone()),
-                    self.sla_tiers
-                        .iter()
-                        .find(|t| t.name == *tier)
-                        .and_then(|t| t.p90),
-                ),
-                solve::SolveResult::BestEffort { .. } => (None, None),
-            };
-            solve::SlaPrediction {
-                wall_secs: Some(f.fit.t_at(RawCores(f64::from(cores))).0),
-                mem_bytes: mem,
-                tier,
-                tier_p90,
-            }
-        });
+        // `Probe` is filtered: `Probe.t_at(_) = ∞` would record
+        // `actual/∞ = 0` into `sla_prediction_ratio{dim=wall}`.
+        let predicted = fit
+            .as_ref()
+            .filter(|f| !matches!(f.fit, crate::sla::types::DurationFit::Probe))
+            .map(|f| {
+                let (tier, tier_p90) = match full
+                    .as_ref()
+                    .map(|r| r as &solve::SolveResult)
+                    .unwrap_or(&solve::solve_mvp(f, &self.sla_tiers, &self.sla_ceilings))
+                {
+                    solve::SolveResult::Feasible { tier, .. } => (
+                        Some(tier.clone()),
+                        self.sla_tiers
+                            .iter()
+                            .find(|t| t.name == *tier)
+                            .and_then(|t| t.p90),
+                    ),
+                    solve::SolveResult::BestEffort { .. } => (None, None),
+                };
+                solve::SlaPrediction {
+                    wall_secs: Some(f.fit.t_at(RawCores(f64::from(cores))).0),
+                    mem_bytes: mem,
+                    tier,
+                    tier_p90,
+                }
+            });
         SolvedIntent {
             cores,
             mem_bytes: mem,

@@ -190,14 +190,23 @@ impl SlaEstimator {
     }
 
     /// `T_min` (ref-seconds) for one cached key. `None` for never-seen
-    /// keys — caller falls back to `critical_path::DEFAULT_DURATION_SECS`.
-    /// Feeds critical-path priority (D1): a relative ordering, so the
-    /// point estimate at `min(p̄, c_opt)` suffices — no solve, no
-    /// tier/ceiling dependency. `Probe` fits return `Some(∞)`; the
-    /// caller's `unwrap_or` doesn't fire but ∞ is a valid "this is the
-    /// longest thing" priority signal for a key under cold-start probing.
+    /// keys AND for `Probe`-stage fits (n_eff<3 ∨ span<4) — caller falls
+    /// back to `critical_path::DEFAULT_DURATION_SECS`. Feeds
+    /// critical-path priority (D1): a relative ordering, so the point
+    /// estimate at `min(p̄, c_opt)` suffices — no solve, no tier/ceiling
+    /// dependency.
+    ///
+    /// `Probe.t_min() = ∞` MUST NOT propagate: priority is additive
+    /// bottom-up (∞ taints the whole ancestor cone, defeating
+    /// `INTERACTIVE_BOOST` and degenerating dispatch order to
+    /// insertion-order), and `est_duration` feeds two metrics that
+    /// saturate on ∞ (`ca_cutoff_seconds_saved` → `u64::MAX`;
+    /// `critical_path_accuracy` → `actual/∞ = 0`). The flat default is
+    /// the same "unfitted" treatment a never-seen key gets.
     pub fn wall_estimate(&self, key: &types::ModelKey) -> Option<f64> {
-        self.cached(key).map(|p| p.fit.t_min().0)
+        self.cached(key)
+            .map(|p| p.fit.t_min().0)
+            .filter(|t| t.is_finite())
     }
 
     /// Drop one cached fit. Pairs with
@@ -496,6 +505,24 @@ mod tests {
         src.seed(other);
         assert_eq!(src.export_corpus(Some("t0"), 3).entries.len(), 1);
         assert_eq!(src.export_corpus(None, 3).entries.len(), 2);
+    }
+
+    #[test]
+    fn wall_estimate_probe_is_none_not_infinity() {
+        let est = SlaEstimator::for_test(&cfg());
+        let mut p = fitted("probing", 1.0);
+        p.fit = DurationFit::Probe;
+        let key = p.key.clone();
+        est.seed(p);
+        // Probe.t_min() = ∞ is filtered → None, so critical_path falls
+        // back to DEFAULT_DURATION_SECS instead of poisoning priority.
+        assert_eq!(est.wall_estimate(&key), None);
+        // Control: a fitted Amdahl curve returns a finite estimate.
+        let f = fitted("fitted", 10.0);
+        let fkey = f.key.clone();
+        est.seed(f);
+        let w = est.wall_estimate(&fkey).expect("fitted → Some");
+        assert!(w.is_finite() && w > 0.0);
     }
 
     #[test]
