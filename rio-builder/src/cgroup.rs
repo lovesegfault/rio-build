@@ -694,6 +694,49 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 pub type ResourceSnapshotHandle =
     std::sync::Arc<std::sync::RwLock<rio_proto::types::ResourceUsage>>;
 
+/// One synchronous cgroup/quota read merged onto `prev`. Called from
+/// `completion_stamp()` so `CompletionReport.final_resources` reflects
+/// the build's ACTUAL final state — the reporter loop sleeps 10s
+/// between samples and exits without a final read on shutdown, so the
+/// shared snapshot alone is ≤10s stale.
+///
+/// Refreshes only the fields `build_samples` consumes (completion.rs):
+/// `cpu_seconds_total` (cumulative — fresh `cpu.stat` read),
+/// `peak_disk_bytes` / `peak_io_pressure_pct` (running-max — `.max()`
+/// against `prev`). The instantaneous heartbeat fields (`cpu_fraction`,
+/// `memory_*`, `disk_*`) are left as-is from `prev`; they don't feed
+/// the SLA fit and a 10s-stale value there is harmless.
+///
+/// Unreadable file → keeps `prev`'s value (matches the loop's
+/// degrade-silently semantics).
+pub fn final_sample(
+    root: &Path,
+    overlay_base: &Path,
+    prev: rio_proto::types::ResourceUsage,
+) -> rio_proto::types::ResourceUsage {
+    let cpu_seconds_total = fs::read_to_string(root.join("cpu.stat"))
+        .ok()
+        .and_then(|c| parse_cpu_stat_usage_usec(&c))
+        .map(|u| u as f64 / 1e6)
+        .or(prev.cpu_seconds_total);
+    let peak_io_pressure_pct = fs::read_to_string(root.join("io.pressure"))
+        .ok()
+        .and_then(|s| parse_io_pressure_some_avg10(&s))
+        .map(|p| prev.peak_io_pressure_pct.map_or(p, |prev_p| prev_p.max(p)))
+        .or(prev.peak_io_pressure_pct);
+    let peak_disk_bytes = crate::quota::peak_bytes(overlay_base)
+        .ok()
+        .flatten()
+        .map(|q| prev.peak_disk_bytes.map_or(q, |prev_q| prev_q.max(q)))
+        .or(prev.peak_disk_bytes);
+    rio_proto::types::ResourceUsage {
+        cpu_seconds_total,
+        peak_io_pressure_pct,
+        peak_disk_bytes,
+        ..prev
+    }
+}
+
 /// statvfs on the overlay base dir. `f_blocks * f_frsize` = total;
 /// `(f_blocks - f_bavail) * f_frsize` = used. `f_bavail` (not
 /// `f_bfree`) because bfree includes root-reserved blocks — the
@@ -1150,5 +1193,57 @@ mod tests {
         // `starts_with("oom_kill ")` includes the trailing space).
         assert_eq!(parse_memory_events_oom_kill("oom 3\n"), None);
         assert_eq!(parse_memory_events_oom_kill(""), None);
+    }
+
+    /// `final_sample` refreshes `cpu_seconds_total` from cpu.stat and
+    /// max-merges `peak_io_pressure_pct` against `prev` — the
+    /// completion-time read that closes the reporter loop's ≤10s
+    /// staleness window. `peak_disk_bytes` falls through to `prev` here
+    /// (tmpdir has no prjquota).
+    #[test]
+    fn final_sample_refreshes_cpu_seconds_and_maxes_peaks() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("cpu.stat"),
+            "usage_usec 120000000\nuser_usec 0\nsystem_usec 0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("io.pressure"),
+            "some avg10=33.50 avg60=5.00 avg300=1.00 total=1\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        let prev = rio_proto::types::ResourceUsage {
+            cpu_seconds_total: Some(108.0),
+            peak_io_pressure_pct: Some(50.0),
+            peak_disk_bytes: Some(800 << 20),
+            cpu_fraction: 0.42,
+            ..Default::default()
+        };
+        let out = final_sample(root.path(), root.path(), prev);
+        assert_eq!(
+            out.cpu_seconds_total,
+            Some(120.0),
+            "cumulative cpu.stat read overrides stale prev (108 → 120)"
+        );
+        assert_eq!(
+            out.peak_io_pressure_pct,
+            Some(50.0),
+            "running-max keeps prev when fresh (33.5) < prev (50.0)"
+        );
+        assert_eq!(
+            out.peak_disk_bytes,
+            Some(800 << 20),
+            "no prjquota on tmpdir → prev preserved"
+        );
+        assert_eq!(out.cpu_fraction, 0.42, "heartbeat-only fields untouched");
+
+        // Unreadable root → all three fall through to prev.
+        let nowhere = Path::new("/nonexistent/cgroup");
+        let out2 = final_sample(nowhere, nowhere, prev);
+        assert_eq!(out2.cpu_seconds_total, Some(108.0));
+        assert_eq!(out2.peak_io_pressure_pct, Some(50.0));
+        assert_eq!(out2.peak_disk_bytes, Some(800 << 20));
     }
 }

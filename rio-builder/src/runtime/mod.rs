@@ -138,13 +138,25 @@ pub struct BuildSpawnContext {
 
 impl BuildSpawnContext {
     /// Per-worker fields stamped onto every [`CompletionReport`]
-    /// (success, error, and panic paths). Read once at completion
-    /// time so the snapshot reflects the build's final cgroup state.
+    /// (success, error, and panic paths).
+    ///
+    /// `final_resources`: the shared snapshot is the heartbeat's
+    /// 10s-cadence poll — ≤10s stale, and the reporter loop exits on
+    /// shutdown WITHOUT a final read. `cpu_seconds_total` (cumulative)
+    /// and `peak_disk_bytes` (running-max over CURRENT `dqb_curspace`)
+    /// would systematically under-report into `build_samples`, biasing
+    /// the SLA p̄ fit and disk_p90 low for short builds.
+    /// [`cgroup::final_sample`] forces one synchronous read on top.
     fn completion_stamp(&self) -> result::CompletionStamp {
+        let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
             node_name: self.node_name.clone(),
             hw_class: self.hw_class.clone(),
-            final_resources: Some(*self.resources.read().unwrap_or_else(|e| e.into_inner())),
+            final_resources: Some(crate::cgroup::final_sample(
+                &self.cgroup_parent,
+                &self.overlay_base_dir,
+                prev,
+            )),
         }
     }
 }

@@ -768,7 +768,7 @@ impl DerivationState {
     }
 
     /// Tenant IDs of all interested builds. Base iterator for
-    /// [`Self::attributed_tenant`] (first) and the path-tenant upsert
+    /// [`Self::attributed_tenant`] (min) and the path-tenant upsert
     /// (collect-all). `filter_map` drops `None` (single-tenant mode;
     /// empty SSH-key comment → gateway sends "" → scheduler stores
     /// `None`).
@@ -781,15 +781,24 @@ impl DerivationState {
             .filter_map(|id| builds.get(id)?.tenant_id)
     }
 
-    /// First interested build's tenant — the SLA model-key attribution
-    /// shared by `solve_intent_for` / `model_key_for` /
-    /// `write_build_sample` so the estimator's cache key matches the
+    /// Minimum-UUID tenant among interested builds — the SLA model-key
+    /// attribution shared by `solve_intent_for` / `model_key_for` /
+    /// `record_build_sample` so the estimator's cache key matches the
     /// rows that fed it.
+    ///
+    /// `.min()` not `.next()`: `interested_builds` is a `HashSet`
+    /// (RandomState iteration order). When a second tenant merges the
+    /// same drv mid-build, `.next()` would let solve key on tenant_A
+    /// and the completion sample land under tenant_B (or flip the
+    /// SpawnIntent shape between controller polls). `.min()` is stable
+    /// for a given set; cross-tenant dedup is rare enough that
+    /// "smallest UUID wins" is fine — per-tenant key is a grouping
+    /// dimension, not an accounting ledger.
     pub fn attributed_tenant(
         &self,
         builds: &std::collections::HashMap<Uuid, super::BuildInfo>,
     ) -> Option<Uuid> {
-        self.attributed_tenants(builds).next()
+        self.attributed_tenants(builds).min()
     }
 
     /// Attempt to transition to a new status. Returns the old status on success.
@@ -1359,6 +1368,48 @@ mod tests {
         // — recovery.rs filters expired rows before calling here so
         // a +inf elapsed would never reach this in practice.
         assert!(state.retry.poisoned_at.is_some());
+    }
+
+    /// `attributed_tenant()` is deterministic across `HashSet`
+    /// iteration order: same set → same tenant, regardless of
+    /// insertion order. Regression for the `.next()` form, which
+    /// returned hash-bucket order (RandomState) and let solve key on
+    /// tenant_A while the completion sample landed under tenant_B.
+    #[test]
+    fn attributed_tenant_deterministic_min() -> anyhow::Result<()> {
+        use super::super::{BuildInfo, BuildOptions, PriorityClass};
+        let t_hi = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff);
+        let t_lo = Uuid::from_u128(0x1);
+        let (b_hi, b_lo) = (Uuid::new_v4(), Uuid::new_v4());
+        let mk = |bid, tid| {
+            BuildInfo::new_pending(
+                bid,
+                Some(tid),
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions::default(),
+                HashSet::new(),
+            )
+        };
+        let builds: std::collections::HashMap<_, _> =
+            [(b_hi, mk(b_hi, t_hi)), (b_lo, mk(b_lo, t_lo))].into();
+
+        let mut s = DerivationState::try_from_node(&dummy_node())?;
+        // Insert hi-tenant build first, lo second.
+        s.interested_builds.insert(b_hi);
+        s.interested_builds.insert(b_lo);
+        assert_eq!(s.attributed_tenant(&builds), Some(t_lo), "min, not first");
+
+        // Reverse insertion order — same answer.
+        let mut s2 = DerivationState::try_from_node(&dummy_node())?;
+        s2.interested_builds.insert(b_lo);
+        s2.interested_builds.insert(b_hi);
+        assert_eq!(
+            s2.attributed_tenant(&builds),
+            Some(t_lo),
+            "insertion order irrelevant"
+        );
+        Ok(())
     }
 }
 

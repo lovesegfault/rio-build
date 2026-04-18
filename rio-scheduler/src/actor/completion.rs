@@ -1338,18 +1338,12 @@ impl DagActor {
                 // ("sub-second build, poller didn't fire"); the
                 // percentile computation doesn't drag.
                 {
-                    // Tenant: first interested build's tenant_id,
-                    // stringified. A derivation shared across tenants
-                    // (dedup at merge) is attributed to whichever build
-                    // landed first — close enough for the SLA fit
-                    // (per-tenant key is a grouping dimension, not an
-                    // accounting ledger). None → "" matches the column's
-                    // NOT NULL DEFAULT ''.
+                    // Same `attributed_tenant()` as `solve_intent_for`
+                    // — the sample row MUST land under the key the
+                    // estimator was queried with. None → "" matches the
+                    // column's NOT NULL DEFAULT ''.
                     let tenant = state
-                        .interested_builds
-                        .iter()
-                        .filter_map(|id| self.builds.get(id)?.tenant_id)
-                        .next()
+                        .attributed_tenant(&self.builds)
                         .map(|u| u.to_string())
                         .unwrap_or_default();
                     let row = crate::db::BuildSampleRow {
