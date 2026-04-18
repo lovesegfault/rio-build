@@ -1339,9 +1339,13 @@ impl DagActor {
                 // percentile computation doesn't drag.
                 {
                     // Same `attributed_tenant()` as `solve_intent_for`
-                    // — the sample row MUST land under the key the
-                    // estimator was queried with. None → "" matches the
-                    // column's NOT NULL DEFAULT ''.
+                    // so the sample lands under the key the estimator
+                    // was queried with — modulo the rare cancel/late-
+                    // merge mid-build that shifts the min (per-tenant
+                    // key is a grouping dimension, not a ledger; one
+                    // mislabeled row in a P-percentile fitter is
+                    // tolerated). None → "" matches the column's NOT
+                    // NULL DEFAULT ''.
                     let tenant = state
                         .attributed_tenant(&self.builds)
                         .map(|u| u.to_string())
