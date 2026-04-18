@@ -101,7 +101,9 @@ spec:
 
                   containerd deployments that don''t chown the pod cgroup to the
 
-                  userns-mapped root UID. CEL-forbidden for `kind=Fetcher`.'
+                  userns-mapped root UID. NOT CEL-gated for `kind=Fetcher` (k3s
+
+                  escape hatch); the reconciler default `false` is the safety net.'
                 nullable: true
                 type: boolean
               image:

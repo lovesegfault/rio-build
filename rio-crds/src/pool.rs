@@ -190,7 +190,8 @@ pub struct PoolSpec {
     /// Explicit `hostUsers` override. `None` defaults to `hostUsers:
     /// false` (userns isolation per ADR-012). Set `true` for k3s/
     /// containerd deployments that don't chown the pod cgroup to the
-    /// userns-mapped root UID. CEL-forbidden for `kind=Fetcher`.
+    /// userns-mapped root UID. NOT CEL-gated for `kind=Fetcher` (k3s
+    /// escape hatch); the reconciler default `false` is the safety net.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
 
