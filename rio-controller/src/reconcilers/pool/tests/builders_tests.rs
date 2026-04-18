@@ -688,6 +688,9 @@ fn job_pod_env_vars() {
         "unset in spec → not injected → worker default"
     );
     assert!(!envs.contains_key("RIO_FUSE_PASSTHROUGH"));
+    // RIO_DAEMON_TIMEOUT_SECS is NOT set here — it's intent-derived,
+    // injected by `apply_intent_resources` per Job, not by the base
+    // pod-spec builder.
     assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
 
     // RIO_EXECUTOR_ID uses fieldRef, not value — check separately.
@@ -722,7 +725,6 @@ fn job_pod_worker_knobs_injected_when_set() {
     let mut wp = test_wp();
     wp.spec.fuse_threads = Some(8);
     wp.spec.fuse_passthrough = Some(false);
-    wp.spec.daemon_timeout_secs = Some(14400);
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
     let envs = crate::fixtures::env_map(container.env.as_deref().unwrap());
@@ -733,7 +735,6 @@ fn job_pod_worker_knobs_injected_when_set() {
         Some(&"false"),
         "figment bool parse accepts true/false (rio-common config.rs test)"
     );
-    assert_eq!(envs.get("RIO_DAEMON_TIMEOUT_SECS"), Some(&"14400"));
 }
 
 #[test]

@@ -26,7 +26,6 @@ spec:
   imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
   fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher
   fusePassthrough: true                        # bool?, optional — Builder-only, CEL-forbidden for Fetcher
-  daemonTimeoutSecs: 7200                      # u64?, optional — Builder-only, CEL-forbidden for Fetcher
   terminationGracePeriodSeconds: 7200          # i64?, optional — K8s grace; defaults per-kind (r[ctrl.pod.tgps-default])
   privileged: false                            # bool?, optional — CEL-forbidden for Fetcher
   hostNetwork: false                           # bool?, optional — true requires privileged:true; CEL-forbidden for Fetcher

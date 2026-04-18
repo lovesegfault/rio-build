@@ -153,13 +153,6 @@ impl ExecutorKind {
         "kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not FUSE-bound"
     )
 )]
-#[x_kube(
-    validation = Rule::new(
-        "self.kind != 'Fetcher' || !has(self.daemonTimeoutSecs)"
-    ).message(
-        "kind=Fetcher forbids daemonTimeoutSecs — fetcher activeDeadlineSeconds is the bound; daemon timeout is builder-only"
-    )
-)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -224,20 +217,6 @@ pub struct PoolSpec {
     /// to BOTH kinds — NOT CEL-gated for Fetcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_cache_bytes: Option<u64>,
-
-    /// Timeout (seconds) for the local nix-daemon subprocess when
-    /// the client didn't specify `BuildOptions.build_timeout`.
-    /// Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
-    /// (7200 = 2h). Raise for pools running known-long builds
-    /// (LLVM, chromium, full NixOS closure from cold cache).
-    /// Builder-only.
-    // WONTFIX: kept as `Option<u64>` rather than `Option<Duration>` —
-    // schemars derives Duration as a `{secs,nanos}` object, breaking the
-    // CRD OpenAPI schema unless paired with both an Option-aware serde
-    // adapter and `#[schemars(with = "Option<u64>")]`. The only consumer
-    // string-formats this into the env var anyway.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daemon_timeout_secs: Option<u64>,
 
     /// requiredSystemFeatures this pool advertises (e.g., "kvm",
     /// "big-parallel"). Worker's Nix config `system-features`.
@@ -410,10 +389,6 @@ mod tests {
                 "self.kind != 'Fetcher' || !has(self.seccompProfile)",
                 "kind=Fetcher forbids seccompProfile",
             ),
-            (
-                "self.kind != 'Fetcher' || !has(self.daemonTimeoutSecs)",
-                "kind=Fetcher forbids daemonTimeoutSecs",
-            ),
         ] {
             assert!(json.contains(rule), "fetcher CEL rule missing: {rule}");
             assert!(json.contains(msg), "fetcher CEL rule has no message: {msg}");
@@ -441,7 +416,6 @@ mod tests {
         assert!(json.contains("fuseThreads"));
         assert!(json.contains("fusePassthrough"));
         assert!(json.contains("fuseCacheBytes"));
-        assert!(json.contains("daemonTimeoutSecs"));
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("readyReplicas"));
         assert!(json.contains("desiredReplicas"));

@@ -82,13 +82,14 @@ const WORKER_DEADLINE_SLACK_SECS: i64 = 90;
 /// deadline_secs` verbatim. The scheduler computes it per-derivation
 /// (D7: `wall_p99 × 5` for fitted, `[sla].probe.deadline_secs` for
 /// unfitted, clamped `[floor, 86400]`) and `SlaConfig::validate`
-/// guarantees `probe.deadline_secs >= 60`, so the intent value is
-/// always `>= 60`. No controller-side multiplier or per-kind
-/// fallback. `.max(60)` is defensive only — proto default is 0; a
-/// 0s deadline would fail the Job at creation.
+/// guarantees `probe.deadline_secs >= 180`, so the intent value is
+/// always `>= 180`. No controller-side multiplier or per-kind
+/// fallback. `.max(180)` is defensive only — proto default is 0; a
+/// 0s deadline would fail the Job at creation, and `< 180` would tie
+/// the worker's `daemon_timeout = deadline − 90` against this timer.
 // r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
-    i64::from(intent.deadline_secs).max(60)
+    i64::from(intent.deadline_secs).max(180)
 }
 
 // r[impl ctrl.pool.ephemeral]
@@ -520,19 +521,16 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         ..Default::default()
     });
 
-    // Re-couple the worker's `daemon_timeout` to the per-intent K8s
+    // Couple the worker's `daemon_timeout` to the per-intent K8s
     // `activeDeadlineSeconds`: worker fires `WORKER_DEADLINE_SLACK_SECS`
     // BEFORE K8s SIGKILLs, so `CompletionReport{TimedOut}` (primary
     // path) carries telemetry and reaches `handle_timeout_failure`'s
     // cap-check; `DeadlineExceeded` stays the wedged-worker backstop
-    // per `r[sched.termination.deadline-exceeded+2]`. Overrides any
-    // `pool.spec.daemon_timeout_secs` — that static value can't fit
-    // both `hello` and LLVM under ADR-023's unified Pool, and a
-    // decoupled 7200s default capped fitted >2h builds regardless of
-    // how high `solve_intent_for` set `deadline_secs`.
+    // per `r[sched.termination.deadline-exceeded+2]`.
+    // `ephemeral_deadline` floors at 180 so `− 90` never underflows
+    // the `.max(60)` clamp into a tie.
     let worker_timeout = (ephemeral_deadline(i) - WORKER_DEADLINE_SLACK_SECS).max(60);
     let env = container.env.get_or_insert_with(Vec::new);
-    env.retain(|e| e.name != "RIO_DAEMON_TIMEOUT_SECS");
     env.push(pod::env(
         "RIO_DAEMON_TIMEOUT_SECS",
         &worker_timeout.to_string(),
@@ -612,8 +610,8 @@ mod tests {
         // r[verify ctrl.ephemeral.intent-deadline]
         assert_eq!(
             spec.active_deadline_seconds,
-            Some(60),
-            "activeDeadlineSeconds backstop (proto-default 0 → 60s floor)"
+            Some(180),
+            "activeDeadlineSeconds backstop (proto-default 0 → 180s floor)"
         );
 
         let pod_anns = spec
@@ -674,7 +672,7 @@ mod tests {
 
     // r[verify ctrl.ephemeral.intent-deadline]
     /// D7: `SpawnIntent.deadline_secs` propagates verbatim;
-    /// proto-default 0 floors to 60.
+    /// proto-default 0 floors to 180.
     #[test]
     fn intent_deadline_propagates_to_job_spec() {
         let i = SpawnIntent {
@@ -683,20 +681,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ephemeral_deadline(&i), 240);
-        assert_eq!(ephemeral_deadline(&intent("abc")), 60, "0 → 60s floor");
+        assert_eq!(ephemeral_deadline(&intent("abc")), 180, "0 → 180s floor");
     }
 
     /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
     /// activeDeadlineSeconds − 90` so the worker times out before K8s
-    /// SIGKILLs. Overrides any `pool.spec.daemon_timeout_secs` (static
-    /// can't fit per-derivation deadlines). Regression: a fitted
-    /// `deadline_secs=15000` build with the decoupled 7200s default
-    /// looped `TimedOut` at 7200s while only the K8s side doubled.
+    /// SIGKILLs. Regression: a fitted `deadline_secs=15000` build with
+    /// the old decoupled 7200s static default looped `TimedOut` at
+    /// 7200s while only the K8s side doubled.
     #[test]
     fn build_job_daemon_timeout_couples_to_intent_deadline() {
-        let mut pool = test_pool("p", ExecutorKind::Builder);
-        pool.spec.daemon_timeout_secs = Some(14400); // overridden
-        for (deadline, want) in [(15000, "14910"), (240, "150"), (0, "60"), (120, "60")] {
+        let pool = test_pool("p", ExecutorKind::Builder);
+        for (deadline, want) in [(15000, "14910"), (240, "150"), (0, "90"), (120, "90")] {
             let i = SpawnIntent {
                 intent_id: "abc".into(),
                 deadline_secs: deadline,
@@ -722,15 +718,15 @@ mod tests {
                 envs.get("RIO_DAEMON_TIMEOUT_SECS"),
                 Some(&want),
                 "deadline_secs={deadline} → daemon_timeout={want} \
-                 (activeDeadlineSeconds − {WORKER_DEADLINE_SLACK_SECS}, floored at 60); \
-                 pool.spec.daemon_timeout_secs must be overridden"
+                 (activeDeadlineSeconds − {WORKER_DEADLINE_SLACK_SECS}; \
+                 ephemeral_deadline floored at 180)"
             );
             assert_eq!(
                 env.iter()
                     .filter(|e| e.name == "RIO_DAEMON_TIMEOUT_SECS")
                     .count(),
                 1,
-                "pool-static value retained-out, exactly one entry"
+                "exactly one entry"
             );
         }
     }

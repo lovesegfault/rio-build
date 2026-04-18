@@ -593,9 +593,6 @@ fn build_executor_container(
                         if p { "true" } else { "false" },
                     ));
                 }
-                if let Some(s) = pool.spec.daemon_timeout_secs {
-                    e.push(env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
-                }
             }
             // Coverage + RUST_LOG passthrough (test-only / operator
             // knob respectively).

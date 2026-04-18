@@ -180,18 +180,21 @@ impl SlaConfig {
         );
         // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
         // probe value; the controller takes it verbatim as
-        // `activeDeadlineSeconds` with no fallback. A sub-minute probe
-        // deadline kills the Job before the pod heartbeats (cold-start
-        // is ~10–30s) and there is no controller-side backstop.
+        // `activeDeadlineSeconds` and derives the worker's
+        // `daemon_timeout = deadline − 90s`. At the old 60s floor both
+        // timers tied (the worker `.max(60)` clamp masked the negative
+        // slack) so K8s SIGKILL raced `CompletionReport{TimedOut}`.
+        // 180s leaves the 90s slack + ~30s cold-start + a meaningful
+        // build window.
         anyhow::ensure!(
-            self.probe.deadline_secs >= 60,
-            "sla.probe.deadline_secs must be >= 60, got {}",
+            self.probe.deadline_secs >= 180,
+            "sla.probe.deadline_secs must be >= 180, got {}",
             self.probe.deadline_secs
         );
         for (feat, p) in &self.feature_probes {
             anyhow::ensure!(
-                p.deadline_secs >= 60,
-                "sla.feature_probes[{feat}].deadline_secs must be >= 60, got {}",
+                p.deadline_secs >= 180,
+                "sla.feature_probes[{feat}].deadline_secs must be >= 180, got {}",
                 p.deadline_secs
             );
         }
@@ -293,12 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_probe_deadline_under_60() {
+    fn rejects_probe_deadline_under_180() {
         let mut cfg = base();
-        cfg.probe.deadline_secs = 0;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("probe.deadline_secs must be >= 60"), "{err}");
         cfg.probe.deadline_secs = 60;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("probe.deadline_secs must be >= 180"), "{err}");
+        cfg.probe.deadline_secs = 180;
         cfg.validate().unwrap();
 
         cfg.feature_probes.insert(
@@ -307,7 +310,7 @@ mod tests {
                 cpu: 4.0,
                 mem_per_core: 0,
                 mem_base: 0,
-                deadline_secs: 30,
+                deadline_secs: 120,
             },
         );
         let err = cfg.validate().unwrap_err().to_string();
