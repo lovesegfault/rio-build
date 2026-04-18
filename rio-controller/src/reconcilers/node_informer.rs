@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
@@ -72,9 +73,12 @@ pub struct HwClass {
 struct NodeMeta {
     hw: HwClass,
     capacity_type: Option<String>,
-    /// Unix-epoch seconds from `metadata.creationTimestamp`. `None` for
-    /// nodes with no timestamp (shouldn't happen post-Create).
-    created_at: Option<f64>,
+    /// Epoch of the last exposure flush for this node (initialised to
+    /// `metadata.creationTimestamp` on first sight). [`NodeLabelCache::spot_exposure`]
+    /// and [`NodeLabelCache::drain_live_spot_exposure`] return the
+    /// delta `now - last_exposure_at`, so live nodes contribute to the
+    /// λ denominator every flush instead of only on Delete.
+    last_exposure_at: Option<f64>,
 }
 
 impl HwClass {
@@ -109,18 +113,56 @@ impl NodeLabelCache {
         self.0.read().get(node_name).map(|m| m.hw.as_string())
     }
 
-    /// `Some((hw_class, node_seconds))` for `node_name` IF it's a spot
-    /// node with a creation timestamp. Feeds the exposure half of λ\[h\]
-    /// — on-demand nodes contribute neither numerator nor denominator
-    /// (their λ is 0 by definition).
+    /// `Some((hw_class, node_seconds_since_last_flush))` for
+    /// `node_name` IF it's a spot node with a creation timestamp.
+    /// Feeds the exposure half of λ\[h\] — on-demand nodes contribute
+    /// neither numerator nor denominator (their λ is 0 by definition).
+    ///
+    /// Returns the slice since the last
+    /// [`Self::drain_live_spot_exposure`] (or since creation if never
+    /// drained) so the Delete arm reports only the final residual,
+    /// not the full lifetime — the periodic flush has already banked
+    /// the rest.
     pub fn spot_exposure(&self, node_name: &str, now_epoch: f64) -> Option<(String, f64)> {
         let g = self.0.read();
         let m = g.get(node_name)?;
         if m.capacity_type.as_deref() != Some("spot") {
             return None;
         }
-        let secs = (now_epoch - m.created_at?).max(0.0);
+        let secs = (now_epoch - m.last_exposure_at?).max(0.0);
         Some((m.hw.as_string(), secs))
+    }
+
+    /// For every live spot node, sum `now - last_exposure_at` per
+    /// `hw_class` and advance `last_exposure_at = now`. Called from
+    /// [`run`]'s periodic flush so the λ denominator includes
+    /// still-running (right-censored) nodes — without this, a single
+    /// early interrupt in a fresh N-node burst inflates λ ≈N× until
+    /// the survivors are eventually deleted.
+    ///
+    /// Controller restart re-seeds `last_exposure_at = created_at`
+    /// (in-process state), so the first post-restart flush re-reports
+    /// the pre-restart slice once. Accepted: restarts are rare and
+    /// the 24h EMA halflife dampens the duplicate; the alternative
+    /// (seed `= now`) would *under*-count on cold start, which is the
+    /// bias direction this fix exists to eliminate.
+    pub fn drain_live_spot_exposure(&self, now_epoch: f64) -> Vec<(String, f64)> {
+        let mut by_hw: HashMap<String, f64> = HashMap::new();
+        let mut g = self.0.write();
+        for m in g.values_mut() {
+            if m.capacity_type.as_deref() != Some("spot") {
+                continue;
+            }
+            let Some(last) = m.last_exposure_at else {
+                continue;
+            };
+            let secs = (now_epoch - last).max(0.0);
+            m.last_exposure_at = Some(now_epoch);
+            if secs > 0.0 {
+                *by_hw.entry(m.hw.as_string()).or_default() += secs;
+            }
+        }
+        by_hw.into_iter().collect()
     }
 
     /// Current cache size. For the `rio_controller_node_cache_size`
@@ -139,16 +181,24 @@ impl NodeLabelCache {
             return;
         };
         let labels = node.metadata.labels.as_ref();
-        let meta = NodeMeta {
-            hw: HwClass::from_node(node),
-            capacity_type: labels.and_then(|l| l.get(LABEL_CAPACITY_TYPE)).cloned(),
-            created_at: node
-                .metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.as_second() as f64),
-        };
-        self.0.write().insert(name, meta);
+        let created_at = node
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.as_second() as f64);
+        let mut g = self.0.write();
+        // Preserve last_exposure_at across re-apply (watch relist,
+        // label-change Modify) so the periodic flush doesn't re-count
+        // the already-banked slice. New entry → seed from created_at.
+        let last_exposure_at = g.get(&name).and_then(|m| m.last_exposure_at).or(created_at);
+        g.insert(
+            name,
+            NodeMeta {
+                hw: HwClass::from_node(node),
+                capacity_type: labels.and_then(|l| l.get(LABEL_CAPACITY_TYPE)).cloned(),
+                last_exposure_at,
+            },
+        );
     }
 
     fn delete(&self, node: &Node) -> Option<NodeMeta> {
@@ -183,6 +233,12 @@ pub async fn run(
         .default_backoff()
         .boxed();
 
+    // Live-exposure flush cadence. λ's denominator must include
+    // censored (still-running) observations; flushing every minute
+    // bounds the right-censoring bias to ≤60 node-seconds per node.
+    let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     info!("Node informer started");
 
     loop {
@@ -191,6 +247,12 @@ pub async fn run(
             _ = shutdown.cancelled() => {
                 debug!("Node informer: shutdown");
                 return;
+            }
+            _ = flush.tick() => {
+                for (hw, secs) in cache.drain_live_spot_exposure(now_epoch()) {
+                    report_exposure(&mut admin, hw, secs).await;
+                }
+                continue;
             }
             next = stream.next() => match next {
                 Some(Ok(ev)) => ev,
@@ -215,8 +277,10 @@ pub async fn run(
                 cache.apply(&node);
             }
             watcher::Event::Delete(node) => {
-                // ADR-023 phase-13: spot-node lifetime → λ denominator.
-                // Compute BEFORE delete (cache still has created_at).
+                // ADR-023 phase-13: final exposure slice → λ
+                // denominator. Compute BEFORE delete (cache still has
+                // last_exposure_at). Periodic flush above has already
+                // banked the bulk of this node's lifetime.
                 if let Some(name) = &node.metadata.name
                     && let Some((hw, secs)) = cache.spot_exposure(name, now_epoch())
                 {
@@ -228,6 +292,10 @@ pub async fn run(
         }
     }
 }
+
+/// Live spot-node exposure flush cadence (seconds). See
+/// [`NodeLabelCache::drain_live_spot_exposure`].
+const EXPOSURE_FLUSH_SECS: u64 = 60;
 
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
@@ -319,8 +387,11 @@ pub async fn run_pod_annotator(
 /// `AdminService.AppendInterruptSample`.
 ///
 /// The exposure half (`kind='exposure', value=node_seconds`) is
-/// emitted from [`run`]'s Node-DELETE arm — every spot-node teardown
-/// (interrupted or not) contributes its lifetime to the denominator.
+/// emitted from [`run`]: a periodic flush banks live node-seconds
+/// every `EXPOSURE_FLUSH_SECS`, and the Node-DELETE arm appends
+/// the final residual slice. Live nodes MUST contribute — counting
+/// only completed lifetimes is the right-censoring bias that spikes
+/// λ at burst onset.
 ///
 /// `field_selector` narrows the watch server-side so we don't churn
 /// on the cluster's full event firehose. Karpenter's interruption
@@ -378,9 +449,9 @@ pub async fn run_spot_interrupt_watcher(
     }
 }
 
-/// Append `kind='exposure'` for a deleted spot node. Best-effort: a
-/// failed RPC drops one denominator sample (λ reads slightly high
-/// until the next exposure lands).
+/// Append `kind='exposure'` node-seconds for one `hw_class`.
+/// Best-effort: a failed RPC drops one denominator sample (λ reads
+/// slightly high until the next flush lands).
 async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: String, secs: f64) {
     if let Err(e) = admin
         .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
@@ -495,6 +566,67 @@ mod tests {
         assert!(cache.spot_exposure("od-n", 1100.0).is_none());
         // Unknown node → None.
         assert!(cache.spot_exposure("missing", 1100.0).is_none());
+    }
+
+    fn spot_node(name: &str, gen_: &str, created: i64) -> Node {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+        let mut n = node(
+            name,
+            &[(LABEL_CAPACITY_TYPE, "spot"), (LABEL_GENERATION, gen_)],
+        );
+        n.metadata.creation_timestamp = Some(Time(Timestamp::from_second(created).unwrap()));
+        n
+    }
+
+    /// Right-censoring fix: live spot nodes contribute exposure on
+    /// every periodic drain, not only on Delete. Drain returns the
+    /// per-hw_class delta since last drain and advances the cursor;
+    /// Delete-arm `spot_exposure` then sees only the residual.
+    #[test]
+    fn drain_live_spot_exposure_banks_incremental_deltas() {
+        let cache = NodeLabelCache::default();
+        cache.apply(&spot_node("a", "7", 1000));
+        cache.apply(&spot_node("b", "7", 1000));
+        cache.apply(&spot_node("c", "6", 1020));
+        // On-demand node: must NOT appear in drain output.
+        let mut od = node("od", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
+        od.metadata.creation_timestamp = spot_node("x", "7", 1000).metadata.creation_timestamp;
+        cache.apply(&od);
+
+        // First drain at t=1060: a+b → 2×60=120s for gen-7, c → 40s.
+        let mut d = cache.drain_live_spot_exposure(1060.0);
+        d.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            d,
+            vec![
+                ("unknown-6-ebs".into(), 40.0),
+                ("unknown-7-ebs".into(), 120.0),
+            ]
+        );
+
+        // Second drain at t=1120: deltas only (60s each), not
+        // cumulative-from-created.
+        let mut d = cache.drain_live_spot_exposure(1120.0);
+        d.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            d,
+            vec![
+                ("unknown-6-ebs".into(), 60.0),
+                ("unknown-7-ebs".into(), 120.0),
+            ]
+        );
+
+        // Re-apply (watch relist / label Modify) MUST preserve
+        // last_exposure_at — no double-count of the banked slice.
+        cache.apply(&spot_node("a", "7", 1000));
+        let (_, secs) = cache.spot_exposure("a", 1150.0).unwrap();
+        assert!((secs - 30.0).abs() < 1e-6, "residual since last drain");
+
+        // Delete-arm sees only the residual since last drain, not
+        // full lifetime (periodic flush already banked 1000..1120).
+        let (_, secs) = cache.spot_exposure("c", 1150.0).unwrap();
+        assert!((secs - 30.0).abs() < 1e-6);
     }
 
     fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {
