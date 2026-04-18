@@ -823,6 +823,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
             max_infra_retries: 2,
+            max_timeout_retries: 2,
             ..Default::default()
         };
     });
@@ -907,6 +908,31 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     assert_eq!(
         s.retry.infra_count, 0,
         "DeadlineExceeded uses timeout_count, NOT infra_count (I-213 separate budget)"
+    );
+    assert_eq!(
+        s.status,
+        DerivationStatus::Ready,
+        "1 < max_timeout_retries=2 → re-queued, not yet terminal"
+    );
+
+    // Second at-cap report → timeout_count=2 == max → poison HERE.
+    // Backstop fires when the worker is too wedged to send
+    // CompletionReport{TimedOut}, so handle_timeout_failure's cap-
+    // check never runs; without owning poison this loops at 24h
+    // forever (is_poisoned() never reads timeout_count).
+    let mut rx = connect_builder(&handle, "rio-b-dl-abc-aaaaa", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    disconnect(&handle, "rio-b-dl-abc-aaaaa").await?;
+    drop(rx);
+    let promoted = report_termination(&handle, "rio-b-dl-abc", R::DeadlineExceeded).await?;
+    assert!(!promoted);
+    let s = expect_drv(&handle, "cap-dl").await;
+    assert_eq!(s.retry.timeout_count, 2);
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "DeadlineExceeded backstop: timeout_count exhausted at cap → poison \
+         (m044 cap-check; was warn-only → 24h loop forever)"
     );
     Ok(())
 }

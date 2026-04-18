@@ -72,6 +72,11 @@ const LOG_BUDGET_BYTES: u64 = 1 << 30;
 /// TODO(ADR-023 phase-2): replace with `headroom(n_eff)` from the SLA
 /// estimator (variance-aware). 1.5× is the phase-1 flat fallback.
 const OVERLAY_HEADROOM: f64 = 1.5;
+/// Margin between the worker's `daemon_timeout` and K8s
+/// `activeDeadlineSeconds`, so the worker's `tokio::time::timeout`
+/// fires first and emits `CompletionReport{TimedOut}` (telemetry +
+/// `handle_timeout_failure` cap-check) before K8s SIGKILLs.
+const WORKER_DEADLINE_SLACK_SECS: i64 = 90;
 
 /// `activeDeadlineSeconds` for an ephemeral Job: `intent.
 /// deadline_secs` verbatim. The scheduler computes it per-derivation
@@ -515,6 +520,24 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         ..Default::default()
     });
 
+    // Re-couple the worker's `daemon_timeout` to the per-intent K8s
+    // `activeDeadlineSeconds`: worker fires `WORKER_DEADLINE_SLACK_SECS`
+    // BEFORE K8s SIGKILLs, so `CompletionReport{TimedOut}` (primary
+    // path) carries telemetry and reaches `handle_timeout_failure`'s
+    // cap-check; `DeadlineExceeded` stays the wedged-worker backstop
+    // per `r[sched.termination.deadline-exceeded+2]`. Overrides any
+    // `pool.spec.daemon_timeout_secs` — that static value can't fit
+    // both `hello` and LLVM under ADR-023's unified Pool, and a
+    // decoupled 7200s default capped fitted >2h builds regardless of
+    // how high `solve_intent_for` set `deadline_secs`.
+    let worker_timeout = (ephemeral_deadline(i) - WORKER_DEADLINE_SLACK_SECS).max(60);
+    let env = container.env.get_or_insert_with(Vec::new);
+    env.retain(|e| e.name != "RIO_DAEMON_TIMEOUT_SECS");
+    env.push(pod::env(
+        "RIO_DAEMON_TIMEOUT_SECS",
+        &worker_timeout.to_string(),
+    ));
+
     // ADR-023 phase-13: per-(band, cap) targeting. Merge into the
     // existing nodeSelector; intent keys win on collision.
     if !i.node_selector.is_empty() {
@@ -661,6 +684,55 @@ mod tests {
         };
         assert_eq!(ephemeral_deadline(&i), 240);
         assert_eq!(ephemeral_deadline(&intent("abc")), 60, "0 → 60s floor");
+    }
+
+    /// `apply_intent_resources` injects `RIO_DAEMON_TIMEOUT_SECS =
+    /// activeDeadlineSeconds − 90` so the worker times out before K8s
+    /// SIGKILLs. Overrides any `pool.spec.daemon_timeout_secs` (static
+    /// can't fit per-derivation deadlines). Regression: a fitted
+    /// `deadline_secs=15000` build with the decoupled 7200s default
+    /// looped `TimedOut` at 7200s while only the K8s side doubled.
+    #[test]
+    fn build_job_daemon_timeout_couples_to_intent_deadline() {
+        let mut pool = test_pool("p", ExecutorKind::Builder);
+        pool.spec.daemon_timeout_secs = Some(14400); // overridden
+        for (deadline, want) in [(15000, "14910"), (240, "150"), (0, "60"), (120, "60")] {
+            let i = SpawnIntent {
+                intent_id: "abc".into(),
+                deadline_secs: deadline,
+                ..Default::default()
+            };
+            let job = build_job(
+                &pool,
+                crate::fixtures::oref(&pool),
+                &test_sched_addrs(),
+                &test_store_addrs(),
+                &i,
+            )
+            .unwrap();
+            let env = job
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .map(|p| &p.containers[0])
+                .and_then(|c| c.env.as_deref())
+                .unwrap();
+            let envs = crate::fixtures::env_map(env);
+            assert_eq!(
+                envs.get("RIO_DAEMON_TIMEOUT_SECS"),
+                Some(&want),
+                "deadline_secs={deadline} → daemon_timeout={want} \
+                 (activeDeadlineSeconds − {WORKER_DEADLINE_SLACK_SECS}, floored at 60); \
+                 pool.spec.daemon_timeout_secs must be overridden"
+            );
+            assert_eq!(
+                env.iter()
+                    .filter(|e| e.name == "RIO_DAEMON_TIMEOUT_SECS")
+                    .count(),
+                1,
+                "pool-static value retained-out, exactly one entry"
+            );
+        }
     }
 
     /// `selector_fingerprint` is deterministic over key order. Empty

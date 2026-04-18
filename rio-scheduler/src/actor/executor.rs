@@ -497,9 +497,16 @@ impl DagActor {
     /// remove() = first-report-wins dedup, same as the exact-match
     /// path. Unlike `handle_timeout_failure`, this does NOT
     /// `reset_to_ready` — `handle_executor_disconnected` already re-
-    /// queued, and the drv may already be re-dispatched. The cap is
-    /// observed but not enforced terminally here; the worker-side
-    /// `TimedOut` (primary path) owns terminal `Cancelled`.
+    /// queued, and the drv may already be re-dispatched.
+    ///
+    /// At the 24h cap (`counted=true`), `timeout_count >=
+    /// max_timeout_retries` poisons HERE — the backstop fires
+    /// precisely when the worker is too wedged (FUSE/kernel hang) to
+    /// send `CompletionReport{TimedOut}`, so `handle_timeout_failure`'s
+    /// cap-check never runs and a deterministically-wedging drv would
+    /// otherwise re-queue at 24h forever (`is_poisoned()` reads
+    /// `failure_count`/`failed_builders`, never `timeout_count`).
+    /// Mirrors the m044 OOM/DiskPressure cap-check above.
     async fn handle_deadline_exceeded(&mut self, job_name: &ExecutorId) -> bool {
         use rio_proto::types::TerminationReason as R;
         let prefix = format!("{job_name}-");
@@ -520,30 +527,39 @@ impl DagActor {
             .remove(&pod_name)
             .expect("key found above");
 
-        let promoted = self
+        let outcome = self
             .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
-            .await
-            .promoted;
+            .await;
 
         let max = self.retry_policy.max_timeout_retries;
-        if let Some(state) = self.dag.node(&drv_hash) {
-            if state.retry.timeout_count > max {
-                warn!(
-                    drv_hash = %drv_hash, job_name = %job_name,
-                    timeout_retry_count = state.retry.timeout_count, max,
-                    "DeadlineExceeded: max_timeout_retries exhausted; \
-                     worker-side TimedOut owns terminal-Cancel"
-                );
-            } else {
-                info!(
-                    drv_hash = %drv_hash, job_name = %job_name,
-                    pod_name = %pod_name, promoted,
-                    timeout_retry_count = state.retry.timeout_count, max,
-                    "DeadlineExceeded backstop fired"
-                );
-            }
+        if outcome.counted
+            && let Some(state) = self.dag.node(&drv_hash)
+            && state.retry.timeout_count >= max
+            && matches!(
+                state.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            )
+        {
+            warn!(
+                drv_hash = %drv_hash, job_name = %job_name,
+                timeout_retry_count = state.retry.timeout_count, max,
+                resource_floor = ?state.sched.resource_floor,
+                "DeadlineExceeded backstop: max_timeout_retries exhausted \
+                 at cap, poisoning"
+            );
+            self.poison_and_cascade(&drv_hash).await;
+            return false;
         }
-        promoted
+
+        if let Some(state) = self.dag.node(&drv_hash) {
+            info!(
+                drv_hash = %drv_hash, job_name = %job_name,
+                pod_name = %pod_name, promoted = outcome.promoted,
+                timeout_retry_count = state.retry.timeout_count, max,
+                "DeadlineExceeded backstop fired"
+            );
+        }
+        outcome.promoted
     }
 
     /// Sweep `recently_disconnected` entries older than
