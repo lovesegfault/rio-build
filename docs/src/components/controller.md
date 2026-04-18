@@ -15,7 +15,6 @@ metadata:
 spec:
   kind: Builder                                # Builder | Fetcher, required
   maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped (Karpenter NodePool limits.cpu is the only gate)
-  deadlineSeconds: 3600                        # u32?, optional — Job activeDeadlineSeconds; default 3600 (Builder), 300 (Fetcher)
   image: rio-builder:dev                       # string, required — container image ref
   systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
   hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); CEL-forbidden for Fetcher
@@ -129,29 +128,22 @@ unreachable) --- fail-closed, same posture as
 Jobs finish their one build naturally; ownerRef GC removes them after
 the pool is gone.
 
-r[ctrl.pool.ephemeral-deadline]
-Jobs MUST set `spec.activeDeadlineSeconds` from
-`PoolSpec.deadlineSeconds` (default 3600). This is a backstop:
-the spawn decision reads the **cluster-wide**
-`ClusterStatus.queued_derivations`, not pool-matching depth. A queue
-full of `x86_64-linux` work on an `aarch64-darwin` pool triggers a Job
-spawn; the spawned executor heartbeats in, never matches dispatch (wrong
-`system`), and would hang indefinitely without a deadline. K8s kills
-the pod at deadline, `backoffLimit: 0` marks the Job Failed,
-`ttlSecondsAfterFinished` reaps.
-
 r[ctrl.ephemeral.intent-deadline]
-When a `SpawnIntent` carries `deadline_secs > 0`, the Job's
-`activeDeadlineSeconds` is set to that value verbatim. Precedence:
-`intent.deadline_secs` > `spec.deadlineSeconds` > 3600 default. The
+Jobs MUST set `spec.activeDeadlineSeconds` to `SpawnIntent.deadline_secs`
+verbatim (floored at 60 as defense against the proto default). The
 scheduler computes `deadline_secs` per-derivation (D7): for fitted
 keys, `wall_p99 * 5` at the solved core count; for unfitted
 (probe/explore), `[sla].probe.deadline_secs`; both clamped
-`[resource_floor.deadline_secs, 86400]`. A `DeadlineExceeded` kill
-triggers `r[ctrl.terminated.deadline-exceeded]` -> `bump_floor_or_count`
-doubles `floor.deadline_secs` -> the next intent gets a longer
-`activeDeadlineSeconds`. The 5x headroom is scheduler-side; the
-controller adds no multiplier or margin.
+`[resource_floor.deadline_secs, 86400]`. `SlaConfig::validate`
+enforces `probe.deadline_secs >= 60`, so the intent value is always
+positive --- the controller has no per-kind fallback. A
+`DeadlineExceeded` kill triggers `r[ctrl.terminated.deadline-exceeded]`
+-> `bump_floor_or_count` doubles `floor.deadline_secs` -> the next
+intent gets a longer `activeDeadlineSeconds`. The 5x headroom is
+scheduler-side; the controller adds no multiplier or margin. Backstop
+purpose: a wrong-pool spawn (executor heartbeats in, never matches
+dispatch) would hang indefinitely without it; K8s kills at deadline,
+`backoffLimit: 0` marks Failed, `ttlSecondsAfterFinished` reaps.
 
 r[ctrl.terminated.deadline-exceeded]
 The Job-mode reconciler MUST report each Job with `status.conditions`

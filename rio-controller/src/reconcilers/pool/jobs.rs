@@ -73,37 +73,17 @@ const LOG_BUDGET_BYTES: u64 = 1 << 30;
 /// estimator (variance-aware). 1.5× is the phase-1 flat fallback.
 const OVERLAY_HEADROOM: f64 = 1.5;
 
-/// Fallback `activeDeadlineSeconds` when neither the SpawnIntent nor
-/// `spec.deadline_seconds` carries a deadline. Builder: 3600 (1h) —
-/// long enough that a matched dispatch + build completes; short
-/// enough that a wrong-pool spawn doesn't leak. Fetcher: 300 (5min)
-/// — fetches are network-bound and short; a stuck download is the
-/// failure mode, not a 90min compile.
-const DEFAULT_BUILDER_DEADLINE_SECS: i64 = 3600;
-const DEFAULT_FETCHER_DEADLINE_SECS: i64 = 300;
-
-/// `activeDeadlineSeconds` for an ephemeral Job. Precedence:
-///   1. `intent.deadline_secs` — scheduler-computed per-derivation
-///      bound (D7: `wall_p99 × 5` for fitted, `[sla].probe.
-///      deadline_secs` for unfitted, clamped `[floor, 86400]`). The
-///      scheduler owns the 5× headroom; no controller-side multiplier.
-///   2. `spec.deadline_seconds` — explicit operator override, verbatim.
-///   3. Per-kind default.
-///
-/// `intent.deadline_secs == 0` (proto default) is treated as unset
-/// and falls through.
+/// `activeDeadlineSeconds` for an ephemeral Job: `intent.
+/// deadline_secs` verbatim. The scheduler computes it per-derivation
+/// (D7: `wall_p99 × 5` for fitted, `[sla].probe.deadline_secs` for
+/// unfitted, clamped `[floor, 86400]`) and `SlaConfig::validate`
+/// guarantees `probe.deadline_secs >= 60`, so the intent value is
+/// always `>= 60`. No controller-side multiplier or per-kind
+/// fallback. `.max(60)` is defensive only — proto default is 0; a
+/// 0s deadline would fail the Job at creation.
 // r[impl ctrl.ephemeral.intent-deadline]
-pub(super) fn ephemeral_deadline(spec: &rio_crds::pool::PoolSpec, intent: &SpawnIntent) -> i64 {
-    if intent.deadline_secs > 0 {
-        return i64::from(intent.deadline_secs);
-    }
-    if let Some(explicit) = spec.deadline_seconds {
-        return i64::from(explicit);
-    }
-    match spec.kind {
-        ExecutorKind::Builder => DEFAULT_BUILDER_DEADLINE_SECS,
-        ExecutorKind::Fetcher => DEFAULT_FETCHER_DEADLINE_SECS,
-    }
+pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
+    i64::from(intent.deadline_secs).max(60)
 }
 
 // r[impl ctrl.pool.ephemeral]
@@ -454,7 +434,6 @@ pub(super) async fn reap_stale_for_intents(
 ///   - `activeDeadlineSeconds` — backstop for hung builds + wrong-
 ///     pool spawns.
 // r[impl ctrl.pool.ephemeral]
-// r[impl ctrl.pool.ephemeral-deadline]
 // r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn build_job(
     pool: &Pool,
@@ -476,7 +455,7 @@ pub(super) fn build_job(
         pool.namespace(),
         oref,
         pod::executor_labels(pool),
-        ephemeral_deadline(&pool.spec, intent),
+        ephemeral_deadline(intent),
         pod_spec,
     );
     // Stamp `rio.build/intent-id` on the pod template so the builder
@@ -607,11 +586,11 @@ mod tests {
             Some(JOB_TTL_SECS),
             "completed Jobs must auto-reap"
         );
-        // r[verify ctrl.pool.ephemeral-deadline]
+        // r[verify ctrl.ephemeral.intent-deadline]
         assert_eq!(
             spec.active_deadline_seconds,
-            Some(DEFAULT_BUILDER_DEADLINE_SECS),
-            "activeDeadlineSeconds backstop missing"
+            Some(60),
+            "activeDeadlineSeconds backstop (proto-default 0 → 60s floor)"
         );
 
         let pod_anns = spec
@@ -670,58 +649,18 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.pool.ephemeral-deadline]
-    /// `spec.deadline_seconds` propagates verbatim when no intent
-    /// carries a deadline.
-    #[test]
-    fn ephemeral_deadline_some_propagates_to_job_spec() {
-        let mut pool = test_pool("eph-pool", ExecutorKind::Builder);
-        pool.spec.deadline_seconds = Some(7200);
-        let oref = crate::fixtures::oref(&pool);
-        let job = build_job(
-            &pool,
-            oref,
-            &test_sched_addrs(),
-            &test_store_addrs(),
-            &intent("abc"),
-        )
-        .unwrap();
-        assert_eq!(
-            job.spec.as_ref().unwrap().active_deadline_seconds,
-            Some(7200)
-        );
-    }
-
     // r[verify ctrl.ephemeral.intent-deadline]
-    /// D7: `SpawnIntent.deadline_secs` wins over BOTH the spec
-    /// override and the default. `deadline_secs == 0` is unset.
+    /// D7: `SpawnIntent.deadline_secs` propagates verbatim;
+    /// proto-default 0 floors to 60.
     #[test]
     fn intent_deadline_propagates_to_job_spec() {
-        let mut pool = test_pool("eph-pool", ExecutorKind::Builder);
-        pool.spec.deadline_seconds = Some(7200);
         let i = SpawnIntent {
             intent_id: "abc123def456".into(),
             deadline_secs: 240,
             ..Default::default()
         };
-        assert_eq!(ephemeral_deadline(&pool.spec, &i), 240);
-
-        let zero = intent("abc");
-        assert_eq!(ephemeral_deadline(&pool.spec, &zero), 7200);
-
-        pool.spec.deadline_seconds = None;
-        assert_eq!(
-            ephemeral_deadline(&pool.spec, &zero),
-            DEFAULT_BUILDER_DEADLINE_SECS
-        );
-
-        // Per-kind default.
-        let fetcher = test_pool("f", ExecutorKind::Fetcher);
-        assert_eq!(
-            ephemeral_deadline(&fetcher.spec, &zero),
-            DEFAULT_FETCHER_DEADLINE_SECS,
-            "default 5min, not Builder's 1h — stuck download is the failure mode"
-        );
+        assert_eq!(ephemeral_deadline(&i), 240);
+        assert_eq!(ephemeral_deadline(&intent("abc")), 60, "0 → 60s floor");
     }
 
     /// `selector_fingerprint` is deterministic over key order. Empty

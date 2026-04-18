@@ -623,7 +623,7 @@ in
     name = "autoscale";
     subtests = [
       # r[verify ctrl.pool.ephemeral]
-      # r[verify ctrl.pool.ephemeral-deadline]
+      # r[verify ctrl.ephemeral.intent-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
       # heartbeat + build + exit). Subtest deletes the default x86-64

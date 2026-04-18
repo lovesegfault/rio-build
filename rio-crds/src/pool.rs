@@ -183,12 +183,6 @@ pub struct PoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
 
-    /// Backstop `activeDeadlineSeconds` on Jobs. `None` = per-kind
-    /// default (3600 for builders, 300 for fetchers).
-    // r[impl ctrl.pool.ephemeral-deadline]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_seconds: Option<u32>,
-
     /// Node selector for the Job pod spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
@@ -448,7 +442,6 @@ mod tests {
         assert!(json.contains("fusePassthrough"));
         assert!(json.contains("fuseCacheBytes"));
         assert!(json.contains("daemonTimeoutSecs"));
-        assert!(json.contains("deadlineSeconds"));
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("readyReplicas"));
         assert!(json.contains("desiredReplicas"));

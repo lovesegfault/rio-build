@@ -1477,6 +1477,52 @@ async fn pending_intent_timeout_marks_ice() {
     assert!(actor.pending_intents.is_empty(), "heartbeat clears entry");
 }
 
+/// `handle_ack_spawned_intents` is idempotent: a re-ack of an
+/// already-armed intent (the controller acks the FULL still-Pending
+/// set every tick) MUST NOT reset `armed_at` — `or_insert`, not
+/// `insert`. Otherwise a pod stuck Pending forever never crosses
+/// `hw_fallback_after_secs` because each tick re-arms it at `now`.
+/// After the ICE-sweep removes a timed-out entry, a subsequent ack
+/// is a fresh insert at the new time.
+#[tokio::test]
+async fn ack_spawned_intents_reack_preserves_armed_at() {
+    use crate::sla::cost::{self, Band, Cap};
+    use std::time::{Duration, Instant};
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
+
+    let sel = cost::selector_for(Band::Mid, Cap::Spot);
+    let intent = rio_proto::types::SpawnIntent {
+        intent_id: "x".into(),
+        node_selector: sel.into_iter().collect(),
+        ..Default::default()
+    };
+
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
+    let t1 = actor.pending_intents.get("x").unwrap().2;
+
+    // Re-ack after measurable elapsed time. `Instant::now()` inside
+    // `handle_ack_spawned_intents` would yield > t1 if it overwrote.
+    std::thread::sleep(Duration::from_millis(5));
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
+    let t1_again = actor.pending_intents.get("x").unwrap().2;
+    assert_eq!(
+        t1, t1_again,
+        "re-ack preserves armed_at (or_insert, not insert)"
+    );
+    assert!(Instant::now() > t1, "sleep was observable");
+
+    // Simulate ICE-sweep removing the timed-out entry.
+    actor.pending_intents.remove("x");
+    std::thread::sleep(Duration::from_millis(5));
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
+    let t3 = actor.pending_intents.get("x").unwrap().2;
+    assert!(
+        t3 > t1,
+        "post-removal ack arms fresh: t3={t3:?} > t1={t1:?}"
+    );
+}
+
 /// `solve_full` wired into the actor: with `hw_cost_source` set, a
 /// populated hw-factor table, and a fitted key, `SpawnIntent.
 /// node_selector` carries `rio.build/hw-band` + `karpenter.sh/

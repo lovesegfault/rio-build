@@ -178,6 +178,23 @@ impl SlaConfig {
             "sla.halflife_secs must be finite and positive, got {}",
             self.halflife_secs
         );
+        // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
+        // probe value; the controller takes it verbatim as
+        // `activeDeadlineSeconds` with no fallback. A sub-minute probe
+        // deadline kills the Job before the pod heartbeats (cold-start
+        // is ~10–30s) and there is no controller-side backstop.
+        anyhow::ensure!(
+            self.probe.deadline_secs >= 60,
+            "sla.probe.deadline_secs must be >= 60, got {}",
+            self.probe.deadline_secs
+        );
+        for (feat, p) in &self.feature_probes {
+            anyhow::ensure!(
+                p.deadline_secs >= 60,
+                "sla.feature_probes[{feat}].deadline_secs must be >= 60, got {}",
+                p.deadline_secs
+            );
+        }
         Ok(())
     }
 
@@ -273,6 +290,28 @@ mod tests {
         cfg.validate().unwrap();
         cfg.probe.cpu = 64.0; // = max_cores
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_probe_deadline_under_60() {
+        let mut cfg = base();
+        cfg.probe.deadline_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("probe.deadline_secs must be >= 60"), "{err}");
+        cfg.probe.deadline_secs = 60;
+        cfg.validate().unwrap();
+
+        cfg.feature_probes.insert(
+            "kvm".into(),
+            ProbeShape {
+                cpu: 4.0,
+                mem_per_core: 0,
+                mem_base: 0,
+                deadline_secs: 30,
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("feature_probes[kvm]"), "{err}");
     }
 
     #[test]

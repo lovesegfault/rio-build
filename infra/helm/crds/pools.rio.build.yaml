@@ -61,14 +61,6 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
-              deadlineSeconds:
-                description: 'Backstop `activeDeadlineSeconds` on Jobs. `None` = per-kind
-
-                  default (3600 for builders, 300 for fetchers).'
-                format: uint32
-                minimum: 0.0
-                nullable: true
-                type: integer
               features:
                 default: []
                 description: "requiredSystemFeatures this pool advertises (e.g., \"\

@@ -26,9 +26,6 @@ spec:
   {{- with $p.maxConcurrent }}
   maxConcurrent: {{ . }}
   {{- end }}
-  {{- with $p.deadlineSeconds }}
-  deadlineSeconds: {{ . }}
-  {{- end }}
   {{- with $p.fuseCacheBytes }}
   fuseCacheBytes: {{ int64 . }}
   {{- end }}

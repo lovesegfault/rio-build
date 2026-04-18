@@ -27,7 +27,6 @@ pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
         image: "rio-builder:test".into(),
         systems: vec!["x86_64-linux".into()],
         max_concurrent: Some(10),
-        deadline_seconds: None,
         node_selector: None,
         tolerations: None,
         host_users: None,
