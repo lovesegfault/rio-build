@@ -1,7 +1,7 @@
 //! ComponentScaler reconciler: predictive store autoscaling with a
 //! learned `builders_per_replica` ratio.
 //!
-//! Reconcile (10s tick): poll scheduler `GetSpawnIntents` →
+//! Reconcile (10s tick): poll scheduler `ClusterStatus` →
 //! `Σ(queued+running)` builders; poll each `loadEndpoint` pod's
 //! `StoreAdminService.GetLoad` → max `pg_pool_utilization`; feed
 //! both into `decide::decide`; patch the target
@@ -72,21 +72,18 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // ── Predictive: total builders (queued + running) ────────────
     let builders = match spec.signal {
         Signal::SchedulerBuilders => {
-            let resp = ctx.spawn_intents().await.map_err(|e| {
-                Error::InvalidSpec(format!(
-                    "GetSpawnIntents failed: {e}; check schedulerAddr / scheduler readiness"
-                ))
-            })?;
-            // `queued_by_system` is Ready-only; add running so a
-            // builder mid-compile still weighs as a store-load source
-            // (FUSE reads, output PutPath).
+            // ClusterStatus, NOT GetSpawnIntents: Σqueued_by_system ==
+            // queued_derivations (snapshot.rs counts both from the same
+            // Ready set). GetSpawnIntents would make the scheduler run
+            // solve_intent_for per Ready drv and serialize the full
+            // intent vec — wasted work for a u32 ClusterStatus already
+            // carries.
             let cs = ctx.admin.clone().cluster_status(()).await.map_err(|e| {
                 Error::InvalidSpec(format!(
                     "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
                 ))
             })?;
-            decide::total_builders(&resp)
-                .saturating_add(u64::from(cs.into_inner().running_derivations))
+            decide::total_builders(&cs.into_inner())
         }
     };
 

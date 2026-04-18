@@ -199,7 +199,6 @@ async fn main() -> anyhow::Result<()> {
         store: cfg.store.clone(),
         recorder: recorder.clone(),
         error_counts: Default::default(),
-        spawn_intents_cache: Default::default(),
         scaler: Default::default(),
     });
 

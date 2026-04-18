@@ -87,18 +87,6 @@ pub struct Ctx {
     /// a single HashMap op, and parking_lot has no poison so a
     /// panic in one reconciler can't wedge another's error_policy.
     pub error_counts: Mutex<HashMap<String, u32>>,
-    /// TTL-cached unfiltered `GetSpawnIntents` response. The
-    /// pool reconciler and the ComponentScaler reconciler
-    /// both poll this on ~10s ticks; without the cache they'd
-    /// double-poll the scheduler. 5s TTL: short enough that a
-    /// reconciler never acts on data more than half a tick stale,
-    /// long enough that two reconcilers ticking within the same
-    /// second share one RPC.
-    ///
-    /// `tokio::sync::Mutex` (not `std`) because the critical
-    /// section spans an await (the gRPC call).
-    pub spawn_intents_cache:
-        tokio::sync::Mutex<Option<(Instant, rio_proto::types::GetSpawnIntentsResponse)>>,
     /// In-process state owned by the ComponentScaler reconciler.
     pub scaler: ScalerState,
 }
@@ -146,42 +134,6 @@ impl Ctx {
         let n = counts.entry(key.to_string()).or_insert(0);
         *n = n.saturating_add(1);
         transient_backoff(*n)
-    }
-
-    /// Unfiltered `GetSpawnIntents` with a 5s TTL cache. See the
-    /// `spawn_intents_cache` field doc for rationale.
-    ///
-    /// The lock is held across the gRPC call so two concurrent
-    /// callers don't both miss-then-fetch (the second waits for the
-    /// first's fetch then reads the fresh cache). Starvation isn't a
-    /// concern: ≤2 reconcilers, ~10s tick. The gRPC has a 5s timeout
-    /// so a wedged scheduler can't park BOTH reconcilers on the lock
-    /// indefinitely; on timeout we fail-open with the stale cached
-    /// value (reconcilers tolerate half-a-tick staleness already).
-    pub async fn spawn_intents(
-        &self,
-    ) -> std::result::Result<rio_proto::types::GetSpawnIntentsResponse, tonic::Status> {
-        const TTL: Duration = Duration::from_secs(5);
-        let mut cache = self.spawn_intents_cache.lock().await;
-        if let Some((at, resp)) = cache.as_ref()
-            && at.elapsed() < TTL
-        {
-            return Ok(resp.clone());
-        }
-        let mut admin = self.admin.clone();
-        let fut = admin.get_spawn_intents(rio_proto::types::GetSpawnIntentsRequest::default());
-        let resp = match tokio::time::timeout(TTL, fut).await {
-            Ok(r) => r?.into_inner(),
-            Err(_) => {
-                tracing::warn!("get_spawn_intents timed out; using stale cache");
-                return cache
-                    .as_ref()
-                    .map(|(_, r)| r.clone())
-                    .ok_or_else(|| tonic::Status::unavailable("scheduler timed out (no cache)"));
-            }
-        };
-        *cache = Some((Instant::now(), resp.clone()));
-        Ok(resp)
     }
 
     /// Reset the consecutive-error count for an object. Called on

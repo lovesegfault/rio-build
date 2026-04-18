@@ -241,7 +241,7 @@ status:
 
 Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
 in-cluster, and the controller already has the demand signal
-(`GetSpawnIntents`). See `r[ctrl.scaler.component]` /
+(`ClusterStatus`). See `r[ctrl.scaler.component]` /
 `r[ctrl.scaler.ratio-learn]` for reconciler behavior.
 
 ## Reconciliation Loops
@@ -358,7 +358,7 @@ r[ctrl.drain.disruption-target]
 ## ComponentScaler
 
 r[ctrl.scaler.component]
-The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.GetSpawnIntents` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
+The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.ClusterStatus` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
 
 r[ctrl.scaler.ratio-learn]
 `status.learnedRatio` self-calibrates against `max(StoreAdminService.GetLoad().pg_pool_utilization)` over the `spec.loadEndpoint` headless-service endpoints (the **observed** signal). Asymmetric correction: `load > spec.loadThresholds.high` (default 0.8) → immediate `current+1` AND `learnedRatio *= 0.95` (under-provisioning is dangerous — I-105 cascade); `load < spec.loadThresholds.low` (default 0.3) for 30 consecutive ticks → `learnedRatio *= 1.02` (over-provisioning is cheap). The ratio persists in `.status` so a controller restart resumes from the learned value, not `spec.seedRatio`.

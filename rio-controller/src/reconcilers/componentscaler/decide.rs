@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use rio_proto::types::GetSpawnIntentsResponse;
+use rio_proto::types::ClusterStatusResponse;
 
 use rio_crds::componentscaler::{ComponentScalerSpec, ComponentScalerStatus, LoadThresholds};
 
@@ -86,23 +86,24 @@ pub struct Decision {
     pub scaled_up: bool,
 }
 
-/// Sum queued + running derivations across all systems.
+/// Sum queued + running derivations from `ClusterStatus`.
 ///
-/// Reads `queued_by_system` (Ready-only) — a queued builder is the
-/// store's load source (FUSE reads on input prefetch, output
-/// PutPath). The reconciler adds `ClusterStatus.running_derivations`
-/// for the in-flight half so queued and running weigh the same
-/// (I-110's batching made the per-builder RPC count roughly constant
-/// across the build's lifetime).
+/// queued (Ready-only) and running weigh the same for store load:
+/// FUSE input reads + output PutPath happen across the build's
+/// lifetime, and I-110's batching made the per-builder RPC count
+/// roughly constant from queued through done.
 ///
-/// Empty map (no Ready derivations) → 0. Caller treats 0 builders as
-/// "scale to min" — correct for an idle cluster, and a misconfigured
-/// one will be caught by the high-load reactive path (`current + 1`).
+/// 0 → "scale to min" — correct for idle, and a misconfigured cluster
+/// is caught by the high-load reactive path (`current + 1`).
+///
+/// `ClusterStatus`, NOT `GetSpawnIntents`: `Σqueued_by_system ==
+/// queued_derivations` by construction (both count the actor's Ready
+/// set), so the cheap scalar suffices and the scheduler avoids a
+/// per-drv `solve_intent_for` + full intent-vec serialization just to
+/// produce a count.
 // r[impl ctrl.scaler.component]
-pub fn total_builders(resp: &GetSpawnIntentsResponse) -> u64 {
-    resp.queued_by_system
-        .values()
-        .fold(0u64, |a, b| a.saturating_add(*b))
+pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
+    u64::from(cs.queued_derivations).saturating_add(u64::from(cs.running_derivations))
 }
 
 /// Compute the next replica count + ratio adjustment.
@@ -232,29 +233,35 @@ mod tests {
         }
     }
 
-    /// Σ(queued+running) across classes; saturates instead of
-    /// wrapping. The saturate matters: a malformed scheduler
-    /// response with u64::MAX in one field shouldn't wrap to 0 and
-    /// scale the store to min under extreme load.
+    /// Σ(queued+running) from ClusterStatus; saturates instead of
+    /// wrapping. The parameter type IS the assertion: predictive
+    /// signal sources from the cheap `ClusterStatus` scalar, not a
+    /// full `GetSpawnIntents` stream.
     // r[verify ctrl.scaler.component]
     #[test]
-    fn total_builders_sums_and_saturates() {
-        let resp = GetSpawnIntentsResponse {
-            intents: vec![],
-            queued_by_system: [("x86_64-linux".into(), 110), ("aarch64-linux".into(), 12)].into(),
+    fn total_builders_from_cluster_status() {
+        let cs = ClusterStatusResponse {
+            queued_derivations: 110,
+            running_derivations: 12,
+            ..Default::default()
         };
-        assert_eq!(total_builders(&resp), 122);
+        assert_eq!(total_builders(&cs), 122);
 
-        let resp = GetSpawnIntentsResponse {
-            intents: vec![],
-            queued_by_system: [("a".into(), u64::MAX), ("b".into(), 1)].into(),
+        let cs = ClusterStatusResponse {
+            queued_derivations: u32::MAX,
+            running_derivations: u32::MAX,
+            ..Default::default()
         };
-        assert_eq!(total_builders(&resp), u64::MAX, "saturates, not wraps");
+        assert_eq!(
+            total_builders(&cs),
+            2 * u64::from(u32::MAX),
+            "u32→u64 widen, no wrap"
+        );
 
         assert_eq!(
-            total_builders(&GetSpawnIntentsResponse::default()),
+            total_builders(&ClusterStatusResponse::default()),
             0,
-            "empty map → 0 (idle cluster)"
+            "idle cluster → 0"
         );
     }
 

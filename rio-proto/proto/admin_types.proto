@@ -423,10 +423,9 @@ message GetSpawnIntentsResponse {
   repeated SpawnIntent intents = 1;
   // Per-system breakdown of Ready derivations (same population the
   // intent filter sees, before the kind/feature filters apply). Sum
-  // across keys == `ClusterStatus.queued_derivations`. The
-  // ComponentScaler reads this for the predictive store-replica
-  // signal; it's a coherent snapshot with `intents` so a single RPC
-  // serves both the spawn loop and the predictive scaler.
+  // across keys == `ClusterStatus.queued_derivations`. Coherent
+  // snapshot with `intents` so a controller reading both sees one
+  // queue state.
   map<string, uint64> queued_by_system = 2;
 }
 
