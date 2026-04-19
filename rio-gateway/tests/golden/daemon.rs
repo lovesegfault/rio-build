@@ -345,11 +345,17 @@ async fn read_stderr_loop(
                 // Error is a terminal message — the daemon returns to waiting
                 // for the next opcode after sending it. Parse the full error
                 // payload, then return (don't loop for another STDERR message).
+                //
+                // Layout per r[gw.stderr.error-format] / StderrWriter::error
+                // (rio-nix/src/protocol/stderr.rs). KEEP IN SYNC with
+                // rio-nix/src/protocol/client.rs::read_stderr_error — this is
+                // a byte-capturing mirror of that struct parser.
                 read_wire_string(stream, &mut result).await?; // type
-                read_wire_string(stream, &mut result).await?; // message/error msg
-                let mut err_code = [0u8; 8];
-                stream.read_exact(&mut err_code).await?;
-                result.extend_from_slice(&err_code);
+                let mut level = [0u8; 8];
+                stream.read_exact(&mut level).await?;
+                result.extend_from_slice(&level);
+                read_wire_string(stream, &mut result).await?; // name
+                read_wire_string(stream, &mut result).await?; // message
                 // Position: has_pos (u64), if nonzero: file, line, col
                 let mut has_pos = [0u8; 8];
                 stream.read_exact(&mut has_pos).await?;
@@ -888,6 +894,70 @@ fn register_fixture_paths(state_dir: &std::path::Path) {
         out.status.success(),
         "nix-store --load-db failed:\nstdin:\n{reg}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// r[verify gw.stderr.error-format]
+/// `read_stderr_loop` STDERR_ERROR arm parses what the production
+/// `StderrWriter::error()` actually emits. Regression: the arm previously
+/// read `string,string,u64,u64` where the wire is `string,u64,string,
+/// string,u64` — with `level=0` it desynced and `read_exact` blocked
+/// forever waiting for 8 bytes the daemon never sends (STDERR_ERROR is
+/// terminal). The test wraps the read in `tokio::time::timeout` so a
+/// regression fails fast (`Elapsed`) instead of hitting nextest's
+/// per-test timeout. No real daemon needed — write the wire bytes via
+/// the canonical writer over a `UnixStream::pair()`.
+#[tokio::test]
+async fn read_stderr_loop_parses_stderr_error() {
+    use rio_nix::protocol::stderr::{Position, STDERR_ERROR, StderrError, StderrWriter, Trace};
+    use std::time::Duration;
+
+    async fn roundtrip(err: StderrError) -> Vec<u8> {
+        let (mut server, mut client) = UnixStream::pair().expect("UnixStream::pair");
+        let write = tokio::spawn(async move {
+            StderrWriter::new(&mut server)
+                .error(&err)
+                .await
+                .expect("write STDERR_ERROR");
+            // Hold the write half open until the reader returns —
+            // STDERR_ERROR is terminal so read_stderr_loop returns
+            // immediately after consuming the last field, but a
+            // premature EOF would mask a desync as UnexpectedEof
+            // instead of the timeout.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_stderr_loop(&mut client, PostLastRead::Timeout(Duration::ZERO)),
+        )
+        .await
+        .expect("read_stderr_loop must not block on STDERR_ERROR (field-order desync regression)")
+        .expect("read_stderr_loop io");
+        write.abort();
+        read
+    }
+
+    // Common case: level=0 (verbosity::ERROR), no position, no traces.
+    let bytes = roundtrip(StderrError::simple("nix-daemon", "path not valid")).await;
+    assert_eq!(
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        STDERR_ERROR,
+        "captured bytes must start with the STDERR_ERROR marker"
+    );
+
+    // level≠0 + position + one trace — exercises both optional branches.
+    let with_pos = StderrError::new(
+        "Error",
+        1,
+        "nix-daemon",
+        "evaluation aborted",
+        Some(Position::new("/foo.nix", 12, 3)),
+        vec![Trace::new(None, "while evaluating attribute 'foo'")],
+    );
+    let bytes = roundtrip(with_pos).await;
+    assert_eq!(
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        STDERR_ERROR
     );
 }
 
