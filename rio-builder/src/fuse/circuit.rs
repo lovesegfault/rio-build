@@ -4,7 +4,7 @@
 //!
 //! Two trip conditions — EITHER opens the circuit:
 //!   (a) `threshold` (default 5) consecutive `ensure_cached` fetch failures
-//!   (b) `last_success.elapsed() > wall_clock_trip` (default 90s) AND at
+//!   (b) `last_success.elapsed() > wall_clock_trip` (default 720s) AND at
 //!       least one failure since last success — catches the degraded-but-
 //!       alive store (accepting connections, serving slowly) without waiting
 //!       for threshold × fetch_timeout. The failure-gate is critical: an
@@ -67,6 +67,21 @@ const DEFAULT_AUTO_CLOSE: Duration = Duration::from_secs(30);
 /// tripped the circuit BEFORE the fetch would have succeeded.
 const DEFAULT_WALL_CLOCK_TRIP: Duration = Duration::from_secs(720);
 
+/// Open/half-open state, serialized under one mutex.
+#[derive(Default)]
+struct OpenState {
+    /// `Some(t)` = circuit opened at `t`. Open until `t + auto_close_after`,
+    /// then half-open. `None` = closed. Cleared lazily on `record(true)`,
+    /// not eagerly on half-open — a stale `Some` with `elapsed > auto_close`
+    /// is indistinguishable from `None` via `is_open()`.
+    since: Option<Instant>,
+    /// Half-open probe claimed by one thread. Set by the first `check()`
+    /// to observe half-open; cleared by `record()` (success → close,
+    /// failure → re-open). While set, other half-open `check()` callers
+    /// get `EIO` — exactly one probe in flight.
+    probing: bool,
+}
+
 /// Three-state circuit breaker for the FUSE fetch path.
 ///
 /// Shared across all fuser threads (`Arc<CircuitBreaker>` on
@@ -75,20 +90,20 @@ const DEFAULT_WALL_CLOCK_TRIP: Duration = Duration::from_secs(720);
 pub struct CircuitBreaker<C: Clock = SystemClock> {
     /// Consecutive fetch failures. Reset to 0 on any success. Relaxed
     /// ordering is sufficient — precise interleaving at the threshold
-    /// boundary doesn't matter; the `open_since` Mutex serializes the
-    /// actual open transition.
+    /// boundary doesn't matter; the `open` Mutex serializes the actual
+    /// open transition.
     consecutive_failures: AtomicU32,
 
-    /// If `Some(t)`, circuit opened at `t`. Open until `t + auto_close_after`,
-    /// then half-open (next check() probes). `None` = closed. Cleared
-    /// lazily on `record(true)`, not eagerly on half-open transition —
-    /// a stale `Some` with elapsed > auto_close is indistinguishable from
-    /// `None` via `is_open()`.
-    open_since: Mutex<Option<Instant>>,
+    /// Open/half-open state. The `since`/`probing` pair lives under one
+    /// lock so the half-open probe gate is race-free against `record()`
+    /// — a standalone `AtomicBool` for `probing` would let a stale
+    /// pre-open fetch's `record()` clear it mid-probe and leak an extra
+    /// concurrent probe.
+    open: Mutex<OpenState>,
 
     /// Last successful fetch. `None` until first success — the wall-clock
     /// trip can't fire on a fresh worker that's served only cache hits for
-    /// 90s (it would otherwise open the circuit without ever having tried
+    /// 720s (it would otherwise open the circuit without ever having tried
     /// the store). Flips to `Some` on first `record(true)`.
     last_success: Mutex<Option<Instant>>,
 
@@ -118,7 +133,7 @@ impl<C: Clock> CircuitBreaker<C> {
     ) -> Self {
         Self {
             consecutive_failures: AtomicU32::new(0),
-            open_since: Mutex::new(None),
+            open: Mutex::new(OpenState::default()),
             last_success: Mutex::new(None),
             threshold,
             auto_close_after,
@@ -139,16 +154,24 @@ impl<C: Clock> CircuitBreaker<C> {
 
         // ── Trip (a) already fired: explicit open ─────────────────────
         {
-            let guard = self.open_since.lock().ignore_poison();
-            if let Some(since) = *guard {
+            let mut guard = self.open.lock().ignore_poison();
+            if let Some(since) = guard.since {
                 if now.duration_since(since) < self.auto_close_after {
                     return Err(Errno::EIO); // open — fail fast
                 }
-                // Half-open: auto_close_after elapsed. Return Ok to let
-                // the probe fetch through. DON'T fall through to the
-                // wall-clock check — last_success hasn't been updated
-                // since before we opened, so it would almost certainly
-                // re-trip and starve the probe. Half-open overrides.
+                // Half-open: auto_close_after elapsed. Admit exactly ONE
+                // probe; concurrent callers get EIO until that probe's
+                // record() clears `probing`. bug_035: previously this
+                // returned Ok unconditionally → up to fetch_permits
+                // (default 3) concurrent probes against a degraded store.
+                if guard.probing {
+                    return Err(Errno::EIO); // probe already in flight
+                }
+                guard.probing = true;
+                // DON'T fall through to the wall-clock check —
+                // last_success hasn't been updated since before we
+                // opened, so it would almost certainly re-trip and
+                // starve the probe. Half-open overrides.
                 return Ok(());
             }
         }
@@ -167,10 +190,10 @@ impl<C: Clock> CircuitBreaker<C> {
             && now.duration_since(t) > self.wall_clock_trip
             && self.consecutive_failures.load(Ordering::Relaxed) > 0
         {
-            let mut guard = self.open_since.lock().ignore_poison();
+            let mut guard = self.open.lock().ignore_poison();
             // Re-check under lock: another thread may have opened.
-            if guard.is_none() {
-                *guard = Some(now);
+            if guard.since.is_none() {
+                guard.since = Some(now);
                 metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                 tracing::warn!(
                     since_last_success = ?now.duration_since(t),
@@ -196,8 +219,12 @@ impl<C: Clock> CircuitBreaker<C> {
         if ok {
             self.consecutive_failures.store(0, Ordering::Relaxed);
             *self.last_success.lock().ignore_poison() = Some(self.clock.now());
-            // take(): clear + return whether we WERE open, atomically.
-            let was_open = self.open_since.lock().ignore_poison().take().is_some();
+            // Clear since + probing atomically; report whether we WERE open.
+            let was_open = {
+                let mut g = self.open.lock().ignore_poison();
+                g.probing = false;
+                g.since.take().is_some()
+            };
             if was_open {
                 metrics::gauge!("rio_builder_fuse_circuit_open").set(0.0);
                 tracing::info!("FUSE circuit breaker CLOSING — store recovered");
@@ -210,17 +237,22 @@ impl<C: Clock> CircuitBreaker<C> {
             let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= self.threshold {
                 let now = self.clock.now();
-                let mut guard = self.open_since.lock().ignore_poison();
-                // Refresh open_since UNCONDITIONALLY:
-                //   closed    → opens (guard: None → Some(now))
+                let mut guard = self.open.lock().ignore_poison();
+                // Refresh `since` UNCONDITIONALLY:
+                //   closed    → opens (since: None → Some(now))
                 //   open      → stays open (timer refresh is harmless)
                 //   half-open → RE-opens with FRESH 30s timer (stale
                 //               Some → fresh Some) — the probe failed
                 // The `already_open` check gates the log/metric (one per
                 // transition, not one per failure-while-open), not state.
-                let already_open =
-                    guard.is_some_and(|t| now.duration_since(t) < self.auto_close_after);
-                *guard = Some(now);
+                let already_open = guard
+                    .since
+                    .is_some_and(|t| now.duration_since(t) < self.auto_close_after);
+                // Clear probing: the half-open probe (if this was it)
+                // has resolved; the next half-open cycle may admit a
+                // fresh one. Also harmless on the closed/open paths.
+                guard.probing = false;
+                guard.since = Some(now);
                 if !already_open {
                     metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                     tracing::warn!(
@@ -240,9 +272,10 @@ impl<C: Clock> CircuitBreaker<C> {
     /// Doesn't mutate — the stale `open_since` is cleaned up lazily on
     /// the next `record(true)`.
     pub fn is_open(&self) -> bool {
-        self.open_since
+        self.open
             .lock()
             .ignore_poison()
+            .since
             .is_some_and(|since| self.clock.now().duration_since(since) < self.auto_close_after)
     }
 }
@@ -436,7 +469,7 @@ mod tests {
     }
 
     /// The wall-clock gate disarms on the next success: success →
-    /// failure (arms) → success (disarms) → idle 91s → no trip.
+    /// failure (arms) → success (disarms) → idle 721s → no trip.
     #[test]
     fn wall_clock_trip_disarmed_by_intervening_success() {
         let b = breaker();
@@ -446,7 +479,7 @@ mod tests {
         b.clock.advance(Duration::from_secs(721));
         assert!(
             b.check().is_ok(),
-            "failure→success disarms the gate; idle 91s is still idle"
+            "failure→success disarms the gate; idle 721s is still idle"
         );
     }
 
@@ -459,8 +492,8 @@ mod tests {
         assert!(b.check().is_err(), "wall-clock trip");
 
         // Half-open after 30s. The half-open override in check() means
-        // the probe gets through even though last_success is still 121s
-        // old (91+30) — otherwise the wall-clock check would starve it.
+        // the probe gets through even though last_success is still 752s
+        // old (721+31) — otherwise the wall-clock check would starve it.
         b.clock.advance(Duration::from_secs(31));
         assert!(
             b.check().is_ok(),
@@ -480,5 +513,87 @@ mod tests {
         b.record(true); // refresh last_success
         b.clock.advance(Duration::from_secs(80)); // 160s total, but 80s since refresh
         assert!(b.check().is_ok(), "80s since last success: closed");
+    }
+
+    // ── Half-open single-probe gate (bug_035) ─────────────────────────
+
+    /// Regression for bug_035: half-open `check()` previously returned
+    /// `Ok` to every concurrent caller (no probe gate) → up to
+    /// `fetch_permits` (default 3) distinct-path lookups all probed a
+    /// degraded store and hung for `fetch_timeout`. The fix gates on
+    /// `OpenState::probing` under the same lock as `since`.
+    ///
+    /// `Barrier` ensures all N threads enter `check()` after the
+    /// half-open transition; exactly one must get `Ok`.
+    // r[verify builder.fuse.circuit-breaker+2]
+    #[test]
+    fn half_open_admits_exactly_one_concurrent_probe() {
+        const N: usize = 8;
+        let b = breaker();
+        for _ in 1..=5 {
+            b.record(false);
+        }
+        b.clock.advance(Duration::from_secs(31)); // half-open
+
+        let barrier = std::sync::Barrier::new(N);
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        b.check()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(ok, 1, "exactly one half-open probe admitted; rest EIO");
+        assert!(
+            results
+                .iter()
+                .filter(|r| r.is_err())
+                .all(|r| r.as_ref().unwrap_err().code() == Errno::EIO.code())
+        );
+    }
+
+    /// After a failed probe's `record(false)`, `probing` is cleared so
+    /// the NEXT half-open cycle (fresh 30s timer) admits one again.
+    #[test]
+    fn half_open_probe_failure_clears_gate_for_next_cycle() {
+        let b = breaker();
+        for _ in 1..=5 {
+            b.record(false);
+        }
+        b.clock.advance(Duration::from_secs(31));
+        assert!(b.check().is_ok(), "first probe claimed");
+        assert!(b.check().is_err(), "second concurrent check: gated");
+
+        b.record(false); // probe failed → re-open, probing cleared
+        assert!(b.check().is_err(), "re-opened: fail fast");
+
+        b.clock.advance(Duration::from_secs(31));
+        assert!(b.check().is_ok(), "next cycle: one probe admitted again");
+        assert!(b.check().is_err(), "next cycle: second check gated");
+    }
+
+    /// `record(true)` clears `probing` and closes — subsequent `check()`
+    /// is `Ok` because the circuit is closed, not because the gate
+    /// re-admitted.
+    #[test]
+    fn half_open_probe_success_clears_gate() {
+        let b = breaker();
+        for _ in 1..=5 {
+            b.record(false);
+        }
+        b.clock.advance(Duration::from_secs(31));
+        assert!(b.check().is_ok(), "probe claimed");
+        assert!(b.check().is_err(), "concurrent check: gated");
+
+        b.record(true); // probe succeeded → close, probing cleared
+        assert!(!b.is_open());
+        assert!(b.check().is_ok(), "closed: ungated");
+        assert!(b.check().is_ok(), "closed: still ungated");
     }
 }

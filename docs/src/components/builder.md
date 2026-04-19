@@ -115,10 +115,10 @@ r[builder.fuse.circuit-breaker+2]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive
 `ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
-(default 90s) AND at least one failure since the last success — catches
+(default 720s) AND at least one failure since the last success — catches
 the degraded-but-alive store (accepting connections, serving slowly)
 without waiting for 5×fetch-timeout. The failure-gate on (b) is
-critical: an idle build (no store traffic for >90s, e.g., a long sleep)
+critical: an idle build (no store traffic for >720s, e.g., a long sleep)
 has a stale `last_success` but a healthy store — without the gate, the
 first post-idle fetch trips → EIO on upload → InfrastructureFailure →
 reassign loop. After `auto_close_after` (default 30s) the circuit goes
