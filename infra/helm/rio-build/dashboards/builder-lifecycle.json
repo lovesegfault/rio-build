@@ -56,8 +56,8 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (reason) (rate(rio_controller_disruption_drains_total[5m]))",
-          "legendFormat": "{{reason}}",
+          "expr": "sum by (result) (rate(rio_controller_disruption_drains_total[5m]))",
+          "legendFormat": "{{result}}",
           "refId": "A"
         }
       ],
@@ -78,13 +78,13 @@
       "id": 4,
       "type": "timeseries",
       "title": "Scaling decisions",
-      "description": "rio_controller_scaling_decisions_total — how often the controller chose to scale up/down/hold, per pool.",
+      "description": "rio_controller_scaling_decisions_total — how often the controller patched /scale (direction=up|down).",
       "gridPos": {"x": 0, "y": 17, "w": 12, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (pool, decision) (rate(rio_controller_scaling_decisions_total[5m]))",
-          "legendFormat": "{{pool}} {{decision}}",
+          "expr": "sum by (direction) (rate(rio_controller_scaling_decisions_total[5m]))",
+          "legendFormat": "{{direction}}",
           "refId": "A"
         }
       ],

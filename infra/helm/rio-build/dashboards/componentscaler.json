@@ -115,17 +115,17 @@
       "id": 4,
       "type": "timeseries",
       "title": "Reconcile latency / errors",
-      "description": "rio_controller_reconcile_duration_seconds p99 + reconcile_errors_total for the componentscaler controller.",
+      "description": "rio_controller_reconcile_duration_seconds p99 + reconcile_errors_total for the componentscaler reconciler.",
       "gridPos": {"x": 0, "y": 16, "w": 24, "h": 7},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_controller_reconcile_duration_seconds_bucket{controller=\"componentscaler\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_controller_reconcile_duration_seconds_bucket{reconciler=\"componentscaler\"}[5m])))",
           "legendFormat": "reconcile p99",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(rio_controller_reconcile_errors_total{controller=\"componentscaler\"}[5m]))",
+          "expr": "sum(rate(rio_controller_reconcile_errors_total{reconciler=\"componentscaler\"}[5m]))",
           "legendFormat": "errors/s",
           "refId": "B"
         }
