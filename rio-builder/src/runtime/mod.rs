@@ -318,12 +318,12 @@ pub async fn spawn_build_task(
         // cancelled flag is set by try_cancel_build before cgroup.kill,
         // so checking it here avoids retrying a user-cancelled build.
         let mut attempt = 0u32;
-        let result = loop {
-            let r =
+        let outcome = loop {
+            let o =
                 executor::execute_build(&assignment, &build_env, &mut store_client, &ctx.stream_tx)
                     .await;
 
-            match &r {
+            match &o.result {
                 Err(e)
                     if e.is_daemon_transient()
                         && attempt < executor::DAEMON_RETRY_MAX
@@ -341,16 +341,24 @@ pub async fn spawn_build_task(
                     );
                     tokio::time::sleep(delay).await;
                 }
-                _ => break r,
+                _ => break o,
             }
         };
 
         // Send CompletionReport. Resource fields flow from the executor
-        // (cgroup memory.peak + polled cpu.stat). On Err, the cancel flag
-        // is read BEFORE deciding the status — Acquire pairs with
-        // try_cancel_build's Release (not strictly needed, no other state
-        // to synchronize, but cheap and documents the pairing).
-        let peak_disk_bytes = result.as_ref().ok().and_then(|r| r.peak_disk_bytes);
+        // (cgroup memory.peak + polled cpu.stat). Peaks live on
+        // ExecuteOutcome so they survive the Err path — for CgroupOom,
+        // peak_memory_bytes ≈ memory.max is the most actionable sizing
+        // signal. On Err, the cancel flag is read BEFORE deciding the
+        // status — Acquire pairs with try_cancel_build's Release (not
+        // strictly needed, no other state to synchronize, but cheap and
+        // documents the pairing).
+        let executor::ExecuteOutcome {
+            result,
+            peak_memory_bytes,
+            peak_cpu_cores,
+            peak_disk_bytes,
+        } = outcome;
         let stamp = ctx.completion_stamp(peak_disk_bytes);
         let completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
@@ -360,6 +368,8 @@ pub async fn spawn_build_task(
                 assignment_token,
                 cancelled.load(std::sync::atomic::Ordering::Acquire),
                 stamp,
+                peak_memory_bytes,
+                peak_cpu_cores,
             ),
         };
 

@@ -735,8 +735,9 @@ impl DagActor {
             // NotDeterministic: nix --check failed. Retrying doesn't
             // help — the nondeterminism is in the build itself.
             | rio_proto::types::BuildResultStatus::NotDeterministic
-            // InputRejected: corrupt/invalid .drv. Same .drv on another
-            // worker is still corrupt.
+            // InputRejected: corrupt/invalid .drv OR wrong-kind misroute
+            // (deterministic re-dispatch on persisted is_fixed_output).
+            // Retry can't help.
             | rio_proto::types::BuildResultStatus::InputRejected => {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
                     .await;

@@ -59,7 +59,8 @@ pub(super) fn ok_completion(r: ExecutionResult, stamp: CompletionStamp) -> Compl
 ///   completion handler treats `Cancelled` as a no-op (already
 ///   transitioned the derivation when it sent the `CancelSignal`).
 /// - `e.is_permanent()` → `InputRejected`. Deterministic per-derivation
-///   (`WrongKind`, `.drv` parse failure). Another pod will fail
+///   under the scheduler's routing (`WrongKind`, `.drv` parse failure).
+///   Another pod *of the kind the scheduler will pick* fails
 ///   identically; surface so the scheduler stops burning ephemeral
 ///   cold-starts before the poison threshold trips.
 /// - else → `InfrastructureFailure`. Node- or network-local executor
@@ -71,6 +72,8 @@ pub(super) fn err_completion(
     assignment_token: String,
     was_cancelled: bool,
     stamp: CompletionStamp,
+    peak_memory_bytes: u64,
+    peak_cpu_cores: f64,
 ) -> CompletionReport {
     let status = if was_cancelled {
         tracing::info!(drv_path = %drv_path, "build cancelled (cgroup.kill)");
@@ -94,10 +97,15 @@ pub(super) fn err_completion(
             ..Default::default()
         }),
         assignment_token,
-        // Executor error → cgroup never populated.
-        // All resource fields = 0 = no-signal.
-        peak_memory_bytes: 0,
-        peak_cpu_cores: 0.0,
+        // r[impl builder.cgroup.memory-peak+2]
+        // 0 only for pre-cgroup setup errors (drv parse, WrongKind,
+        // overlay, daemon-spawn). Populated for CgroupOom /
+        // post-handshake Wire / Upload / BuildFailed — exactly the
+        // cases where memory.peak ≈ memory.max is the most actionable
+        // sizing signal. ExecuteOutcome carries these across the
+        // inner-Err boundary; previously hardcoded 0 here defeated that.
+        peak_memory_bytes,
+        peak_cpu_cores,
         node_name: stamp.node_name,
         hw_class: stamp.hw_class,
         // Carry the snapshot even on executor error: cpu_seconds_total
@@ -122,8 +130,8 @@ pub(super) fn panic_completion(
             ..Default::default()
         }),
         assignment_token,
-        // Panic = cgroup file descriptor likely dropped mid-read, or we
-        // never got past spawn. 0 = no-signal.
+        // Panic = no telemetry path (panic-catcher has no ExecuteOutcome
+        // in scope; the build task's stack is gone). 0 = no-signal.
         peak_memory_bytes: 0,
         peak_cpu_cores: 0.0,
         node_name: stamp.node_name,
@@ -193,6 +201,68 @@ mod tests {
     use super::*;
     use rio_test_support::metrics::CountingRecorder;
 
+    fn stamp() -> CompletionStamp {
+        CompletionStamp {
+            node_name: None,
+            hw_class: None,
+            final_resources: None,
+        }
+    }
+
+    /// r[verify builder.cgroup.memory-peak+2]
+    /// `CgroupOom` is the case where `memory.peak` ≈ `memory.max` is the
+    /// single most actionable sizing signal. `err_completion` MUST report
+    /// the peaks `ExecuteOutcome` carried across the inner-Err boundary,
+    /// not 0. Regression: previously hardcoded 0 with the false comment
+    /// "Executor error → cgroup never populated" — defeating
+    /// `DaemonOutcome`'s whole purpose.
+    #[test]
+    fn test_err_completion_carries_peaks_for_cgroup_oom() {
+        let r = err_completion(
+            &ExecutorError::CgroupOom,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            4_294_967_296,
+            3.8,
+        );
+        assert_eq!(
+            r.peak_memory_bytes, 4_294_967_296,
+            "OOM'd build's memory.peak ≈ memory.max MUST reach CompletionReport"
+        );
+        assert_eq!(r.peak_cpu_cores, 3.8);
+        assert_eq!(
+            r.result.as_ref().map(|b| b.status),
+            Some(BuildResultStatus::InfrastructureFailure.into()),
+            "CgroupOom is infra (bump resource_floor), not permanent"
+        );
+    }
+
+    /// Pre-cgroup setup errors (here `WrongKind`) genuinely never
+    /// populated the cgroup. Caller passes 0; `err_completion` reports 0
+    /// — not a special case, just the parameter value.
+    #[test]
+    fn test_err_completion_pre_cgroup_zero_peaks() {
+        let r = err_completion(
+            &ExecutorError::WrongKind {
+                is_fod: true,
+                executor_kind: rio_proto::types::ExecutorKind::Builder,
+            },
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            0,
+            0.0,
+        );
+        assert_eq!(r.peak_memory_bytes, 0);
+        assert_eq!(
+            r.result.as_ref().map(|b| b.status),
+            Some(BuildResultStatus::InputRejected.into())
+        );
+    }
+
     /// bug_174 regression: the panic path's `InfrastructureFailure`
     /// completion MUST increment `rio_builder_builds_total{outcome=
     /// "infra_failure"}`. Pre-fix, only the `executor_future` send
@@ -217,11 +287,7 @@ mod tests {
         let completion = panic_completion(
             "/nix/store/aaa-x.drv".into(),
             "tok".into(),
-            CompletionStamp {
-                node_name: None,
-                hw_class: None,
-                final_resources: None,
-            },
+            stamp(),
         );
 
         send_completion(&tx, &pending, completion).await;

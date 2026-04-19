@@ -222,8 +222,9 @@ impl ExecutorError {
         }
     }
 
-    /// Whether this error is deterministic per-derivation (same on every
-    /// pod) and so should map to `InputRejected` rather than
+    /// Whether this error is deterministic per-derivation under the
+    /// scheduler's routing (same outcome on every pod the scheduler
+    /// would pick) and so should map to `InputRejected` rather than
     /// `InfrastructureFailure`. Prevents the scheduler from burning N
     /// ephemeral cold-starts on a derivation that will fail identically
     /// each time before the poison threshold trips.
@@ -234,8 +235,13 @@ impl ExecutorError {
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
-            // FOD/non-FOD routed to wrong executor kind. Scheduler bug
-            // or malformed `is_fod` — same kind, same failure.
+            // FOD/non-FOD routed to wrong executor kind. Not "same on
+            // every pod" literally (a correct-kind pod would succeed),
+            // but re-dispatch is deterministic on persisted
+            // `is_fixed_output` (dispatch.rs kind_for_drv), so retry
+            // hits the same wrong kind — InfrastructureFailure would
+            // just fleet-exhaust to the same poison. Short-circuit.
+            // I-057: fix the routing input, never the permanence here.
             ExecutorError::WrongKind { .. }
             // .drv content failed UTF-8/ATerm/BasicDerivation parse.
             // The bytes are what they are; every pod parses identically.
@@ -294,6 +300,70 @@ pub struct ExecutionResult {
     pub fixture_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
+/// Result of [`execute_build`]: the inner result PLUS the cgroup peak
+/// samples, which survive even when `result` is `Err`. Mirrors
+/// `DaemonOutcome` one level up so `runtime::result::err_completion`
+/// can report the actual `memory.peak` for a `CgroupOom`'d build (the
+/// single most actionable sizing signal) instead of hardcoding 0.
+///
+/// On `Ok`, the peak fields are duplicated inside `ExecutionResult` —
+/// `ok_completion` reads from there; the outer copies are for the `Err`
+/// path only.
+#[derive(Debug)]
+pub struct ExecuteOutcome {
+    pub result: Result<ExecutionResult, ExecutorError>,
+    /// 0 only for pre-cgroup setup errors (drv parse, WrongKind,
+    /// overlay, daemon-spawn). Populated for `CgroupOom` /
+    /// post-handshake `Wire` / `Upload` / `BuildFailed`.
+    pub peak_memory_bytes: u64,
+    pub peak_cpu_cores: f64,
+    /// `None` = no prjquota OR pre-cgroup error. Sampled BEFORE
+    /// `build_result?` so an OOM'd build also reports it.
+    pub peak_disk_bytes: Option<u64>,
+}
+
+impl ExecuteOutcome {
+    /// Pre-cgroup setup error: cgroup never populated, peaks genuinely 0.
+    fn pre_cgroup(e: ExecutorError) -> Self {
+        Self {
+            result: Err(e),
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            peak_disk_bytes: None,
+        }
+    }
+
+    /// Fixture short-circuit: scripted peaks live on the
+    /// `ExecutionResult`; copy them out so the `Err`-path consumers
+    /// (which only exist on real builds) see consistent shape.
+    #[cfg(feature = "test-fixtures")]
+    fn fixture(r: ExecutionResult) -> Self {
+        Self {
+            peak_memory_bytes: r.peak_memory_bytes,
+            peak_cpu_cores: r.peak_cpu_cores,
+            peak_disk_bytes: r.peak_disk_bytes,
+            result: Ok(r),
+        }
+    }
+}
+
+/// What `execute_build`'s pre-daemon inner block produced. Exists so
+/// the block's `?` sites stay `?` (pre-cgroup errors → peaks=0) while
+/// the post-daemon section can carry peaks across `Err`.
+enum PreDaemon {
+    /// `RIO_BUILDER_SCRIPT` short-circuit (feature `test-fixtures`).
+    /// Variant is cfg-gated to its only construction site so the match
+    /// stays exhaustive in both feature configurations.
+    #[cfg(feature = "test-fixtures")]
+    Fixture(ExecutionResult),
+    /// Daemon ran; carry locals needed for the post-daemon section.
+    Ran {
+        overlay_mount: overlay::OverlayMount,
+        input_paths: Vec<String>,
+        outcome: DaemonOutcome,
+    },
+}
+
 /// Execute a single build assignment.
 ///
 /// This is the main entry point for building a derivation. It handles
@@ -319,7 +389,7 @@ pub async fn execute_build(
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
     log_tx: &mpsc::Sender<ExecutorMessage>,
-) -> Result<ExecutionResult, ExecutorError> {
+) -> ExecuteOutcome {
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
 
@@ -330,11 +400,18 @@ pub async fn execute_build(
         "starting build"
     );
 
+    // ── Head section: drv parse + WrongKind gate. ─────────────────────
+    // Explicit early-returns (not `?`) because the return type isn't
+    // `Result`. These are pre-cgroup → peaks genuinely 0.
+
     // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
-        fetch_drv_from_store(store_client, drv_path).await?
+        match fetch_drv_from_store(store_client, drv_path).await {
+            Ok(d) => d,
+            Err(e) => return ExecuteOutcome::pre_cgroup(e),
+        }
     } else {
         // Strict UTF-8 — matches the else-branch (parse_from_nar uses
         // strict from_utf8 at derivation/mod.rs:168). Lossy would silently
@@ -342,12 +419,19 @@ pub async fn execute_build(
         // character" instead of the real UTF-8 error. P0017's 2f807a4
         // eliminated this pattern; 395e826f reintroduced it one day after
         // P0020 closed. Clippy disallowed-methods (P0290) prevents round 3.
-        let drv_text = std::str::from_utf8(&assignment.drv_content).map_err(|e| {
-            ExecutorError::InvalidDerivation(format!("drv content is not valid UTF-8: {e}"))
-        })?;
-        Derivation::parse(drv_text).map_err(|e| {
-            ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
-        })?
+        let parsed = std::str::from_utf8(&assignment.drv_content)
+            .map_err(|e| {
+                ExecutorError::InvalidDerivation(format!("drv content is not valid UTF-8: {e}"))
+            })
+            .and_then(|t| {
+                Derivation::parse(t).map_err(|e| {
+                    ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
+                })
+            });
+        match parsed {
+            Ok(d) => d,
+            Err(e) => return ExecuteOutcome::pre_cgroup(e),
+        }
     };
 
     // wkr-fod-flag-trust (21-p2-p3-rollup Batch B): the .drv is ground
@@ -377,7 +461,7 @@ pub async fn execute_build(
     // Running pre-overlay also means a misroute wastes no mount
     // namespace setup and is unit-testable without CAP_SYS_ADMIN.
     if is_fod != (env.executor_kind == rio_proto::types::ExecutorKind::Fetcher) {
-        return Err(ExecutorError::WrongKind {
+        return ExecuteOutcome::pre_cgroup(ExecutorError::WrongKind {
             is_fod,
             executor_kind: env.executor_kind,
         });
@@ -393,145 +477,199 @@ pub async fn execute_build(
             .record(build_start.elapsed().as_secs_f64());
     });
 
-    // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
-    // overlayfs mount syscall); run on the blocking pool so a slow mount
-    // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
-    // worker thread and block the heartbeat loop.
-    let fuse_mp = env.fuse_mount_point.clone();
-    let overlay_base = env.overlay_base_dir.clone();
-    let build_id_owned = build_id.clone();
-    let overlay_mount = tokio::task::spawn_blocking(move || {
-        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
-    })
-    .await
-    .map_err(ExecutorError::OverlayTaskPanic)??;
+    // ── Pre-daemon block: overlay → resolve → sandbox → daemon. ───────
+    // Wrapped so the `?` sites stay `?`: every error here is pre-cgroup
+    // (cgroup created INSIDE `run_daemon_lifecycle` after daemon spawn),
+    // including `run_daemon_lifecycle`'s own outer `Err` (its doc:
+    // "returns Err only for setup failures BEFORE the cgroup kill-guard
+    // is in place"). Converted to `ExecuteOutcome::pre_cgroup` once at
+    // the match below — no per-site churn.
+    let pre: Result<PreDaemon, ExecutorError> =
+        async {
+            // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
+            // overlayfs mount syscall); run on the blocking pool so a slow mount
+            // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
+            // worker thread and block the heartbeat loop.
+            let fuse_mp = env.fuse_mount_point.clone();
+            let overlay_base = env.overlay_base_dir.clone();
+            let build_id_owned = build_id.clone();
+            let overlay_mount = tokio::task::spawn_blocking(move || {
+                overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
+            })
+            .await
+            .map_err(ExecutorError::OverlayTaskPanic)??;
 
-    // 3. Resolve inputDrvs → BasicDerivation + full input closure.
-    let ResolvedInputs {
-        basic_drv,
-        input_paths,
-        input_sized,
-        input_metadata,
-    } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+            // 3. Resolve inputDrvs → BasicDerivation + full input closure.
+            let ResolvedInputs {
+                basic_drv,
+                input_paths,
+                input_sized,
+                input_metadata,
+            } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
-    // r[impl builder.cores.cgroup-clamp+2]
-    // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
-    // and wopSetOptions build_cores below. I-196/I-197 rationale at
-    // crate::cgroup::effective_cores.
-    let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
+            // r[impl builder.cores.cgroup-clamp+2]
+            // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
+            // and wopSetOptions build_cores below. I-196/I-197 rationale at
+            // crate::cgroup::effective_cores.
+            let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
 
-    // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
-    // short-circuit the daemon lifecycle and report scripted telemetry
-    // so the explore ladder can be driven without wall-clock minutes
-    // per probe. After overlay+input setup so the FUSE/JIT paths still
-    // exercise; before sandbox prep so no nix-daemon spawns.
-    #[cfg(feature = "test-fixtures")]
-    if let Some(pname) = drv.env().get("pname")
-        && let Some(o) = crate::fixture::lookup(pname, effective_cores)
-    {
-        tracing::info!(%pname, effective_cores, wall_secs = o.wall_secs,
+            // RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario):
+            // short-circuit the daemon lifecycle and report scripted telemetry
+            // so the explore ladder can be driven without wall-clock minutes
+            // per probe. After overlay+input setup so the FUSE/JIT paths still
+            // exercise; before sandbox prep so no nix-daemon spawns.
+            #[cfg(feature = "test-fixtures")]
+            if let Some(pname) = drv.env().get("pname")
+                && let Some(o) = crate::fixture::lookup(pname, effective_cores)
+            {
+                tracing::info!(%pname, effective_cores, wall_secs = o.wall_secs,
             "RIO_BUILDER_SCRIPT: short-circuiting build with scripted telemetry");
-        let r = crate::fixture::scripted_result(
-            drv_path,
-            &assignment.assignment_token,
-            effective_cores,
-            o,
-        );
-        if let Err(e) = overlay::teardown_overlay(overlay_mount) {
-            tracing::warn!(error = %e, "fixture-path overlay teardown failed");
+                let r = crate::fixture::scripted_result(
+                    drv_path,
+                    &assignment.assignment_token,
+                    effective_cores,
+                    o,
+                );
+                if let Err(e) = overlay::teardown_overlay(overlay_mount) {
+                    tracing::warn!(error = %e, "fixture-path overlay teardown failed");
+                }
+                return Ok(PreDaemon::Fixture(r));
+            }
+
+            // 4. Populate sandbox: synth DB, nix.conf.
+            prepare_sandbox(
+                &overlay_mount,
+                &drv,
+                drv_path,
+                input_metadata,
+                effective_cores,
+                &env.systems,
+            )
+            .await?;
+
+            // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
+            // closure as the FUSE `lookup()` allowlist. The daemon's first
+            // overlay→FUSE `lstat` of each input now blocks-and-fetches in
+            // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
+            // ENOENT — overlay would negative-cache it). Names NOT in the
+            // allowlist (`.lock`, `.chroot`, output-path probes) get fast
+            // ENOENT without contacting the store.
+            //
+            // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
+            // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
+            // lazy fetch for builds that touch a fraction of their closure.
+            // The I-165 47-min hang window is gone with it: register +
+            // prefetch_manifests together are <100 ms (one HashMap extend +
+            // one BatchGetManifest RPC).
+            //
+            // r[impl builder.cancel.pre-cgroup-deferred]
+            // I-166: the cgroup doesn't exist yet (created post-spawn below),
+            // so a Cancel that arrived during overlay/resolve/prepare landed
+            // as ENOENT in `try_cancel_build` — which now LEAVES the flag
+            // set. Check it here. The pre-cgroup window is now overlay →
+            // resolve → prepare_sandbox → register + prefetch (sub-second);
+            // the cancel_poll select that covered the warm hang is no longer
+            // needed.
+            if env.cancelled.load(Ordering::Acquire) {
+                tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
+                return Err(ExecutorError::Cancelled);
+            }
+            if let Some(cache) = &env.fuse_cache {
+                // r[impl builder.fuse.jit-register]
+                cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
+                    Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))
+                }));
+                metrics::gauge!("rio_builder_jit_inputs_registered")
+                    .set(cache.known_inputs_len() as f64);
+                // I-110c: prime manifest hints so each JIT fetch's `GetPath`
+                // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
+                // Unimplemented (old store) or any error, the per-path
+                // `GetPath` queries PG as before.
+                prefetch_manifests(store_client, cache, &input_paths).await;
+            }
+
+            // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
+            //
+            // The daemon reads/writes the chroot store at the per-build dir:
+            //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
+            //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
+            //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
+            //
+            // Its OWN binary + libs come from host `/nix/store` (the builder's
+            // namespace) — structurally separate from the per-build store, so a
+            // build whose `$out` collides with the daemon's runtime closure
+            // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
+            // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
+            // canonical `/nix/store/...`.
+            let opts = resolve_build_opts(assignment, env, effective_cores);
+
+            let outcome = run_daemon_lifecycle(
+                &overlay_mount,
+                env,
+                &build_id,
+                drv_path,
+                &basic_drv,
+                opts,
+                log_tx,
+            )
+            .await?;
+
+            Ok(PreDaemon::Ran {
+                overlay_mount,
+                input_paths,
+                outcome,
+            })
         }
-        return Ok(r);
-    }
+        .await;
 
-    // 4. Populate sandbox: synth DB, nix.conf.
-    prepare_sandbox(
-        &overlay_mount,
-        &drv,
-        drv_path,
-        input_metadata,
-        effective_cores,
-        &env.systems,
-    )
-    .await?;
+    let (overlay_mount, input_paths, build_result, peak_memory_bytes, peak_cpu_cores) = match pre {
+        Err(e) => return ExecuteOutcome::pre_cgroup(e),
+        #[cfg(feature = "test-fixtures")]
+        Ok(PreDaemon::Fixture(r)) => return ExecuteOutcome::fixture(r),
+        Ok(PreDaemon::Ran {
+            overlay_mount,
+            input_paths,
+            outcome:
+                DaemonOutcome {
+                    build_result,
+                    peak_memory_bytes,
+                    peak_cpu_cores,
+                },
+        }) => (
+            overlay_mount,
+            input_paths,
+            build_result,
+            peak_memory_bytes,
+            peak_cpu_cores,
+        ),
+    };
 
-    // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
-    // closure as the FUSE `lookup()` allowlist. The daemon's first
-    // overlay→FUSE `lstat` of each input now blocks-and-fetches in
-    // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
-    // ENOENT — overlay would negative-cache it). Names NOT in the
-    // allowlist (`.lock`, `.chroot`, output-path probes) get fast
-    // ENOENT without contacting the store.
-    //
-    // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
-    // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
-    // lazy fetch for builds that touch a fraction of their closure.
-    // The I-165 47-min hang window is gone with it: register +
-    // prefetch_manifests together are <100 ms (one HashMap extend +
-    // one BatchGetManifest RPC).
-    //
-    // r[impl builder.cancel.pre-cgroup-deferred]
-    // I-166: the cgroup doesn't exist yet (created post-spawn below),
-    // so a Cancel that arrived during overlay/resolve/prepare landed
-    // as ENOENT in `try_cancel_build` — which now LEAVES the flag
-    // set. Check it here. The pre-cgroup window is now overlay →
-    // resolve → prepare_sandbox → register + prefetch (sub-second);
-    // the cancel_poll select that covered the warm hang is no longer
-    // needed.
-    if env.cancelled.load(Ordering::Acquire) {
-        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
-        return Err(ExecutorError::Cancelled);
-    }
-    if let Some(cache) = &env.fuse_cache {
-        // r[impl builder.fuse.jit-register]
-        cache.register_inputs(
-            input_sized
-                .iter()
-                .filter_map(|(p, sz)| Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))),
-        );
-        metrics::gauge!("rio_builder_jit_inputs_registered").set(cache.known_inputs_len() as f64);
-        // I-110c: prime manifest hints so each JIT fetch's `GetPath`
-        // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
-        // Unimplemented (old store) or any error, the per-path
-        // `GetPath` queries PG as before.
-        prefetch_manifests(store_client, cache, &input_paths).await;
-    }
-
-    // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
-    //
-    // The daemon reads/writes the chroot store at the per-build dir:
-    //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
-    //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
-    //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
-    //
-    // Its OWN binary + libs come from host `/nix/store` (the builder's
-    // namespace) — structurally separate from the per-build store, so a
-    // build whose `$out` collides with the daemon's runtime closure
-    // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
-    // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
-    // canonical `/nix/store/...`.
-    let opts = resolve_build_opts(assignment, env, effective_cores);
-
-    let DaemonOutcome {
-        build_result,
+    // ── Post-daemon: peaks now in scope; carry across every Err. ──────
+    // r[impl builder.cgroup.memory-peak+2]
+    // Sample prjquota BEFORE the build_result/collect_outputs
+    // early-returns — `dqb_curspace` is current bytes (overlay still
+    // mounted on this path) so an OOM'd build also reports
+    // peak_disk_bytes. Previously sampled only at line 11 (teardown),
+    // which the `?` at build_result skipped.
+    let peak_disk_bytes = crate::quota::peak_bytes(&env.overlay_base_dir)
+        .ok()
+        .flatten();
+    let post_err = |e| ExecuteOutcome {
+        result: Err(e),
         peak_memory_bytes,
         peak_cpu_cores,
-    } = run_daemon_lifecycle(
-        &overlay_mount,
-        env,
-        &build_id,
-        drv_path,
-        &basic_drv,
-        opts,
-        log_tx,
-    )
-    .await?;
+        peak_disk_bytes,
+    };
 
     // Propagate any daemon error AFTER cgroup teardown ran inside
-    // run_daemon_lifecycle.
-    let build_result = build_result?;
+    // run_daemon_lifecycle — but WITH peaks attached, not via `?`.
+    let build_result = match build_result {
+        Ok(r) => r,
+        Err(e) => return post_err(e),
+    };
 
     // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
-    let BuildOutputs { proto_result } = collect_outputs(
+    let BuildOutputs { proto_result } = match collect_outputs(
         &build_result,
         store_client,
         &overlay_mount,
@@ -541,7 +679,11 @@ pub async fn execute_build(
         &input_paths,
         &assignment.assignment_token,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return post_err(e),
+    };
 
     // 11. Tear down overlay (explicit, before Drop).
     // We don't override a successful build result just because its own
@@ -549,14 +691,6 @@ pub async fn execute_build(
     // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
     // centralized so ?-early-returns and panics also count); with one build
     // per pod a leaked mount is reclaimed when the pod is discarded.
-    //
-    // Sample prjquota BEFORE teardown — `dqb_curspace` is current bytes,
-    // and `remove_dir_all` of the upper dir drops it to ≈0. Stashed on
-    // ExecutionResult so `final_sample()` (which runs AFTER this returns)
-    // doesn't read post-teardown zero.
-    let peak_disk_bytes = crate::quota::peak_bytes(&env.overlay_base_dir)
-        .ok()
-        .flatten();
     let merged_path = overlay_mount.merged_dir().to_path_buf();
     if let Err(e) = overlay::teardown_overlay(overlay_mount) {
         tracing::error!(
@@ -567,15 +701,20 @@ pub async fn execute_build(
         // Metric incremented in Drop (see overlay.rs).
     }
 
-    Ok(ExecutionResult {
-        drv_path: drv_path.clone(),
-        result: proto_result,
-        assignment_token: assignment.assignment_token.clone(),
+    ExecuteOutcome {
+        result: Ok(ExecutionResult {
+            drv_path: drv_path.clone(),
+            result: proto_result,
+            assignment_token: assignment.assignment_token.clone(),
+            peak_memory_bytes,
+            peak_cpu_cores,
+            peak_disk_bytes,
+            fixture_resources: None,
+        }),
         peak_memory_bytes,
         peak_cpu_cores,
         peak_disk_bytes,
-        fixture_resources: None,
-    })
+    }
 }
 
 /// Effective per-build option triple after applying assignment →

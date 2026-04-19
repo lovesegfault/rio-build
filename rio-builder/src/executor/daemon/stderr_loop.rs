@@ -105,47 +105,33 @@ pub(in crate::executor) async fn run_daemon_build(
     // back because the loop itself reads BuildResult after STDERR_LAST.
     let stdout = stdout.take().expect("borrowed above, not yet taken");
 
-    // Timeout is a BUILD OUTCOME, not an executor error. Returning
-    // Ok(failure) flows through execute_build's status-mapping path
-    // (BuildResultStatus::from → TimedOut), which the
-    // scheduler treats as permanent-no-reassign. Returning Err would
-    // land in runtime.rs's InfrastructureFailure arm → reassignment
-    // storm (same build, same inputs, same timeout, forever).
-    //
-    // The inner Result<BuildResult, WireError> is different: a wire
+    // All four limit-class terminations (build_timeout, max_silent_time,
+    // byte-limit, msg-cap) live INSIDE read_build_stderr_loop's select!
+    // and `break Ok(Some(BuildResult::failure(..)))`. That converges
+    // them on `state.final_flush()` (so the trailing ≤63 buffered lines
+    // reach log_tx) AND maps each to a non-reassignable proto status.
+    // Timeout is a BUILD OUTCOME, not an executor error: returning Err
+    // would land in runtime.rs's InfrastructureFailure arm →
+    // reassignment storm (same build, same inputs, same timeout,
+    // forever). The Result<_, WireError> here is different — a wire
     // error mid-STDERR-loop IS an executor fault (daemon died, pipe
-    // corrupted) — that `?` stays.
+    // corrupted); that `?` stays.
     //
-    // max_silent_time is threaded INTO the loop (not wrapped around it
-    // like build_timeout) because the silence timer must reset on each
-    // output-producing message. The local nix-daemon MAY also enforce
-    // maxSilentTime itself (forwarded via client_set_options above) —
-    // but rio-side is the authoritative backstop: we get a correct
-    // TimedOut regardless of what the daemon does, and the caller's
-    // unconditional cgroup.kill() (executor/mod.rs) reaps the tree.
+    // The local nix-daemon MAY also enforce maxSilentTime itself
+    // (forwarded via client_set_options above) — but rio-side is the
+    // authoritative backstop: we get a correct TimedOut regardless of
+    // what the daemon does, and the caller's unconditional
+    // cgroup.kill() (executor/mod.rs) reaps the tree.
     //
     // r[impl builder.timeout.no-reassign]
-    let build_result = match tokio::time::timeout(
+    let build_result = read_build_stderr_loop(
+        stdout,
+        opts.max_silent_time,
         opts.build_timeout,
-        read_build_stderr_loop(stdout, opts.max_silent_time, batcher, log_tx),
+        batcher,
+        log_tx,
     )
-    .await
-    {
-        Ok(inner) => inner?,
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_secs = opts.build_timeout.as_secs(),
-                "build exceeded timeout; reporting TimedOut (no reassignment)"
-            );
-            BuildResult::failure(
-                BuildStatus::TimedOut,
-                format!(
-                    "build exceeded configured timeout of {}s",
-                    opts.build_timeout.as_secs()
-                ),
-            )
-        }
-    };
+    .await?;
 
     Ok(build_result)
 }
@@ -274,10 +260,13 @@ impl<'a> StderrLoop<'a> {
     /// `NIX_LOG_FD` for the full `build_timeout`.
     async fn dispatch(&mut self, msg: StderrMessage) -> std::ops::ControlFlow<LoopOutcome> {
         use std::ops::ControlFlow::*;
+        // r[impl builder.stderr.msg-cap]
         self.msg_count += 1;
         if self.msg_count >= MAX_BUILD_STDERR_MESSAGES {
-            return Break(Err(wire::WireError::Io(std::io::Error::other(
-                "exceeded maximum STDERR messages during build",
+            tracing::warn!("build exceeded MAX_BUILD_STDERR_MESSAGES, aborting");
+            return Break(Ok(Some(BuildResult::failure(
+                BuildStatus::LogLimitExceeded,
+                format!("build exceeded {MAX_BUILD_STDERR_MESSAGES} STDERR-protocol messages"),
             ))));
         }
         match msg {
@@ -401,6 +390,7 @@ fn misc_fail(m: &str) -> BuildResult {
 async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
+    build_timeout: Duration,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, wire::WireError>
@@ -417,6 +407,12 @@ where
     // Activity/Write/Progress chatter does NOT reset — a build that
     // spins sending progress updates but no actual log lines is still
     // "silent" by the maxSilentTime contract (builder stderr quiescence).
+    //
+    // Build deadline: absolute hard cap, never resets. Computed here
+    // (not by caller) so paused-time tests advance it via
+    // tokio::time::advance and the error message can name the
+    // configured seconds.
+    let build_deadline = Instant::now() + build_timeout;
     let mut state = StderrLoop::new(batcher, log_tx, Duration::from_secs(max_silent_time));
 
     // Spawn the owned reader task. It reads one StderrMessage at a time and
@@ -510,6 +506,26 @@ where
                     format!("no output for {max_silent_time}s (maxSilentTime)"),
                 )));
             }
+
+            // Hard build deadline. biased; above means a pending message
+            // (or the silence arm) wins on the same iteration; this is
+            // the absolute backstop. Breaking out of the loop reaches
+            // final_flush below — symmetric with the silence arm so the
+            // last ≤63 buffered lines reach log_tx instead of being
+            // dropped with the future (the previous outer-timeout shape).
+            _ = tokio::time::sleep_until(build_deadline) => {
+                tracing::warn!(
+                    timeout_secs = build_timeout.as_secs(),
+                    "build exceeded timeout; reporting TimedOut (no reassignment)"
+                );
+                break Ok(Some(BuildResult::failure(
+                    BuildStatus::TimedOut,
+                    format!(
+                        "build exceeded configured timeout of {}s",
+                        build_timeout.as_secs()
+                    ),
+                )));
+            }
         }
     };
 
@@ -559,6 +575,11 @@ mod tests {
     use rio_nix::protocol::build::write_build_result;
     use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
 
+    /// Effectively-disabled build_timeout for tests that don't exercise
+    /// the build-deadline arm. Far enough out that no
+    /// `tokio::time::advance` in this module reaches it.
+    const NO_BUILD_TIMEOUT: Duration = Duration::from_secs(86400 * 365);
+
     /// Serialize a BuildResult to wire bytes.
     async fn build_result_bytes(r: &BuildResult) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -578,7 +599,7 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -681,7 +702,7 @@ mod tests {
         drop(rx); // channel closed before loop starts
         let cursor = std::io::Cursor::new(buf);
 
-        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
         let br = result.expect("channel-closed is Ok(failure)");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert!(
@@ -756,10 +777,9 @@ mod tests {
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
         // Spawn the loop. It will read from read_half (which we write to).
-        let loop_handle =
-            tokio::spawn(
-                async move { read_build_stderr_loop(read_half, 0, batcher, &log_tx).await },
-            );
+        let loop_handle = tokio::spawn(async move {
+            read_build_stderr_loop(read_half, 0, NO_BUILD_TIMEOUT, batcher, &log_tx).await
+        });
 
         // Send exactly one STDERR_NEXT line, then go silent.
         {
@@ -833,10 +853,9 @@ mod tests {
         );
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
-        let loop_handle =
-            tokio::spawn(
-                async move { read_build_stderr_loop(read_half, 0, batcher, &log_tx).await },
-            );
+        let loop_handle = tokio::spawn(async move {
+            read_build_stderr_loop(read_half, 0, NO_BUILD_TIMEOUT, batcher, &log_tx).await
+        });
 
         // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
         // the reader task blocked mid-read_u64.
@@ -927,7 +946,14 @@ mod tests {
         );
         let (log_tx, log_rx) = mpsc::channel(8);
         let handle = tokio::spawn(async move {
-            read_build_stderr_loop(read_half, max_silent_time, batcher, &log_tx).await
+            read_build_stderr_loop(
+                read_half,
+                max_silent_time,
+                NO_BUILD_TIMEOUT,
+                batcher,
+                &log_tx,
+            )
+            .await
         });
         (write_half, log_rx, handle)
     }
@@ -1107,7 +1133,7 @@ mod tests {
         let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -1473,6 +1499,23 @@ mod tests {
         StderrLoop::new(batcher, tx, Duration::ZERO)
     }
 
+    /// Hitting the cap MUST be a build outcome (`LogLimitExceeded`),
+    /// NOT `Err(WireError)`. `Err` would propagate via `inner?` →
+    /// `ExecutorError::Wire` → `is_daemon_transient()=false` /
+    /// `is_permanent()=false` → `InfrastructureFailure` → reassignment
+    /// storm (same build emits 10M messages on every worker).
+    fn assert_msg_cap_outcome(r: std::ops::ControlFlow<LoopOutcome>) {
+        let std::ops::ControlFlow::Break(Ok(Some(br))) = r else {
+            panic!("msg-cap MUST Break(Ok(Some(LogLimitExceeded))), got {r:?}");
+        };
+        assert_eq!(
+            br.status,
+            BuildStatus::LogLimitExceeded,
+            "msg-cap is terminal non-retryable, same semantics as byte-limit"
+        );
+    }
+
+    /// r[verify builder.stderr.msg-cap]
     /// `Result{104}` (SetPhase) MUST count toward `MAX_BUILD_STDERR_MESSAGES`.
     /// Previously `forward_phase` bypassed `msg_count` entirely → a malicious
     /// build could flood unbounded `BuildPhase` frames for `build_timeout`.
@@ -1488,10 +1531,7 @@ mod tests {
             fields: vec![ResultField::String("x".into())],
         };
         assert!(matches!(state.dispatch(phase_msg()).await, Continue(())));
-        assert!(
-            matches!(state.dispatch(phase_msg()).await, Break(Err(_))),
-            "SetPhase (Result{{104}}) MUST count toward MAX_BUILD_STDERR_MESSAGES"
-        );
+        assert_msg_cap_outcome(state.dispatch(phase_msg()).await);
     }
 
     /// Discard arm (`StartActivity` / `StopActivity` / `Write` / other
@@ -1512,10 +1552,7 @@ mod tests {
             parent_id: 0,
         };
         assert!(matches!(state.dispatch(act_msg()).await, Continue(())));
-        assert!(
-            matches!(state.dispatch(act_msg()).await, Break(Err(_))),
-            "discard arm MUST count toward MAX_BUILD_STDERR_MESSAGES"
-        );
+        assert_msg_cap_outcome(state.dispatch(act_msg()).await);
     }
 
     /// Sensitivity: the original `Next` path still hits the cap after
@@ -1530,9 +1567,68 @@ mod tests {
             state.dispatch(StderrMessage::Next("a".into())).await,
             Continue(())
         ));
-        assert!(matches!(
-            state.dispatch(StderrMessage::Next("b".into())).await,
-            Break(Err(_))
-        ));
+        assert_msg_cap_outcome(state.dispatch(StderrMessage::Next("b".into())).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_timeout select! arm — symmetric with silence: drains final_flush
+    // -----------------------------------------------------------------------
+
+    /// The build-deadline arm MUST `break` the select! loop so
+    /// `final_flush` runs — same as the silence arm. Regression: when
+    /// `build_timeout` was an outer `tokio::time::timeout` wrapper, the
+    /// inner future was DROPPED mid-select on elapse, discarding the
+    /// owned `LogBatcher` (≤63 buffered lines) without flush.
+    #[tokio::test(start_paused = true)]
+    async fn test_build_deadline_flushes_buffered_lines() -> anyhow::Result<()> {
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
+        let (log_tx, mut log_rx) = mpsc::channel(8);
+        let loop_handle = tokio::spawn(async move {
+            read_build_stderr_loop(read_half, 0, Duration::from_secs(10), batcher, &log_tx).await
+        });
+
+        // 3 lines (< MAX_BATCH_LINES=64): stay buffered, no flush yet.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.log("tail-a").await?;
+            w.log("tail-b").await?;
+            w.log("tail-c").await?;
+        }
+        drain_tasks().await;
+        assert!(
+            log_rx.try_recv().is_err(),
+            "3 lines < 64, no flush_tick yet → batcher still holding them"
+        );
+
+        // Advance past build_timeout. Deadline arm breaks; final_flush
+        // sends the 3 buffered lines BEFORE returning TimedOut.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        drain_tasks().await;
+
+        let br = loop_handle
+            .await?
+            .expect("build-deadline is Ok(TimedOut), not Err");
+        assert_eq!(br.status, BuildStatus::TimedOut);
+        assert!(
+            br.error_msg.contains("10s"),
+            "error_msg names the configured timeout: {}",
+            br.error_msg
+        );
+
+        let mut received = Vec::new();
+        while let Ok(m) = log_rx.try_recv() {
+            received.push(m);
+        }
+        assert_eq!(
+            count_log_lines(&received),
+            3,
+            "build-deadline arm MUST reach final_flush (was dropped under outer-timeout shape)"
+        );
+        Ok(())
     }
 }

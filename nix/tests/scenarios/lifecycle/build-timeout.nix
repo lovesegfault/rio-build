@@ -8,7 +8,8 @@ scope: with scope; ''
   #   (1) scheduler per-build timeout (actor/worker.rs:597) — checked
   #       on Tick (10s here), fires cancel_build_derivations
   #   (2) worker per-derivation daemon timeout (executor/mod.rs:567 →
-  #       stderr_loop.rs:126 tokio::time::timeout) — fires TimedOut
+  #       stderr_loop.rs read_build_stderr_loop select! build-deadline
+  #       arm) — fires TimedOut
   # Either way run_daemon_build returns (Ok(TimedOut) or Err on
   # cancel-killed daemon), and the executor FALLS THROUGH to line
   # 764: build_cgroup.kill() + drain + Drop rmdirs. THAT is the

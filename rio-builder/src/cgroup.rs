@@ -4,7 +4,7 @@
 //! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
 //! builder and waitpid()s — the builder's memory never appeared in
 // r[impl builder.cgroup.sibling-layout]
-// r[impl builder.cgroup.memory-peak]
+// r[impl builder.cgroup.memory-peak+2]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
 //! (daemon + builder + every compiler sub-process), which is what the
 //! resource_floor memory-bump actually needs.
@@ -914,7 +914,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
 use nix::libc;
 
 // r[verify builder.cgroup.sibling-layout]
-// r[verify builder.cgroup.memory-peak]
+// r[verify builder.cgroup.memory-peak+2]
 #[cfg(test)]
 mod tests {
     use super::*;

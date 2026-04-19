@@ -61,6 +61,7 @@ async fn run(kind: ExecutorKind, drv: &[u8], is_fod: bool) -> Result<(), Executo
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
     execute_build(&assignment, &env, &mut store, &log_tx)
         .await
+        .result
         .map(|_| ())
 }
 

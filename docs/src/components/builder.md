@@ -241,6 +241,9 @@ Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, 
 r[builder.stderr.forward-set-phase]
 The builder's stderr loop forwards the daemon's `STDERR_RESULT{SetPhase}` (result type 104) as a `BuildPhase{derivation_path, phase}` `ExecutorMessage`. Phase is a state edge, not log content --- it is sent unbatched and does not reset the max-silent-time deadline.
 
+r[builder.stderr.msg-cap]
+The stderr loop enforces a hard cap of `MAX_BUILD_STDERR_MESSAGES` (10M) protocol frames per build, counted at `dispatch()` so every variant including `SetPhase`/activity-lifecycle is covered. Exceeding it terminates with `BuildStatus::LogLimitExceeded` --- same non-retryable semantics as the byte limit.
+
 r[builder.log-limit+2]
 The log batcher enforces per-build `LogLimits`. `total_bytes` (cumulative across flushed batches) is a hard cap: a line whose PROSPECTIVE total would exceed it is rejected, `add_line` returns `LimitExceeded{reason}`, the stderr loop flushes already-buffered lines and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (same build on a different executor spews the same logs). Maps to `rio_builder_builds_total{outcome="log_limit"}`. `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) is a suppression threshold: excess lines within a window are DROPPED, and a single `[rio: N lines suppressed by log_rate_limit (M lines/s)]` marker is injected at the next window reset. The build continues. Dropped lines do not count toward `total_bytes`. Maps to `rio_builder_log_lines_suppressed_total`. Either limit set to `0` means unlimited.
 
@@ -347,8 +350,8 @@ Per-build cgroups are **siblings** of the builder's own cgroup under the delegat
 r[builder.cgroup.ns-root-remount]
 When running in a cgroup-namespace root (`/proc/self/cgroup` shows `0::/`) under a non-privileged security context, the builder MUST remount `/sys/fs/cgroup` read-write before creating the `/leaf/` subgroup. Containerd mounts `/sys/fs/cgroup` read-only for non-privileged pods even with `CAP_SYS_ADMIN`; the `MS_REMOUNT | MS_BIND` call clears the per-mount-point RO flag (preserving superblock `nosuid`/`nodev`/`noexec`). Under `privileged: true` containerd mounts rw already and the remount is a no-op --- this path is load-bearing only in the production `privileged: false` + `base_runtime_spec` device-injection configuration (ADR-012).
 
-r[builder.cgroup.memory-peak]
-cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed.
+r[builder.cgroup.memory-peak+2]
+cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed. `memory.peak` and the polled `cpu.stat` peak MUST be reported in `CompletionReport` for every build that reached cgroup attachment, including `CgroupOom` / `BuildFailed` / `Upload` outcomes --- 0 is reserved for pre-cgroup setup errors.
 
 r[builder.cgroup.kill-on-teardown]
 On any error exit after the build cgroup is populated, the executor MUST write `cgroup.kill` and poll `cgroup.procs` until empty (bounded) before dropping the cgroup handle. `daemon.kill()` alone only signals the daemon PID; forked builders reparent to init.
@@ -357,7 +360,7 @@ On any error exit after the build cgroup is populated, the executor MUST write `
 
 A builder pod runs **one** build, then exits. The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; the next queued derivation gets a fresh Job. Operators size the pod via `Pool.spec.resources`.
 
-The per-build sub-cgroup is **measurement and cancellation only**: cgroup v2 `memory.peak` + polled `cpu.stat` for resource accounting (`r[builder.cgroup.memory-peak]`), and `cgroup.kill` for clean teardown (`r[builder.cgroup.kill-on-teardown]`) without touching the rio-builder process or its FUSE threads.
+The per-build sub-cgroup is **measurement and cancellation only**: cgroup v2 `memory.peak` + polled `cpu.stat` for resource accounting (`r[builder.cgroup.memory-peak+2]`), and `cgroup.kill` for clean teardown (`r[builder.cgroup.kill-on-teardown]`) without touching the rio-builder process or its FUSE threads.
 
 r[builder.cores.cgroup-clamp+2]
 The executor MUST clamp `build_cores` (passed to nix-daemon via `wopSetOptions`, becomes `NIX_BUILD_CORES` → `make -jN`) to `ceil(quota/period)` from the pod cgroup's `cpu.max`, minimum 1. It MUST NOT pass `build_cores=0`: nix-daemon resolves 0 to host nproc, and cgroup CPU quota does not reduce visible cores --- a 0.5-core pod on a 16-core node would run `make -j16`, OOM-loop on compiler RSS (I-196). A client-requested `build_cores > 0` is capped at the same ceiling. When `cpu.max` reads `max` (no quota), use host nproc --- but builder/fetcher pools set `limits.cpu == requests.cpu` (I-197, hard limits, no burst) so production pods always see a real quota; the `max` fallback only fires in VM tests / bare-metal dev. The same clamped value MUST also be written to the per-build `nix.conf` as `cores = N` and `max-jobs = 1`, appended after any operator override (later lines win): defense-in-depth against an upstream `wopSetOptions` regression where the daemon would otherwise fall back to nix.conf → host nproc.
