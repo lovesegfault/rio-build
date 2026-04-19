@@ -402,7 +402,10 @@ impl DagActor {
     /// no-op. If the report races AHEAD of the disconnect (controller
     /// observed Pod-status before the gRPC stream broke at the
     /// scheduler — rare), fall back to the still-live executor's
-    /// `running_build`.
+    /// `running_build` and set its `last_completed` so the imminent
+    /// `handle_executor_disconnected` skips the `recently_disconnected`
+    /// insert (otherwise the controller's ~10s re-report would find the
+    /// entry and double-bump).
     pub(super) async fn handle_executor_termination(
         &mut self,
         executor_id: &ExecutorId,
@@ -424,9 +427,19 @@ impl DagActor {
             Some((drv, _)) => drv,
             // Race-ahead: report landed before ExecutorDisconnected.
             // Look at the still-live executor.
-            None => match self.executors.get(executor_id) {
-                Some(w) => match &w.running_build {
-                    Some(drv) => drv.clone(),
+            None => match self.executors.get_mut(executor_id) {
+                Some(w) => match w.running_build.clone() {
+                    Some(drv) => {
+                        // Mark as termination-handled so the imminent
+                        // ExecutorDisconnected's `last_completed !=
+                        // running_build` guard skips the
+                        // recently_disconnected insert. Otherwise the
+                        // controller's ~10s re-report finds the entry
+                        // and double-bumps (4× provisioning, or
+                        // infra_count+=2 at ceiling → premature poison).
+                        w.last_completed = Some(drv.clone());
+                        drv
+                    }
                     None => {
                         debug!(executor_id = %executor_id, ?reason,
                                "termination report: executor live but idle, ignoring");

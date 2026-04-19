@@ -1423,6 +1423,138 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     Ok(())
 }
 
+// r[verify sched.sla.reactive-floor]
+/// Race-ahead order: `ReportExecutorTermination` lands BEFORE
+/// `ExecutorDisconnected` (controller observed Pod-status before the
+/// gRPC stream broke at the scheduler). The race-ahead arm reads the
+/// still-live executor's `running_build` and bumps. Regression: it did
+/// NOT mark the executor as termination-handled, so the subsequent
+/// disconnect inserted `(exec_id, drv)` into `recently_disconnected`,
+/// and the controller's ~10s re-report found it → second bump (4×
+/// provisioning for one OOM, or `infra_count += 2` at ceiling →
+/// premature poison).
+///
+/// This is `test_disconnect_no_promote_oom_report_promotes` with the
+/// report/disconnect order inverted.
+#[tokio::test]
+async fn test_termination_report_race_ahead_of_disconnect_bumps_once() -> TestResult {
+    use rio_proto::types::{ExecutorKind, TerminationReason};
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
+
+    let tag = "race-ahead-oom";
+    let mut rx =
+        connect_executor_kind(&handle, "w-race", "x86_64-linux", ExecutorKind::Builder).await?;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![make_node(tag)], vec![], false).await?;
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains(tag));
+
+    // Seed est_memory_bytes so bump has a base (no SLA config in this
+    // fixture → solve_intent_for gated off → est=None → bump no-ops).
+    handle
+        .debug_seed_sched_hint(tag, Some(4 << 30), None, None, None)
+        .await?;
+
+    // ── Report BEFORE disconnect (race-ahead arm) ──────────────────
+    let promoted = report_termination(&handle, "w-race", TerminationReason::OomKilled).await?;
+    assert!(promoted, "race-ahead OOM report → bump from live executor");
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes,
+        8 << 30,
+        "first OOM report doubled mem floor from est=4GiB"
+    );
+
+    // ── Disconnect arrives after ──────────────────────────────────
+    disconnect(&handle, "w-race").await?;
+    drop(rx);
+
+    // ── Controller re-reports OOMKilled ~10s later: must NO-OP ─────
+    // Regression: race-ahead arm didn't set last_completed →
+    // disconnect inserted recently_disconnected entry → this re-report
+    // found it and bumped AGAIN (8→16 GiB).
+    let promoted = report_termination(&handle, "w-race", TerminationReason::OomKilled).await?;
+    assert!(
+        !promoted,
+        "re-report after race-ahead+disconnect must no-op \
+         (race-ahead arm sets last_completed → disconnect skips \
+         recently_disconnected insert)"
+    );
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes,
+        8 << 30,
+        "one physical OOM → one bump (NOT 16GiB)"
+    );
+
+    // ── Steady-state: third report still no-op ─────────────────────
+    let promoted = report_termination(&handle, "w-race", TerminationReason::OomKilled).await?;
+    assert!(!promoted);
+    assert_eq!(
+        expect_drv(&handle, tag)
+            .await
+            .sched
+            .resource_floor
+            .mem_bytes,
+        8 << 30
+    );
+    Ok(())
+}
+
+// r[verify sched.sla.reactive-floor]
+/// At-ceiling variant of the race-ahead regression: with floor already
+/// at `max_mem`, each bump increments `infra_count` instead of
+/// doubling. One physical OOM under report→disconnect→re-report must
+/// yield `infra_count == 1`, not 2 (which would halve the effective
+/// `max_infra_retries` budget and fire `poison_and_cascade` early).
+#[tokio::test]
+async fn test_termination_report_race_ahead_at_ceiling_counts_once() -> TestResult {
+    use rio_proto::types::{ExecutorKind, TerminationReason};
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
+
+    let tag = "race-ahead-ceil";
+    let mut rx =
+        connect_executor_kind(&handle, "w-ceil", "x86_64-linux", ExecutorKind::Builder).await?;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![make_node(tag)], vec![], false).await?;
+    let _asgn = recv_assignment(&mut rx).await;
+
+    // Seed floor AT the ceiling (test_sla_config: max_mem = 256 GiB)
+    // so bump_floor_or_count takes the `floor >= ceil → infra_count++`
+    // branch on the first report.
+    handle
+        .debug_seed_sched_hint(
+            tag,
+            None,
+            None,
+            None,
+            Some(crate::state::ResourceFloor {
+                mem_bytes: 256 << 30,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    let promoted = report_termination(&handle, "w-ceil", TerminationReason::OomKilled).await?;
+    assert!(!promoted, "at-ceiling bump → counted, not promoted");
+    assert_eq!(
+        expect_drv(&handle, tag).await.retry.infra_count,
+        1,
+        "first at-ceiling OOM → infra_count=1"
+    );
+
+    disconnect(&handle, "w-ceil").await?;
+    drop(rx);
+
+    let promoted = report_termination(&handle, "w-ceil", TerminationReason::OomKilled).await?;
+    assert!(!promoted);
+    assert_eq!(
+        expect_drv(&handle, tag).await.retry.infra_count,
+        1,
+        "race-ahead re-report must NOT double-count infra_count \
+         (was: +=2 → premature poison_and_cascade)"
+    );
+    Ok(())
+}
+
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// I-188 race case: a builder that disconnects with `running_build ==
 /// Some(X)` AFTER having sent CompletionReport(X) gets NO
