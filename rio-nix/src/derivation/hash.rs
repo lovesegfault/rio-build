@@ -23,6 +23,7 @@ use super::{Derivation, DerivationError, DerivationLike, MAX_HASH_RECURSION_DEPT
 /// the parsed `Derivation`. All transitive inputs must be resolvable.
 ///
 /// `hash_cache` provides memoisation across calls (keyed by drv path string).
+/// Only the `mask_outputs=false` form is cached — see the inner doc.
 pub fn hash_derivation_modulo<'c>(
     drv: &'c Derivation,
     drv_path: &str,
@@ -30,9 +31,29 @@ pub fn hash_derivation_modulo<'c>(
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> Result<[u8; 32], DerivationError> {
     let mut visiting = HashSet::new();
-    hash_derivation_modulo_inner(drv, drv_path, resolve_input, hash_cache, &mut visiting, 0)
+    // Nix 2.18-2.20: top-level entry (`staticOutputHashes`) passes
+    // maskOutputs=true for CA-floating; recursive entry
+    // (`pathDerivationModulo`) hard-codes false. We mirror that — the
+    // top-level call masks iff this drv is CA-floating; the recursive
+    // call below always passes false.
+    let mask_outputs = drv.has_ca_floating_outputs();
+    hash_derivation_modulo_inner(
+        drv,
+        drv_path,
+        resolve_input,
+        hash_cache,
+        &mut visiting,
+        0,
+        mask_outputs,
+    )
 }
 
+/// `mask_outputs` is threaded explicitly (NOT recomputed per level): a
+/// CA-floating drv has *two* distinct modular hashes — `mask=true` when it
+/// is the realisation-key subject, `mask=false` when it appears as an
+/// input to another drv. `hash_cache` stores only the `mask=false` value
+/// (the form reused across input lookups), mirroring Nix where `drvHashes`
+/// lives in `pathDerivationModulo`, not `hashDerivationModulo`.
 fn hash_derivation_modulo_inner<'c>(
     drv: &'c Derivation,
     drv_path: &str,
@@ -40,9 +61,10 @@ fn hash_derivation_modulo_inner<'c>(
     hash_cache: &mut HashMap<String, [u8; 32]>,
     visiting: &mut HashSet<String>,
     depth: usize,
+    mask_outputs: bool,
 ) -> Result<[u8; 32], DerivationError> {
-    // Memoisation
-    if let Some(&cached) = hash_cache.get(drv_path) {
+    // Memoisation — cache holds the mask=false form only.
+    if !mask_outputs && let Some(&cached) = hash_cache.get(drv_path) {
         return Ok(cached);
     }
 
@@ -78,9 +100,10 @@ fn hash_derivation_modulo_inner<'c>(
             );
             Ok(Sha256::digest(fingerprint.as_bytes()).into())
         } else {
-            // Input-addressed or CA floating: recurse on input drvs
-            let mask_outputs = drv.has_ca_floating_outputs();
-
+            // Input-addressed or CA floating: recurse on input drvs.
+            // Inputs are ALWAYS hashed with mask_outputs=false (Nix
+            // `pathDerivationModulo`), regardless of the input's own
+            // CA-floating-ness — only the top-level subject masks.
             let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
             for input_drv_path in drv.input_drvs().keys() {
                 let input_drv = resolve_input(input_drv_path)
@@ -92,6 +115,7 @@ fn hash_derivation_modulo_inner<'c>(
                     hash_cache,
                     visiting,
                     depth + 1,
+                    false,
                 )?;
                 input_rewrites.insert(input_drv_path.clone(), hex::encode(input_hash));
             }
@@ -104,7 +128,9 @@ fn hash_derivation_modulo_inner<'c>(
     visiting.remove(drv_path);
 
     let hash = result?;
-    hash_cache.insert(drv_path.to_string(), hash);
+    if !mask_outputs {
+        hash_cache.insert(drv_path.to_string(), hash);
+    }
     Ok(hash)
 }
 
@@ -570,6 +596,113 @@ mod hash_derivation_modulo_tests {
 
         let result = drv.to_aterm_modulo(&BTreeMap::new(), false);
         assert!(matches!(result, Err(DerivationError::InputNotFound(_))));
+        Ok(())
+    }
+
+    /// Helper: a CA-floating leaf (no inputDrvs) with the canonical
+    /// hashPlaceholder("out") env value Nix writes for CA outputs.
+    fn ca_floating_leaf() -> Derivation {
+        Derivation::parse(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-leaf"),("out","/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9"),("system","x86_64-linux")])"#,
+        )
+        .expect("static fixture")
+    }
+
+    /// Nix 2.18-2.20 hashes inputs via `pathDerivationModulo` with
+    /// `maskOutputs=false` — only the top-level subject masks. A
+    /// CA-floating leaf Y appearing as an input to CA-floating X must be
+    /// hashed UNMASKED (env `out` placeholder kept), not masked.
+    #[test]
+    fn ca_on_ca_input_uses_unmasked_hash() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let y = ca_floating_leaf();
+        // X: CA-floating, depends on Y.
+        let x = Derivation::parse(
+            r#"Derive([("out","","r:sha256","")],[("/nix/store/yyy-ca-leaf.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-x"),("out","/04fmi8q93y9c8zd2hcq8dckk8lgm75wqjaj4hbn03ikl5ich30bi"),("system","x86_64-linux")])"#,
+        )?;
+        assert!(x.has_ca_floating_outputs());
+
+        let mut cache = HashMap::new();
+        let resolve =
+            |p: &str| -> Option<&Derivation> { (p == "/nix/store/yyy-ca-leaf.drv").then_some(&y) };
+        hash_derivation_modulo(&x, "/nix/store/xxx-ca-x.drv", &resolve, &mut cache)?;
+
+        // Y's UNMASKED hash (mask_outputs=false → env `out` placeholder kept).
+        let y_unmasked: [u8; 32] =
+            Sha256::digest(y.to_aterm_modulo(&BTreeMap::new(), false)?.as_bytes()).into();
+        // Y's MASKED hash (env `out` blanked) — what the buggy code computed.
+        let y_masked: [u8; 32] =
+            Sha256::digest(y.to_aterm_modulo(&BTreeMap::new(), true)?.as_bytes()).into();
+        assert_ne!(y_unmasked, y_masked, "fixture must distinguish mask modes");
+
+        // The cache holds Y's input-form (mask=false) hash.
+        assert_eq!(
+            cache.get("/nix/store/yyy-ca-leaf.drv"),
+            Some(&y_unmasked),
+            "CA-floating input must be hashed with mask_outputs=false"
+        );
+        Ok(())
+    }
+
+    /// `hash_cache` stores only the mask=false form. Computing a
+    /// CA-floating drv's top-level (mask=true) hash must NOT poison the
+    /// cache for later consumers using it as an input.
+    #[test]
+    fn ca_top_level_not_cached_as_input() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let y = ca_floating_leaf();
+        let y_unmasked: [u8; 32] =
+            Sha256::digest(y.to_aterm_modulo(&BTreeMap::new(), false)?.as_bytes()).into();
+
+        let mut cache = HashMap::new();
+        let resolve_none = |_: &str| -> Option<&Derivation> { None };
+        // Top-level call on Y (mask=true since Y is CA-floating).
+        let y_top = hash_derivation_modulo(&y, "/nix/store/yyy.drv", &resolve_none, &mut cache)?;
+        assert_ne!(y_top, y_unmasked, "top-level CA hash is the masked form");
+        // mask=true result must NOT be cached.
+        assert!(
+            !cache.contains_key("/nix/store/yyy.drv"),
+            "mask=true hash must not populate the (mask=false) cache"
+        );
+
+        // Now compute a consumer X depending on Y with the SAME cache.
+        let x = Derivation::parse(
+            r#"Derive([("out","/nix/store/xxx-ia","","")],[("/nix/store/yyy.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ia-x"),("out","/nix/store/xxx-ia"),("system","x86_64-linux")])"#,
+        )?;
+        let resolve =
+            |p: &str| -> Option<&Derivation> { (p == "/nix/store/yyy.drv").then_some(&y) };
+        hash_derivation_modulo(&x, "/nix/store/xxx.drv", &resolve, &mut cache)?;
+        // After recursing, Y's mask=false hash is cached and is the unmasked one.
+        assert_eq!(cache.get("/nix/store/yyy.drv"), Some(&y_unmasked));
+        Ok(())
+    }
+
+    /// Nix C++ `inputs2[h].insert(outputName)` set-unions when two
+    /// inputDrvs collide on modular hash. Last-write-wins drops outputs
+    /// → divergent ATerm → divergent consumer hash.
+    #[test]
+    fn to_aterm_modulo_merges_colliding_rewrite_keys() -> anyhow::Result<()> {
+        let drv = Derivation::parse(
+            r#"Derive([("out","/nix/store/ccc-consumer","","")],[("/nix/store/aaa-libA.drv",["out"]),("/nix/store/bbb-libB.drv",["dev"])],[],"x86_64-linux","/bin/sh",[],[("name","consumer"),("system","x86_64-linux")])"#,
+        )?;
+
+        let h = "d".repeat(64);
+        let mut rewrites = BTreeMap::new();
+        rewrites.insert("/nix/store/aaa-libA.drv".to_string(), h.clone());
+        rewrites.insert("/nix/store/bbb-libB.drv".to_string(), h.clone());
+
+        let result = drv.to_aterm_modulo(&rewrites, false)?;
+
+        // Exactly one inputDrvs entry, with the sorted UNION of output names.
+        assert!(
+            result.contains(&format!(r#"[("{h}",["dev","out"])]"#)),
+            "expected merged sorted-union [dev,out]; got: {result}"
+        );
+        // Neither single-output form should appear (overwrite would leave one).
+        assert!(!result.contains(&format!(r#"("{h}",["dev"])]"#)));
+        assert!(!result.contains(&format!(r#"("{h}",["out"])]"#)));
         Ok(())
     }
 }

@@ -298,15 +298,22 @@ impl Derivation {
         write_aterm_outputs(&mut out, &self.outputs, mask_outputs);
         out.push(',');
 
-        // inputDrvs -- re-sorted by replacement keys
-        let mut replaced_inputs: BTreeMap<&str, &BTreeSet<String>> = BTreeMap::new();
+        // inputDrvs -- re-sorted by replacement keys. Two distinct
+        // input_drvs can map to the SAME modular hash (e.g. FOD aliasing:
+        // same outputHash, different url → identical fingerprint). Nix C++
+        // does `inputs2[h].insert(outputName)` (set-union); we must merge,
+        // not overwrite, or the consumer's hash diverges.
+        let mut replaced_inputs: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for (drv_path, output_names) in &self.input_drvs {
             let new_key = input_rewrites
                 .get(drv_path)
                 .ok_or_else(|| DerivationError::InputNotFound(drv_path.clone()))?;
-            replaced_inputs.insert(new_key.as_str(), output_names);
+            replaced_inputs
+                .entry(new_key.as_str())
+                .or_default()
+                .extend(output_names.iter().cloned());
         }
-        write_aterm_input_drvs(&mut out, replaced_inputs);
+        write_aterm_input_drvs(&mut out, &replaced_inputs);
         out.push(',');
 
         // mask_outputs masks env vars too — see doc comment above.
@@ -711,7 +718,9 @@ mod tests {
 
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
-        assert_eq!(drv.platform(), "x86_64-linux");
+        // system = builtins.currentSystem → host-dependent; the roundtrip
+        // below proves the field is parsed faithfully.
+        assert!(!drv.platform().is_empty());
         assert_eq!(drv.builder(), "/bin/sh");
         assert_eq!(drv.env().get("name").unwrap(), "golden-test");
 
@@ -749,7 +758,8 @@ mod tests {
         assert_eq!(drv.outputs()[0].name(), "out");
         assert!(!drv.input_drvs().is_empty());
         assert_eq!(drv.env().get("pname").unwrap(), "hello");
-        assert_eq!(drv.platform(), "x86_64-linux");
+        // <nixpkgs> -A hello → host-dependent; roundtrip below covers parsing.
+        assert!(!drv.platform().is_empty());
 
         // Roundtrip
         let serialized = drv.to_aterm();
