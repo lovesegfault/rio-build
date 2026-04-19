@@ -421,6 +421,7 @@ pub struct ChunkSeed {
     refcount: i32,
     size: i64,
     age_secs: Option<i64>,
+    uploaded: bool,
 }
 
 impl ChunkSeed {
@@ -430,6 +431,7 @@ impl ChunkSeed {
             refcount: 0,
             size: 0,
             age_secs: None,
+            uploaded: false,
         }
     }
 
@@ -450,18 +452,29 @@ impl ChunkSeed {
         self
     }
 
+    /// Set `uploaded_at = now()`. Default is NULL (the
+    /// `upgrade_manifest_to_chunked` insert state — mid-upload).
+    /// `VerifyChunks` filters `uploaded_at IS NOT NULL`, so a seeded
+    /// row is invisible to that scan unless `.uploaded()` is set.
+    pub fn uploaded(mut self) -> Self {
+        self.uploaded = true;
+        self
+    }
+
     /// INSERT and return the synthesized blake3 hash.
     pub async fn seed(self, pool: &PgPool) -> [u8; 32] {
         let mut hash = [0u8; 32];
         hash[0] = self.tag;
         sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, created_at) \
-             VALUES ($1, $2, $3, now() - make_interval(secs => COALESCE($4, 0)))",
+            "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at) \
+             VALUES ($1, $2, $3, now() - make_interval(secs => COALESCE($4, 0)), \
+                     CASE WHEN $5 THEN now() END)",
         )
         .bind(&hash[..])
         .bind(self.refcount)
         .bind(self.size)
         .bind(self.age_secs)
+        .bind(self.uploaded)
         .execute(pool)
         .await
         .expect("ChunkSeed INSERT failed");

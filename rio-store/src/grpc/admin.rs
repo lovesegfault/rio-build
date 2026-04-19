@@ -265,15 +265,22 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                     return;
                 }
 
-                // deleted = FALSE only: a deleted=true row is awaiting
-                // S3-delete (drain.rs); the object might or might not
-                // be there yet. Either way it's not a verification
-                // target. refcount=0 IS verified — it could be a
-                // mid-upload row (grace TTL), and the object SHOULD
-                // exist once `uploaded_at` is set.
+                // Both lifecycle windows excluded:
+                // - deleted=TRUE → awaiting S3-delete (drain.rs); the
+                //   object might or might not be there yet. Not a
+                //   verification target.
+                // - uploaded_at IS NULL → mid-upload (cas.rs:
+                //   upgrade_manifest_to_chunked inserts NULL → S3 PUT
+                //   → mark_chunks_uploaded sets now()); the object may
+                //   not exist yet. Not a verification target either —
+                //   reporting it as "missing" would be a false
+                //   positive on every in-flight PutPath.
+                // refcount=0 IS verified — once uploaded_at is set the
+                // object SHOULD exist regardless of refcount.
                 let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
                     "SELECT blake3_hash FROM chunks \
-                     WHERE deleted = FALSE AND blake3_hash > $1 \
+                     WHERE deleted = FALSE AND uploaded_at IS NOT NULL \
+                     AND blake3_hash > $1 \
                      ORDER BY blake3_hash LIMIT $2",
                 )
                 .bind(&cursor)
@@ -855,14 +862,29 @@ mod tests {
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Consistent: refcount=1 in PG, present in backend.
-        let h_ok = ChunkSeed::new(0x10).with_refcount(1).seed(&db.pool).await;
+        let h_ok = ChunkSeed::new(0x10)
+            .with_refcount(1)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
         backend
             .put(&h_ok, bytes::Bytes::from_static(b"ok"))
             .await
             .unwrap();
 
         // The I-040 case: refcount=1 in PG, NOT in backend.
-        let h_missing = ChunkSeed::new(0x20).with_refcount(1).seed(&db.pool).await;
+        let h_missing = ChunkSeed::new(0x20)
+            .with_refcount(1)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+
+        // In-flight upload: refcount=1, uploaded_at=NULL, NOT in
+        // backend. MUST be skipped — the cas.rs window between
+        // upgrade_manifest_to_chunked and mark_chunks_uploaded. Tag
+        // 0x08 sorts between 0x05 (deleted) and 0x10 so a buggy WHERE
+        // would scan it.
+        let h_inflight = ChunkSeed::new(0x08).with_refcount(1).seed(&db.pool).await;
 
         // deleted=true in PG → MUST be skipped (it's awaiting drain;
         // backend state is undefined). Tag 0x05 sorts before 0x10 so
@@ -900,12 +922,16 @@ mod tests {
         let p = final_progress.expect("at least one progress frame");
 
         assert!(p.done, "stream ends with done=true");
-        assert_eq!(p.scanned, 2, "deleted=true row excluded");
+        assert_eq!(p.scanned, 2, "deleted + in-flight rows excluded");
         assert_eq!(p.missing, 1);
         assert_eq!(all_missing, vec![h_missing.to_vec()]);
         assert!(
             !all_missing.contains(&h_ok.to_vec()),
             "backend-consistent chunk not flagged"
+        );
+        assert!(
+            !all_missing.contains(&h_inflight.to_vec()),
+            "in-flight (uploaded_at=NULL) chunk not flagged"
         );
     }
 
