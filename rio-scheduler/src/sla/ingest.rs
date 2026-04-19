@@ -318,24 +318,37 @@ fn hw_bias(
 /// 3σ-equivalent under a normal-MAD scale (1.4826·MAD ≈ σ for normal
 /// data). The MAD is floored at `sigma_resid / 1.4826` (so a near-zero
 /// MAD on a tight fit doesn't reject everything) and at the relative
-/// poll-granularity `dt_poll / sample_t` (a 1s cgroup poll on a 10s
-/// build is ±10% noise on its own; don't call that an outlier).
+/// poll-granularity `dt_poll / wall_t` (both wall-seconds → hw-invariant:
+/// a 1s cgroup poll on a 10s build is ±10% noise on its own; don't call
+/// that an outlier).
+///
+/// `ref_t` is the hw-normalized reference-seconds duration (matching
+/// `fit`'s curve); `wall_t` is the raw wall-clock duration. The
+/// log-residual needs the former; the poll-granularity floor needs the
+/// latter — keeping both explicit prevents the unit mismatch that
+/// `c6163485` left behind.
 ///
 /// Gated on `n_eff ≥ 5`: with fewer effective samples MAD is unstable
 /// and the explore ladder is still walking — rejecting then would
 /// throw away exactly the diversity the fit needs.
 // r[impl sched.sla.outlier-mad-reject]
-pub fn is_outlier(sample_t: f64, sample_c: f64, fit: &FittedParams, dt_poll: f64) -> bool {
+pub fn is_outlier(
+    ref_t: f64,
+    wall_t: f64,
+    sample_c: f64,
+    fit: &FittedParams,
+    dt_poll: f64,
+) -> bool {
     if fit.n_eff < 5.0 || fit.log_residuals.is_empty() {
         return false;
     }
     let predicted = fit.fit.t_at(RawCores(sample_c)).0;
-    if !predicted.is_finite() || predicted <= 0.0 || sample_t <= 0.0 {
+    if !predicted.is_finite() || predicted <= 0.0 || ref_t <= 0.0 {
         return false;
     }
-    let log_resid = (sample_t / predicted).ln().abs();
+    let log_resid = (ref_t / predicted).ln().abs();
     let mad = median_abs_dev(&fit.log_residuals);
-    let floor = (fit.sigma_resid / 1.4826).max(dt_poll / sample_t);
+    let floor = (fit.sigma_resid / 1.4826).max(dt_poll / wall_t);
     log_resid > 3.0 * 1.4826 * mad.max(floor)
 }
 
@@ -1002,9 +1015,16 @@ mod tests {
         let pred = fit.fit.t_at(RawCores(8.0)).0;
         // 10× predicted → ln(10)≈2.3 absolute log-resid. 5% noise gives
         // MAD ~0.03; gate = 3·1.4826·max(MAD, σ/1.4826) ≈ 3σ ≈ 0.15.
-        assert!(is_outlier(pred * 10.0, 8.0, &fit, 1.0), "10× → flagged");
+        // factor=1 here (test data are reference-seconds) → ref_t==wall_t.
+        assert!(
+            is_outlier(pred * 10.0, pred * 10.0, 8.0, &fit, 1.0),
+            "10× → flagged"
+        );
         // 1.2× predicted → ln(1.2)≈0.18, borderline; 1.05× must pass.
-        assert!(!is_outlier(pred * 1.05, 8.0, &fit, 1.0), "5% → kept");
+        assert!(
+            !is_outlier(pred * 1.05, pred * 1.05, 8.0, &fit, 1.0),
+            "5% → kept"
+        );
     }
 
     #[test]
@@ -1013,19 +1033,19 @@ mod tests {
         fit.n_eff = 4.0;
         let pred = fit.fit.t_at(RawCores(8.0)).0;
         assert!(
-            !is_outlier(pred * 10.0, 8.0, &fit, 1.0),
+            !is_outlier(pred * 10.0, pred * 10.0, 8.0, &fit, 1.0),
             "n_eff=4 → never flag"
         );
         // No residuals (Probe fit) → never flag regardless of n_eff.
         fit.n_eff = 10.0;
         fit.log_residuals.clear();
-        assert!(!is_outlier(pred * 10.0, 8.0, &fit, 1.0));
+        assert!(!is_outlier(pred * 10.0, pred * 10.0, 8.0, &fit, 1.0));
     }
 
     #[test]
     fn mad_floor_from_dt_poll() {
         // Perfect fit (zero MAD, zero σ) → floor must come from
-        // dt_poll/sample_t. At c=8 predicted=280; dt_poll=28 → floor=0.1,
+        // dt_poll/wall_t. At c=8 predicted=280; dt_poll=28 → floor=0.1,
         // gate = 3·1.4826·0.1 ≈ 0.44.
         let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
             .into_iter()
@@ -1036,10 +1056,42 @@ mod tests {
         assert!(fit.n_eff >= 5.0, "n_eff={}", fit.n_eff);
         let pred = fit.fit.t_at(RawCores(8.0)).0; // ≈ 280
         // ln(1.3)≈0.26 < 0.44 → kept; ln(2)≈0.69 > 0.44 → flagged.
-        assert!(!is_outlier(pred * 1.3, 8.0, &fit, 28.0));
-        assert!(is_outlier(pred * 2.0, 8.0, &fit, 28.0));
+        assert!(!is_outlier(pred * 1.3, pred * 1.3, 8.0, &fit, 28.0));
+        assert!(is_outlier(pred * 2.0, pred * 2.0, 8.0, &fit, 28.0));
         // dt_poll=0 → floor 0 → near-zero gate → 1.3× IS flagged.
-        assert!(is_outlier(pred * 1.3, 8.0, &fit, 0.0));
+        assert!(is_outlier(pred * 1.3, pred * 1.3, 8.0, &fit, 0.0));
+    }
+
+    // r[verify sched.sla.outlier-mad-reject]
+    #[test]
+    fn mad_floor_is_hw_invariant() {
+        // The dt_poll floor is a wall-second ÷ wall-second ratio, so the
+        // outlier verdict must be identical for any hw_factor. Perfect
+        // fit (zero σ/MAD), wall_t=5s, dt_poll=1s → floor=0.2, gate≈0.89.
+        let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .map(|c| row(c, 30.0 + 2000.0 / c))
+            .collect();
+        let fit = r(&rows);
+        assert!(fit.sigma_resid < 1e-3, "perfect fit");
+        let pred = fit.fit.t_at(RawCores(8.0)).0;
+        let wall_t = 5.0;
+        let dt_poll = 1.0;
+        for factor in [1.0, 3.0, 0.5] {
+            // Residual fixed at ln(1.5)≈0.405 / ln(3)≈1.10; floor sees
+            // wall_t directly so the verdict is the same for any
+            // hw_factor the caller used to derive ref_t. Under the
+            // c6163485 residual (dt_poll ÷ ref_t) the floor was off by
+            // `factor×` and the 1.5× sample flipped at factor>2.
+            assert!(
+                !is_outlier(pred * 1.5, wall_t, 8.0, &fit, dt_poll),
+                "factor={factor}: ln(1.5)≈0.405 < gate≈0.89 → kept"
+            );
+            assert!(
+                is_outlier(pred * 3.0, wall_t, 8.0, &fit, dt_poll),
+                "factor={factor}: ln(3)≈1.10 > gate≈0.89 → flagged"
+            );
+        }
     }
 
     #[test]

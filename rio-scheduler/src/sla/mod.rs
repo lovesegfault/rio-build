@@ -373,7 +373,7 @@ impl SlaEstimator {
                     // |ln(1/factor)|.
                     let ref_t = hw_snapshot.normalize(r.duration_secs, r.hw_class.as_deref());
                     if let Some(c) = r.cpu_limit_cores
-                        && ingest::is_outlier(ref_t, c, prev, DT_POLL_SECS)
+                        && ingest::is_outlier(ref_t, r.duration_secs, c, prev, DT_POLL_SECS)
                     {
                         outlier_ids.insert(r.id);
                         metrics::outlier_rejected(&key.tenant);
