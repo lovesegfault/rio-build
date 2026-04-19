@@ -324,12 +324,19 @@ impl DagActor {
                 // registered workers of the right kind but none
                 // eligible, the freeze detectors above don't fire
                 // (they key on stream_count==0), and the drv silently
-                // defers forever. Dump per-worker rejection_reason at
-                // INFO so `kubectl logs` names the gate. Sized for
-                // small-N flake debugging — at scale (100s of workers)
-                // the .map().collect() allocates per-tick; if that
-                // becomes a problem, gate on a counter.
-                if let Some(state) = self.dag.node(&drv_hash) {
+                // defers forever. Dump per-worker rejection_reason so
+                // `RUST_LOG=rio_scheduler=debug` names the gate.
+                //
+                // debug!, not info!: under ADR-023's one-shot-pod
+                // ramp-up, N drvs sit Ready while N pods register
+                // serially → ~N² emissions (every deferred drv on
+                // every dispatch_ready pass), each carrying an M-entry
+                // vec. INFO floods kubectl logs and buries the
+                // freeze-detector WARN. The same diagnostic is
+                // available on demand via InspectBuildDag.
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && let Some(state) = self.dag.node(&drv_hash)
+                {
                     let reasons: Vec<_> = self
                         .executors
                         .values()
@@ -342,7 +349,7 @@ impl DagActor {
                         })
                         .collect();
                     if !reasons.is_empty() {
-                        tracing::info!(
+                        tracing::debug!(
                             drv_hash = %drv_hash,
                             ?reasons,
                             "no eligible executor; per-worker rejection reasons"

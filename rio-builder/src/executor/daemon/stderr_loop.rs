@@ -1130,12 +1130,12 @@ mod tests {
             BuildStatus::Built,
             "rate limit drops lines, does NOT abort the build"
         );
-        // 5 buffered, 5 dropped. No marker — window never reset (test
-        // completes in <1s).
+        // 5 buffered, 5 dropped → final_flush emits the suppression marker
+        // even though the window never reset (test completes in <1s).
         assert_eq!(
             count_log_lines(&batches),
-            5,
-            "5 lines accepted within rate window; 5 dropped"
+            6,
+            "5 lines accepted + 1 suppression marker on final flush"
         );
         Ok(())
     }
@@ -1436,7 +1436,11 @@ mod tests {
 
         let br = result.expect("rate suppression is not a failure");
         assert_eq!(br.status, BuildStatus::Built);
-        assert_eq!(count_log_lines(&batches), 5, "5 within rate, 5 dropped");
+        assert_eq!(
+            count_log_lines(&batches),
+            6,
+            "5 within rate + 1 suppression marker on final flush"
+        );
         Ok(())
     }
 }

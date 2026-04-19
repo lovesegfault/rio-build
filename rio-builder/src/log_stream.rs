@@ -200,7 +200,26 @@ impl LogBatcher {
     }
 
     /// Flush any remaining lines as a final batch.
+    ///
+    /// Drains `lines_dropped_this_window` first: a build whose final burst
+    /// exceeds the rate and then exits within the same 1s window never
+    /// triggers `add_line()`'s window-reset, so the suppression marker +
+    /// metric would otherwise be lost (silent truncation, undercounted
+    /// `rio_builder_log_lines_suppressed_total`). All exit paths
+    /// (`STDERR_LAST`, `LimitExceeded`, silence-timeout, `BatchReady`) go
+    /// through here.
     pub fn flush(&mut self) -> BuildLogBatch {
+        let dropped = std::mem::take(&mut self.lines_dropped_this_window);
+        if dropped > 0 {
+            metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
+            let marker = format!(
+                "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
+                self.limits.rate_lines_per_sec
+            )
+            .into_bytes();
+            self.total_bytes += marker.len() as u64;
+            self.lines.push(marker);
+        }
         let first_line_number = self.next_line_number;
         self.next_line_number += self.lines.len() as u64;
 
@@ -214,12 +233,13 @@ impl LogBatcher {
         }
     }
 
-    /// Whether there are any buffered lines.
+    /// Whether there are any buffered lines or an unreported suppression
+    /// count.
     ///
     /// Used by `executor/daemon/stderr_loop.rs` to decide whether to
     /// `flush()` before sending the final batch on stream close.
     pub fn has_pending(&self) -> bool {
-        !self.lines.is_empty()
+        !self.lines.is_empty() || self.lines_dropped_this_window > 0
     }
 }
 
@@ -339,8 +359,33 @@ mod tests {
             }
         }
         let batch = batcher.flush();
-        assert_eq!(batch.lines.len(), 5, "5 buffered, 5 dropped");
+        assert_eq!(batch.lines.len(), 6, "5 buffered + 1 suppression marker");
         assert_eq!(batch.lines[4], vec![4u8], "last buffered is index 4");
+        let marker = std::str::from_utf8(&batch.lines[5]).unwrap();
+        assert!(
+            marker.contains("5 lines suppressed"),
+            "flush() emits marker for drops never followed by window-reset: {marker}"
+        );
+    }
+
+    /// Regression: build ends within the suppression window → flush() must
+    /// emit the marker (was lost: only add_line()'s window-reset drained it).
+    #[test]
+    fn rate_limit_flush_emits_marker_when_build_ends_in_window() {
+        let mut batcher = mk(LogLimits {
+            rate_lines_per_sec: 3,
+            total_bytes: 0,
+        });
+        for _ in 0..7 {
+            batcher.add_line(b"l".to_vec());
+        }
+        // No sleep, no further add_line — straight to final flush.
+        assert!(batcher.has_pending(), "has_pending sees unreported drops");
+        let batch = batcher.flush();
+        assert_eq!(batch.lines.len(), 4, "3 accepted + 1 marker");
+        let marker = std::str::from_utf8(&batch.lines[3]).unwrap();
+        assert!(marker.contains("4 lines suppressed"));
+        assert!(!batcher.has_pending(), "drained after flush");
     }
 
     #[test]

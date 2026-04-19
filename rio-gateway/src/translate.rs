@@ -347,6 +347,60 @@ pub fn validate_dag(
 ///
 /// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
 /// predicate (single `out` with both `hash_algo` AND `hash` set) —
+/// `__structuredAttrs`-aware env lookup, mirroring Nix's
+/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
+///
+/// When a derivation sets `__structuredAttrs = true`, Nix's
+/// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
+/// they do NOT appear as separate env keys. Direct `env.get("foo")`
+/// returns None, so the ADR-023 sizing hints (and pre-existing
+/// `requiredSystemFeatures`) were always None for structuredAttrs drvs.
+/// JSON is checked first, then raw env, matching upstream semantics.
+struct StructuredEnv<'a> {
+    env: &'a std::collections::BTreeMap<String, String>,
+    json: Option<serde_json::Value>,
+}
+
+impl<'a> StructuredEnv<'a> {
+    fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
+        let json = env.get("__json").and_then(|s| serde_json::from_str(s).ok());
+        Self { env, json }
+    }
+
+    fn string(&self, key: &str) -> Option<String> {
+        self.json
+            .as_ref()
+            .and_then(|j| j.get(key)?.as_str().map(String::from))
+            .or_else(|| self.env.get(key).cloned())
+    }
+
+    fn bool(&self, key: &str) -> Option<bool> {
+        self.json
+            .as_ref()
+            .and_then(|j| j.get(key)?.as_bool())
+            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
+    }
+
+    fn strings(&self, key: &str) -> Option<Vec<String>> {
+        self.json
+            .as_ref()
+            .and_then(|j| {
+                Some(
+                    j.get(key)?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                )
+            })
+            .or_else(|| {
+                self.env
+                    .get(key)
+                    .map(|s| s.split_whitespace().map(String::from).collect())
+            })
+    }
+}
+
 /// matches the worker's strict recompute at executor/mod.rs:344.
 // r[impl sched.ca.detect]
 // Both CA kinds: floating (hash_algo set, hash empty) and
@@ -358,7 +412,7 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         .iter()
         .map(|o| (o.name().to_string(), o.path().to_string()))
         .unzip();
-    let env = drv.env();
+    let env = StructuredEnv::new(drv.env());
     types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Input-addressed derivations use the store path as the drv_hash.
@@ -372,24 +426,18 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // LESS stable key (hello-2.12 vs hello-2.13 are different
         // rows), but some history beats none.
         pname: env
-            .get("pname")
-            .or_else(|| env.get("name"))
-            .cloned()
+            .string("pname")
+            .or_else(|| env.string("name"))
             .unwrap_or_default(),
         // ADR-023 sizing attrs. Nix bool env values are "1"/"" (older
         // stdenv) or "true"/"false" (newer). Absent stays None — for
         // enableParallelBuilding in particular, absent ≠ false (nixpkgs
         // is migrating to default-true; None means "unknown, explore").
-        version: env.get("version").cloned(),
-        enable_parallel_building: env
-            .get("enableParallelBuilding")
-            .map(|v| v == "1" || v == "true"),
-        prefer_local_build: env.get("preferLocalBuild").map(|v| v == "1" || v == "true"),
+        version: env.string("version"),
+        enable_parallel_building: env.bool("enableParallelBuilding"),
+        prefer_local_build: env.bool("preferLocalBuild"),
         system: drv.platform().to_string(),
-        required_features: env
-            .get("requiredSystemFeatures")
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default(),
+        required_features: env.strings("requiredSystemFeatures").unwrap_or_default(),
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
@@ -803,6 +851,51 @@ mod tests {
         let node = build_node("/nix/store/x.drv", &drv);
         assert_eq!(node.enable_parallel_building, Some(false));
         assert_eq!(node.prefer_local_build, Some(false));
+        Ok(())
+    }
+
+    /// `__structuredAttrs = true` derivations have their user attrs in
+    /// `env["__json"]` only, not as separate env keys. Without the
+    /// __json fallback, all five hints (pname/version/epb/plb/features)
+    /// were always None → structuredAttrs builds got the full probe
+    /// shape instead of the minimal-pod / serial-pin paths.
+    #[test]
+    fn test_extracts_adr023_attrs_from_structured_attrs() -> anyhow::Result<()> {
+        let mut env = BTreeMap::new();
+        // What Nix actually writes: name + __structuredAttrs flag + the
+        // JSON blob. No top-level pname/version/enableParallelBuilding.
+        env.insert("name".into(), "foo-1.0".into());
+        env.insert("__structuredAttrs".into(), "1".into());
+        env.insert(
+            "__json".into(),
+            serde_json::json!({
+                "pname": "foo",
+                "version": "1.0",
+                "enableParallelBuilding": false,
+                "preferLocalBuild": true,
+                "requiredSystemFeatures": ["kvm", "big-parallel"],
+            })
+            .to_string(),
+        );
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.pname, "foo", "pname from __json, not name fallback");
+        assert_eq!(node.version.as_deref(), Some("1.0"));
+        assert_eq!(
+            node.enable_parallel_building,
+            Some(false),
+            "JSON bool false → Some(false), not None"
+        );
+        assert_eq!(node.prefer_local_build, Some(true));
+        assert_eq!(node.required_features, vec!["kvm", "big-parallel"]);
+
+        // Malformed __json → falls through to raw env (no panic).
+        let mut env = BTreeMap::new();
+        env.insert("__json".into(), "{not json".into());
+        env.insert("version".into(), "2.0".into());
+        let drv = make_basic_drv(env)?;
+        let node = build_node("/nix/store/x.drv", &drv);
+        assert_eq!(node.version.as_deref(), Some("2.0"));
         Ok(())
     }
 
