@@ -41,7 +41,6 @@ rio-crds = { path = "rio-crds" }
 
 # Byte buffers
 bytes = "1"
-crc32fast = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

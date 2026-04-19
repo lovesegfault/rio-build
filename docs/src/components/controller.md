@@ -135,7 +135,7 @@ scheduler computes `deadline_secs` per-derivation (D7): for fitted
 keys, `wall_p99 * 5` at the solved core count; for unfitted
 (probe/explore), `[sla].probe.deadline_secs`; both clamped
 `[resource_floor.deadline_secs, 86400]`. `SlaConfig::validate`
-enforces `probe.deadline_secs >= 60`, so the intent value is always
+enforces `probe.deadline_secs >= 180`, so the intent value is always
 positive --- the controller has no per-kind fallback. A
 `DeadlineExceeded` kill triggers `r[ctrl.terminated.deadline-exceeded]`
 -> `bump_floor_or_count` doubles `floor.deadline_secs` -> the next

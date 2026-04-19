@@ -4,7 +4,7 @@
 //! apiserver, so they report `spec.nodeName` (downward API) and the
 //! controller joins to Node labels server-side when ingesting build
 //! completion samples. `hw_class = "{manufacturer}-{generation}-
-//! {storage}"` from Karpenter-provisioned + rio.build labels.
+//! {storage}-{band}"` from Karpenter-provisioned + rio.build labels.
 //!
 //! Node-gone-at-ingest → [`NodeLabelCache::hw_class_of`] returns
 //! `None` and the sample's `hw_class` stays NULL. This is expected
@@ -21,7 +21,7 @@
 //! # Why not `reflector::store()`
 //!
 //! The reflector store caches full `Node` objects (status, conditions,
-//! images list — kilobytes each). We need three label strings. A
+//! images list — kilobytes each). We need four label strings. A
 //! hand-rolled `HashMap<String, HwClass>` is the lightweight version.
 
 use std::collections::{HashMap, HashSet};
