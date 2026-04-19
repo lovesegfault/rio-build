@@ -25,7 +25,7 @@
 //! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
 //! only if a third breaker appears.
 //
-// r[impl builder.fuse.circuit-breaker+2]
+// r[impl builder.fuse.circuit-breaker+3]
 
 use std::sync::Mutex;
 
@@ -42,7 +42,7 @@ use fuser::Errno;
 
 /// Time source for the breaker. Production uses [`SystemClock`];
 /// tests inject a mock so the state-transition tests don't need
-/// real 30s/90s sleeps.
+/// real 30s/720s sleeps.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
@@ -243,16 +243,24 @@ impl<C: Clock> CircuitBreaker<C> {
             // returns 0) but that's 4 billion consecutive failures —
             // not reachable in practice.
             let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= self.threshold {
-                let now = self.clock.now();
-                let mut guard = self.open.lock().ignore_poison();
-                // Refresh `since` UNCONDITIONALLY:
-                //   closed    → opens (since: None → Some(now))
-                //   open      → stays open (timer refresh is harmless)
-                //   half-open → RE-opens with FRESH 30s timer (stale
-                //               Some → fresh Some) — the probe failed
-                // The `already_open` check gates the log/metric (one per
-                // transition, not one per failure-while-open), not state.
+            let now = self.clock.now();
+            let mut guard = self.open.lock().ignore_poison();
+            // Refresh `since` when EITHER threshold is reached OR a
+            // half-open probe failed (since already Some). The wall-clock
+            // trip opens at cf=1; without the `since.is_some()` arm, a
+            // failed probe at cf 1→2<5 leaves `since` stale → next
+            // `check()` is half-open again → 4 failed probes pass before
+            // re-open, with `is_open()` lying false throughout (heartbeat
+            // reports `store_degraded=false` to a degraded worker).
+            //
+            //   closed    → opens (since: None → Some(now)) iff n≥threshold
+            //   open      → stays open (timer refresh is harmless)
+            //   half-open → RE-opens with FRESH 30s timer (stale
+            //               Some → fresh Some) — the probe failed
+            //
+            // The `already_open` check gates the log/metric (one per
+            // transition, not one per failure-while-open), not state.
+            if n >= self.threshold || guard.since.is_some() {
                 let already_open = guard
                     .since
                     .is_some_and(|t| now.duration_since(t) < self.auto_close_after);
@@ -309,7 +317,7 @@ mod tests {
         }
     }
 
-    /// 5/30s/90s, matching production defaults. Clock owned by the breaker;
+    /// 5/30s/720s, matching production defaults. Clock owned by the breaker;
     /// tests advance it via `b.clock.advance(...)`.
     fn breaker() -> CircuitBreaker<MockClock> {
         CircuitBreaker::with_clock(
@@ -322,7 +330,7 @@ mod tests {
 
     // ── Trip condition (a): consecutive-failure threshold ─────────────
 
-    // r[verify builder.fuse.circuit-breaker+2]
+    // r[verify builder.fuse.circuit-breaker+3]
     #[test]
     fn four_failures_stay_closed() {
         let b = breaker();
@@ -430,7 +438,7 @@ mod tests {
     fn wall_clock_trip_needs_prior_success() {
         let b = breaker();
         // Never recorded a success → last_success is None → wall-clock
-        // trip can't fire. Advance way past 90s; still closed.
+        // trip can't fire. Advance way past 720s; still closed.
         b.clock.advance(Duration::from_secs(1000));
         assert!(b.check().is_ok(), "no prior success: can't wall-clock-trip");
         assert!(!b.is_open());
@@ -462,7 +470,7 @@ mod tests {
         b.clock.advance(Duration::from_secs(800));
         assert!(
             b.check().is_ok(),
-            "180s idle with 0 failures: store is idle, not degraded"
+            "800s idle with 0 failures: store is idle, not degraded"
         );
         assert!(!b.is_open());
 
@@ -509,14 +517,20 @@ mod tests {
         assert!(b.check().is_ok(), "fresh last_success: closed");
     }
 
+    /// `record(true)` refreshes `last_success`. With the refresh,
+    /// 700s-since-last-success < 720s → closed. Without it (mutation:
+    /// delete the `last_success` write in `record(true)`), 1400s > 720s
+    /// AND cf=1 → trip → this test fails.
     #[test]
     fn success_refreshes_wall_clock() {
         let b = breaker();
         b.record(true);
-        b.clock.advance(Duration::from_secs(80));
-        b.record(true); // refresh last_success
-        b.clock.advance(Duration::from_secs(80)); // 160s total, but 80s since refresh
-        assert!(b.check().is_ok(), "80s since last success: closed");
+        b.record(false); // arm the wall-clock gate (cf>0)
+        b.clock.advance(Duration::from_secs(700));
+        b.record(true); // refresh last_success; cf→0
+        b.record(false); // re-arm
+        b.clock.advance(Duration::from_secs(700)); // 1400s total, 700s since refresh
+        assert!(b.check().is_ok(), "700s since last success: closed");
     }
 
     // ── Half-open single-probe gate (bug_035) ─────────────────────────
@@ -529,7 +543,7 @@ mod tests {
     ///
     /// `Barrier` ensures all N threads enter `check()` after the
     /// half-open transition; exactly one must get `Ok`.
-    // r[verify builder.fuse.circuit-breaker+2]
+    // r[verify builder.fuse.circuit-breaker+3]
     #[test]
     fn half_open_admits_exactly_one_concurrent_probe() {
         const N: usize = 8;
@@ -584,11 +598,12 @@ mod tests {
 
     /// Regression: `record()` MUST clear `probing` even when
     /// `n < threshold`. Wall-clock trip opens at cf=1; half-open probe
-    /// fails → cf=2<5 → the `n>=threshold` arm in `record(false)` is
-    /// NOT taken. If `probing` were only cleared inside that arm, every
-    /// subsequent half-open `check()` would see `probing=true` → EIO
-    /// forever (permanent stuck circuit). The unconditional clear at
-    /// the top of `record()` is load-bearing for this path.
+    /// fails → cf=2<5. If `probing` were only cleared inside the
+    /// `n>=threshold` arm, the NEXT half-open cycle's `check()` would
+    /// see `probing=true` → EIO forever. The unconditional clear at the
+    /// top of `record()` is load-bearing for this path. (After the
+    /// re-open fix, the next cycle is 30s later — but the gate must
+    /// still be clear when it arrives.)
     #[test]
     fn wall_clock_trip_probe_failure_below_threshold_clears_gate() {
         let b = breaker();
@@ -601,13 +616,49 @@ mod tests {
         assert!(b.check().is_ok(), "half-open: probe claimed");
         assert!(b.check().is_err(), "concurrent: gated");
 
-        b.record(false); // cf=2 < 5 — does NOT hit the threshold arm
-        // `since` unchanged (still stale-half-open); `probing` cleared.
+        b.record(false); // cf=2 < 5 — probe failed → re-open + clear gate
+        assert!(b.is_open(), "probe-fail re-opens (fresh 30s timer)");
+        assert!(b.check().is_err(), "re-opened: fail fast");
+
+        b.clock.advance(Duration::from_secs(31));
         assert!(
             b.check().is_ok(),
-            "cf<threshold probe failure clears gate; next check admits one"
+            "next cycle: gate cleared, one probe admitted"
         );
         assert!(b.check().is_err(), "and gates the second");
+    }
+
+    /// bug_055: wall-clock trip opens at cf=1. After half-open, a failed
+    /// probe (cf 1→2<5) MUST re-open with a fresh 30s timer — NOT leave
+    /// `since` stale (which makes `is_open()` lie false and admits four
+    /// more probes against a degraded store before re-open). The module
+    /// doc promises "re-opens (fresh 30s timer) on failure"; before the
+    /// fix that only held when n≥threshold.
+    #[test]
+    fn wall_clock_trip_half_open_probe_failure_reopens() {
+        let b = breaker();
+        b.record(true);
+        b.record(false); // cf=1, arms wall-clock
+        b.clock.advance(Duration::from_secs(721));
+        assert!(b.check().is_err(), "wall-clock trip");
+
+        b.clock.advance(Duration::from_secs(31));
+        assert!(b.check().is_ok(), "half-open: probe allowed");
+
+        b.record(false); // cf=2<5 — probe failed
+        assert!(
+            b.is_open(),
+            "probe-fail at cf<threshold MUST re-open; before bug_055 \
+             fix `since` stayed stale → is_open() returned false → \
+             heartbeat lied store_degraded=false"
+        );
+        assert!(b.check().is_err(), "re-opened: fail fast");
+
+        // Fresh 30s timer from the probe failure.
+        b.clock.advance(Duration::from_secs(29));
+        assert!(b.check().is_err(), "29s after re-open: still open");
+        b.clock.advance(Duration::from_secs(2));
+        assert!(b.check().is_ok(), "31s after re-open: half-open again");
     }
 
     /// `record(true)` clears `probing` and closes — subsequent `check()`
