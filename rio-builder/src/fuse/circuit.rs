@@ -216,15 +216,23 @@ impl<C: Clock> CircuitBreaker<C> {
     ///
     /// Pure sync — no `.await`.
     pub fn record(&self, ok: bool) {
+        // The half-open probe (if this thread was it) is over — clear
+        // the gate UNCONDITIONALLY: regardless of `ok`, regardless of
+        // `n >= threshold`. A wall-clock-trip open at cf<threshold whose
+        // probe fails would otherwise leave `probing` set forever
+        // (cf=2<5 → the `n>=threshold` arm below isn't taken → no other
+        // place clears it → permanent EIO). Harmless when this thread
+        // wasn't the probe. Not RAII-guarded: a panic between `check()`
+        // and here would leak the gate, but the fetch path between them
+        // (`fetch_extract_insert`) is network+fs I/O that returns Err,
+        // not panics; fuser also catches callback panics.
+        self.open.lock().ignore_poison().probing = false;
+
         if ok {
             self.consecutive_failures.store(0, Ordering::Relaxed);
             *self.last_success.lock().ignore_poison() = Some(self.clock.now());
-            // Clear since + probing atomically; report whether we WERE open.
-            let was_open = {
-                let mut g = self.open.lock().ignore_poison();
-                g.probing = false;
-                g.since.take().is_some()
-            };
+            // take(): clear + return whether we WERE open, atomically.
+            let was_open = self.open.lock().ignore_poison().since.take().is_some();
             if was_open {
                 metrics::gauge!("rio_builder_fuse_circuit_open").set(0.0);
                 tracing::info!("FUSE circuit breaker CLOSING — store recovered");
@@ -248,10 +256,6 @@ impl<C: Clock> CircuitBreaker<C> {
                 let already_open = guard
                     .since
                     .is_some_and(|t| now.duration_since(t) < self.auto_close_after);
-                // Clear probing: the half-open probe (if this was it)
-                // has resolved; the next half-open cycle may admit a
-                // fresh one. Also harmless on the closed/open paths.
-                guard.probing = false;
                 guard.since = Some(now);
                 if !already_open {
                     metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
@@ -576,6 +580,34 @@ mod tests {
         b.clock.advance(Duration::from_secs(31));
         assert!(b.check().is_ok(), "next cycle: one probe admitted again");
         assert!(b.check().is_err(), "next cycle: second check gated");
+    }
+
+    /// Regression: `record()` MUST clear `probing` even when
+    /// `n < threshold`. Wall-clock trip opens at cf=1; half-open probe
+    /// fails → cf=2<5 → the `n>=threshold` arm in `record(false)` is
+    /// NOT taken. If `probing` were only cleared inside that arm, every
+    /// subsequent half-open `check()` would see `probing=true` → EIO
+    /// forever (permanent stuck circuit). The unconditional clear at
+    /// the top of `record()` is load-bearing for this path.
+    #[test]
+    fn wall_clock_trip_probe_failure_below_threshold_clears_gate() {
+        let b = breaker();
+        b.record(true); // last_success = now
+        b.record(false); // cf=1, arms wall-clock
+        b.clock.advance(Duration::from_secs(721));
+        assert!(b.check().is_err(), "wall-clock trip opens at cf=1");
+
+        b.clock.advance(Duration::from_secs(31));
+        assert!(b.check().is_ok(), "half-open: probe claimed");
+        assert!(b.check().is_err(), "concurrent: gated");
+
+        b.record(false); // cf=2 < 5 — does NOT hit the threshold arm
+        // `since` unchanged (still stale-half-open); `probing` cleared.
+        assert!(
+            b.check().is_ok(),
+            "cf<threshold probe failure clears gate; next check admits one"
+        );
+        assert!(b.check().is_err(), "and gates the second");
     }
 
     /// `record(true)` clears `probing` and closes — subsequent `check()`
