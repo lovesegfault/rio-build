@@ -19,17 +19,29 @@
 # sleepSecs=8 and 3 steps, build-1 takes ~24s serial. Build-2 with
 # cutoff working: A rebuilds (~8s), B+C skip → <15s total.
 #
-# The `iaFinal` arg swaps the FINAL step to input-addressed while
-# A and B stay floating-CA. This is the GAP-2 / ia.deferred case
-# from ADR-018 Appendix B: an IA derivation depending on a CA input
-# has that input's placeholder embedded in env/args, so the scheduler
-# must resolve it at dispatch (the gateway's needs_resolve detection
-# fires on any-inputDrv-is-floating-CA, not just self-is-CA).
+# The `iaLevels` arg stacks N input-addressed steps ABOVE the CA chain
+# (A and B always stay floating-CA). This is the GAP-2 / ia.deferred
+# case from ADR-018 Appendix B: an IA derivation depending on a CA
+# input has that input's placeholder embedded in env/args, so the
+# scheduler must resolve it at dispatch.
+#
+#   iaLevels=0 → A→B→C all floating-CA (default; cutoff test).
+#   iaLevels=1 → A→B→C with C input-addressed (1-level ia.deferred).
+#   iaLevels=2 → A→B→C→D with C and D input-addressed. CppNix's
+#     derivationStrict makes BOTH C and D deferred-IA (empty output
+#     path); D's child C is NOT floating-CA, so the gateway's
+#     needs_resolve detection must check has_unknown_output_paths
+#     (any empty path), not has_ca_floating_outputs (algo set + hash
+#     empty), or D dispatches with an unresolved /1<hash> placeholder.
+#
+# `iaFinal` is a deprecated alias for `iaLevels=1` (kept until callers
+# migrate).
 {
   busybox,
   marker ? "caa",
   sleepSecs ? 8,
   iaFinal ? false,
+  iaLevels ? (if iaFinal then 1 else 0),
 }:
 let
   inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
@@ -84,11 +96,16 @@ let
 
   a = mkStep "rio-ca-a" null true;
   b = mkStep "rio-ca-b" a true;
-  # iaFinal=true → C is input-addressed but depends on floating-CA B.
+  # iaLevels>=1 → C is input-addressed but depends on floating-CA B.
   # B's output path is a placeholder in C's env until the scheduler's
   # maybe_resolve_ca rewrites it (gated on needs_resolve, set by the
-  # gateway when any inputDrv is floating-CA). Without that rewrite,
-  # C's `cat ${b}/chain` references a nonexistent `/1rlll...` path.
-  c = mkStep (if iaFinal then "rio-ia-c" else "rio-ca-c") b (!iaFinal);
+  # gateway when any inputDrv has an unknown output path). Without that
+  # rewrite, C's `cat ${b}/chain` references a nonexistent `/1rlll...`
+  # path.
+  c = mkStep (if iaLevels >= 1 then "rio-ia-c" else "rio-ca-c") b (iaLevels < 1);
+  # iaLevels>=2 → D is input-addressed depending on input-addressed
+  # deferred C. D's child is NOT floating-CA — regression target for
+  # populate_needs_resolve's has_unknown_output_paths predicate.
+  d = mkStep "rio-ia-d" c false;
 in
-c
+if iaLevels >= 2 then d else c

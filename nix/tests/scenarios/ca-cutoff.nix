@@ -46,10 +46,11 @@ pkgs.testers.runNixOSTest {
 
     store_url = "ssh-ng://${gatewayHost}"
 
-    def build_ca_chain(marker):
-        """Build the floating-CA A→B→C chain. marker goes into the
-        ATerm env (distinct drv hashes across calls) but NOT into
-        $out/chain (identical nar_hash → cutoff fires). --impure for
+    def build_ca_chain(marker, ia_levels=0, sleep_secs=8):
+        """Build the A→B→C[→D] chain. marker goes into the ATerm env
+        (distinct drv hashes across calls) but NOT into $out/chain
+        (identical nar_hash → cutoff fires). ia_levels>0 stacks that
+        many input-addressed steps on top (ia.deferred). --impure for
         builtins.currentSystem in ca-chain.nix."""
         try:
             return client.succeed(
@@ -57,6 +58,8 @@ pkgs.testers.runNixOSTest {
                 f"--store '{store_url}' "
                 "--arg busybox '(builtins.storePath ${common.busybox})' "
                 f"--argstr marker '{marker}' "
+                f"--arg iaLevels {ia_levels} "
+                f"--arg sleepSecs {sleep_secs} "
                 "${drvs.caChain} 2>&1"
             )
         except Exception:
@@ -135,6 +138,27 @@ pkgs.testers.runNixOSTest {
         assert path1 and path2 and path1 == path2, (
             f"CA chain outputs should be identical across builds "
             f"(same content → same CA path); got {path1!r} vs {path2!r}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # ia.deferred 2-level: CA-A → CA-B → IA-C → IA-D. D's direct child
+    # C is deferred-IA (NOT floating-CA), so populate_needs_resolve
+    # must use has_unknown_output_paths, not has_ca_floating_outputs.
+    # Regression: the old predicate left D.needs_resolve=false → D
+    # dispatched with /1<hash> placeholder unresolved → worker failed
+    # "path '/1…' is not in the Nix store". Success here is the proof;
+    # no timing assertion needed. sleep_secs=1 keeps it fast (~4s
+    # build work + worker-restart overhead).
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("ia-deferred-2-level: IA-on-IA-on-CA resolves"):
+        out_ia = build_ca_chain("ia2", ia_levels=2, sleep_secs=1)
+        assert "/nix/store/" in out_ia, \
+            f"expected a store-path result, got: {out_ia[:400]}"
+        # If the placeholder leaked through, the worker stderr would
+        # contain "/1" — make the failure mode explicit.
+        assert " /1" not in out_ia, (
+            "unresolved downstream placeholder reached the worker — "
+            f"populate_needs_resolve missed a deferred-IA level: {out_ia[:400]}"
         )
 
     ${common.collectCoverage fixture.pyNodeVars}

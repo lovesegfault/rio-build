@@ -240,20 +240,27 @@ fn populate_ca_modular_hashes(
     }
 }
 
-/// Set `needs_resolve` for nodes with floating-CA inputs (`ia.deferred`).
+/// Set `needs_resolve` for nodes with unresolved-path inputs (`ia.deferred`).
 ///
 /// ADR-018 Appendix B: Nix's `shouldResolve` returns true for IA
-/// derivations when they're "deferred" — i.e., they have a floating-CA
-/// input whose output path is a placeholder at eval time. The parent's
-/// env/args reference that placeholder, so dispatch-time resolve must
-/// rewrite it to the realized path.
+/// derivations when they're "deferred" — i.e., they have an input whose
+/// output path is a placeholder at eval time. The parent's env/args
+/// reference that placeholder, so dispatch-time resolve must rewrite it
+/// to the realized path.
 ///
 /// [`build_node`] already set `needs_resolve = has_ca_floating_outputs()`
-/// (self-floating always resolves). This pass ORs in the any-child-is-
-/// floating-CA case. AFTER BFS so every child drv is in `drv_cache`.
+/// (self-floating always resolves). This pass ORs in the
+/// any-child-has-unknown-output-path case — that covers BOTH floating-CA
+/// children AND deferred-IA children. CppNix's `derivationStrict`
+/// propagates the deferred kind upward (every IA whose input has an
+/// unknown path becomes `DerivationOutput::Deferred{}` with empty path
+/// itself), so every node in a deferred chain has empty output paths and
+/// this propagates transitively in a single pass; no fixpoint needed.
+/// Concrete-IA and FOD children have non-empty paths so are unaffected.
 ///
-/// Missing children (BFS inconsistency) → skip; the node keeps its
-/// self-computed value. Same degrade as `populate_ca_modular_hashes`.
+/// AFTER BFS so every child drv is in `drv_cache`. Missing children
+/// (BFS inconsistency) → skip; the node keeps its self-computed value.
+/// Same degrade as `populate_ca_modular_hashes`.
 fn populate_needs_resolve(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -265,7 +272,7 @@ fn populate_needs_resolve(
                 StorePath::parse(child_path)
                     .ok()
                     .and_then(|sp| drv_cache.get(&sp))
-                    .is_some_and(|child| child.has_ca_floating_outputs())
+                    .is_some_and(|child| child.has_unknown_output_paths())
             })
         })
         .map(|(idx, _, _)| idx)
@@ -955,6 +962,25 @@ mod tests {
         Derivation::parse(&aterm).expect("test ATerm should parse")
     }
 
+    /// Parse a deferred-IA derivation: `("out","","","")` — empty
+    /// path/algo/hash. CppNix's `derivationStrict` emits this shape for
+    /// any IA whose input has an unknown output path. Distinct from
+    /// [`make_test_derivation`] which emits a *concrete* `out_path`.
+    fn make_deferred_derivation(input_drvs: &[(&str, &[&str])]) -> Derivation {
+        let inputs: Vec<String> = input_drvs
+            .iter()
+            .map(|(path, outs)| {
+                let outs_str: Vec<String> = outs.iter().map(|o| format!(r#""{o}""#)).collect();
+                format!(r#"("{path}",[{}])"#, outs_str.join(","))
+            })
+            .collect();
+        let input_drvs_str = format!("[{}]", inputs.join(","));
+        let aterm = format!(
+            r#"Derive([("out","","","")],{input_drvs_str},[],"x86_64-linux","/bin/sh",[],[])"#
+        );
+        Derivation::parse(&aterm).expect("test ATerm should parse")
+    }
+
     fn sp(s: &str) -> StorePath {
         StorePath::parse(s).expect("valid test store path")
     }
@@ -1426,6 +1452,84 @@ mod tests {
         assert!(
             !nodes[3].needs_resolve,
             "IA with only-IA inputs → still false"
+        );
+    }
+
+    // r[verify sched.ca.detect]
+    /// `populate_needs_resolve`: 2+ IA levels stacked above a
+    /// floating-CA leaf. CppNix's `derivationStrict` propagates the
+    /// deferred kind upward — every IA whose input has an unknown output
+    /// path becomes deferred-IA `("out","","","")`. The OLD predicate
+    /// (`has_ca_floating_outputs`) was true for the CA leaf only, so
+    /// IA-mid was flagged but IA-grandparent was NOT (its child IA-mid
+    /// has empty algo). The grandparent then dispatched with `/1<hash>`
+    /// placeholders unresolved → worker `path '/1…' is not in the Nix
+    /// store`. The new predicate (`has_unknown_output_paths`) is true
+    /// for both the CA leaf and every deferred-IA above it.
+    #[test]
+    fn populate_needs_resolve_ia_deferred_chain() {
+        let ca_leaf_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca.drv");
+        let ia_mid_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mid.drv");
+        let ia_gp_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-gp.drv");
+        let ia_conc_path = sp("/nix/store/dddddddddddddddddddddddddddddddd-conc.drv");
+        let ia_pure_path = sp("/nix/store/ffffffffffffffffffffffffffffffff-pure.drv");
+
+        // Floating-CA leaf: hash_algo set, hash empty.
+        let ca_leaf = Derivation::parse(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+        )
+        .unwrap();
+        // Deferred-IA mid: ("out","","","") depending on the CA leaf.
+        let ia_mid = make_deferred_derivation(&[(ca_leaf_path.as_str(), &["out"])]);
+        // Deferred-IA grandparent: depends on deferred-IA mid (NOT on
+        // the CA leaf directly). This is the case the old predicate missed.
+        let ia_gp = make_deferred_derivation(&[(ia_mid_path.as_str(), &["out"])]);
+        // Concrete-IA child (non-empty out_path) and a parent on it —
+        // proves concrete-IA-on-concrete-IA still stays false.
+        let ia_conc = make_test_derivation("/nix/store/ia-out", &[]);
+        let ia_pure =
+            make_test_derivation("/nix/store/pure-out", &[(ia_conc_path.as_str(), &["out"])]);
+
+        let mut drv_cache = HashMap::new();
+        for (p, d) in [
+            (&ca_leaf_path, &ca_leaf),
+            (&ia_mid_path, &ia_mid),
+            (&ia_gp_path, &ia_gp),
+            (&ia_conc_path, &ia_conc),
+            (&ia_pure_path, &ia_pure),
+        ] {
+            drv_cache.insert(p.clone(), d.clone());
+        }
+
+        let mut nodes = vec![
+            build_node(ca_leaf_path.as_str(), &ca_leaf),
+            build_node(ia_mid_path.as_str(), &ia_mid),
+            build_node(ia_gp_path.as_str(), &ia_gp),
+            build_node(ia_conc_path.as_str(), &ia_conc),
+            build_node(ia_pure_path.as_str(), &ia_pure),
+        ];
+
+        // Pre-pass: only the floating-CA leaf is self-floating.
+        assert!(nodes[0].needs_resolve);
+        assert!(!nodes[1].needs_resolve);
+        assert!(!nodes[2].needs_resolve);
+
+        populate_needs_resolve(&mut nodes, &drv_cache);
+
+        assert!(nodes[0].needs_resolve, "floating-CA leaf unchanged");
+        assert!(
+            nodes[1].needs_resolve,
+            "IA-mid (child = floating-CA) → true"
+        );
+        assert!(
+            nodes[2].needs_resolve,
+            "IA-grandparent (child = deferred-IA) → true (regression: \
+             has_ca_floating_outputs would have left this false)"
+        );
+        assert!(!nodes[3].needs_resolve, "concrete-IA leaf → still false");
+        assert!(
+            !nodes[4].needs_resolve,
+            "IA with only concrete-IA input → still false"
         );
     }
 }

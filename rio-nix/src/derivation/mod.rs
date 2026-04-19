@@ -198,6 +198,25 @@ pub trait DerivationLike {
     fn static_outputs(&self) -> impl Iterator<Item = &DerivationOutput> {
         self.outputs().iter().filter(|o| !o.path().is_empty())
     }
+
+    /// Any output has no statically-known store path — floating-CA
+    /// (`("out","","r:sha256","")`) OR deferred-IA (`("out","","","")`).
+    ///
+    /// CppNix `hasUnknownOutputPaths` semantics. Used by gateway
+    /// translate for `ia.deferred` propagation (ADR-018 Appendix B):
+    /// CppNix's `derivationStrict` propagates the deferred kind upward,
+    /// so every IA whose input has an unknown output path itself becomes
+    /// `DerivationOutput::Deferred{}` with empty path. Thus checking the
+    /// child's *path* (not its hash_algo) propagates transitively in a
+    /// single pass — every node in a deferred chain has empty output
+    /// paths; concrete IA and FOD have non-empty paths.
+    ///
+    /// Contrast [`has_ca_floating_outputs`](Self::has_ca_floating_outputs)
+    /// which is true only for the floating-CA leaf, not for the
+    /// deferred-IA nodes above it.
+    fn has_unknown_output_paths(&self) -> bool {
+        self.outputs().iter().any(|o| o.path().is_empty())
+    }
 }
 
 /// A full Nix derivation parsed from a `.drv` file.
