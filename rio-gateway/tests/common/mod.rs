@@ -27,6 +27,7 @@ pub fn spawn_session_task(
     mut store_client: StoreServiceClient<Channel>,
     mut sched_client: SchedulerServiceClient<Channel>,
     tenant: Option<NormalizedName>,
+    jwt: rio_gateway::handler::SessionJwt,
     shutdown: CancellationToken,
 ) -> (DuplexStream, JoinHandle<()>) {
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
@@ -38,7 +39,7 @@ pub fn spawn_session_task(
             &mut store_client,
             &mut sched_client,
             tenant,
-            rio_gateway::handler::SessionJwt::none(),
+            jwt,
             None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),
@@ -144,6 +145,35 @@ impl GatewaySession {
     ///
     /// [`new`]: Self::new
     pub async fn new_with_tenant(tenant_name: &str) -> anyhow::Result<Self> {
+        Self::new_inner(tenant_name, rio_gateway::handler::SessionJwt::none()).await
+    }
+
+    /// Handshake-ready session with `jwt_token` set on the
+    /// `SessionContext`. The token is passed verbatim (NOT minted —
+    /// downstream mocks don't verify it). For `r[gw.jwt.propagate]`
+    /// tests asserting the token reaches scheduler/store metadata.
+    pub async fn new_with_jwt_handshake(jwt: &str) -> anyhow::Result<Self> {
+        // SessionJwt::token() returns the cached token verbatim when
+        // signing_key is None (no re-mint path). Far-future exp keeps
+        // refresh_session_jwt's slack check inert regardless.
+        let claims = rio_auth::jwt::TenantClaims {
+            sub: uuid::Uuid::nil(),
+            iat: 0,
+            exp: i64::MAX,
+            jti: "test-fixed".to_string(),
+        };
+        let session_jwt =
+            rio_gateway::handler::SessionJwt::new(Some((jwt.to_string(), claims)), None);
+        let mut sess = Self::new_inner("", session_jwt).await?;
+        do_handshake(&mut sess.stream).await?;
+        send_set_options(&mut sess.stream).await?;
+        Ok(sess)
+    }
+
+    async fn new_inner(
+        tenant_name: &str,
+        jwt: rio_gateway::handler::SessionJwt,
+    ) -> anyhow::Result<Self> {
         // Idempotent (try_init); output captured per-test via
         // with_test_writer, shown only on failure. Without this,
         // tracing::debug! in run_protocol error-log paths is void.
@@ -166,6 +196,7 @@ impl GatewaySession {
             store_client.clone(),
             scheduler_client.clone(),
             tenant,
+            jwt,
             shutdown.child_token(),
         );
 

@@ -2201,3 +2201,214 @@ async fn unknown_tenant_fails_open() -> anyhow::Result<()> {
     h.finish().await;
     Ok(())
 }
+
+// ===========================================================================
+// build_mode rejection — gw.reject.build-mode
+// ===========================================================================
+//
+// All three build opcodes parse build_mode; before this fix, Repair (1) and
+// Check (2) parsed successfully and were silently dropped — `nix build
+// --rebuild` ran a Normal build and reported success. Now they STDERR_ERROR
+// and never reach SubmitBuild.
+
+// r[verify gw.reject.build-mode]
+#[tokio::test]
+async fn test_build_paths_rejects_repair_mode() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 1, // BuildMode::Repair
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("--repair/--rebuild"),
+        "error should name the unsupported flag: {}",
+        err.message
+    );
+    assert!(
+        h.scheduler.submit_calls.read().unwrap().is_empty(),
+        "non-Normal build_mode must NOT reach SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.reject.build-mode]
+#[tokio::test]
+async fn test_build_paths_with_results_rejects_check_mode() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 2, // BuildMode::Check (`nix build --rebuild`)
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("--repair/--rebuild"),
+        "error should name the unsupported flag: {}",
+        err.message
+    );
+    assert!(
+        h.scheduler.submit_calls.read().unwrap().is_empty(),
+        "non-Normal build_mode must NOT reach SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.reject.build-mode]
+#[tokio::test]
+async fn test_build_derivation_rejects_check_mode() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+
+    // Full BasicDerivation payload (same as test_build_derivation_basic_format),
+    // build_mode = Check (2). Helper rejects AFTER reading the BasicDerivation
+    // — wire ordering preserved.
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,
+        string: "out", string: "/nix/store/zzz-output", string: "", string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1, string: "out", string: "/nix/store/zzz-output",
+        u64: 2, // BuildMode::Check
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("--repair/--rebuild"),
+        "error should name the unsupported flag: {}",
+        err.message
+    );
+    assert!(h.scheduler.submit_calls.read().unwrap().is_empty());
+
+    h.finish().await;
+    Ok(())
+}
+
+// ===========================================================================
+// JWT/trace propagation on outbound RPCs — gw.jwt.propagate
+// ===========================================================================
+//
+// `with_jwt` is the single injection point for traceparent + x-rio-tenant-token.
+// Three call sites (WatchBuild reconnect, CancelBuild on disconnect,
+// QueryRealisation in CA-output resolve) bypassed it. These tests assert the
+// tenant token reaches the mock — any future bare-struct call site with a
+// wire_opcodes test will fail here.
+
+// r[verify gw.jwt.propagate]
+/// SubmitBuild stream EOFs without terminal → reconnect via WatchBuild.
+/// The WatchBuild request must carry the session JWT (before fix: bare
+/// struct → empty metadata → `watch_metadata` recorded `None`).
+#[tokio::test]
+async fn test_reconnect_propagates_jwt() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_jwt_handshake("test-jwt-abc").await?;
+    // Empty SubmitBuild stream → EofWithoutTerminal → reconnect arm.
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![]));
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz-out".into()],
+            },
+        ))]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    assert!(
+        frames
+            .iter()
+            .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting"))),
+        "reconnect path must have fired: {frames:?}"
+    );
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+
+    let watch_md = h.scheduler.watch_metadata.read().unwrap().clone();
+    assert_eq!(
+        watch_md,
+        vec![Some("test-jwt-abc".to_string())],
+        "WatchBuild reconnect must carry x-rio-tenant-token via with_jwt"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.jwt.propagate]
+/// Mid-opcode client disconnect → `cancel_active_builds` → CancelBuild.
+/// Same mechanics as `test_mid_opcode_disconnect_cancels_build`, but with
+/// a session JWT — the CancelBuild request must carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
+    let log_events: Vec<types::BuildEvent> = (0..50)
+        .map(|i| {
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: String::new(),
+                executor_id: String::new(),
+                lines: vec![format!("building step {i}").into_bytes()],
+                first_line_number: 0,
+            }))
+        })
+        .collect();
+
+    let mut h = GatewaySession::new_with_jwt_handshake("test-jwt-cancel").await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: log_events,
+        interval: Some(std::time::Duration::from_millis(20)),
+        error_after_n: None,
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // Anchor: first Log frame proves we're past SubmitBuild.
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stderr_message(&mut h.stream),
+    )
+    .await
+    .expect("first stderr frame within 5s")
+    .expect("read stderr frame");
+    assert!(matches!(first, StderrMessage::Next(ref s) if s.contains("building step")));
+
+    // Drop client → BrokenPipe on next stderr write → cancel_active_builds.
+    h.stream = tokio::io::duplex(1).0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.join_server())
+        .await
+        .expect("server task exits within 5s after client drop");
+
+    let cancel_md = h.scheduler.cancel_metadata.read().unwrap().clone();
+    assert_eq!(
+        cancel_md,
+        vec![Some("test-jwt-cancel".to_string())],
+        "CancelBuild on disconnect must carry x-rio-tenant-token via with_jwt"
+    );
+
+    Ok(())
+}

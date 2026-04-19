@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
-use crate::handler::{self, SessionContext};
+use crate::handler::{self, SessionContext, with_jwt};
 use crate::quota::QuotaCache;
 use crate::ratelimit::TenantLimiter;
 
@@ -62,11 +62,25 @@ async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
     // needs &mut ctx.scheduler_client — split field borrows don't survive
     // across .await in all cases).
     let build_ids: Vec<String> = ctx.active_build_ids.keys().cloned().collect();
+    let jwt_token = ctx.jwt.token_owned();
+    let jwt_token = jwt_token.as_deref();
     for build_id in build_ids {
         debug!(build_id = %build_id, reason = %reason, "cancelling build on disconnect");
-        let req = types::CancelBuildRequest {
-            build_id: build_id.clone(),
-            reason: reason.to_string(),
+        // r[impl gw.jwt.propagate]
+        // with_jwt on a JWT can't actually fail (handler/mod.rs:47-51) but
+        // this loop is best-effort either way: log+skip rather than `?`.
+        let req = match with_jwt(
+            types::CancelBuildRequest {
+                build_id: build_id.clone(),
+                reason: reason.to_string(),
+            },
+            jwt_token,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(build_id = %build_id, error = %e, "with_jwt failed; skipping cancel");
+                continue;
+            }
         };
         // Best-effort cancel: wrap in timeout so an unreachable
         // scheduler doesn't block the disconnect cleanup loop.

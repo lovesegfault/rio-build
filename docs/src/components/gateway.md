@@ -489,6 +489,9 @@ When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or `wopBuildPat
 r[gw.reject.nochroot]
 The gateway MUST reject any derivation (at SubmitBuild time) whose env contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build does not honor. Rejection happens at two points with different frame semantics: (1) `validate_dag` rejects via `BuildResult::failure` → `STDERR_LAST` (opcodes 36/46 wrap the error; session stays open); (2) `wopBuildDerivation`'s inline check sends `STDERR_ERROR` terminal (opcode 9 doesn't wrap — this is a protocol-level reject). The scheduler does not see the `__noChroot` env (DerivationNode doesn't carry it), so this check is gateway-only.
 
+r[gw.reject.build-mode]
+The gateway MUST reject `wopBuildDerivation` / `wopBuildPaths` / `wopBuildPathsWithResults` with `STDERR_ERROR` when `build_mode ≠ Normal`. Repair/Check semantics are not representable in `SubmitBuildRequest`; silently downgrading to `Normal` yields a false-positive reproducibility (`--rebuild`) or repair result.
+
 ### Inline .drv Optimization
 
 After DAG construction, the gateway optionally inlines the ATerm content of `.drv` files into the `drv_content` field of each `DerivationNode`. This saves one executor -> store round-trip per dispatched derivation (the `GetPath` fetch). The optimization:
@@ -522,6 +525,9 @@ The tonic interceptor on scheduler and store MUST extract `x-rio-tenant-token`, 
 
 r[gw.jwt.dual-mode+2]
 Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator selects the deployment posture via the **two `[jwt]` knobs in `gateway.toml`** — `key_path` and `required` (there is no separate `auth_mode` enum): `key_path` absent → comment-fallback only (no JWT minting); `key_path` set with `required=false` → mint-with-degrade (JWT minted on auth, downstream falls back to comment if verify fails); `key_path` set with `required=true` → mint-or-reject. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
+
+r[gw.jwt.propagate]
+Every gateway-originated gRPC to rio-scheduler or rio-store MUST be wrapped via `with_jwt`, including reconnect (`WatchBuild`), cleanup (`CancelBuild`), and post-build resolution (`QueryRealisation`) paths. `with_jwt` is the single injection point for both W3C `traceparent` and `x-rio-tenant-token`; a bare-struct call site silently loses both (orphan trace span today, hard auth failure once downstream tenant authz lands).
 
 r[gw.jwt.anon-drv-lookup]
 Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`, `wopQueryValidPaths`) MUST send the JWT to the store **except for `.drv` paths**, which are looked up anonymously (`jwt_unless_drv`). `.drv` files are build INPUTS, not tenant-owned OUTPUTS: a `.drv` uploaded under one identity then queried under another has no `path_tenants` row for the querying tenant, so a tenant-filtered `QueryPathInfo` would return NotFound for a `.drv` the client just uploaded. Output paths keep tenant-scoped visibility (`r[store.tenant.narinfo-filter]`); only the `.drv` lookup is exempt.

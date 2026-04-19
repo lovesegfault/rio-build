@@ -776,3 +776,79 @@ async fn test_add_to_store_nar_oversized_returns_error() -> anyhow::Result<()> {
     h.finish().await;
     Ok(())
 }
+
+/// Early store rejection of a streaming PutPath surfaces the store's
+/// `Status` to the client, not the generic "channel closed mid-stream".
+///
+/// Mechanics: non-.drv path → `grpc_put_path_streaming`. NAR is 6 ×
+/// `NAR_CHUNK_SIZE` so the pump's `tx.send` blocks on the 4-slot mpsc
+/// buffer (metadata + 3 chunks fill it), yields, the spawned rpc task
+/// runs, `fail_next_puts` fires before the mock reads anything → rx
+/// dropped → pump's blocked send fails. Before fix that became
+/// `Err(GrpcStream("channel closed mid-stream"))` and `pump_result?`
+/// returned it, discarding the real `Status` in `rpc_result`.
+///
+/// The 1.5 MiB NAR doesn't fit in the 256 KiB DuplexStream buffer, so the
+/// framed write runs in a spawned task on the split write-half while the
+/// main task reads stderr from the read-half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_add_to_store_nar_streaming_early_reject_surfaces_store_status() -> anyhow::Result<()>
+{
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.store.faults.fail_next_puts.store(1, Ordering::SeqCst);
+
+    // 6 × 256 KiB > 4-slot × 256 KiB mpsc buffer → pump blocks → yields.
+    let (nar, hash) = make_nar(&vec![0xab; 6 * 256 * 1024]);
+
+    // Split: write framed NAR concurrently while main reads stderr.
+    // After stderr_err! the handler returns and the server-side duplex
+    // half is dropped, so the writer task may see BrokenPipe — ignore.
+    let stream = std::mem::replace(&mut h.stream, tokio::io::duplex(1).0);
+    let (mut rd, mut wr) = tokio::io::split(stream);
+
+    wire_send!(&mut wr;
+        u64: 39,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        bool: false, bool: true,
+    );
+    let writer = tokio::spawn(async move {
+        let _ = wire::write_framed_stream(&mut wr, &nar, 8192).await;
+        let _ = wr.flush().await;
+    });
+
+    // `drain_stderr_expecting_error` is `DuplexStream`-only; inline the
+    // loop on `ReadHalf` (read_stderr_message is generic over AsyncRead).
+    let err = loop {
+        match rio_nix::protocol::client::read_stderr_message(&mut rd).await? {
+            rio_nix::protocol::client::StderrMessage::Error(e) => break e,
+            rio_nix::protocol::client::StderrMessage::Last => {
+                panic!("expected STDERR_ERROR but got STDERR_LAST")
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        err.message.contains("injected put failure"),
+        "early store reject must surface the store's Status, got: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("channel closed"),
+        "must NOT surface the generic channel-closed pump error, got: {}",
+        err.message
+    );
+
+    let _ = writer.await;
+    Ok(())
+}

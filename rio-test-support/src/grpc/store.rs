@@ -73,6 +73,10 @@ pub struct MockStoreCalls {
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
     pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
+    /// `x-rio-tenant-token` value on each QueryRealisation call
+    /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
+    /// output resolution in `wopBuildPathsWithResults`.
+    pub query_realisation_metadata: Arc<RwLock<Vec<Option<String>>>>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -754,6 +758,13 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::QueryRealisationRequest>,
     ) -> Result<Response<types::Realisation>, Status> {
+        self.calls.query_realisation_metadata.write().unwrap().push(
+            request
+                .metadata()
+                .get(rio_proto::TENANT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        );
         if self.faults.fail_query_realisation.load(Ordering::SeqCst) {
             return Err(Status::unavailable(
                 "mock: injected query_realisation failure",

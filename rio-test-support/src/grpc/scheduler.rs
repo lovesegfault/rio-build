@@ -113,6 +113,20 @@ pub struct MockScheduler {
     /// the gateway's reconnect sent the correct resume point (see
     /// `r[gw.reconnect.since-seq]`).
     pub watch_calls: Arc<RwLock<Vec<(String, u64)>>>,
+    /// `x-rio-tenant-token` value on each WatchBuild call (`None` = absent).
+    /// For `r[gw.jwt.propagate]` — catches bare-struct call sites that
+    /// bypass `with_jwt` on the reconnect path.
+    pub watch_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// `x-rio-tenant-token` value on each CancelBuild call (`None` = absent).
+    pub cancel_metadata: Arc<RwLock<Vec<Option<String>>>>,
+}
+
+/// Extract `x-rio-tenant-token` from request metadata as `Option<String>`.
+fn tenant_token<T>(req: &Request<T>) -> Option<String> {
+    req.metadata()
+        .get(rio_proto::TENANT_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 impl MockScheduler {
@@ -250,6 +264,10 @@ impl SchedulerService for MockScheduler {
         &self,
         request: Request<types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        self.watch_metadata
+            .write()
+            .unwrap()
+            .push(tenant_token(&request));
         let req = request.into_inner();
         let since = req.since_sequence;
         self.watch_calls
@@ -317,6 +335,10 @@ impl SchedulerService for MockScheduler {
         &self,
         request: Request<types::CancelBuildRequest>,
     ) -> Result<Response<types::CancelBuildResponse>, Status> {
+        self.cancel_metadata
+            .write()
+            .unwrap()
+            .push(tenant_token(&request));
         let req = request.into_inner();
         self.cancel_calls
             .write()

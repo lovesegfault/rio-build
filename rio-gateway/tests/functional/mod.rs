@@ -104,6 +104,7 @@ impl RioStack {
             store_client.clone(),
             sched_client,
             None,
+            rio_gateway::handler::SessionJwt::none(),
             rio_common::signal::Token::new(),
         );
 

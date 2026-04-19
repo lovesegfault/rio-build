@@ -292,9 +292,11 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         });
 
     // Read exactly nar_size bytes in NAR_CHUNK_SIZE chunks, forward each.
-    // Backpressure: tx.send blocks when rpc isn't pulling. On any error
-    // (short read, channel closed) we still drop tx and await rpc so the
-    // spawned task completes before we return.
+    // Backpressure: tx.send blocks when rpc isn't pulling. On a short read
+    // we still drop tx and await rpc so the spawned task completes before
+    // we return. A closed channel is NOT a pump error: it means the rpc
+    // task has already completed (dropping rx), so the rpc result is the
+    // root cause and the pump just stops early.
     let pump_result: anyhow::Result<()> = async {
         let mut remaining = nar_size;
         let mut chunk = vec![0u8; NAR_CHUNK_SIZE];
@@ -307,27 +309,35 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
                     context: format!("at {} of {nar_size}", nar_size - remaining),
                     source: e,
                 })?;
-            tx.send(types::PutPathRequest {
-                msg: Some(types::put_path_request::Msg::NarChunk(chunk[..n].to_vec())),
-            })
-            .await
-            .map_err(|_| {
-                GatewayError::GrpcStream("PutPath channel closed mid-stream (store error?)".into())
-            })?;
+            if tx
+                .send(types::PutPathRequest {
+                    msg: Some(types::put_path_request::Msg::NarChunk(chunk[..n].to_vec())),
+                })
+                .await
+                .is_err()
+            {
+                // rx dropped → rpc task already finished; rpc_result has
+                // the real Status. Stop pumping; let rpc_result? surface it.
+                return Ok(());
+            }
             remaining -= n as u64;
         }
 
         // Trailer: client-declared hash. Store validates independently.
-        tx.send(types::PutPathRequest {
-            msg: Some(types::put_path_request::Msg::Trailer(
-                types::PutPathTrailer {
-                    nar_hash: client_nar_hash,
-                    nar_size,
-                },
-            )),
-        })
-        .await
-        .map_err(|_| GatewayError::GrpcStream("PutPath channel closed before trailer".into()))?;
+        if tx
+            .send(types::PutPathRequest {
+                msg: Some(types::put_path_request::Msg::Trailer(
+                    types::PutPathTrailer {
+                        nar_hash: client_nar_hash,
+                        nar_size,
+                    },
+                )),
+            })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
         Ok(())
     }
     .await;
@@ -338,9 +348,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         .await
         .map_err(|e| GatewayError::GrpcStream(format!("PutPath task panicked: {e}")))?;
 
-    // Error priority: pump error > rpc error (pump error is the root cause;
-    // a short read causes the rpc to see a truncated stream, but the useful
-    // message is "NAR read at X of Y", not "store rejected incomplete stream").
+    // Error priority: pump error (NarRead — client short read) > rpc error.
+    // A short read truncates the stream; the useful message is "NAR read at
+    // X of Y", not "store rejected incomplete stream". The pump's only Err
+    // variant is NarRead — a closed channel returns Ok above, so an early
+    // store rejection (auth/quota/validation) surfaces via rpc_result?
+    // with the store's actual Status, not a generic "channel closed".
     pump_result?;
     let resp = rpc_result?;
     Ok(resp.into_inner().created)

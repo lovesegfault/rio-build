@@ -49,6 +49,37 @@ enum StreamProcessError {
     Wire(#[from] rio_nix::protocol::wire::WireError),
 }
 
+// r[impl gw.reject.build-mode]
+/// Read `build_mode` from the wire and reject anything other than `Normal`.
+///
+/// rio does not implement Repair (force-rebuild a corrupted path) or Check
+/// (rebuild-and-diff for reproducibility) — `SubmitBuildRequest` has no mode
+/// field. Erroring is correct: a silent Normal build gives the user a
+/// false-positive determinism/repair result (`nix build --rebuild` would
+/// always "pass").
+///
+/// Called at the exact wire position of the `build_mode` field for each of
+/// the three build opcodes — DO NOT reorder relative to other reads.
+async fn read_build_mode_normal_only<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    opcode: &str,
+) -> anyhow::Result<()> {
+    let raw = wire::read_u64(reader).await?;
+    match BuildMode::try_from(raw) {
+        Ok(BuildMode::Normal) => Ok(()),
+        Ok(mode) => {
+            stderr_err!(
+                stderr,
+                "{opcode}: rio-gateway does not support build mode {mode:?} (--repair/--rebuild); use a local store"
+            );
+        }
+        Err(_) => {
+            stderr_err!(stderr, "{opcode}: unsupported build mode {raw}");
+        }
+    }
+}
+
 /// Check the per-tenant rate limit before `SubmitBuild`. On violation:
 /// sends `STDERR_ERROR` with a wait-hint and returns `Ok(true)` so the
 /// caller short-circuits. On pass: returns `Ok(false)`.
@@ -778,6 +809,12 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 // internally), and the underlying channel may have
                 // auto-reconnected. If that fails (channel dead),
                 // WatchBuild will Err and we retry.
+                // r[impl gw.jwt.propagate]
+                // Reconnect goes through with_jwt like the initial submit
+                // at :678 — otherwise the resumed stream's scheduler span
+                // is an orphan root trace AND carries no x-rio-tenant-token
+                // (hard auth failure once scheduler-side WatchBuild authz
+                // lands → every failover burns through MAX_RECONNECT).
                 let watch_req = with_jwt(
                     types::WatchBuildRequest {
                         build_id: build_id.clone(),
@@ -914,15 +951,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let Ok(basic_drv) = read_basic_derivation(reader).await else {
         stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
     };
-    let Ok(build_mode_val) = wire::read_u64(reader).await else {
-        stderr_err!(stderr, "wopBuildDerivation: failed to read build mode");
-    };
-    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
-        stderr_err!(
-            stderr,
-            "wopBuildDerivation: unsupported build mode {build_mode_val}"
-        );
-    };
+    read_build_mode_normal_only(reader, stderr, "wopBuildDerivation").await?;
 
     debug!(
         path = %drv_path_str,
@@ -1260,13 +1289,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
-    let build_mode_val = wire::read_u64(reader).await?;
-    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
-        stderr_err!(
-            stderr,
-            "wopBuildPaths: unsupported build mode {build_mode_val}"
-        );
-    };
+    read_build_mode_normal_only(reader, stderr, "wopBuildPaths").await?;
 
     tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPaths");
@@ -1330,13 +1353,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
-    let build_mode_val = wire::read_u64(reader).await?;
-    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
-        stderr_err!(
-            stderr,
-            "wopBuildPathsWithResults: unsupported build mode {build_mode_val}"
-        );
-    };
+    read_build_mode_normal_only(reader, stderr, "wopBuildPathsWithResults").await?;
 
     tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
