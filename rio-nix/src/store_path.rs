@@ -80,6 +80,9 @@ pub enum StorePathError {
         "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})"
     )]
     FixedOutputRefsNotAllowed { algo: &'static str, recursive: bool },
+
+    #[error("text content-address requires sha256, got {got}")]
+    TextHashMustBeSha256 { got: &'static str },
 }
 
 /// The 20-byte hash part of a Nix store path.
@@ -227,6 +230,7 @@ impl StorePath {
         if is_recursive && hash.algo() == HashAlgo::SHA256 {
             let mut sorted: Vec<&str> = references.iter().map(|r| r.as_str()).collect();
             sorted.sort_unstable();
+            sorted.dedup();
             let mut type_str = "source".to_string();
             for r in sorted {
                 type_str.push(':');
@@ -306,12 +310,22 @@ impl StorePath {
         hash: &crate::hash::NixHash,
         references: &[StorePath],
     ) -> Result<Self, StorePathError> {
+        use crate::hash::HashAlgo;
+        // Nix C++ `makeTextPath` asserts SHA-256 — there is no non-SHA256
+        // text path. Enforce, don't just document; the fingerprint below
+        // hardcodes "sha256" so any other algo would silently mislabel.
+        if hash.algo() != HashAlgo::SHA256 {
+            return Err(StorePathError::TextHashMustBeSha256 {
+                got: hash.algo().as_str(),
+            });
+        }
         // Nix uses StorePathSet (a BTreeSet), so references are always
         // iterated in sorted order. The wire protocol does not mandate
         // sorted references from the client, so we must sort here.
         // narinfo.rs fingerprint() does the same thing for the same reason.
         let mut sorted: Vec<&str> = references.iter().map(|r| r.as_str()).collect();
         sorted.sort_unstable();
+        sorted.dedup();
 
         let mut type_str = "text".to_string();
         for r in sorted {
@@ -794,6 +808,55 @@ mod tests {
         Ok(())
     }
 
+    /// Nix uses a StorePathSet (BTreeSet) → sorted AND deduped. The wire
+    /// gives us a Vec; sort_unstable+dedup is the BTreeSet emulation.
+    #[test]
+    fn test_make_text_dedups_references() -> anyhow::Result<()> {
+        let r_a = StorePath::parse("/nix/store/00000000000000000000000000000000-a-ref")?;
+        let r_b = StorePath::parse("/nix/store/11111111111111111111111111111111-b-ref")?;
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+
+        let p_dup = StorePath::make_text("t", &hash, &[r_a.clone(), r_a.clone(), r_b.clone()])?;
+        let p_uniq = StorePath::make_text("t", &hash, &[r_a, r_b])?;
+        assert_eq!(p_dup, p_uniq, "duplicate refs must not affect path");
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_fixed_output_dedups_references() -> anyhow::Result<()> {
+        let r_a = StorePath::parse("/nix/store/00000000000000000000000000000000-a-ref")?;
+        let r_b = StorePath::parse("/nix/store/11111111111111111111111111111111-b-ref")?;
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+
+        let p_dup = StorePath::make_fixed_output(
+            "s",
+            &hash,
+            true,
+            &[r_a.clone(), r_a.clone(), r_b.clone()],
+        )?;
+        let p_uniq = StorePath::make_fixed_output("s", &hash, true, &[r_a, r_b])?;
+        assert_eq!(p_dup, p_uniq, "duplicate refs must not affect path");
+        Ok(())
+    }
+
+    /// Nix C++ `makeTextPath` asserts SHA-256; there is no non-SHA256
+    /// text path. The fingerprint hardcodes "sha256" so accepting other
+    /// algos would silently miscompute.
+    #[test]
+    fn test_make_text_rejects_non_sha256() -> anyhow::Result<()> {
+        let sha512 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA512, vec![0u8; 64])?;
+        assert!(matches!(
+            StorePath::make_text("t", &sha512, &[]),
+            Err(StorePathError::TextHashMustBeSha256 { .. })
+        ));
+        let sha1 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA1, vec![0u8; 20])?;
+        assert!(matches!(
+            StorePath::make_text("t", &sha1, &[]),
+            Err(StorePathError::TextHashMustBeSha256 { .. })
+        ));
+        Ok(())
+    }
+
     #[test]
     fn test_output_path_name_out_vs_named() {
         assert_eq!(output_path_name("hello", "out"), "hello");
@@ -861,10 +924,14 @@ mod tests {
         let decoded = nixbase32::decode(&good).expect("zero padding is canonical");
         assert_eq!(decoded, vec![0u8; 32]);
 
-        // '1' = 1 (0b00001) → only bit 0 set, which lands in out[31] bit 7.
-        // That bit IS in-bounds for 32 bytes (bit 255). No padding, must succeed.
-        let one_in_lsb = format!("{}1", "0".repeat(51));
-        assert!(nixbase32::decode(&one_in_lsb).is_ok());
+        // '1' first → bit 255 (out[31] bit 7), in-bounds; '2' first → bit 256, padding.
+        let one_in_msb = format!("1{}", "0".repeat(51));
+        assert!(nixbase32::decode(&one_in_msb).is_ok());
+        let two_in_msb = format!("2{}", "0".repeat(51));
+        assert!(matches!(
+            nixbase32::decode(&two_in_msb),
+            Err(StorePathError::InvalidBase32Padding)
+        ));
     }
 
     #[test]

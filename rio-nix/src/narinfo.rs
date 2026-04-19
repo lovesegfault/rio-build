@@ -232,6 +232,7 @@ impl NarInfo {
             .map(|r| format!("{store_dir}{r}"))
             .collect();
         full_refs.sort_unstable();
+        full_refs.dedup();
         let fp = format!(
             "1;{};{};{};{}",
             self.store_path,
@@ -320,6 +321,7 @@ pub fn fingerprint(
     // text.
     let mut sorted_refs: Vec<&str> = references.iter().map(String::as_str).collect();
     sorted_refs.sort_unstable();
+    sorted_refs.dedup();
     let refs_joined = sorted_refs.join(",");
 
     format!("1;{store_path};{hash_colon};{nar_size};{refs_joined}")
@@ -404,6 +406,21 @@ mod tests {
              /nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-m,\
              /nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-z"
         );
+    }
+
+    /// Nix uses a BTreeSet → sorted AND deduped. An untrusted worker
+    /// (proto `repeated string`) can send `[A, A, B]`; rio must sign the
+    /// same fingerprint a Nix client recomputes from its `StorePathSet`.
+    #[test]
+    fn fingerprint_dedups_references() {
+        let a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a".to_string();
+        let b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b".to_string();
+        let p = "/nix/store/00000000000000000000000000000000-x";
+        let h = [0u8; 32];
+
+        let with_dup = fingerprint(p, &h, 1, &[a.clone(), a.clone(), b.clone()]);
+        let without = fingerprint(p, &h, 1, &[a, b]);
+        assert_eq!(with_dup, without);
     }
 
     #[test]
@@ -736,6 +753,23 @@ FileSize: 54321
         let (mut ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
         ni.references.push("evil-injected-ref".into());
         assert_eq!(ni.verify_sig(&[trusted]), None);
+    }
+
+    /// A narinfo carrying duplicate references must verify identically to
+    /// the deduped form — Nix's `StorePathSet` collapses duplicates before
+    /// fingerprinting.
+    #[test]
+    fn verify_sig_dedups_references() {
+        let (mut ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        // Fixture signs over a single dep ref. Duplicating it must NOT
+        // change the recomputed fingerprint.
+        ni.references
+            .push("11111111111111111111111111111111-dep".into());
+        assert_eq!(
+            ni.verify_sig(&[trusted]).as_deref(),
+            Some("test-key-1"),
+            "duplicate refs must not invalidate the signature"
+        );
     }
 
     #[test]

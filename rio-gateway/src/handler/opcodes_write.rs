@@ -478,7 +478,14 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
     let algo = |s: &str| s.parse::<HashAlgo>().map_err(|e| e.to_string());
     if let Some(s) = cam_str.strip_prefix("text:") {
-        Ok((true, false, algo(s)?))
+        let a = algo(s)?;
+        // Nix C++ `makeTextPath` asserts SHA-256; reject at the wire
+        // boundary so the client gets a proper STDERR_ERROR rather than
+        // a silently-miscomputed store path.
+        if a != HashAlgo::SHA256 {
+            return Err(format!("text content-address requires sha256, got {a}"));
+        }
+        Ok((true, false, a))
     } else if let Some(rest) = cam_str.strip_prefix("fixed:") {
         if let Some(s) = rest
             .strip_prefix("r:")
@@ -761,5 +768,14 @@ mod tests {
         assert!(parse_cam_str("text:md5").is_err());
         assert!(parse_cam_str("fixed:r:md5").is_err());
         assert!(parse_cam_str("fixed:blake2b").is_err());
+    }
+
+    /// Nix C++ `makeTextPath` asserts SHA-256; reject at the wire boundary.
+    #[test]
+    fn test_parse_cam_str_rejects_text_non_sha256() {
+        assert!(parse_cam_str("text:sha512").is_err());
+        assert!(parse_cam_str("text:sha1").is_err());
+        // sha256 still accepted.
+        assert!(parse_cam_str("text:sha256").is_ok());
     }
 }
