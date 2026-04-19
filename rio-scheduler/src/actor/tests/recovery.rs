@@ -1425,3 +1425,105 @@ async fn test_reset_orphan_does_not_record_failure() -> TestResult {
     );
     Ok(())
 }
+
+/// Recovery recompute of a `Substituting` node whose dep is `Poisoned`
+/// must reach `DependencyFailed` via the two-step Queued bridge.
+/// Without the bridge covering `Substituting`, the
+/// `Substituting→DependencyFailed` transition (not in the table) fails
+/// with a warn and the node stays `Substituting` forever — no fetch
+/// task (died with the old process), never pushed Ready.
+#[tokio::test]
+async fn test_recovery_substituting_with_poisoned_dep_goes_dependency_failed() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // D depends on E. Merge both (build stays Active), then
+        // backdate PG: E poisoned, D substituting (detached fetch in
+        // flight at crash). Direct PG writes so no in-mem cascade
+        // marks the build terminal pre-recovery.
+        let _rx = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("sub-D"), make_node("sub-E")],
+            vec![make_test_edge("sub-D", "sub-E")],
+            true,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'poisoned', poisoned_at = now() \
+             WHERE drv_hash = 'sub-E'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'sub-D'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    let d = expect_drv(&f.handle, "sub-D").await;
+    assert_eq!(
+        d.status,
+        DerivationStatus::DependencyFailed,
+        "Substituting with poisoned dep must recompute to DependencyFailed \
+         (not stuck Substituting), got {:?}",
+        d.status
+    );
+    Ok(())
+}
+
+/// I-059 orphan guard must also cover already-`Ready` nodes. A
+/// derivation that is Ready in PG but whose every build is terminal
+/// (e.g. produced by `check_build_completion`'s recovery `!keep_going`
+/// branch which doesn't `cancel_build_derivations`) bypassed the
+/// recompute-set guard and dispatched into GC'd inputs → spurious
+/// poison.
+#[tokio::test]
+async fn test_recovery_orphan_ready_not_pushed() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let _rx = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("orphan-ready")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Drv stays 'ready' (merge left it there: no deps); build → failed.
+        // load_nonterminal_builds will exclude it → interested_builds empty.
+        sqlx::query("UPDATE builds SET status = 'failed'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Node loaded (Ready is non-terminal) but orphan — no active build.
+    let d = expect_drv(&handle, "orphan-ready").await;
+    assert_eq!(d.status, DerivationStatus::Ready);
+
+    // Connect a worker and tick: orphan-Ready must NOT dispatch.
+    let mut rx = connect_executor(&handle, "orphan-ready-w", "x86_64-linux").await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        Err(_) => {} // timeout — nothing dispatched (good)
+        Ok(Some(msg)) => {
+            use rio_proto::types::scheduler_message::Msg;
+            // PrefetchHint is fine (warm-gate); Assignment is the bug.
+            if let Some(Msg::Assignment(a)) = msg.msg {
+                panic!(
+                    "orphan-Ready must NOT dispatch, got assignment for {}",
+                    a.drv_path
+                );
+            }
+        }
+        Ok(None) => {}
+    }
+    Ok(())
+}

@@ -419,12 +419,6 @@ impl DagActor {
             })
             .map(|(h, _)| h.into())
             .collect();
-        if orphans_skipped > 0 {
-            debug!(
-                count = orphans_skipped,
-                "recovery: skipping orphan Created/Queued nodes (no active build interested)"
-            );
-        }
         let initial_states = self.dag.compute_initial_states(&to_recompute);
         let mut transitioned_ready = 0usize;
         for (drv_hash, target) in initial_states {
@@ -439,9 +433,13 @@ impl DagActor {
             if from == target {
                 continue;
             }
-            // Created needs the two-step. Queued goes direct.
-            if from == DerivationStatus::Created
-                && target != DerivationStatus::Queued
+            // Created and Substituting need the two-step (both have a
+            // valid →Queued edge but no direct →DependencyFailed).
+            // Queued goes direct.
+            if matches!(
+                from,
+                DerivationStatus::Created | DerivationStatus::Substituting
+            ) && target != DerivationStatus::Queued
                 && let Err(e) = state.transition(DerivationStatus::Queued)
             {
                 warn!(drv_hash = %drv_hash, error = %e,
@@ -465,15 +463,36 @@ impl DagActor {
         }
 
         // --- Populate ready queue ---
-        // Push all Ready-status derivations. push_ready computes
-        // the priority-heap key from state.priority (just set by
-        // full_sweep above).
+        // Push all Ready-status derivations with at least one active
+        // interested build. push_ready computes the priority-heap key
+        // from state.priority (just set by full_sweep above).
+        // I-059 also applies here: an already-Ready node whose every
+        // build is terminal (orphan-Ready, produced e.g. by
+        // check_build_completion's recovery !keep_going branch which
+        // does not cancel sibling derivations) bypasses the recompute-
+        // set guard above and would otherwise dispatch into GC'd
+        // inputs → infra-fail → spurious poison.
         let ready: Vec<DrvHash> = self
             .dag
             .iter_nodes()
-            .filter(|(_, s)| s.status() == DerivationStatus::Ready)
+            .filter(|(_, s)| {
+                if s.status() != DerivationStatus::Ready {
+                    return false;
+                }
+                if s.interested_builds.is_empty() {
+                    orphans_skipped += 1;
+                    return false;
+                }
+                true
+            })
             .map(|(h, _)| h.into())
             .collect();
+        if orphans_skipped > 0 {
+            debug!(
+                count = orphans_skipped,
+                "recovery: skipping orphan Created/Queued/Ready nodes (no active build interested)"
+            );
+        }
         for hash in ready {
             self.push_ready(hash);
         }
