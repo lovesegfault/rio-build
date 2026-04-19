@@ -208,8 +208,9 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_builder_fuse_circuit_open",
         "1.0 when the FUSE fetch circuit breaker is open (store unreachable \
-         or degraded). Opens after 5 consecutive fetch failures OR 90s since \
-         last successful fetch. Half-open after 30s (one probe fetch allowed)."
+         or degraded). Opens after 5 consecutive fetch failures OR 720s since \
+         last successful fetch with ≥1 failure since. Half-open after 30s \
+         (one probe fetch allowed)."
     );
     describe_gauge!(
         "rio_builder_cpu_fraction",

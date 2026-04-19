@@ -255,12 +255,22 @@ impl Filesystem for NixStoreFs {
                                 return;
                             }
                             Err(e) => {
+                                // Same I-043 invariant as the Err arm below:
+                                // NEVER ENOENT for a registered input. Any
+                                // post-Ok stat failure (NotFound included —
+                                // TOCTOU vs. external rm) is a cache
+                                // inconsistency, not a legitimate absence.
+                                // `io_error_to_errno` would map NotFound →
+                                // ENOENT and leak past the line-298
+                                // defense-in-depth (which only covers
+                                // ensure_cached's Err arm).
                                 tracing::warn!(
                                     path = %local_path.display(),
                                     error = %e,
-                                    "ensure_cached succeeded but stat failed"
+                                    "ensure_cached succeeded but stat failed → EIO \
+                                     (overlay must not negative-cache)"
                                 );
-                                reply.error(io_error_to_errno(&e));
+                                reply.error(Errno::EIO);
                                 return;
                             }
                         },
@@ -360,6 +370,10 @@ impl Filesystem for NixStoreFs {
                                 // not the pre-cache `e` (which is stale and
                                 // misleading; typically ENOENT when the real
                                 // post-cache failure might be EACCES/EIO).
+                                // ENOENT is acceptable here (unlike lookup's
+                                // KnownInput arm): getattr operates on an
+                                // already-positive inode — overlayfs does
+                                // not negative-cache on getattr ENOENT.
                                 reply.error(io_error_to_errno(&fresh));
                             }
                         },
