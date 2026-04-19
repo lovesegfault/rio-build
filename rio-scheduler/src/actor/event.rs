@@ -320,8 +320,9 @@ impl DagActor {
     /// — both paths flush because failed builds still have useful logs.
     /// NOT called from `handle_transient_failure`: the derivation gets
     /// re-queued, a new worker builds it from scratch, and that worker's
-    /// logs replace the partial ones. The ring buffer gets `discard()`ed
-    /// by the BuildExecution recv task on worker disconnect.
+    /// logs replace the partial ones. The seal is `unseal()`ed by the
+    /// BuildExecution recv task on worker disconnect; the flusher's
+    /// `flush_final` removes the buffer.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
         let Some(drv_path) = self.dag.path_for_hash(drv_hash).map(String::from) else {
             // Should be impossible at this call site (completion handlers

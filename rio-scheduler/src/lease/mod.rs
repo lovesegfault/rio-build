@@ -553,11 +553,19 @@ pub async fn run_lease_loop(
     // error is non-fatal: we're shutting down regardless, and
     // TTL expiry is the fallback.
     if was_leading {
-        match election.step_down().await {
-            Ok(()) => info!("released lease on shutdown"),
-            Err(e) => {
-                warn!(error = %e, "step_down failed; lease will expire in {}s", LEASE_TTL.as_secs())
-            }
+        let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+        match tokio::time::timeout(deadline, election.step_down()).await {
+            Ok(Ok(())) => info!("released lease on shutdown"),
+            Ok(Err(e)) => warn!(
+                error = %e,
+                "step_down failed; lease will expire in {}s",
+                LEASE_TTL.as_secs()
+            ),
+            Err(_) => warn!(
+                ?deadline,
+                "step_down timed out (apiserver hung?); lease will expire in {}s",
+                LEASE_TTL.as_secs()
+            ),
         }
     }
     debug!("lease loop exited");
@@ -779,6 +787,35 @@ mod tests {
         assert!(
             elapsed >= deadline && elapsed < deadline + Duration::from_millis(500),
             "timeout fired at {elapsed:?}, expected ~{deadline:?}"
+        );
+    }
+
+    /// step_down on a hung apiserver must time out, not hang shutdown.
+    /// Same hang-injection as renew_timeout_fires_on_hung_apiserver:
+    /// hold the verifier without `.run()` so the GET pends forever.
+    /// Without the timeout wrapper at `run_lease_loop`'s shutdown
+    /// branch, `main.rs`'s `h.await` would block until SIGKILL.
+    // r[verify sched.lease.graceful-release]
+    #[tokio::test]
+    async fn step_down_timeout_fires_on_hung_apiserver() {
+        let (client, _verifier) = ApiServerVerifier::new();
+        let election = LeaderElection::new(
+            client,
+            "default",
+            "rio-sched".into(),
+            "us".into(),
+            LEASE_TTL,
+        );
+
+        let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+        let started = Instant::now();
+        let result = tokio::time::timeout(deadline, election.step_down()).await;
+
+        assert!(result.is_err(), "step_down should time out, got {result:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_millis(500),
+            "fired at {elapsed:?}, expected ~{deadline:?}"
         );
     }
 

@@ -87,6 +87,7 @@ impl ExecutorService for SchedulerGrpc {
         let executor_id_for_recv = executor_id.clone();
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
+            let mut seen_drvs: std::collections::HashSet<String> = std::collections::HashSet::new();
             loop {
                 let msg = match stream.message().await {
                     Ok(Some(m)) => m,
@@ -195,6 +196,7 @@ impl ExecutorService for SchedulerGrpc {
                             //    This is the durability path: even if the actor is
                             //    backpressured or the gateway stream lags, the lines
                             //    land here and are serveable via AdminService.
+                            seen_drvs.insert(log.derivation_path.clone());
                             log_buffers.push(&log);
 
                             // 2. Gateway forward — via actor (it owns the
@@ -223,6 +225,15 @@ impl ExecutorService for SchedulerGrpc {
                         }
                     }
                 }
+            }
+
+            // The seal's job (block late batches between CompletionReport
+            // and flusher drain) is done once this stream is closed — no
+            // more batches CAN arrive. Unseal (NOT discard: that would
+            // race the flusher's drain and lose the log). Bounds `sealed`
+            // to drvs whose worker stream is still open.
+            for drv in &seen_drvs {
+                log_buffers.unseal(drv);
             }
 
             // Stream closed: worker disconnected. Use blocking send — if this

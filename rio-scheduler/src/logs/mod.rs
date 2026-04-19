@@ -102,9 +102,10 @@ pub struct LogBuffers {
     /// [`Self::push`] drops batches for sealed paths so a late
     /// `LogBatch` (still in flight on the BuildExecution stream after
     /// the worker sent CompletionReport) cannot recreate a buffer
-    /// that the flusher already drained. Bounds entry count over
-    /// scheduler lifetime — without sealing, every completed
-    /// derivation that emits one late line leaves one orphan entry.
+    /// that the flusher already drained. Unsealed by the
+    /// BuildExecution recv task on stream-close and by
+    /// [`LogFlusher::flush_final`] post-drain — bounds `sealed` to
+    /// drvs whose worker stream is still open.
     sealed: DashSet<String>,
 }
 
@@ -223,8 +224,9 @@ impl LogBuffers {
     }
 
     /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called on
-    /// re-dispatch after a terminal state (poison-clear, manual retry).
-    /// Idempotent; no-op if not sealed.
+    /// re-dispatch after a terminal state (poison-clear, manual retry),
+    /// and by the recv task / flusher on terminal cleanup to bound
+    /// `sealed`. Idempotent; no-op if not sealed.
     pub fn unseal(&self, drv_path: &str) {
         self.sealed.remove(drv_path);
     }
@@ -232,6 +234,12 @@ impl LogBuffers {
     /// Number of active buffers. For metrics + flusher periodic-scan skip.
     pub fn active_count(&self) -> usize {
         self.buffers.len()
+    }
+
+    /// Number of sealed (tombstoned) drv_paths. Should hover near
+    /// `active_count()` in steady state; unbounded growth = leak.
+    pub fn sealed_count(&self) -> usize {
+        self.sealed.len()
     }
 
     /// Snapshot all currently-buffered drv_paths (keys only, no lines).
@@ -444,6 +452,7 @@ mod tests {
 
         // Actor seals on completion (BEFORE flusher drains).
         bufs.seal("drv-a");
+        assert_eq!(bufs.sealed_count(), 1);
 
         // Late batch from the same BuildExecution stream — dropped.
         bufs.push(&mk_batch("drv-a", 2, &[b"late"]));
@@ -468,7 +477,27 @@ mod tests {
         // Re-dispatch (poison-clear / retry) un-seals; new worker's
         // pushes land again.
         bufs.unseal("drv-a");
+        assert_eq!(bufs.sealed_count(), 0);
         bufs.push(&mk_batch("drv-a", 0, &[b"retry"]));
+        assert_eq!(bufs.active_count(), 1);
+    }
+
+    /// Regression: `sealed` must be cleared on terminal cleanup.
+    /// Before the fix, `seal()` had no production remover — every
+    /// completion leaked one String into `sealed` forever.
+    #[test]
+    fn seal_then_drain_then_unseal_clears_tombstone() {
+        let bufs = LogBuffers::new();
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0"]));
+        bufs.seal("drv-a");
+        let _ = bufs.drain("drv-a");
+        // drain() does NOT touch `sealed` — that's the leak shape.
+        assert_eq!(bufs.sealed_count(), 1, "drain leaves seal in place");
+        // Recv-task / flusher unseal is the bound.
+        bufs.unseal("drv-a");
+        assert_eq!(bufs.sealed_count(), 0);
+        // Unseal re-opened: a fresh push lands.
+        bufs.push(&mk_batch("drv-a", 0, &[b"fresh"]));
         assert_eq!(bufs.active_count(), 1);
     }
 

@@ -144,7 +144,12 @@ impl LogFlusher {
     /// On-completion flush: drain the buffer (derivation is done, no more
     /// writes coming) and upload with `is_complete=true`.
     async fn flush_final(&self, req: FlushRequest) {
-        let Some((line_count, raw_bytes, lines)) = self.buffers.drain(&req.drv_path) else {
+        let drained = self.buffers.drain(&req.drv_path);
+        // Seal bridged completion→drain; that window is now closed.
+        // Clear so `sealed` stays bounded even if the recv task is
+        // still running (or never saw a LogBatch — silent build).
+        self.buffers.unseal(&req.drv_path);
+        let Some((line_count, raw_bytes, lines)) = drained else {
             // Buffer doesn't exist. Two legitimate causes:
             // (a) Derivation produced zero log output. Rare but possible
             //     (e.g., a silent `cp` FOD). No blob to write.

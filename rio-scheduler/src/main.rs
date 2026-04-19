@@ -430,9 +430,10 @@ async fn main() -> anyhow::Result<()> {
     // Wait for step_down() to complete. serve_with_shutdown has
     // already returned (cancel token fired), so the lease loop has
     // seen the same signal and is on its way out — this join is
-    // quick (one K8s PATCH). Ignore the JoinError: it's only set
-    // if the lease task panicked, which spawn_monitored already
-    // logged, and we're shutting down regardless.
+    // bounded by step_down's ~3s timeout (RENEW_INTERVAL -
+    // RENEW_SLOP). Ignore the JoinError: it's only set if the lease
+    // task panicked, which spawn_monitored already logged, and we're
+    // shutting down regardless.
     if let Some(h) = lease_loop {
         let _ = h.await;
     }

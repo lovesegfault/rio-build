@@ -316,12 +316,12 @@ async fn setup_worker_svc() -> anyhow::Result<(
 /// bound, a re-Register is a no-op. Kicking would cause a disconnect
 /// + reassign cascade for no good reason.
 ///
-/// Note: can't use `#[traced_test]` with multi_thread flavor — the
-/// recv task (spawn_monitored) runs on a worker thread, and
-/// traced_test's subscriber is thread-local to the test thread. We
-/// assert on observable state instead: if the duplicate Register
-/// were NOT ignored, the recv loop would break → stream close →
-/// ExecutorDisconnected → worker removed from actor.executors.
+/// Synchronization: the dup-Register handler sends nothing to the
+/// actor, so an actor-mpsc round-trip (`barrier()`) proves nothing.
+/// The one observable that IS synchronized with the recv task is the
+/// server→client stream: if the recv loop breaks, the spawned task
+/// drops `output_tx` → `inbound.next()` yields `None`. If correctly
+/// ignored, `inbound` stays open+silent → poll times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()> {
     let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
@@ -339,7 +339,7 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
         .await?;
 
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
-    let _inbound = worker_client.build_execution(outbound).await?.into_inner();
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
 
     // Second Register — should be logged (from the spawned recv task)
     // + ignored. We can't check the log (thread-local subscriber) so
@@ -354,25 +354,99 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
         })
         .await?;
 
-    // barrier to ensure the recv task processed the duplicate.
-    crate::actor::tests::barrier(&handle).await;
+    // Structural sync: if duplicate Register broke the recv loop, the
+    // server task drops output_tx → inbound.next() returns None within
+    // loopback RTT. If correctly ignored, inbound stays open+silent →
+    // timeout fires. 200ms >> loopback RTT (~µs) but << test budget.
+    // barrier() does NOT work here: the dup-Register handler sends
+    // nothing to the actor, so an actor round-trip proves nothing.
+    let poll = tokio::time::timeout(Duration::from_millis(200), inbound.next()).await;
+    assert!(
+        poll.is_err(),
+        "inbound should remain open+silent after duplicate Register; got {poll:?} \
+         (Ok(None) = stream closed = recv loop broke — the regression this test guards; \
+          Ok(Some) = unexpected server message)"
+    );
 
-    // Stream should still be open: worker is still in the actor's
-    // workers map. If the duplicate Register caused a break/error,
-    // ExecutorDisconnected would have fired and removed the entry.
+    // Now that 200ms has elapsed, any ExecutorDisconnected from a
+    // (hypothetically broken) recv loop has reached the actor; barrier
+    // to drain it before querying.
+    crate::actor::tests::barrier(&handle).await;
     let workers = handle.debug_query_workers().await?;
     assert!(
         workers.iter().any(|w| w.executor_id == "dup-worker"),
-        "worker should still be connected after duplicate Register \
-         (stream stayed open, no spurious disconnect)"
+        "worker should still be registered after duplicate Register"
     );
 
-    // Stronger: the stream_tx should still be usable (channel open).
-    // is_closed() = false proves the recv task didn't drop its rx end.
-    assert!(
-        !stream_tx.is_closed(),
-        "stream_tx should still be open after duplicate Register"
-    );
+    Ok(())
+}
+
+/// Regression: `LogBuffers.sealed` must not grow unboundedly. Before
+/// the fix, `seal()` was called on every completion but `unseal()` /
+/// `discard()` had no production callers — one leaked String per
+/// completed derivation, forever. The recv task now `unseal()`s every
+/// drv it pushed when the stream closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_log_buffers_sealed_reaped_on_stream_close() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "seal-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Push a LogBatch so the recv task records this drv in seen_drvs.
+    let drv_path = test_drv_path("seal-reap");
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                rio_proto::types::BuildLogBatch {
+                    derivation_path: drv_path.clone(),
+                    lines: vec![b"line".to_vec()],
+                    first_line_number: 0,
+                    executor_id: "seal-worker".into(),
+                },
+            )),
+        })
+        .await?;
+
+    // Seal directly (what the actor's completion handler does). No
+    // flusher in this setup, so this is the only seal source — and the
+    // only unseal is the recv task's stream-exit cleanup under test.
+    log_buffers.seal(&drv_path);
+    assert_eq!(log_buffers.sealed_count(), 1);
+
+    // Close the stream → recv task exits → unseals seen_drvs.
+    drop(stream_tx);
+
+    // Recv task runs on a worker thread; poll until unseal lands.
+    // barrier() doesn't help here (recv task isn't actor-mediated).
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers.sealed_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sealed_count should reach 0 after stream close");
+
+    assert_eq!(log_buffers.sealed_count(), 0);
+    // inbound should now close (recv task dropped output_tx).
+    let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
 
     Ok(())
 }
