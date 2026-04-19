@@ -955,4 +955,140 @@ mod tests {
             assert!(exists, "Q's narinfo must survive sweep");
         }
     }
+
+    /// Regression: concurrent `decrement_and_enqueue` (GC sweep's
+    /// per-manifest body) vs another chunk writer on overlapping
+    /// hashes MUST NOT deadlock.
+    ///
+    /// `decrement_and_enqueue` runs inside a CALLER-provided txn so
+    /// it cannot use `with_sorted_retry`; its inline
+    /// `unique_hashes.sort_unstable()` is the lock-order discipline.
+    /// The per-row contender stands in for any other chunk writer
+    /// obeying r\[store.chunk.lock-order\] — it row-locks in iteration
+    /// order, so its `with_sorted_retry` wrapper is what makes its
+    /// order canonical. With both sides ascending, no circular wait.
+    ///
+    /// Mutation-tested: removing `with_sorted_retry`'s sort (the
+    /// contender's discipline) makes the contender lock descending
+    /// while `decrement_and_enqueue` locks PK-ascending → 40P01 →
+    /// attempts==3 → fails here. Removing the inline sort at this
+    /// function's `r[impl]` site is NOT independently observable:
+    /// both its UPDATEs are batch `= ANY($1)` which PG evaluates in
+    /// scan order regardless of array order (btree presort) — same
+    /// root insight as `rollback_overlapping_no_deadlock`. The inline
+    /// sort is discipline (defends a future per-row refactor), not
+    /// load-bearing under the current batch-ANY shape.
+    // r[verify store.chunk.lock-order]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decrement_and_enqueue_no_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed 100 chunks at refcount=2 — both sides decrement once
+        // without tripping CHECK(refcount>=0). 100 hashes so the
+        // per-row contender's 100 sequential roundtrips overlap the
+        // batch UPDATE. Raw INSERT (ChunkSeed's hash is `[tag,0..]`;
+        // we need `[i;32]` to match `make_manifest`).
+        let hashes: Vec<[u8; 32]> = (0u8..100).map(|i| [i; 32]).collect();
+        for h in &hashes {
+            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 2, 1024)")
+                .bind(&h[..])
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let manifest = make_manifest(&hashes);
+        let hashes: Vec<Vec<u8>> = hashes.into_iter().map(|h| h.to_vec()).collect();
+
+        // Per-row contender: locks in `sorted` ARRAY order. No-op
+        // write — row-locks unconditionally.
+        async fn contend_per_row(pool: &PgPool, sorted: &[Vec<u8>]) -> crate::metadata::Result<()> {
+            let mut tx = pool.begin().await?;
+            for h in sorted {
+                sqlx::query("UPDATE chunks SET size = size WHERE blake3_hash = $1")
+                    .bind(h)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+
+        // Side A: production decrement_and_enqueue inside a fresh txn,
+        // wrapped in retry-once-on-40P01. The hashes vec passed to
+        // with_sorted_retry is the SAME set decrement_and_enqueue will
+        // derive from the manifest — the helper's sort is a no-op for
+        // side A's lock order (batch ANY locks scan-order); its role
+        // here is the retry + attempt counter.
+        // Side B: per-row contender fed REVERSED.
+        let hashes_fwd = hashes.clone();
+        let mut hashes_rev = hashes.clone();
+        hashes_rev.reverse();
+
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+        let manifest_a = manifest.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_a = Arc::clone(&attempts);
+        let attempts_b = Arc::clone(&attempts);
+
+        let task_a = tokio::spawn(async move {
+            crate::metadata::with_sorted_retry(hashes_fwd, move |_sorted| {
+                attempts_a.fetch_add(1, Ordering::Relaxed);
+                let pool_a = pool_a.clone();
+                let manifest_a = manifest_a.clone();
+                async move {
+                    let mut tx = pool_a.begin().await?;
+                    let stats = decrement_and_enqueue(&mut tx, &manifest_a, None).await?;
+                    tx.commit().await?;
+                    Ok(stats)
+                }
+            })
+            .await
+        });
+        let task_b = tokio::spawn(async move {
+            crate::metadata::with_sorted_retry(hashes_rev, move |sorted| {
+                attempts_b.fetch_add(1, Ordering::Relaxed);
+                let pool_b = pool_b.clone();
+                async move { contend_per_row(&pool_b, &sorted).await }
+            })
+            .await
+        });
+
+        let (ra, rb) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(task_a, task_b).expect("tasks should not panic")
+        })
+        .await
+        .expect("concurrent decrement+contender must complete within 5s — deadlock detected");
+
+        let stats = ra.expect("decrement_and_enqueue should succeed");
+        rb.expect("contender should succeed");
+
+        // Mutation sentinel: with both sides obeying lock-order
+        // discipline → no 40P01 → no retry → exactly 2 body
+        // invocations total.
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "lock-order discipline should prevent 40P01 (no retry needed)"
+        );
+
+        // Vacuity sentinel: decrement_and_enqueue's UPDATE must have
+        // matched all 100 (refcount 2→1, none zeroed). If a future
+        // seed regression makes the UPDATE match zero rows, this
+        // fails loudly instead of going vacuous.
+        assert_eq!(stats.chunks_zeroed, 0, "rc 2→1, nobody hit zero");
+        let sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
+        )
+        .bind(&hashes)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(sum, 100, "decrement matched all 100 chunks (2→1)");
+    }
 }

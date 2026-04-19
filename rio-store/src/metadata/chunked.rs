@@ -726,71 +726,123 @@ mod tests {
         );
     }
 
-    /// Regression: concurrent rollbacks with reverse-ordered overlapping
-    /// chunk sets MUST NOT deadlock.
+    /// Regression: concurrent rollback (production path) vs another
+    /// chunk writer on overlapping hashes MUST NOT deadlock.
     ///
-    /// Before the sort in `delete_manifest_chunked_uploading`, PG acquired
-    /// row locks in the ANY($1) array's scan order. Array A = [h1..h50],
-    /// array B = [h50..h1] → txn A locks h1 waits for h50, txn B locks
-    /// h50 waits for h1 → circular wait → SQLSTATE 40P01.
+    /// PG semantics: a single-statement `UPDATE ... WHERE blake3_hash
+    /// = ANY($1)` evaluates the qual at the scan node and row-locks in
+    /// SCAN order (btree PK ascending), NOT in `$1` array order. So
+    /// the previous fwd/rev two-rollback shape was theatre — both
+    /// sides locked ascending regardless of `with_sorted_retry`'s
+    /// sort. The sort is observable only when at least one writer
+    /// row-locks in ITERATION order, i.e. issues one statement per
+    /// key inside one txn. The per-row contender below models that.
     ///
-    /// After the sort, both txns acquire locks in the same canonical
-    /// order — no circular wait possible. The 5s timeout makes a
-    /// regression fail fast rather than hang the suite.
+    /// Both sides go through `with_sorted_retry`. With its sort in
+    /// place, both bodies see ascending input → no circular wait → 1
+    /// attempt each. Mutation-tested: removing the sort in
+    /// `with_sorted_retry` makes the contender (fed reversed input)
+    /// lock descending while rollback's batch UPDATE locks ascending
+    /// → 40P01 → one side retries → attempts==3 → fails here. The 5s
+    /// timeout backstops PG's deadlock detector (1s default).
     // r[verify store.chunk.refcount-txn]
     // r[verify store.put.wal-manifest]
+    // r[verify store.chunk.lock-order]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rollback_overlapping_no_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use tokio::time::timeout;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // 50 overlapping chunk hashes. Each manifest references all 50
-        // (refcount starts at 2 so both rollbacks can decrement without
-        // hitting the CHECK (refcount >= 0) constraint).
-        let hashes: Vec<Vec<u8>> = (0u8..50).map(|i| vec![i; 32]).collect();
-        let sizes: Vec<i64> = vec![1024; 50];
-
-        // Seed via two upgrade_manifest_to_chunked calls → refcount=2
-        // for every chunk.
+        // Seed 100 chunks at refcount=1 via one manifest. 100 (vs 50)
+        // widens the per-row contender's window — 100 sequential PG
+        // roundtrips ~guarantees overlap with the batch UPDATE.
+        let hashes: Vec<Vec<u8>> = (0u8..100).map(|i| vec![i; 32]).collect();
+        let sizes: Vec<i64> = vec![1024; 100];
         let sph_a = vec![0xAAu8; 32];
-        let sph_b = vec![0xBBu8; 32];
         seed_placeholder(&db.pool, &sph_a).await;
-        seed_placeholder(&db.pool, &sph_b).await;
         upgrade_manifest_to_chunked(&db.pool, &sph_a, b"ml-a", &hashes, &sizes)
             .await
             .unwrap();
-        upgrade_manifest_to_chunked(&db.pool, &sph_b, b"ml-b", &hashes, &sizes)
-            .await
-            .unwrap();
 
-        // Forward order for A, reversed for B. Before the fix this is
-        // the pathological lock-order inversion.
+        // Per-row contender: locks in `sorted` ARRAY order (one UPDATE
+        // per hash, all in one tx). No-op write — row-locks
+        // unconditionally. Stands in for "any chunk writer obeying
+        // r[store.chunk.lock-order] that walks its hash list under
+        // one tx".
+        async fn contend_per_row(pool: &PgPool, sorted: &[Vec<u8>]) -> crate::metadata::Result<()> {
+            let mut tx = pool.begin().await?;
+            for h in sorted {
+                sqlx::query("UPDATE chunks SET size = size WHERE blake3_hash = $1")
+                    .bind(h)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+
+        // Side A: production rollback body (`_inner` directly so the
+        // closure owns the attempt counter). Fed forward order.
+        // Side B: per-row contender. Fed REVERSED — pathological
+        // input that the helper's sort must canonicalise.
         let hashes_fwd = hashes.clone();
         let mut hashes_rev = hashes.clone();
         hashes_rev.reverse();
 
         let pool_a = db.pool.clone();
         let pool_b = db.pool.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_a = Arc::clone(&attempts);
+        let attempts_b = Arc::clone(&attempts);
 
         let task_a = tokio::spawn(async move {
-            delete_manifest_chunked_uploading(&pool_a, &sph_a, &hashes_fwd).await
+            crate::metadata::with_sorted_retry(hashes_fwd, move |sorted| {
+                attempts_a.fetch_add(1, Ordering::Relaxed);
+                let pool_a = pool_a.clone();
+                let sph_a = sph_a.clone();
+                async move {
+                    delete_manifest_chunked_uploading_inner(&pool_a, &sph_a, &sorted).await
+                }
+            })
+            .await
         });
         let task_b = tokio::spawn(async move {
-            delete_manifest_chunked_uploading(&pool_b, &sph_b, &hashes_rev).await
+            crate::metadata::with_sorted_retry(hashes_rev, move |sorted| {
+                attempts_b.fetch_add(1, Ordering::Relaxed);
+                let pool_b = pool_b.clone();
+                async move { contend_per_row(&pool_b, &sorted).await }
+            })
+            .await
         });
 
         let (ra, rb) = timeout(Duration::from_secs(5), async {
             tokio::try_join!(task_a, task_b).expect("tasks should not panic")
         })
         .await
-        .expect("concurrent rollbacks must complete within 5s — deadlock detected");
+        .expect("concurrent rollback+contender must complete within 5s — deadlock detected");
 
-        ra.expect("rollback A should succeed");
-        rb.expect("rollback B should succeed");
+        ra.expect("rollback should succeed");
+        rb.expect("contender should succeed");
 
-        // All refcounts back to 0.
+        // Mutation sentinel: with_sorted_retry's sort means both sides
+        // lock ascending → no 40P01 → no retry → exactly 2 body
+        // invocations total. Removing the sort makes this 3 (one side
+        // 40P01s, helper retries). Mutation-tested locally: sort
+        // removed → attempts==3 → fails here.
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "with_sorted_retry sort should prevent 40P01 (no retry needed)"
+        );
+
+        // Vacuity sentinel: rollback's UPDATE must have matched and
+        // decremented all 100. If a future seed regression makes the
+        // UPDATE match zero rows, this fails loudly instead of going
+        // vacuous again.
         let sum: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
         )
@@ -798,7 +850,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(sum, 0, "both rollbacks decremented all 50 chunks to zero");
+        assert_eq!(sum, 0, "rollback decremented all 100 chunks to zero");
     }
 
     /// I-040 chain, post-M033: the inline `delete_manifest_uploading`
