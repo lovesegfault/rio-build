@@ -151,9 +151,16 @@ describe('graphLayout', () => {
     // status lands there without a mapping here, it defaults to gray
     // (safe but invisible). This test pins the full current set.
     const green = ['completed', 'skipped'];
-    const yellow = ['running', 'assigned'];
+    const yellow = ['running', 'assigned', 'substituting'];
     const red = ['failed', 'poisoned', 'dependency_failed'];
     const gray = ['created', 'queued', 'ready', 'cancelled'];
+
+    // Count assertion so future hand-list drift fails loudly instead of
+    // silently — a missing entry here means that status's color is
+    // unverified by any test in this file.
+    expect(green.length + yellow.length + red.length + gray.length).toBe(
+      DERIVATION_STATUSES.length,
+    );
 
     for (const s of green) expect(statusClass(s)).toBe('green');
     for (const s of yellow) expect(statusClass(s)).toBe('yellow');

@@ -131,8 +131,16 @@ describe('createLogStream', () => {
     ) {
       seenSignal = opts.signal;
       yield chunk([u8(0x78)]); // "x"
-      // Park forever — only destroy() can unblock.
-      await new Promise(() => {});
+      // Park until destroy() aborts; then throw so the catch arm runs.
+      // A bare `new Promise(() => {})` would never settle — abort()
+      // flips the signal but doesn't wake a parked promise — and the
+      // `s.err === null` assert below would pass vacuously (catch
+      // never reached, err never assigned).
+      await new Promise((_, rej) =>
+        opts.signal?.addEventListener('abort', () =>
+          rej(new DOMException('aborted', 'AbortError')),
+        ),
+      );
     });
 
     const s = createLogStream('build-abort');
@@ -149,6 +157,10 @@ describe('createLogStream', () => {
     // assertion ever fails the viewer would flash "AbortError" every
     // time the drawer closed.
     expect(s.err).toBeNull();
+    // done flips in the catch arm — structurally proves the abort
+    // actually drove execution through the catch block (a parked-forever
+    // mock would leave done false and err null for the wrong reason).
+    expect(s.done).toBe(true);
   });
 
   it('marks done when the generator exhausts without isComplete', async () => {

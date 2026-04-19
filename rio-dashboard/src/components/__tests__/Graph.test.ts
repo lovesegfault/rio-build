@@ -139,8 +139,11 @@ describe('Graph poll loop', () => {
     // every([]) → true is the vacuous-truth footgun. An empty nodes
     // array (build just submitted, scheduler hasn't walked the DAG yet)
     // must keep polling or the page freezes on "loading graph…" with
-    // the drawer open.
-    getBuildGraph.mockResolvedValue(mkResp([]));
+    // the drawer open. truncated:false so the !r.truncated term is true
+    // and the r.nodes.length > 0 guard is the actual gating term —
+    // with the default truncated:true the length guard would never be
+    // reached and this test would pass even if it were deleted.
+    getBuildGraph.mockResolvedValue(mkResp([], false));
 
     render(Graph, { props: { buildId: 'b-3' } });
     await flushSvelte();
@@ -150,7 +153,8 @@ describe('Graph poll loop', () => {
     await flushSvelte();
     await vi.advanceTimersByTimeAsync(5000);
     await flushSvelte();
-    // Still climbing — the length-0 guard kept the interval alive.
+    // Still climbing — the r.nodes.length > 0 guard kept the interval
+    // alive (without it, [].every() → true would have set allTerminal).
     expect(getBuildGraph.mock.calls.length).toBeGreaterThanOrEqual(3);
   });
 });
