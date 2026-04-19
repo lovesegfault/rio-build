@@ -173,5 +173,43 @@ pkgs.testers.runNixOSTest {
         assert "nameserver " in upstream, f"upstream resolv.conf has no nameserver:\n{upstream}"
         stub = node.succeed("cat /run/systemd/resolve/stub-resolv.conf")
         assert "127.0.0.53" in stub, f"stub no longer loopback (precondition changed):\n{stub}"
+
+    # bug_364: 99-vpc-cni sorted AFTER systemd's built-in 99-default.link
+    # (MACAddressPolicy=persistent catch-all) and never applied. Renamed
+    # to 80-rio-mac-none. udevadm test-builtin prints which .link file
+    # matched; eth0 is the qemu test framework's primary nic.
+    with subtest("MACAddressPolicy=none .link sorts before systemd 99-default"):
+        out = node.succeed(
+            "SYSTEMD_LOG_LEVEL=debug udevadm test-builtin net_setup_link "
+            "/sys/class/net/eth0 2>&1 || true"
+        )
+        assert "80-rio-mac-none.link" in out, f"expected rio .link to apply, got:\n{out}"
+
+    # bug_479: local-fs.target does NOT order after udev coldplug of
+    # non-fstab block devices. Multi-NVMe instances could enumerate a
+    # partial set → undersized RAID0 stripe. The QEMU VM has no AWS
+    # instance-store NVMe (ConditionPathExistsGlob → unit skipped), so
+    # assert structurally on the rendered script: settle precedes glob.
+    # `systemctl cat` shows ExecStart= as a store-path; cat that.
+    with subtest("rio-nvme-mount settles udev before enumerating"):
+        script = node.succeed(
+            "cat $(systemctl show -P ExecStart rio-nvme-mount.service "
+            "| grep -oE '/nix/store/[^ ;]+')"
+        )
+        assert script.index("udevadm settle") < script.index(
+            "nvme-Amazon_EC2_NVMe_Instance_Storage"
+        ), f"udevadm settle missing or after device glob:\n{script}"
+
+    # bug_054: pause import previously had `|| true` and lacked --local.
+    # With sandbox=localhost/kubernetes/pause there is no registry
+    # fallback, so a swallowed failure left a Ready-but-100%-failing
+    # node. kubelet.service waited above; assert the import landed AND
+    # the pinned label survived (the --local fix).
+    with subtest("pause image imported and pinned"):
+        node.succeed(
+            "ctr -n k8s.io image ls "
+            "| grep 'localhost/kubernetes/pause' "
+            "| grep -q 'io.cri-containerd.pinned=pinned'"
+        )
   '';
 }

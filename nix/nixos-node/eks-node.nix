@@ -32,9 +32,8 @@ let
   # expects the AMI bake to have pre-loaded it (templates/shared/runtime/
   # bin/cache-pause-container in the AL2023 builder). Build the pause binary
   # from the same kubernetes derivation kubelet comes from and wrap it as
-  # a single-layer OCI tarball; kubelet preStart `ctr image import`s it.
-  # The CRI pinned label is set on import so kubelet's image-GC won't
-  # evict it.
+  # a single-layer OCI tarball; kubelet preStart `ctr image import`s it
+  # then `ctr image label`s it pinned so kubelet's image-GC won't evict.
   pauseImage = pkgs.dockerTools.buildImage {
     name = "localhost/kubernetes/pause";
     tag = "latest";
@@ -189,7 +188,15 @@ in
         ManageForeignRoutes = false;
         ManageForeignRoutingPolicyRules = false;
       };
-      links."99-vpc-cni" = {
+      # Prefix < "99-default" (systemd's built-in MACAddressPolicy=
+      # persistent catch-all). systemd.link(5) sorts ALL .link files
+      # lexically across /etc and /lib; /etc only masks /lib on
+      # IDENTICAL filenames. The AL2023 port originally named this
+      # 99-default (same-name mask); a later "clarity" rename to
+      # 99-vpc-cni sorted AFTER and silently never applied — cilium's
+      # lxc*/cilium_* veths got MACAddressPolicy=persistent, a known
+      # cilium datapath breaker.
+      links."80-rio-mac-none" = {
         matchConfig.OriginalName = "*";
         linkConfig.MACAddressPolicy = "none";
       };
@@ -298,13 +305,17 @@ in
                   ${ctr} image import --local ${seed} \
                     || echo "<4>rio: seed import ${seed} failed; first-pod pull will be cold" >&2
                 '') cfg.seedImages}
-                # Pin both seed.local/…:prebaked refs. The label stops
+                # Pin every seed.local/… ref just imported. The label stops
                 # kubelet's CRI image-GC from deleting the IMAGE RECORD; the
                 # record's mere existence stops containerd's content-GC from
                 # deleting the LAYER BLOBS (Q8 — gc.Scheduler walks image-
                 # store refs, not labels). No content-label or lease needed.
-                for ref in seed.local/rio-builder:prebaked seed.local/rio-fetcher:prebaked; do
-                  ${ctr} image label "$ref" io.cri-containerd.pinned=pinned || true
+                # Derived from `ctr image ls` so it can never diverge from
+                # cfg.seedImages — a hardcoded ref list here once silently
+                # un-pinned a renamed image (image-GC evicted the warm).
+                for ref in $(${ctr} image ls -q | ${pkgs.gnugrep}/bin/grep '^seed\.local/'); do
+                  ${ctr} image label "$ref" io.cri-containerd.pinned=pinned \
+                    || echo "<4>rio: seed pin $ref failed" >&2
                 done
               '';
           };
@@ -343,7 +354,8 @@ in
             "nodeadm-init.service"
             "kubelet.service"
           ];
-          # local-fs.target: udev has settled, by-id symlinks exist.
+          # local-fs.target: fstab mounts done. udev coldplug of NON-fstab
+          # NVMe is async — settle in-script before enumerating.
           after = [ "local-fs.target" ];
           unitConfig = {
             # Early boot: drop the implicit After=basic.target so this
@@ -355,9 +367,19 @@ in
             pkgs.mdadm
             pkgs.xfsprogs
             pkgs.util-linux
+            pkgs.systemd # udevadm
           ];
           script = ''
             set -euo pipefail
+            # local-fs.target orders after fstab mounts, NOT udev coldplug
+            # of non-fstab block devices; with DefaultDependencies=false
+            # there is no implicit After=sysinit.target either.
+            # ConditionPathExistsGlob needs ≥1 match, so on multi-NVMe
+            # instances (c6id/m6id.32xl: 4 disks) udev may have created
+            # some-but-not-all by-id symlinks → mdadm builds an undersized
+            # stripe with no error → premature DiskPressure once Karpenter
+            # bin-packs assuming full instanceStorePolicy:RAID0 capacity.
+            udevadm settle
             # udev (≥v250) creates two by-id symlinks per NVMe namespace
             # (`…_<serial>` and `…_<serial>_<nsid>`); resolve and dedup so
             # mdadm doesn't get the same /dev/nvmeXn1 twice → EBUSY.
@@ -529,8 +551,18 @@ in
               ${lib.getExe' pkgs.iptables "iptables"} -P FORWARD ACCEPT -w 5
               # pause MUST land before kubelet's first sandbox; no registry
               # fallback (containerd-config.nix pins sandbox=localhost/
-              # kubernetes/pause).
-              ${ctr} image import --label io.cri-containerd.pinned=pinned ${pauseImage} || true
+              # kubernetes/pause). NO `|| true`: import failure → preStart
+              # exits non-zero → Restart=always re-runs preStart in 10s;
+              # node stays NotReady until pause lands. A Ready-but-100%-
+              # sandbox-failing node is strictly worse than NotReady.
+              #
+              # Label SEPARATELY: containerd 2.x transfer-API import drops
+              # --label silently; --local honours it but rejects gzipped
+              # docker-archive (dockerTools.buildImage default) with
+              # "invalid tar header". Import via transfer-API (handles
+              # gzip), then `ctr image label` — same shape as seed-warm.
+              ${ctr} image import ${pauseImage}
+              ${ctr} image label ${pauseRef} io.cri-containerd.pinned=pinned
             ''
             + lib.optionalString (cfg.staticPods != { }) ''
               mkdir -p /etc/kubernetes/manifests
