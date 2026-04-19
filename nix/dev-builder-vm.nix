@@ -76,12 +76,9 @@
     ];
   };
 
-  # With writableStore=false, /nix/var is on the RO 9p mount too. Mount tmpfs
-  # so the host nix-daemon + synth-DB bind target have writable paths.
-  fileSystems."/nix/var" = {
-    fsType = "tmpfs";
-    neededForBoot = true;
-  };
+  # /nix/var: see nix/tests/common.nix mkWorkerNode for why no mount is
+  # needed (and why plain `fileSystems.*` wouldn't apply here anyway —
+  # qemu-vm.nix mkVMOverride at priority 10 silently drops it).
 
   system.stateVersion = "25.11";
 }
