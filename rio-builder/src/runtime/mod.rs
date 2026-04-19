@@ -472,11 +472,6 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             })
             .await?;
 
-        // Swap in the new gRPC target. Relay resumes pumping.
-        // send_replace because we don't care about the old value
-        // (it's a dead channel or None).
-        rt.relay_target_tx.send_replace(Some(grpc_tx));
-
         let mut build_stream = match rt
             .scheduler_client
             .build_execution(tokio_stream::wrappers::ReceiverStream::new(grpc_rx))
@@ -488,7 +483,6 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 // caught up. Back off and retry. The balanced
                 // channel's probe loop rediscovers within ~3s.
                 tracing::warn!(error = %e, "BuildExecution open failed; retrying in 1s");
-                rt.relay_target_tx.send_replace(None);
                 match reconnect_backoff(&rt).await {
                     std::ops::ControlFlow::Continue(()) => continue 'reconnect,
                     std::ops::ControlFlow::Break(()) => break 'reconnect,
@@ -496,6 +490,19 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             }
         };
         info!("BuildExecution stream open");
+
+        // Swap in the new gRPC target only NOW that the stream is
+        // confirmed open. merged_bug_020: previously swapped before
+        // build_execution.await — relay drained sink_rx into grpc_tx
+        // while the future was pending; on Err, grpc_rx dropped along
+        // with everything pumped into it (a CompletionReport queued
+        // during the reconnect gap was silently discarded → re-dispatch
+        // of a finished build). With the swap here the relay stays
+        // parked on the previous iteration's `send_replace(None)`
+        // (:641) and sink messages wait in sink_rx until a connect
+        // actually succeeds. Register at :467 went on grpc_tx directly,
+        // so it's still first on the wire.
+        rt.relay_target_tx.send_replace(Some(grpc_tx));
 
         let stream_end = loop {
             if rt.heartbeat_handle.is_finished() {
@@ -1155,6 +1162,100 @@ mod tests {
         assert!(
             grpc1_rx.try_recv().is_err(),
             "stale target must not receive messages after watch swap"
+        );
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Regression for merged_bug_020. Pins the invariant `run()` now
+    /// relies on: while `target = None`, sink messages stay in
+    /// `sink_rx`; a failed connect attempt that never swaps the watch
+    /// loses nothing; the eventual live target receives everything in
+    /// order.
+    ///
+    /// Pre-fix, `run()` swapped `Some(doomed_tx)` BEFORE
+    /// `build_execution.await` resolved → relay drained the sink into
+    /// the doomed channel → on `Err`, `doomed_rx` dropped with the
+    /// buffer; the relay's single-slot `buffered` only rescued the one
+    /// message whose `send()` failed AFTER the drop. The negative half
+    /// of this test demonstrates that loss path so the swap-after-Ok
+    /// ordering in `run()` is visibly load-bearing.
+    // r[verify builder.relay.reconnect]
+    #[tokio::test]
+    async fn relay_sink_preserved_across_failed_connect_window() {
+        // ── Positive: fixed connect sequence (no swap on failed try) ──
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+
+        // Build finishes during the reconnect gap; queues completion +
+        // logs while target is None (relay parked on changed()).
+        sink_tx.send(msg("completion")).await.unwrap();
+        sink_tx.send(msg("log-a")).await.unwrap();
+        sink_tx.send(msg("log-b")).await.unwrap();
+
+        // Failed connect attempt: target stays None (run() never swaps).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Successful attempt: swap to live target.
+        let (live_tx, mut live_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(live_tx));
+
+        for want in ["completion", "log-a", "log-b"] {
+            let r = tokio::time::timeout(Duration::from_secs(1), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    r.msg,
+                    Some(executor_message::Msg::Register(ExecutorRegister { executor_id }))
+                        if executor_id == want
+                ),
+                "expected {want} in order"
+            );
+        }
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // ── Negative pin: pre-fix swap-before-connect loses messages ──
+        // Do NOT reintroduce a swap before `build_execution` Ok.
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+
+        sink_tx.send(msg("completion")).await.unwrap();
+        sink_tx.send(msg("log-a")).await.unwrap();
+        sink_tx.send(msg("log-b")).await.unwrap();
+
+        // Pre-fix run(): swap to a doomed target whose rx is alive
+        // during the connect await, then drops on Err.
+        let (doomed_tx, doomed_rx) = mpsc::channel::<ExecutorMessage>(8);
+        target_tx.send_replace(Some(doomed_tx));
+        tokio::time::sleep(Duration::from_millis(10)).await; // relay drains
+        drop(doomed_rx); // build_execution → Err → ReceiverStream drops
+        target_tx.send_replace(None);
+
+        let (live_tx, mut live_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(live_tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // At most ONE message survives (the relay's `buffered` slot, IF
+        // a send happened to fail post-drop). Everything accepted into
+        // doomed_rx's buffer is gone.
+        let mut survived = 0;
+        while live_rx.try_recv().is_ok() {
+            survived += 1;
+        }
+        assert!(
+            survived <= 1,
+            "pre-fix ordering loses sink messages (got {survived}, expected ≤1)"
         );
         drop(sink_tx);
         tokio::time::timeout(Duration::from_secs(1), relay)
