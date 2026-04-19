@@ -274,12 +274,13 @@ impl DerivationDag {
             // Resubmit-retry: if the existing node is Cancelled or Failed,
             // remove it so the else-branch below re-inserts fresh state and
             // it flows through `compute_initial_states` → `newly_inserted`.
-            // Without this, a Cancelled node left by a timed-out build
-            // (reap misses it — `cancel_build_derivations` removes interest
-            // BEFORE `remove_build_interest_and_reap`'s `was_interested`
-            // check) makes the resubmitted build hang: merge adds interest
-            // but `compute_initial_states` only iterates newly-inserted, and
-            // `handle_merge_dag`'s pre-existing-node match ignores Cancelled.
+            // Defense-in-depth: reap now removes Cancelled nodes for terminal
+            // builds, so the reset is only load-bearing during the
+            // TERMINAL_CLEANUP_DELAY window or for nodes shared with a
+            // still-active build at cancel time. Without it, merge adds
+            // interest but `compute_initial_states` only iterates
+            // newly-inserted, and `handle_merge_dag`'s pre-existing-node
+            // match ignores Cancelled — the resubmitted build would hang.
             //
             // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
             // string, so they stay valid across the remove+reinsert. The merge's
@@ -864,14 +865,18 @@ impl DerivationDag {
         let mut to_reap = Vec::new();
 
         for (hash, state) in &mut self.nodes {
-            // HashSet::remove returns true iff the element was present.
-            // Only reap nodes that THIS call emptied. Recovered-poisoned
-            // nodes have interested_builds=∅ from birth (from_poisoned_row
-            // at state/derivation.rs) — without this guard, the FIRST
-            // build completion post-recovery reaps every one of them,
-            // silently disabling poison-TTL tracking.
-            let was_interested = state.interested_builds.remove(&build_id);
-            if was_interested && state.interested_builds.is_empty() && state.status().is_terminal()
+            state.interested_builds.remove(&build_id);
+            // Exclude Poisoned: recovered-poisoned nodes have
+            // interested_builds=∅ from birth (from_poisoned_row at
+            // state/derivation.rs) and are TTL-tracked — reaping them
+            // would silently disable poison-TTL. The previous
+            // `was_interested` guard achieved that exclusion as a side
+            // effect, but it also defeated reap entirely for cancelled/
+            // failed/timed-out builds: cancel_build_derivations strips
+            // interest first, so was_interested was always false here.
+            if state.interested_builds.is_empty()
+                && state.status().is_terminal()
+                && state.status() != DerivationStatus::Poisoned
             {
                 to_reap.push(hash.clone());
             }

@@ -163,3 +163,45 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
     );
     Ok(())
 }
+
+/// `transition_build` DB error must NOT commit the in-memory transition.
+///
+/// Previous order was in-mem mutate → DB write → `?`. A transient PG
+/// error left in-mem terminal, DB Active; every caller swallowed with
+/// `error!()`. `check_build_completion` then early-returned forever
+/// (`is_terminal()` true), `BuildCompleted` was never emitted, and
+/// `schedule_terminal_cleanup` never ran. Retry self-defeated: re-calling
+/// on already-terminal returns `Rejected`.
+///
+/// Post-fix (validate → DB → in-mem): DB error leaves in-mem `Active`,
+/// so the next completion-driven `check_build_completion` retries cleanly.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_transition_build_db_fault_leaves_state_retryable() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("tbfault-w", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "tbfault-h", PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx).await;
+
+    // Close pool AFTER dispatch so only transition_build's
+    // update_build_status fails (plus the best-effort writes around it).
+    db.pool.close().await;
+
+    complete_success_empty(&handle, "tbfault-w", &test_drv_path("tbfault-h")).await?;
+    barrier(&handle).await;
+
+    // Load-bearing: in-mem state is STILL Active. Pre-fix this was
+    // Succeeded — stuck terminal with no event emitted, no cleanup.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "DB error in transition_build must leave in-mem Active so retry remains possible"
+    );
+    assert!(
+        logs_contain("failed to persist build completion"),
+        "transition_build DB failure should be logged by check_build_completion"
+    );
+    Ok(())
+}

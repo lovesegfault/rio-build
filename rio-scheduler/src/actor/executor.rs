@@ -667,12 +667,13 @@ impl DagActor {
             // on drv_path, not drv_hash). Skip derivations that
             // aren't in the DAG (shouldn't happen but be defensive).
             if let Some(tx) = &stream_tx {
+                let mut sent: u64 = 0;
                 for drv_hash in &to_reassign {
                     let Some(drv_path) = self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
                     else {
                         continue;
                     };
-                    if let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
+                    match tx.try_send(rio_proto::types::SchedulerMessage {
                         msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
                             rio_proto::types::CancelSignal {
                                 drv_path,
@@ -680,19 +681,24 @@ impl DagActor {
                             },
                         )),
                     }) {
-                        debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
-                               "cancel signal dropped (stream full/closed)");
-                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
+                        Ok(()) => sent += 1,
+                        Err(e) => {
+                            debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
+                                   "cancel signal dropped (stream full/closed)");
+                            metrics::counter!("rio_scheduler_cancel_signal_dropped_total")
+                                .increment(1);
+                        }
                     }
                 }
-                if !to_reassign.is_empty() {
+                // cancel_signals_total counts signals DELIVERED — see
+                // build.rs / housekeeping.rs.
+                if sent > 0 {
                     info!(
                         executor_id = %executor_id,
-                        count = to_reassign.len(),
+                        count = sent,
                         "sent CancelSignal for force-drain (preemption)"
                     );
-                    metrics::counter!("rio_scheduler_cancel_signals_total")
-                        .increment(to_reassign.len() as u64);
+                    metrics::counter!("rio_scheduler_cancel_signals_total").increment(sent);
                 }
             }
 

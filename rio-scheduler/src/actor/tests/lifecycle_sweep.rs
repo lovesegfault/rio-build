@@ -680,12 +680,18 @@ async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> Test
         "D1 must be removed from the DAG"
     );
 
-    // Complete D2. Pre-fix hang; post-fix terminal.
+    // Complete D2. Pre-fix: spuriously Succeeded (failed_count derived from
+    // DAG → 0 after D1 removed). Post-fix: sticky error_summary forces Failed.
     complete_success_empty(&handle, w_d2, &test_drv_path("pr-d2")).await?;
-    assert_ne!(
-        query_status(&handle, build_id).await?.state,
-        rio_proto::types::BuildState::Active as i32,
-        "build must reach terminal — derivation_hashes pruned on remove_node"
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "D1 was poisoned → build must end Failed even after poison cleared"
+    );
+    assert!(
+        !status.error_summary.is_empty(),
+        "error_summary must report the poisoned derivation"
     );
     Ok(())
 }

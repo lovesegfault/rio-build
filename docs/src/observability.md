@@ -130,7 +130,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_backstop_timeouts_total` | Counter | Running derivations reset to Ready by the backstop timeout (running_since > max(est_duration×3, daemon_timeout+10m)). Non-zero indicates wedged executors. |
 | `rio_scheduler_build_timeouts_total` | Counter | Builds failed by per-build wall-clock timeout (`BuildOptions.build_timeout` seconds since submission). Distinct from `backstop_timeouts_total` (per-derivation heuristic). |
 | `rio_scheduler_worker_disconnects_total` | Counter | BuildExecution stream closures (executor gone). Triggers reassignment. |
-| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages sent to executors (explicit CancelBuild, backstop timeout, per-build timeout, or finalizer drain). |
+| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages successfully delivered to the executor stream (Ok on `try_send`). Excludes drops (counted in `cancel_signal_dropped_total`) and skipped attempts. Sources: explicit CancelBuild, backstop timeout, per-build timeout, finalizer drain. |
 | `rio_scheduler_cancel_signal_dropped_total` | Counter | CancelSignal `try_send` drops (executor stream full/closed under backpressure). Best-effort: the transition to Cancelled is scheduler-authoritative regardless; the executor's next heartbeat reconcile cleans it up. Alert if rate > 0 sustained. |
 | `rio_scheduler_sla_refit_total` | Counter | SLA estimator refresh ticks (≈60s cadence). *Internal — VM test sync signal.* |
 | `rio_scheduler_derivations_gc_deleted_total` | Counter | Orphan-terminal `derivations` rows deleted by the periodic Tick sweep (I-169.2). Nonzero rate is normal; a sustained 1000/tick saturation means the backlog hasn't drained yet. |

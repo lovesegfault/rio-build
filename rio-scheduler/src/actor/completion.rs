@@ -1746,7 +1746,9 @@ impl DagActor {
         // `newly_inserted` — node would sit in Created forever. Poisoned
         // nodes have no interested keep_going=false builds (build already
         // terminated); keep_going=true builds are pruned from
-        // derivation_hashes here so removal orphans no live accounting.
+        // derivation_hashes here. The sticky `error_summary` set by
+        // `handle_derivation_failure` keeps such builds on track to Fail
+        // even after the node (and its `failed_count` contribution) is gone.
         self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
@@ -2314,7 +2316,15 @@ impl DagActor {
                 error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
             }
         } else {
-            // keepGoing: check if all derivations are resolved
+            // keepGoing: record sticky failure (failed_count is DAG-derived
+            // and resets to 0 if the poisoned node is later removed via
+            // ClearPoison/TTL), then check if all derivations are resolved.
+            build
+                .error_summary
+                .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
+            build
+                .failed_derivation
+                .get_or_insert_with(|| drv_hash.to_string());
             self.check_build_completion(build_id).await;
         }
     }

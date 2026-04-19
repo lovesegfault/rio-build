@@ -130,9 +130,8 @@ fn test_initial_states() -> anyhow::Result<()> {
 /// `poisoned_at_limit` case here (bound holds at limit) plus
 /// `merge_reset_parent_child::poisoned_under_limit` (resets under limit).
 #[rstest]
-// Per-build timeout: cancel_build_derivations removes interest BEFORE reap
-// runs → node sits with interested_builds=∅ and status=Cancelled. Reap's
-// `was_interested` guard misses it. Resubmit must reset.
+// Cancelled node still in DAG during TERMINAL_CLEANUP_DELAY (reap hasn't
+// run yet) — resubmit must reset so the new build doesn't hang.
 #[case::cancelled(DerivationStatus::Cancelled, 0, true, true, DerivationStatus::Created)]
 // Failed: non-terminal but stuck without a retry driver. build1 still
 // interested → preserved across reset so the stuck build also benefits.
@@ -1781,6 +1780,64 @@ fn test_find_roots_build_scoped() -> anyhow::Result<()> {
         "shared has Y-interested parent → not Y's root"
     );
 
+    Ok(())
+}
+
+/// Reap must remove an orphaned terminal node even if a prior
+/// `remove_build_interest` already stripped this build_id.
+///
+/// `cancel_build_derivations` calls `remove_build_interest` (for ready-
+/// queue cleanup) before `handle_cleanup_terminal_build` calls
+/// `remove_build_interest_and_reap`. The previous `was_interested`
+/// guard saw `interested_builds.remove(&b)` return false (already
+/// removed) and reaped nothing — every cancelled/fail-fast/timed-out
+/// build leaked its sole-interest nodes for the process lifetime.
+#[test]
+fn test_reap_after_prior_remove_interest() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b = Uuid::new_v4();
+    dag.merge(b, &[make_node("reap-h", "x86_64-linux")], &[], "")?;
+    dag.node_mut("reap-h")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    // Prior strip — interested_builds is now ∅ but node still in DAG.
+    let _ = dag.remove_build_interest(b);
+    assert!(dag.nodes.contains_key("reap-h"));
+
+    let reaped = dag.remove_build_interest_and_reap(b);
+    assert_eq!(
+        reaped, 1,
+        "reap must be idempotent w.r.t. prior interest-strip"
+    );
+    assert!(!dag.nodes.contains_key("reap-h"));
+    Ok(())
+}
+
+/// Reap must NOT remove a Poisoned node with `interested_builds=∅`.
+///
+/// Recovered-poisoned nodes (`from_poisoned_row`) have empty
+/// `interested_builds` from birth and are TTL-tracked. Reaping them on
+/// the first build completion post-recovery would silently disable
+/// poison-TTL. Regression guard for the explicit `!= Poisoned`
+/// exclusion that replaced the `was_interested` side-effect guard.
+#[test]
+fn test_reap_preserves_poisoned() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b = Uuid::new_v4();
+    dag.merge(b, &[make_node("poison-h", "x86_64-linux")], &[], "")?;
+    {
+        let n = dag.node_mut("poison-h").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.interested_builds.clear(); // recovered-poisoned shape
+    }
+
+    let reaped = dag.remove_build_interest_and_reap(Uuid::new_v4());
+    assert_eq!(
+        reaped, 0,
+        "Poisoned nodes are TTL-tracked, never reaped here"
+    );
+    assert!(dag.nodes.contains_key("poison-h"));
     Ok(())
 }
 

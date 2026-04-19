@@ -672,22 +672,184 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
             reply: reply_tx,
         })
         .await?;
-    let cancelled = reply_rx.await??;
+    // The reply oneshot is sent only AFTER handle_cancel_build (incl.
+    // all PG writes) returns, so timing reply_rx itself IS the
+    // load-bearing assertion. 5s is >50× the expected ~100ms for 2
+    // batched local-PG round-trips — generous slack budget per
+    // ci-failure-patterns.md "Wall-clock gate under load". Mutation-
+    // verified: reverting persist_status_batch/unpin_best_effort_batch
+    // to per-item loops blows through this on a network-latency PG.
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        .await
+        .expect(
+            "cancel should complete within 5s with batched PG writes (was 2×N RTTs before)",
+        )??;
     assert!(cancelled);
 
-    // The actor must be responsive immediately after: a heartbeat
-    // should process within 5s. send_heartbeat awaits actor ingestion
-    // (mpsc send), and query_status awaits a full round-trip through
-    // the actor — both would time out if the actor were still stuck
-    // in a 200-await PG loop.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        send_heartbeat(&handle, "batch-w-000", "x86_64-linux").await?;
-        let status = query_status(&handle, build_id).await?;
-        assert_eq!(status.state, rio_proto::types::BuildState::Cancelled as i32);
-        anyhow::Ok(())
-    })
-    .await
-    .expect("actor should process heartbeat within 5s after batched cancel")?;
+    // Functional check: build is Cancelled and actor is responsive.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.state, rio_proto::types::BuildState::Cancelled as i32);
 
+    Ok(())
+}
+
+/// CancelBuild reaps sole-interest DAG nodes after cleanup.
+///
+/// `cancel_build_derivations` strips build interest BEFORE
+/// `handle_cleanup_terminal_build` calls `remove_build_interest_and_reap`.
+/// The previous `was_interested` guard saw the empty set and reaped
+/// nothing — every cancelled build leaked its DAG nodes for the
+/// process lifetime. Only `complete_build` (which skips
+/// `cancel_build_derivations`) actually reaped.
+#[tokio::test]
+async fn test_cancel_reaps_dag_nodes() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("reap-w", "x86_64-linux").await?;
+
+    // 3 sole-interest nodes: dispatched (Assigned/Running) + 2 queued
+    // behind it (Queued → DependencyFailed). Covers both transition
+    // arms of cancel_build_derivations.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_node("reap-a"),
+            make_node("reap-b"),
+            make_node("reap-c"),
+        ],
+        vec![
+            make_test_edge("reap-b", "reap-a"),
+            make_test_edge("reap-c", "reap-a"),
+        ],
+        false,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx).await;
+
+    let (tx, rrx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "reap test".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rrx.await??);
+
+    // Inject cleanup directly (bypass TERMINAL_CLEANUP_DELAY per
+    // test_terminal_build_cleanup_after_delay precedent).
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
+        .await?;
+    barrier(&handle).await;
+
+    for h in ["reap-a", "reap-b", "reap-c"] {
+        assert!(
+            handle.debug_query_derivation(h).await?.is_none(),
+            "cancelled sole-interest node {h:?} must be reaped"
+        );
+    }
+    Ok(())
+}
+
+/// `handle_cancel_build` records `build_duration_seconds`.
+///
+/// Previously it open-coded `transition + db.update_build_status`
+/// instead of calling `transition_build`, so cancelled builds bumped
+/// `builds_total{outcome="cancelled"}` but never the duration histogram
+/// — `histogram_count` ≠ `sum(builds_total)` and percentiles biased high.
+#[tokio::test]
+async fn test_cancel_records_duration_histogram() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "cdur-h", PriorityClass::Scheduled).await?;
+
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "duration test".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await??);
+
+    assert!(
+        recorder.histogram_touched("rio_scheduler_build_duration_seconds"),
+        "cancelled build must record into build_duration_seconds"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_builds_total{outcome=cancelled}"),
+        1,
+        "builds_total{{outcome=cancelled}} should increment exactly once"
+    );
+    Ok(())
+}
+
+/// `cancel_signals_total` counts only signals that landed on the executor
+/// stream (Ok on `try_send`), not the candidate-list length.
+///
+/// Three sole-interest dispatched nodes; one worker's stream_tx is
+/// dropped before CancelBuild so its `try_send` fails. Expect
+/// `signals_total += 2`, `dropped_total += 1`. Previously
+/// `signals_total += to_cancel.len() == 3`.
+#[tokio::test]
+async fn test_cancel_signals_total_counts_delivered_only() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task) = setup().await;
+    let mut rx0 = connect_executor(&handle, "csig-w0", "x86_64-linux").await?;
+    let mut rx1 = connect_executor(&handle, "csig-w1", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "csig-w2", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_node("csig-a"),
+            make_node("csig-b"),
+            make_node("csig-c"),
+        ],
+        vec![],
+        false,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx0).await;
+    let _ = recv_assignment(&mut rx1).await;
+    let _ = recv_assignment(&mut rx2).await;
+
+    // Close one worker's stream so its try_send Errs (channel closed).
+    // The actor still has the executor record + stream_tx; only the
+    // receiver end is gone.
+    drop(rx2);
+
+    let before_signals = recorder.get("rio_scheduler_cancel_signals_total{}");
+    let before_dropped = recorder.get("rio_scheduler_cancel_signal_dropped_total{}");
+
+    let (tx, rrx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "csig test".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rrx.await??);
+
+    assert_eq!(
+        recorder.get("rio_scheduler_cancel_signals_total{}") - before_signals,
+        2,
+        "signals_total counts delivered (Ok on try_send) only — was to_cancel.len()=3 before"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_cancel_signal_dropped_total{}") - before_dropped,
+        1,
+        "closed-stream worker contributes to dropped_total"
+    );
     Ok(())
 }

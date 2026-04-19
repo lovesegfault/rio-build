@@ -338,18 +338,20 @@ impl DagActor {
                 // which makes the gap vs backstop_timeouts_total explainable:
                 // backstop fires for silent workers; silent workers often have
                 // no stream_tx (disconnected) → no increment here. That's correct.
-                if tx
-                    .try_send(rio_proto::types::SchedulerMessage {
-                        msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
-                            rio_proto::types::CancelSignal {
-                                drv_path: drv_path.clone(),
-                                reason: "backstop timeout (stuck build)".into(),
-                            },
-                        )),
-                    })
-                    .is_ok()
-                {
-                    metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
+                match tx.try_send(rio_proto::types::SchedulerMessage {
+                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                        rio_proto::types::CancelSignal {
+                            drv_path: drv_path.clone(),
+                            reason: "backstop timeout (stuck build)".into(),
+                        },
+                    )),
+                }) {
+                    Ok(()) => {
+                        metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
+                    }
+                    Err(_) => {
+                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
+                    }
                 }
             }
             // Clear worker's running build (we're taking it back). With

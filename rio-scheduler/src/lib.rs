@@ -378,7 +378,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_cancel_signals_total",
-        "CancelSignal messages sent to workers (build cancellation propagation)"
+        "CancelSignal messages successfully delivered to the executor stream (Ok on try_send). \
+         Excludes drops (counted in cancel_signal_dropped_total) and skipped attempts."
     );
     describe_counter!(
         "rio_scheduler_cancel_signal_dropped_total",

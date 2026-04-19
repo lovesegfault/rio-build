@@ -42,35 +42,57 @@ impl DagActor {
     ///
     /// [`handle_cancel_build`]: Self::handle_cancel_build
     pub(super) async fn cancel_build_derivations(&mut self, build_id: Uuid, signal_reason: &str) {
-        // Before removing interest, find derivations that are Running/
-        // Assigned AND have THIS build as their ONLY interested build.
-        // These need an active cancel — the worker is burning CPU on
-        // them right now. Other derivations (sole-interest but not
-        // yet dispatched, or shared with another build) are handled
-        // by the existing orphan-removal / keep-running paths.
+        // Classify every sole-interest node in ONE iter_nodes() pass via
+        // an exhaustive match on status(). Exhaustive (not `matches!`
+        // allowlists) so adding a DerivationStatus variant is a compile
+        // error here — the previous two-filter shape silently skipped
+        // Substituting (orphaned zero-interest nodes re-entered the
+        // dispatch queue when SubstituteComplete{ok:false} arrived).
         //
-        // Collect (drv_path, executor_id) for each such derivation.
-        // drv_path (not drv_hash) because that's what CancelSignal
-        // and the worker's cancel registry are keyed on.
-        let to_cancel: Vec<(DrvHash, String, ExecutorId)> = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Assigned | DerivationStatus::Running
-                ) && s.interested_builds.len() == 1
-                    && s.interested_builds.contains(&build_id)
-            })
-            .filter_map(|(h, s)| {
-                // assigned_executor should always be Some for Assigned/
-                // Running, but be defensive. h is &str (iter_nodes
-                // returns HashMap's &str keys) — .into() to DrvHash.
-                s.assigned_executor
-                    .as_ref()
-                    .map(|w| (h.into(), s.drv_path().to_string(), w.clone()))
-            })
-            .collect();
+        // Shared derivations (another build still cares) are left alone
+        // — the other build drives them.
+        let mut to_cancel: Vec<(DrvHash, String, Option<ExecutorId>)> = Vec::new();
+        let mut to_cancel_substituting: Vec<DrvHash> = Vec::new();
+        let mut to_depfail: Vec<DrvHash> = Vec::new();
+        for (h, s) in self.dag.iter_nodes() {
+            if !(s.interested_builds.len() == 1 && s.interested_builds.contains(&build_id)) {
+                continue;
+            }
+            match s.status() {
+                // In-flight on a worker → CancelSignal + transition Cancelled.
+                // assigned_executor should always be Some for these, but
+                // a stuck node without one still gets the transition
+                // (signal skipped) — None indicates a prior bug, not a
+                // reason to leak the node.
+                DerivationStatus::Assigned | DerivationStatus::Running => {
+                    to_cancel.push((
+                        h.into(),
+                        s.drv_path().to_string(),
+                        s.assigned_executor.clone(),
+                    ));
+                }
+                // Detached fetch in flight → transition Cancelled (no
+                // executor to signal). handle_substitute_complete's
+                // "not Substituting → drop" guard then discards the
+                // task's eventual SubstituteComplete.
+                DerivationStatus::Substituting => to_cancel_substituting.push(h.into()),
+                // Not yet dispatched → DependencyFailed.
+                DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created => {
+                    to_depfail.push(h.into());
+                }
+                // Transient sub-second intermediate inside one
+                // handle_transient_failure call (Running → Failed →
+                // Ready). The single-threaded actor cannot observe it
+                // here — no CancelBuild can interleave mid-handler.
+                DerivationStatus::Failed => {}
+                // Terminal — nothing to transition. Reap handles them.
+                DerivationStatus::Completed
+                | DerivationStatus::Poisoned
+                | DerivationStatus::DependencyFailed
+                | DerivationStatus::Cancelled
+                | DerivationStatus::Skipped => {}
+            }
+        }
 
         // Send CancelSignal + transition Cancelled. The worker's
         // cgroup.kill SIGKILLs the daemon tree → run_daemon_build
@@ -89,6 +111,7 @@ impl DagActor {
         // heartbeats/completions/dispatch for the duration. Batching
         // collapses that to 2 round-trips regardless of N.
         let mut transitioned: Vec<&str> = Vec::with_capacity(to_cancel.len());
+        let mut sent: u64 = 0;
         for (drv_hash, drv_path, executor_id) in &to_cancel {
             // Transition FIRST. If it fails (state changed under
             // us — completion arrived between the collect above and
@@ -102,20 +125,27 @@ impl DagActor {
                 state.assigned_executor = None;
             }
             transitioned.push(drv_hash.as_str());
+            let Some(executor_id) = executor_id else {
+                continue;
+            };
             if let Some(worker) = self.executors.get(executor_id)
                 && let Some(tx) = &worker.stream_tx
-                && let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
+            {
+                match tx.try_send(rio_proto::types::SchedulerMessage {
                     msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
                         rio_proto::types::CancelSignal {
                             drv_path: drv_path.clone(),
                             reason: signal_reason.to_string(),
                         },
                     )),
-                })
-            {
-                debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
-                       "cancel signal dropped (stream full/closed)");
-                metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
+                }) {
+                    Ok(()) => sent += 1,
+                    Err(e) => {
+                        debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
+                               "cancel signal dropped (stream full/closed)");
+                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
+                    }
+                }
             }
             // Clear worker's running build — no longer counted against
             // capacity. They'll re-report it on next heartbeat but our
@@ -126,6 +156,13 @@ impl DagActor {
                 worker.running_build = None;
             }
         }
+        for drv_hash in &to_cancel_substituting {
+            if let Some(state) = self.dag.node_mut(drv_hash)
+                && state.transition(DerivationStatus::Cancelled).is_ok()
+            {
+                transitioned.push(drv_hash.as_str());
+            }
+        }
         // Batch persist + unpin. fire-and-forget via db; completion
         // handler's no-op for Cancelled means no double-write.
         if !transitioned.is_empty() {
@@ -133,34 +170,23 @@ impl DagActor {
                 .await;
             self.unpin_best_effort_batch(&transitioned).await;
         }
-        if !to_cancel.is_empty() {
+        // cancel_signals_total counts signals DELIVERED (Ok on try_send),
+        // matching housekeeping.rs's documented semantic. Previously this
+        // emitted to_cancel.len(), which counted items skipped before
+        // try_send and items already in dropped_total.
+        if sent > 0 {
             info!(
                 build_id = %build_id,
-                count = to_cancel.len(),
+                count = sent,
                 "sent CancelSignal to workers for sole-interest in-flight derivations"
             );
-            metrics::counter!("rio_scheduler_cancel_signals_total")
-                .increment(to_cancel.len() as u64);
+            metrics::counter!("rio_scheduler_cancel_signals_total").increment(sent);
         }
 
         // Sole-interest Queued/Ready/Created → DependencyFailed.
         // Without this, remove_build_interest orphans them (no
         // interested build → never dispatched → never terminal) but
-        // they linger in the DAG with no accounting path. Shared
-        // derivations (another build still cares) are left alone —
-        // the other build will drive them.
-        let to_depfail: Vec<DrvHash> = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created
-                ) && s.interested_builds.len() == 1
-                    && s.interested_builds.contains(&build_id)
-            })
-            .map(|(h, _)| h.into())
-            .collect();
+        // they linger in the DAG with no accounting path.
         let mut depfailed: Vec<&str> = Vec::with_capacity(to_depfail.len());
         for drv_hash in &to_depfail {
             if let Some(state) = self.dag.node_mut(drv_hash)
@@ -202,21 +228,23 @@ impl DagActor {
         self.cancel_build_derivations(build_id, &format!("build {build_id} cancelled: {reason}"))
             .await;
 
-        // Transition build to cancelled. Already checked !is_terminal above
-        // and we're the actor (single owner), so this should always succeed.
-        // If it doesn't, skip the DB write to avoid state drift.
-        if let Some(build) = self.builds.get_mut(&build_id)
-            && let Err(e) = build.transition(BuildState::Cancelled)
+        // Route through transition_build (the single chokepoint) so this
+        // path picks up the build_duration_seconds histogram and the
+        // DB-first ordering. Previously this open-coded transition + DB
+        // write, which skipped the histogram (builds_total{cancelled}
+        // diverged from histogram_count) and had the same in-mem-before-
+        // DB ordering bug. Rejected is unreachable here (checked
+        // !is_terminal above and we're the single-owner actor) but
+        // handled for defence-in-depth.
+        if self
+            .transition_build(build_id, BuildState::Cancelled)
+            .await?
+            == TransitionOutcome::Rejected
         {
-            // Should be unreachable (checked !is_terminal earlier).
-            error!(build_id = %build_id, current = ?build.state(), error = %e,
-                   "cancel transition rejected despite !is_terminal check; skipping DB write");
+            error!(build_id = %build_id,
+                   "cancel transition rejected despite !is_terminal check");
             return Ok(false);
         }
-
-        self.db
-            .update_build_status(build_id, BuildState::Cancelled, None)
-            .await?;
 
         // Emit cancelled event
         self.events.emit(
@@ -407,15 +435,20 @@ impl DagActor {
         let total = b.derivation_hashes.len() as u32;
         let completed = b.completed_count;
         let failed = b.failed_count;
+        // Sticky had-failure flag: failed_count is recomputed from the live
+        // DAG and drops to 0 if a poisoned node is removed (ClearPoison/TTL).
+        // error_summary is set on first failure and never cleared, so it is
+        // the authoritative "this build had a failure" gate for keep_going.
+        let had_failure = b.error_summary.is_some();
 
         let all_completed = completed >= total;
         let all_resolved = (completed + failed) >= total;
 
-        if all_completed && failed == 0 {
+        if all_completed && failed == 0 && !had_failure {
             if let Err(e) = self.complete_build(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist build completion");
             }
-        } else if failed > 0 && (all_resolved || !keep_going) {
+        } else if (failed > 0 || had_failure) && (all_resolved || !keep_going) {
             // keep_going=true: all derivations resolved but some failed.
             //
             // keep_going=false: live failures go through handle_derivation_failure
@@ -515,37 +548,38 @@ impl DagActor {
     /// in-memory state machine rejected the transition (e.g., already
     /// terminal → Succeeded would double-complete).
     ///
-    /// Callers (complete_build, transition_build_to_failed) check
-    /// the outcome and skip side effects on Rejected — otherwise a
-    /// double-complete or resurrected orphan build would emit a
-    /// spurious BuildCompleted event (with empty output_paths) to
-    /// the gateway.
+    /// Ordering is dry-run validate → DB write → in-memory mutate.
+    /// A transient DB error therefore leaves in-memory unchanged
+    /// (`is_terminal()` stays false), so the next `check_build_completion`
+    /// retries cleanly. The previous order (in-mem first) self-defeated
+    /// retry: in-mem went terminal, the `?` propagated, every caller
+    /// swallowed with `error!()`, and re-calling on an already-terminal
+    /// build returns `Rejected` — gateway `WatchBuild` hung forever.
+    ///
+    /// Callers (complete_build, transition_build_to_failed,
+    /// handle_cancel_build) check the outcome and skip side effects on
+    /// Rejected — otherwise a double-complete or resurrected orphan
+    /// build would emit a spurious BuildCompleted event (with empty
+    /// output_paths) to the gateway.
     pub(super) async fn transition_build(
         &mut self,
         build_id: Uuid,
         new_state: BuildState,
     ) -> Result<TransitionOutcome, ActorError> {
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            if let Err(e) = build.transition(new_state) {
-                // Already terminal or otherwise invalid. Skip the DB write to
-                // avoid in-memory/DB drift. Return Rejected so callers skip
-                // side effects (events, metrics, cleanup).
-                debug!(
-                    build_id = %build_id,
-                    from = ?build.state(),
-                    to = ?new_state,
-                    error = %e,
-                    "build transition rejected; skipping DB update + side effects"
-                );
-                return Ok(TransitionOutcome::Rejected);
-            }
-
-            // Record build duration on terminal transition.
-            if new_state.is_terminal() {
-                let duration = build.submitted_at.elapsed();
-                metrics::histogram!("rio_scheduler_build_duration_seconds")
-                    .record(duration.as_secs_f64());
-            }
+        // Dry-run validate without mutating. validate_transition is the
+        // exact predicate transition() uses, so the post-DB transition()
+        // below cannot fail.
+        if let Some(b) = self.builds.get(&build_id)
+            && let Err(e) = b.state().validate_transition(new_state)
+        {
+            debug!(
+                build_id = %build_id,
+                from = ?b.state(),
+                to = ?new_state,
+                error = %e,
+                "build transition rejected; skipping DB update + side effects"
+            );
+            return Ok(TransitionOutcome::Rejected);
         }
 
         let error_summary = self
@@ -553,9 +587,23 @@ impl DagActor {
             .get(&build_id)
             .and_then(|b| b.error_summary.as_deref());
 
+        // DB first — if this fails, in-memory is unchanged and retry
+        // remains possible.
         self.db
             .update_build_status(build_id, new_state, error_summary)
             .await?;
+
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            // Validated above; the actor is single-threaded and there is
+            // no `.await` between the dry-run and here that could observe
+            // a state change.
+            let _ = build.transition(new_state);
+            if new_state.is_terminal() {
+                let duration = build.submitted_at.elapsed();
+                metrics::histogram!("rio_scheduler_build_duration_seconds")
+                    .record(duration.as_secs_f64());
+            }
+        }
 
         Ok(TransitionOutcome::Applied)
     }

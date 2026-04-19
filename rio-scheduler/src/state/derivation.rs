@@ -85,12 +85,12 @@ impl DerivationStatus {
     /// `Cancelled`: explicit cancel OR worker-side timeout (`BuildResultStatus::
     /// TimedOut` routes here, not to `Poisoned` — a timeout isn't a build
     /// defect, just needs more time or different conditions). Per the
-    /// `Cancelled` doc-comment: "retry means re-submitting". Without reset,
-    /// a `Cancelled` node stuck in the DAG (reap misses it —
-    /// `cancel_build_derivations` removes interest BEFORE
-    /// `remove_build_interest_and_reap`'s `was_interested` check) makes the
-    /// resubmitted build hang: `merge()` adds interest but
-    /// `compute_initial_states` only iterates `newly_inserted`.
+    /// `Cancelled` doc-comment: "retry means re-submitting". Reset is
+    /// defense-in-depth (reap now removes Cancelled nodes for terminal
+    /// builds) — covers a resubmit during `TERMINAL_CLEANUP_DELAY` or a
+    /// node shared with a still-active build at cancel time. Without reset,
+    /// `merge()` adds interest but `compute_initial_states` only iterates
+    /// `newly_inserted` — the resubmitted build would hang.
     ///
     /// `Failed`: transient-fail with no retry driver pending — resubmit retries.
     ///
