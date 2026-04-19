@@ -334,6 +334,10 @@ message TenantQuotaResponse {
 // informer); pod_id is the executor_id (k8s pod name).
 message AppendHwPerfSampleRequest {
   string hw_class = 1;
+  // DEPRECATED: ignored server-side when hmac_verifier is enabled;
+  // pod_id is derived from x-rio-assignment-token claims.executor_id
+  // (r[sec.boundary.grpc-hmac]). Kept for wire-compat + dev-mode
+  // fallback.
   string pod_id = 2;
   double factor = 3;  // REF_TIME_SECS / measured_secs
 }

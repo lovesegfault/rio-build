@@ -564,23 +564,49 @@ impl StoreService for StoreServiceImpl {
         self.tenant_quota_impl(request).await
     }
 
-    /// ADR-023 phase-10: builder writes one `hw_perf_samples` row at
-    /// init. Upsert on `(hw_class, pod_id)` — the `hw_perf_factors`
-    /// view's median is over ALL rows (only the `HAVING` is
-    /// distinct-pod), so without the UNIQUE constraint (M_046) a single
-    /// pod spamming N inserts would dominate the median once 3 honest
-    /// pods exist. With it, a garbage row from a misbehaving pod really
-    /// is one rank in a median. Validation stays minimal (non-empty
-    /// hw_class, finite positive factor) — the builder controls all
-    /// three fields.
+    /// ADR-023 phase-10: builder writes one `hw_perf_samples` row.
+    /// Upsert on `(hw_class, pod_id)` — the `hw_perf_factors` view's
+    /// median is over ALL rows (only the `HAVING` is distinct-pod), so
+    /// without the UNIQUE constraint (M_046) a single pod spamming N
+    /// inserts would dominate the median once 3 honest pods exist.
+    ///
+    /// **Identity from claims, not body.** The "one rank in a median"
+    /// defense only holds if `pod_id` identifies the caller. Builders
+    /// are untrusted (`r[sec.boundary.grpc-hmac]`), so `pod_id` is
+    /// derived from the verified assignment-token's
+    /// `claims.executor_id` (scheduler-signed at dispatch); the body
+    /// `pod_id` is IGNORED. Without this gate a compromised builder
+    /// could fabricate N distinct `pod_id` values and own the median
+    /// for any `hw_class`. Service-token callers (gateway) have no
+    /// business here and are rejected. Dev mode (`hmac_verifier` is
+    /// None) falls back to the body field — same as PutPath dev-mode.
+    ///
+    /// `hw_class` and `factor` remain body-supplied: a valid token
+    /// holder can write its one row to a foreign `hw_class`, but
+    /// that's one rank in that class's median, bounded by
+    /// `HW_FACTOR_SANITY_CEIL` in `HwTable`.
     // r[impl sched.sla.hw-bench-append-only]
+    // r[impl sec.boundary.grpc-hmac]
     #[instrument(skip(self, request), fields(rpc = "AppendHwPerfSample"))]
     async fn append_hw_perf_sample(
         &self,
         request: Request<AppendHwPerfSampleRequest>,
     ) -> Result<Response<()>, Status> {
+        let pod_id = match self.verify_assignment_token(&request)? {
+            Some(claims) => claims.executor_id,
+            None if self.hmac_verifier.is_none() => request.get_ref().pod_id.clone(),
+            None => {
+                metrics::counter!("rio_store_hmac_rejected_total",
+                                  "reason" => "service_caller_not_permitted")
+                .increment(1);
+                return Err(Status::permission_denied(
+                    "AppendHwPerfSample: service-token callers not permitted; \
+                     pod_id must come from an assignment token",
+                ));
+            }
+        };
         let req = request.into_inner();
-        if req.hw_class.is_empty() || req.pod_id.is_empty() {
+        if req.hw_class.is_empty() || pod_id.is_empty() {
             return Err(Status::invalid_argument("hw_class and pod_id required"));
         }
         if !req.factor.is_finite() || req.factor <= 0.0 {
@@ -591,7 +617,7 @@ impl StoreService for StoreServiceImpl {
              ON CONFLICT (hw_class, pod_id) \
              DO UPDATE SET factor = EXCLUDED.factor, measured_at = now()",
             req.hw_class,
-            req.pod_id,
+            pod_id,
             req.factor,
         )
         .execute(&self.pool)

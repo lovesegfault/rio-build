@@ -26,7 +26,7 @@ use rio_proto::types::FindMissingPathsRequest;
 use rio_proto::validated::ValidatedPathInfo;
 
 mod batch;
-mod common;
+pub(crate) mod common;
 mod single;
 
 use batch::upload_outputs_batch;

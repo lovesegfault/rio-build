@@ -124,9 +124,10 @@ pub struct Config {
     pub node_name: String,
     /// ADR-023 phase-10: `rio.build/hw-class` pod annotation
     /// (controller-stamped from the Node informer; downward-API →
-    /// `RIO_HW_CLASS`). Feeds [`crate::hw_bench::report`]'s
-    /// `hw_perf_samples` insert. Empty → bench skipped (no hw_class to
-    /// key the sample on; controller hasn't stamped yet, or non-k8s).
+    /// `RIO_HW_CLASS`). Feeds [`crate::hw_bench::spawn_measure`] /
+    /// [`crate::hw_bench::send`]'s `hw_perf_samples` insert. Empty →
+    /// bench skipped (no hw_class to key the sample on; controller
+    /// hasn't stamped yet, or non-k8s).
     pub hw_class: String,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent

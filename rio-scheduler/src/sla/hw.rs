@@ -16,12 +16,21 @@ use std::collections::HashMap;
 
 use crate::db::SchedulerDb;
 
-/// Sanity floor for [`HwTable::min_factor`]. A pathological
-/// `hw_perf_samples` row (bad bench, clock skew) could yield a factor
-/// near 0; `ref_secs / min_factor()` would then blow the deadline up
-/// ~×100 (capped at 24h, but wasteful). Clamp at 0.25 — i.e., assume no
-/// admitted hw_class is more than 4× slower than the reference.
+/// Sanity floor for hw factors. A pathological `hw_perf_samples` row
+/// (bad bench, clock skew) could yield a factor near 0; `ref_secs /
+/// min_factor()` would then blow the deadline up ~×100 (capped at 24h,
+/// but wasteful). Clamp at 0.25 — i.e., assume no admitted hw_class is
+/// more than 4× slower than the reference.
 const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
+
+/// Sanity ceiling, mirror of [`HW_FACTOR_SANITY_FLOOR`]: assume no
+/// admitted hw_class is more than 4× FASTER than the reference.
+/// Belt-and-suspenders for `r[sec.boundary.grpc-hmac]` on
+/// `AppendHwPerfSample` — even with `pod_id` derived from claims, a
+/// compromised builder holding one valid token can write its one row
+/// at an absurd `factor`; the clamp bounds the blast radius of that
+/// one rank.
+const HW_FACTOR_SANITY_CEIL: f64 = 4.0;
 
 /// Per-hw_class median microbench factor. Built from the
 /// `hw_perf_factors` view each [`super::SlaEstimator::refresh`] tick.
@@ -46,13 +55,18 @@ impl HwTable {
                 .and_then(|h| self.factors.get(h))
                 .copied()
                 .unwrap_or(1.0)
+                .clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
     }
 
     /// Factor for `hw_class`, or 1.0 if unknown / <3 distinct pods.
     /// Exposed for `ingest::hw_bias`'s per-(pname, hw_class)
     /// residual computation.
     pub fn factor(&self, hw_class: &str) -> f64 {
-        self.factors.get(hw_class).copied().unwrap_or(1.0)
+        self.factors
+            .get(hw_class)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
     }
 
     /// Iterate `(hw_class, factor)`. For [`super::cost`]'s
@@ -160,5 +174,30 @@ mod tests {
         assert_eq!(t.min_factor(), HW_FACTOR_SANITY_FLOOR);
         // Empty table → 1.0 (above floor, unchanged).
         assert_eq!(HwTable::default().min_factor(), 1.0);
+    }
+
+    /// `normalize` and `factor` clamp to `[FLOOR, CEIL]` so a single
+    /// poisoned `hw_perf_samples` row can't blow T(c) fitting up by
+    /// orders of magnitude. The store's `AppendHwPerfSample` already
+    /// derives `pod_id` from claims (one rank per token), but `factor`
+    /// is still body-supplied — this is the bound on that one rank.
+    #[test]
+    fn normalize_and_factor_clamped() {
+        let mut m = HashMap::new();
+        m.insert("fast".into(), 1e6);
+        m.insert("slow".into(), 1e-6);
+        let t = HwTable::from_map(m);
+        assert_eq!(
+            t.normalize(10.0, Some("fast")),
+            10.0 * HW_FACTOR_SANITY_CEIL
+        );
+        assert_eq!(
+            t.normalize(10.0, Some("slow")),
+            10.0 * HW_FACTOR_SANITY_FLOOR
+        );
+        assert_eq!(t.factor("fast"), HW_FACTOR_SANITY_CEIL);
+        assert_eq!(t.factor("slow"), HW_FACTOR_SANITY_FLOOR);
+        // Unknown still passes through at 1.0 (within band).
+        assert_eq!(t.normalize(10.0, Some("unknown")), 10.0);
     }
 }

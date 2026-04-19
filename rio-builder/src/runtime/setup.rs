@@ -76,19 +76,16 @@ pub async fn setup(
         "connected to gRPC services"
     );
 
-    // ADR-023 phase-10 hw self-calibration. Best-effort, fire-and-
-    // forget: a ~5s CPU-bound microbench in a blocking thread + one
-    // store RPC. Runs concurrently with FUSE mount + first heartbeat
-    // below; the bench finishes well before the first assignment can
-    // arrive (Karpenter cold-start is ~30s). Empty hw_class → skipped
-    // inside `report` (controller hasn't stamped the annotation yet,
-    // or non-k8s).
-    rio_common::task::spawn_monitored("hw-bench", {
-        let mut store = store_clients.store.clone();
-        let hw_class = cfg.hw_class.clone();
-        let pod_id = executor_id.clone();
-        async move { crate::hw_bench::report(&mut store, &hw_class, &pod_id).await }
-    });
+    // ADR-023 phase-10 hw self-calibration. Best-effort: a ~5s
+    // CPU-bound microbench in a blocking thread, started here so it
+    // runs concurrently with FUSE mount + first heartbeat below. The
+    // RPC itself is DEFERRED until the first WorkAssignment arrives
+    // (`spawn_build_task` consumes `BuildSpawnContext::hw_bench`) —
+    // the store now gates `AppendHwPerfSample` on the assignment
+    // token (`r[sec.boundary.grpc-hmac]`), and there is no token
+    // until the scheduler dispatches. Empty hw_class → None
+    // (controller hasn't stamped the annotation yet, or non-k8s).
+    let hw_bench = crate::hw_bench::spawn_measure(&cfg.hw_class);
 
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
@@ -283,6 +280,7 @@ pub async fn setup(
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,
+        hw_bench: Arc::new(std::sync::Mutex::new(hw_bench)),
     };
 
     Ok(Some(BuilderRuntime {

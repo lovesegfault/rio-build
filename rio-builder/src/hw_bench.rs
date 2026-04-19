@@ -86,29 +86,45 @@ pub fn run() -> f64 {
     REF_TIME_SECS / start.elapsed().as_secs_f64()
 }
 
-/// Best-effort: run the bench and append the sample. Logs and returns
-/// on any failure — a missed sample degrades normalization (hw_class
-/// stays at `factor=1.0` until ≥3 distinct pods report), not the
-/// build itself.
+/// Spawn the ~5s CPU-bound microbench on a blocking thread. Called at
+/// init so the bench runs concurrently with FUSE mount + cold-start
+/// (~30s); the result is awaited later by [`send`] once the first
+/// `WorkAssignment` (and its assignment token) is in hand.
 ///
 /// `hw_class` is the `rio.build/hw-class` pod annotation (controller-
 /// stamped from the Node informer; downward-API → `RIO_HW_CLASS`).
-/// Empty → skip: the controller hasn't stamped this pod yet (race at
-/// pod-start), or the deployment isn't k8s. Either way, no hw_class
-/// means the row would be useless.
-pub async fn report(
-    store: &mut rio_proto::StoreServiceClient<tonic::transport::Channel>,
-    hw_class: &str,
-    pod_id: &str,
-) {
+/// Empty → `None`: the controller hasn't stamped this pod yet (race
+/// at pod-start), or the deployment isn't k8s. Either way, no
+/// hw_class means the row would be useless.
+pub fn spawn_measure(hw_class: &str) -> Option<tokio::task::JoinHandle<f64>> {
     if hw_class.is_empty() {
         tracing::debug!("hw_bench: no hw_class (RIO_HW_CLASS unset); skipping");
-        return;
+        return None;
     }
     // spawn_blocking: ~5s of pure CPU. Running it inline on the
     // runtime would stall the executor's other startup tasks (FUSE
     // mount, heartbeat) for the duration.
-    let factor = match tokio::task::spawn_blocking(run).await {
+    Some(tokio::task::spawn_blocking(run))
+}
+
+/// Best-effort: await the bench handle from [`spawn_measure`] and
+/// append the sample. Logs and returns on any failure — a missed
+/// sample degrades normalization (hw_class stays at `factor=1.0`
+/// until ≥3 distinct pods report), not the build itself.
+///
+/// **Why deferred until an assignment token is in hand:** the store
+/// gates `AppendHwPerfSample` on `x-rio-assignment-token` and derives
+/// `pod_id` from the token's `executor_id` claim
+/// (`r[sec.boundary.grpc-hmac]`). The body `pod_id` is sent for
+/// dev-mode fallback only.
+pub async fn send(
+    store: &mut rio_proto::StoreServiceClient<tonic::transport::Channel>,
+    hw_class: &str,
+    pod_id: &str,
+    bench: tokio::task::JoinHandle<f64>,
+    assignment_token: &str,
+) {
+    let factor = match bench.await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "hw_bench: spawn_blocking panicked");
@@ -116,14 +132,16 @@ pub async fn report(
         }
     };
     tracing::info!(%hw_class, %pod_id, factor, "hw_bench: measured");
-    if let Err(e) = store
-        .append_hw_perf_sample(rio_proto::types::AppendHwPerfSampleRequest {
-            hw_class: hw_class.to_owned(),
-            pod_id: pod_id.to_owned(),
-            factor,
-        })
-        .await
-    {
+    let mut req = tonic::Request::new(rio_proto::types::AppendHwPerfSampleRequest {
+        hw_class: hw_class.to_owned(),
+        pod_id: pod_id.to_owned(),
+        factor,
+    });
+    if let Err(e) = crate::upload::common::attach_assignment_token(&mut req, assignment_token) {
+        tracing::warn!(error = %e, "hw_bench: attach_assignment_token failed (best-effort)");
+        return;
+    }
+    if let Err(e) = store.append_hw_perf_sample(req).await {
         tracing::warn!(error = %e, "hw_bench: AppendHwPerfSample failed (best-effort)");
     }
 }

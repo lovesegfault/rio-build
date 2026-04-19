@@ -176,7 +176,7 @@ pub(super) fn spawn_dump_tee(
 /// Silently omitting the header would turn that into a confusing
 /// "rejected, no token" error with no worker-side trace; fail loud
 /// instead.
-pub(super) fn attach_assignment_token<T>(
+pub(crate) fn attach_assignment_token<T>(
     req: &mut tonic::Request<T>,
     assignment_token: &str,
 ) -> Result<(), tonic::Status> {

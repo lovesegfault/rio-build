@@ -134,6 +134,14 @@ pub struct BuildSpawnContext {
     /// only telemetry channel for the scheduler's `build_samples`
     /// writer (ADR-023).
     pub resources: ResourceSnapshotHandle,
+    /// ADR-023 phase-10 microbench handle, spawned at init. `take()`n
+    /// by [`spawn_build_task`] on the FIRST assignment so the
+    /// `AppendHwPerfSample` RPC can carry that assignment's token
+    /// (`r[sec.boundary.grpc-hmac]` — the store derives `pod_id` from
+    /// claims, not the request body). `Arc<Mutex<Option<..>>>` so the
+    /// struct stays `Clone` (shared slot; second `take()` on any
+    /// clone sees `None`).
+    pub hw_bench: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<f64>>>>,
 }
 
 impl BuildSpawnContext {
@@ -225,6 +233,21 @@ pub async fn spawn_build_task(
     if let Err(e) = ctx.stream_tx.send(ack).await {
         tracing::error!(error = %e, "failed to send ACK");
         return; // Guard drops, no build spawned.
+    }
+
+    // ADR-023 phase-10: now that we have an assignment token, fire the
+    // hw-bench RPC. The bench itself was spawned at init (~5s CPU,
+    // long since done by the time the first assignment arrives);
+    // `take()` so this is one-shot. Best-effort fire-and-forget — the
+    // build does not block on it.
+    if let Some(bench) = ctx.hw_bench.lock().unwrap().take() {
+        let mut store = ctx.store_clients.store.clone();
+        let hw_class = ctx.hw_class.clone().unwrap_or_default();
+        let pod_id = ctx.executor_id.clone();
+        let token = assignment_token.clone();
+        rio_common::task::spawn_monitored("hw-bench-send", async move {
+            crate::hw_bench::send(&mut store, &hw_class, &pod_id, bench, &token).await;
+        });
     }
 
     // Record the cgroup path on the slot. We know it deterministically:
