@@ -108,6 +108,9 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the b
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
 
+r[builder.fuse.listxattr-empty]
+`listxattr` on a FUSE-served store path MUST return an empty list (not an error) when queried with a non-zero buffer; replying with a `fuse_getxattr_out{size:0}` struct to a non-zero-buffer query trips the kernel's `fuse_verify_xattr_list` zero-length-name check and surfaces as `-EIO` to the caller (e.g., Python's `shutil.copy2`).
+
 r[builder.fuse.circuit-breaker+2]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive

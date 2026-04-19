@@ -723,14 +723,23 @@ impl Filesystem for NixStoreFs {
     // (the default) and ENODATA/ENOTTY (here) are handled identically by
     // overlayfs and nix-daemon's canonicalisePathMetaData; the explicit
     // errnos just stop the per-call WARN spam (113× ioctl per build with
-    // chroot-store's FS_IOC_GETFLAGS probe).
+    // chroot-store's FS_IOC_GETFLAGS probe). listxattr MUST branch on
+    // size: size==0 is the size-probe (reply.size(0) is correct); size>0
+    // wants the name list — reply.size(0) there serializes an 8-byte
+    // fuse_getxattr_out which the kernel's fuse_verify_xattr_list reads
+    // as a zero-length name → -EIO (broke shutil.copy2 from store paths).
 
     fn getxattr(&self, _: &Request, _: INodeNo, _: &std::ffi::OsStr, _: u32, reply: ReplyXattr) {
         reply.error(Errno::ENODATA);
     }
 
-    fn listxattr(&self, _: &Request, _: INodeNo, _: u32, reply: ReplyXattr) {
-        reply.size(0);
+    // r[impl builder.fuse.listxattr-empty]
+    fn listxattr(&self, _: &Request, _: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
     }
 
     fn flush(&self, _: &Request, _: INodeNo, _: FileHandle, _: LockOwner, reply: ReplyEmpty) {

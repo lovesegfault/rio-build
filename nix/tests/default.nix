@@ -423,6 +423,8 @@ in
           # r[verify builder.fuse.passthrough]
           "fanout"
           "fuse-direct"
+          # r[verify builder.fuse.listxattr-empty]
+          "fuse-listxattr"
           "overlay-readdir"
           # r[verify store.inline.threshold]
           # r[verify obs.metric.transfer-volume]
