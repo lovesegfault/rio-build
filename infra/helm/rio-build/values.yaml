@@ -521,9 +521,13 @@ karpenter:
   # Adding a band = one entry here (requirements/common labels live in
   # the template).
   builderBands:
-    - {name: hi, generation: "8"}
-    - {name: mid, generation: "7"}
-    - {name: lo, generation: "6"}
+    - {name: hi, generations: ["8"]}
+    # mid spans 6+7: gen-7 amd64 c/m/r have no `d` (local-NVMe) variants
+    # in us-east-2, so mid-nvme-x86 would resolve empty on ["7"] alone.
+    # arm64 has c7gd/m7gd; amd64 falls back to c6id/m6id. hw_perf_factors
+    # normalizes per instance-type, so the band label stays a coarse grouping.
+    - {name: mid, generations: ["6", "7"]}
+    - {name: lo, generations: ["6"]}
   builderStorages:
     - {name: ebs, nodeClass: rio-default, nvme: false}
     - {name: nvme, nodeClass: rio-nvme, nvme: true}

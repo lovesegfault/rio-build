@@ -29,11 +29,13 @@
 # for arm64 (Graviton .metal requires UEFI). Spec is otherwise identical
 # to rio-default; only the rio-builder-metal NodePool references rio-metal,
 # virtualized pools stay on rio-default (UEFI/UKI).
-{{- /* rio-nvme: instanceStorePolicy deliberately UNSET — the AMI's
-       rio-nvme-mount.service owns the mdadm→mkfs.xfs→mount chain
-       (must run before tmpfiles + nodeadm so seccomp/kubeconfig land
-       ON the XFS, not get overmounted). nodeadm's LocalDisk aspect
-       would mkfs.ext4 + mount itself, which conflicts. */}}
+{{- /* rio-nvme: instanceStorePolicy: RAID0 set so Karpenter's bin-pack
+       sim sees the NVMe capacity (else only EBS root → 50Gi+ ephemeral
+       requests look unschedulable at provisioning time). nodeadm does
+       NOT act on it: AMI invokes `nodeadm init --skip run --daemon
+       kubelet`, which never runs the local-disk aspect. The AMI's
+       rio-nvme-mount.service (before=nodeadm-init+tmpfiles) owns
+       mdadm→mkfs.xfs+prjquota→mount. */}}
 {{- range $nc := list (dict "name" "rio-default" "amd64Boot" "uefi") (dict "name" "rio-metal" "amd64Boot" "legacy-bios") (dict "name" "rio-nvme" "amd64Boot" "uefi") }}
 ---
 apiVersion: karpenter.k8s.aws/v1
@@ -87,6 +89,9 @@ spec:
         throughput: {{ $k.dataVolumeThroughputMiBps }}
         deleteOnTermination: true
         encrypted: true
+  {{- if eq $nc.name "rio-nvme" }}
+  instanceStorePolicy: RAID0
+  {{- end }}
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
 {{- end }}
@@ -129,7 +134,7 @@ spec:
           values: [c, m, r]
         - key: karpenter.k8s.aws/instance-generation
           operator: In
-          values: [{{ $band.generation | quote }}]
+          values: {{ $band.generations | toJson }}
         - key: kubernetes.io/arch
           operator: In
           values: [{{ $arch.k8s }}]
