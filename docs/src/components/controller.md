@@ -130,7 +130,7 @@ the pool is gone.
 
 r[ctrl.ephemeral.intent-deadline]
 Jobs MUST set `spec.activeDeadlineSeconds` to `SpawnIntent.deadline_secs`
-verbatim (floored at 60 as defense against the proto default). The
+verbatim (floored at 180 as defense against the proto default). The
 scheduler computes `deadline_secs` per-derivation (D7): for fitted
 keys, `wall_p99 * 5` at the solved core count; for unfitted
 (probe/explore), `[sla].probe.deadline_secs`; both clamped
