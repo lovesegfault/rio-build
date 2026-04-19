@@ -126,12 +126,12 @@ pub(in crate::grpc) fn validate_put_metadata(
 
     // Step 6: HMAC path-in-claims check. None = verifier disabled OR
     // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
-    // skip the membership check: the output path is computed post-build
-    // from the NAR hash, so expected_outputs is [""] at sign time.
-    // Threat model holds — token is still bound to drv_hash (worker
-    // can't upload for a derivation it wasn't assigned), and
-    // r[store.integrity.verify-on-put] below hashes the NAR stream
-    // independently.
+    // skip the membership check here: the output path is computed
+    // post-build from the NAR hash, so expected_outputs is [""] at
+    // sign time. Authorization for the CA case is enforced AFTER the
+    // NAR is hashed by `verify_ca_store_path` (r[sec.authz.ca-path-
+    // derived]): the store recomputes the CA path from the
+    // server-verified `nar_hash` and rejects on mismatch.
     if let Some(claims) = hmac_claims
         && !claims.is_ca
     {
@@ -244,6 +244,86 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
+// r[impl sec.authz.ca-path-derived]
+/// Floating-CA path-authorization gate. When `claims.is_ca` is set,
+/// [`validate_put_metadata`] skipped the `store_path ∈
+/// expected_outputs` check (the path isn't known at sign time). This
+/// is the replacement gate: recompute the CA store path SERVER-SIDE
+/// from the NAR hash that [`verify_nar`] just confirmed, and reject if
+/// it doesn't match `info.store_path`. A worker holding an
+/// `is_ca=true` token therefore cannot upload to any path that isn't
+/// the content-derived path of the NAR it actually sent.
+///
+/// Floating-CA (`__contentAddressed = true`, non-FOD) always uses
+/// `nar:sha256` recursive hashing — see `dispatch.rs`'s `is_ca` gate
+/// (`state.ca.is_ca && !state.is_fixed_output`). FODs with known
+/// output paths go through the IA `expected_outputs` check instead.
+///
+/// `None`/non-CA claims → no-op (IA already gated, dev/service
+/// bypass already trusted).
+pub(in crate::grpc) fn verify_ca_store_path(
+    info: &ValidatedPathInfo,
+    hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    let Some(claims) = hmac_claims else {
+        return Ok(());
+    };
+    if !claims.is_ca {
+        return Ok(());
+    }
+
+    // Self-reference: Nix's `:self` token in the source-type
+    // fingerprint isn't yet implemented in rio-nix's
+    // `make_fixed_output`. Filter the path-under-construction out of
+    // refs and reject explicitly if it was present — none in the
+    // current build graph.
+    let refs: Vec<rio_nix::store_path::StorePath> = info
+        .references
+        .iter()
+        .filter(|r| r.as_str() != info.store_path.as_str())
+        .cloned()
+        .collect();
+    if refs.len() != info.references.len() {
+        return Err(Status::unimplemented(format!(
+            "{ctx_label}: self-referencing floating-CA not yet supported \
+             (extend make_fixed_output with :self)"
+        )));
+    }
+
+    // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar has
+    // already confirmed it equals SHA-256(stream)).
+    let nar_hash =
+        rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
+            .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))?;
+    let expected = rio_nix::store_path::StorePath::make_fixed_output(
+        info.store_path.name(),
+        &nar_hash,
+        /* recursive */ true,
+        &refs,
+    )
+    .map_err(|e| Status::invalid_argument(format!("{ctx_label}: CA path derive: {e}")))?;
+
+    if expected.as_str() != info.store_path.as_str() {
+        warn!(
+            store_path = %info.store_path,
+            expected = %expected,
+            executor_id = %claims.executor_id,
+            drv_hash = %claims.drv_hash,
+            "{ctx_label}: is_ca store_path does not match server-derived CA path"
+        );
+        metrics::counter!(
+            "rio_store_hmac_rejected_total",
+            "reason" => "ca_path_mismatch"
+        )
+        .increment(1);
+        return Err(Status::permission_denied(format!(
+            "{ctx_label}: store_path does not match content-derived CA path"
+        )));
+    }
+    Ok(())
+}
+
 impl StoreServiceImpl {
     // r[impl sec.boundary.grpc-hmac]
     /// HMAC token verify + JWT tenant extraction. Shared step-0 of the
@@ -338,7 +418,8 @@ impl StoreServiceImpl {
     /// chunks ([`Self::accumulate_chunk`]), receive the mandatory
     /// trailer, reject protocol violations (chunk-after-trailer,
     /// duplicate metadata/trailer), then [`apply_trailer`] +
-    /// [`verify_nar`]. Returns the buffered NAR and held budget permits.
+    /// [`verify_nar`] + [`verify_ca_store_path`]. Returns the buffered
+    /// NAR and held budget permits.
     ///
     /// Errors do NOT clean up the placeholder — caller wraps the call
     /// and `abort_upload`s on `Err`.
@@ -346,6 +427,7 @@ impl StoreServiceImpl {
         &'a self,
         stream: &mut Streaming<PutPathRequest>,
         info: &mut ValidatedPathInfo,
+        hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
     ) -> Result<(Vec<u8>, Vec<tokio::sync::SemaphorePermit<'a>>), Status> {
         let mut nar_data = Vec::new();
         let mut trailer: Option<PutPathTrailer> = None;
@@ -396,6 +478,7 @@ impl StoreServiceImpl {
         })?;
         apply_trailer(info, &t, "PutPath")?;
         verify_nar(&nar_data, info, "PutPath")?;
+        verify_ca_store_path(info, hmac_claims, "PutPath")?;
         Ok((nar_data, held_permits))
     }
 

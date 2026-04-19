@@ -23,12 +23,21 @@ fn now_unix() -> u64 {
 
 /// Build a valid Claims with the given expected_outputs and sign it.
 fn sign_claims(outputs: Vec<String>, expiry_offset_secs: i64) -> String {
+    sign_claims_full("test-worker", outputs, false, expiry_offset_secs)
+}
+
+fn sign_claims_full(
+    executor_id: &str,
+    outputs: Vec<String>,
+    is_ca: bool,
+    expiry_offset_secs: i64,
+) -> String {
     let claims = AssignmentClaims {
-        executor_id: "test-worker".into(),
+        executor_id: executor_id.into(),
         drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
-        is_ca: false,
+        is_ca,
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -317,5 +326,170 @@ async fn hmac_disabled_no_token_accepted() -> TestResult {
         .context("dev-mode put")?;
     assert!(created);
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Floating-CA: store_path derived server-side from verified nar_hash
+// ---------------------------------------------------------------------------
+
+/// Compute the floating-CA store path for `nar` the way the server
+/// does (`make_fixed_output(name, sha256(nar), recursive, [])`).
+fn ca_path_for(name: &str, nar: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let h = rio_nix::hash::NixHash::new(
+        rio_nix::hash::HashAlgo::SHA256,
+        Sha256::digest(nar).to_vec(),
+    )
+    .unwrap();
+    rio_nix::store_path::StorePath::make_fixed_output(name, &h, true, &[])
+        .unwrap()
+        .to_string()
+}
+
+// r[verify sec.authz.ca-path-derived]
+#[tokio::test]
+async fn hmac_is_ca_correct_path_accepted() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"ca content");
+    let path = ca_path_for("ca-ok", &nar);
+    let info = make_path_info_for_nar(&path, &nar);
+
+    // is_ca=true, expected_outputs empty (as at dispatch time). Upload
+    // to the content-derived path → accepted.
+    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
+    let created = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .context("put to derived CA path")?;
+    assert!(created);
+    Ok(())
+}
+
+// r[verify sec.authz.ca-path-derived]
+#[tokio::test]
+async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"evil content");
+    // Upload to an ARBITRARY (IA-shaped) path that is NOT the
+    // content-derived CA path. Pre-fix this was accepted — the
+    // "backdoored libc" scenario.
+    let path = test_store_path("evil-glibc-2.38");
+    let info = make_path_info_for_nar(&path, &nar);
+
+    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("is_ca token to non-derived path → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("content-derived CA path"),
+        "msg: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"ca content 2");
+    // Correct name, WRONG hash-part (test_store_path uses a fixed
+    // TEST_HASH). Proves the check compares the full path, not just
+    // the name.
+    let derived = ca_path_for("ca-hashpart", &nar);
+    let wrong = test_store_path("ca-hashpart");
+    assert_ne!(derived, wrong, "test precondition: paths differ");
+    let info = make_path_info_for_nar(&wrong, &nar);
+
+    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("wrong hash-part → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AppendHwPerfSample: pod_id derived from claims, not body
+// ---------------------------------------------------------------------------
+
+use rio_proto::types::AppendHwPerfSampleRequest;
+
+async fn append_hw(
+    client: &mut StoreServiceClient<Channel>,
+    body_pod_id: &str,
+    header: Option<(&'static str, &str)>,
+) -> Result<(), tonic::Status> {
+    let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
+        hw_class: "aws-8-ebs-hi".into(),
+        pod_id: body_pod_id.into(),
+        factor: 1.5,
+    });
+    if let Some((h, v)) = header {
+        req.metadata_mut().insert(h, v.parse().unwrap());
+    }
+    client.append_hw_perf_sample(req).await.map(|_| ())
+}
+
+// r[verify sec.boundary.grpc-hmac]
+#[tokio::test]
+async fn append_hw_perf_sample_without_token_rejected() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let err = append_hw(&mut s.client, "fake-pod", None)
+        .await
+        .expect_err("no token → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+// r[verify sec.boundary.grpc-hmac]
+#[tokio::test]
+async fn append_hw_perf_sample_forged_pod_id_ignored() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    // Token signed for executor_id="real-pod"; body says "fake-pod".
+    // Server MUST write pod_id='real-pod'.
+    let token = sign_claims_full("real-pod", vec![String::new()], false, 60);
+    append_hw(
+        &mut client,
+        "fake-pod",
+        Some((rio_proto::ASSIGNMENT_TOKEN_HEADER, &token)),
+    )
+    .await
+    .context("append with valid token")?;
+
+    let row: (String,) =
+        sqlx::query_as("SELECT pod_id FROM hw_perf_samples WHERE hw_class = 'aws-8-ebs-hi'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(
+        row.0, "real-pod",
+        "pod_id from claims.executor_id, not body"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_hw_perf_sample_service_token_rejected() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    // Gateway has no business writing hw_perf_samples; service-token
+    // bypass yields no executor_id → reject.
+    let err = append_hw(
+        &mut s.client,
+        "fake-pod",
+        Some((
+            rio_proto::SERVICE_TOKEN_HEADER,
+            &sign_service("rio-gateway", 60),
+        )),
+    )
+    .await
+    .expect_err("service token → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("service-token"),
+        "msg: {}",
+        err.message()
+    );
     Ok(())
 }

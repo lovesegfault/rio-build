@@ -129,6 +129,9 @@ r[store.api.add-signatures]
 r[store.put.wal-manifest]
 **Authorization:** Executor `PutPath` calls include an HMAC-SHA256-signed assignment token in the `x-rio-assignment-token` gRPC metadata header. The store verifies the token signature, checks expiry, and rejects uploads whose `store_path` is not in `claims.expected_outputs`. The gateway (which handles `nix copy --to` and has no assignment) bypasses the assignment-token check via a service token — see `r[sec.authz.service-token]`. See [Security: assignment tokens](../security.md#boundary-2-gatewayexecutor--internal-services-grpc).
 
+r[sec.authz.ca-path-derived]
+For floating-CA derivations (`AssignmentClaims.is_ca = true`), `expected_outputs` is unknown at dispatch time. Instead of skipping authorization, the store recomputes the CA store path **server-side** from the SHA-256 it computed over the buffered NAR (via `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)`) and rejects with `PERMISSION_DENIED` if it does not match the uploaded `store_path`. A worker holding an `is_ca=true` token therefore cannot upload to any path other than the content-derived path of the NAR it actually sent.
+
 r[sec.authz.service-token]
 Trusted control-plane callers present an `x-rio-service-token` header: an HMAC-SHA256-signed `ServiceClaims { caller, expiry_unix }` keyed with `RIO_SERVICE_HMAC_KEY_PATH` (a separate secret from the assignment-token key). The store verifies signature and expiry, then checks `caller ∈ service_bypass_callers` (default `["rio-gateway"]`). A valid service token bypasses the assignment-token check — the gateway mints one per `PutPath` with a 60-second expiry. Transport-agnostic: works over plaintext-on-WireGuard with no TLS dependency.
 

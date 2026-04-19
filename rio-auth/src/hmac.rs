@@ -70,17 +70,14 @@ pub struct AssignmentClaims {
     /// skips the membership check when [`is_ca`](Self::is_ca) is set.
     pub expected_outputs: Vec<String>,
     /// Floating-CA derivation: output paths are not known at dispatch
-    /// time (computed post-build from the NAR hash). When set, the store
-    /// skips the `store_path ∈ expected_outputs` check on PutPath.
-    ///
-    /// Threat model holds: the token is still bound to [`drv_hash`] (a
-    /// worker can't upload for a derivation it wasn't assigned), and
-    /// `r[store.integrity.verify-on-put]` independently hashes the NAR
-    /// stream. A compromised worker can upload a garbage path for ITS
-    /// assigned CA build — same blast radius as IA (it could upload
-    /// garbage to its known IA output path too).
-    ///
-    /// [`drv_hash`]: Self::drv_hash
+    /// time (computed post-build from the NAR hash). When set, the
+    /// store skips the `store_path ∈ expected_outputs` check on
+    /// PutPath and instead RECOMPUTES the CA store path server-side
+    /// from the verified NAR hash (`r[sec.authz.ca-path-derived]`),
+    /// rejecting on mismatch. A worker holding an `is_ca=true` token
+    /// therefore cannot upload to a path that doesn't match the
+    /// content it actually sent — same blast radius as IA (one
+    /// content-determined path per NAR).
     pub is_ca: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
     /// sets it to ~2× build_timeout; a worker legitimately uploading

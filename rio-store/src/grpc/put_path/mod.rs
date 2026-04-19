@@ -192,7 +192,10 @@ impl StoreServiceImpl {
 
         let placeholder_guard = self.spawn_placeholder_guard(store_path_hash.clone());
 
-        let (nar_data, _held_permits) = match self.ingest_nar_stream(&mut stream, &mut info).await {
+        let (nar_data, _held_permits) = match self
+            .ingest_nar_stream(&mut stream, &mut info, auth.hmac_claims.as_ref())
+            .await
+        {
             Ok(x) => x,
             Err(e) => {
                 self.abort_upload(&store_path_hash).await;
