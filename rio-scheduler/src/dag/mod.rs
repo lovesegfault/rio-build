@@ -52,6 +52,13 @@ pub struct MergeResult {
     /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
     /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
     pub reset_on_resubmit: Vec<DrvHash>,
+    /// Full prior state of each retriable node destructively removed by
+    /// the resubmit-retry path. `rollback_merge` re-inserts these AFTER
+    /// scrubbing `newly_inserted` so a failed merge restores the exact
+    /// pre-merge DAG (status, `interested_builds`, `retry.count`).
+    /// Without this, a `{retriable-X, cycle}` submission would wipe X
+    /// and reset its `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
+    pub removed_retriable: Vec<(DrvHash, DerivationState)>,
 }
 
 /// The global derivation DAG maintained by the actor.
@@ -246,6 +253,11 @@ impl DerivationDag {
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
         let mut interest_added: Vec<DrvHash> = Vec::new();
+        // Full prior state of retriable nodes destructively removed below
+        // for resubmit-reset. rollback_merge restores these so a failed
+        // merge leaves the DAG exactly as it was (status, interest set,
+        // retry.count toward POISON_RESUBMIT_RETRY_LIMIT all preserved).
+        let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
 
         // Insert or update nodes
         for node in nodes {
@@ -284,9 +296,10 @@ impl DerivationDag {
                 .get(&drv_hash)
                 .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
-                self.nodes
-                    .remove(&drv_hash)
-                    .map(|old| (old.interested_builds, old.retry.count))
+                let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                let carry = (old.interested_builds.clone(), old.retry.count);
+                removed_retriable.push((drv_hash.clone(), old));
+                Some(carry)
             } else {
                 None
             };
@@ -306,16 +319,29 @@ impl DerivationDag {
                 }
             } else {
                 // New node. try_from_node validates drv_path: StorePath::parse.
-                // Invalid paths fail the whole merge (the actor rolls back
-                // as it does for CycleDetected). The gRPC layer also validates
-                // upfront and returns INVALID_ARGUMENT, so this is belt-and-
-                // suspenders — but it's the only thing protecting us if the
-                // actor is ever driven by something other than the gRPC layer.
-                let mut state =
-                    DerivationState::try_from_node(node).map_err(|e| DagError::InvalidDrvPath {
-                        path: node.drv_path.clone(),
-                        source: e,
-                    })?;
+                // Invalid paths fail the whole merge with inline rollback of
+                // EVERYTHING this merge has touched so far (nodes inserted in
+                // earlier loop iterations, edges, interest, removed retriable
+                // nodes). The gRPC layer also validates upfront and returns
+                // INVALID_ARGUMENT, so this is belt-and-suspenders — but it's
+                // the only thing protecting us if the actor is ever driven by
+                // something other than the gRPC layer.
+                let mut state = match DerivationState::try_from_node(node) {
+                    Ok(s) => s,
+                    Err(source) => {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            build_id,
+                            removed_retriable,
+                        );
+                        return Err(DagError::InvalidDrvPath {
+                            path: node.drv_path.clone(),
+                            source,
+                        });
+                    }
+                };
                 // I-204: strip soft features at insertion so the
                 // I-181/I-176 snapshot filter and rejection_reason's
                 // `feature-missing` clause both see hardware-gate
@@ -399,7 +425,13 @@ impl DerivationDag {
         for start in dfs_starts {
             if self.has_cycle_from(start, &mut color) {
                 // Rollback: remove newly-inserted edges and nodes
-                self.rollback_merge(&newly_inserted, &new_edges, &interest_added, build_id);
+                self.rollback_merge(
+                    &newly_inserted,
+                    &new_edges,
+                    &interest_added,
+                    build_id,
+                    removed_retriable,
+                );
                 return Err(DagError::CycleDetected);
             }
         }
@@ -409,6 +441,7 @@ impl DerivationDag {
             reset_on_resubmit,
             new_edges,
             interest_added,
+            removed_retriable,
         })
     }
 
@@ -482,15 +515,18 @@ impl DerivationDag {
         false
     }
 
-    /// Rollback a failed merge: remove newly-inserted nodes and edges, and
+    /// Rollback a failed merge: remove newly-inserted nodes and edges,
     /// remove build interest from pre-existing nodes that gained it during
-    /// this merge (but not from nodes where build_id was already present).
+    /// this merge (but not from nodes where build_id was already present),
+    /// and restore any retriable nodes that the resubmit-reset path
+    /// destructively removed.
     pub(crate) fn rollback_merge(
         &mut self,
         newly_inserted: &HashSet<DrvHash>,
         new_edges: &[(DrvHash, DrvHash)],
         interest_added: &[DrvHash],
         build_id: Uuid,
+        removed_retriable: Vec<(DrvHash, DerivationState)>,
     ) {
         // Remove newly-inserted edges
         for (parent, child) in new_edges {
@@ -508,14 +544,35 @@ impl DerivationDag {
             }
         }
 
+        // Hashes being restored below — their children[X]/parents[X]
+        // entries are pre-existing (the resubmit-reset path removed only
+        // nodes[X], never edges) and must NOT be scrubbed. The new_edges
+        // loop above already reverted any edges THIS merge added to them.
+        let restoring: HashSet<&DrvHash> = removed_retriable.iter().map(|(h, _)| h).collect();
+
         // Remove newly-inserted nodes (and their path index entries)
         for hash in newly_inserted {
             if let Some(state) = self.nodes.remove(hash) {
                 self.path_to_hash.remove(state.drv_path().as_str());
             }
-            // Also clean up any edge entries keyed on this hash
-            self.children.remove(hash);
-            self.parents.remove(hash);
+            // Also clean up any edge entries keyed on this hash — but only
+            // for truly-fresh nodes. For resubmit-reset nodes, these entries
+            // are the prior node's pre-existing edges; scrubbing them would
+            // leave dangling one-way edges (e.g. children[W]∋X survives,
+            // parents[X]∋W gone → X completes but W never sees it).
+            if !restoring.contains(hash) {
+                self.children.remove(hash);
+                self.parents.remove(hash);
+            }
+        }
+
+        // Restore retriable nodes that were destructively removed for
+        // resubmit-reset. Runs AFTER newly_inserted removal so the fresh
+        // replacement (same hash key) is gone first.
+        for (hash, state) in removed_retriable {
+            self.path_to_hash
+                .insert(state.drv_path().to_string(), hash.clone());
+            self.nodes.insert(hash, state);
         }
 
         // Remove build interest only from pre-existing nodes that gained it

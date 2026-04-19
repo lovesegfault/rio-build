@@ -335,7 +335,7 @@ impl DagActor {
             Ok(r) => r,
             Err(e) => {
                 error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
-                self.cleanup_failed_merge(build_id, &merge_result).await;
+                self.cleanup_failed_merge(build_id, merge_result).await;
                 return Err(e);
             }
         };
@@ -351,7 +351,7 @@ impl DagActor {
             .persist_and_activate(build_id, &nodes, &edges, &merge_result)
             .await
         {
-            self.cleanup_failed_merge(build_id, &merge_result).await;
+            self.cleanup_failed_merge(build_id, merge_result).await;
             return Err(e);
         }
         phase!("5-persist-and-activate");
@@ -1248,16 +1248,20 @@ impl DagActor {
     /// merge succeeded but DB persistence or transition_build failed.
     /// Rolls back the DAG merge, removes map entries, and best-effort
     /// deletes the orphan DB build row.
+    ///
+    /// Takes `merge_result` by value: `removed_retriable` carries owned
+    /// `DerivationState`s that `rollback_merge` re-inserts into the DAG.
     async fn cleanup_failed_merge(
         &mut self,
         build_id: Uuid,
-        merge_result: &crate::dag::MergeResult,
+        merge_result: crate::dag::MergeResult,
     ) {
         self.dag.rollback_merge(
             &merge_result.newly_inserted,
             &merge_result.new_edges,
             &merge_result.interest_added,
             build_id,
+            merge_result.removed_retriable,
         );
         self.events.remove(build_id);
         self.builds.remove(&build_id);

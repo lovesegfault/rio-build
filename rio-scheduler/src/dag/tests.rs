@@ -509,6 +509,153 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resubmit-reset destructively removes a retriable node before
+/// validation. If the merge then fails (cycle), rollback must restore
+/// the prior node verbatim — status, interested_builds, retry.count,
+/// path_to_hash entry, AND pre-existing edges keyed on its hash. Without
+/// restore, `{retriable-X, cycle}` wipes X and resets its retry counter,
+/// defeating `POISON_RESUBMIT_RETRY_LIMIT` (I-169).
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[test]
+fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+
+    // B1: W depends on X. X then fails with retry.count=4.
+    dag.merge(
+        b1,
+        &[
+            make_node("hashW", "x86_64-linux"),
+            make_node("hashX", "x86_64-linux"),
+        ],
+        &[make_edge("hashW", "hashX")],
+        "",
+    )?;
+    {
+        let x = dag.node_mut("hashX").expect("hashX");
+        x.set_status_for_test(DerivationStatus::Failed);
+        x.retry.count = 4;
+    }
+    let x_path = test_drv_path("hashX");
+
+    // B2: resubmit X plus a cycle A↔B. Resubmit-reset removes X before
+    // the cycle is detected; rollback must restore it.
+    let b2 = Uuid::new_v4();
+    let result = dag.merge(
+        b2,
+        &[
+            make_node("hashX", "x86_64-linux"),
+            make_node("hashA", "x86_64-linux"),
+            make_node("hashB", "x86_64-linux"),
+        ],
+        &[make_edge("hashA", "hashB"), make_edge("hashB", "hashA")],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::CycleDetected)));
+
+    // X restored exactly as it was.
+    let x = dag.node("hashX").expect("hashX restored after rollback");
+    assert_eq!(
+        x.status(),
+        DerivationStatus::Failed,
+        "prior status restored"
+    );
+    assert_eq!(
+        x.retry.count, 4,
+        "retry.count toward poison-limit preserved"
+    );
+    assert_eq!(
+        x.interested_builds,
+        HashSet::from([b1]),
+        "prior interest restored, b2 NOT added"
+    );
+    assert_eq!(
+        dag.hash_for_path(&x_path).map(|h| h.as_str()),
+        Some("hashX"),
+        "path_to_hash entry restored"
+    );
+    // Pre-existing W→X edge intact in BOTH directions.
+    assert!(
+        dag.children
+            .get("hashW")
+            .is_some_and(|c| c.contains("hashX")),
+        "children[W]∋X survives"
+    );
+    assert!(
+        dag.parents
+            .get("hashX")
+            .is_some_and(|p| p.contains("hashW")),
+        "parents[X]∋W survives (not over-scrubbed by newly_inserted cleanup)"
+    );
+    // Cycle nodes fully rolled back.
+    assert!(!dag.nodes.contains_key("hashA"));
+    assert!(!dag.nodes.contains_key("hashB"));
+    Ok(())
+}
+
+/// `InvalidDrvPath` mid-loop must roll back EVERYTHING the merge has
+/// touched so far: earlier-iteration fresh inserts, interest added to
+/// pre-existing nodes, and removed retriable nodes. Previously the `?`
+/// dropped all rollback state on the floor.
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[test]
+fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+
+    // Pre-seed: GOOD-PRE (will gain b2 interest) and X (Failed, retry=2).
+    dag.merge(
+        b1,
+        &[
+            make_node("good-pre", "x86_64-linux"),
+            make_node("hashX", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    {
+        let x = dag.node_mut("hashX").expect("hashX");
+        x.set_status_for_test(DerivationStatus::Failed);
+        x.retry.count = 2;
+    }
+
+    // B2: [good-pre (interest), X (resubmit-reset), GOOD-NEW (fresh), BAD].
+    // BAD has an unparseable drv_path → InvalidDrvPath after the first
+    // three iterations have already mutated state.
+    let b2 = Uuid::new_v4();
+    let result = dag.merge(
+        b2,
+        &[
+            make_node("good-pre", "x86_64-linux"),
+            make_node("hashX", "x86_64-linux"),
+            make_node("good-new", "x86_64-linux"),
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    // X restored verbatim.
+    let x = dag.node("hashX").expect("hashX restored");
+    assert_eq!(x.status(), DerivationStatus::Failed);
+    assert_eq!(x.retry.count, 2);
+    assert_eq!(x.interested_builds, HashSet::from([b1]));
+    // Earlier-iteration fresh insert rolled back.
+    assert!(
+        !dag.nodes.contains_key("good-new"),
+        "fresh node from earlier loop iteration must be rolled back"
+    );
+    // Interest added to pre-existing node reverted.
+    assert_eq!(
+        dag.node("good-pre").expect("good-pre").interested_builds,
+        HashSet::from([b1]),
+        "b2 interest in pre-existing node must be reverted"
+    );
+    assert!(!dag.nodes.contains_key("bad"));
+    Ok(())
+}
+
 /// The path_to_hash reverse index must stay in sync with nodes across
 /// merge, rollback, and reap operations.
 #[test]
