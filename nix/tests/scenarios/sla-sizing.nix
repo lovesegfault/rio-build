@@ -313,7 +313,7 @@ let
           # NOTE: requires solve_full -> intent_for -> intents
           # node_selector wiring (impl-todos commit 3). Until that
           # lands, nodeSelector stays {} and this subtest fails.
-          band_hw = [("intel-6-ebs", 1.0), ("intel-7-ebs", 1.4), ("intel-8-nvme", 2.0)]
+          band_hw = [("intel-6-ebs-lo", 1.0), ("intel-7-ebs-mid", 1.4), ("intel-8-nvme-hi", 2.0)]
           for hw, factor in band_hw:
               for i in range(3):
                   ${gatewayHost}.succeed(
@@ -334,7 +334,7 @@ let
           # and node_selector stays {}.
           n_hw = int(psql(${gatewayHost},
               "SELECT COUNT(*) FROM hw_perf_factors "
-              "WHERE hw_class IN ('intel-6-ebs','intel-7-ebs','intel-8-nvme')"
+              "WHERE hw_class IN ('intel-6-ebs-lo','intel-7-ebs-mid','intel-8-nvme-hi')"
           ))
           assert n_hw == 3, (
               f"hw_perf_factors view shows {n_hw}/3 band-aware classes; "
@@ -408,7 +408,7 @@ let
           # the queued build still receives a well-formed (band,cap)
           # nodeSelector — i.e. the solve_full path is stable across
           # the per-(band,cap) candidate enumeration.
-          for hw in ("intel-6-ebs", "intel-7-ebs", "intel-8-nvme"):
+          for hw in ("intel-6-ebs-lo", "intel-7-ebs-mid", "intel-8-nvme-hi"):
               grpcurl_admin("AppendInterruptSample",
                   {"hwClass": hw, "kind": "interrupt", "value": 100})
               grpcurl_admin("AppendInterruptSample",
