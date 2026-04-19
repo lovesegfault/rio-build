@@ -857,7 +857,7 @@ impl DagActor {
                       "orphan completion transition failed");
                 return;
             }
-            state.output_paths = expected_outputs;
+            state.output_paths = expected_outputs.clone();
             state.assigned_executor = None;
         }
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
@@ -874,6 +874,23 @@ impl DagActor {
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.
         self.unpin_best_effort(drv_hash).await;
+        // Per-derivation Completed event BEFORE release_downstream
+        // (which may emit BuildCompleted) — same ordering as
+        // handle_success_completion. Clients tracking per-derivation
+        // state (rio-cli, dashboard, gateway outPathOf) and PG
+        // event-log replay otherwise see this drv frozen at Started.
+        let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+        for build_id in &interested {
+            self.events.emit(
+                *build_id,
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent::completed(
+                        drv_path.clone(),
+                        expected_outputs.clone(),
+                    ),
+                ),
+            );
+        }
         self.release_downstream(drv_hash, &interested, HashSet::new())
             .await;
     }

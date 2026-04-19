@@ -456,6 +456,18 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
         "drv should be Assigned after recovery (before reconcile)"
     );
 
+    // Subscribe to the build's event stream BEFORE reconcile so we
+    // can observe the per-derivation Completed event.
+    let (ev_tx, ev_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            since_sequence: 0,
+            reply: ev_tx,
+        })
+        .await?;
+    let (mut events, _last_seq) = ev_rx.await??;
+
     // ReconcileAssignments → worker 'dead-w1' not in self.executors
     // → store check → outputs present → orphan completion →
     // check_build_completion fires.
@@ -480,6 +492,30 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
         rio_proto::types::BuildState::Succeeded as i32,
         "build should be Succeeded after orphan completion"
     );
+
+    // Per-derivation Completed event must be emitted (with output
+    // paths) BEFORE the build-level Completed; without this,
+    // clients see the drv frozen at Started.
+    use rio_proto::types::{DerivationEventKind, build_event::Event};
+    let mut got_drv_completed = None;
+    let mut got_build_completed = false;
+    while let Ok(ev) = events.try_recv() {
+        match ev.event {
+            Some(Event::Derivation(d)) if d.kind() == DerivationEventKind::Completed => {
+                assert!(
+                    !got_build_completed,
+                    "DerivationCompleted must precede BuildCompleted"
+                );
+                got_drv_completed = Some(d);
+            }
+            Some(Event::Completed(_)) => got_build_completed = true,
+            _ => {}
+        }
+    }
+    let d =
+        got_drv_completed.expect("adopt_orphan_completion must emit DerivationEvent::Completed");
+    assert_eq!(d.derivation_path, test_drv_path("orphan-drv"));
+    assert_eq!(d.output_paths, vec![out_path]);
 
     Ok(())
 }
