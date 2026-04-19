@@ -269,7 +269,8 @@ pub fn describe_metrics() {
     //     "0" from "store hasn't reported yet"
     //   - inline-only (non-S3) deployments never run drain_once, so the
     //     gauges stay absent forever without this
-    // Zero is the correct initial value (no pending deletes at boot).
+    // Zero is a placeholder; the first drain tick (≤30s) overwrites
+    // with the real count.
     metrics::gauge!("rio_store_s3_deletes_pending").set(0.0);
     metrics::gauge!("rio_store_s3_deletes_stuck").set(0.0);
     // Same pre-register reasoning: until the first GetLoad call (or

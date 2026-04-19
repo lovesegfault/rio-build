@@ -79,12 +79,6 @@ pub async fn drain_once(
     .fetch_all(&mut *tx)
     .await?;
 
-    if rows.is_empty() {
-        // Nothing to do — commit (no-op) to release.
-        tx.commit().await?;
-        return Ok((0, 0));
-    }
-
     let mut deleted = 0u64;
     let mut failed = 0u64;
 
@@ -169,6 +163,10 @@ pub async fn drain_once(
     // drain). Operators alert on _stuck > 0 — those need manual
     // intervention (S3 perms, key format, Glacier). _pending > 0
     // with steady drain activity is normal.
+    //
+    // Refreshed on every successful tick (including empty-SELECT
+    // ticks — the for-loop above no-ops on empty rows). PG-error
+    // ticks (`?`-return above) skip; next 30s tick recovers.
     let (pending, stuck): (i64, i64) = sqlx::query_as(
         "SELECT \
            COUNT(*) FILTER (WHERE attempts < $1), \
@@ -383,6 +381,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_respects_max_attempts() {
+        use rio_test_support::metrics::CountingRecorder;
+
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
@@ -393,11 +393,54 @@ mod tests {
             .await
             .unwrap();
 
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
         let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
         // Both 0: the row is excluded by WHERE attempts < MAX.
         // Operator investigates; this row is effectively "parked."
         assert_eq!(deleted, 0);
         assert_eq!(failed, 0, "max-attempts row excluded from drain");
+
+        // bug_029: SELECT returned empty (only stuck rows), but the
+        // gauge block must STILL run so the alert fires. Before the
+        // fix, the empty-rows early-return skipped it → None.
+        assert_eq!(
+            rec.gauge_value("rio_store_s3_deletes_stuck{}"),
+            Some(1.0),
+            "stuck gauge must refresh on empty-SELECT tick; saw {:?}",
+            rec.gauge_names()
+        );
+        assert_eq!(rec.gauge_value("rio_store_s3_deletes_pending{}"), Some(0.0));
+    }
+
+    /// bug_029: empty `pending_s3_deletes` table — gauges must still
+    /// be set to 0.0 (not left untouched). This is the "alert never
+    /// clears after manual cleanup" direction: operator deletes stuck
+    /// rows, next tick must drive `_stuck` back to 0.
+    #[tokio::test]
+    async fn drain_gauge_refreshed_on_empty_table() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!((deleted, failed), (0, 0));
+
+        assert_eq!(
+            rec.gauge_value("rio_store_s3_deletes_pending{}"),
+            Some(0.0),
+            "pending gauge must be set on empty-table tick"
+        );
+        assert_eq!(
+            rec.gauge_value("rio_store_s3_deletes_stuck{}"),
+            Some(0.0),
+            "stuck gauge must be set on empty-table tick"
+        );
     }
 
     /// TOCTOU regression: drain's re-check SELECT ... FOR UPDATE must

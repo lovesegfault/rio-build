@@ -322,6 +322,8 @@ pub async fn sweep(
             return Err(SweepAbort::Shutdown);
         }
         let mut tx = conn.begin().await?;
+        // Snapshot for per-batch counter deltas (emitted post-commit below).
+        let batch_start = stats.clone();
 
         // Within-batch two-pass: lock + re-check every batch item before
         // any narinfo DELETE. The whole-sweep resurrection drain above
@@ -403,7 +405,6 @@ pub async fn sweep(
                     store_path_hash = %hex::encode(store_path_hash),
                     "GC sweep: path resurrected (new referrer after mark), skipping"
                 );
-                metrics::counter!("rio_store_gc_path_resurrected_total").increment(1);
                 stats.paths_resurrected += 1;
                 // Transitive resurrection: this path is now live, so
                 // its own references (and theirs, recursively) must
@@ -435,7 +436,6 @@ pub async fn sweep(
 
         for (store_path_hash, chunk_list) in to_delete {
             if !still_unreachable.contains(store_path_hash) {
-                metrics::counter!("rio_store_gc_path_resurrected_total").increment(1);
                 stats.paths_resurrected += 1;
                 continue;
             }
@@ -466,8 +466,23 @@ pub async fn sweep(
             tx.rollback().await?;
         } else {
             tx.commit().await?;
+            // Per-batch, post-commit: every increment ↔ exactly one
+            // committed tx. Survives SweepAbort (prior batches already
+            // emitted); never fires under dry_run (rolled back above —
+            // a counter is a promise of monotonic fact, not a what-if).
+            // Singular naming matches observability.md:138; `s3_key`
+            // not `chunk` — chunks are marked deleted in PG, KEYS are
+            // what get queued for S3 DeleteObject.
+            metrics::counter!("rio_store_gc_path_swept_total")
+                .increment(stats.paths_deleted - batch_start.paths_deleted);
+            metrics::counter!("rio_store_gc_s3_key_enqueued_total")
+                .increment(stats.s3_keys_enqueued - batch_start.s3_keys_enqueued);
+            metrics::counter!("rio_store_gc_path_resurrected_total")
+                .increment(stats.paths_resurrected - batch_start.paths_resurrected);
         }
     }
+    // On SweepAbort the per-batch set() above already left this at the
+    // correct remaining count; reaching here means the sweep completed.
     metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
 
     info!(
@@ -479,20 +494,6 @@ pub async fn sweep(
         dry_run,
         "GC sweep complete"
     );
-
-    // Sweep counters. Singular naming matches
-    // rio_store_gc_path_resurrected_total (observability.md:138).
-    // `s3_key` not `chunk`: GcStats has s3_keys_enqueued (mod.rs:90);
-    // there is no chunks_enqueued field — chunks are marked deleted
-    // in PG, keys are what get queued for S3 DeleteObject.
-    //
-    // Gated on !dry_run: a dry-run ROLLBACKs the sweep tx. The stats
-    // show what WOULD have been swept, but nothing WAS swept. A
-    // counter is a promise of monotonic fact, not a what-if.
-    if !dry_run {
-        metrics::counter!("rio_store_gc_path_swept_total").increment(stats.paths_deleted);
-        metrics::counter!("rio_store_gc_s3_key_enqueued_total").increment(stats.s3_keys_enqueued);
-    }
 
     Ok(stats)
 }
@@ -745,6 +746,84 @@ mod tests {
         assert_eq!(
             realisations_count, 0,
             "sweep should delete realisations pointing to swept path (no FK CASCADE)"
+        );
+    }
+
+    /// merged_bug_019: dry-run must NOT increment any of the three
+    /// sweep counters (swept/enqueued/resurrected). Before the fix,
+    /// `_resurrected_total` was emitted inline pre-rollback, so
+    /// repeated `--dry-run` invocations inflated it.
+    ///
+    /// The mid-sweep-abort case (batch 1 commits, batch 2 aborts,
+    /// counter==batch1) is correct-by-construction with per-batch
+    /// post-commit emission and shares the same root cause this test
+    /// proves moved; not deterministically unit-testable without
+    /// instrumenting the loop.
+    #[tokio::test]
+    async fn sweep_dry_run_emits_no_counters() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // P: in unreachable list. Q: references P → P resurrects.
+        let p = test_store_path("dryrun-resurrected");
+        let p_hash = StoreSeed::raw_path(&p).seed(&db.pool).await;
+        StoreSeed::path("dryrun-referrer")
+            .with_refs(&[&p])
+            .seed(&db.pool)
+            .await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let stats = sweep(&db.pool, None, vec![p_hash], true, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_resurrected, 1, "P resurrected (stats)");
+        assert_eq!(stats.paths_deleted, 0);
+
+        assert_eq!(
+            rec.get("rio_store_gc_path_resurrected_total{}"),
+            0,
+            "dry-run rolled back → resurrected counter must NOT fire; saw {:?}",
+            rec.all_keys()
+        );
+        assert_eq!(rec.get("rio_store_gc_path_swept_total{}"), 0);
+        assert_eq!(rec.get("rio_store_gc_s3_key_enqueued_total{}"), 0);
+    }
+
+    /// merged_bug_019: real sweep (dry_run=false) — all three counters
+    /// must equal the corresponding `stats` field. Locks the contract
+    /// that per-batch deltas sum to the final stats.
+    #[tokio::test]
+    async fn sweep_counters_match_stats() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h1 = StoreSeed::path("ctr-a").seed(&db.pool).await;
+        let h2 = StoreSeed::path("ctr-b").seed(&db.pool).await;
+        let h3 = StoreSeed::path("ctr-c").seed(&db.pool).await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let stats = sweep(&db.pool, None, vec![h1, h2, h3], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 3);
+        assert_eq!(stats.paths_resurrected, 0);
+
+        assert_eq!(
+            rec.get("rio_store_gc_path_swept_total{}"),
+            stats.paths_deleted
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_path_resurrected_total{}"),
+            stats.paths_resurrected
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_s3_key_enqueued_total{}"),
+            stats.s3_keys_enqueued
         );
     }
 
@@ -1395,21 +1474,26 @@ mod tests {
         assert!(!deleted);
     }
 
-    /// Regression: concurrent orphan-chunk sweep vs rollback on
-    /// overlapping chunk hashes MUST NOT deadlock.
+    /// Regression: concurrent orphan-chunk sweep vs another chunk
+    /// writer on overlapping hashes MUST NOT deadlock.
     ///
-    /// Before P0495's sort in sweep_orphan_chunks, sweep bound its
-    /// ANY($1) in outer-SELECT scan order while rollback
-    /// (delete_manifest_chunked_uploading) bound in sort order. With
-    /// an overlapping hash set, sweep locks in one order while
-    /// rollback locks in another → circular wait → SQLSTATE 40P01.
+    /// PG semantics: `UPDATE ... WHERE` evaluates the full qual at the
+    /// scan node; only matching tuples reach `ModifyTable` where
+    /// `heap_update` takes the row lock. So for sweep's UPDATE to
+    /// participate in a circular wait, its `WHERE refcount=0 AND
+    /// deleted=FALSE` must MATCH — chunks are seeded at refcount=0
+    /// for that reason. The contender is a synthetic no-op `UPDATE
+    /// size=size WHERE blake3_hash=ANY($1)` standing in for "any
+    /// other chunk writer obeying r[store.chunk.lock-order]"; it
+    /// row-locks every hash unconditionally.
     ///
-    /// After the sort, both acquire row locks in the same canonical
-    /// byte order — no circular wait possible. The 5s timeout makes
-    /// a regression fail fast (PG's deadlock_timeout is 1s; a real
-    /// deadlock shows as one side 40P01'ing and the test failing on
-    /// the error, OR — under the right interleaving — the timeout
-    /// trips before PG's detector fires).
+    /// Both sides go through `with_sorted_retry`. With the sort at
+    /// metadata/mod.rs:114 in place, both lock in canonical byte
+    /// order → no circular wait. Mutation-tested: removing that sort
+    /// makes side A lock ascending while side B (fed reversed input)
+    /// locks descending → 40P01 on the second attempt → test fails.
+    /// The 5s timeout backstops the case where PG's deadlock detector
+    /// (1s) hasn't fired yet.
     // r[verify store.chunk.lock-order]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sweep_vs_rollback_no_deadlock() {
@@ -1417,80 +1501,114 @@ mod tests {
 
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Seed 100 chunks at refcount=0, created_at=1h ago →
-        // sweep-eligible (past grace). All overlap with the rollback
-        // set below. Refcount starts at 0 so rollback's decrement
-        // would go negative — we seed via upgrade_manifest_to_chunked
-        // which bumps to refcount=1, making both the sweep (refcount=0
-        // check fails → no-op on those rows) AND rollback (1→0) valid
-        // concurrently. For THIS test we want the DEADLOCK surface,
-        // not the row-state: sweep's UPDATE and rollback's UPDATE
-        // both take row locks on the SAME hashes in the SAME txn
-        // window. Whether each UPDATE flips state doesn't matter —
-        // row locks are acquired regardless.
-        //
-        // Seed strategy: 100 chunks at refcount=1, old. Sweep's outer
-        // SELECT (refcount=0) won't find them, so call
-        // sweep_orphan_batch directly with the hash list to force the
-        // row-lock acquisition. Rollback decrements 1→0.
+        // Seed 100 chunks at refcount=0, deleted=FALSE, past grace —
+        // matches sweep_orphan_batch's WHERE qual so the UPDATE
+        // actually row-locks. Raw INSERT (no manifest needed).
         let hashes: Vec<Vec<u8>> = (0u8..100).map(|i| vec![i; 32]).collect();
-        let sizes: Vec<i64> = vec![1024; 100];
-
-        // Seed placeholder + upgrade → chunks at refcount=1.
-        let sph = vec![0xAAu8; 32];
-        crate::metadata::insert_manifest_uploading(
-            &db.pool,
-            &sph,
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p495-test",
-            &[],
-        )
-        .await
-        .unwrap();
-        crate::metadata::upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &hashes, &sizes)
+        for h in &hashes {
+            sqlx::query(
+                "INSERT INTO chunks (blake3_hash, refcount, size, deleted, created_at) \
+                 VALUES ($1, 0, 1024, FALSE, NOW() - INTERVAL '1 hour')",
+            )
+            .bind(h)
+            .execute(&db.pool)
             .await
             .unwrap();
+        }
 
-        // Sweep side: call sweep_orphan_batch directly with the
-        // sorted hash list (matching what sweep_orphan_chunks does
-        // post-sort). This forces row-lock acquisition on all 100
-        // chunks. The UPDATE's WHERE refcount=0 won't match (they're
-        // at 1), but locks are acquired before the WHERE filter.
-        //
-        // Rollback side: delete_manifest_chunked_uploading with a
-        // REVERSED copy of hashes — this was the pathological order
-        // before both sides sorted.
-        let mut hashes_sorted = hashes.clone();
-        hashes_sorted.sort_unstable();
+        // Per-row contender: locks in `sorted` ARRAY order (one UPDATE
+        // per hash, all in one tx). A single-statement
+        // `WHERE blake3_hash = ANY($1)` locks in PG SCAN order
+        // regardless of array order, so the helper's sort is only
+        // observable when at least one side iterates per-row — this
+        // represents any chunk writer that walks its (sorted) hash
+        // list under one tx.
+        async fn contend_per_row(pool: &PgPool, sorted: &[Vec<u8>]) -> crate::metadata::Result<()> {
+            let mut tx = pool.begin().await?;
+            for h in sorted {
+                sqlx::query("UPDATE chunks SET size = size WHERE blake3_hash = $1")
+                    .bind(h)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+
+        // Sweep (production path) + per-row contender, both through
+        // with_sorted_retry. Sweep is fed FORWARD order; the contender
+        // is fed REVERSED. We count how many times the helper invokes
+        // each body: with the sort, both bodies see ascending input →
+        // zero 40P01 → exactly 1 attempt each. Without the sort, the
+        // contender locks descending while sweep locks in PK-ascending
+        // scan order → 40P01 → one side's body runs twice. The helper's
+        // retry-once still RECOVERS, so we assert on attempt count, not
+        // on Ok/Err.
+        let hashes_fwd = hashes.clone();
         let mut hashes_rev = hashes.clone();
         hashes_rev.reverse();
 
         let pool_a = db.pool.clone();
         let pool_b = db.pool.clone();
-        let sph_b = sph.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_a = Arc::clone(&attempts);
+        let attempts_b = Arc::clone(&attempts);
 
-        let task_sweep =
-            tokio::spawn(async move { sweep_orphan_batch(&pool_a, &hashes_sorted, None).await });
-        let task_rollback = tokio::spawn(async move {
-            crate::metadata::delete_manifest_chunked_uploading(&pool_b, &sph_b, &hashes_rev).await
+        let task_sweep = tokio::spawn(async move {
+            crate::metadata::with_sorted_retry(hashes_fwd, move |sorted| {
+                attempts_a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pool_a = pool_a.clone();
+                async move { sweep_orphan_batch(&pool_a, &sorted, None).await }
+            })
+            .await
+        });
+        let task_contend = tokio::spawn(async move {
+            crate::metadata::with_sorted_retry(hashes_rev, move |sorted| {
+                attempts_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pool_b = pool_b.clone();
+                async move { contend_per_row(&pool_b, &sorted).await }
+            })
+            .await
         });
 
-        let (rs, rr) = timeout(Duration::from_secs(5), async {
-            tokio::try_join!(task_sweep, task_rollback).expect("tasks should not panic")
+        let (rs, rc) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(task_sweep, task_contend).expect("tasks should not panic")
         })
         .await
-        .expect("concurrent sweep+rollback must complete within 5s — deadlock detected");
+        .expect("concurrent sweep+contender must complete within 5s — deadlock detected");
 
-        rs.expect("sweep batch should succeed (or retry-once past 40P01)");
-        rr.expect("rollback should succeed (or retry-once past 40P01)");
+        let (zd, _bf) = rs.expect("sweep batch should succeed");
+        rc.expect("contender should succeed");
 
-        // Ground truth: all refcounts → 0 (rollback decremented them).
-        let sum: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
+        // Mutation sentinel: with_sorted_retry's sort means both sides
+        // lock ascending → no 40P01 → no retry → exactly 2 body
+        // invocations total. Removing the sort at metadata/mod.rs:114
+        // makes this 3 (one side 40P01s, helper retries). Mutation-
+        // tested locally: sort removed → attempts==3 → fails here.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "with_sorted_retry sort should prevent 40P01 (no retry needed)"
+        );
+
+        // Vacuity sentinel: sweep's UPDATE must have matched and
+        // row-locked at least one chunk. If 0, the WHERE qual didn't
+        // match (e.g. seed regressed to refcount=1) and this test is
+        // silently vacuous again — fail loudly.
+        assert!(
+            zd > 0,
+            "sweep matched zero rows — WHERE refcount=0 didn't hit; test is vacuous"
+        );
+
+        // Ground truth: all 100 flipped to deleted=TRUE (sweep won
+        // every row; contender's no-op didn't interfere).
+        let flipped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chunks WHERE blake3_hash = ANY($1) AND deleted = TRUE",
         )
         .bind(&hashes)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(sum, 0, "rollback decremented all 100 chunks to zero");
+        assert_eq!(flipped, 100, "sweep flipped all 100 chunks to deleted=TRUE");
     }
 }
