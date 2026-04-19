@@ -736,18 +736,27 @@ fn dashboard_loads_from_toml_and_splits_origins() {
         "http://a.example,http://b.example"
     );
 
-    // build_cors_layer splits on comma, trims, filters empty.
-    // We can't easily inspect CorsLayer's internal origin list,
-    // so assert the split logic directly on a synthetic config
-    // with whitespace + a trailing comma.
-    let messy = DashboardConfig {
-        cors_allow_origins: " http://a.example , http://b.example ,".into(),
-    };
-    let layer = build_cors_layer(&messy);
-    // Exercising the layer at all proves the HeaderValue parse
-    // succeeded for both trimmed origins (a malformed origin
-    // would have logged a warn but not panicked — the layer is
-    // still constructible). The end-to-end CORS behavior is
-    // covered by the dashboard-gateway VM scenario.
-    let _ = layer;
+    // parse_cors_origins splits on comma, trims, filters empty.
+    // Asserted directly on the extracted helper — CorsLayer's
+    // internal origin list isn't inspectable, so the previous
+    // `let _ = build_cors_layer(...)` form was vacuous.
+    use http::HeaderValue;
+    assert_eq!(
+        parse_cors_origins(" http://a.example , http://b.example ,"),
+        vec![
+            HeaderValue::from_static("http://a.example"),
+            HeaderValue::from_static("http://b.example"),
+        ],
+        "whitespace trimmed, trailing-comma empty dropped"
+    );
+    // Unparseable origins (control bytes are rejected by
+    // HeaderValue::from_str) are dropped, not propagated.
+    assert_eq!(
+        parse_cors_origins("http://ok,\x01bad,http://ok2"),
+        vec![
+            HeaderValue::from_static("http://ok"),
+            HeaderValue::from_static("http://ok2"),
+        ],
+        "invalid origin filtered out, valid siblings kept"
+    );
 }

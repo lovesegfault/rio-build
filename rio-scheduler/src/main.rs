@@ -450,23 +450,13 @@ async fn main() -> anyhow::Result<()> {
 /// blocks the trailer headers and every RPC error renders as
 /// `Code.Unknown`.
 fn build_cors_layer(cfg: &DashboardConfig) -> tower_http::cors::CorsLayer {
-    use http::{HeaderName, HeaderValue, Method};
+    use http::{HeaderName, Method};
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
-    let origins = cfg
-        .cors_allow_origins
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|o| {
-            HeaderValue::from_str(o)
-                .inspect_err(|e| tracing::warn!(origin = o, error = %e, "invalid CORS origin"))
-                .ok()
-        })
-        .collect::<Vec<_>>();
-
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::list(parse_cors_origins(
+            &cfg.cors_allow_origins,
+        )))
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_headers([
             HeaderName::from_static("content-type"),
@@ -478,6 +468,23 @@ fn build_cors_layer(cfg: &DashboardConfig) -> tower_http::cors::CorsLayer {
             HeaderName::from_static("grpc-message"),
             HeaderName::from_static("grpc-status-details-bin"),
         ])
+}
+
+/// Parse a comma-separated CORS origin list (helm renders
+/// `| join ","`): split, trim, drop empties, drop unparseable.
+/// Extracted from `build_cors_layer` so the split/trim/filter chain
+/// is directly assertable — `CorsLayer`'s internal origin list isn't
+/// inspectable, so a constructibility check alone is vacuous.
+pub(crate) fn parse_cors_origins(raw: &str) -> Vec<http::HeaderValue> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|o| {
+            http::HeaderValue::from_str(o)
+                .inspect_err(|e| tracing::warn!(origin = o, error = %e, "invalid CORS origin"))
+                .ok()
+        })
+        .collect()
 }
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
