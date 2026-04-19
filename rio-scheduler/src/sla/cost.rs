@@ -30,8 +30,10 @@ use super::hw::HwTable;
 use super::types::{FittedParams, RawCores};
 
 /// Hardware-generation band. Maps to the `rio.build/hw-band` Node label
-/// (12-NodePool topology) and the `karpenter.k8s.aws/instance-generation`
-/// requirement: `Hi`=gen8, `Mid`=gen7, `Lo`=gen6.
+/// (12-NodePool topology). The label is the source of truth — bands are
+/// non-disjoint by `instance-generation` (helm `mid` admits gen 6+7 so
+/// `mid-nvme-x86` can fall back to c6id), so the generation digit alone
+/// cannot recover the band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Band {
@@ -49,17 +51,6 @@ impl Band {
             Band::Hi => "hi",
             Band::Mid => "mid",
             Band::Lo => "lo",
-        }
-    }
-
-    /// `instance-generation` strings this band admits. Feeds
-    /// [`HwTable::h_dagger`]'s "is hw_class `h` in band `b`?" check
-    /// (hw_class is `"{mfr}-{gen}-{storage}"`).
-    pub fn generations(self) -> &'static [&'static str] {
-        match self {
-            Band::Hi => &["8"],
-            Band::Mid => &["7"],
-            Band::Lo => &["6"],
         }
     }
 }
@@ -352,9 +343,10 @@ impl CostTable {
     /// — controller appends, scheduler aggregates.
     pub async fn refresh_lambda(&mut self, db: &SchedulerDb) -> anyhow::Result<()> {
         // Aggregate per-hw_class since the last per-band update; map
-        // hw_class → band via the generation segment. Unknown
-        // hw_classes (no generation match) are dropped — they
-        // contribute to neither numerator nor denominator.
+        // hw_class → band via the band segment. Unknown hw_classes
+        // (band segment absent or `unknown` — non-builder/fetcher
+        // nodes) are dropped — they contribute to neither numerator
+        // nor denominator.
         let rows: Vec<(String, String, f64, f64)> = sqlx::query_as(
             "SELECT hw_class, kind, COALESCE(SUM(value), 0), \
                     EXTRACT(EPOCH FROM MAX(at))::float8 \
@@ -421,12 +413,17 @@ impl CostTable {
     }
 }
 
-/// Map `"{mfr}-{gen}-{storage}"` → `Band` via the generation segment.
-/// `None` for hw_classes outside gen 6-8 (e.g. metal `unknown` or gen5
-/// fallback nodes — the 12-NodePool topology doesn't admit them).
+/// Map `"{mfr}-{gen}-{storage}-{band}"` → `Band` via the trailing band
+/// segment (the node's `rio.build/hw-band` label, captured by
+/// `node_informer`). `None` for hw_classes with no/unknown band segment
+/// — fetcher/metal/non-Karpenter nodes carry no `rio.build/hw-band`
+/// label, and the 12-NodePool builder topology always sets one.
+///
+/// Keys on the band label, NOT the generation digit: helm
+/// `builderBands.mid` admits gen 6+7, so a c6id node provisioned via the
+/// mid NodePool has gen=`6` but band=`mid`.
 pub fn band_of_hw_class(hw_class: &str) -> Option<Band> {
-    let g = hw_class.split('-').nth(1)?;
-    Band::ALL.into_iter().find(|b| b.generations().contains(&g))
+    parse_band(hw_class.split('-').nth(3)?)
 }
 
 fn parse_band(s: &str) -> Option<Band> {
@@ -640,31 +637,22 @@ pub async fn spot_price_poller(
 /// `$/vCPU·hr` (the per-vCPU price is near-flat across sizes within a
 /// family). Graviton + x86 are both included so a band-wide ARM
 /// discount (or x86 premium) shows up in the EMA.
-const BAND_INSTANCE_TYPES: &[&str] = &[
-    // Hi (gen8)
-    "c8g.large",
-    "m8g.large",
-    // Mid (gen7)
-    "c7a.large",
-    "c7g.large",
-    "m7a.large",
-    "m7g.large",
-    // Lo (gen6)
-    "c6a.large",
-    "c6g.large",
-    "m6a.large",
-    "m6g.large",
+///
+/// Band is tagged explicitly per entry — bands are non-disjoint by
+/// generation (helm `mid` spans 6+7), so it cannot be recovered by
+/// parsing the family's generation digit.
+const BAND_INSTANCE_TYPES: &[(Band, &str)] = &[
+    (Band::Hi, "c8g.large"),
+    (Band::Hi, "m8g.large"),
+    (Band::Mid, "c7a.large"),
+    (Band::Mid, "c7g.large"),
+    (Band::Mid, "m7a.large"),
+    (Band::Mid, "m7g.large"),
+    (Band::Lo, "c6a.large"),
+    (Band::Lo, "c6g.large"),
+    (Band::Lo, "m6a.large"),
+    (Band::Lo, "m6g.large"),
 ];
-
-/// Map an EC2 instance type (`c7a.large`) to its [`Band`] via the
-/// generation digit in the family prefix. `None` for types outside gen
-/// 6-8 or unparseable shapes.
-fn band_of_instance_type(t: &str) -> Option<Band> {
-    let family = t.split('.').next()?;
-    let g = family.chars().find(|c| c.is_ascii_digit())?;
-    let g = &g.to_string()[..];
-    Band::ALL.into_iter().find(|b| b.generations().contains(&g))
-}
 
 /// One `DescribeSpotPriceHistory` round. Returns vCPU-normalized
 /// `$/vCPU·hr` per `(band, Cap::Spot)`.
@@ -690,7 +678,7 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
                 .set_instance_types(Some(
                     BAND_INSTANCE_TYPES
                         .iter()
-                        .map(|t| InstanceType::from(*t))
+                        .map(|(_, t)| InstanceType::from(*t))
                         .collect(),
                 ))
                 .send()
@@ -712,6 +700,7 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
     // Spot history, last hour, all configured types, paginated. AWS
     // returns one row per (type, AZ, price-change); a quiet hour can
     // be empty for some types — those just drop out of the median.
+    let band_of: HashMap<&str, Band> = BAND_INSTANCE_TYPES.iter().map(|&(b, t)| (t, b)).collect();
     let start = aws_sdk_ec2::primitives::DateTime::from_secs((now_epoch() - 3600.0) as i64);
     let mut per_band: HashMap<Band, Vec<f64>> = HashMap::new();
     let mut pages = ec2
@@ -719,7 +708,7 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
         .set_instance_types(Some(
             BAND_INSTANCE_TYPES
                 .iter()
-                .map(|t| InstanceType::from(*t))
+                .map(|(_, t)| InstanceType::from(*t))
                 .collect(),
         ))
         .product_descriptions("Linux/UNIX")
@@ -731,7 +720,7 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
             let Some(t) = row.instance_type().map(|t| t.as_str()) else {
                 continue;
             };
-            let Some(band) = band_of_instance_type(t) else {
+            let Some(&band) = band_of.get(t) else {
                 continue;
             };
             let Some(v) = vcpu.get(t).copied().filter(|v| *v > 0.0) else {
@@ -823,12 +812,18 @@ mod tests {
     }
 
     #[test]
-    fn band_of_hw_class_parses_generation() {
-        assert_eq!(band_of_hw_class("aws-8-nvme"), Some(Band::Hi));
-        assert_eq!(band_of_hw_class("intel-7-ebs"), Some(Band::Mid));
-        assert_eq!(band_of_hw_class("amd-6-ebs"), Some(Band::Lo));
-        assert_eq!(band_of_hw_class("aws-5-ebs"), None);
-        assert_eq!(band_of_hw_class("unknown-unknown-ebs"), None);
+    fn band_of_hw_class_parses_band_label() {
+        assert_eq!(band_of_hw_class("aws-8-nvme-hi"), Some(Band::Hi));
+        assert_eq!(band_of_hw_class("intel-7-ebs-mid"), Some(Band::Mid));
+        assert_eq!(band_of_hw_class("amd-6-ebs-lo"), Some(Band::Lo));
+        // Regression: helm `mid` admits gen 6+7. A c6id provisioned via
+        // the mid NodePool is `gen=6, band=mid` — must map to Mid, NOT
+        // Lo. This is why band is keyed on the label segment, not the
+        // generation digit.
+        assert_eq!(band_of_hw_class("amd-6-nvme-mid"), Some(Band::Mid));
+        // No band segment / unknown band → None.
+        assert_eq!(band_of_hw_class("aws-7-ebs"), None);
+        assert_eq!(band_of_hw_class("unknown-unknown-ebs-unknown"), None);
     }
 
     #[test]
@@ -839,19 +834,6 @@ mod tests {
         ]);
         assert_eq!(parse_selector(&ns), Some((Band::Mid, Cap::Spot)));
         assert_eq!(parse_selector(&Default::default()), None);
-    }
-
-    #[test]
-    fn band_of_instance_type_parses_generation() {
-        assert_eq!(band_of_instance_type("c8g.large"), Some(Band::Hi));
-        assert_eq!(band_of_instance_type("m7a.2xlarge"), Some(Band::Mid));
-        assert_eq!(band_of_instance_type("c6i.large"), Some(Band::Lo));
-        assert_eq!(band_of_instance_type("c5.large"), None);
-        assert_eq!(band_of_instance_type("garbage"), None);
-        // Every configured type maps to a band.
-        for t in BAND_INSTANCE_TYPES {
-            assert!(band_of_instance_type(t).is_some(), "{t} unmapped");
-        }
     }
 
     /// `poll_spot_once`: per-band median of `price/vCPU` over the
@@ -921,8 +903,8 @@ mod tests {
         a.persist(&sdb).await.unwrap();
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
-             VALUES ('us-east-1', 'aws-8-nvme', 'interrupt', 5), \
-                    ('us-east-1', 'aws-8-nvme', 'exposure', 100)",
+             VALUES ('us-east-1', 'aws-8-nvme-hi', 'interrupt', 5), \
+                    ('us-east-1', 'aws-8-nvme-hi', 'exposure', 100)",
         )
         .execute(&db.pool)
         .await

@@ -52,19 +52,29 @@ const LABEL_GENERATION: &str = "karpenter.k8s.aws/instance-generation";
 /// rio-set via EC2NodeClass `spec.tags` → Karpenter propagates to
 /// Node labels. `ebs` (gp3 root) or `nvme` (instance-store).
 const LABEL_STORAGE: &str = "rio.build/storage";
+/// rio-set via NodePool `template.metadata.labels` (helm
+/// `builderBands[].name`). `hi` / `mid` / `lo`. The scheduler keys its
+/// per-band cost solve on THIS, not on `instance-generation` — bands
+/// are non-disjoint by generation since helm `mid` spans `["6","7"]`.
+const LABEL_HW_BAND: &str = "rio.build/hw-band";
 
 /// `karpenter.sh/capacity-type` — `spot` or `on-demand`. Cached so the
 /// spot-interrupt watcher can skip on-demand nodes without re-fetching.
 const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 
-/// Three labels that determine build-performance equivalence class.
-/// Formatted as `"{manufacturer}-{generation}-{storage}"` for the
-/// completion-sample `hw_class` column.
+/// Labels that determine build-performance equivalence class +
+/// provisioning band. Formatted as
+/// `"{manufacturer}-{generation}-{storage}-{band}"` for the
+/// completion-sample `hw_class` column. `band` is the NodePool's
+/// `rio.build/hw-band` — carried explicitly because bands are
+/// non-disjoint by generation (helm `mid` admits gen 6+7), so the
+/// scheduler cannot recover band from the generation digit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HwClass {
     pub manufacturer: String,
     pub generation: String,
     pub storage: String,
+    pub band: String,
 }
 
 /// Per-node cache value: `HwClass` + the bits the spot-interrupt
@@ -82,13 +92,17 @@ struct NodeMeta {
 }
 
 impl HwClass {
-    /// `"{manufacturer}-{generation}-{storage}"`, e.g. `"aws-7-ebs"`.
+    /// `"{manufacturer}-{generation}-{storage}-{band}"`, e.g.
+    /// `"aws-7-ebs-mid"`.
     pub fn as_string(&self) -> String {
-        format!("{}-{}-{}", self.manufacturer, self.generation, self.storage)
+        format!(
+            "{}-{}-{}-{}",
+            self.manufacturer, self.generation, self.storage, self.band
+        )
     }
 
     /// Extract from a Node's labels. Missing labels default to
-    /// `"unknown"` (manufacturer/generation) or `"ebs"` (storage —
+    /// `"unknown"` (manufacturer/generation/band) or `"ebs"` (storage —
     /// the conservative default; nvme is opt-in via EC2NodeClass).
     fn from_node(node: &Node) -> Self {
         let labels = node.metadata.labels.as_ref();
@@ -97,6 +111,7 @@ impl HwClass {
             manufacturer: get(LABEL_MANUFACTURER).unwrap_or_else(|| "unknown".into()),
             generation: get(LABEL_GENERATION).unwrap_or_else(|| "unknown".into()),
             storage: get(LABEL_STORAGE).unwrap_or_else(|| "ebs".into()),
+            band: get(LABEL_HW_BAND).unwrap_or_else(|| "unknown".into()),
         }
     }
 }
@@ -560,9 +575,13 @@ mod tests {
                 (LABEL_MANUFACTURER, "aws"),
                 (LABEL_GENERATION, "7"),
                 (LABEL_STORAGE, "ebs"),
+                (LABEL_HW_BAND, "mid"),
             ],
         ));
-        assert_eq!(cache.hw_class_of("ip-10-0-1-5"), Some("aws-7-ebs".into()));
+        assert_eq!(
+            cache.hw_class_of("ip-10-0-1-5"),
+            Some("aws-7-ebs-mid".into())
+        );
         assert_eq!(cache.hw_class_of("missing"), None);
     }
 
@@ -573,13 +592,36 @@ mod tests {
         cache.apply(&node("bare", &[]));
         assert_eq!(
             cache.hw_class_of("bare"),
-            Some("unknown-unknown-ebs".into())
+            Some("unknown-unknown-ebs-unknown".into())
         );
         // Partial: only manufacturer set.
         cache.apply(&node("partial", &[(LABEL_MANUFACTURER, "intel")]));
         assert_eq!(
             cache.hw_class_of("partial"),
-            Some("intel-unknown-ebs".into())
+            Some("intel-unknown-ebs-unknown".into())
+        );
+    }
+
+    /// Regression: helm `mid` admits gen 6+7, so a c6id node provisioned
+    /// by the mid NodePool has `instance-generation: 6` AND
+    /// `rio.build/hw-band: mid`. The hw_class string must carry the band
+    /// label so the scheduler's `band_of_hw_class` can recover `Mid` —
+    /// parsing the generation digit alone would mis-bucket it as `Lo`.
+    #[test]
+    fn hw_class_carries_band_label_not_just_generation() {
+        let cache = NodeLabelCache::default();
+        cache.apply(&node(
+            "c6id-via-mid",
+            &[
+                (LABEL_MANUFACTURER, "amd"),
+                (LABEL_GENERATION, "6"),
+                (LABEL_STORAGE, "nvme"),
+                (LABEL_HW_BAND, "mid"),
+            ],
+        ));
+        assert_eq!(
+            cache.hw_class_of("c6id-via-mid"),
+            Some("amd-6-nvme-mid".into())
         );
     }
 
@@ -610,7 +652,7 @@ mod tests {
         cache.apply(&od);
         // Spot node → exposure with hw_class + uptime.
         let (hw, secs) = cache.spot_exposure("spot-n", 1100.0).unwrap();
-        assert_eq!(hw, "unknown-7-ebs");
+        assert_eq!(hw, "unknown-7-ebs-unknown");
         assert!((secs - 100.0).abs() < 1e-6);
         // On-demand → no exposure (λ=0 by definition).
         assert!(cache.spot_exposure("od-n", 1100.0).is_none());
@@ -650,8 +692,8 @@ mod tests {
         assert_eq!(
             d,
             vec![
-                ("unknown-6-ebs".into(), 40.0),
-                ("unknown-7-ebs".into(), 120.0),
+                ("unknown-6-ebs-unknown".into(), 40.0),
+                ("unknown-7-ebs-unknown".into(), 120.0),
             ]
         );
 
@@ -662,8 +704,8 @@ mod tests {
         assert_eq!(
             d,
             vec![
-                ("unknown-6-ebs".into(), 60.0),
-                ("unknown-7-ebs".into(), 120.0),
+                ("unknown-6-ebs-unknown".into(), 60.0),
+                ("unknown-7-ebs-unknown".into(), 120.0),
             ]
         );
 
@@ -702,7 +744,7 @@ mod tests {
         // od is not spot → no exposure slice.
         let seen: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
         let evicted = cache.prune_absent(&seen, 1090.0);
-        assert_eq!(evicted, vec![("unknown-7-ebs".into(), 30.0)]);
+        assert_eq!(evicted, vec![("unknown-7-ebs-unknown".into(), 30.0)]);
         assert_eq!(cache.len(), 2);
         assert!(cache.hw_class_of("b").is_none());
         assert!(cache.hw_class_of("od").is_none());
@@ -714,8 +756,8 @@ mod tests {
         assert_eq!(
             d,
             vec![
-                ("unknown-6-ebs".into(), 60.0),
-                ("unknown-7-ebs".into(), 60.0),
+                ("unknown-6-ebs-unknown".into(), 60.0),
+                ("unknown-7-ebs-unknown".into(), 60.0),
             ]
         );
     }
@@ -749,14 +791,18 @@ mod tests {
         let p = pod("rb-abc", "rio", Some("ip-10-0-1-5"), &[]);
         assert_eq!(
             hw_class_patch_target(&p, &cache),
-            Some(("rb-abc".into(), "rio".into(), "unknown-unknown-nvme".into()))
+            Some((
+                "rb-abc".into(),
+                "rio".into(),
+                "unknown-unknown-nvme-unknown".into()
+            ))
         );
         // Already annotated → skip (sticky).
         let p = pod(
             "rb-abc",
             "rio",
             Some("ip-10-0-1-5"),
-            &[(ANNOT_HW_CLASS, "unknown-unknown-nvme")],
+            &[(ANNOT_HW_CLASS, "unknown-unknown-nvme-unknown")],
         );
         assert_eq!(hw_class_patch_target(&p, &cache), None);
         // Pending (no nodeName yet) → skip.
@@ -771,11 +817,17 @@ mod tests {
     fn apply_upserts_on_label_change() {
         let cache = NodeLabelCache::default();
         cache.apply(&node("n", &[(LABEL_STORAGE, "ebs")]));
-        assert_eq!(cache.hw_class_of("n"), Some("unknown-unknown-ebs".into()));
+        assert_eq!(
+            cache.hw_class_of("n"),
+            Some("unknown-unknown-ebs-unknown".into())
+        );
         // Relabel (e.g., operator manually patched) → Modify event →
         // apply() again → cache reflects new value.
         cache.apply(&node("n", &[(LABEL_STORAGE, "nvme")]));
-        assert_eq!(cache.hw_class_of("n"), Some("unknown-unknown-nvme".into()));
+        assert_eq!(
+            cache.hw_class_of("n"),
+            Some("unknown-unknown-nvme-unknown".into())
+        );
         assert_eq!(cache.len(), 1, "upsert, not duplicate");
     }
 }

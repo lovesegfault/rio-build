@@ -1553,7 +1553,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
     // tight, populate one class per band so all 6 cells are candidates
     // and the argmin picks the cheapest spot.
     let mut m = HashMap::new();
-    m.insert("aws-7-ebs".into(), 1.0);
+    m.insert("aws-7-ebs-mid".into(), 1.0);
     actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
     // cost_table left at seed defaults — spot < on-demand for every
     // band, Lo cheapest. With only Mid in hw table, h_dagger for Hi/Lo
@@ -1712,7 +1712,7 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         p99: None,
     }];
     let mut m = HashMap::new();
-    m.insert("aws-7-ebs".into(), 1.0);
+    m.insert("aws-7-ebs-mid".into(), 1.0);
     actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
     // One fitted key reused by every variant below.
     actor.sla_estimator.seed(FittedParams {

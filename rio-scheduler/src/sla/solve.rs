@@ -955,8 +955,8 @@ mod tests {
         // Only mid-band has bench data; hi/lo fall back to factor=1.0
         // (the empty-band h_dagger path).
         let mut m = HashMap::new();
-        m.insert("aws-7-ebs".into(), 1.0);
-        m.insert("aws-7-nvme".into(), 1.2);
+        m.insert("aws-7-ebs-mid".into(), 1.0);
+        m.insert("aws-7-nvme-mid".into(), 1.2);
         HwTable::from_map(m)
     }
 
@@ -1049,13 +1049,16 @@ mod tests {
         let hw = hw_mid_only();
         let no_bias = HashMap::new();
         let (h, f) = hw.h_dagger("foo", Band::Mid, &no_bias);
-        assert_eq!(h, "aws-7-ebs");
+        assert_eq!(h, "aws-7-ebs-mid");
         assert!((f - 1.0).abs() < 1e-9);
 
         let mut bias = HashMap::new();
-        bias.insert("aws-7-nvme".into(), 1.5);
+        bias.insert("aws-7-nvme-mid".into(), 1.5);
         let (h, f) = hw.h_dagger("foo", Band::Mid, &bias);
-        assert_eq!(h, "aws-7-nvme", "per-pname bias flips effective-slowest");
+        assert_eq!(
+            h, "aws-7-nvme-mid",
+            "per-pname bias flips effective-slowest"
+        );
         assert!((f - 0.8).abs() < 1e-9);
 
         // Band with no hw_classes → ("", 1.0).
