@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 /// `rio_common::limits::MAX_NAR_SIZE` so the gateway's `wopAddToStoreNar`
 /// size check is the effective gate, not this clamp. Enforced by a
 /// compile-time `const` assertion in `rio-gateway`.
-// r[impl gw.wire.framed-max-total+2]
+// r[impl gw.wire.framed-max-total+3]
 pub const MAX_FRAMED_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Maximum single frame size (64 MiB).
@@ -67,6 +67,8 @@ impl<R> FramedStreamReader<R> {
     /// Create a new `FramedStreamReader`.
     ///
     /// `max_total` is clamped to [`MAX_FRAMED_TOTAL`] for defense-in-depth.
+    /// Use [`new_unbounded`](Self::new_unbounded) for callers that enforce
+    /// their own per-entry bounds *inside* the de-framed stream.
     pub fn new(inner: R, max_total: u64) -> Self {
         Self {
             inner,
@@ -76,6 +78,27 @@ impl<R> FramedStreamReader<R> {
             frame_remaining: 0,
             total_read: 0,
             max_total: max_total.min(MAX_FRAMED_TOTAL),
+        }
+    }
+
+    /// Unbounded total — for callers that enforce their own per-entry
+    /// bounds inside the de-framed stream (e.g., `wopAddMultipleToStore`:
+    /// `num_paths ≤ MAX_COLLECTION_COUNT`, each `nar_size ≤ MAX_NAR_SIZE`).
+    /// Per-frame is still capped at [`MAX_FRAME_SIZE`] and entries stream
+    /// through, so memory stays bounded; the aggregate cap serves no
+    /// OOM-protection purpose for those callers.
+    ///
+    /// Do NOT use for single-NAR / fully-buffered readers — use
+    /// [`new`](Self::new) so `MAX_FRAMED_TOTAL` provides defense-in-depth.
+    pub fn new_unbounded(inner: R) -> Self {
+        Self {
+            inner,
+            state: FramedState::ReadingHeader,
+            header_buf: [0u8; 8],
+            header_pos: 0,
+            frame_remaining: 0,
+            total_read: 0,
+            max_total: u64::MAX,
         }
     }
 
@@ -145,6 +168,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for FramedStreamReader<R> {
                         ))));
                     }
 
+                    // u64::MAX (new_unbounded) makes this unreachable:
+                    // frame_len ≤ MAX_FRAME_SIZE and total_read grows
+                    // only by += n ≤ buf.remaining(), so new_total can't
+                    // overflow u64.
                     let new_total = this.total_read + frame_len;
                     if new_total > this.max_total {
                         return Poll::Ready(Err(std::io::Error::other(format!(
@@ -398,5 +425,59 @@ pub(super) mod tests {
         let reader = FramedStreamReader::new(Cursor::new(Vec::<u8>::new()), u64::MAX);
         assert_eq!(reader.max_total, MAX_FRAMED_TOTAL);
         assert_eq!(reader.max_total, 4 * 1024 * 1024 * 1024);
+    }
+
+    /// `new_unbounded` does NOT clamp. Structural proof that the total
+    /// gate at `poll_read` is unreachable: `new_total > u64::MAX` is
+    /// impossible. Paired with the `new()` clamp test above —
+    /// `wopAddMultipleToStore` uses this constructor so closures >4 GiB
+    /// don't fail mid-stream with the framed-total error.
+    #[test]
+    fn test_new_unbounded_no_clamp() {
+        let reader = FramedStreamReader::new_unbounded(Cursor::new(Vec::<u8>::new()));
+        assert_eq!(reader.max_total, u64::MAX);
+        assert!(reader.max_total > MAX_FRAMED_TOTAL);
+    }
+
+    /// Unbounded reader actually streams past 4 GiB. Synthetic source
+    /// emits `[u64(64 MiB), 64 MiB zeros] × 65, u64(0)` ≈ 4.06 GiB
+    /// without allocating it — built by chaining `repeat(0).take(64MiB)`
+    /// per frame and discarding into a fixed buffer. With `new()`, the
+    /// 65th frame would trip the framed-total error; with
+    /// `new_unbounded()`, the read completes and `total_bytes_read ==
+    /// 65 × 64 MiB > MAX_FRAMED_TOTAL`. `#[ignore]` because it moves
+    /// >4 GiB through `tokio::io::repeat` (~seconds at memcpy speed);
+    /// NOT in `.#ci`. Run via `cargo nextest run -p rio-nix
+    /// --run-ignored only -- past_4gib`.
+    #[tokio::test]
+    #[ignore = "moves >4 GiB; run manually"]
+    async fn test_unbounded_reads_past_4gib_synthetic() {
+        use tokio::io::AsyncReadExt;
+        const FRAMES: u64 = 65; // 65 × 64 MiB = 4.0625 GiB > 4 GiB
+
+        // Chain (header + take(64MiB)) per frame, terminator last.
+        // Boxed dyn keeps the type linear instead of 65-deep generic.
+        let mut src: Box<dyn AsyncRead + Unpin + Send> =
+            Box::new(Cursor::new(0u64.to_le_bytes().to_vec()));
+        for _ in 0..FRAMES {
+            let header = Cursor::new(MAX_FRAME_SIZE.to_le_bytes().to_vec());
+            let body = tokio::io::repeat(0u8).take(MAX_FRAME_SIZE);
+            src = Box::new(header.chain(body).chain(src));
+        }
+
+        let mut reader = FramedStreamReader::new_unbounded(src);
+        let mut sink = vec![0u8; 1 << 20];
+        loop {
+            let n = reader
+                .read(&mut sink)
+                .await
+                .expect("unbounded reader must not hit framed-total error");
+            if n == 0 {
+                break;
+            }
+        }
+        assert!(reader.is_done());
+        assert_eq!(reader.total_bytes_read(), FRAMES * MAX_FRAME_SIZE);
+        assert!(reader.total_bytes_read() > MAX_FRAMED_TOTAL);
     }
 }

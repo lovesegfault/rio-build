@@ -17,7 +17,7 @@ use super::grpc::{grpc_put_path, grpc_put_path_streaming};
 use super::{GatewayError, PROGRAM_NAME, SessionContext};
 use crate::drv_cache::{DRV_NAR_BUFFER_LIMIT, try_cache_drv};
 
-// r[impl gw.wire.framed-max-total+2]
+// r[impl gw.wire.framed-max-total+3]
 // Guard against future drift: if MAX_NAR_SIZE is bumped without
 // raising MAX_FRAMED_TOTAL, compilation fails. The wopAddToStoreNar
 // handler gates on nar_size ≤ MAX_NAR_SIZE before constructing the
@@ -25,6 +25,9 @@ use crate::drv_cache::{DRV_NAR_BUFFER_LIMIT, try_cache_drv};
 // reader's internal clamp silently shrinks the effective limit and
 // NARs between the two bounds fail mid-stream with a confusing
 // framed-total error instead of the upfront size-gate message.
+//
+// wopAddMultipleToStore uses `new_unbounded` (no aggregate clamp), so
+// this assert applies only to the single-NAR path.
 const _: () = assert!(
     wire::MAX_FRAMED_TOTAL >= MAX_NAR_SIZE,
     "MAX_FRAMED_TOTAL must be >= MAX_NAR_SIZE so the nar_size gate is effective"
@@ -523,7 +526,15 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     // work on it directly (they take R: AsyncRead). After this point, ANY
     // early return leaves the outer reader mid-frame — caller MUST drop the
     // connection (which it does: stderr_err! → Err → session loop aborts).
-    let mut framed = wire::FramedStreamReader::new(&mut *reader, wire::MAX_FRAMED_TOTAL);
+    //
+    // Unbounded aggregate: per-entry nar_size ≤ MAX_NAR_SIZE
+    // (read_entry_head), num_paths ≤ MAX_COLLECTION_COUNT (below), and
+    // per-frame ≤ MAX_FRAME_SIZE — those are the effective DoS gates.
+    // A 4 GiB *aggregate* cap broke `nix copy` of any closure >4 GiB
+    // (NixOS system closure, llvm/chromium build closure); the streaming
+    // reader uses bounded memory regardless, so the aggregate cap served
+    // no OOM-protection purpose here.
+    let mut framed = wire::FramedStreamReader::new_unbounded(&mut *reader);
 
     // Count prefix: Nix `Store::addMultipleToStore(Source &)` reads this
     // first (`readNum<uint64_t>(source)`) before the per-entry loop.

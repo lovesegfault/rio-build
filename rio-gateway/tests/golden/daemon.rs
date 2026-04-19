@@ -346,7 +346,7 @@ async fn read_stderr_loop(
                 // for the next opcode after sending it. Parse the full error
                 // payload, then return (don't loop for another STDERR message).
                 //
-                // Layout per r[gw.stderr.error-format] / StderrWriter::error
+                // Layout per gw.stderr.error-format / StderrWriter::error
                 // (rio-nix/src/protocol/stderr.rs). KEEP IN SYNC with
                 // rio-nix/src/protocol/client.rs::read_stderr_error — this is
                 // a byte-capturing mirror of that struct parser.

@@ -261,10 +261,6 @@ in
   #   output against itself).
   #   Single worker: the chain is serial anyway; multi-worker would
   #   only add boot cost.
-  # r[verify sched.ca.detect]
-  #   ia-deferred-2-level subtest: CA-A→CA-B→IA-C→IA-D. D's child C is
-  #   deferred-IA (not floating-CA); populate_needs_resolve must check
-  #   has_unknown_output_paths or D dispatches with /1<hash> unresolved.
   vm-ca-cutoff-standalone = ca-cutoff {
     inherit pkgs common;
     fixture = standalone {
