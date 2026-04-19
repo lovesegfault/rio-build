@@ -153,6 +153,69 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.recovery.failed-dep-cascade]
+/// bug_341: crash mid-`cascade_dependency_failure` leaves PG with
+/// child=poisoned, parent=queued, build=active. `load_edges_for_
+/// derivations` drops the edge (child terminal → not in $1), so
+/// `compute_initial_states` sees `all_deps_completed(parent)=true` →
+/// wrongly Ready → dispatched against missing input. Recovery must
+/// short-circuit parent → DependencyFailed instead.
+#[tokio::test]
+async fn test_recovery_failed_dep_transitions_parent_not_ready() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        merge_chain(
+            &handle,
+            build_id,
+            &["faildep-child", "faildep-parent"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Precondition: parent=queued (so it hits the I-058 collection).
+        let (pg_status,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'faildep-parent'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            pg_status, "queued",
+            "test precondition: parent must be Queued in PG"
+        );
+        // Backdate: child → poisoned (cascade_dependency_failure
+        // persisted child but crashed before parent). Build stays
+        // Active (interested_builds non-empty → I-059 gate passes).
+        sqlx::query("UPDATE derivations SET status = 'poisoned' WHERE drv_hash = 'faildep-child'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Parent must be DependencyFailed — NOT Ready. Before the fix,
+    // the dropped edge made all_deps_completed()=true → Ready.
+    let parent = expect_drv(&handle, "faildep-parent").await;
+    assert_eq!(
+        parent.status,
+        DerivationStatus::DependencyFailed,
+        "parent with poisoned dep must transition to DependencyFailed, not Ready"
+    );
+
+    // Persisted to PG (so it doesn't leak as a non-terminal orphan
+    // once the build goes terminal).
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'faildep-parent'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "dependency_failed",
+        "DependencyFailed persisted to PG"
+    );
+
+    Ok(())
+}
+
 /// Recovery failure (PG down mid-recovery) → recovery_complete set
 /// TRUE with empty DAG. Degrade, don't block. The alternative (leave
 /// recovery_complete=false) would block dispatch forever while the

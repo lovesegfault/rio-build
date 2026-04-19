@@ -400,11 +400,20 @@ async fn test_build_samples_batch_read_and_trim() -> anyhow::Result<()> {
         "outlier_excluded row filtered"
     );
 
-    // Batch trim to 3 → 2 deleted per key for a/b/c; 'd' untouched.
+    // Batch trim to 3 → 'a' has 4 non-outlier rows so 1 deleted;
+    // 'b'/'c' have 5 → 2 each. 'd' untouched. Outliers don't occupy
+    // ring slots (rank only non-outlier rows).
     let deleted = db
         .trim_build_samples_batch(&pnames, &systems, &tenants, 3)
         .await?;
-    assert_eq!(deleted, 6, "3 keys × (5-3) = 6 rows deleted");
+    assert_eq!(deleted, 5, "a:1 + b:2 + c:2 = 5 rows deleted");
+    // 'a's outlier-excluded row is untouched by trim (forensics-kept;
+    // age-swept by delete_samples_older_than).
+    let (a_outlier_survives,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM build_samples WHERE pname = 'a' AND outlier_excluded")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(a_outlier_survives, 1, "outlier row untouched by trim");
     let (d_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM build_samples WHERE pname = 'd'")
         .fetch_one(&test_db.pool)
         .await?;
@@ -422,6 +431,74 @@ async fn test_build_samples_batch_read_and_trim() -> anyhow::Result<()> {
     assert_eq!(b_excl, 3);
     // Empty slice → no-op (no error, no round-trip).
     db.mark_outliers_excluded(&[]).await?;
+
+    Ok(())
+}
+
+/// bug_056: outlier burst must NOT displace good samples from the
+/// ring. 32 good rows + 20 newer outlier-excluded rows; trim(32) →
+/// 0 deleted (32 good kept, 20 outliers untouched). Before the fix,
+/// the trim ranked all 52 rows and deleted the 20 oldest good ones,
+/// permanently thinning the fit population to 12.
+#[tokio::test]
+async fn test_trim_build_samples_ignores_outliers() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // 32 good samples (completed_at = 0..31) + 20 newer outliers
+    // (completed_at = 32..51) for one key.
+    for i in 0..52 {
+        sqlx::query(
+            "INSERT INTO build_samples
+               (pname, system, tenant, duration_secs, peak_memory_bytes,
+                cpu_limit_cores, completed_at, outlier_excluded)
+             VALUES ('burst', 'x86_64-linux', 't', $1, 0, 4, to_timestamp($1), $2)",
+        )
+        .bind(i as f64)
+        .bind(i >= 32)
+        .execute(&test_db.pool)
+        .await?;
+    }
+
+    // Single-key trim: only 32 non-outlier rows ranked → all rn ≤ 32
+    // → nothing deleted. Outliers untouched.
+    let deleted = db
+        .trim_build_samples("burst", "x86_64-linux", "t", 32)
+        .await?;
+    assert_eq!(deleted, 0, "32 good rows fit in keep_n=32; nothing deleted");
+
+    let (good, outliers): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE NOT outlier_excluded), \
+           count(*) FILTER (WHERE outlier_excluded) \
+         FROM build_samples WHERE pname = 'burst'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(good, 32, "all good rows kept");
+    assert_eq!(outliers, 20, "outliers untouched (forensics-kept)");
+
+    // Batch variant: same result.
+    let deleted = db
+        .trim_build_samples_batch(
+            &["burst".into()],
+            &["x86_64-linux".into()],
+            &["t".into()],
+            32,
+        )
+        .await?;
+    assert_eq!(deleted, 0, "batch trim: same — outliers don't rank");
+
+    // Now read-side parity: refit sees all 32 good rows.
+    let rows = db
+        .read_build_samples_for_keys(
+            &["burst".into()],
+            &["x86_64-linux".into()],
+            &["t".into()],
+            32,
+        )
+        .await?;
+    assert_eq!(rows.len(), 32, "refit population fully preserved");
 
     Ok(())
 }

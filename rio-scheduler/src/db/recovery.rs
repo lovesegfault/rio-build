@@ -72,12 +72,19 @@ impl SchedulerDb {
         .await
     }
 
-    /// Load edges for a set of derivation IDs. Only loads edges
-    /// where BOTH endpoints are in the set — an edge to a completed
-    /// derivation (not in `derivation_ids`) is dropped; the in-mem
-    /// DAG treats "no edge" = "no incomplete dependency" = "ready"
-    /// (compute_initial_states). This is correct: a completed
-    /// dependency IS satisfied.
+    /// Load edges for a set of derivation IDs. Only loads edges where
+    /// BOTH endpoints are in the set — an edge to a `completed`/
+    /// `skipped` derivation (not in `derivation_ids`) is dropped; the
+    /// in-mem DAG treats "no edge" = "no incomplete dependency" =
+    /// "ready" (compute_initial_states). This is correct for those
+    /// two: a completed/skipped dependency IS satisfied.
+    ///
+    /// Edges to `poisoned`/`dependency_failed`/`cancelled` children are
+    /// ALSO dropped here (they're terminal too) — those parents are
+    /// handled by [`Self::load_parents_with_failed_deps`] and
+    /// short-circuited to `DependencyFailed` in `seed_ready_queue`
+    /// BEFORE `compute_initial_states` runs, so the missing edge can't
+    /// cause a wrong `all_deps_completed() == true` promotion.
     ///
     /// ANY($1): PG unnest-style array comparison. Scales to ~100k
     /// IDs before the planner starts preferring a temp table; recovery
@@ -93,6 +100,40 @@ impl SchedulerDb {
             r#"
             SELECT parent_id, child_id FROM derivation_edges
             WHERE parent_id = ANY($1) AND child_id = ANY($1)
+            "#,
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // r[impl sched.recovery.failed-dep-cascade]
+    /// Recovered parents with at least one terminal-**failure**
+    /// dependency (`poisoned`/`dependency_failed`/`cancelled`).
+    ///
+    /// [`Self::load_edges_for_derivations`] drops edges to ALL terminal
+    /// children, so `any_dep_terminally_failed` walks an empty
+    /// `children` map for these parents and `all_deps_completed`
+    /// returns `true` → wrong Ready. This query lets `seed_ready_queue`
+    /// transition them directly to `DependencyFailed` without loading
+    /// stub nodes for the failed children. `'skipped'` is NOT a
+    /// failure (CA-cutoff — `all_deps_completed` treats it as
+    /// satisfied) and `'completed'` is the genuine satisfied case;
+    /// neither is matched here.
+    pub(crate) async fn load_parents_with_failed_deps(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT e.parent_id
+            FROM derivation_edges e
+            JOIN derivations d ON d.derivation_id = e.child_id
+            WHERE e.parent_id = ANY($1)
+              AND d.status IN ('poisoned', 'dependency_failed', 'cancelled')
             "#,
         )
         .bind(derivation_ids)

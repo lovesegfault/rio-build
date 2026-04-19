@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO tenants (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token)\n            VALUES ($1, COALESCE($2, 168), $3, $4)\n            ON CONFLICT DO NOTHING\n            RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,\n                      cache_token IS NOT NULL AS \"has_cache_token!\",\n                      EXTRACT(EPOCH FROM created_at)::bigint AS \"created_at!\"\n            ",
+  "query": "\n            INSERT INTO tenants (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT DO NOTHING\n            RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,\n                      cache_token IS NOT NULL AS \"has_cache_token!\",\n                      EXTRACT(EPOCH FROM created_at)::bigint AS \"created_at!\"\n            ",
   "describe": {
     "columns": [
       {
@@ -51,5 +51,5 @@
       null
     ]
   },
-  "hash": "782239fdd9224ccacdfad3746c967bcd37285e127d736eb00df2bafdfcb49b9c"
+  "hash": "09d4a077a7867808d3415921236bb8f9b658829e5ebda1b1add211f1ba70617c"
 }

@@ -60,6 +60,12 @@ struct RecoveryLoad {
     /// per-build links for the orphan guard.
     bd_rows: Vec<(Uuid, Uuid)>,
     build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
+    /// Recovered parents with ≥1 `poisoned`/`dependency_failed`/
+    /// `cancelled` child in PG. `seed_ready_queue` short-circuits
+    /// these to `DependencyFailed` BEFORE `compute_initial_states`
+    /// (which would otherwise see no edge → `all_deps_completed`
+    /// → wrong Ready). r[sched.recovery.failed-dep-cascade]
+    failed_dep_parents: HashSet<DrvHash>,
 }
 
 impl DagActor {
@@ -99,6 +105,7 @@ impl DagActor {
             build_ids,
             bd_rows,
             build_drv_hashes,
+            failed_dep_parents,
         } = self.load_dag_from_rows().await?;
 
         self.restore_builds(build_rows, &build_ids, build_drv_hashes)
@@ -110,7 +117,7 @@ impl DagActor {
         // self.leader's generation here would false-positive that check.
         let pg_max_gen = self.db.max_assignment_generation().await?;
 
-        self.seed_ready_queue();
+        self.seed_ready_queue(&failed_dep_parents).await;
 
         self.finalize_recovered_builds(&bd_rows).await;
 
@@ -222,6 +229,26 @@ impl DagActor {
         // --- Load edges + add to DAG ---
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;
+        // r[impl sched.recovery.failed-dep-cascade]
+        // Parents with a terminal-FAILURE dep: edge_rows above drops
+        // edges to ALL terminal children, so compute_initial_states
+        // would see all_deps_completed()=true and wrongly promote
+        // these to Ready. Load the set here (uses id_to_hash, internal
+        // to this fn) and pass through RecoveryLoad for seed_ready_
+        // queue to short-circuit → DependencyFailed.
+        let failed_dep_parents: HashSet<DrvHash> = self
+            .db
+            .load_parents_with_failed_deps(&drv_ids)
+            .await?
+            .into_iter()
+            .filter_map(|id| id_to_hash.get(&id).cloned())
+            .collect();
+        if !failed_dep_parents.is_empty() {
+            info!(
+                count = failed_dep_parents.len(),
+                "loaded parents with terminal-failed deps (crash mid-cascade)"
+            );
+        }
         for (parent_id, child_id) in &edge_rows {
             // Both must be in id_to_hash (query filters on ANY($1)
             // for both endpoints) but be defensive.
@@ -275,6 +302,7 @@ impl DagActor {
             build_ids,
             bd_rows,
             build_drv_hashes,
+            failed_dep_parents,
         })
     }
 
@@ -365,7 +393,11 @@ impl DagActor {
     /// Critical-path sweep + I-058 Created/Queued recompute, then push
     /// every Ready node into `self.ready_queue`. Reads only from
     /// `self.dag` (already populated by `load_dag_from_rows`).
-    fn seed_ready_queue(&mut self) {
+    ///
+    /// `failed_dep_parents`: short-circuited to `DependencyFailed`
+    /// BEFORE `compute_initial_states` — see
+    /// `r[sched.recovery.failed-dep-cascade]`.
+    async fn seed_ready_queue(&mut self, failed_dep_parents: &HashSet<DrvHash>) {
         // --- Recompute priorities (critical-path sweep) ---
         // est_duration is recomputed from the SLA cache (refreshed on
         // first tick). full_sweep does a bottom-up pass: leaves
@@ -419,6 +451,64 @@ impl DagActor {
             })
             .map(|(h, _)| h.into())
             .collect();
+        // r[impl sched.recovery.failed-dep-cascade]
+        // Partition: parents whose dep is poisoned/dependency_failed/
+        // cancelled in PG go directly to DependencyFailed and are
+        // EXCLUDED from compute_initial_states. Without this, the
+        // edge to the failed child was dropped by
+        // load_edges_for_derivations → all_deps_completed()=true →
+        // wrong Ready → dispatch against missing input →
+        // InfrastructureFailure → wasted retries → wrong-reason Poisoned.
+        // Realistic trigger: crash mid-cascade_dependency_failure
+        // (sequential per-parent persist_status awaits).
+        //
+        // I-059 orphan gate also applies here: a parent with no
+        // active interested build is left at PG status (it's not in
+        // `to_recompute`, so the intersection below skips it; the
+        // orphan-derivation GC will eventually reap it).
+        let mut cascade_failed: Vec<DrvHash> = Vec::new();
+        let to_recompute: HashSet<DrvHash> = to_recompute
+            .into_iter()
+            .filter(|h| {
+                if failed_dep_parents.contains(h) {
+                    cascade_failed.push(h.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        for hash in &cascade_failed {
+            let Some(state) = self.dag.node_mut(hash) else {
+                continue;
+            };
+            // Created/Queued → DependencyFailed direct;
+            // Substituting → Queued → DependencyFailed (no direct arm
+            // in validate_transition).
+            if state.status() == DerivationStatus::Substituting
+                && let Err(e) = state.transition(DerivationStatus::Queued)
+            {
+                warn!(drv_hash = %hash, error = %e,
+                      "recovery: Substituting→Queued (failed-dep) failed");
+                continue;
+            }
+            if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
+                warn!(drv_hash = %hash, error = %e,
+                      "recovery: →DependencyFailed (failed-dep) failed");
+                continue;
+            }
+            // Persist: otherwise PG stays 'queued', the build goes
+            // terminal, the build_derivations link is GC'd, and the
+            // derivation row leaks (status non-terminal, no link).
+            self.persist_status(hash, DerivationStatus::DependencyFailed, None)
+                .await;
+        }
+        if !cascade_failed.is_empty() {
+            info!(
+                count = cascade_failed.len(),
+                "recovery: →DependencyFailed (dep was terminal-failed in PG; crash mid-cascade)"
+            );
+        }
         let initial_states = self.dag.compute_initial_states(&to_recompute);
         let mut transitioned_ready = 0usize;
         for (drv_hash, target) in initial_states {
@@ -630,11 +720,31 @@ impl DagActor {
                 warn!(error = %e, "failed to sweep stale live pins (best-effort)");
             }
         }
+        // Stale-assignment cleanup: crash-between-derivations-UPDATE-
+        // and-assignments-UPDATE (pre-tx-wrap binaries) left rows with
+        // derivation terminal but assignment pending → permanently
+        // un-GC-able (I-209 leak class). Best-effort backstop; the
+        // tx-wrap chokepoint is the structural fix going forward.
+        // DB-side terminal-status based, independent of `result` —
+        // same TOCTOU-window placement as sweep_stale_live_pins above.
+        // r[impl sched.db.assignment-stale-sweep]
+        match self.db.sweep_stale_assignments().await {
+            Ok(n) if n > 0 => {
+                info!(
+                    swept = n,
+                    "swept stale assignments (terminal derivation, pending assignment)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to sweep stale assignments (best-effort)");
+            }
+        }
 
         // Test-only interleave gate: lets a test bump `generation`
         // between the awaits above and the gen re-check below,
         // deterministically proving the TOCTOU fix covers BOTH
-        // recover_from_pg AND sweep_stale_live_pins. Signal "reached"
+        // recover_from_pg AND the sweep_stale_* calls. Signal "reached"
         // then wait for "release".
         #[cfg(test)]
         if let Some((reached_tx, release_rx)) = self.recovery_toctou_gate.take() {

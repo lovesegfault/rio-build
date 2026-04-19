@@ -55,28 +55,21 @@ pub(super) async fn insert_test_derivation(
 
 #[test]
 fn test_derivation_status_roundtrip() -> anyhow::Result<()> {
-    for status in [
-        DerivationStatus::Created,
-        DerivationStatus::Queued,
-        DerivationStatus::Ready,
-        DerivationStatus::Assigned,
-        DerivationStatus::Running,
-        DerivationStatus::Completed,
-        DerivationStatus::Failed,
-        DerivationStatus::Poisoned,
-        DerivationStatus::DependencyFailed,
-        DerivationStatus::Cancelled,
-        DerivationStatus::Skipped,
-    ] {
+    // Iterate the macro-generated `ALL` so a new variant is covered
+    // automatically — hand-maintained arrays drifted (`Substituting`
+    // was missing for months).
+    for status in DerivationStatus::ALL {
         let s = status.as_str();
         let parsed: DerivationStatus = s.parse()?;
-        assert_eq!(parsed, status);
+        assert_eq!(parsed, *status);
     }
     Ok(())
 }
 
 #[test]
 fn test_build_state_roundtrip() -> anyhow::Result<()> {
+    // BuildState is a proto enum, NOT db_str_enum! — no `ALL`
+    // generated. Hand list intentional; this is not exhaustive.
     for state in [
         BuildState::Pending,
         BuildState::Active,
@@ -93,6 +86,22 @@ fn test_build_state_roundtrip() -> anyhow::Result<()> {
 
 #[test]
 fn test_assignment_status_as_str_exhaustive() {
-    assert_eq!(AssignmentStatus::Pending.as_str(), "pending");
-    assert_eq!(AssignmentStatus::Completed.as_str(), "completed");
+    // AssignmentStatus is write-only to PG (no FromStr), so the
+    // roundtrip is `as_str()` ↔ the schema literals. Iterate `ALL` and
+    // assert each maps to its expected string, AND assert `ALL` covers
+    // exactly the expected set — a new variant trips the second.
+    let expected = [
+        (AssignmentStatus::Pending, "pending"),
+        (AssignmentStatus::Completed, "completed"),
+        (AssignmentStatus::Failed, "failed"),
+        (AssignmentStatus::Cancelled, "cancelled"),
+    ];
+    for (variant, lit) in expected {
+        assert_eq!(variant.as_str(), lit);
+    }
+    assert_eq!(
+        AssignmentStatus::ALL.len(),
+        expected.len(),
+        "new AssignmentStatus variant: pin its literal above"
+    );
 }

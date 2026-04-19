@@ -589,7 +589,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.db.derivations-gc]
+    // r[impl sched.db.derivations-gc+2]
     /// I-169.2: periodic sweep of orphan-terminal `derivations` rows.
     /// Every 30th tick (~5min at the default 10s interval) → delete
     /// ≤1000. A 1.16M backlog drains in ~4 days; steady-state churn

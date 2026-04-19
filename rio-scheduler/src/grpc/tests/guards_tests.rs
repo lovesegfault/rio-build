@@ -8,6 +8,25 @@
 use super::*;
 use rio_proto::{ExecutorService, ExecutorServiceClient, SchedulerService};
 
+/// Compile-time exhaustiveness pin for the `cases` array below:
+/// `ActorError` is `thiserror`, no macro-generated `ALL`, so a no-
+/// wildcard match here breaks the build when a new variant is added —
+/// forcing the maintainer to add the corresponding `(variant, Code,
+/// substr)` row. Without this, the array drifted (`StoreUnavailable`
+/// was missing — its `Code::Unavailable` mapping is load-bearing for
+/// BalancedChannel client retry per actor_guards.rs).
+fn _actor_error_exhaustive(e: &ActorError) {
+    match e {
+        ActorError::BuildNotFound(_)
+        | ActorError::Backpressure
+        | ActorError::ChannelSend
+        | ActorError::Database(_)
+        | ActorError::Dag(_)
+        | ActorError::MissingDbId { .. }
+        | ActorError::StoreUnavailable => {}
+    }
+}
+
 /// Each ActorError variant maps to the expected tonic::Code.
 #[test]
 fn test_actor_error_to_status_all_arms() {
@@ -41,7 +60,15 @@ fn test_actor_error_to_status_all_arms() {
             Code::Internal,
             "unpersisted",
         ),
+        (
+            ActorError::StoreUnavailable,
+            Code::Unavailable,
+            "store service is unreachable",
+        ),
     ];
+    // Count pinned to `_actor_error_exhaustive`: when that match stops
+    // compiling on a new variant, bump this and add a row above.
+    assert_eq!(cases.len(), 7, "add new ActorError variant to `cases`");
     for (err, expected_code, expected_substr) in cases {
         let status = SchedulerGrpc::actor_error_to_status(err);
         assert_eq!(status.code(), expected_code);

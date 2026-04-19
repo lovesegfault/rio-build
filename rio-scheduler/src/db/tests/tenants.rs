@@ -40,6 +40,22 @@ async fn tenant_seed_optional_columns() {
             .unwrap();
     assert_eq!(full_retention, 48);
     assert_eq!(full_token.as_deref(), Some("sekrit"));
+
+    // create_tenant with retention=None → DEFAULT_GC_RETENTION_HOURS.
+    // Structurally couples the const to the actual insert value: if
+    // someone changes DEFAULT_GC_RETENTION_HOURS without it being the
+    // load-bearing value, this fails.
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+    let row = sched_db
+        .create_tenant("ct-default", None, None, None)
+        .await
+        .unwrap()
+        .expect("fresh name, no conflict");
+    assert_eq!(
+        row.gc_retention_hours,
+        crate::db::SchedulerDb::DEFAULT_GC_RETENTION_HOURS,
+        "create_tenant(None) must use DEFAULT_GC_RETENTION_HOURS as the actual default"
+    );
 }
 
 /// Migration 020 adds a CHECK constraint that rejects tenant

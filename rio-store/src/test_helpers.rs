@@ -231,10 +231,11 @@ impl TenantSeed {
     /// DEFAULT 168` — COALESCE on the SQL side so `None` means
     /// "schema default", not "NULL" (which would violate NOT NULL).
     ///
-    /// The `COALESCE($2, 168)` magic-168 duplicates
-    /// `rio_scheduler::db::DEFAULT_GC_RETENTION_HOURS`; rio-store
-    /// doesn't depend on rio-scheduler, so the constant is inlined
-    /// here. Bump both if the default ever changes.
+    /// The literal `168` here mirrors
+    /// `rio_scheduler::SchedulerDb::DEFAULT_GC_RETENTION_HOURS` (the
+    /// canonical value); rio-store can't depend on rio-scheduler, so
+    /// the constant is inlined. If you change that const, change this
+    /// literal too.
     pub async fn seed(self, pool: &PgPool) -> uuid::Uuid {
         let tid: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO tenants \

@@ -17,30 +17,34 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 /// FOD-from-store) left the row at `'pending'`, the pruner's
 /// `NOT EXISTS assignments` never matched, and `derivations` leaked
 /// (12,609 stuck rows on terminal derivations observed in production).
-fn terminal_assignment_status(drv_status: DerivationStatus) -> Option<AssignmentStatus> {
+pub(super) fn terminal_assignment_status(drv_status: DerivationStatus) -> Option<AssignmentStatus> {
+    use DerivationStatus::*;
+    // Exhaustive — no `_` arm: a new variant is a compile error here,
+    // so the I-209 leak this function guards against can't be silently
+    // re-introduced. Belt-and-suspenders runtime check is in
+    // `tests::transactions::test_terminal_statuses_match_is_terminal`.
     match drv_status {
-        DerivationStatus::Completed => Some(AssignmentStatus::Completed),
-        DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
-            Some(AssignmentStatus::Failed)
-        }
-        DerivationStatus::Cancelled | DerivationStatus::Skipped => {
-            Some(AssignmentStatus::Cancelled)
-        }
-        _ => None,
+        Completed => Some(AssignmentStatus::Completed),
+        Poisoned | DependencyFailed => Some(AssignmentStatus::Failed),
+        Cancelled | Skipped => Some(AssignmentStatus::Cancelled),
+        Created | Queued | Ready | Assigned | Running | Substituting | Failed => None,
     }
 }
 
 impl SchedulerDb {
     /// Update a derivation's status. If the new status is terminal,
     /// also closes the active `assignments` row (pending/acknowledged
-    /// → mapped terminal status, `completed_at = now()`).
-    // r[impl sched.db.assignment-terminal-on-status]
+    /// → mapped terminal status, `completed_at = now()`) **in the
+    /// same transaction** so a crash between can't leave a permanent
+    /// un-GC-able row (terminal derivation + pending assignment).
+    // r[impl sched.db.assignment-terminal-on-status+2]
     pub async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
         status: DerivationStatus,
         assigned_executor: Option<&ExecutorId>,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query!(
             r#"
             UPDATE derivations
@@ -51,7 +55,7 @@ impl SchedulerDb {
             status.as_str(),
             assigned_executor.map(ExecutorId::as_str),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if let Some(assign_status) = terminal_assignment_status(status) {
@@ -63,11 +67,11 @@ impl SchedulerDb {
                 drv_hash.as_str(),
                 assign_status.as_str(),
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
 
-        Ok(())
+        tx.commit().await
     }
 
     /// Batch variant of [`update_derivation_status`]: set the same
@@ -93,6 +97,7 @@ impl SchedulerDb {
         if drv_hashes.is_empty() {
             return Ok(0);
         }
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query!(
             r#"
             UPDATE derivations
@@ -102,10 +107,10 @@ impl SchedulerDb {
             drv_hashes as &[&str],
             status.as_str(),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        // r[impl sched.db.assignment-terminal-on-status]
+        // r[impl sched.db.assignment-terminal-on-status+2]
         if let Some(assign_status) = terminal_assignment_status(status) {
             sqlx::query!(
                 "UPDATE assignments
@@ -116,10 +121,11 @@ impl SchedulerDb {
                 drv_hashes as &[&str],
                 assign_status.as_str(),
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
 
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -209,6 +215,7 @@ impl SchedulerDb {
     /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
     pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
@@ -216,9 +223,9 @@ impl SchedulerDb {
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        // r[impl sched.db.assignment-terminal-on-status]
+        // r[impl sched.db.assignment-terminal-on-status+2]
         sqlx::query!(
             "UPDATE assignments
              SET status = 'failed', completed_at = now()
@@ -226,9 +233,40 @@ impl SchedulerDb {
                AND status IN ('pending', 'acknowledged')",
             drv_hash.as_str(),
         )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    // r[impl sched.db.assignment-stale-sweep]
+    /// Recovery backstop: close any `pending`/`acknowledged`
+    /// `assignments` row whose derivation is already terminal.
+    /// Mirrors [`Self::sweep_stale_live_pins`].
+    ///
+    /// The transactional chokepoint above (`update_derivation_status`,
+    /// `update_derivation_status_batch`, `persist_poisoned`) makes the
+    /// torn state structurally impossible going forward, but rows leaked
+    /// by older binaries (pre-tx-wrap) are still permanently un-GC-able:
+    /// `load_nonterminal_derivations` filters them out so
+    /// `collect_orphaned_assignments` never sees them, and
+    /// `gc_orphan_terminal_derivations`' `NOT EXISTS … pending|
+    /// acknowledged` is forever false. This sweeps them on every
+    /// recovery; it's also defense-in-depth if a future caller forgets
+    /// the transaction discipline.
+    pub async fn sweep_stale_assignments(&self) -> Result<u64, sqlx::Error> {
+        // format! of a compile-time const — no injection surface.
+        // See TERMINAL_STATUS_SQL doc for why this isn't a bind param.
+        let result = sqlx::query(&format!(
+            "UPDATE assignments \
+             SET status = 'failed', completed_at = now() \
+             WHERE status IN ('pending', 'acknowledged') \
+               AND derivation_id IN \
+                 (SELECT derivation_id FROM derivations \
+                  WHERE status IN {TERMINAL_STATUS_SQL})"
+        ))
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
@@ -275,7 +313,7 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    // r[impl sched.db.derivations-gc]
+    // r[impl sched.db.derivations-gc+2]
     /// Delete up to `limit` orphan-terminal `derivations` rows: status
     /// is terminal AND no `build_derivations` link AND no `assignments`
     /// row. Returns rows deleted.
@@ -298,13 +336,17 @@ impl SchedulerDb {
     /// row, and only `handle_success_completion` ever closed one — so
     /// every poisoned/cancelled/cache-hit derivation leaked forever.
     ///
-    /// `derivation_edges` rows referencing deleted ids are left in
-    /// place (FK dropped in 028). They're harmless:
+    /// `derivation_edges` rows referencing the deleted ids are removed
+    /// in the same statement via the `del_edges` CTE. Migration 028
+    /// dropped both FKs (no cascade), and re-submitted drv_hashes get
+    /// fresh UUIDs after GC, so orphan edges are otherwise permanent.
     /// `load_edges_for_derivations` filters by `ANY(nonterminal_ids)`
-    /// on both endpoints, so orphans are never loaded.
+    /// on both endpoints (orphans never loaded — correctness OK), but
+    /// the table still grows unbounded at avg-fanout× the I-169.2
+    /// churn rate (1.16M derivations) without the edge delete.
     pub async fn gc_orphan_terminal_derivations(&self, limit: i64) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(&format!(
-            "DELETE FROM derivations WHERE derivation_id IN (
+            "WITH victims AS (
                  SELECT d.derivation_id FROM derivations d
                  WHERE d.status IN {TERMINAL_STATUS_SQL}
                    AND NOT EXISTS (SELECT 1 FROM build_derivations bd
@@ -313,7 +355,15 @@ impl SchedulerDb {
                                    WHERE a.derivation_id = d.derivation_id
                                      AND a.status IN ('pending', 'acknowledged'))
                  LIMIT $1
-             )"
+             ),
+             del_edges AS (
+                 DELETE FROM derivation_edges e
+                 WHERE e.parent_id IN (SELECT derivation_id FROM victims)
+                    OR e.child_id  IN (SELECT derivation_id FROM victims)
+                 RETURNING 1
+             )
+             DELETE FROM derivations d USING victims v
+             WHERE d.derivation_id = v.derivation_id"
         ))
         .bind(limit)
         .execute(&self.pool)

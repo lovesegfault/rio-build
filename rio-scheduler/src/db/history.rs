@@ -237,12 +237,21 @@ impl SchedulerDb {
         tenant: &str,
         keep_n: u32,
     ) -> Result<u64, sqlx::Error> {
+        // `NOT outlier_excluded` on BOTH sides: outliers are
+        // fit-invisible (`read_build_samples_for_keys` filters them),
+        // so they must NOT occupy ring slots — otherwise an outlier
+        // burst displaces older good samples and the next refit sees a
+        // permanently thinned population. Outliers are reaped by the
+        // 30-day age sweep (`delete_samples_older_than`) instead,
+        // preserving the forensics intent of `mark_outliers_excluded`.
         let r = sqlx::query!(
             "DELETE FROM build_samples
              WHERE pname = $1 AND system = $2 AND tenant = $3
+               AND NOT outlier_excluded
                AND id NOT IN (
                  SELECT id FROM build_samples
                  WHERE pname = $1 AND system = $2 AND tenant = $3
+                   AND NOT outlier_excluded
                  ORDER BY completed_at DESC LIMIT $4)",
             pname,
             system,
@@ -309,10 +318,12 @@ impl SchedulerDb {
     }
 
     /// Batch [`Self::trim_build_samples`]: delete all but the `keep_n`
-    /// most-recent rows for every `(pname, system, tenant)` in the
-    /// parallel arrays, in a single round-trip. Returns total rows
-    /// deleted across all keys. Same window-function shape as
-    /// [`Self::read_build_samples_for_keys`].
+    /// most-recent NON-OUTLIER rows for every `(pname, system,
+    /// tenant)` in the parallel arrays, in a single round-trip. Returns
+    /// total rows deleted across all keys. Same window-function shape
+    /// as [`Self::read_build_samples_for_keys`] — including the `NOT
+    /// outlier_excluded` filter, so outliers don't occupy ring slots
+    /// (they're age-swept by `delete_samples_older_than` instead).
     pub async fn trim_build_samples_batch(
         &self,
         pnames: &[String],
@@ -333,6 +344,7 @@ impl SchedulerDb {
               FROM build_samples
               WHERE (pname, system, tenant) IN
                 (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+                AND NOT outlier_excluded
             )
             DELETE FROM build_samples
             WHERE id IN (SELECT id FROM ranked WHERE rn > $4)

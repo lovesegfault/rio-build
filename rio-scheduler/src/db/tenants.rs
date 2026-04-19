@@ -49,15 +49,15 @@ impl SchedulerDb {
     }
 
     /// Default `gc_retention_hours` for new tenants: 168h = 7 days.
-    /// Used as the COALESCE fallback in `Self::create_tenant` when
-    /// the CreateTenant request omits retention (proto3 default 0 →
+    /// Applied via `unwrap_or` in `Self::create_tenant` when the
+    /// CreateTenant request omits retention (proto3 default 0 →
     /// `None` here → this value).
     pub const DEFAULT_GC_RETENTION_HOURS: i32 = 168;
 
     /// Create a tenant. Returns `None` on conflict (tenant_name OR
     /// cache_token already exists) — caller maps to `AlreadyExists`.
     ///
-    /// `gc_retention_hours=None` → [`DEFAULT_GC_RETENTION_HOURS`] via SQL COALESCE.
+    /// `gc_retention_hours=None` → [`DEFAULT_GC_RETENTION_HOURS`] via `unwrap_or`.
     ///
     /// [`DEFAULT_GC_RETENTION_HOURS`]: Self::DEFAULT_GC_RETENTION_HOURS
     pub(crate) async fn create_tenant(
@@ -71,14 +71,14 @@ impl SchedulerDb {
             TenantRow,
             r#"
             INSERT INTO tenants (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token)
-            VALUES ($1, COALESCE($2, 168), $3, $4)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT DO NOTHING
             RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
                       cache_token IS NOT NULL AS "has_cache_token!",
                       EXTRACT(EPOCH FROM created_at)::bigint AS "created_at!"
             "#,
             name,
-            gc_retention_hours,
+            gc_retention_hours.unwrap_or(Self::DEFAULT_GC_RETENTION_HOURS),
             gc_max_store_bytes,
             cache_token,
         )

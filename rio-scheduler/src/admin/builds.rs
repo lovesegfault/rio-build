@@ -81,6 +81,14 @@ fn decode_cursor(s: &str) -> Result<(i64, Uuid), Status> {
     // Slice→array conversions: both are infallible after the len check
     // above, so `unwrap()` is structurally safe (not runtime-faith).
     let micros = i64::from_be_bytes(buf[1..9].try_into().unwrap());
+    // Real `encode_cursor` output is always post-epoch (`submitted_at`
+    // is `now()`). A crafted negative `micros` reaches `to_timestamp`
+    // and underflows PG's 4713 BC TIMESTAMPTZ floor → SQLSTATE 22008 →
+    // `Internal` + `error!` log. Reject it here so the contract above
+    // ("CODES are InvalidArgument … client-supplied-garbage") holds.
+    if micros < 0 {
+        return Err(Status::invalid_argument("bad cursor timestamp"));
+    }
     let build_id = Uuid::from_bytes(buf[9..25].try_into().unwrap());
     Ok((micros, build_id))
 }
@@ -205,10 +213,6 @@ mod tests {
             (0, Uuid::nil()),
             (1_700_000_000_000_000, Uuid::new_v4()),
             (i64::MAX, Uuid::max()),
-            // Negative micros: not expected in practice (pre-epoch
-            // submitted_at) but the codec shouldn't care — i64 BE
-            // encodes the sign bit just fine.
-            (-1, Uuid::new_v4()),
         ] {
             let encoded = encode_cursor(micros, id);
             let (m, i) = decode_cursor(&encoded).expect("round-trip");
@@ -259,6 +263,22 @@ mod tests {
         assert_eq!(
             decode_cursor(&short_enc).unwrap_err().message(),
             "bad cursor length"
+        );
+        // Right version + length, negative micros (i64::MIN). Would
+        // reach `to_timestamp(-9.22e12)` ≈ 290,307 BC → PG SQLSTATE
+        // 22008 → `Internal`. Decoder must reject as InvalidArgument.
+        let mut neg = [0u8; CURSOR_V1_LEN];
+        neg[0] = CURSOR_V1;
+        neg[1..9].copy_from_slice(&i64::MIN.to_be_bytes());
+        let neg_enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(neg);
+        let err = decode_cursor(&neg_enc).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "bad cursor timestamp");
+        // Same for -1: not just the extreme.
+        let neg1_enc = encode_cursor(-1, Uuid::nil());
+        assert_eq!(
+            decode_cursor(&neg1_enc).unwrap_err().message(),
+            "bad cursor timestamp"
         );
     }
 }

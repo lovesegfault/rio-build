@@ -2554,7 +2554,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.db.assignment-terminal-on-status]
+// r[verify sched.db.assignment-terminal-on-status+2]
 /// I-209: PermanentFailure MUST close the active `assignments` row
 /// (`pending` → `failed`, `completed_at` set) and record the executor
 /// in `derivations.retry.failed_builders`. Pre-fix, only the success path

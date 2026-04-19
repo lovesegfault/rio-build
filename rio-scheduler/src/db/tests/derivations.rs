@@ -114,7 +114,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc]
+// r[verify sched.db.derivations-gc+2]
 /// I-169.2: orphan-terminal rows are deleted; rows with a live
 /// `build_derivations` link, an `assignments` row, or non-terminal
 /// status are kept. LIMIT respected.
@@ -189,6 +189,21 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     // (d) Non-terminal, no links → KEPT.
     let live_id = insert_test_derivation(&db, "gc-live").await?;
 
+    // (e) Edges: orphan→orphan + orphan→linked. Both reference an
+    // orphan id, so both must be deleted in the same CTE. linked→live
+    // references no victim → kept. bug_073: without the del_edges CTE,
+    // these accumulate unbounded (028 dropped the FKs, no cascade).
+    sqlx::query(
+        "INSERT INTO derivation_edges (parent_id, child_id)
+         VALUES ($1, $2), ($1, $3), ($3, $4)",
+    )
+    .bind(orphan_ids[0])
+    .bind(orphan_ids[1])
+    .bind(linked_id)
+    .bind(live_id)
+    .execute(&test_db.pool)
+    .await?;
+
     // Sweep with generous limit.
     let deleted = db.gc_orphan_terminal_derivations(1000).await?;
     assert_eq!(
@@ -222,12 +237,23 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
             .await?;
     assert_eq!(cascade_assigns, 0, "034: assignment row CASCADEd");
 
+    // (e) Edges referencing GC'd ids deleted; edge between kept rows survives.
+    let remaining_edges: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT parent_id, child_id FROM derivation_edges")
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(
+        remaining_edges,
+        vec![(linked_id, live_id)],
+        "edges referencing victims deleted; non-victim edge kept"
+    );
+
     // Second sweep: nothing left to delete.
     assert_eq!(db.gc_orphan_terminal_derivations(1000).await?, 0);
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc]
+// r[verify sched.db.derivations-gc+2]
 /// LIMIT batches the sweep: 5 orphans, limit=2 → 2, 2, 1, 0.
 #[tokio::test]
 async fn test_gc_orphan_terminal_derivations_limit() -> anyhow::Result<()> {
@@ -246,5 +272,73 @@ async fn test_gc_orphan_terminal_derivations_limit() -> anyhow::Result<()> {
     assert_eq!(db.gc_orphan_terminal_derivations(2).await?, 2);
     assert_eq!(db.gc_orphan_terminal_derivations(2).await?, 1);
     assert_eq!(db.gc_orphan_terminal_derivations(2).await?, 0);
+    Ok(())
+}
+
+// r[verify sched.db.assignment-stale-sweep]
+/// bug_138: torn terminal write (derivation=poisoned, assignment=
+/// pending) is permanently un-GC-able. `sweep_stale_assignments`
+/// repairs it; then GC can delete. The torn state is now structurally
+/// impossible via the tx-wrap chokepoint, so this test seeds it via
+/// raw SQL (simulating a row leaked by a pre-tx-wrap binary).
+#[tokio::test]
+async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Seed: derivation terminal, assignment pending — the torn state.
+    let torn_id = insert_test_derivation(&db, "torn-poisoned").await?;
+    sqlx::query("UPDATE derivations SET status = 'poisoned' WHERE derivation_id = $1")
+        .bind(torn_id)
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status)
+         VALUES ($1, 'w-crash', 1, 'pending')",
+    )
+    .bind(torn_id)
+    .execute(&test_db.pool)
+    .await?;
+    // Control: non-terminal derivation with pending assignment → untouched.
+    let live_id = insert_test_derivation(&db, "torn-live").await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status)
+         VALUES ($1, 'w-live', 1, 'pending')",
+    )
+    .bind(live_id)
+    .execute(&test_db.pool)
+    .await?;
+
+    // GC blocked: NOT EXISTS assignments…pending is forever false.
+    assert_eq!(
+        db.gc_orphan_terminal_derivations(1000).await?,
+        0,
+        "torn row blocks GC"
+    );
+
+    // Sweep repairs the torn row only.
+    let swept = db.sweep_stale_assignments().await?;
+    assert_eq!(swept, 1, "exactly the torn row repaired");
+    let (torn_status,): (String,) =
+        sqlx::query_as("SELECT status FROM assignments WHERE derivation_id = $1")
+            .bind(torn_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(torn_status, "failed", "torn assignment closed → 'failed'");
+    let (live_status,): (String,) =
+        sqlx::query_as("SELECT status FROM assignments WHERE derivation_id = $1")
+            .bind(live_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(live_status, "pending", "non-terminal derivation untouched");
+
+    // GC now succeeds.
+    assert_eq!(
+        db.gc_orphan_terminal_derivations(1000).await?,
+        1,
+        "post-sweep, GC deletes the repaired row"
+    );
+    // Idempotent.
+    assert_eq!(db.sweep_stale_assignments().await?, 0);
     Ok(())
 }

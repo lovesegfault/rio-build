@@ -6,43 +6,22 @@ use super::TERMINAL_STATUSES;
 use crate::db::TERMINAL_STATUS_SQL;
 
 // r[verify sched.db.partial-index-literal]
-/// Drift guard: `TERMINAL_STATUSES` const ⇔ `DerivationStatus::is_terminal()`.
+/// Drift guard: `TERMINAL_STATUSES` const ⇔ `DerivationStatus::is_terminal()`
+/// ⇔ `terminal_assignment_status().is_some()`.
 ///
-/// Exhaustive over all variants. If you add a variant without
-/// updating the match arm below, `non_exhaustive_patterns` fires.
-/// If you add it to the match but flip terminality without updating
-/// `TERMINAL_STATUSES`, the assertion fires.
+/// Iterates the macro-generated `DerivationStatus::ALL` — a new variant
+/// is structurally covered (the previous hand-maintained array + no-op
+/// match was decoupled: adding a variant forced updating only the match
+/// arm, not `all`, so the assertion loop never iterated it).
 ///
 /// ALSO asserts `TERMINAL_STATUS_SQL` is the `(a,b,c)`-joined form
 /// of `TERMINAL_STATUSES` — catches the case where someone edits
 /// one but not the other.
 #[test]
 fn test_terminal_statuses_match_is_terminal() {
-    use crate::state::DerivationStatus::*;
-    // Exhaustive binding — not `_ =>` — so adding a variant to
-    // the enum is a compile error here until you handle it.
-    let all = [
-        Created,
-        Queued,
-        Ready,
-        Assigned,
-        Running,
-        Substituting,
-        Completed,
-        Failed,
-        Poisoned,
-        DependencyFailed,
-        Cancelled,
-        Skipped,
-    ];
-    // Compile-time exhaustiveness: this match has no wildcard.
-    // Add a variant → this function stops compiling.
-    for v in all {
-        match v {
-            Created | Queued | Ready | Assigned | Running | Substituting | Completed | Failed
-            | Poisoned | DependencyFailed | Cancelled | Skipped => {}
-        }
-    }
+    use crate::db::derivations::terminal_assignment_status;
+    use crate::state::DerivationStatus;
+    let all = DerivationStatus::ALL;
 
     let terminal_set: std::collections::HashSet<&str> = TERMINAL_STATUSES.iter().copied().collect();
 
@@ -54,6 +33,20 @@ fn test_terminal_statuses_match_is_terminal() {
             "TERMINAL_STATUSES drift: {v:?}.is_terminal()={is_term} but \
              presence in TERMINAL_STATUSES={in_const}. Update db/mod.rs const \
              AND migrations/004_recovery.sql:85 partial index predicate."
+        );
+        // r[verify sched.db.assignment-terminal-on-status+2]
+        // I-209 belt-and-suspenders: every terminal status MUST map to
+        // an AssignmentStatus. The match in `terminal_assignment_status`
+        // is already exhaustive (compile-time guard); this is the runtime
+        // check that a new terminal variant wasn't added to the `=> None`
+        // arm by mistake.
+        assert_eq!(
+            is_term,
+            terminal_assignment_status(*v).is_some(),
+            "terminal_assignment_status drift: {v:?}.is_terminal()={is_term} \
+             but terminal_assignment_status maps to {:?}. Every terminal \
+             status MUST close the active assignment row (I-209).",
+            terminal_assignment_status(*v),
         );
     }
 
