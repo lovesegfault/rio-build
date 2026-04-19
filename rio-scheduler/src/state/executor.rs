@@ -51,8 +51,6 @@ pub struct ExecutorState {
     pub stream_tx: Option<tokio::sync::mpsc::Sender<rio_proto::types::SchedulerMessage>>,
     /// Timestamp of last heartbeat (for timeout detection).
     pub last_heartbeat: Instant,
-    /// Number of consecutive missed heartbeats.
-    pub missed_heartbeats: u32,
     /// Stop accepting new assignments (graceful shutdown).
     ///
     /// Set by `AdminService.DrainExecutor` which the executor's SIGTERM
@@ -186,7 +184,6 @@ impl ExecutorState {
             running_build: None,
             stream_tx: None,
             last_heartbeat: Instant::now(),
-            missed_heartbeats: 0,
             draining: false,
             draining_hb: false,
             last_completed: None,

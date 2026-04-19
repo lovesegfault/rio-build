@@ -371,6 +371,15 @@ LeaderAcquired send is fire-and-forget via `tokio::spawn` — blocking on
 recovery would let the lease expire (>15s) → another replica acquires →
 dual-leader.
 
+r[sched.lease.standby-tick-noop]
+On lease loss (or local self-fence) the lease loop sends `LeaderLost` to
+the actor (symmetric with `LeaderAcquired`, same fire-and-forget spawn).
+The actor clears in-memory builds/dag/events and zeros the leader-only
+state gauges. `handle_tick` early-returns on `!is_leader` so an
+ex-leader's PG-writing housekeeping (orphan-watcher cancel, build-timeout
+fail, backstop reassign, poison-clear, derivations-gc) cannot race the
+new leader.
+
 3. **State reconstruction**: The actor's `LeaderAcquired` handler invokes state recovery (see State Recovery below), then sets `recovery_complete = true`. Dispatch is a no-op while `recovery_complete` is false.
 4. **Executor reconnection**: Executors reconnect their `BuildExecution` streams to the new leader. Stale completion reports (carrying an old generation number) are verified against rio-store for output existence before acceptance.
 5. **In-flight assignments**: Assignments from the old leader are verified via heartbeat. If an executor reports it is still running the assigned derivation, the new leader reuses the assignment with the new generation number.
@@ -458,12 +467,12 @@ A newly-registered executor (step 3 above --- first heartbeat with open stream) 
 r[sched.executor.deregister-reassign]
 **Deregistration:** An executor is removed from the scheduler's state when:
 - The `BuildExecution` stream is closed (graceful shutdown or network failure)
-- Heartbeat timeout: the actor's tick (configurable, default 10s) finds `last_heartbeat` older than 30s **and** this has been observed on 3 consecutive ticks (effective wall-clock timeout: ~50–60s depending on tick phase alignment)
+- Heartbeat timeout: the actor's tick (configurable, default 10s) finds `last_heartbeat` older than `HEARTBEAT_TIMEOUT_SECS` (= `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` = 30s). Effective wall-clock timeout: ~30-40s depending on tick phase alignment.
 
 On deregistration, all derivations in `assigned` state for that executor are transitioned back to `ready` for reassignment.
 
-r[sched.backstop.timeout]
-**Backstop timeout:** Separately from executor deregistration, `handle_tick` checks each `running` derivation's `running_since` timestamp. If elapsed time exceeds `max(est_duration × 3, daemon_timeout + 10min)`, the scheduler sends a CancelSignal to the executor, resets the derivation to `ready`, increments `retry_count`, and adds the executor to `failed_builders`. This catches the "executor is heartbeating but daemon is wedged" case where no stream-close or heartbeat-timeout fires. The `rio_scheduler_backstop_timeouts_total` counter tracks these events.
+r[sched.backstop.timeout+2]
+**Backstop timeout:** Separately from executor deregistration, `handle_tick` checks each `running` derivation's `running_since` timestamp. If elapsed time exceeds `max(est_duration × 3, daemon_timeout + 10min)` — where `est_duration` is reference-seconds denormalized to wall-clock via the slowest fleet `hw_factor` per `r[sched.sla.hw-ref-seconds]` — the scheduler sends a CancelSignal to the executor, resets the derivation to `ready`, increments `retry_count`, and adds the executor to `failed_builders`. This catches the "executor is heartbeating but daemon is wedged" case where no stream-close or heartbeat-timeout fires. The `rio_scheduler_backstop_timeouts_total` counter tracks these events.
 
 r[sched.timeout.per-build]
 `BuildOptions.build_timeout` (proto field, seconds) is a wall-clock

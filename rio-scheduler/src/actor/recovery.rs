@@ -559,6 +559,36 @@ impl DagActor {
     /// dispatch a build while half-recovered (the DAG would be
     /// inconsistent). MergeDag from a standby-period SubmitBuild
     /// would queue in the mpsc channel and get processed after.
+    /// Lose-transition counterpart to [`Self::handle_leader_acquired`].
+    /// The lease loop has already flipped `is_leader=false` via
+    /// `on_lose()`; this clears the actor's stale in-memory view so a
+    /// long-lived standby doesn't hold the previous leadership's DAG.
+    /// `handle_tick` early-returns on `!is_leader`, so housekeeping
+    /// can't act on the stale state in the gap before this command
+    /// lands — but holding it indefinitely is wasted memory and would
+    /// be wrong if any future code path forgets the gate.
+    ///
+    /// Also zeros the leader-only state gauges (one-shot). A fresh
+    /// standby never sets them; a was-leader-now-standby would
+    /// otherwise export its frozen last-tick values forever (the
+    /// `tick_publish_gauges` call is unreachable on standby via the
+    /// `handle_tick` gate). Prometheus then sees two series per
+    /// gauge until this pod restarts.
+    // r[impl sched.lease.standby-tick-noop]
+    // r[impl obs.metric.scheduler-leader-gate]
+    pub(super) fn handle_leader_lost(&mut self) {
+        info!("leader lost: clearing persisted actor state");
+        self.clear_persisted_state();
+        for g in [
+            "rio_scheduler_derivations_queued",
+            "rio_scheduler_workers_active",
+            "rio_scheduler_builds_active",
+            "rio_scheduler_derivations_running",
+        ] {
+            metrics::gauge!(g).set(0.0);
+        }
+    }
+
     pub(super) async fn handle_leader_acquired(&mut self) {
         // Snapshot generation BEFORE recovery. If the lease flaps
         // (lose→reacquire) while recover_from_pg() is running, the

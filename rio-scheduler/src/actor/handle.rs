@@ -252,6 +252,31 @@ impl ActorHandle {
         .await
     }
 
+    /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
+    /// tests. Returns `false` if executor not found.
+    pub async fn debug_backdate_heartbeat(
+        &self,
+        executor_id: &str,
+        secs_ago: u64,
+    ) -> Result<bool, ActorError> {
+        let executor_id = executor_id.into();
+        self.debug(|reply| DebugCmd::BackdateHeartbeat {
+            executor_id,
+            secs_ago,
+            reply,
+        })
+        .await
+    }
+
+    /// Seed the SLA estimator's hw_table for ref→wall tests.
+    pub async fn debug_seed_hw_table(
+        &self,
+        factors: std::collections::HashMap<String, f64>,
+    ) -> Result<(), ActorError> {
+        self.debug(|reply| DebugCmd::SeedHwTable { factors, reply })
+            .await
+    }
+
     /// Backdate a build's `submitted_at`. For per-build-timeout tests.
     /// Returns `false` if build not found.
     pub async fn debug_backdate_submitted(

@@ -31,7 +31,7 @@ use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
-    HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, RetryPolicy,
+    HEARTBEAT_TIMEOUT_SECS, POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
 // `impl DagActor` is sharded across these submodules by concern.
@@ -704,6 +704,9 @@ impl DagActor {
                 }
                 ActorCommand::ForwardPhase { phase } => {
                     self.handle_forward_phase(phase);
+                }
+                ActorCommand::LeaderLost => {
+                    self.handle_leader_lost();
                 }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;

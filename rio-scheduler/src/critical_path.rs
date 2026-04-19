@@ -97,7 +97,7 @@ pub fn compute_initial(
     for hash in newly_inserted {
         if let Some(state) = dag.node_mut(hash) {
             state.sched.est_duration = model_key_for(state, builds)
-                .and_then(|k| sla.wall_estimate(&k))
+                .and_then(|k| sla.ref_estimate(&k))
                 .unwrap_or(DEFAULT_DURATION_SECS);
         }
     }

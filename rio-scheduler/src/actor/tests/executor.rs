@@ -598,17 +598,15 @@ async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestRe
 #[tokio::test]
 async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     // NOTE: This test would ideally use tokio::time::pause + advance, but
-    // that interferes with PG pool timeouts. Instead, we verify that Tick
-    // correctly processes the timeout path by checking the missed_heartbeats
-    // counter accumulates. Since we can't easily fast-forward real time in
-    // this test harness, we verify the logic indirectly: Tick with fresh
-    // heartbeat does NOT remove the worker (negative test), and the
-    // timeout-removal path is exercised directly via ExecutorDisconnected
-    // in test_worker_disconnect_running_derivation.
+    // that interferes with PG pool timeouts. We verify the logic
+    // indirectly: Tick with fresh heartbeat does NOT remove the worker
+    // (negative test). The positive timing case is covered by
+    // test_heartbeat_timeout_fires_at_timeout_secs_not_2x below via
+    // DebugBackdateHeartbeat.
     let (_db, handle, _task, _stream_rx) = setup_with_worker("tick-worker", "x86_64-linux").await?;
 
     // Send several Ticks. Worker has fresh heartbeat, should NOT be removed.
-    for _ in 0..MAX_MISSED_HEARTBEATS + 1 {
+    for _ in 0..4 {
         handle.send_unchecked(ActorCommand::Tick).await?;
     }
 
@@ -616,6 +614,59 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     assert!(
         workers.iter().any(|w| w.executor_id == "tick-worker"),
         "worker with fresh heartbeat should survive Tick"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.deregister-reassign]
+/// `tick_check_heartbeats` reaps a silent worker after exactly
+/// `HEARTBEAT_TIMEOUT_SECS` (30s) of silence — NOT after the
+/// double-applied ~60s the previous counter implementation produced.
+///
+/// Uses `DebugBackdateHeartbeat` to force `last_heartbeat` into the
+/// past (tokio paused time can't mock `Instant`, and breaks PG pool
+/// timeouts anyway). Then ONE Tick must reap.
+///
+/// Pre-fix (b62291b8): 31s silence on one Tick set
+/// `missed_heartbeats=1` (need 3) → worker survived → assertion fails.
+#[tokio::test]
+async fn test_heartbeat_timeout_fires_at_timeout_secs_not_2x() -> TestResult {
+    use crate::state::HEARTBEAT_TIMEOUT_SECS;
+    let (_db, handle, _task, _rx) = setup_with_worker("hb-worker", "x86_64-linux").await?;
+
+    // Just under threshold: ONE Tick → worker survives.
+    let ok = handle
+        .debug_backdate_heartbeat("hb-worker", HEARTBEAT_TIMEOUT_SECS - 1)
+        .await?;
+    assert!(ok, "executor should exist");
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_workers()
+            .await?
+            .iter()
+            .any(|w| w.executor_id == "hb-worker"),
+        "worker silent {HEARTBEAT_TIMEOUT_SECS}-1s should survive ONE Tick (under threshold)",
+    );
+
+    // Just over threshold: ONE Tick → worker reaped. The pre-fix
+    // implementation would have set missed_heartbeats=1 here and kept
+    // the worker (need 3 ticks past threshold ≈ 60s total).
+    let ok = handle
+        .debug_backdate_heartbeat("hb-worker", HEARTBEAT_TIMEOUT_SECS + 1)
+        .await?;
+    assert!(ok, "executor should still exist");
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert!(
+        !handle
+            .debug_query_workers()
+            .await?
+            .iter()
+            .any(|w| w.executor_id == "hb-worker"),
+        "worker silent {HEARTBEAT_TIMEOUT_SECS}+1s should be reaped on ONE Tick \
+         (HEARTBEAT_TIMEOUT_SECS already = MAX_MISSED × INTERVAL; no second ×3)",
     );
     Ok(())
 }
@@ -2082,7 +2133,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
     Ok(())
 }
 
-// r[verify sched.backstop.timeout]
+// r[verify sched.backstop.timeout+2]
 /// Backstop timeout: a derivation Running far longer than expected
 /// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor
 /// is 0s (BACKSTOP_DAEMON_TIMEOUT_SECS=0, BACKSTOP_SLACK_SECS=0) so
@@ -2153,6 +2204,74 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
     assert_eq!(
         post.retry.count, 0,
         "backstop reassign re-queues at current floor only (no retry budget consumed)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.sla.hw-ref-seconds]
+// r[verify sched.backstop.timeout+2]
+/// `est_duration` is reference-seconds (sla `t_min`); `elapsed` is
+/// wall-clock. The backstop must denormalize via `min_factor()` so a
+/// long build on slow hardware (`hw_factor < 1/3`) is not cancelled
+/// before its expected wall-clock completion.
+///
+/// `DEFAULT_DURATION_SECS=60` ref-sec; with `min_factor=0.25`,
+/// wall-est = 240s → backstop at 720s. Pre-fix compared 60×3=180
+/// against wall elapsed → fired at 200s (build ~83% done on a 0.25
+/// worker). Post-fix: 200s does NOT fire, 800s does.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_backstop_denormalizes_ref_seconds() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("bs-slow", "x86_64-linux").await?;
+
+    // Seed hw_table so min_factor()=0.25 (slowest band). Default table
+    // is empty → min_factor()=1.0 → no behavior difference.
+    handle
+        .debug_seed_hw_table([("slow-band".to_string(), 0.25)].into_iter().collect())
+        .await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "bs-ref", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // 200s elapsed: > 60×3 (pre-fix threshold) but < (60/0.25)×3=720
+    // (post-fix). Backstop must NOT fire.
+    let ok = handle.debug_backdate_running("bs-ref", 200).await?;
+    assert!(ok, "debug_backdate_running should succeed for Assigned drv");
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    let mid = expect_drv(&handle, "bs-ref").await;
+    assert_eq!(
+        mid.status,
+        DerivationStatus::Running,
+        "200s wall < (60 ref / 0.25 min_hw) × 3 = 720s → backstop should \
+         NOT fire. Pre-fix compared ref-sec×3=180 against wall and fired here."
+    );
+    assert!(
+        !logs_contain("backstop timeout"),
+        "no backstop log at 200s wall on slow hw"
+    );
+
+    // 800s elapsed: > 720s denormalized threshold → fires.
+    let ok = handle.debug_backdate_running("bs-ref", 800).await?;
+    assert!(ok);
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("backstop timeout"),
+        "800s wall > 720s denormalized → backstop should fire"
+    );
+    let post = expect_drv(&handle, "bs-ref").await;
+    assert!(
+        matches!(
+            post.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "backstop should reset drv past denormalized threshold; got {:?}",
+        post.status
     );
 
     Ok(())

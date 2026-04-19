@@ -211,7 +211,7 @@ impl SlaEstimator {
     /// saturate on ∞ (`ca_cutoff_seconds_saved` → `u64::MAX`;
     /// `critical_path_accuracy` → `actual/∞ = 0`). The flat default is
     /// the same "unfitted" treatment a never-seen key gets.
-    pub fn wall_estimate(&self, key: &types::ModelKey) -> Option<f64> {
+    pub fn ref_estimate(&self, key: &types::ModelKey) -> Option<f64> {
         self.cached(key)
             .map(|p| p.fit.t_min().0)
             .filter(|t| t.is_finite())
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn wall_estimate_probe_is_none_not_infinity() {
+    fn ref_estimate_probe_is_none_not_infinity() {
         let est = SlaEstimator::for_test(&cfg());
         let mut p = fitted("probing", 1.0);
         p.fit = DurationFit::Probe;
@@ -577,12 +577,12 @@ mod tests {
         est.seed(p);
         // Probe.t_min() = ∞ is filtered → None, so critical_path falls
         // back to DEFAULT_DURATION_SECS instead of poisoning priority.
-        assert_eq!(est.wall_estimate(&key), None);
+        assert_eq!(est.ref_estimate(&key), None);
         // Control: a fitted Amdahl curve returns a finite estimate.
         let f = fitted("fitted", 10.0);
         let fkey = f.key.clone();
         est.seed(f);
-        let w = est.wall_estimate(&fkey).expect("fitted → Some");
+        let w = est.ref_estimate(&fkey).expect("fitted → Some");
         assert!(w.is_finite() && w > 0.0);
     }
 

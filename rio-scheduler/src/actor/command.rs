@@ -312,6 +312,15 @@ pub enum ActorCommand {
     /// (no-op: empty PG → empty DAG → recovery_complete already true).
     LeaderAcquired,
 
+    /// Lease lost (or self-fenced): clear in-memory builds/dag/events
+    /// and zero the leader-only state gauges. Symmetric with
+    /// `LeaderAcquired`. Fire-and-forget — the lease loop has already
+    /// flipped `is_leader=false` via `on_lose()`; this command brings
+    /// the actor's persisted state in line so a long-lived standby
+    /// doesn't (a) hold a stale DAG indefinitely, (b) export frozen
+    /// gauge values.
+    LeaderLost,
+
     /// Post-recovery worker reconciliation (spec step 6). Scheduled
     /// ~45s after recovery via WeakSender. For each Assigned/Running
     /// derivation: if assigned_executor NOT in self.executors →
@@ -465,6 +474,22 @@ pub enum DebugCmd {
         n: u32,
         reply: oneshot::Sender<bool>,
     },
+    /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
+    /// tests: `tokio::time::pause` interferes with PG pool timeouts so
+    /// real-time can't be advanced. With this, one Tick at
+    /// `secs_ago > HEARTBEAT_TIMEOUT_SECS` proves the reap fires
+    /// without the pre-fix double-multiply.
+    BackdateHeartbeat {
+        executor_id: ExecutorId,
+        secs_ago: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Seed the SLA estimator's hw_table. For ref-seconds → wall-seconds
+    /// denormalization tests (`min_factor()` needs a non-default table).
+    SeedHwTable {
+        factors: std::collections::HashMap<String, f64>,
+        reply: oneshot::Sender<()>,
+    },
     /// Seed `state.sched.last_intent` and/or `resource_floor` for D4
     /// floor tests. Per-field `Option` (builder-style); any `Some`
     /// field materializes a `last_intent`.
@@ -522,6 +547,7 @@ impl ActorCommand {
             Self::Admin(q) => q.name(),
             Self::ClearPoison { .. } => "ClearPoison",
             Self::LeaderAcquired => "LeaderAcquired",
+            Self::LeaderLost => "LeaderLost",
             Self::ReconcileAssignments => "ReconcileAssignments",
             #[cfg(test)]
             Self::Debug(_) => "Debug",

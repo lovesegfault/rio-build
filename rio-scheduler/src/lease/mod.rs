@@ -517,6 +517,27 @@ pub async fn run_lease_loop(
                     );
                     metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
 
+                    // r[impl sched.lease.standby-tick-noop]
+                    // Symmetric with LeaderAcquired above: tell the
+                    // actor to drop its stale builds/dag and zero
+                    // leader-only gauges. Same fire-and-forget spawn
+                    // pattern — lease loop MUST NOT block on actor
+                    // backpressure (channel capacity is 10k, but
+                    // defensive). is_leader is already false (above)
+                    // so handle_tick early-returns regardless; this
+                    // just stops the standby holding the prior DAG
+                    // in memory and exporting frozen gauges.
+                    let actor_clone = actor.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = actor_clone
+                            .send_unchecked(crate::actor::ActorCommand::LeaderLost)
+                            .await
+                        {
+                            tracing::error!(error = %e,
+                                "failed to send LeaderLost (actor dead?)");
+                        }
+                    });
+
                     // Clear deletion cost — we're standby now, K8s
                     // should prefer to kill us over the new leader.
                     spawn_patch_deletion_cost(
@@ -562,12 +583,26 @@ pub async fn run_lease_loop(
                 // noise generator. Worker-side generation fence
                 // (r[sched.lease.generation-fence]) saves correctness
                 // either way; this fence saves ops sanity.
-                maybe_self_fence(
+                if maybe_self_fence(
                     &state,
                     &mut was_leading,
                     &mut owe_cost_clear,
                     last_successful_renew,
-                );
+                ) {
+                    // Self-fence is a lose-transition: same LeaderLost
+                    // notification as the explicit lose arm above.
+                    // Spawned for the same non-blocking-lease reason.
+                    let actor_clone = actor.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = actor_clone
+                            .send_unchecked(crate::actor::ActorCommand::LeaderLost)
+                            .await
+                        {
+                            tracing::error!(error = %e,
+                                "failed to send LeaderLost (actor dead?)");
+                        }
+                    });
+                }
             }
         }
     }

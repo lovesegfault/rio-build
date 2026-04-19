@@ -15,8 +15,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS,
-    MAX_MISSED_HEARTBEATS, POISON_TTL,
+    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS, POISON_TTL,
 };
 
 use super::DagActor;
@@ -110,6 +109,19 @@ impl DagActor {
     }
 
     pub(super) async fn handle_tick(&mut self) {
+        // r[impl sched.lease.standby-tick-noop]
+        // Standby keeps stale self.builds/dag until LeaderLost lands;
+        // every tick_* below either writes PG (orphan-cancel, build-
+        // timeout, backstop-reassign, poison-clear, derivations-gc,
+        // event-log sweep) or reads stale state. dispatch_ready (:108)
+        // and gRPC (r[sched.grpc.leader-guard]) already gate; this
+        // closes the Tick path. A 2-replica deploy with one lease flap
+        // would otherwise let the ex-leader cancel every Active build
+        // 5min later (orphan grace) — db.update_build_status has no
+        // fence in its WHERE clause.
+        if !self.leader.is_leader() {
+            return;
+        }
         // Reset the "worker newly available" inline-dispatch budget.
         // See `BECAME_IDLE_INLINE_CAP` — past the cap, became_idle
         // heartbeats and PrefetchComplete cold→warm edges since the
@@ -224,22 +236,22 @@ impl DagActor {
     }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have
-    /// missed MAX_MISSED_HEARTBEATS consecutive checks.
+    /// been silent past `HEARTBEAT_TIMEOUT_SECS`. The constant is
+    /// `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` (limits.rs:63)
+    /// — the ×3 is already baked in. The previous implementation used
+    /// 30s as a per-tick increment gate AND required a counter to reach
+    /// 3, applying the ×3 twice → reap at ~60s not 30s.
     async fn tick_check_heartbeats(&mut self, now: Instant) {
         let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
-        let mut timed_out_workers = Vec::new();
-
-        for (executor_id, worker) in &mut self.executors {
-            if now.duration_since(worker.last_heartbeat) > timeout {
-                worker.missed_heartbeats += 1;
-                if worker.missed_heartbeats >= MAX_MISSED_HEARTBEATS {
-                    timed_out_workers.push(executor_id.clone());
-                }
-            }
-        }
-
-        for executor_id in timed_out_workers {
-            warn!(executor_id = %executor_id, "worker timed out (missed heartbeats)");
+        let timed_out: Vec<_> = self
+            .executors
+            .iter()
+            .filter(|(_, w)| now.duration_since(w.last_heartbeat) > timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for executor_id in timed_out {
+            warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
+                  "worker heartbeat timeout; disconnecting");
             self.handle_executor_disconnected(&executor_id).await;
         }
     }
@@ -251,11 +263,21 @@ impl DagActor {
     ///
     /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
     /// `(drv_hash, drv_path, executor_id)`.
-    // r[impl sched.backstop.timeout]
+    // r[impl sched.backstop.timeout+2]
     fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
         let mut backstop_timeouts: Vec<(DrvHash, String, ExecutorId)> = Vec::new();
+
+        // r[impl sched.sla.hw-ref-seconds]
+        // est_duration is REF-seconds (sla.ref_estimate → t_min); elapsed
+        // is wall. Worker hw_class is unknown here (only CompletionReport
+        // carries it) → divide by slowest factor so the backstop never
+        // fires before worst-case wall completion. Same pattern as
+        // snapshot.rs deadline derivation. min_factor() is clamped at
+        // HW_FACTOR_SANITY_FLOOR (sla/hw.rs) so division is safe; one
+        // read-lock per tick (hoisted out of the per-node loop).
+        let min_hw = self.sla_estimator.hw_table().min_factor();
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
@@ -281,9 +303,10 @@ impl DagActor {
                 && let Some(running_since) = state.running_since
             {
                 let elapsed = now.duration_since(running_since);
-                // est_duration is in seconds (f64). 0.0 = no
-                // estimate (fresh derivation, estimator had no
-                // history) → floor applies.
+                // est_duration is REF-seconds (f64) — denormalized to
+                // wall above the loop via `/ min_hw`. 0.0 = no estimate
+                // (fresh derivation, estimator had no history) → floor
+                // applies.
                 //
                 // is_finite() guard: NaN/inf propagate through max()
                 // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
@@ -291,7 +314,7 @@ impl DagActor {
                 // non-finite est as "no estimate" (0.0 → floor wins).
                 let est_3x_secs =
                     if state.sched.est_duration.is_finite() && state.sched.est_duration > 0.0 {
-                        state.sched.est_duration * 3.0
+                        (state.sched.est_duration / min_hw) * 3.0
                     } else {
                         0.0
                     };
@@ -511,6 +534,15 @@ impl DagActor {
             // → total never reached. keep_going=false builds are
             // already terminal (failed fast at poison time).
             self.prune_interested_keep_going(&drv_hash);
+            // Discard any log buffer BEFORE remove_node drops the
+            // hash→path mapping. Reachable via 24h-TTL on a drv that
+            // never re-dispatched (so the reassign-path discard never
+            // fired) — defense-in-depth against a slow leak.
+            if let Some(bufs) = &self.log_buffers
+                && let Some(drv_path) = self.dag.path_for_hash(&drv_hash)
+            {
+                bufs.discard(drv_path);
+            }
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }
@@ -585,39 +617,37 @@ impl DagActor {
     /// The inc/dec calls at connect/disconnect/heartbeat stay — they give
     /// sub-tick responsiveness. This block corrects any drift every tick.
     ///
-    /// Leader-only: standby's actor is warm (DAGs merge for takeover) but
-    /// workers don't connect to it (leader-guarded gRPC), so its counts are
-    /// stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
-    /// gauge query returns two series. Stat-panel lastNotNull picks one
-    /// nondeterministically. Gate here so the standby simply doesn't export
-    /// the series — queries see one series, no max() wrapper needed.
+    /// Leader-only via the `handle_tick` early-return above. A fresh
+    /// standby never reaches here so it exports no series (see
+    /// `test_not_leader_does_not_set_gauges`). A was-leader-now-standby
+    /// has its gauges zeroed once by `handle_leader_lost` so its frozen
+    /// last-tick values don't sit in Prometheus indefinitely. Net:
+    /// queries see one non-zero series, no max() wrapper needed.
     // r[impl obs.metric.scheduler-leader-gate]
     fn tick_publish_gauges(&self) {
-        if self.leader.is_leader() {
-            metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
-            metrics::gauge!("rio_scheduler_workers_active").set(
-                self.executors
-                    .values()
-                    .filter(|w| w.is_registered())
-                    .count() as f64,
-            );
-            metrics::gauge!("rio_scheduler_builds_active").set(
-                self.builds
-                    .values()
-                    .filter(|b| b.state() == BuildState::Active)
-                    .count() as f64,
-            );
-            metrics::gauge!("rio_scheduler_derivations_running").set(
-                self.dag
-                    .iter_values()
-                    .filter(|s| {
-                        matches!(
-                            s.status(),
-                            DerivationStatus::Running | DerivationStatus::Assigned
-                        )
-                    })
-                    .count() as f64,
-            );
-        }
+        metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
+        metrics::gauge!("rio_scheduler_workers_active").set(
+            self.executors
+                .values()
+                .filter(|w| w.is_registered())
+                .count() as f64,
+        );
+        metrics::gauge!("rio_scheduler_builds_active").set(
+            self.builds
+                .values()
+                .filter(|b| b.state() == BuildState::Active)
+                .count() as f64,
+        );
+        metrics::gauge!("rio_scheduler_derivations_running").set(
+            self.dag
+                .iter_values()
+                .filter(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Running | DerivationStatus::Assigned
+                    )
+                })
+                .count() as f64,
+        );
     }
 }

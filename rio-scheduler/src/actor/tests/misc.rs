@@ -11,21 +11,38 @@ use tracing_test::traced_test;
 // Leader/recovery dispatch gate
 // ---------------------------------------------------------------------------
 
-/// Helper: build an actor with custom leader/recovery flags (no mock store).
+/// Helper: build an actor with custom leader/recovery flags (no mock
+/// store). Returns the `LeaderState` handle so tests can drive
+/// `on_lose()` / `on_acquire()` from outside the lease loop.
+fn spawn_actor_with_leader(
+    pool: sqlx::PgPool,
+    is_leader: bool,
+    recovery_complete: bool,
+) -> (
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+    crate::lease::LeaderState,
+) {
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        Arc::new(AtomicBool::new(is_leader)),
+        Arc::new(AtomicBool::new(recovery_complete)),
+    );
+    let leader_clone = leader.clone();
+    let (handle, task) = setup_actor_configured(pool, None, move |_, p| {
+        p.leader = leader_clone;
+    });
+    (handle, task, leader)
+}
+
+/// Backward-compat wrapper for tests that don't need the LeaderState handle.
 fn spawn_actor_with_flags(
     pool: sqlx::PgPool,
     is_leader: bool,
     recovery_complete: bool,
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
-    let leader_flag = Arc::new(AtomicBool::new(is_leader));
-    let recovery_flag = Arc::new(AtomicBool::new(recovery_complete));
-    setup_actor_configured(pool, None, |_, p| {
-        p.leader = crate::lease::LeaderState::from_parts(
-            Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            leader_flag,
-            recovery_flag,
-        );
-    })
+    let (h, t, _l) = spawn_actor_with_leader(pool, is_leader, recovery_complete);
+    (h, t)
 }
 
 // r[verify sched.recovery.gate-dispatch]
@@ -115,6 +132,102 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
             recorder.gauge_names()
         );
     }
+    Ok(())
+}
+
+// r[verify sched.lease.standby-tick-noop]
+// r[verify obs.metric.scheduler-leader-gate]
+/// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
+/// gauges; subsequent `Tick` early-returns so the orphan-watcher does
+/// NOT write `Cancelled` to PG for builds the new leader is running.
+///
+/// Pre-fix (b62291b8): no `LeaderLost` command, no `handle_tick`
+/// leader gate. After `on_lose()`, dropping `event_rx` and ticking ×3
+/// (cfg(test) `ORPHAN_BUILD_GRACE=ZERO` → cancels on tick 2) wrote
+/// `status='cancelled'` to PG.
+#[tokio::test]
+async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
+
+    // Merge a build while we ARE leader. Hold event_rx so the
+    // orphan-watcher precondition (receiver_count==0) is set up by an
+    // explicit drop below, not by the temporary going out of scope.
+    let build_id = Uuid::new_v4();
+    let event_rx =
+        merge_single_node(&handle, build_id, "ex-leader-drv", PriorityClass::Scheduled).await?;
+    // One Tick as leader: gauges set non-zero (builds_active=1).
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_builds_active{}"),
+        Some(1.0),
+        "leader's first Tick should set builds_active=1"
+    );
+
+    // Precondition: PG has the build as Active.
+    let row: (String,) = sqlx::query_as("SELECT status::text FROM builds WHERE build_id = $1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(row.0, "active");
+
+    // ── Lose transition ──────────────────────────────────────────────
+    // Mirror the lease loop: on_lose() flips atomics; LeaderLost tells
+    // the actor. Order matters: handle_tick checks is_leader, so flip
+    // BEFORE any Tick can run.
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+
+    // LeaderLost cleared persisted state: drv gone from in-memory DAG.
+    assert!(
+        handle
+            .debug_query_derivation("ex-leader-drv")
+            .await?
+            .is_none(),
+        "LeaderLost should clear_persisted_state (DAG empty)"
+    );
+    // LeaderLost zeroed the gauges (one-shot, not per-Tick).
+    for g in [
+        "rio_scheduler_derivations_queued",
+        "rio_scheduler_workers_active",
+        "rio_scheduler_builds_active",
+        "rio_scheduler_derivations_running",
+    ] {
+        assert_eq!(
+            recorder.gauge_value(&format!("{g}{{}}")),
+            Some(0.0),
+            "LeaderLost should zero {g} so ex-leader's series collapses"
+        );
+    }
+
+    // Drop the watcher (orphan condition) and Tick ×3. cfg(test)
+    // ORPHAN_BUILD_GRACE=ZERO means a leader's Tick 2 would have
+    // cancelled the build. Ex-leader's Tick must early-return.
+    drop(event_rx);
+    for _ in 0..3 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+    }
+    barrier(&handle).await;
+
+    // PG row UNTOUCHED: still 'active', NOT 'cancelled'. This is the
+    // core split-brain assertion — db.update_build_status has no fence
+    // in its WHERE clause, so the only thing stopping the ex-leader's
+    // write is the handle_tick gate + cleared state.
+    let row: (String,) = sqlx::query_as("SELECT status::text FROM builds WHERE build_id = $1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        row.0, "active",
+        "ex-leader Tick must NOT write Cancelled to PG (orphan-watcher \
+         on stale state would; gate + LeaderLost prevent it)"
+    );
+
     Ok(())
 }
 

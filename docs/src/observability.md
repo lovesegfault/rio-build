@@ -363,7 +363,7 @@ The scheduler sets `x-rio-trace-id` in `SubmitBuild` response metadata to its ha
 
 - **Error budget burn rate:** Alert when the error budget consumption rate exceeds 14.4x the allowed rate over 1h (fast burn) or 6x over 6h (slow burn), following the multi-window multi-burn-rate approach.
 - **Saturation alerts:** PostgreSQL connection pool utilization > 80%, S3 rate limiting (429 responses), executor queue depth exceeding 2x executor count.
-- **Absence alerts:** No executor heartbeat received for > ~50-60s (the scheduler's effective deregistration threshold: 30s staleness + 3-tick confirmation). Indicates an executor has silently died or lost network connectivity.
+- **Absence alerts:** No executor heartbeat received for > ~30-40s (`HEARTBEAT_TIMEOUT_SECS=30` + ≤1 tick alignment). Indicates an executor has silently died or lost network connectivity.
 
 ## Structured Logging
 

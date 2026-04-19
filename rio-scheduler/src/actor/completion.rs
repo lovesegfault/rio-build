@@ -826,6 +826,14 @@ impl DagActor {
             .await;
         self.unpin_best_effort(drv_hash).await;
 
+        // r[impl sched.sla.hw-ref-seconds]
+        // For the critical_path_accuracy metric below: est_duration is
+        // REF-seconds, result.duration() is wall. Normalize wall→ref via
+        // the reporting worker's hw_factor so the ratio is dimensionally
+        // consistent (same normalization record_build_sample applies to
+        // its T sample). Computed before the move into record_build_sample.
+        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref());
+
         self.record_build_sample(
             drv_hash,
             result,
@@ -883,10 +891,10 @@ impl DagActor {
             && state.sched.est_duration > 0.0
             && let Some(actual) = result.duration()
         {
-            let actual_secs = actual.as_secs_f64();
-            if actual_secs > 0.0 {
+            let actual_ref = actual.as_secs_f64() * hw_factor;
+            if actual_ref > 0.0 {
                 metrics::histogram!("rio_scheduler_critical_path_accuracy")
-                    .record(actual_secs / state.sched.est_duration);
+                    .record(actual_ref / state.sched.est_duration);
             }
         }
         crate::critical_path::update_ancestors(&mut self.dag, drv_hash);

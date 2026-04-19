@@ -64,6 +64,22 @@ impl DagActor {
             DebugCmd::TripBreaker { n, reply } => {
                 let _ = reply.send(self.handle_debug_trip_breaker(n));
             }
+            DebugCmd::BackdateHeartbeat {
+                executor_id,
+                secs_ago,
+                reply,
+            } => {
+                let ok = self.executors.get_mut(&executor_id).is_some_and(|w| {
+                    w.last_heartbeat = backdate(secs_ago);
+                    true
+                });
+                let _ = reply.send(ok);
+            }
+            DebugCmd::SeedHwTable { factors, reply } => {
+                self.sla_estimator
+                    .seed_hw(crate::sla::hw::HwTable::from_map(factors));
+                let _ = reply.send(());
+            }
             DebugCmd::SeedSchedHint {
                 drv_hash,
                 est_memory_bytes,

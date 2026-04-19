@@ -827,7 +827,6 @@ impl DagActor {
         worker.systems = hb.systems;
         worker.supported_features = hb.supported_features;
         worker.last_heartbeat = Instant::now();
-        worker.missed_heartbeats = 0;
         worker.running_build = reconciled;
         // intent_id: the pod annotation is immutable post-create, but
         // the scheduler may re-plan (drv completed elsewhere, scheduler

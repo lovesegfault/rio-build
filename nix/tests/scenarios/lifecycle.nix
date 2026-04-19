@@ -353,14 +353,14 @@ let
     #   fallback window.
     #
     # Budget derivation (rio-common/src/limits.rs constants):
-    #   HEARTBEAT_TIMEOUT_SECS (30) + MAX_MISSED_HEARTBEATS×tick (30)
-    #   = ~60s last_heartbeat→reap (tick_check_heartbeats), plus:
+    #   HEARTBEAT_TIMEOUT_SECS (30) = ~30s last_heartbeat→reap
+    #   (tick_check_heartbeats), plus:
     #   + tick alignment (≤10s)
     #   + pod termination stagger: when two pods terminate ~20-30s apart,
     #     the second reap lands ~20-30s after the first
     #   + one in-flight heartbeat delayed under load (≤10s)
-    #   ≈ 110s worst-case from pods-gone to stable workers_active==0.
-    #   180s budget = 110s + ~60% GHA tail headroom. Stays under the
+    #   ≈ 80s worst-case from pods-gone to stable workers_active==0.
+    #   180s budget = 80s + ~125% GHA tail headroom. Stays under the
     #   300s pods-gone budget so a real disconnect-detection regression
     #   (e.g. heartbeat-reap broken) still trips before globalTimeout.
     #
