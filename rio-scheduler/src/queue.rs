@@ -20,12 +20,19 @@
 //!
 //! # Priority representation
 //!
-//! `(OrderedFloat<f64>, Reverse<u64>, DrvHash)`:
+//! `(OrderedFloat<f64>, Reverse<u64>, u64, DrvHash)`:
 //! - `OrderedFloat`: f64 doesn't impl Ord (NaN). Wrapper fixes it.
 //! - `Reverse<u64>`: FIFO tiebreak for equal priority. Without this,
 //!   ties are broken by DrvHash (alphabetical), which is arbitrary.
 //!   `Reverse` because lower sequence number = older = first; but
 //!   BinaryHeap is max-heap, so Reverse makes lower sort higher.
+//! - `u64` (generation): membership-session tag. A hash's gen is
+//!   set on first push and frozen until pop/remove. Heap entries
+//!   whose gen doesn't match `members[hash]` are stale leftovers
+//!   from a *prior* pop→re-push session and skipped. Placed AFTER
+//!   `Reverse<seq>` so it never affects ordering between distinct
+//!   hashes (entries from distinct sessions of the same hash never
+//!   coexist as live).
 //! - `DrvHash`: the actual payload.
 //!
 //! # Interactive boost
@@ -38,7 +45,7 @@
 //! 3.6e8 — 1e9 still wins).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use ordered_float::OrderedFloat;
 
@@ -55,8 +62,11 @@ use crate::state::DrvHash;
 pub const INTERACTIVE_BOOST: f64 = 1e9;
 
 /// Entry in the BinaryHeap. Tuple so derived Ord works
-/// (lexicographic: priority first, then reverse sequence, then hash).
-type Entry = (OrderedFloat<f64>, Reverse<u64>, DrvHash);
+/// (lexicographic: priority first, then reverse sequence, then
+/// generation, then hash). The generation slot never participates
+/// in ordering between distinct live hashes — it's a liveness tag,
+/// not a sort key.
+type Entry = (OrderedFloat<f64>, Reverse<u64>, u64, DrvHash);
 
 /// Priority queue of ready derivations.
 ///
@@ -70,10 +80,12 @@ pub struct ReadyQueue {
     /// Monotonic counter for FIFO tiebreak. Wraps at u64::MAX —
     /// after 1.8e19 pushes, the tiebreak order flips once. Don't care.
     seq: u64,
-    /// Hashes currently live in the queue. `pop()` skips heap entries
-    /// whose hash is not here (removed or already-popped duplicate).
-    /// Same HashSet-for-dedup pattern as the old FIFO.
-    members: HashSet<DrvHash>,
+    /// Hashes currently live in the queue, mapped to the generation
+    /// of their CURRENT membership session. A heap entry is live iff
+    /// its embedded gen matches this map's value. `pop()`/`remove()`
+    /// drop the key; the next `push()` allocates a fresh gen, so any
+    /// leftover heap entries from the prior session no longer match.
+    members: HashMap<DrvHash, u64>,
 }
 
 impl ReadyQueue {
@@ -81,46 +93,51 @@ impl ReadyQueue {
         Self {
             heap: BinaryHeap::new(),
             seq: 0,
-            members: HashSet::new(),
+            members: HashMap::new(),
         }
     }
 
     /// Push a derivation with the given priority.
     ///
-    /// If `hash` is already in the queue, this pushes a duplicate
-    /// entry. `pop()` returns the higher-priority entry first and
-    /// then skips the lower one (no longer in `members`). Net effect:
-    /// re-push with **higher** priority takes effect; re-push with
-    /// **lower-or-equal** priority is a no-op (the existing higher
-    /// entry pops first; the duplicate is then skipped). Callers only
-    /// ever raise priority — a new interested build raises a shared
-    /// derivation's priority via the critical-path machinery and the
-    /// re-push in `handle_merge_dag`.
+    /// If `hash` is already in the queue (same membership session),
+    /// this pushes a duplicate entry. `pop()` returns the higher-
+    /// priority entry first and then skips the lower one. Net effect:
+    /// within a session, re-push with **higher** priority takes
+    /// effect; re-push with **lower-or-equal** priority is a no-op.
+    ///
+    /// A push AFTER pop/remove starts a NEW membership session
+    /// (fresh generation). Stale heap entries from the prior session
+    /// — left behind by the lazy-invalidation scheme — are skipped on
+    /// pop because their embedded gen no longer matches. This is what
+    /// makes pop→re-push at a *lower* priority correct: cancelling
+    /// the last interactive interested build drops `INTERACTIVE_BOOST`
+    /// (1e9) from `queue_priority`, and the leftover boosted entry
+    /// must not leak into the new session.
     pub fn push(&mut self, hash: DrvHash, priority: f64) {
-        // Already-present case: just push again. pop() sees two
-        // entries for the same hash; the FIRST popped (higher
-        // priority) wins and removes the hash from `members`; the
-        // SECOND is later skipped because it's no longer in
-        // `members`. The `members` check in pop() handles both dedup
-        // and cancellation — no separate tombstone set needed.
-        self.members.insert(hash.clone());
         self.seq = self.seq.wrapping_add(1);
+        // Re-push WITHIN a session reuses the existing gen so the
+        // higher-priority duplicate pops first; first push AFTER a
+        // pop/remove allocates a fresh gen (= current seq) so prior-
+        // session leftovers no longer match.
+        let g = *self.members.entry(hash.clone()).or_insert(self.seq);
         self.heap
-            .push((OrderedFloat(priority), Reverse(self.seq), hash));
+            .push((OrderedFloat(priority), Reverse(self.seq), g, hash));
     }
 
     /// Pop the highest-priority derivation.
     ///
-    /// Skips entries that were removed (lazy invalidation) or that
-    /// are duplicate pushes of a hash already popped. Both reduce to
-    /// "is this hash still in `members`?".
+    /// Skips entries that were removed (lazy invalidation), duplicate
+    /// pushes of a hash already popped, or leftovers from a prior
+    /// membership session of a re-pushed hash. All three reduce to
+    /// "does this entry's gen match `members[hash]`?".
     pub fn pop(&mut self) -> Option<DrvHash> {
         loop {
-            let (_, _, hash) = self.heap.pop()?;
-            if self.members.remove(&hash) {
+            let (_, _, g, hash) = self.heap.pop()?;
+            if self.members.get(&hash) == Some(&g) {
+                self.members.remove(&hash);
                 return Some(hash);
             }
-            // Not in members: stale entry (removed or duplicate). Skip.
+            // gen mismatch (or absent): stale entry. Skip.
         }
     }
 
@@ -129,7 +146,7 @@ impl ReadyQueue {
     /// Returns `true` if it was in the queue, `false` otherwise
     /// (same signature as the old remove).
     pub fn remove(&mut self, hash: &str) -> bool {
-        self.members.remove(hash)
+        self.members.remove(hash).is_some()
     }
 
     /// Remove all entries. Used by recover_from_pg() to start
@@ -167,17 +184,17 @@ impl ReadyQueue {
             return;
         }
 
-        // Drain the heap, keep only entries in members. For
-        // duplicates (same hash, multiple pushes), keep the entry
-        // that would have popped first under the FULL Entry ordering
-        // — highest priority, then lowest seq (FIFO), then hash.
+        // Drain the heap, keep only entries whose gen matches the
+        // current membership session. For duplicates (same hash,
+        // multiple pushes within a session), keep the entry that
+        // would have popped first under the FULL Entry ordering —
+        // highest priority, then lowest seq (FIFO), then hash.
         // `drain()` is arbitrary order so we max-reduce.
-        let mut best: std::collections::HashMap<DrvHash, Entry> =
-            std::collections::HashMap::with_capacity(self.members.len());
+        let mut best: HashMap<DrvHash, Entry> = HashMap::with_capacity(self.members.len());
         for entry in self.heap.drain() {
-            let hash = &entry.2;
-            if !self.members.contains(hash) {
-                continue; // removed or stale
+            let (_, _, g, hash) = &entry;
+            if self.members.get(hash) != Some(g) {
+                continue; // removed, or prior-session leftover
             }
             best.entry(hash.clone())
                 .and_modify(|existing| {
@@ -266,6 +283,57 @@ mod tests {
         assert_eq!(q.pop(), Some("other".into()));
         // The stale x@10 entry is still in the heap but x is no
         // longer in members → skipped.
+        assert_eq!(q.pop(), None);
+    }
+
+    /// Regression: a pop→re-push at LOWER priority must not pick up
+    /// a stale higher-priority heap entry from the prior session.
+    /// `queue_priority` drops by `INTERACTIVE_BOOST` (1e9) when the
+    /// last interactive interested build is cancelled; without
+    /// generation-tagging the leftover boosted entry leaked across
+    /// the boundary and dispatched out of order.
+    #[test]
+    fn repush_after_pop_ignores_stale_higher_priority() {
+        let mut q = ReadyQueue::new();
+        q.push("x".into(), INTERACTIVE_BOOST);
+        q.push("filler".into(), 100.0);
+        q.push("x".into(), INTERACTIVE_BOOST); // same session, dup in heap
+        assert_eq!(q.pop(), Some("x".into())); // ends x's session
+
+        // New session for x, at low priority. The leftover
+        // x@INTERACTIVE_BOOST entry (from the prior session's dup
+        // push) is still in the heap but its gen no longer matches.
+        q.push("x".into(), 50.0);
+        assert_eq!(
+            q.pop(),
+            Some("filler".into()),
+            "stale prior-session x@1e9 must be skipped"
+        );
+        assert_eq!(q.pop(), Some("x".into()));
+        assert_eq!(q.pop(), None);
+    }
+
+    /// Same scenario through compact(): prior-session leftovers must
+    /// be dropped, not max-reduced into the surviving entry.
+    #[test]
+    fn compact_drops_prior_session_entries() {
+        let mut q = ReadyQueue::new();
+        q.push("x".into(), INTERACTIVE_BOOST);
+        q.push("filler".into(), 100.0);
+        q.push("x".into(), INTERACTIVE_BOOST);
+        assert_eq!(q.pop(), Some("x".into()));
+        q.push("x".into(), 50.0);
+
+        // Garbage to trip the 50% compact threshold.
+        for i in 0..10 {
+            q.push(format!("junk-{i}").into(), 5.0);
+            q.remove(&format!("junk-{i}"));
+        }
+        q.compact();
+
+        assert_eq!(q.heap.len(), 2, "x@1e9 leftover dropped, not max-reduced");
+        assert_eq!(q.pop(), Some("filler".into()));
+        assert_eq!(q.pop(), Some("x".into()));
         assert_eq!(q.pop(), None);
     }
 

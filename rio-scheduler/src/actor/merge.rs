@@ -533,10 +533,10 @@ impl DagActor {
         // re-walked over newly_inserted, but a pre-existing Ready node
         // already in the queue under its OLD priority isn't touched by
         // that walk). Re-push so a higher-priority build's shared dep
-        // doesn't sit behind lower-priority work. ReadyQueue::push on
-        // an already-present hash with a lower priority is a no-op
-        // (higher entry pops first; dup is skipped), so this is safe
-        // for the non-raised case.
+        // doesn't sit behind lower-priority work. Re-push at lower
+        // priority is harmless: ReadyQueue's per-session generation
+        // tagging keeps the higher in-session entry winning, and prior-
+        // session leftovers are skipped on pop.
         for hash in &merge_result.interest_added {
             if self
                 .dag
