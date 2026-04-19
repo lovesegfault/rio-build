@@ -209,7 +209,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `active` decreases. Under mandatory `[sla]` (Phase 5) the
     // scheduler ALWAYS populates intents — empty list means empty
     // queue → spawns nothing.
-    spawn_for_each(
+    let spawned = spawn_for_each(
         &jobs_api,
         &to_spawn_intents,
         &existing_names,
@@ -224,6 +224,12 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // pre-restart Pending Job under deterministic softmax (same
     // selector → no reap → no respawn → no fresh ack) never re-arms.
     // Scheduler-side `or_insert` makes re-ack of a live timer a no-op.
+    //
+    // Chain `spawned`, NOT `to_spawn_intents`: an intent whose create
+    // hit `SpawnOutcome::Failed` (apiserver 5xx, quota 403, webhook
+    // reject) has no Job behind it, so acking it would arm the ICE
+    // timer for a Job that will never heartbeat → false ICE on the
+    // `(band, cap)` cell after `hw_fallback_after_secs`.
     let pending_job_names: HashSet<String> = jobs
         .items
         .iter()
@@ -241,7 +247,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
             ))
         })
         .cloned()
-        .chain(to_spawn_intents)
+        .chain(spawned)
         .collect();
     if to_ack.is_empty() {
         debug!(pool = %name, queued, active, ?ceiling, "no Pending intents to ack");
@@ -330,10 +336,18 @@ fn selector_fingerprint(sel: &std::collections::HashMap<String, String>) -> Stri
 }
 
 /// DNS-1123-safe deterministic suffix from `intent_id`. In production
-/// `intent_id == drv_hash` (nixbase32, already lowercase-alnum); the
-/// filter is belt-and-suspenders for the proto's "opaque" contract.
+/// `intent_id` is the FULL store path `/nix/store/{hash}-{name}.drv`
+/// (translate.rs:`build_node` sets `drv_hash = drv_path`; snapshot.rs
+/// sets `intent_id = drv_hash`). Strip the constant prefix so the
+/// 12-char take lands on the nixbase32 hash (32⁵ ≈ 3.3e7× more
+/// distinct values than the 4 hash chars left after `nixstore` ate 8).
+/// The lowercase-alnum filter is belt-and-suspenders for the proto's
+/// "opaque" contract; nixbase32 is already lowercase-alnum so it's a
+/// no-op on the happy path.
 fn intent_suffix(intent_id: &str) -> String {
     let s: String = intent_id
+        .strip_prefix("/nix/store/")
+        .unwrap_or(intent_id)
         .chars()
         .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         .take(12)
@@ -823,6 +837,32 @@ mod tests {
         assert_eq!(intent_suffix(h), intent_suffix(h), "deterministic");
         assert_eq!(intent_suffix("FOO-bar.baz/9"), "barbaz9");
         assert_eq!(intent_suffix("---"), "0");
+    }
+
+    /// Production `intent_id` is the full store path, not a bare hash
+    /// (translate.rs:`build_node` → `drv_hash = drv_path`). Without
+    /// the prefix-strip the lowercase-alnum filter eats 8 of 12 chars
+    /// on the constant `"nixstore"`, leaving 4 hash chars → ~38%
+    /// collision at 1000 concurrent. These two paths share the first
+    /// 4 hash chars and MUST produce distinct suffixes.
+    #[test]
+    fn intent_suffix_distinct_for_store_paths_sharing_prefix() {
+        let a = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-firefox-149.0.drv";
+        let b = "/nix/store/amnhqqy03c4k8f2sgh5j7nv9wp1x6r8z-glibc-2.40.drv";
+        assert_eq!(intent_suffix(a), "amnhr5p1w6gm");
+        assert_eq!(intent_suffix(b), "amnhqqy03c4k");
+        assert_ne!(
+            intent_suffix(a),
+            intent_suffix(b),
+            "store paths with shared 4-char hash prefix must not collide"
+        );
+        // Bare-hash inputs (controller unit tests) still work — strip
+        // is `unwrap_or(intent_id)`.
+        assert_eq!(
+            intent_suffix("amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2"),
+            intent_suffix(a),
+            "bare hash and full path produce same suffix"
+        );
     }
 
     /// ADR-023: `build_job` stamps the scheduler-computed resources

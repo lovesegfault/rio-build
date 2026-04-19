@@ -525,21 +525,28 @@ pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// one pod per intent with that intent's resources stamped in — the
 /// closure receives the item so `build_job(pool, intent)` can read it.
 ///
-/// Returns the count that reached `Spawned`. `NameCollision` and
-/// `Failed` are logged (debug/warn) and the loop CONTINUES — the
-/// P0516 invariant: a spawn error never short-circuits the reconcile
-/// tick, so the caller's status patch still runs. The structural
-/// guard at `pool/tests/jobs_tests.rs::
-/// ephemeral_spawn_fail_still_patches_status` asserts this body
-/// contains no `return Err`.
+/// Returns the subset of `intents` whose Job now observably exists
+/// (`Spawned` or `NameCollision` — a 409 means the Job is there).
+/// `Failed` and `build_job`-Err entries are logged and OMITTED so the
+/// caller does NOT ack them: acking a failed spawn arms the
+/// scheduler's ICE-backoff timer for a Job that doesn't exist → no
+/// heartbeat ever clears it → false ICE mark on the `(band, cap)`
+/// cell. `skip_existing` hits are also omitted — the caller's
+/// `pending_job_names` re-ack covers those independently.
+///
+/// The loop CONTINUES on every error — the P0516 invariant: a spawn
+/// error never short-circuits the reconcile tick, so the caller's
+/// status patch still runs. The structural guard at `pool/tests/
+/// jobs_tests.rs::ephemeral_spawn_fail_still_patches_status` asserts
+/// this body contains no `return Err`.
 pub(super) async fn spawn_for_each(
     jobs_api: &Api<Job>,
     intents: &[SpawnIntent],
     skip_existing: &std::collections::HashSet<String>,
     pool: &str,
     mut build: impl FnMut(&SpawnIntent) -> Result<Job>,
-) -> u32 {
-    let mut spawned = 0;
+) -> Vec<SpawnIntent> {
+    let mut spawned = Vec::with_capacity(intents.len());
     for intent in intents {
         let job = match build(intent) {
             Ok(j) => j,
@@ -561,10 +568,12 @@ pub(super) async fn spawn_for_each(
         }
         match try_spawn_job(jobs_api, &job).await {
             SpawnOutcome::Spawned => {
-                spawned += 1;
+                spawned.push(intent.clone());
                 info!(pool, job = %job_name, "spawned ephemeral Job");
             }
             SpawnOutcome::NameCollision => {
+                // 409 ⇒ a Job by that name exists; safe to ack.
+                spawned.push(intent.clone());
                 debug!(pool, job = %job_name, "Job name collision; will retry");
             }
             SpawnOutcome::Failed(e) => {

@@ -438,7 +438,7 @@ async fn reap_stale_at_ceiling_saturation() {
         })
     })
     .await;
-    assert_eq!(spawned, 2, "spawn fires post-reap (skip-set empty)");
+    assert_eq!(spawned.len(), 2, "spawn fires post-reap (skip-set empty)");
     guard.verified().await;
 }
 
@@ -481,7 +481,80 @@ async fn spawn_for_each_skips_existing_names() {
         })
     })
     .await;
-    assert_eq!(spawned, 1, "existing skipped; only fresh spawned");
+    assert_eq!(spawned.len(), 1, "existing skipped; only fresh spawned");
+    assert_eq!(
+        spawned[0].intent_id, "fresh",
+        "skip_existing hits omitted from ack-set; pending_job_names re-ack covers them"
+    );
+    guard.verified().await;
+}
+
+/// `spawn_for_each` returns ONLY intents whose Job now exists
+/// (`Spawned`/`NameCollision`); `Failed` entries are omitted so the
+/// caller does not ack them. Acking a failed spawn arms the
+/// scheduler's ICE timer for a Job that will never heartbeat → false
+/// ICE mark on the `(band, cap)` cell.
+#[tokio::test]
+async fn spawn_for_each_omits_failed_from_ack_set() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let intents = vec![
+        SpawnIntent {
+            intent_id: "quota".into(),
+            ..Default::default()
+        },
+        SpawnIntent {
+            intent_id: "ok".into(),
+            ..Default::default()
+        },
+        SpawnIntent {
+            intent_id: "exists".into(),
+            ..Default::default()
+        },
+    ];
+    let skip = HashSet::new();
+
+    // First create → 403 (quota), second → 200, third → 409.
+    let guard = verifier.run(vec![
+        Scenario::k8s_error(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            403,
+            "Forbidden",
+            "jobs.batch is forbidden: exceeded quota",
+        ),
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+        Scenario::k8s_error(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            409,
+            "AlreadyExists",
+            "jobs.batch \"rio-builder-p-exists\" already exists",
+        ),
+    ]);
+
+    let spawned = spawn_for_each(&jobs_api, &intents, &skip, "p", |i| {
+        Ok(Job {
+            metadata: ObjectMeta {
+                name: Some(format!("rio-builder-p-{}", i.intent_id)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    })
+    .await;
+
+    let ids: Vec<_> = spawned.iter().map(|i| i.intent_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["ok", "exists"],
+        "Failed (403) omitted; Spawned + NameCollision (409 ⇒ Job exists) included"
+    );
     guard.verified().await;
 }
 
