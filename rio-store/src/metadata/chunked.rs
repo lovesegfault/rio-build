@@ -61,21 +61,27 @@ pub async fn upgrade_manifest_to_chunked(
 ) -> Result<HashSet<Vec<u8>>> {
     let mut tx = pool.begin().await?;
 
-    // Sanity: the manifests row MUST exist with status='uploading'.
-    // If it doesn't, the caller's step-3 placeholder was deleted
-    // (concurrent cleanup? bug?) — fail loudly.
-    let exists: bool = sqlx::query_scalar(
+    // Ownership lock: the manifests row MUST exist with status=
+    // 'uploading' AND we must hold a FOR UPDATE lock on it for the
+    // rest of this txn. A plain `SELECT EXISTS(...)` (no FOR UPDATE)
+    // is wrong: under READ COMMITTED, the orphan reaper can delete +
+    // commit between the EXISTS and the INSERT below, leaving an
+    // orphaned `manifest_data` row + leaked refcounts with no
+    // `manifests` parent. FOR UPDATE blocks `reap_one` (and
+    // `complete_manifest_chunked`) until this tx commits, so the
+    // verdict holds for the whole tx. Same pattern as
+    // `gc::orphan::reap_one`.
+    let still_ours: Option<(i32,)> = sqlx::query_as(
         r#"
-        SELECT EXISTS(
-            SELECT 1 FROM manifests
-            WHERE store_path_hash = $1 AND status = 'uploading'
-        )
+        SELECT 1 FROM manifests
+        WHERE store_path_hash = $1 AND status = 'uploading'
+        FOR UPDATE
         "#,
     )
     .bind(store_path_hash)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if !exists {
+    if still_ours.is_none() {
         return Err(MetadataError::PlaceholderMissing {
             store_path: hex::encode(store_path_hash),
         });
@@ -96,8 +102,23 @@ pub async fn upgrade_manifest_to_chunked(
     .execute(&mut *tx)
     .await?;
 
-    // Refcount UPSERT. UNNEST over parallel arrays (PG errors if lengths
-    // differ — caller guarantees equal, this is a sanity check).
+    // Hard length check: the co-sort `zip` below truncates to
+    // `min(len)`, so a mismatch would silently drop trailing chunks
+    // (manifest_data references hashes with no `chunks` row → GC-
+    // eligible). The sole prod caller (cas.rs) builds both via
+    // `.unzip()` so this can't fire today; the check makes the
+    // contract executable instead of a comment promise.
+    if chunk_hashes.len() != chunk_sizes.len() {
+        return Err(MetadataError::InvariantViolation(format!(
+            "chunk_hashes/chunk_sizes length mismatch: {} vs {}",
+            chunk_hashes.len(),
+            chunk_sizes.len()
+        )));
+    }
+
+    // Refcount UPSERT. UNNEST over parallel arrays; lengths are asserted
+    // equal above (the co-sort `zip` below would silently truncate to
+    // the shorter input otherwise — there is NO PG-side length check).
     //
     // The array-of-1s for initial refcount: can't use a literal `1` in
     // the UNNEST position (not an array). Materializing N×1 is mildly
@@ -223,9 +244,13 @@ pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) 
 /// would corrupt refcounts. The caller (cas.rs) holds the Manifest
 /// across the upload, so this invariant is easy to maintain.
 ///
-/// Same safety guards as the inline variant: only deletes rows where
-/// `nar_size = 0` / `status = 'uploading'` so a concurrent successful
-/// upload isn't touched.
+/// Safety: opens with `SELECT … FOR UPDATE` on the `'uploading'`
+/// placeholder and returns `Ok(())` if it's gone — so if the orphan
+/// reaper reclaimed our placeholder and a re-uploader has since
+/// completed, the refcount decrement and `manifest_data` DELETE below
+/// can't clobber the re-uploader's state. The `manifests`/`narinfo`
+/// deletes additionally carry `status='uploading'` / `nar_size=0`
+/// guards (defense-in-depth, same as the inline variant).
 #[instrument(skip(pool, chunk_hashes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
 pub async fn delete_manifest_chunked_uploading(
     pool: &PgPool,
@@ -250,6 +275,32 @@ async fn delete_manifest_chunked_uploading_inner(
     hashes: &[Vec<u8>],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+
+    // Ownership lock: verify the `'uploading'` placeholder is still
+    // ours and row-lock it for the rest of this txn. If A's PUT hangs
+    // >15min → orphan reaper reclaims A's placeholder → B re-uploads
+    // the same path and completes → A's hung PUT errors → without this
+    // check, the unguarded refcount decrement + manifest_data DELETE
+    // below would zero B's refcounts and delete B's chunk_list,
+    // leaving B's `status='complete'` manifest unreadable + chunks
+    // GC-eligible. Mirrors `gc::orphan::reap_one`. The FOR UPDATE
+    // serializes against `reap_one` and `complete_manifest_chunked`
+    // for the rest of the tx.
+    let still_ours: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1 FROM manifests
+        WHERE store_path_hash = $1 AND status = 'uploading'
+        FOR UPDATE
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if still_ours.is_none() {
+        // Reaper already cleaned up, or a re-uploader completed.
+        // Nothing to do — the dependent rows are not ours to touch.
+        return Ok(());
+    }
 
     // Decrement refcounts FIRST. If we deleted manifest_data first and
     // then crashed before decrementing, the refcounts would be leaked
@@ -939,5 +990,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 2, "1 leaked + 1 real = 2");
+    }
+
+    /// Mismatched parallel-array lengths → InvariantViolation BEFORE
+    /// the zip truncates. Previously the zip silently dropped trailing
+    /// chunks and PG never saw a mismatch (the "PG errors if lengths
+    /// differ" comment was false).
+    #[tokio::test]
+    async fn upgrade_mismatched_lengths_rejected() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sph = vec![0x77u8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+
+        let hashes = vec![vec![0xA0; 32], vec![0xA1; 32], vec![0xA2; 32]];
+        let sizes = vec![1024i64, 2048]; // len 2 ≠ 3
+
+        let err = upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &hashes, &sizes)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, MetadataError::InvariantViolation(s) if s.contains("length mismatch")),
+            "expected InvariantViolation(length mismatch), got {err:?}"
+        );
+
+        // Tx rolled back: no manifest_data row written.
+        let md: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT chunk_list FROM manifest_data WHERE store_path_hash = $1")
+                .bind(&sph)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert!(md.is_none(), "manifest_data must NOT be inserted on reject");
+    }
+
+    // r[verify store.put.wal-manifest]
+    /// A's late rollback after reaper reclaimed A's placeholder AND B
+    /// re-uploaded + completed the same path MUST be a no-op.
+    /// Previously: the unguarded refcount decrement + manifest_data
+    /// DELETE clobbered B's committed state (rc 1→0, chunk_list gone,
+    /// `get_manifest` → InvariantViolation).
+    #[tokio::test]
+    async fn rollback_after_reap_and_reupload_is_noop() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let path = rio_test_support::fixtures::test_store_path("reap-reupload");
+        let sph = rio_nix::store_path::StorePath::parse(&path)
+            .unwrap()
+            .sha256_digest()
+            .to_vec();
+        let chunk = vec![0x9Au8; 32];
+        let one_chunk = std::slice::from_ref(&chunk);
+        let chunk_list = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: chunk.as_slice().try_into().unwrap(),
+                size: 1024,
+            }],
+        }
+        .serialize();
+
+        // --- A: placeholder + upgrade (rc=1). Then A's PUT hangs. ---
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+
+        // --- Reaper: reclaims A's stale placeholder (rc 1→0). ---
+        let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
+        let reaped = crate::gc::orphan::reap_one(&db.pool, &sph, None, no_backend)
+            .await
+            .unwrap();
+        assert!(reaped, "reaper reclaims A's placeholder");
+
+        // --- B: re-uploads same path, same chunk hash, completes. ---
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
+        let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
+        info.store_path_hash = sph.clone();
+        complete_manifest_chunked(&db.pool, &info).await.unwrap();
+
+        // --- A: hung PUT errors → late rollback fires. ---
+        delete_manifest_chunked_uploading(&db.pool, &sph, one_chunk)
+            .await
+            .unwrap();
+
+        // B's state MUST be intact: rc==1, manifest_data present,
+        // get_manifest returns Chunked.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "B's refcount untouched by A's late rollback");
+
+        let md: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT chunk_list FROM manifest_data WHERE store_path_hash = $1")
+                .bind(&sph)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert!(md.is_some(), "B's manifest_data row survives");
+
+        let kind = crate::metadata::queries::get_manifest(&db.pool, &path)
+            .await
+            .unwrap();
+        assert!(
+            matches!(kind, Some(crate::metadata::ManifestKind::Chunked(_))),
+            "get_manifest still resolves B's chunked manifest, got {kind:?}"
+        );
+    }
+
+    /// `upgrade_manifest_to_chunked` holds a FOR UPDATE lock on the
+    /// placeholder, blocking until a competing FOR UPDATE tx commits.
+    /// Previously: `SELECT EXISTS(...)` (no FOR UPDATE) returned
+    /// immediately, so the reaper could delete + commit between the
+    /// EXISTS and the manifest_data INSERT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrade_holds_for_update_against_reaper() {
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sph = vec![0x88u8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+
+        // Competing tx: lock the placeholder FOR UPDATE, hold ~100ms,
+        // then commit. Stands in for `reap_one`'s FOR UPDATE.
+        let pool_c = db.pool.clone();
+        let sph_c = sph.clone();
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let competitor = tokio::spawn(async move {
+            let mut tx = pool_c.begin().await.unwrap();
+            sqlx::query(
+                "SELECT 1 FROM manifests \
+                 WHERE store_path_hash = $1 AND status = 'uploading' FOR UPDATE",
+            )
+            .bind(&sph_c)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            // Signal: lock held. Upgrade may now start (and must block).
+            let _ = locked_tx.send(());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.commit().await.unwrap();
+        });
+
+        // Wait until the competitor holds the lock, THEN start upgrade.
+        locked_rx.await.unwrap();
+        let started = std::time::Instant::now();
+        upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &[vec![0x99; 32]], &[1024])
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        competitor.await.unwrap();
+
+        // Ordering witness: upgrade must have BLOCKED on the
+        // competitor's FOR UPDATE for ≥ the competitor's hold time.
+        // 50ms slack budget for scheduler jitter (structural assertion
+        // — `SELECT EXISTS` without FOR UPDATE returns in <5ms).
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "upgrade should block on competing FOR UPDATE; elapsed={elapsed:?}"
+        );
     }
 }
