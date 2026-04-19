@@ -641,7 +641,7 @@ in
   # Own split (not folded into autoscale): fresh fixture → clean
   # state → fast finalizers. ~4min boot + ~3min subtests.
   # r[verify ctrl.scaler.component]
-  # r[verify ctrl.scaler.ratio-learn]
+  # r[verify ctrl.scaler.ratio-learn+2]
   # r[verify store.admin.get-load]
   # r[verify obs.metric.store-pg-pool]
   #   ComponentScaler e2e: CR status populated → 30-leaf slowFanout

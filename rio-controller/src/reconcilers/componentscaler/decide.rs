@@ -17,7 +17,8 @@
 //!
 //! if max_load > high:  desired = current + 1; ratio *= 0.95; low_ticks = 0
 //! elif max_load < low: low_ticks += 1; desired = predicted
-//!                       if low_ticks >= 30: ratio *= 1.02; low_ticks = 0
+//!                       if low_ticks >= 30 && builders > 0 && current > min:
+//!                           ratio *= 1.02; low_ticks = 0
 //! else:                desired = predicted; low_ticks = 0
 //!
 //! desired = clamp(desired, min, max)
@@ -56,6 +57,15 @@ pub const RATIO_GROWTH_ON_LOW: f64 = 1.02;
 /// ratio being floored means it recovers faster once the misread
 /// clears.
 pub const RATIO_FLOOR: f64 = 1.0;
+
+/// Ceiling for the learned ratio. Symmetric with [`RATIO_FLOOR`]:
+/// prevents `ratio → ∞` runaway under sustained idle (`builders=0`
+/// misread as "over-provisioned" — see the `builders > 0` gate in
+/// [`decide`]). Well above the empirical ~70 (I-110) so it never
+/// pinches a real ratio; well below the ~88,000× a 48h idle would
+/// produce un-capped, so a pre-fix inflated CR self-heals on first
+/// reconcile (applied at the `ratio_in` read site too).
+pub const RATIO_CEILING: f64 = 1000.0;
 
 /// Scale-down stabilization. `desired < current` is held at
 /// `current` until this much time has passed since the last
@@ -125,7 +135,7 @@ pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
 /// scale-down). The alternative (treat as "just now") would mean a
 /// fresh CR can never scale down for the first 5 minutes even from
 /// an over-provisioned `replicas` chart value.
-// r[impl ctrl.scaler.ratio-learn]
+// r[impl ctrl.scaler.ratio-learn+2]
 pub fn decide(
     spec: &ComponentScalerSpec,
     status: &ComponentScalerStatus,
@@ -137,7 +147,7 @@ pub fn decide(
     let ratio_in = status
         .learned_ratio
         .unwrap_or(spec.seed_ratio)
-        .max(RATIO_FLOOR);
+        .clamp(RATIO_FLOOR, RATIO_CEILING);
     let LoadThresholds { high, low } = spec.load_thresholds;
 
     // Predictive: ceil(builders / ratio). f64 ceil is fine here —
@@ -160,14 +170,35 @@ pub fn decide(
             )
         }
         Some(l) if l < low => {
-            // Over-provisioned (maybe). Count toward ratio growth;
+            // Over-provisioned — maybe. Count toward ratio growth;
             // use the prediction (which may itself be < current —
             // scale-down guard below handles that).
+            //
+            // Gate growth on `builders > 0 && current > min`: low
+            // load with zero builders means "nothing to do", NOT
+            // "each replica handles more than we thought". Growing
+            // on that conflation inflates the ratio unboundedly over
+            // an idle weekend (1.02^576 ≈ 88,000×) and the predictor
+            // is useless for hours when load returns.
             let ticks = status.low_load_ticks.saturating_add(1);
-            if ticks >= LOW_LOAD_TICKS_FOR_RATIO_GROWTH {
-                (predicted, ratio_in * RATIO_GROWTH_ON_LOW, 0)
+            if ticks >= LOW_LOAD_TICKS_FOR_RATIO_GROWTH
+                && builders > 0
+                && current > spec.replicas.min
+            {
+                (
+                    predicted,
+                    (ratio_in * RATIO_GROWTH_ON_LOW).min(RATIO_CEILING),
+                    0,
+                )
             } else {
-                (predicted, ratio_in, ticks)
+                // Cap the counter so a long idle doesn't accumulate
+                // toward u32::MAX (cosmetic — it's mirrored to
+                // status for `kubectl get`).
+                (
+                    predicted,
+                    ratio_in,
+                    ticks.min(LOW_LOAD_TICKS_FOR_RATIO_GROWTH),
+                )
             }
         }
         // In-band load OR no load reading: trust the prediction,
@@ -194,7 +225,17 @@ pub fn decide(
         if !stabilized {
             desired = current.clamp(min, max);
         } else {
-            desired = desired.max(current - MAX_SCALE_DOWN_STEP);
+            // `.min(max)`: `current` is the OBSERVED Deployment
+            // replicas, not bounded by [min,max] (operator lowered
+            // `replicas.max`, or out-of-band edit). `current-1` may
+            // exceed `max`; re-clamp so `Decision.desired`'s
+            // "already clamped" contract holds. `saturating_sub`:
+            // `current=0` underflow guard (currently unreachable —
+            // branch entered only when `desired ≥ min ≥ 0` and
+            // `desired < current`).
+            desired = desired
+                .max(current.saturating_sub(MAX_SCALE_DOWN_STEP))
+                .min(max);
         }
     }
 
@@ -291,7 +332,7 @@ mod tests {
 
     /// High load: +1 over current AND ratio decays. Asymmetric —
     /// under-provisioning is dangerous (I-105 cascade).
-    // r[verify ctrl.scaler.ratio-learn]
+    // r[verify ctrl.scaler.ratio-learn+2]
     #[test]
     fn high_load_bumps_current_and_decays_ratio() {
         let s = spec(2, 14);
@@ -311,7 +352,7 @@ mod tests {
     /// Low load: ratio grows ONLY after LOW_LOAD_TICKS_FOR_RATIO_
     /// GROWTH consecutive low ticks. Slow — over-provisioning is
     /// cheap.
-    // r[verify ctrl.scaler.ratio-learn]
+    // r[verify ctrl.scaler.ratio-learn+2]
     #[test]
     fn low_load_grows_ratio_after_streak() {
         let s = spec(2, 14);
@@ -347,6 +388,75 @@ mod tests {
         let d = decide(&s, &status(Some(50.0), 10), 4, 200, Some(0.5), None);
         assert_eq!(d.low_load_ticks, 0);
         assert_eq!(d.learned_ratio, 50.0);
+    }
+
+    /// Idle (`builders=0`) is NOT evidence of over-provisioning —
+    /// ratio must not grow. bug_288 regression: pre-fix, a 48h idle
+    /// inflated ratio ~88,000× and the predictor was useless for
+    /// hours after load returned.
+    // r[verify ctrl.scaler.ratio-learn+2]
+    #[test]
+    fn low_load_idle_does_not_grow_ratio() {
+        let s = spec(2, 14);
+        // builders=0, current=min, low load, streak at threshold-1.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            2,
+            0,
+            Some(0.1),
+            None,
+        );
+        assert_eq!(d.learned_ratio, 50.0, "no work → no ratio growth");
+        assert_eq!(
+            d.low_load_ticks, LOW_LOAD_TICKS_FOR_RATIO_GROWTH,
+            "counter caps at threshold (doesn't accumulate over long idle)"
+        );
+
+        // builders>0 but current==min: also gated — at min there's no
+        // over-provisioning to learn from.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            2,
+            200,
+            Some(0.1),
+            None,
+        );
+        assert_eq!(d.learned_ratio, 50.0, "current==min → no ratio growth");
+    }
+
+    /// `RATIO_CEILING` bounds both the read site (a pre-fix inflated
+    /// CR self-heals) and the growth site (defense-in-depth).
+    // r[verify ctrl.scaler.ratio-learn+2]
+    #[test]
+    fn ratio_in_clamped_to_ceiling() {
+        let s = spec(2, 14);
+        // Status carries an inflated ratio (e.g. from a pre-fix
+        // controller). predicted = ceil(200/CEILING) = 1 → clamped
+        // to min, NOT ceil(200/1e9)=1 — same here, but the ratio_out
+        // is what matters: it must be ≤ CEILING so decay starts from
+        // a sane value.
+        let d = decide(&s, &status(Some(1e9), 0), 2, 200, Some(0.5), None);
+        assert!(d.learned_ratio <= RATIO_CEILING);
+        assert_eq!(
+            d.learned_ratio, RATIO_CEILING,
+            "in-band → ratio_in passed through, clamped"
+        );
+
+        // Growth site also capped.
+        let d = decide(
+            &s,
+            &status(Some(RATIO_CEILING), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            4,
+            200,
+            Some(0.1),
+            None,
+        );
+        assert_eq!(
+            d.learned_ratio, RATIO_CEILING,
+            "growth never exceeds ceiling"
+        );
     }
 
     /// Scale-down: 5m stabilization since last UP, then max −1/tick.
@@ -389,7 +499,7 @@ mod tests {
     /// Mechanically: `decide` reads `status.learnedRatio` (which the
     /// reconciler reads back from the apiserver), NOT `spec.
     /// seedRatio`, when status is populated.
-    // r[verify ctrl.scaler.ratio-learn]
+    // r[verify ctrl.scaler.ratio-learn+2]
     #[test]
     fn learned_ratio_persists_over_seed() {
         let s = spec(2, 14);
@@ -418,6 +528,20 @@ mod tests {
             Some(Duration::from_secs(30)),
         );
         assert_eq!(d.desired, 14);
+
+        // current=20 (>max), PAST stabilization → step down by 1, but
+        // STILL clamped to max. bug_049 regression: pre-fix this
+        // returned 19 (current-1), violating the "already clamped"
+        // contract on Decision.desired.
+        let d = decide(
+            &s,
+            &status(Some(50.0), 0),
+            20,
+            200,
+            Some(0.5),
+            Some(Duration::from_secs(360)),
+        );
+        assert_eq!(d.desired, 14, "stabilized branch also respects max");
 
         // High load at max → current+1=15 → clamped to 14.
         let d = decide(&s, &status(Some(50.0), 0), 14, 200, Some(0.9), None);
