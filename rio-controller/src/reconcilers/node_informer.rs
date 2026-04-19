@@ -362,6 +362,17 @@ pub async fn run(
 /// [`NodeLabelCache::drain_live_spot_exposure`].
 const EXPOSURE_FLUSH_SECS: u64 = 60;
 
+/// Per-RPC bound on `AppendInterruptSample`. The balanced channel sets
+/// only `connect_timeout`; h2 keepalive (~40s) detects a dead
+/// transport but not a stalled handler. Without this a hung scheduler
+/// actor wedges the Node-informer/spot-interrupt watch loops — every
+/// subsequent `flush.tick()` and watch event is blocked behind the
+/// await, so λ's denominator stops accruing AND `prune_absent` never
+/// runs (phantom node-seconds leak). Best-effort RPCs: timed-out
+/// samples are dropped (λ reads slightly high until the next flush
+/// lands), same as the existing `Err` path.
+const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -505,37 +516,46 @@ pub async fn run_spot_interrupt_watcher(
         // restart, apiserver restart, watch reconnect). Without dedup
         // each relist double-counts into λ's numerator → `solve_full`
         // biases away from spot.
-        let r = admin
-            .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+        let r = tokio::time::timeout(
+            ADMIN_RPC_TIMEOUT,
+            admin.append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
                 hw_class: hw_class.clone(),
                 kind: "interrupt".into(),
                 value: 1.0,
                 event_uid: ev.metadata.uid.clone(),
-            })
-            .await;
+            }),
+        )
+        .await;
         match r {
-            Ok(_) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
-            Err(e) => warn!(%node, error = %e, "spot-interrupt: append failed"),
+            Ok(Ok(_)) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
+            Ok(Err(e)) => warn!(%node, error = %e, "spot-interrupt: append failed"),
+            Err(_) => warn!(%node, "spot-interrupt: append timed out"),
         }
     }
 }
 
 /// Append `kind='exposure'` node-seconds for one `hw_class`.
-/// Best-effort: a failed RPC drops one denominator sample (λ reads
-/// slightly high until the next flush lands).
+/// Best-effort: a failed/timed-out RPC drops one denominator sample
+/// (λ reads slightly high until the next flush lands). Bounded by
+/// [`ADMIN_RPC_TIMEOUT`] so a hung scheduler can't wedge the Node-
+/// informer's watch loop (every caller is inside that loop).
 async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: String, secs: f64) {
-    if let Err(e) = admin
-        .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+    let r = tokio::time::timeout(
+        ADMIN_RPC_TIMEOUT,
+        admin.append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
             hw_class,
             kind: "exposure".into(),
             value: secs,
             // Timer-driven, no K8s Event → NULL uid (unconstrained by
             // the M_047 partial unique index).
             event_uid: None,
-        })
-        .await
-    {
-        warn!(error = %e, "spot-exposure: append failed");
+        }),
+    )
+    .await;
+    match r {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!(error = %e, "spot-exposure: append failed"),
+        Err(_) => warn!("spot-exposure: append timed out"),
     }
 }
 
