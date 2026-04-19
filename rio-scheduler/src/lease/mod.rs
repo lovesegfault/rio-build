@@ -378,6 +378,7 @@ pub async fn run_lease_loop(
     );
 
     let mut was_leading = false;
+    let mut owe_cost_clear = false;
     let mut last_successful_renew = Instant::now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
@@ -409,6 +410,26 @@ pub async fn run_lease_loop(
                 // map to now_leading=false; was_leading edge-
                 // detection below distinguishes the lose case.
                 let now_leading = matches!(result, ElectionResult::Leading);
+
+                // r[impl sched.lease.deletion-cost]
+                // Deferred deletion-cost clear: if we self-fenced
+                // while the apiserver was unreachable, the cost=0
+                // patch was owed but skipped (no connectivity).
+                // This is the first reachable observation since —
+                // pay the debt now. Level-triggered (not edge):
+                // `was_leading` was already flipped false by the
+                // self-fence so the lose-transition arm below will
+                // never see the edge. If we re-acquired before
+                // anyone else (`now_leading`), the acquire arm
+                // sets cost=1 anyway, so just drop the debt.
+                if std::mem::take(&mut owe_cost_clear) && !now_leading {
+                    spawn_patch_deletion_cost(
+                        pod_patch_client.clone(),
+                        cfg.namespace.clone(),
+                        cfg.holder_id.clone(),
+                        0,
+                    );
+                }
 
                 if now_leading && !was_leading {
                     // ---- Acquire transition ----
@@ -504,6 +525,7 @@ pub async fn run_lease_loop(
                         cfg.holder_id.clone(),
                         0,
                     );
+                    owe_cost_clear = false;
                 }
                 // else: steady state (still leading, renewed; or
                 // still standby, someone else holds). No log —
@@ -540,7 +562,12 @@ pub async fn run_lease_loop(
                 // noise generator. Worker-side generation fence
                 // (r[sched.lease.generation-fence]) saves correctness
                 // either way; this fence saves ops sanity.
-                maybe_self_fence(&state, &mut was_leading, last_successful_renew);
+                maybe_self_fence(
+                    &state,
+                    &mut was_leading,
+                    &mut owe_cost_clear,
+                    last_successful_renew,
+                );
             }
         }
     }
@@ -587,6 +614,7 @@ pub async fn run_lease_loop(
 fn maybe_self_fence(
     state: &LeaderState,
     was_leading: &mut bool,
+    owe_cost_clear: &mut bool,
     last_successful_renew: Instant,
 ) -> bool {
     if *was_leading && last_successful_renew.elapsed() > LEASE_TTL {
@@ -597,8 +625,13 @@ fn maybe_self_fence(
         state.on_lose();
         metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
         *was_leading = false;
-        // No spawn_patch_deletion_cost: can't reach apiserver.
-        // The peer (if leading) patched its OWN pod.
+        // No spawn_patch_deletion_cost here: can't reach apiserver.
+        // Record the debt so the FIRST reachable round-trip in
+        // run_lease_loop's Ok arm patches cost=0. The peer's cost=1
+        // doesn't clear OURS — without this deferred clear we'd stay
+        // tied at cost=1 with the new leader and the next
+        // RollingUpdate picks arbitrarily.
+        *owe_cost_clear = true;
         true
     } else {
         false
@@ -829,10 +862,11 @@ mod tests {
         state.recovery_complete.store(true, Ordering::Relaxed);
 
         let mut was_leading = true;
+        let mut owe_cost_clear = false;
         // 20s ago > LEASE_TTL (15s). Pattern matches election.rs:535.
         let last_renew = Instant::now() - Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
 
         assert!(fired, "self-fence should fire past TTL");
         assert!(
@@ -860,10 +894,11 @@ mod tests {
         state.recovery_complete.store(true, Ordering::Relaxed);
 
         let mut was_leading = true;
+        let mut owe_cost_clear = false;
         // 10s ago < LEASE_TTL (15s). Two failed ticks, lease still valid.
         let last_renew = Instant::now() - Duration::from_secs(10);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
 
         assert!(!fired, "within TTL → no self-fence");
         assert!(
@@ -884,12 +919,55 @@ mod tests {
         // is_leader already false, recovery_complete already false.
 
         let mut was_leading = false;
+        let mut owe_cost_clear = false;
         let last_renew = Instant::now() - Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
 
         assert!(!fired, "not leading → no fence even past TTL");
         assert!(!state.is_leader.load(Ordering::Relaxed));
         assert!(!was_leading);
+    }
+
+    /// Self-fence sets `owe_cost_clear` so the lease loop's first
+    /// reachable round-trip clears our pod-deletion-cost annotation.
+    /// Without the deferred clear, an ex-leader keeps cost=1 tied with
+    /// the new leader (peer's cost=1 patch doesn't touch OUR pod) and
+    /// the next RollingUpdate evicts arbitrarily — defeating
+    /// `r[sched.lease.deletion-cost]`. Regression: maybe_self_fence
+    /// previously consumed the `was_leading` edge without arranging
+    /// the deferred patch.
+    // r[verify sched.lease.deletion-cost]
+    #[test]
+    fn self_fence_sets_owe_cost_clear() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
+        state.is_leader.store(true, Ordering::Relaxed);
+        state.recovery_complete.store(true, Ordering::Relaxed);
+
+        let mut was_leading = true;
+        let mut owe_cost_clear = false;
+        let last_renew = Instant::now() - Duration::from_secs(20);
+
+        let fired = maybe_self_fence(&state, &mut was_leading, &mut owe_cost_clear, last_renew);
+        assert!(fired);
+        assert!(
+            owe_cost_clear,
+            "self-fence must record the owed cost=0 patch (apiserver unreachable now, \
+             so the lease loop pays it on first reachable round-trip)"
+        );
+
+        // No-fire path leaves the flag untouched (a standby that never
+        // led has no cost to clear).
+        let standby = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let mut was_leading = false;
+        let mut owe_cost_clear = false;
+        let fired = maybe_self_fence(
+            &standby,
+            &mut was_leading,
+            &mut owe_cost_clear,
+            Instant::now() - Duration::from_secs(20),
+        );
+        assert!(!fired);
+        assert!(!owe_cost_clear, "no-fire → no debt recorded");
     }
 }
