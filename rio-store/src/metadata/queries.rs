@@ -22,16 +22,20 @@ use crate::narinfo_cols;
 /// callers (I-078 made the index strategy load-bearing).
 macro_rules! narinfo_complete_select {
     ($pred:literal) => {
-        narinfo_complete_select!($pred, "")
+        narinfo_complete_select!($pred, "", "")
     };
     ($pred:literal, $extra_cols:literal) => {
+        narinfo_complete_select!($pred, $extra_cols, "")
+    };
+    ($pred:literal, $extra_cols:literal, $extra_join:literal) => {
         concat!(
             "SELECT ",
             narinfo_cols!(),
             $extra_cols,
             " FROM narinfo n \
-             INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-             WHERE ",
+             INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash ",
+            $extra_join,
+            " WHERE ",
             $pred,
             " AND m.status = 'complete'"
         )
@@ -68,13 +72,25 @@ fn path_hash(store_path: &str) -> Result<[u8; 32]> {
 #[instrument(skip(pool))]
 pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
     let hash = path_hash(store_path)?;
-    // Single query: filter on the manifests PK directly (no narinfo
-    // join needed — both tables key on store_path_hash). I-078: the
-    // previous narinfo-join + `n.store_path = $1` filter was a Seq Scan.
-    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+    // Single LEFT JOIN: both halves of the inline/chunked branch in
+    // ONE statement = ONE MVCC snapshot. Filter on the manifests PK
+    // directly (no narinfo join needed — both tables key on
+    // store_path_hash). I-078: the previous narinfo-join +
+    // `n.store_path = $1` filter was a Seq Scan.
+    //
+    // Two separate `.fetch_optional(pool)` calls (the previous shape)
+    // race with GC sweep: under READ COMMITTED each statement takes a
+    // fresh snapshot, so sweep's `DELETE FROM narinfo` CASCADE can
+    // commit between them — query 1 sees the chunked `manifests` row,
+    // query 2 sees no `manifest_data` → spurious InvariantViolation
+    // for what is semantically NotFound. A READ COMMITTED `BEGIN` does
+    // NOT fix that (each statement re-snapshots); LEFT JOIN does.
+    type ManifestRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+    let row: Option<ManifestRow> = sqlx::query_as(
         r#"
-        SELECT m.inline_blob
+        SELECT m.inline_blob, md.chunk_list
         FROM manifests m
+        LEFT JOIN manifest_data md USING (store_path_hash)
         WHERE m.store_path_hash = $1 AND m.status = 'complete'
         "#,
     )
@@ -84,51 +100,39 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
 
     match row {
         None => Ok(None),
-        Some((Some(blob),)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
-        // inline_blob NULL → chunked. Fetch + deserialize manifest_data.
-        Some((None,)) => {
-            let data: Option<(Vec<u8>,)> = sqlx::query_as(
-                r#"
-                SELECT md.chunk_list
-                FROM manifest_data md
-                WHERE md.store_path_hash = $1
-                "#,
-            )
-            .bind(hash.as_slice())
-            .fetch_optional(pool)
-            .await?;
-
-            // manifest exists + inline_blob NULL but NO manifest_data row:
-            // invariant violation (store.md:222 says inline_blob NULL ⇔
-            // manifest_data exists). Possible causes: manual DB surgery,
-            // a bug in delete_manifest_chunked_uploading ordering, or a
-            // CASCADE we didn't expect. Surface it — don't silently return
-            // None (that would look like "path not found", masking corruption).
-            let (chunk_list,) = data.ok_or_else(|| {
-                MetadataError::InvariantViolation(format!(
-                    "manifest for {store_path} has NULL inline_blob but no manifest_data row"
-                ))
-            })?;
-
-            let manifest =
-                crate::manifest::Manifest::deserialize(&chunk_list).map_err(|source| {
-                    MetadataError::CorruptManifest {
-                        store_path: store_path.to_string(),
-                        source,
-                    }
-                })?;
-
-            // Convert Manifest → Vec<([u8;32], u32)> for the enum variant.
-            // ManifestKind uses tuples; Manifest uses a struct — one cheap conversion.
-            let entries: Vec<([u8; 32], u32)> = manifest
-                .entries
-                .into_iter()
-                .map(|e| (e.hash, e.size))
-                .collect();
-
-            Ok(Some(ManifestKind::Chunked(entries)))
-        }
+        Some((Some(blob), _)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
+        Some((None, Some(chunk_list))) => Ok(Some(ManifestKind::Chunked(decode_chunk_list(
+            store_path,
+            &chunk_list,
+        )?))),
+        // manifest exists + inline_blob NULL but NO manifest_data row:
+        // invariant violation (store.md:222 says inline_blob NULL ⇔
+        // manifest_data exists). Single-snapshot read; this arm is now
+        // ONLY reachable via genuine corruption (manual DB surgery or
+        // a CASCADE bug) — concurrent GC cannot produce it. Surface
+        // it — don't silently return None (that would look like "path
+        // not found", masking corruption).
+        Some((None, None)) => Err(MetadataError::InvariantViolation(format!(
+            "manifest for {store_path} has NULL inline_blob but no manifest_data row"
+        ))),
     }
+}
+
+/// Deserialize a `manifest_data.chunk_list` blob into the
+/// `ManifestKind::Chunked` tuple shape. Shared by `get_manifest` and
+/// `get_manifest_batch`.
+fn decode_chunk_list(store_path: &str, chunk_list: &[u8]) -> Result<Vec<([u8; 32], u32)>> {
+    let manifest = crate::manifest::Manifest::deserialize(chunk_list).map_err(|source| {
+        MetadataError::CorruptManifest {
+            store_path: store_path.to_string(),
+            source,
+        }
+    })?;
+    Ok(manifest
+        .entries
+        .into_iter()
+        .map(|e| (e.hash, e.size))
+        .collect())
 }
 
 /// Query path info for a store path.
@@ -207,8 +211,8 @@ pub async fn query_path_info_batch(
 /// I-110c: the builder's FUSE-warm stat loop drives one `GetPath` per
 /// input path; each GetPath does TWO PG lookups (narinfo + manifest).
 /// One `BatchGetManifest` before the loop collapses ~1600 PG hits to
-/// ≤2 (`= ANY(hashes)` on narinfo+manifests, then `= ANY` on
-/// manifest_data for the chunked subset).
+/// ONE (`= ANY(hashes)` on narinfo+manifests `LEFT JOIN
+/// manifest_data`).
 ///
 /// Returns `(path, Option<(info, manifest)>)` per input, in INPUT
 /// ORDER. `None` = no complete manifest. Same `status='complete'`
@@ -225,92 +229,51 @@ pub async fn get_manifest_batch(
     }
     let hashes = batch_hashes(store_paths)?;
 
-    // Query 1: narinfo + manifests.inline_blob in one go (LEFT side of
-    // the inline/chunked branch). One row per complete path.
+    // Single query: narinfo + manifests.inline_blob + manifest_data.
+    // chunk_list via LEFT JOIN — one statement = one MVCC snapshot. A
+    // separate manifest_data query (the previous shape) raced with GC
+    // sweep: one chunked path GC'd between the two queries failed the
+    // ENTIRE batch with InvariantViolation. See `get_manifest` for the
+    // full READ COMMITTED reasoning.
     #[derive(sqlx::FromRow)]
     struct Row {
         #[sqlx(flatten)]
         narinfo: NarinfoRow,
         inline_blob: Option<Vec<u8>>,
+        chunk_list: Option<Vec<u8>>,
     }
     let rows: Vec<Row> = sqlx::query_as(narinfo_complete_select!(
         "n.store_path_hash = ANY($1)",
-        ", m.inline_blob"
+        ", m.inline_blob, md.chunk_list",
+        // ON, not USING: `n` and `m` both expose store_path_hash on
+        // the left side after the INNER JOIN ON, so USING is ambiguous
+        // (PG 42702 "appears more than once in left table").
+        "LEFT JOIN manifest_data md ON md.store_path_hash = m.store_path_hash"
     ))
     .bind(&hashes)
     .fetch_all(pool)
     .await?;
 
-    // Index by store_path. Inline rows resolve immediately; chunked
-    // rows (inline_blob NULL) are queued for the second query.
+    // Index by store_path. Same 4-arm match as `get_manifest`.
     let mut by_path: std::collections::HashMap<String, (ValidatedPathInfo, ManifestKind)> =
         std::collections::HashMap::with_capacity(rows.len());
-    let mut chunked_hashes: Vec<Vec<u8>> = Vec::new();
-    let mut chunked_paths: std::collections::HashMap<Vec<u8>, String> =
-        std::collections::HashMap::new();
-
     for row in rows {
-        let inline_blob = row.inline_blob;
         let info = row.narinfo.try_into_validated()?;
         let path = info.store_path.to_string();
-        match inline_blob {
-            Some(blob) => {
-                by_path.insert(path, (info, ManifestKind::Inline(Bytes::from(blob))));
+        let kind = match (row.inline_blob, row.chunk_list) {
+            (Some(blob), _) => ManifestKind::Inline(Bytes::from(blob)),
+            (None, Some(chunk_list)) => {
+                ManifestKind::Chunked(decode_chunk_list(&path, &chunk_list)?)
             }
-            None => {
-                // Chunked — need manifest_data. Re-derive the hash
-                // from the (validated) path; cheap, and avoids carrying
-                // store_path_hash through NarinfoRow just for this.
-                let h = path_hash(&path)?.to_vec();
-                chunked_paths.insert(h.clone(), path.clone());
-                chunked_hashes.push(h);
-                // Placeholder so a missing manifest_data row below is
-                // detectable (invariant violation, same as get_manifest).
-                by_path.insert(path, (info, ManifestKind::Chunked(Vec::new())));
+            // Single-snapshot read; only reachable via genuine
+            // corruption — same arm as `get_manifest`. Fail the batch.
+            (None, None) => {
+                return Err(MetadataError::InvariantViolation(format!(
+                    "manifest for {path} has NULL inline_blob but no manifest_data row"
+                )));
             }
-        }
-    }
-
-    // Query 2: manifest_data for the chunked subset only. Skipped
-    // entirely when every path is inline (the common small-NAR case).
-    if !chunked_hashes.is_empty() {
-        let data: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT store_path_hash, chunk_list FROM manifest_data \
-             WHERE store_path_hash = ANY($1)",
-        )
-        .bind(&chunked_hashes)
-        .fetch_all(pool)
-        .await?;
-
-        for (h, chunk_list) in data {
-            let Some(path) = chunked_paths.remove(&h) else {
-                continue; // shouldn't happen — ANY($1) only returns what we asked
-            };
-            let manifest =
-                crate::manifest::Manifest::deserialize(&chunk_list).map_err(|source| {
-                    MetadataError::CorruptManifest {
-                        store_path: path.clone(),
-                        source,
-                    }
-                })?;
-            let entries: Vec<([u8; 32], u32)> = manifest
-                .entries
-                .into_iter()
-                .map(|e| (e.hash, e.size))
-                .collect();
-            if let Some((_, kind)) = by_path.get_mut(&path) {
-                *kind = ManifestKind::Chunked(entries);
-            }
-        }
-
-        // Any chunked path NOT covered by query 2 = inline_blob NULL
-        // but no manifest_data row — same invariant violation
-        // get_manifest surfaces. Fail the batch (corruption indicator).
-        if let Some((_, path)) = chunked_paths.into_iter().next() {
-            return Err(MetadataError::InvariantViolation(format!(
-                "manifest for {path} has NULL inline_blob but no manifest_data row"
-            )));
-        }
+        };
+        by_path.insert(path, (info, kind));
     }
 
     Ok(store_paths
@@ -453,6 +416,15 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
     //
     // fetch_optional + RETURNING: None = path not found; Some(count) =
     // post-dedup cardinality. Disambiguates not-found from at-cap.
+    //
+    // Explicit tx so the over-cap arm can ROLL BACK the UPDATE. The
+    // previous `.fetch_optional(pool)` auto-committed before the cap
+    // check — every over-cap call still grew the array by up to 100
+    // novel sigs, so an untrusted caller could bloat the row
+    // indefinitely (`r[store.api.add-signatures]` says "bounded by
+    // MAX_SIGNATURES" — a hard bound, not an alert threshold).
+    // r[impl store.api.add-signatures]
+    let mut tx = pool.begin().await?;
     let row = sqlx::query!(
         r#"
         UPDATE narinfo
@@ -465,23 +437,29 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
         store_path,
         sigs,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     match row {
-        None => Ok(0), // not found — caller maps to NOT_FOUND
+        None => {
+            tx.commit().await?;
+            Ok(0) // not found — caller maps to NOT_FOUND
+        }
         Some(r) if r.n as usize > rio_common::limits::MAX_SIGNATURES => {
             // Over cap post-dedup → client sent novel sigs and we grew
-            // past the limit. Reject: clearer than silently truncating.
-            // The row was updated (UPDATE committed), but we signal the
-            // client their sigs pushed us over — operator alert-worthy.
+            // past the limit. ROLL BACK the UPDATE so the stored array
+            // never exceeds the cap; reject so the client backs off.
+            tx.rollback().await?;
             Err(MetadataError::ResourceExhausted(format!(
                 "signature count {} exceeds MAX_SIGNATURES ({})",
                 r.n,
                 rio_common::limits::MAX_SIGNATURES
             )))
         }
-        Some(_) => Ok(1),
+        Some(_) => {
+            tx.commit().await?;
+            Ok(1)
+        }
     }
 }
 
@@ -838,6 +816,246 @@ mod tests {
         assert!(
             matches!(err, MetadataError::ResourceExhausted(_)),
             "expected ResourceExhausted, got {err:?}"
+        );
+
+        // r[verify store.api.add-signatures]
+        // Reject MUST roll back: stored cardinality stays at MAX, not
+        // MAX+1. Previously the UPDATE auto-committed before the cap
+        // check (this assertion was the fails-before/passes-after).
+        let n: i32 =
+            sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n as usize,
+            rio_common::limits::MAX_SIGNATURES,
+            "over-cap reject must NOT persist the over-cap array"
+        );
+
+        // Second over-cap call with 50 more novel sigs: still rejected,
+        // cardinality still pinned at MAX.
+        let more: Vec<String> = (0..50).map(|i| format!("sig:over{i}")).collect();
+        let err2 = append_signatures(&db.pool, &path, &more).await.unwrap_err();
+        assert!(matches!(err2, MetadataError::ResourceExhausted(_)));
+        let n2: i32 =
+            sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n2 as usize,
+            rio_common::limits::MAX_SIGNATURES,
+            "repeated over-cap calls must NOT grow the array"
+        );
+    }
+
+    // r[verify store.api.batch-manifest]
+    /// `get_manifest` racing GC sweep's CASCADE delete: every result
+    /// is `Ok(Some(..))` or `Ok(None)`; never `InvariantViolation`.
+    /// Previously: two separate `.fetch_optional(pool)` calls under
+    /// READ COMMITTED could observe the manifests row but not the
+    /// (just-deleted) manifest_data row → spurious InvariantViolation.
+    /// After the LEFT JOIN rewrite this is structurally impossible
+    /// (one statement = one snapshot), so this test is deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_manifest_concurrent_gc_never_invariant_violation() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = test_store_path("gc-race");
+        let (ph, _) = seed_complete(&db.pool, &path, None).await;
+        let manifest = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: [0x33; 32],
+                size: 4096,
+            }],
+        }
+        .serialize();
+        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+            .bind(&ph)
+            .bind(&manifest)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let pool_r = db.pool.clone();
+        let path_r = path.clone();
+        let reader = tokio::spawn(async move {
+            let mut results = Vec::with_capacity(200);
+            for _ in 0..200 {
+                results.push(get_manifest(&pool_r, &path_r).await);
+            }
+            results
+        });
+
+        let pool_d = db.pool.clone();
+        let deleter = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Sweep's effect: DELETE narinfo CASCADE → manifests +
+            // manifest_data gone atomically.
+            sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+                .bind(&ph)
+                .execute(&pool_d)
+                .await
+                .unwrap();
+        });
+
+        let (results, _) = tokio::join!(reader, deleter);
+        for r in results.unwrap() {
+            match r {
+                Ok(Some(ManifestKind::Chunked(_))) | Ok(None) => {}
+                other => panic!(
+                    "get_manifest under concurrent GC must be Ok(Some(Chunked)) \
+                     or Ok(None); got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Batch variant of the GC-race test: one stable inline path + one
+    /// chunked path being deleted. Batch never errors; the inline path
+    /// always resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_manifest_batch_concurrent_gc_never_invariant_violation() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p_inline = test_store_path("gcb-inline");
+        let p_chunked = test_store_path("gcb-chunked");
+        seed_complete(&db.pool, &p_inline, Some(b"stable")).await;
+        let (ph, _) = seed_complete(&db.pool, &p_chunked, None).await;
+        let manifest = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: [0x44; 32],
+                size: 4096,
+            }],
+        }
+        .serialize();
+        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+            .bind(&ph)
+            .bind(&manifest)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let pool_r = db.pool.clone();
+        let req = vec![p_inline.clone(), p_chunked.clone()];
+        let reader = tokio::spawn(async move {
+            let mut results = Vec::with_capacity(200);
+            for _ in 0..200 {
+                results.push(get_manifest_batch(&pool_r, &req).await);
+            }
+            results
+        });
+
+        let pool_d = db.pool.clone();
+        let deleter = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+                .bind(&ph)
+                .execute(&pool_d)
+                .await
+                .unwrap();
+        });
+
+        let (results, _) = tokio::join!(reader, deleter);
+        for r in results.unwrap() {
+            let batch = r.expect("batch must never Err under concurrent GC");
+            assert_eq!(batch.len(), 2);
+            // Inline path always resolves (never deleted).
+            assert!(
+                matches!(&batch[0].1, Some((_, ManifestKind::Inline(b))) if &b[..] == b"stable"),
+                "stable inline path must always resolve"
+            );
+            // Chunked path: Some(Chunked) before delete, None after.
+            assert!(
+                matches!(&batch[1].1, Some((_, ManifestKind::Chunked(_))) | None),
+                "chunked path under GC: Some(Chunked) or None, got {:?}",
+                batch[1].1
+            );
+        }
+    }
+
+    // r[verify store.api.hash-part]
+    /// Migration 049: `idx_narinfo_store_path_pattern` exists with
+    /// opclass `text_pattern_ops`. Under non-C collation (production
+    /// default `en_US.UTF-8`), the default-opclass `idx_narinfo_
+    /// store_path` cannot serve `LIKE 'prefix%'` → seq-scan. CI's
+    /// `--locale=C` initdb masks this, so we assert the INDEX exists
+    /// (locale-independent) rather than EXPLAIN.
+    #[tokio::test]
+    async fn query_by_hash_part_pattern_idx_exists() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let opclass: Option<String> = sqlx::query_scalar(
+            "SELECT oc.opcname \
+               FROM pg_index x \
+               JOIN pg_class i  ON i.oid = x.indexrelid \
+               JOIN pg_opclass oc ON oc.oid = x.indclass[0] \
+              WHERE i.relname = 'idx_narinfo_store_path_pattern'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            opclass.as_deref(),
+            Some("text_pattern_ops"),
+            "idx_narinfo_store_path_pattern must exist with text_pattern_ops \
+             (LIKE 'prefix%' under non-C collation seq-scans without it)"
+        );
+    }
+
+    /// Dev-only EXPLAIN sanity for `query_by_hash_part`. Only meaningful
+    /// against a non-C-locale PG (test/prod divergence is the bug here);
+    /// under CI's `--locale=C` initdb the default-opclass index ALSO
+    /// serves LIKE-prefix, so this can't gate. Mirrors orphan.rs's
+    /// `scan_query_uses_uploading_partial_idx` shape.
+    #[ignore = "EXPLAIN plan depends on PG cost model + locale; dev-only sanity"]
+    #[tokio::test]
+    async fn query_by_hash_part_uses_pattern_idx() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             SELECT sha256(i::text::bytea), \
+                    '/nix/store/' || lpad(to_hex(i), 32, '0') || '-seed', \
+                    sha256(i::text::bytea), 0 \
+             FROM generate_series(1, 10000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status) \
+             SELECT sha256(i::text::bytea), 'complete' \
+             FROM generate_series(1, 10000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE narinfo")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let plan: Vec<(String,)> = sqlx::query_as(concat!(
+            "EXPLAIN (FORMAT TEXT) ",
+            narinfo_complete_select!("n.store_path LIKE $1")
+        ))
+        .bind("/nix/store/00000000000000000000000000000001-%")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+        let joined: String = plan
+            .into_iter()
+            .map(|(l,)| l)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("idx_narinfo_store_path_pattern"),
+            "EXPLAIN should reference idx_narinfo_store_path_pattern; got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Seq Scan on narinfo"),
+            "EXPLAIN should NOT seq-scan narinfo; got:\n{joined}"
         );
     }
 }

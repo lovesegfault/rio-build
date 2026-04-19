@@ -754,6 +754,26 @@ pub const M_047: () = ();
 /// (which self-heal on the next tick anyway). Idempotent.
 pub const M_048: () = ();
 
+/// `migrations/049_narinfo_store_path_pattern_idx.sql`
+///
+/// `text_pattern_ops` index on `narinfo(store_path)` for
+/// `query_by_hash_part`'s `LIKE '/nix/store/{hash}-%'` filter. Same
+/// I-078 failure class as M_029, but M_029's default-opclass btree
+/// only serves `LIKE 'prefix%'` under C/POSIX collation. Production
+/// (Aurora / Bitnami) defaults to `en_US.UTF-8`, under which the
+/// planner falls back to Seq Scan over ~1.5M-row `narinfo` on every
+/// `wopQueryPathFromHashPart`.
+///
+/// CI couldn't catch it: both `rio-test-support/src/pg.rs` and
+/// `process-compose.yaml` `initdb --locale=C`, under which the plain
+/// btree DOES serve LIKE-prefix. M_029's stated beneficiaries were
+/// equality filters; the LIKE caller was never covered. Keeping both
+/// indexes — 029's for `=` / ordering, 049's for byte-prefix.
+///
+/// Hot-apply with `CREATE INDEX CONCURRENTLY` first; the migration's
+/// `IF NOT EXISTS` then no-ops on deploy (same pattern as M_029).
+pub const M_049: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

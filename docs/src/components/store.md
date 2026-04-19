@@ -104,7 +104,7 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 | `GetPath(store_path)` | Return narinfo + reconstruct NAR from verified chunks |
 | `QueryPathInfo(store_path)` | Return narinfo only |
 | `BatchQueryPathInfo(paths)` | Batch narinfo lookup, one PG round-trip (`r[store.api.batch-query]`) |
-| `BatchGetManifest(paths)` | Batch (narinfo, manifest) lookup, ≤2 PG round-trips (`r[store.api.batch-manifest]`) |
+| `BatchGetManifest(paths)` | Batch (narinfo, manifest) lookup, 1 PG round-trip (`r[store.api.batch-manifest]`) |
 | `FindMissingPaths(paths)` | Batch validity check (like REAPI's FindMissingBlobs) |
 | `QueryPathFromHashPart(hash_part)` | Resolve full store path from 32-char nixbase32 hash prefix (`r[store.api.hash-part]`) |
 | `AddSignatures(store_path, sigs)` | Append ed25519 signatures to existing narinfo (`r[store.api.add-signatures]`) |
@@ -116,7 +116,7 @@ r[store.api.batch-query]
 `BatchQueryPathInfo` returns `(store_path, Option<PathInfo>)` for many paths in ONE PostgreSQL round-trip. Local-only --- it does NOT trigger upstream substitution and does NOT apply the cross-tenant signature-visibility gate (both add per-path round-trips, defeating the batch). The request is bounded by `max_batch_paths` (default `DEFAULT_MAX_BATCH_PATHS`, configurable via `RIO_MAX_BATCH_PATHS`); over-cap returns `INVALID_ARGUMENT` naming the env var. Every path is `validate_store_path`-checked before PG. I-110: builder closure-BFS (`compute_input_closure`) is the only current caller; the per-path → batch swap was the 130× scale unlock.
 
 r[store.api.batch-manifest]
-`BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many paths in ≤2 PostgreSQL round-trips (one for narinfo, one for `manifest_data`). A `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation rules as `r[store.api.batch-query]`. I-110c: the builder issues this once per build (`r[builder.warmgate.manifest-prime]`) so each subsequent `GetPath` can supply `manifest_hint` and skip both PG lookups.
+`BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many paths in ONE PostgreSQL round-trip (`LEFT JOIN manifest_data`). A `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation rules as `r[store.api.batch-query]`. I-110c: the builder issues this once per build (`r[builder.warmgate.manifest-prime]`) so each subsequent `GetPath` can supply `manifest_hint` and skip both PG lookups.
 
 r[store.api.hash-part]
 `QueryPathFromHashPart` resolves a full store path from its 32-char nixbase32 hash prefix (the 20-byte `compressHash` output). The hash part MUST be exactly 32 chars and MUST decode as nixbase32 --- both checked BEFORE the PG query. The decoded bytes are discarded; the decode is purely a validator that blocks LIKE-injection (the lookup builds `'/nix/store/{hash}-%'`, and nixbase32's alphabet contains neither `%` nor `_`). Returns `NOT_FOUND` if no matching `'complete'` narinfo exists. Backs the gateway's `wopQueryPathFromHashPart`.
