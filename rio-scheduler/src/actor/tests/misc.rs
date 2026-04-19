@@ -691,7 +691,12 @@ async fn soft_feature_strip_only() {
 #[tokio::test]
 async fn solve_intent_for_clamps_at_resource_floor() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor(db.pool.clone());
+    // `bare_actor_sla`: realistic ceilings (256 GiB > 32 GiB floor). The
+    // chokepoint applies `.max(floor).min(ceil)`; `bump_floor_or_count`
+    // caps floor at ceil so the order is sound, but `test_default()`'s
+    // tiny 2 GiB max_mem would otherwise make this assertion test the
+    // ceiling, not the floor.
+    let mut actor = bare_actor_sla(db.pool.clone());
 
     // floor.mem=32GiB; cold-start solve (no fit, no override) returns
     // probe-default mem (typically a few GiB) — the clamp raises it.
@@ -711,6 +716,81 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     assert!(intent_b.mem_bytes < 32 << 30, "control: floor=0 → no clamp");
     // disk also clamped (orthogonal dimension).
     let _ = intent.disk_bytes;
+}
+
+// r[verify sched.sla.intent-from-solve]
+/// D4: `solve_intent_for` clamps mem AND disk at `sla_ceilings` regardless
+/// of which `intent_for` branch (or the post-solve `forced_mem` overlay)
+/// produced the value. The serial-build early-return and the `--mem`
+/// override used to pass `disk_p90` / `forced_mem` through unclamped →
+/// permanently-Pending pod after an operator tightens `max_*`.
+#[tokio::test]
+async fn solve_intent_for_clamps_at_ceil() {
+    use crate::sla::types::*;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_sla(db.pool.clone());
+    let max_mem = actor.sla_ceilings.max_mem;
+    let max_disk = actor.sla_ceilings.max_disk;
+
+    // disk: serial drv with disk_p90 above max_disk.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "big".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(30.0),
+            p: RefSeconds(2000.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(2 << 30),
+        },
+        disk_p90: Some(DiskBytes(max_disk + (50 << 30))),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(4.0),
+            max_c: RawCores(32.0),
+            frozen: false,
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("d", Some("big"), "x86_64-linux", false);
+    actor.dag.node_mut("d").unwrap().enable_parallel_building = Some(false);
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        intent.disk_bytes <= max_disk,
+        "serial branch: disk {} clamped to max_disk {}",
+        intent.disk_bytes,
+        max_disk
+    );
+
+    // mem: forced_mem override above max_mem (overlay applied AFTER
+    // solve, before the chokepoint).
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "big".into(),
+            mem_bytes: Some((max_mem + (64 << 30)) as i64),
+            ..Default::default()
+        }]);
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        intent.mem_bytes <= max_mem,
+        "forced_mem overlay: mem {} clamped to max_mem {}",
+        intent.mem_bytes,
+        max_mem
+    );
 }
 
 /// D7: `solve_intent_for` deadline_secs falls back to

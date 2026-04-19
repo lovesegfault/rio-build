@@ -437,18 +437,24 @@ impl DagActor {
         // `forced_mem` overlays whichever arm fired — `intent_for`
         // already applies it internally so this is a no-op there;
         // `solve_full` doesn't see `override_`, so without this a
-        // `--mem`-only override is dead under `hw_cost_source`.
+        // `--mem`-only override is dead under `hwCostSource`.
         let mem = override_.as_ref().and_then(|o| o.forced_mem).unwrap_or(mem);
         // r[impl sched.sla.reactive-floor]
-        // D4: clamp at the reactive floor. A derivation that OOM'd at
-        // its solved mem (cold-start probe or fit under-estimate) had
+        // D4: floor AND ceiling at the single post-solve chokepoint.
+        // Floor: a derivation that OOM'd at its solved mem had
         // `bump_floor_or_count` double `floor.mem`; the next solve
-        // returns at least that. The solver's BestEffort term is
-        // clamped to `ceil.max_mem` independently (solve.rs), so floor
-        // and ceiling compose.
+        // returns at least that. Ceiling: `intent_for`'s early-return
+        // branches (forced/serial/local/explore) and the `forced_mem`
+        // overlay above pass fit-derived bytes through unclamped, so
+        // the `solve_mvp`/`solve_full` BestEffort clamp doesn't cover
+        // them — a `disk_p90` (or `--mem`) above a tightened
+        // `max_disk`/`max_mem` would otherwise spawn a permanently-
+        // Pending pod. `bump_floor_or_count` already caps `floor` at
+        // `ceil` (floor.rs), so `.max(floor).min(ceil)` always yields
+        // `≤ ceil`.
         let floor = &state.sched.resource_floor;
-        let mem = mem.max(floor.mem_bytes);
-        let disk = disk.max(floor.disk_bytes);
+        let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
+        let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the
         // log-normal `T(c)·exp(ε)` at the chosen cores, no retry tail
         // — k8s-kill-then-reactive-floor IS the retry). Unfitted

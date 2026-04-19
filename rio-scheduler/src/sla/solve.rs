@@ -178,6 +178,15 @@ pub fn intent_for(
 ) -> (u32, u64, u64) {
     let probe_mem =
         (cfg.probe.cpu * cfg.probe.mem_per_core as f64 + cfg.probe.mem_base as f64) as u64;
+    // disk_p90 is core-independent (r[sched.sla.disk-scalar]); resolve
+    // and clamp once so every early-return branch is self-consistent
+    // for `explain.rs`. The `solve_intent_for` chokepoint applies the
+    // same ceiling (alongside mem and the reactive floor), so this is
+    // belt-and-braces.
+    let fit_disk = fit
+        .and_then(|f| f.disk_p90)
+        .map_or(ceil.default_disk, |d| d.0)
+        .min(ceil.max_disk);
     // Operator override beats everything — including drv-declared hints.
     // If the operator forced 12 cores on a `prefer_local_build` drv,
     // they had a reason. Mem unset → fall back to the fit's M(c) at the
@@ -189,10 +198,7 @@ pub fn intent_for(
         let mem = o
             .forced_mem
             .unwrap_or_else(|| fit.map(|f| f.mem.at(RawCores(c)).0).unwrap_or(probe_mem));
-        let disk = fit
-            .and_then(|f| f.disk_p90)
-            .map_or(ceil.default_disk, |d| d.0);
-        return (cores, mem, disk);
+        return (cores, mem, fit_disk);
     }
     // Drv hints pin ONLY cores; mem/disk fall back to the fit when
     // available. `resource_floor` is per-drv_hash, so a new version of
@@ -209,12 +215,10 @@ pub fn intent_for(
         // package). Mirror LOCAL_MEM_BYTES with a minimal disk const.
         let disk = fit
             .and_then(|f| f.disk_p90)
-            .map_or(LOCAL_DISK_BYTES, |d| d.0);
+            .map_or(LOCAL_DISK_BYTES, |d| d.0)
+            .min(ceil.max_disk);
         return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), disk);
     }
-    let fit_disk = fit
-        .and_then(|f| f.disk_p90)
-        .map_or(ceil.default_disk, |d| d.0);
     if hints.enable_parallel_building == Some(false) {
         let mem = forced_mem
             .or_else(|| fit.map(|f| f.mem.at(RawCores(1.0)).0))
@@ -231,7 +235,11 @@ pub fn intent_for(
             // Explore ladder: saturation-gated ×4/÷2 from cfg.probe.
             let d = explore::next(fit, cfg, hints);
             let mem = forced_mem.unwrap_or(d.mem.0);
-            return ((d.c.0.ceil() as u32).max(1), mem, d.disk.0);
+            return (
+                (d.c.0.ceil() as u32).max(1),
+                mem,
+                d.disk.0.min(ceil.max_disk),
+            );
         }
     };
     // tier override: solve against ONLY that tier's bounds. An unknown
@@ -944,6 +952,54 @@ mod tests {
         fit.n_eff = 2.0;
         let (c, _, _) = intent(Some(&fit), &DrvHints::default());
         assert!(c >= 4, "explore ladder ≥ probe.cpu, got {c}");
+    }
+    // r[verify sched.sla.intent-from-solve]
+    #[test]
+    fn intent_for_clamps_disk_at_ceil_in_all_branches() {
+        // disk_p90 = 300 GiB > ceil.max_disk = 200 GiB. Every branch
+        // that reads `disk_p90` must clamp — the `solve_intent_for`
+        // chokepoint is the production guard, but `intent_for` stays
+        // self-consistent for `explain.rs`.
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(300 << 30));
+        let max = ceil().max_disk;
+        // forced_cores override.
+        let o = ResolvedTarget {
+            forced_cores: Some(12.0),
+            ..Default::default()
+        };
+        let (_, _, d) = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            Some(&o),
+            &cfg(),
+            &[],
+            &ceil(),
+        );
+        assert!(d <= max, "forced_cores: disk {d} > max_disk {max}");
+        // prefer_local_build.
+        let (_, _, d) = intent(
+            Some(&fit),
+            &DrvHints {
+                prefer_local_build: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(d <= max, "prefer_local: disk {d} > max_disk {max}");
+        // enable_parallel_building=false.
+        let (_, _, d) = intent(
+            Some(&fit),
+            &DrvHints {
+                enable_parallel_building: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(d <= max, "serial: disk {d} > max_disk {max}");
+        // explore ladder (n_eff < 3 with a fit).
+        let mut explore_fit = fit.clone();
+        explore_fit.n_eff = 2.0;
+        let (_, _, d) = intent(Some(&explore_fit), &DrvHints::default());
+        assert!(d <= max, "explore: disk {d} > max_disk {max}");
     }
     // ─── solve_full / softmax (Algorithm 4) ─────────────────────────
 
