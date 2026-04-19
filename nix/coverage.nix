@@ -70,22 +70,38 @@ let
   # services (client), some tests may not exercise all binaries.
   # Emit an empty lcov and move on — `lcov -a` handles empty
   # inputs gracefully (warns, continues).
+  #
+  # Extraction is factored into a string so the cov-extract-nocollide
+  # check below can exercise the same code path against synthetic
+  # tarballs (no KVM needed).
+  extractProfraws = covRoot: ''
+    # Per-node subdir: tarballs live at <covRoot>/<node>/profraw.tar.gz.
+    # Standalone-fixture profraws are named rio-%h-%p-%m.profraw; %h is
+    # the in-VM hostname, but identically-configured workers share the
+    # same boot sequence → correlated PIDs, same binary → same %m. The
+    # per-node extract dir guarantees no cross-node filename collision
+    # regardless of in-VM naming. (A flat extract with --skip-old-files
+    # sat here previously and silently dropped colliding profraws —
+    # the k3s fixture solved this with $(POD_NAME) in the filename;
+    # standalone never got the equivalent until %h was added.)
+    mkdir -p $TMPDIR/raw
+    for tarball in $(find ${covRoot} -name profraw.tar.gz 2>/dev/null); do
+      node=$(basename "$(dirname "$tarball")")
+      mkdir -p "$TMPDIR/raw/$node"
+      tar xzf "$tarball" -C "$TMPDIR/raw/$node" 2>/dev/null || true
+    done
+    # nullglob: if no match, the glob expands to nothing instead
+    # of a literal '*.profraw' — makes the array-length check
+    # reliable regardless of bash globbing defaults. globstar:
+    # `**` recurses into per-node subdirs.
+    shopt -s nullglob globstar
+    profraws=($TMPDIR/raw/**/*.profraw)
+  '';
+
   mkPerTestLcov =
     name: vmTest:
     pkgs.runCommand "rio-cov-${name}" { } ''
-      mkdir -p $TMPDIR/raw
-      for tarball in $(find ${vmTest}/coverage -name profraw.tar.gz 2>/dev/null); do
-        # --skip-old-files: in case two nodes have the same
-        # profraw filename (different VMs but same PID+module
-        # signature — unlikely but possible).
-        tar xzf "$tarball" -C $TMPDIR/raw --skip-old-files 2>/dev/null || true
-      done
-      # Check for actual profraw files (tarballs may be empty).
-      # nullglob: if no match, the glob expands to nothing instead
-      # of a literal '*.profraw' — makes the array-length check
-      # below reliable regardless of bash globbing defaults.
-      shopt -s nullglob
-      profraws=($TMPDIR/raw/*.profraw)
+      ${extractProfraws "${vmTest}/coverage"}
       if [ "''${#profraws[@]}" -eq 0 ]; then
         echo "WARNING: no profraws for ${name}, emitting empty lcov"
         touch $out
@@ -157,6 +173,32 @@ let
 in
 {
   inherit perTestLcov vmLcov unitLcov;
+
+  # Regression: two nodes producing IDENTICALLY-named profraws (same
+  # PID + same binary signature — happens with identically-configured
+  # workers under deterministic NixOS boot) MUST both survive
+  # extraction. The old flat-extract `--skip-old-files` kept one and
+  # dropped the rest. Runs without KVM — synthetic tarballs only.
+  extractNoCollide = pkgs.runCommand "rio-cov-extract-nocollide" { } ''
+    mkdir -p fake/worker1 fake/worker2
+    echo a > rio-42-abc.profraw
+    tar czf fake/worker1/profraw.tar.gz rio-42-abc.profraw
+    echo b > rio-42-abc.profraw
+    tar czf fake/worker2/profraw.tar.gz rio-42-abc.profraw
+    ${extractProfraws "fake"}
+    if [ "''${#profraws[@]}" -ne 2 ]; then
+      echo "FAIL: lost a colliding profraw — got ''${#profraws[@]}, want 2" >&2
+      ls -lR $TMPDIR/raw >&2
+      exit 1
+    fi
+    # And the contents differ (proves both tarballs extracted, not one
+    # twice).
+    if diff -q "''${profraws[0]}" "''${profraws[1]}" >/dev/null; then
+      echo "FAIL: both profraws identical — one tarball extracted twice?" >&2
+      exit 1
+    fi
+    touch $out
+  '';
 
   # Fast coverage-infrastructure smoke. ONE scenario in coverage
   # mode, asserts the profraw→lcov pipeline produced real data.

@@ -21,7 +21,9 @@ let
   # LLVM_PROFILE_FILE template: %p = PID (handles service restarts —
   # several scenarios do `systemctl restart rio-*` multiple times), %m =
   # binary signature (each binary has a distinct coverage map; enables
-  # safe on-line merging).
+  # safe on-line merging), %h = hostname (multi-worker fixtures with
+  # identical config get correlated PIDs under deterministic boot — %h
+  # disambiguates; mirrors the k3s fixture's $(POD_NAME)).
   #
   # DOUBLE-% ESCAPE: systemd's Environment= expands specifiers (%p =
   # unit prefix name, %m = machine ID, etc). Without escaping, systemd
@@ -29,7 +31,7 @@ let
   # restarts overwrite the same file (no PID uniqueness). `%%` →
   # literal `%` → LLVM sees `%p-%m` and expands correctly.
   covEnv = lib.optionalAttrs coverage {
-    LLVM_PROFILE_FILE = "/var/lib/rio/cov/rio-%%p-%%m.profraw";
+    LLVM_PROFILE_FILE = "/var/lib/rio/cov/rio-%%h-%%p-%%m.profraw";
   };
   covTmpfiles = lib.optional coverage "d /var/lib/rio/cov 0755 root root -";
   # Instrumented binaries are ~2× RSS; bump VM memory.
@@ -57,7 +59,7 @@ rec {
   # in scenarios/cli.nix). Single %: the shell doesn't expand %p/%m so
   # no escape needed — the double-%% above is systemd-specific. Empty
   # string when coverage=false → safe to interpolate unconditionally.
-  covShellEnv = if coverage then "LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw " else "";
+  covShellEnv = if coverage then "LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%h-%p-%m.profraw " else "";
 
   # ── Fragment-test composition (lifecycle/scheduling/leader-election) ─
   # mkFragmentTest builds a runNixOSTest from a scenario-local `prelude`
