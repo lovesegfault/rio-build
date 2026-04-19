@@ -108,10 +108,26 @@ pub fn spawn(pool: PgPool) -> mpsc::Sender<EventLogEntry> {
                     .push_bind(*seq as i64)
                     .push_bind(bytes);
             });
+            // ON CONFLICT DO NOTHING: PG executes a multi-row VALUES
+            // atomically without this — one duplicate (build_id,
+            // sequence) PK aborts the WHOLE statement and the error
+            // arm below would clear() up to 49 unrelated events.
+            // Reachable on leader transition: the persister has no
+            // leader gate, so an ex-leader's in-flight backlog and
+            // the new leader's first emission (seeded from
+            // db.max_sequence_per_build, which only sees committed
+            // rows) collide. DO NOTHING (not DO UPDATE): both
+            // replicas write from the same logical stream; whichever
+            // committed first is correct, and the new leader's
+            // payload should not be overwritten by the ex-leader's
+            // stale one in the reverse-ordering case either.
+            qb.push(" ON CONFLICT (build_id, sequence) DO NOTHING");
             if let Err(e) = qb.build().execute(&pool).await {
                 // PG error. Log with the batch size so operators
                 // can see how many events were lost. Don't crash
                 // — degraded, not dead. The broadcast still works.
+                // PK collision is now per-row (skipped above) so
+                // this arm fires only on genuine PG-down/network.
                 //
                 // Drop the batch (don't retry): if PG is down,
                 // retrying blocks the drain loop → channel fills
@@ -213,6 +229,85 @@ mod tests {
             sent, CHANNEL_CAPACITY,
             "persister starved on current_thread → channel fills at exactly cap"
         );
+        Ok(())
+    }
+
+    /// Regression: a single (build_id, sequence) PK collision in a
+    /// batch must NOT drop the other rows. Before ON CONFLICT DO
+    /// NOTHING, PG aborted the whole multi-row INSERT and the error
+    /// arm cleared the batch — up to 49 unrelated events lost per
+    /// duplicate. Reachable on leader transition (ex-leader backlog
+    /// collides with new leader's first emission).
+    #[tokio::test]
+    async fn pk_collision_preserves_rest_of_batch() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let build_a = Uuid::new_v4();
+        let build_b = Uuid::new_v4();
+        let build_c = Uuid::new_v4();
+
+        // Pre-seed (build_a, 5) directly — this is the "ex-leader's
+        // already-committed row" the new leader's batch will collide on.
+        sqlx::query(
+            "INSERT INTO build_event_log (build_id, sequence, event_bytes) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(build_a)
+        .bind(5_i64)
+        .bind(b"stale".as_slice())
+        .execute(&db.pool)
+        .await?;
+
+        let tx = spawn(db.pool.clone());
+        // One batch: duplicate + two unrelated fresh rows.
+        tx.send((build_a, 5, b"dup".to_vec())).await?;
+        tx.send((build_b, 1, b"fresh".to_vec())).await?;
+        tx.send((build_c, 1, b"fresh2".to_vec())).await?;
+        drop(tx);
+
+        // Poll until the unrelated rows are present (proves the
+        // batch wasn't dropped). Bounded, not sleep.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM build_event_log WHERE build_id = ANY($1)",
+                )
+                .bind(vec![build_b, build_c])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+                if n == 2 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        // build_a/seq=5 payload UNCHANGED (DO NOTHING, not DO UPDATE).
+        let bytes_a: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_bytes FROM build_event_log WHERE build_id = $1 AND sequence = 5",
+        )
+        .bind(build_a)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(bytes_a, b"stale", "DO NOTHING preserves existing payload");
+
+        // build_b and build_c committed despite the duplicate in the same batch.
+        let bytes_b: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_bytes FROM build_event_log WHERE build_id = $1 AND sequence = 1",
+        )
+        .bind(build_b)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(bytes_b, b"fresh");
+        let bytes_c: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_bytes FROM build_event_log WHERE build_id = $1 AND sequence = 1",
+        )
+        .bind(build_c)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(bytes_c, b"fresh2");
         Ok(())
     }
 }
