@@ -511,9 +511,11 @@ impl DagActor {
         phase!("6d-seed-initial-states");
 
         // r[impl sched.substitute.detached]
-        // Upstream-substitutable nodes from check_cached_outputs: now
-        // that seed_initial_states put them at Created/Queued/Ready,
-        // spawn the detached fetch. Nodes whose transition is rejected
+        // Upstream-substitutable nodes from check_cached_outputs:
+        // newly-inserted ones are at Created/Queued/Ready (via
+        // seed_initial_states above); reprobe ones may still be
+        // Poisoned/DependencyFailed and transition directly →
+        // Substituting (I-094). Nodes whose transition is rejected
         // (e.g. apply_cached_hits already completed a chain that
         // included them) fall through to normal scheduling.
         if !pending_substitute.is_empty() {
@@ -761,9 +763,12 @@ impl DagActor {
             nodes,
             merge_result,
             cached_hits,
+            pending_substitute,
             ..
         } = ingest;
         let newly_inserted = &merge_result.newly_inserted;
+        let pending_sub: HashSet<&str> =
+            pending_substitute.iter().map(|(h, _)| h.as_str()).collect();
         let mut cached = 0u32;
         let mut first_failed: Option<DrvHash> = None;
         for node in nodes {
@@ -779,6 +784,15 @@ impl DagActor {
             // I-099: re-probe hits were already counted + emitted in
             // apply_cached_hits. Don't double-count.
             if cached_hits.contains_key(node.drv_hash.as_str()) {
+                continue;
+            }
+            // I-094 substitutable lane: re-probe hits are now
+            // Substituting (or in transition); don't fail-fast on
+            // them. Parallel to the cached_hits skip above; defensive
+            // — once Substituting they fall to `_ => {}` anyway, but
+            // this is robust to ordering changes between
+            // spawn_substitute_fetches and reconcile_preexisting.
+            if pending_sub.contains(node.drv_hash.as_str()) {
                 continue;
             }
             let Some(state) = self.dag.node(&node.drv_hash) else {
@@ -1839,8 +1853,12 @@ impl DagActor {
                     }
                 }
             }
-            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
-                .increment(root_paths.len() as u64);
+            // No cache_hits_total emission here: the caller continues
+            // into the full merge, so apply_cached_hits counts these
+            // roots correctly per-derivation under source="scheduler".
+            // The previous root_paths.len()-based increment was wrong
+            // basis (counted already-present paths), wrong unit
+            // (per-path vs per-derivation), and double-counted.
         }
 
         // All roots available and fetched. Return owned root nodes

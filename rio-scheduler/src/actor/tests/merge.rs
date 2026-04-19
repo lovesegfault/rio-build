@@ -1319,6 +1319,80 @@ async fn test_resubmit_poisoned_retry_limit_bound(
     Ok(())
 }
 
+// r[verify sched.merge.poisoned-resubmit-bounded]
+// r[verify sched.substitute.detached]
+/// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
+/// whose output is upstream-substitutable (NOT locally present) on
+/// resubmit must transition `Poisoned → Substituting → Completed` and
+/// the build must succeed. Before the fix, `(Poisoned, Substituting)`
+/// was rejected → node stayed Poisoned → `reconcile_preexisting`
+/// fail-fasted the build. The locally-present case (routed via
+/// `cached_hits` → `Poisoned → Completed`) already worked; kept here
+/// as a regression-guard so both lanes stay aligned.
+#[rstest::rstest]
+#[case::substitutable_upstream(false)]
+#[case::locally_present(true)]
+#[tokio::test]
+async fn test_resubmit_poisoned_at_limit_substitutable(
+    #[case] locally_present: bool,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let tag = "i094-sub-poison";
+    let out = test_store_path("i094-sub-poison-out");
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+
+    // Build #1: merge, then force-poison at the limit so resubmit
+    // does NOT reset (`is_retriable_on_resubmit() == false`).
+    merge_dag(&handle, Uuid::new_v4(), vec![node.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned(tag, crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Poisoned,
+        "precondition"
+    );
+
+    // Output appears: either upstream cache (substitutable) or in-store.
+    if locally_present {
+        store.seed_with_content(&out, b"i094-contents");
+    } else {
+        store.state.substitutable.write().unwrap().push(out.clone());
+    }
+
+    // Build #2: resubmit. Single-node → topdown short-circuit doesn't
+    // apply; goes through existing_reprobe → check_cached_outputs.
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    if !locally_present {
+        settle_substituting(&handle, &[tag]).await;
+    }
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "Poisoned → {} → Completed",
+        if locally_present {
+            "Completed"
+        } else {
+            "Substituting"
+        }
+    );
+    assert_eq!(info.retry.count, 0, "poison retry cleared");
+    assert_eq!(
+        query_status(&handle, build2).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build #2 should succeed via re-probe"
+    );
+    Ok(())
+}
+
 // ===========================================================================
 // Large-DAG merge perf bound (I-139)
 // ===========================================================================

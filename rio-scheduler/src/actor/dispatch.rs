@@ -678,12 +678,39 @@ impl DagActor {
             let Some(state) = self.dag.node_mut(&drv_hash) else {
                 continue;
             };
-            if let Err(e) = state.transition(DerivationStatus::Substituting) {
-                debug!(%drv_hash, %e, "spawn_substitute: transition rejected; falling through");
-                continue;
+            let from = match state.transition(DerivationStatus::Substituting) {
+                Ok(f) => f,
+                Err(e) => {
+                    debug!(%drv_hash, %e, "spawn_substitute: transition rejected; falling through");
+                    continue;
+                }
+            };
+            // I-094 reprobe substitutable lane: failure history is moot
+            // — we're fetching the upstream-built output. Mirror the
+            // poison-clear in apply_cached_hits. Clearing here (not on
+            // SubstituteComplete{ok=true}) means a later fetch failure
+            // demotes to Ready and gets one more dispatch attempt —
+            // acceptable, since substitutability is evidence the world
+            // changed (Hydra/another tenant built it).
+            if matches!(
+                from,
+                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+            ) {
+                state.retry.clear();
             }
             let drv_path = state.drv_path().to_string();
             let interested = state.interested_builds.clone();
+            // Best-effort PG clear so recovery doesn't resurrect the
+            // poison. After last use of `state` so the &mut self.dag
+            // borrow ends before &self.db.
+            if matches!(
+                from,
+                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+            ) && let Err(e) = self.db.clear_poison(&drv_hash).await
+            {
+                warn!(%drv_hash, error = %e,
+                      "failed to clear poison in PG after re-probe substitutable hit");
+            }
             let output_paths = paths.clone();
             let store = store.clone();
             let weak_tx = weak_tx.clone();

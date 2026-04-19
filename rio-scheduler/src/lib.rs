@@ -158,7 +158,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_cache_hits_total",
-        "Derivations served from cache (labeled by source: scheduler/existing)"
+        "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );
     describe_counter!(
         "rio_scheduler_cache_hit_deferred_total",

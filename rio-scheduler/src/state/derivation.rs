@@ -144,6 +144,12 @@ impl DerivationStatus {
                 // stay Queued until it re-completes. See I-047.
                 return Ok(());
             }
+            if matches!(self, Self::Poisoned | Self::DependencyFailed) && to == Self::Substituting {
+                // I-094 reprobe substitutable lane (see match arm
+                // below). Substituting is non-terminal because a
+                // failed fetch reverts to Ready/Queued.
+                return Ok(());
+            }
             return Err(TransitionError::TerminalToNonTerminal { from: self, to });
         }
 
@@ -208,6 +214,13 @@ impl DerivationStatus {
             // cancelled mid-fetch (orphan task is benign — it still
             // populates the store, the SubstituteComplete is dropped).
             (Self::Created | Self::Queued | Self::Ready, Self::Substituting) => true,
+            // I-094 reprobe, substitutable lane: poisoned/dep-failed
+            // node's output is upstream-substitutable on resubmit —
+            // same "prior failure is moot" rationale as the
+            // (Poisoned, Completed) arm above. DependencyFailed is
+            // symmetry-only (reset by dag.merge today) but kept
+            // parallel to line 173.
+            (Self::Poisoned | Self::DependencyFailed, Self::Substituting) => true,
             (Self::Substituting, Self::Completed | Self::Ready | Self::Queued) => true,
             (Self::Substituting, Self::Cancelled) => true,
             _ => false,
@@ -1040,10 +1053,12 @@ mod tests {
             // Cancel: only from in-flight states. Queued/Ready
             // derivations are handled by orphan-removal instead
             // (handle_cancel_build's existing path).
-            (Assigned, Cancelled), // CancelSignal before worker ACK
-            (Running, Cancelled),  // CancelSignal mid-build (cgroup.kill)
-            (Queued, Skipped),     // CA early-cutoff cascade
-            (Ready, Skipped),      // CA cutoff after find_newly_ready promoted
+            (Assigned, Cancelled),            // CancelSignal before worker ACK
+            (Running, Cancelled),             // CancelSignal mid-build (cgroup.kill)
+            (Queued, Skipped),                // CA early-cutoff cascade
+            (Ready, Skipped),                 // CA cutoff after find_newly_ready promoted
+            (Poisoned, Substituting),         // I-094 reprobe substitutable lane
+            (DependencyFailed, Substituting), // symmetry with (DependencyFailed, Completed)
         ];
 
         for (from, to) in valid_transitions {
@@ -1314,6 +1329,8 @@ mod tests {
             (Created, Substituting),
             (Queued, Substituting),
             (Ready, Substituting),
+            (Poisoned, Substituting), // I-094 reprobe substitutable lane
+            (DependencyFailed, Substituting),
             (Substituting, Completed),
             (Substituting, Ready),
             (Substituting, Queued),
