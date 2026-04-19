@@ -1246,3 +1246,70 @@ async fn test_recovery_toctou_on_lease_flap(
     }
     Ok(())
 }
+
+/// `handle_reconcile_assignments` must NOT write to PG when not leader.
+/// The 45s reconcile timer is fire-and-forget and `on_lose` doesn't
+/// cancel it or clear the DAG; without an `is_leader()` gate, an
+/// ex-leader's timer fires against a stale DAG and overwrites the new
+/// leader's PG derivation state.
+// r[verify sched.reconcile.leader-gate]
+#[tokio::test]
+async fn test_reconcile_skipped_when_not_leader() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let is_leader = Arc::new(AtomicBool::new(true));
+    let il = Arc::clone(&is_leader);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            Arc::new(AtomicU64::new(1)),
+            il,
+            Arc::new(AtomicBool::new(true)),
+        );
+    });
+
+    // Seed an Assigned drv on a worker that won't be in self.executors
+    // → would be reset_orphan_to_ready'd if reconcile ran.
+    let _rx = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("ex-leader-drv")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', \
+         assigned_builder_id = 'gone-w' WHERE drv_hash = 'ex-leader-drv'",
+    )
+    .execute(&db.pool)
+    .await?;
+    // Re-recover so the actor's in-mem DAG reflects PG (Assigned/gone-w).
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    let pre = expect_drv(&handle, "ex-leader-drv").await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+
+    // Lease lost: flip is_leader=false (on_lose's effect on the atomic).
+    is_leader.store(false, Ordering::Release);
+
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    // PG must be UNTOUCHED — still 'assigned', no failed_builders entry.
+    let (status, failed): (String, Vec<String>) = sqlx::query_as(
+        "SELECT status, failed_builders FROM derivations WHERE drv_hash = 'ex-leader-drv'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        status, "assigned",
+        "ex-leader reconcile must NOT mutate PG status (got {status})"
+    );
+    assert!(
+        failed.is_empty(),
+        "ex-leader reconcile must NOT append failed_builders (got {failed:?})"
+    );
+    Ok(())
+}

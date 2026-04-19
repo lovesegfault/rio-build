@@ -692,6 +692,14 @@ impl DagActor {
     /// running — normal handling resumes.
     #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
+        // r[impl sched.reconcile.leader-gate]
+        // Mirror dispatch_ready: the 45s timer is fire-and-forget and
+        // on_lose doesn't cancel it or clear self.dag, so an ex-leader's
+        // timer would otherwise write to PG against a stale DAG.
+        if !self.leader.is_leader() {
+            debug!("reconcile: not leader, skipping");
+            return;
+        }
         let orphaned = self.collect_orphaned_assignments();
 
         if orphaned.is_empty() {

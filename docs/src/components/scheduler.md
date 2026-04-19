@@ -393,6 +393,9 @@ Generation seeding uses `fetch_max` not `store`. The same `Arc<AtomicU64>`
 is shared with the lease loop's `fetch_add(1)` on acquire — `store` would
 clobber that increment.
 
+r[sched.reconcile.leader-gate]
+The post-recovery reconcile pass (`ReconcileAssignments`) MUST early-return when `is_leader()` is false. The 45s reconcile timer is fire-and-forget and `on_lose` does not cancel it or clear the in-memory DAG, so an ex-leader's timer would otherwise issue PG writes (`persist_status`, `increment_retry_count`, `poison_and_cascade`) against a stale DAG, overwriting the new leader's state. Same gating discipline as `dispatch_ready`.
+
 r[sched.recovery.gate-dispatch]
 On startup or leadership acquisition, the scheduler reconstructs its in-memory state from PostgreSQL. Recovery runs inside the DAG actor (via the `LeaderAcquired` command). Dispatch is **gated** on the `recovery_complete` flag --- `dispatch_ready` is a no-op until recovery finishes, preventing a partially-loaded DAG from issuing assignments.
 
