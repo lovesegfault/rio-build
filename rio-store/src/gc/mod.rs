@@ -465,12 +465,12 @@ pub(super) async fn decrement_and_enqueue(
             .collect()
     };
     // r[impl store.chunk.lock-order]
-    // HashSet iteration order is nondeterministic across runs. Sort
-    // before binding to ANY($1) so both UPDATEs below acquire row
-    // locks in the same canonical order as every other chunk-hash
-    // writer (rollback path, sweep path). Without this, a concurrent
-    // decrement_refcounts_for_manifest on an overlapping manifest
-    // could lock h1→h3 while we lock h3→h1 → circular wait → 40P01.
+    // Defense-in-depth only: with batch `= ANY($1)` PG locks rows in
+    // btree scan order regardless of array order, so this sort is NOT
+    // independently observable (see decrement_and_enqueue_no_deadlock).
+    // The load-bearing lock-order discipline for chunk-hash writers is
+    // `with_sorted_retry`'s sort at the per-row contender boundary.
+    // Kept for clarity and so any future per-row rewrite stays safe.
     unique_hashes.sort_unstable();
     if unique_hashes.is_empty() {
         return Ok(stats);
