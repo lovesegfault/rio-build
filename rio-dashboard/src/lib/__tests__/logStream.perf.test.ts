@@ -81,12 +81,12 @@ describe('createLogStream perf', () => {
     expect(s.truncated).toBe(false);
   });
 
-  it('truncates at 50K cap, dropping oldest 10K, setting truncated flag', async () => {
+  it('truncates at 50K cap, trimming to MAX_LINES − DROP_LINES, setting truncated flag', async () => {
     // 550 chunks × 100 lines = 55_000 lines. Crosses the 50K cap once:
-    // at chunk 501 (50_100 lines) we drop the oldest 10K, landing at
-    // 40_100. Then 49 more chunks bring us to 45_000. We assert the
-    // steady-state math, not the exact crossing moment — the important
-    // invariants are (a) length stays bounded and (b) truncated flips.
+    // at chunk 501 (50_100 lines) excess = 50_100 - 40_000 = 10_100 is
+    // dropped, landing at 40_000. Then 49 more chunks bring us to
+    // 44_900. The important invariants are (a) length stays bounded and
+    // (b) truncated flips.
     const CHUNKS = 550;
     const WIDTH = 100;
     getBuildLogs.mockImplementation(async function* () {
@@ -99,12 +99,12 @@ describe('createLogStream perf', () => {
 
     expect(s.done).toBe(true);
     expect(s.truncated).toBe(true);
-    // After one drop: 50_100 - 10_000 = 40_100, then 49 × 100 = 45_000.
-    // The exact value depends on where the cap fires; we assert the
-    // bounded range instead of an exact count — the cap's job is to
-    // keep memory under control, not to hit a precise number.
-    expect(s.lines.length).toBeLessThanOrEqual(50_000);
-    expect(s.lines.length).toBeGreaterThan(40_000);
+    // After one drop: 50_100 - 10_100 = 40_000, then 49 × 100 = 44_900.
+    // The math is deterministic (excess-based splice always lands at
+    // exactly MAX_LINES - DROP_LINES), so assert the exact count for
+    // parity with the sibling tests below — catches regressions to the
+    // splice formula that the loose range would have masked.
+    expect(s.lines.length).toBe(44_900);
   });
 
   it('stays under cap with a single oversized chunk', async () => {

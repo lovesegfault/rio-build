@@ -75,7 +75,7 @@ describe('Executors page', () => {
     expect(cells[1]).toHaveTextContent('45s ago');
   });
 
-  // r[verify builder.executor.kind-gate]
+  // r[verify dash.executors.kind-filter]
   it('filters by executor kind', async () => {
     listExecutors.mockResolvedValue({
       executors: [
