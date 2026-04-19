@@ -273,4 +273,143 @@ in
     ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { efi = false; }).drvPath}
     EOF
   '';
+
+  # nginx allow-list (docker.nix dashboardReadonlyMethods) MUST equal
+  # the Cilium Gateway rio-scheduler-readonly HTTPRoute's Exact paths.
+  # Both implement r[dash.auth.method-gate+2]; before this check the
+  # nginx side was a deny-list that fail-OPENED 10 mutating RPCs.
+  # Diffing the two closes the drift class — adding an RPC to either
+  # side without the other fails CI.
+  dashboard-method-gate-parity =
+    let
+      chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
+      nginxSide = pkgs.writeText "nginx-readonly-methods" (
+        pkgs.lib.concatLines dockerImages.dashboardReadonlyMethods
+      );
+    in
+    pkgs.runCommand "rio-dashboard-method-gate-parity"
+      {
+        nativeBuildInputs = [
+          pkgs.kubernetes-helm
+          pkgs.yq-go
+          pkgs.diffutils
+        ];
+      }
+      ''
+        cp -r ${chart} $TMPDIR/chart
+        chmod -R +w $TMPDIR/chart
+        cd $TMPDIR/chart
+        mkdir -p charts
+        ln -s ${subcharts.postgresql} charts/postgresql
+
+        helm template rio . \
+          --set dashboard.enabled=true \
+          --set global.image.tag=test \
+          --set postgresql.enabled=false \
+          | yq 'select(.kind=="HTTPRoute" and .metadata.name=="rio-scheduler-readonly")
+                | .spec.rules[].matches[].path.value' \
+          | sort > $TMPDIR/gateway-side
+
+        sort ${nginxSide} > $TMPDIR/nginx-side
+
+        diff $TMPDIR/nginx-side $TMPDIR/gateway-side || {
+          echo "FAIL: nginx readonly allow-list (docker.nix dashboardReadonly{Admin,Scheduler})" >&2
+          echo "      diverged from rio-scheduler-readonly HTTPRoute (dashboard-gateway.yaml)." >&2
+          echo "      Both implement r[dash.auth.method-gate+2] — keep them in sync." >&2
+          exit 1
+        }
+        touch $out
+      '';
+
+  # bootstrap-job.yaml documents the script as "Idempotent". The
+  # signing-key block guarded ONE secret but created TWO; a Job retry
+  # after dying between them (or a delete-private-only rotation) left
+  # a permanently mismatched/missing pub. Mock aws + nix-store +
+  # openssl + ssh-keygen and assert convergence from partial state.
+  bootstrap-idempotent =
+    pkgs.runCommand "rio-bootstrap-idempotent"
+      {
+        nativeBuildInputs = [ pkgs.bash ];
+      }
+      ''
+        export TMPDIR=$PWD
+        mkdir -p secrets bin tmp
+        sh=${pkgs.bash}/bin/bash
+        # Mock aws: state in $TMPDIR/secrets/<id-with-slashes-as-_>.
+        # describe-secret → exit 0 iff file exists; create-secret →
+        # ResourceExistsException (exit 254) if exists, else write;
+        # put-secret-value → unconditional overwrite. Minimal fidelity:
+        # asserts CONTROL FLOW, not AWS semantics.
+        cat > bin/aws <<EOF
+        #!$sh
+        sub="\$1 \$2"; id=""; payload=""
+        while [ \$# -gt 0 ]; do
+          case "\$1" in
+            --secret-id|--name) id="\''${2//\//_}"; shift ;;
+            --secret-string|--secret-binary) payload="\$2"; shift ;;
+          esac; shift
+        done
+        f="$TMPDIR/secrets/\$id"
+        case "\$sub" in
+          "secretsmanager describe-secret") [ -f "\$f" ] ;;
+          "secretsmanager create-secret")
+            [ -f "\$f" ] && { echo ResourceExistsException >&2; exit 254; }
+            echo "\$payload" > "\$f" ;;
+          "secretsmanager put-secret-value") echo "\$payload" > "\$f" ;;
+          *) exit 0 ;;
+        esac
+        EOF
+        # Trivial mocks: nix-store writes deterministic content keyed
+        # by a counter so scenario C can detect regeneration.
+        cat > bin/nix-store <<EOF
+        #!$sh
+        n=\$(cat $TMPDIR/gen-count 2>/dev/null || echo 0)
+        n=\$((n+1)); echo \$n > $TMPDIR/gen-count
+        eval "sec=\\\''${\$((\$#-1))}"; eval "pub=\\\''${\$#}"
+        echo "sec-\$n" > "\$sec"; echo "pub-\$n" > "\$pub"
+        EOF
+        for m in openssl ssh-keygen mktemp; do
+          printf '#!%s\n' "$sh" > bin/$m
+        done
+        echo 'd=$TMPDIR/mktemp.$$.$RANDOM; mkdir -p "$d"; echo "$d"' >> bin/mktemp
+        echo 'echo mock' >> bin/openssl
+        cat >> bin/ssh-keygen <<EOF
+        while [ \$# -gt 0 ]; do
+          [ "\$1" = -f ] && { : > "\$2"; : > "\$2.pub"; }; shift
+        done
+        EOF
+        chmod +x bin/*
+        export PATH=$PWD/bin:${pkgs.coreutils}/bin:${pkgs.gnugrep}/bin
+        export AWS_REGION=x CHUNK_BUCKET=x
+
+        run() { $sh ${dockerImages.bootstrapScript}; }
+
+        # Scenario A: fresh → both halves exist.
+        run
+        [ -f secrets/rio_signing-key ] && [ -f secrets/rio_signing-key-pub ] \
+          || { echo "FAIL-A: fresh run did not create both signing-key halves" >&2; exit 1; }
+
+        # Scenario B (the bug): private exists, pub missing → must
+        # converge. Old guard checked private only → skipped → pub
+        # stayed missing forever.
+        rm secrets/rio_signing-key-pub
+        run
+        [ -f secrets/rio_signing-key-pub ] \
+          || { echo "FAIL-B: pub missing after retry (guard checked private only?)" >&2; exit 1; }
+
+        # Scenario C: pub exists with OLD content, private missing →
+        # both must regenerate (pub overwritten via put-secret-value).
+        # Old code: create-secret on existing pub → exit 254 → set -e
+        # → script aborts; next retry sees private now exists → skips
+        # → stale pub forever.
+        rm secrets/rio_signing-key
+        echo OLD > secrets/rio_signing-key-pub
+        run
+        [ -f secrets/rio_signing-key ] \
+          || { echo "FAIL-C: private not recreated" >&2; exit 1; }
+        if grep -qx OLD secrets/rio_signing-key-pub; then
+          echo "FAIL-C: pub not overwritten (stale pair)" >&2; exit 1
+        fi
+        touch $out
+      '';
 }
