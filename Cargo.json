@@ -20537,6 +20537,10 @@
           "packageId": "hex"
         },
         {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },

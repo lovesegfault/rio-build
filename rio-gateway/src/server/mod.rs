@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -235,6 +236,12 @@ impl GatewayServer {
     /// accept `select!`, but spawned [`run_stream`] tasks have no
     /// shutdown subscription — they run to natural completion (client
     /// EOF, error, or process exit at `terminationGracePeriodSeconds`).
+    ///
+    /// Transient `accept()` errors (ECONNABORTED, EMFILE, …) are
+    /// logged-and-continued; the loop only returns on `serve_shutdown`
+    /// (or a `bind()` failure before the loop starts). A `?` here would
+    /// reproduce the I-064 outcome via process-exit: main.rs `?`s past
+    /// `wait_for_session_drain` and every detached session aborts.
     // r[impl gw.conn.session-drain]
     pub async fn run(
         mut self,
@@ -259,7 +266,18 @@ impl GatewayServer {
                     info!("SSH accept loop: serve_shutdown received, stopping accept");
                     return Ok(());
                 }
-                r = socket.accept() => r.context("SSH accept")?,
+                r = socket.accept() => match r {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(error = %e, "SSH accept failed; retrying");
+                        metrics::counter!("rio_gateway_errors_total", "type" => "accept")
+                            .increment(1);
+                        if let AcceptErrAction::RetryAfter(d) = classify_accept_error(&e) {
+                            tokio::time::sleep(d).await;
+                        }
+                        continue;
+                    }
+                },
             };
             let handler = self.new_client(Some(peer));
             let stage = Arc::clone(&handler.stage);
@@ -288,6 +306,35 @@ impl GatewayServer {
                 }
             });
         }
+    }
+}
+
+/// What the accept loop should do with a `TcpListener::accept()` error.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptErrAction {
+    /// Log + metric + `continue` immediately.
+    Retry,
+    /// Log + metric + sleep + `continue`. For fd exhaustion: lets
+    /// in-flight sessions close and free descriptors instead of
+    /// hot-spinning a core.
+    RetryAfter(Duration),
+}
+
+/// Classify an `accept()` error. Separate fn for unit testability —
+/// can't inject ECONNABORTED into a real `TcpListener`.
+///
+/// tokio's `TcpListener::accept()` only retries `WouldBlock` internally;
+/// `ECONNABORTED` (client RST between SYN-ACK and userspace accept),
+/// `EMFILE`/`ENFILE` (fd exhaustion — happens precisely when many
+/// sessions are live), `ENOMEM`/`ENOBUFS` all surface. Hyper/tonic
+/// precedent: ALL accept errors are transient — the listener fd is
+/// owned and never closed, so `EBADF` is unreachable.
+fn classify_accept_error(e: &std::io::Error) -> AcceptErrAction {
+    match e.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE) => {
+            AcceptErrAction::RetryAfter(Duration::from_millis(100))
+        }
+        _ => AcceptErrAction::Retry,
     }
 }
 
@@ -487,6 +534,41 @@ mod conn_cap_tests {
             sem.available_permits(),
             before,
             "dropping None must not release a permit"
+        );
+    }
+}
+
+// r[verify gw.conn.session-drain]
+#[cfg(test)]
+mod accept_err_tests {
+    use super::*;
+
+    /// `classify_accept_error`: ECONNABORTED and arbitrary errors →
+    /// immediate retry; EMFILE/ENFILE → 100ms backoff. Structural test
+    /// — the accept loop's `?` removal means the only return path is
+    /// `serve_shutdown`; this proves the classifier the loop depends on.
+    #[test]
+    fn classify_accept_error_transient() {
+        use std::io;
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            AcceptErrAction::Retry,
+            "ECONNABORTED (client RST mid-handshake) → immediate retry"
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(libc::EMFILE)),
+            AcceptErrAction::RetryAfter(Duration::from_millis(100)),
+            "EMFILE → backoff so in-flight sessions can free fds"
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::from_raw_os_error(libc::ENFILE)),
+            AcceptErrAction::RetryAfter(Duration::from_millis(100)),
+            "ENFILE → backoff"
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::other("arbitrary")),
+            AcceptErrAction::Retry,
+            "non-OS / unknown → immediate retry (hyper/tonic precedent)"
         );
     }
 }

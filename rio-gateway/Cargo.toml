@@ -60,6 +60,10 @@ base64 = { workspace = true }
 # on the wire. Was dev-only (golden tests); promoted now that the opcodes
 # are real instead of stubs.
 serde_json = { workspace = true }
+# raw_os_error() match on EMFILE/ENFILE in the SSH accept loop
+# (server/mod.rs classify_accept_error). io::ErrorKind maps both to
+# Uncategorized on stable, so the libc constants are the reliable check.
+libc = "0.2"
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
