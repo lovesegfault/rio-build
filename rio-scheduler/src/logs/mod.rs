@@ -64,12 +64,12 @@ pub fn drv_log_hash(s: &str) -> String {
 }
 
 /// Construct the canonical S3 key for a completed derivation's log blob:
-/// `{prefix}/{build_id}/{drv_hash}.log.gz` per `observability.md`.
+/// `{prefix}/{build_id}/{drv_hash}.log.zst` per `observability.md`.
 ///
 /// `drv_path` is the full `/nix/store/...` path (the ring-buffer key);
 /// the hash is extracted via [`drv_log_hash`].
 pub fn log_s3_key(prefix: &str, build_id: &Uuid, drv_path: &str) -> String {
-    format!("{prefix}/{build_id}/{}.log.gz", drv_log_hash(drv_path))
+    format!("{prefix}/{build_id}/{}.log.zst", drv_log_hash(drv_path))
 }
 
 /// Max lines retained per derivation. Beyond this, oldest lines are evicted.

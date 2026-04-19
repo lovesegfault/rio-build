@@ -5,7 +5,7 @@
 //! | Build State | Source |
 //! |---|---|
 //! | Active | Ring buffer (in-memory, most recent) |
-//! | Completed | S3 (gzipped blob, seekable via PG `build_logs.s3_key`) |
+//! | Completed | S3 (zstd blob, seekable via PG `build_logs.s3_key`) |
 //!
 //! We check the ring buffer FIRST: if the derivation is still active,
 //! the ring buffer has the freshest lines (the S3 blob, if any, is a
@@ -13,10 +13,7 @@
 //! we fall back to S3 — which means the derivation finished and the
 //! flusher drained it.
 
-use std::io::Read;
-
 use aws_sdk_s3::Client as S3Client;
-use flate2::read::GzDecoder;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -83,7 +80,7 @@ pub(super) async fn get_build_logs(
     };
 
     // For the S3 path, we need drv_hash, not drv_path. The spec's
-    // S3 key format is `logs/{build_id}/{drv_hash}.log.gz`. The client
+    // S3 key format is `logs/{build_id}/{drv_hash}.log.zst`. The client
     // typically has drv_path (that's what the gateway speaks). We
     // could resolve drv_path→drv_hash via the actor, but the DAG entry
     // is likely gone by now (CleanupTerminalBuild removes it ~30s after
@@ -112,7 +109,7 @@ pub(super) async fn get_build_logs(
 }
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
-/// The whole log is gunzipped into memory first (we need to do line
+/// The whole log is decompressed into memory first (we need to do line
 /// splitting on decompressed data), then re-chunked for the gRPC stream.
 /// 256 lines/chunk balances message count vs. per-message size.
 const CHUNK_LINES: usize = 256;
@@ -145,11 +142,11 @@ fn try_ring_buffer(
     Some(chunks)
 }
 
-/// Fetch from S3, gunzip, split lines, chunk. The whole blob comes
-/// into memory during gunzip — acceptable for build logs (bounded
-/// by the worker's `log_size_limit` of 100 MiB, which gzips to
-/// ~10 MiB). True streaming gunzip would need an async GzDecoder
-/// that yields lines, which flate2 doesn't have natively.
+/// Fetch from S3, decompress, split lines, chunk. The whole blob comes
+/// into memory during decompression — acceptable for build logs (bounded
+/// by the worker's `log_size_limit` of 100 MiB, which compresses to
+/// ~10 MiB). True streaming decode would need an async line-yielding
+/// decoder; we buffer-whole instead and keep the architecture simple.
 async fn try_s3(
     s3: &Option<(S3Client, String)>,
     pool: &PgPool,
@@ -188,39 +185,38 @@ async fn try_s3(
         .send()
         .await
         .status_unavailable("S3 GetObject failed")?;
-    let gzipped = resp
+    let compressed = resp
         .body
         .collect()
         .await
         .status_unavailable("S3 body read failed")?
         .into_bytes();
 
-    // Gunzip in spawn_blocking — same rationale as the flusher's gzip.
+    // Decompress in spawn_blocking — same rationale as the flusher's encode.
     let drv_hash_owned = drv_hash.to_string();
-    let chunks =
-        tokio::task::spawn_blocking(move || gunzip_and_chunk(&gzipped, &drv_hash_owned, since))
-            .await
-            .status_internal("gunzip task panicked")?
-            .status_internal("gunzip failed")?;
+    let chunks = tokio::task::spawn_blocking(move || {
+        decompress_and_chunk(&compressed, &drv_hash_owned, since)
+    })
+    .await
+    .status_internal("zstd decode task panicked")?
+    .status_internal("zstd decode failed")?;
 
     Ok(Some(chunks))
 }
 
-/// Gunzip the blob, split on `\n`, apply `since` filtering, chunk.
+/// Decompress the zstd blob, split on `\n`, apply `since` filtering, chunk.
 /// Standalone so spawn_blocking can take it without `self`.
 ///
 /// `drv_label` goes into `BuildLogChunk.derivation_path`. The S3 path uses
 /// `drv_hash` but the proto field is called `derivation_path` — we put the
 /// hash there since that's all we have at this point (the ring-buffer path
 /// uses the real drv_path, but for completed builds the DAG entry is gone).
-pub(super) fn gunzip_and_chunk(
-    gzipped: &[u8],
+pub(super) fn decompress_and_chunk(
+    compressed: &[u8],
     drv_label: &str,
     since: u64,
 ) -> std::io::Result<Vec<BuildLogChunk>> {
-    let mut decoder = GzDecoder::new(gzipped);
-    let mut raw = Vec::new();
-    decoder.read_to_end(&mut raw)?;
+    let raw = zstd::decode_all(compressed)?;
 
     // Split on \n. The flusher joins with \n so every line gets a trailing
     // \n — split() gives an empty last element, which we skip.
@@ -276,7 +272,7 @@ pub(super) fn gunzip_and_chunk(
 }
 
 /// Convert a Vec<Chunk> into a ReceiverStream. The chunks are already
-/// fully materialized (we either read the ring buffer or gunzipped S3
+/// fully materialized (we either read the ring buffer or decompressed S3
 /// into memory), so there's no backpressure benefit to streaming — but
 /// the gRPC API is streaming, so we honor it.
 fn chunks_to_stream(chunks: Vec<BuildLogChunk>) -> ReceiverStream<Result<BuildLogChunk, Status>> {

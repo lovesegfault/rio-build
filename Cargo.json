@@ -20889,10 +20889,6 @@
           "packageId": "dashmap"
         },
         {
-          "name": "flate2",
-          "packageId": "flate2"
-        },
-        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -21023,6 +21019,10 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "devDependencies": [
@@ -30642,6 +30642,18 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        },
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
@@ -31548,6 +31560,12 @@
           "packageId": "zstd-safe"
         }
       ],
+      "resolvedDefaultFeatures": [
+        "arrays",
+        "default",
+        "legacy",
+        "zdict_builder"
+      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -31570,7 +31588,10 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "std"
+        "arrays",
+        "legacy",
+        "std",
+        "zdict_builder"
       ],
       "libCrateTypes": [
         "lib"
@@ -31598,7 +31619,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "std"
+        "legacy",
+        "std",
+        "zdict_builder"
       ],
       "libCrateTypes": [
         "lib"

@@ -67,7 +67,7 @@ rio-nix = { workspace = true }
 # OrderedFloat wraps it with a total ordering.
 ordered-float = { workspace = true }
 
-# phase2b: build-log S3 flush (gzip + PUT logs/{build_id}/{drv_hash}.log.gz).
+# phase2b: build-log S3 flush (zstd + PUT logs/{build_id}/{drv_hash}.log.zst).
 # Client builder shared with rio-store via rio-common's `aws` feature;
 # aws-sdk-s3 stays a direct dep for ByteStream/PutObject types.
 # WONTFIX: not moving behind a rio-store PutLog RPC — see ADR-024.
@@ -78,7 +78,7 @@ aws-sdk-s3 = { workspace = true }
 # direct here for the EC2 client builder.
 aws-sdk-ec2 = { workspace = true }
 aws-config = { workspace = true }
-flate2 = { workspace = true }
+zstd = { workspace = true }
 # phase2b: log ring buffer written from BuildExecution recv tasks
 dashmap = { workspace = true }
 serde = { workspace = true }

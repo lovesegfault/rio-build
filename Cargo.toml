@@ -115,9 +115,6 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 # six crates' dev-deps say `figment.workspace = true` without overrides.
 figment = { version = "0.10", features = ["toml", "env", "test"] }
 
-# Compression (phase2b: build-log gzip before S3 flush)
-flate2 = "1"
-
 # Concurrent map (phase2b: scheduler log ring buffers, written from
 # BuildExecution recv tasks outside the actor loop)
 dashmap = "6"

@@ -38,7 +38,7 @@ pub const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 ///    at only 8 concurrent puts.
 ///
 /// 2. Stalled-stream protection OFF. The sdk's default grace period
-///    can trip on small bodies (≤256 KiB chunks, gzipped log
+///    can trip on small bodies (≤256 KiB chunks, compressed log
 ///    batches) against local S3-compatible servers where the upload
 ///    completes faster than the throughput monitor can establish a
 ///    baseline. A false-positive stall aborts the request →

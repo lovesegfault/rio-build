@@ -618,7 +618,7 @@ async fn init_log_pipeline(
         return (None, None);
     };
     // Same client builder as rio-store's chunk backend (raised retry
-    // attempts, stalled-stream protection OFF — gzipped log batches
+    // attempts, stalled-stream protection OFF — compressed log batches
     // are small pre-buffered bodies, exactly the case that trips the
     // sdk's stall monitor on S3-compatible servers). One config home
     // for both services. See rio_common::s3::default_client.

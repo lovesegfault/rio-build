@@ -1,10 +1,10 @@
-//! `GetBuildLogs` RPC tests + `drv_log_hash`/`gunzip_and_chunk` helpers.
+//! `GetBuildLogs` RPC tests + `drv_log_hash`/`decompress_and_chunk` helpers.
 //!
 //! Split from the 1732L monolithic `admin/tests.rs` (P0386) to mirror the
 //! `admin/logs.rs` submodule seam introduced by P0383.
 
 use super::*;
-use crate::admin::logs::gunzip_and_chunk;
+use crate::admin::logs::decompress_and_chunk;
 use crate::logs::drv_log_hash;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -86,12 +86,10 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         .execute(&db.pool)
         .await?;
 
-    // Gzip a test log the same way the flusher does.
-    let gzipped = {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
+    // Compress a test log the same way the flusher does.
+    let compressed = {
         use std::io::Write;
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
         for line in ["from-s3-0", "from-s3-1", "from-s3-2"] {
             enc.write_all(line.as_bytes())?;
             enc.write_all(b"\n")?;
@@ -107,15 +105,15 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
     )
     .bind(build_id)
     .bind("abc")
-    .bind(format!("logs/{build_id}/abc.log.gz"))
+    .bind(format!("logs/{build_id}/abc.log.zst"))
     .bind(3_i64)
     .execute(&db.pool)
     .await?;
 
-    // Mock S3 to return the gzipped blob.
+    // Mock S3 to return the zstd blob.
     let rule = mock!(S3Client::get_object).then_output(move || {
         GetObjectOutput::builder()
-            .body(ByteStream::from(gzipped.clone()))
+            .body(ByteStream::from(compressed.clone()))
             .build()
     });
     let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
@@ -244,19 +242,17 @@ fn drv_log_hash_extracts_store_hash() {
 }
 
 #[test]
-fn gunzip_and_chunk_roundtrip() -> anyhow::Result<()> {
-    // Gzip → gunzip_and_chunk → lines match.
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
+fn decompress_and_chunk_roundtrip() -> anyhow::Result<()> {
+    // zstd → decompress_and_chunk → lines match.
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
     for i in 0..5 {
         enc.write_all(format!("line-{i}").as_bytes())?;
         enc.write_all(b"\n")?;
     }
-    let gz = enc.finish()?;
+    let zst = enc.finish()?;
 
-    let chunks = gunzip_and_chunk(&gz, "test", 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", 0)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 5, "trailing \\n artifact stripped");
     assert_eq!(chunks[0].lines[0], b"line-0");
@@ -266,18 +262,16 @@ fn gunzip_and_chunk_roundtrip() -> anyhow::Result<()> {
 }
 
 #[test]
-fn gunzip_and_chunk_since_filtering() -> anyhow::Result<()> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
+fn decompress_and_chunk_since_filtering() -> anyhow::Result<()> {
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
     for i in 0..5 {
         enc.write_all(format!("l{i}").as_bytes())?;
         enc.write_all(b"\n")?;
     }
-    let gz = enc.finish()?;
+    let zst = enc.finish()?;
 
-    let chunks = gunzip_and_chunk(&gz, "test", 3)?;
+    let chunks = decompress_and_chunk(&zst, "test", 3)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 2, "since=3 → lines 3,4 only");
     assert_eq!(chunks[0].first_line_number, 3);

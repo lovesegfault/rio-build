@@ -6514,7 +6514,6 @@ dependencies = [
  "clap",
  "dashmap",
  "figment",
- "flate2",
  "futures-util",
  "hex",
  "http 1.4.0",
@@ -6556,6 +6555,7 @@ dependencies = [
  "tracing-test",
  "uuid",
  "workspace-hack",
+ "zstd",
 ]
 
 [[package]]
@@ -9564,6 +9564,9 @@ dependencies = [
  "winnow 1.0.1",
  "zerocopy",
  "zeroize",
+ "zstd",
+ "zstd-safe",
+ "zstd-sys",
 ]
 
 [[package]]

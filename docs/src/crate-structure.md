@@ -294,7 +294,7 @@ src/
 │   └── tests/         # bridge, guards, stream, submit
 ├── logs/
 │   ├── mod.rs         # LogBuffers: DashMap ring buffers per derivation
-│   └── flush.rs       # LogFlusher: S3 gzip PUT on completion
+│   └── flush.rs       # LogFlusher: S3 zstd PUT on completion
 ├── admin/
 │   ├── mod.rs         # AdminService impl dispatch
 │   ├── builds.rs      # ListBuilds / GetBuild / CancelBuild

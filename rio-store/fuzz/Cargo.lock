@@ -6499,6 +6499,9 @@ dependencies = [
  "winnow 1.0.0",
  "zerocopy",
  "zeroize",
+ "zstd",
+ "zstd-safe",
+ "zstd-sys",
 ]
 
 [[package]]

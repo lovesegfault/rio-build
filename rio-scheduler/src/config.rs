@@ -167,7 +167,7 @@ pub(super) struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tick_interval_secs: Option<u64>,
 
-    /// S3 bucket for build-log gzip flush (unset = flush disabled)
+    /// S3 bucket for build-log zstd flush (unset = flush disabled)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) log_s3_bucket: Option<String>,

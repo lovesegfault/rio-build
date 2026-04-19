@@ -548,7 +548,7 @@ pub const M_036: () = ();
 ///   effect is the `ema_duration_secs` overwrite, which stays.
 /// - `builds.requestor` — bound to `''` on every INSERT, never SELECTed.
 ///   The audit-trail role is served by `jwt_jti` (migration 016).
-/// - `build_logs.byte_size` — gzipped S3 object size, written by the
+/// - `build_logs.byte_size` — compressed S3 object size, written by the
 ///   log flusher and never read. Dashboard log views resolve via
 ///   `s3_key` + `is_complete` + `line_count`.
 ///

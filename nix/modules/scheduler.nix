@@ -36,7 +36,7 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        S3 bucket for build-log gzip flush (`RIO_LOG_S3_BUCKET`).
+        S3 bucket for build-log zstd flush (`RIO_LOG_S3_BUCKET`).
         `null` = flush disabled; logs are ring-buffer-only (lost on restart,
         but still live-servable while running).
       '';

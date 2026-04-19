@@ -8,10 +8,10 @@ Build logs are stored durably for post-build analysis and the [dashboard](./comp
 
 ### Storage Format
 
-Build logs are stored in S3 as gzipped blobs:
+Build logs are stored in S3 as zstd-compressed blobs:
 
 ```
-logs/{build_id}/{derivation_hash}.log.gz
+logs/{build_id}/{derivation_hash}.log.zst
 ```
 
 Metadata (byte offsets, timestamps, line counts) is stored in PostgreSQL for efficient seeking and pagination.
@@ -33,13 +33,13 @@ sequenceDiagram
     Executor->>Scheduler: BuildLogBatch (batched, <=64 lines or 100ms)
     Note over Scheduler: Buffer in memory<br/>(per-derivation ring buffer)
     Executor->>Scheduler: CompletionReport
-    Scheduler->>S3: Async flush (gzip + upload)
+    Scheduler->>S3: Async flush (zstd + upload)
     Note over Scheduler: Write metadata to PG
 ```
 
 1. Executors stream log lines to the scheduler via `BuildLogBatch` messages in the `BuildExecution` stream. Lines are batched (up to 64 lines or 100ms, whichever comes first) for efficiency.
 2. The scheduler buffers logs in an in-memory ring buffer per active derivation.
-3. On derivation completion, the scheduler asynchronously flushes the buffer to S3 as a gzipped blob and writes metadata (byte offsets, timestamps) to PostgreSQL.
+3. On derivation completion, the scheduler asynchronously flushes the buffer to S3 as a zstd-compressed blob and writes metadata (byte offsets, timestamps) to PostgreSQL.
 
 > **Periodic flush:** Logs are also flushed to S3 periodically (every 30s) during active builds, not only on completion. This bounds log loss to at most 30s of output if the scheduler fails over.
 
@@ -51,7 +51,7 @@ sequenceDiagram
 | Build State | Log Source |
 |-------------|-----------|
 | Active (building) | In-memory ring buffer on scheduler |
-| Completed | S3 blob (gzipped), seekable via PG metadata |
+| Completed | S3 blob (zstd), seekable via PG metadata |
 | Failed | S3 blob (flushed on failure as well) |
 
 ## Metrics

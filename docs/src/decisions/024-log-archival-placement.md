@@ -13,11 +13,11 @@ This ADR records why that proposal is **not** net-better and the scheduler keeps
 ### Current shape
 
 - **Write path** (`logs/flush.rs`): `LogFlusher` runs on its own task, fed by the actor via bounded `mpsc::try_send` (never blocks the actor). Two triggers:
-  - *Completion* — drain ring buffer → gzip in `spawn_blocking` → `PutObject` → `INSERT INTO build_logs`.
-  - *Periodic (30s)* — snapshot every active buffer (non-draining) → gzip → `PutObject` to `logs/periodic/`. No PG row.
-- **Read path** (`admin/logs.rs`): `AdminService.GetBuildLogs` checks the in-memory ring buffer first; on miss, looks up `build_logs.s3_key` in PG → `GetObject` → gunzip → stream chunks.
+  - *Completion* — drain ring buffer → zstd:6 in `spawn_blocking` → `PutObject` → `INSERT INTO build_logs`.
+  - *Periodic (30s)* — snapshot every active buffer (non-draining) → zstd:6 → `PutObject` to `logs/periodic/`. No PG row.
+- **Read path** (`admin/logs.rs`): `AdminService.GetBuildLogs` checks the in-memory ring buffer first; on miss, looks up `build_logs.s3_key` in PG → `GetObject` → zstd decode → stream chunks.
 - **Metadata**: the `build_logs` table lives in the **scheduler's** PG schema (`migrations/001_scheduler.sql`), with `build_id UUID REFERENCES builds(build_id)`. One row per `(build_id, drv_hash)`, UPSERTed periodic→final.
-- **Volume**: ring capacity is 100k lines × ~100 B ≈ 10 MiB raw / ~1 MiB gzipped per derivation. Periodic flush re-uploads an ever-growing prefix of each active buffer every 30s (`logs/mod.rs:165-170` accepts this as the cost of crash-bounded loss). At ~50 concurrent active derivations that's order-of 50 MiB gzipped per 30s tick.
+- **Volume**: ring capacity is 100k lines × ~100 B ≈ 10 MiB raw / ~1 MiB compressed per derivation. Periodic flush re-uploads an ever-growing prefix of each active buffer every 30s (`logs/mod.rs:165-170` accepts this as the cost of crash-bounded loss). At ~50 concurrent active derivations that's order-of 50 MiB compressed per 30s tick.
 
 ### What "moving it to store" actually requires
 

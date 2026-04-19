@@ -20,8 +20,8 @@
 //! no buffer to snapshot either → the log is the last periodic snapshot,
 //! which is slightly stale but still useful.
 //!
-//! Gzip is CPU-bound; runs in `spawn_blocking` so it doesn't hog a tokio
-//! worker thread during the typical 10-100ms compression of a few-MB log.
+//! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
+//! tokio worker thread during the typical 10-100ms compression of a few-MB log.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -29,8 +29,6 @@ use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -48,7 +46,7 @@ const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct FlushRequest {
     /// The buffer key — full `/nix/store/{hash}-{name}.drv` path. Also
-    /// the source for the S3 key (`logs/{build_id}/{drv_hash}.log.gz`)
+    /// the source for the S3 key (`logs/{build_id}/{drv_hash}.log.zst`)
     /// and PG `drv_hash` column via [`drv_log_hash`].
     pub drv_path: String,
     /// One PG row per build, all pointing at the same S3 blob. The derivation
@@ -195,7 +193,7 @@ impl LogFlusher {
         }
     }
 
-    /// Gzip → S3 PUT → PG insert (if `interested_builds` is non-empty).
+    /// Compress → S3 PUT → PG insert (if `interested_builds` is non-empty).
     ///
     /// Errors are logged, not propagated. The flusher must never die on a
     /// transient S3/PG error — if it did, ALL future logs would be lost,
@@ -214,14 +212,14 @@ impl LogFlusher {
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        // S3 key: for finals, `{prefix}/{first_build_id}/{drv_hash}.log.gz`
+        // S3 key: for finals, `{prefix}/{first_build_id}/{drv_hash}.log.zst`
         // via `log_s3_key()`. Per spec (observability.md:12-14). We use the
         // FIRST interested build's id for the key path (arbitrary but
         // deterministic — the spec doesn't say which build_id when N>1, and
         // PG rows all point at the same s3_key anyway).
         //
         // For periodic: interested_builds is empty → key is
-        // `{prefix}/periodic/{drv_hash}.log.gz`.
+        // `{prefix}/periodic/{drv_hash}.log.zst`.
         let drv_hash = drv_log_hash(&req.drv_path);
         debug_assert!(
             !drv_hash.is_empty(),
@@ -231,30 +229,30 @@ impl LogFlusher {
         let s3_key = if let Some(bid) = req.interested_builds.first() {
             log_s3_key(&self.prefix, bid, &req.drv_path)
         } else {
-            format!("{}/periodic/{drv_hash}.log.gz", self.prefix)
+            format!("{}/periodic/{drv_hash}.log.zst", self.prefix)
         };
 
-        // Gzip in spawn_blocking. ~10 MiB of log compresses in ~50ms on
+        // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
         // modern hardware; not long enough to matter for latency, but long
         // enough to hog a tokio worker thread under heavy log volume
         // (50 active derivations × 50ms = 2.5s of worker-thread time per
         // periodic tick, spread across tokio's NUM_CPU workers).
-        let gzipped = match tokio::task::spawn_blocking(move || gzip_lines(&lines)).await {
+        let compressed = match tokio::task::spawn_blocking(move || compress_lines(&lines)).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
-                error!(s3_key = %s3_key, error = %e, "gzip failed; log dropped");
-                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "gzip")
+                error!(s3_key = %s3_key, error = %e, "zstd compress failed; log dropped");
+                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "compress")
                     .increment(1);
                 return;
             }
             Err(e) => {
-                error!(s3_key = %s3_key, error = %e, "gzip task panicked; log dropped");
-                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "gzip")
+                error!(s3_key = %s3_key, error = %e, "zstd compress task panicked; log dropped");
+                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "compress")
                     .increment(1);
                 return;
             }
         };
-        let gzipped_size = gzipped.len() as u64;
+        let compressed_size = compressed.len() as u64;
 
         // S3 PUT. No retry loop here — the AWS SDK already retries
         // internally (RetryConfig::standard, set by main.rs). If the
@@ -264,8 +262,8 @@ impl LogFlusher {
             .put_object()
             .bucket(&self.bucket)
             .key(&s3_key)
-            .body(ByteStream::from(gzipped))
-            .content_type("application/gzip")
+            .body(ByteStream::from(compressed))
+            .content_type("application/zstd")
             .send()
             .await;
 
@@ -290,7 +288,7 @@ impl LogFlusher {
         debug!(
             s3_key = %s3_key,
             line_count,
-            gzipped_size,
+            compressed_size,
             is_final,
             "log flushed to S3"
         );
@@ -321,14 +319,15 @@ impl LogFlusher {
     }
 }
 
-/// Gzip-compress lines, joined by `\n`. Returns the compressed bytes.
+/// Zstd-compress lines, joined by `\n`. Returns the compressed bytes.
 ///
 /// Standalone fn so spawn_blocking can take it without capturing `self`.
-fn gzip_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
-    // Compression::default() is level 6. Higher levels (9) give marginally
-    // smaller output at much higher CPU; log text is already highly
-    // compressible at 6 (~10:1 on typical build output).
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+fn compress_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
+    // Level 6 (NOT the crate default 3): log text is already highly
+    // compressible (~10:1 on typical build output), and the periodic
+    // flush re-uploads ever-growing prefixes — the extra ratio at 6 is
+    // worth the CPU on a path that's already off-thread in spawn_blocking.
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 6)?;
     for line in lines {
         encoder.write_all(line)?;
         encoder.write_all(b"\n")?;
@@ -440,29 +439,25 @@ mod tests {
     }
 
     #[test]
-    fn gzip_lines_is_gunzip_roundtrippable() -> anyhow::Result<()> {
+    fn compress_lines_is_zstd_roundtrippable() -> anyhow::Result<()> {
         let lines: Vec<Vec<u8>> = vec![b"hello".to_vec(), b"world".to_vec(), b"!".to_vec()];
-        let gz = gzip_lines(&lines)?;
-        // Magic bytes for gzip: 1f 8b.
-        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
-        // Gunzip and verify content.
-        let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
-        let mut out = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut out)?;
-        assert_eq!(out, "hello\nworld\n!\n");
+        let zst = compress_lines(&lines)?;
+        // Magic bytes for a zstd frame: 28 b5 2f fd.
+        assert_eq!(&zst[..4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
+        // Decode and verify content.
+        let out = zstd::decode_all(&zst[..])?;
+        assert_eq!(out, b"hello\nworld\n!\n");
         Ok(())
     }
 
     #[test]
-    fn gzip_lines_empty_produces_valid_gzip() -> anyhow::Result<()> {
-        // Edge case: zero lines. Still want a valid (empty) gzip blob, not
+    fn compress_lines_empty_produces_valid_zstd() -> anyhow::Result<()> {
+        // Edge case: zero lines. Still want a valid (empty) zstd frame, not
         // an error — a silent build's log is empty, not absent.
-        let gz = gzip_lines(&[])?;
-        assert_eq!(&gz[..2], &[0x1f, 0x8b]);
-        let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
-        let mut out = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut out)?;
-        assert_eq!(out, "");
+        let zst = compress_lines(&[])?;
+        assert_eq!(&zst[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        let out = zstd::decode_all(&zst[..])?;
+        assert_eq!(out, b"");
         Ok(())
     }
 
@@ -509,12 +504,12 @@ mod tests {
         let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
         assert_eq!(puts.len(), 1);
         let (key, body) = &puts[0];
-        assert_eq!(key, &format!("logs/{build_id}/{drv_hash}.log.gz"));
+        assert_eq!(key, &format!("logs/{build_id}/{drv_hash}.log.zst"));
         assert!(
             !key.contains("/nix/store/"),
             "S3 key must not embed the store prefix"
         );
-        assert_eq!(&body[..2], &[0x1f, 0x8b], "should be gzipped");
+        assert_eq!(&body[..4], &[0x28, 0xb5, 0x2f, 0xfd], "should be zstd");
 
         // PG row inserted with is_complete=true.
         let row: (i64, bool) = sqlx::query_as(
@@ -594,7 +589,7 @@ mod tests {
         let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
         assert_eq!(puts.len(), 1);
         let (key, _body) = &puts[0];
-        assert_eq!(key, "logs/periodic/aaaa.log.gz");
+        assert_eq!(key, "logs/periodic/aaaa.log.zst");
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_logs")
             .fetch_one(&db.pool)
@@ -680,7 +675,7 @@ mod tests {
 
         // ONE S3 PUT.
         assert_eq!(captured.lock().unwrap().len(), 1);
-        let expected_key = format!("logs/{b1}/ssssssssssssssssssssssssssssssss.log.gz");
+        let expected_key = format!("logs/{b1}/ssssssssssssssssssssssssssssssss.log.zst");
         assert_eq!(captured.lock().unwrap()[0].0, expected_key);
 
         // THREE PG rows, all same s3_key.
