@@ -194,7 +194,23 @@ pub async fn setup(
     let (relay_target_tx, relay_target_rx) =
         watch::channel::<Option<mpsc::Sender<ExecutorMessage>>>(None);
 
-    rio_common::task::spawn_monitored("stream-relay", relay_loop(sink_rx, relay_target_rx));
+    // bug_472: drain/exit gates on completion-DELIVERED, not
+    // slot-idle. `send_completion` sets this; `relay_loop` clears it
+    // on grpc_tx.send() Ok and notifies. Same Arc threaded into
+    // BuildSpawnContext (set side), relay_loop (clear side), and
+    // BuilderRuntime (gate side).
+    let completion_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completion_cleared = Arc::new(tokio::sync::Notify::new());
+
+    rio_common::task::spawn_monitored(
+        "stream-relay",
+        relay_loop(
+            sink_rx,
+            relay_target_rx,
+            Arc::clone(&completion_pending),
+            Arc::clone(&completion_cleared),
+        ),
+    );
 
     // P0537: one build per pod. The slot tracks both occupancy and
     // the running drv_path (heartbeat reads it). `try_claim` is
@@ -281,6 +297,7 @@ pub async fn setup(
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,
         hw_bench: Arc::new(std::sync::Mutex::new(hw_bench)),
+        completion_pending: Arc::clone(&completion_pending),
     };
 
     Ok(Some(BuilderRuntime {
@@ -293,6 +310,8 @@ pub async fn setup(
         draining,
         drain_done,
         build_done,
+        completion_pending,
+        completion_cleared,
         latest_generation,
         heartbeat_handle,
         build_ctx,

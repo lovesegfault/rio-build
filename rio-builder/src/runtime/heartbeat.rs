@@ -6,9 +6,10 @@
 //! response.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
-use rio_proto::types::HeartbeatRequest;
+use rio_proto::types::{HeartbeatRequest, HeartbeatResponse};
 
 use super::setup::WorkerClient;
 use super::slot::BuildSlot;
@@ -134,45 +135,63 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
             )
             .await;
 
-            match client.heartbeat(request).await {
-                Ok(response) => {
-                    let resp = response.into_inner();
-                    if resp.accepted {
-                        // READY. Set unconditionally — it's idempotent
-                        // (already-true → true is a no-op at the atomic
-                        // level) and cheaper than a load-then-store.
-                        ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                        // r[impl sched.lease.generation-fence]
-                        // fetch_max, not store: during the 15s Lease TTL
-                        // split-brain window (r[sched.lease.k8s-lease]),
-                        // both old and new leader answer with accepted=true.
-                        // If responses interleave new-then-old, `store`
-                        // would REGRESS the fence and let through exactly
-                        // the stale assignment we're blocking. fetch_max
-                        // is monotone regardless of response ordering.
-                        generation.fetch_max(resp.generation, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        tracing::warn!("heartbeat rejected by scheduler");
-                        // NOT READY: scheduler is reachable but rejecting
-                        // us. Could mean the scheduler doesn't recognize
-                        // our executor_id (stale registration, scheduler
-                        // restarted and lost in-memory state). The
-                        // BuildExecution stream reconnect logic handles
-                        // the actual recovery; readiness flag just
-                        // reflects the current state.
-                        ready.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "heartbeat failed");
-                    // NOT READY: gRPC error. Scheduler unreachable or
-                    // overloaded. Don't flip liveness (restarting won't
-                    // fix the network) but do flip readiness. The next
-                    // successful heartbeat flips back — this tracks
-                    // the scheduler's availability from our perspective.
-                    ready.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            apply_heartbeat_response(
+                client.heartbeat(request).await.map(|r| r.into_inner()),
+                &ready,
+                &generation,
+            );
         }
     })
+}
+
+/// Apply a heartbeat RPC result to the shared `ready` / `generation`
+/// atomics. Extracted from `spawn_heartbeat`'s loop body so the
+/// generation-fence WRITE side (`fetch_max`) is unit-testable without
+/// a mock gRPC client — bug_417: the previous test
+/// (`heartbeat_gen_monotone_under_interleaving`) called `fetch_max` on
+/// a local `AtomicU64` and never reached this code; mutating
+/// `fetch_max → store` here passed `nextest -p rio-builder`.
+pub(super) fn apply_heartbeat_response(
+    resp: Result<HeartbeatResponse, tonic::Status>,
+    ready: &AtomicBool,
+    generation: &AtomicU64,
+) {
+    match resp {
+        Ok(resp) => {
+            if resp.accepted {
+                // READY. Set unconditionally — it's idempotent
+                // (already-true → true is a no-op at the atomic
+                // level) and cheaper than a load-then-store.
+                ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                // r[impl sched.lease.generation-fence]
+                // fetch_max, not store: during the 15s Lease TTL
+                // split-brain window (r[sched.lease.k8s-lease]),
+                // both old and new leader answer with accepted=true.
+                // If responses interleave new-then-old, `store`
+                // would REGRESS the fence and let through exactly
+                // the stale assignment we're blocking. fetch_max
+                // is monotone regardless of response ordering.
+                generation.fetch_max(resp.generation, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                tracing::warn!("heartbeat rejected by scheduler");
+                // NOT READY: scheduler is reachable but rejecting
+                // us. Could mean the scheduler doesn't recognize
+                // our executor_id (stale registration, scheduler
+                // restarted and lost in-memory state). The
+                // BuildExecution stream reconnect logic handles
+                // the actual recovery; readiness flag just
+                // reflects the current state.
+                ready.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "heartbeat failed");
+            // NOT READY: gRPC error. Scheduler unreachable or
+            // overloaded. Don't flip liveness (restarting won't
+            // fix the network) but do flip readiness. The next
+            // successful heartbeat flips back — this tracks
+            // the scheduler's availability from our perspective.
+            ready.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }

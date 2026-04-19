@@ -24,9 +24,9 @@ pub use prefetch::handle_prefetch_hint;
 pub use setup::setup;
 pub use slot::{BuildSlot, BuildSlotGuard, try_cancel_build};
 
-use drain::{reconnect_drain_gate, run_drain};
+use drain::{reconnect_drain_gate, run_drain, wait_build_flushed};
 use prefetch::PrefetchDeps;
-use result::{err_completion, ok_completion, outcome_label, panic_completion};
+use result::{err_completion, ok_completion, panic_completion, send_completion};
 use setup::{BalanceGuards, WorkerClient};
 
 use crate::cgroup::ResourceSnapshotHandle;
@@ -142,6 +142,12 @@ pub struct BuildSpawnContext {
     /// struct stays `Clone` (shared slot; second `take()` on any
     /// clone sees `None`).
     pub hw_bench: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<f64>>>>,
+    /// "A `Msg::Completion` is in `sink_rx` or `relay_loop.buffered`
+    /// and has not yet been `grpc_tx.send()`-Ok'd into a confirmed-
+    /// open stream." Set by `send_completion`; cleared by
+    /// `relay_loop`. The drain machinery gates exit on this (NOT
+    /// `slot.is_busy()` alone) — see `wait_build_flushed`. bug_472.
+    pub completion_pending: Arc<AtomicBool>,
 }
 
 impl BuildSpawnContext {
@@ -273,6 +279,7 @@ pub async fn spawn_build_task(
     let panic_node_name = ctx.node_name.clone();
     let panic_hw_class = ctx.hw_class.clone();
     let panic_resources = Arc::clone(&ctx.resources);
+    let panic_completion_pending = Arc::clone(&ctx.completion_pending);
 
     // The spawned task needs 'static; clone the whole context once and
     // move it in. ExecutorEnv is built INSIDE the task from the owned
@@ -356,15 +363,7 @@ pub async fn spawn_build_task(
             ),
         };
 
-        metrics::counter!("rio_builder_builds_total", "outcome" => outcome_label(&completion))
-            .increment(1);
-
-        let msg = ExecutorMessage {
-            msg: Some(executor_message::Msg::Completion(completion)),
-        };
-        if let Err(e) = ctx.stream_tx.send(msg).await {
-            tracing::error!(error = %e, "failed to send completion report");
-        }
+        send_completion(&ctx.stream_tx, &ctx.completion_pending, completion).await;
     };
     let handle =
         rio_common::task::spawn_monitored("build-executor", executor_future.instrument(build_span));
@@ -379,26 +378,22 @@ pub async fn spawn_build_task(
                 drv_path = %panic_drv_path,
                 "build task panicked; sending InfrastructureFailure to scheduler"
             );
-            let msg = ExecutorMessage {
-                msg: Some(executor_message::Msg::Completion(panic_completion(
-                    panic_drv_path.clone(),
+            // Read out before the .await — RwLockReadGuard isn't Send.
+            let final_resources = Some(*panic_resources.read().unwrap_or_else(|e| e.into_inner()));
+            send_completion(
+                &panic_tx,
+                &panic_completion_pending,
+                panic_completion(
+                    panic_drv_path,
                     panic_token,
                     result::CompletionStamp {
                         node_name: panic_node_name,
                         hw_class: panic_hw_class,
-                        final_resources: Some(
-                            *panic_resources.read().unwrap_or_else(|e| e.into_inner()),
-                        ),
+                        final_resources,
                     },
-                ))),
-            };
-            if let Err(e) = panic_tx.send(msg).await {
-                tracing::error!(
-                    drv_path = %panic_drv_path,
-                    error = %e,
-                    "failed to send panic-completion report; derivation may be stuck in Running"
-                );
-            }
+                ),
+            )
+            .await;
         }
     });
 }
@@ -419,6 +414,11 @@ pub struct BuilderRuntime {
     draining: Arc<AtomicBool>,
     drain_done: Arc<Notify>,
     build_done: Arc<Notify>,
+    /// Same `Arc` as `build_ctx.completion_pending` and the relay's
+    /// clear-side. See [`wait_build_flushed`].
+    completion_pending: Arc<AtomicBool>,
+    /// Notified by [`relay_loop`] when it clears `completion_pending`.
+    completion_cleared: Arc<Notify>,
     latest_generation: Arc<AtomicU64>,
     heartbeat_handle: tokio::task::JoinHandle<()>,
     build_ctx: BuildSpawnContext,
@@ -472,7 +472,16 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         // regardless of which select arm was active when SIGTERM
         // arrived: all three `shutdown.cancelled()` arms below
         // `continue 'reconnect` to reach this.
-        if reconnect_drain_gate(&rt.shutdown, &rt.draining, &rt.slot, &rt.drain_done).is_break() {
+        if reconnect_drain_gate(
+            &rt.shutdown,
+            &rt.draining,
+            &rt.slot,
+            &rt.completion_pending,
+            &rt.completion_cleared,
+            &rt.drain_done,
+        )
+        .is_break()
+        {
             break 'reconnect;
         }
 
@@ -542,15 +551,19 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
 
                 // r[impl builder.shutdown.sigint]
                 // First SIGTERM: continue to the top of 'reconnect for
-                // the drain transition (set flag, spawn watcher). The
-                // CURRENT stream stays open via the next iteration's
-                // fresh-channel swap; in-flight completions buffered in
-                // the permanent sink flush through. Guard becomes false
-                // after the swap above, so this arm goes inactive —
-                // `shutdown.cancelled()` would otherwise fire every
-                // iteration once the token is set.
+                // the drain transition (set flag, spawn watcher).
+                // `build_stream` is local to this loop body and DROPS
+                // on `continue`; park the relay first so it can't pump
+                // a Completion into the now-zombie tonic ReceiverStream
+                // before the next iteration's swap-after-Ok (bug_444 —
+                // same I-032 mechanism the Closed|Error arm guards
+                // against). Guard becomes false after the swap above,
+                // so this arm goes inactive — `shutdown.cancelled()`
+                // would otherwise fire every iteration once the token
+                // is set.
                 _ = rt.shutdown.cancelled(),
                     if !rt.draining.load(Ordering::Relaxed) => {
+                    rt.relay_target_tx.send_replace(None);
                     continue 'reconnect;
                 }
 
@@ -863,10 +876,12 @@ async fn handle_assignment(
     spawn_build_task(assignment, guard, &rt.build_ctx).await;
 
     // After spawning the ONE build, wait for
-    // its permit to return (build complete +
-    // CompletionReport sent — spawn_build_task's
-    // scopeguard drops the permit after the
-    // send), then exit. The select arm on
+    // its permit to return AND the
+    // CompletionReport to reach a live wire
+    // (`wait_build_flushed` — bug_472: slot-idle
+    // alone is insufficient, the report may
+    // still be in sink_rx if relay_target=None),
+    // then exit. The select arm on
     // `build_done.notified()` breaks the inner
     // loop → outer loop breaks → run_drain
     // (no-op here: slot already idle,
@@ -897,9 +912,11 @@ async fn handle_assignment(
     // assignment sees true and skips.
     if !done_watcher_spawned.swap(true, Ordering::Relaxed) {
         let watch_slot = Arc::clone(&rt.slot);
+        let pending = Arc::clone(&rt.completion_pending);
+        let cleared = Arc::clone(&rt.completion_cleared);
         let done = Arc::clone(&rt.build_done);
         tokio::spawn(async move {
-            watch_slot.wait_idle().await;
+            wait_build_flushed(&watch_slot, &pending, &cleared).await;
             done.notify_one();
         });
     }
@@ -926,10 +943,19 @@ enum StreamEnd {
 ///
 /// Exits only when the permanent sink closes (all `sink_tx` clones
 /// dropped — process shutdown).
+///
+/// `completion_pending` / `completion_cleared`: cleared after a
+/// `Msg::Completion` is `grpc_tx.send()`-Ok'd. Soundness depends on
+/// `run()` only swapping `Some(grpc_tx)` AFTER `build_execution` Ok
+/// (merged_bug_020) and parking to `None` before any path that drops
+/// `build_stream` (bug_444) — so "send Ok" here means "in a confirmed-
+/// open tonic body buffer" (which tonic flushes on graceful close).
 // r[impl builder.relay.reconnect]
 pub(super) async fn relay_loop(
     mut sink_rx: mpsc::Receiver<ExecutorMessage>,
     mut target: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
+    completion_pending: Arc<AtomicBool>,
+    completion_cleared: Arc<Notify>,
 ) {
     // One-message buffer for the transition case: we recv'd from
     // the sink, tried to send to gRPC, gRPC channel is dead.
@@ -952,16 +978,20 @@ pub(super) async fn relay_loop(
         };
 
         // Flush the buffered message first (if any).
-        if let Some(msg) = buffered.take()
-            && let Err(e) = grpc_tx.send(msg).await
-        {
-            // Still dead (reconnect raced us). Re-buffer
-            // and wait again.
-            buffered = Some(e.0);
-            if target.changed().await.is_err() {
-                return;
+        if let Some(msg) = buffered.take() {
+            let is_completion = matches!(msg.msg, Some(executor_message::Msg::Completion(_)));
+            if let Err(e) = grpc_tx.send(msg).await {
+                // Still dead (reconnect raced us). Re-buffer
+                // and wait again.
+                buffered = Some(e.0);
+                if target.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            } else if is_completion {
+                completion_pending.store(false, Ordering::Release);
+                completion_cleared.notify_waiters();
             }
-            continue;
         }
 
         // Pump until this gRPC target dies OR the reconnect loop
@@ -992,11 +1022,17 @@ pub(super) async fn relay_loop(
                         // process lifetime, so this is shutdown.
                         return;
                     };
+                    let is_completion = matches!(
+                        msg.msg, Some(executor_message::Msg::Completion(_))
+                    );
                     if let Err(e) = grpc_tx.send(msg).await {
                         // gRPC channel died. Buffer this one message
                         // and go back to the top to re-read target.
                         buffered = Some(e.0);
                         break;
+                    } else if is_completion {
+                        completion_pending.store(false, Ordering::Release);
+                        completion_cleared.notify_waiters();
                     }
                 }
             }
@@ -1053,6 +1089,32 @@ mod tests {
         }
     }
 
+    fn completion_msg(drv: &str) -> ExecutorMessage {
+        ExecutorMessage {
+            msg: Some(executor_message::Msg::Completion(
+                rio_proto::types::CompletionReport {
+                    drv_path: drv.into(),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    /// Spawn `relay_loop` with throwaway `completion_pending` /
+    /// `completion_cleared` for tests that don't exercise the drain
+    /// gate. Tests that DO exercise it construct the Arcs explicitly.
+    fn spawn_relay(
+        sink_rx: mpsc::Receiver<ExecutorMessage>,
+        target_rx: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(relay_loop(
+            sink_rx,
+            target_rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Notify::new()),
+        ))
+    }
+
     /// Relay pumps sink → gRPC. When gRPC dies, relay buffers ONE
     /// message (from SendError) and blocks until a new target is
     /// swapped in. Messages in the sink's mpsc backlog are held
@@ -1061,7 +1123,7 @@ mod tests {
     async fn relay_survives_target_swap() {
         let (sink_tx, sink_rx) = mpsc::channel(8);
         let (target_tx, target_rx) = watch::channel(None);
-        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+        let relay = spawn_relay(sink_rx, target_rx);
 
         // Connect target #1.
         let (grpc1_tx, mut grpc1_rx) = mpsc::channel(8);
@@ -1136,7 +1198,7 @@ mod tests {
     async fn relay_swaps_on_watch_change_with_live_old_target() {
         let (sink_tx, sink_rx) = mpsc::channel(8);
         let (target_tx, target_rx) = watch::channel(None);
-        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+        let relay = spawn_relay(sink_rx, target_rx);
 
         let (grpc1_tx, mut grpc1_rx) = mpsc::channel(8);
         target_tx.send_replace(Some(grpc1_tx));
@@ -1212,7 +1274,7 @@ mod tests {
         // ── Positive: fixed connect sequence (no swap on failed try) ──
         let (sink_tx, sink_rx) = mpsc::channel(8);
         let (target_tx, target_rx) = watch::channel(None);
-        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+        let relay = spawn_relay(sink_rx, target_rx);
 
         // Build finishes during the reconnect gap; queues completion +
         // logs while target is None (relay parked on changed()).
@@ -1251,7 +1313,7 @@ mod tests {
         // Do NOT reintroduce a swap before `build_execution` Ok.
         let (sink_tx, sink_rx) = mpsc::channel(8);
         let (target_tx, target_rx) = watch::channel(None);
-        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+        let relay = spawn_relay(sink_rx, target_rx);
 
         sink_tx.send(msg("completion")).await.unwrap();
         sink_tx.send(msg("log-a")).await.unwrap();
@@ -1332,7 +1394,7 @@ mod tests {
     ///
     /// `#[tokio::test]` for the watcher `tokio::spawn` inside the
     /// gate; the gate function itself is sync.
-    // r[verify builder.shutdown.idle-no-reregister]
+    // r[verify builder.shutdown.idle-no-reregister+2]
     #[tokio::test]
     async fn drain_gate_idle_slot_breaks_without_reregister() {
         use std::ops::ControlFlow;
@@ -1341,11 +1403,13 @@ mod tests {
         let shutdown = rio_common::signal::Token::new();
         let draining = AtomicBool::new(false);
         let slot = Arc::new(BuildSlot::default());
+        let pending = Arc::new(AtomicBool::new(false));
+        let cleared = Arc::new(Notify::new());
         let drain_done = Arc::new(tokio::sync::Notify::new());
 
         // Steady state: no SIGTERM → Continue (proceed to Register).
         assert_eq!(
-            reconnect_drain_gate(&shutdown, &draining, &slot, &drain_done),
+            reconnect_drain_gate(&shutdown, &draining, &slot, &pending, &cleared, &drain_done),
             ControlFlow::Continue(()),
             "no SIGTERM → reconnect loop opens stream as normal"
         );
@@ -1356,7 +1420,7 @@ mod tests {
         // ExecutorRegister, THEN break via drain_done.
         shutdown.cancel();
         assert_eq!(
-            reconnect_drain_gate(&shutdown, &draining, &slot, &drain_done),
+            reconnect_drain_gate(&shutdown, &draining, &slot, &pending, &cleared, &drain_done),
             ControlFlow::Break(()),
             "SIGTERM + idle slot → break before ExecutorRegister"
         );
@@ -1370,7 +1434,14 @@ mod tests {
         let guard = slot2.try_claim("/nix/store/aaa-x.drv").unwrap();
         shutdown2.cancel();
         assert_eq!(
-            reconnect_drain_gate(&shutdown2, &draining2, &slot2, &drain_done),
+            reconnect_drain_gate(
+                &shutdown2,
+                &draining2,
+                &slot2,
+                &pending,
+                &cleared,
+                &drain_done
+            ),
             ControlFlow::Continue(()),
             "SIGTERM + busy slot → keep stream open for completion"
         );
@@ -1381,30 +1452,269 @@ mod tests {
         // re-register just to immediately drain_done).
         drop(guard);
         assert_eq!(
-            reconnect_drain_gate(&shutdown2, &draining2, &slot2, &drain_done),
+            reconnect_drain_gate(
+                &shutdown2,
+                &draining2,
+                &slot2,
+                &pending,
+                &cleared,
+                &drain_done
+            ),
             ControlFlow::Break(()),
             "draining + slot went idle on later iteration → break"
         );
     }
 
-    /// Missed-notification race: guard drops BETWEEN the watcher's
-    /// `is_busy()` check and its `notified().await`. Exercises the
-    /// `enable()` ordering in `BuildSlot::wait_idle`.
+    /// bug_472 regression: `draining && !slot.is_busy()` is NOT
+    /// sufficient to Break — a `CompletionReport` may be sitting in
+    /// `sink_rx` (build finished during a stream-retry sleep with
+    /// `relay_target=None`). The gate MUST `Continue` so the loop
+    /// reconnects and the relay flushes; once `completion_pending`
+    /// clears, the next iteration Breaks.
+    ///
+    /// Pre-fix this returned `Break` with `pending=true` and
+    /// `run_teardown` dropped the report → scheduler re-dispatch +
+    /// missing `build_samples` row.
+    // r[verify builder.shutdown.idle-no-reregister+2]
+    #[tokio::test]
+    async fn reconnect_drain_gate_pending_completion_continues() {
+        use std::ops::ControlFlow;
+
+        let shutdown = rio_common::signal::Token::new();
+        let draining = AtomicBool::new(true);
+        let slot = Arc::new(BuildSlot::default()); // idle
+        let pending = Arc::new(AtomicBool::new(true));
+        let cleared = Arc::new(Notify::new());
+        let drain_done = Arc::new(Notify::new());
+        shutdown.cancel();
+
+        assert_eq!(
+            reconnect_drain_gate(&shutdown, &draining, &slot, &pending, &cleared, &drain_done),
+            ControlFlow::Continue(()),
+            "draining + idle + completion pending → reconnect to flush"
+        );
+
+        pending.store(false, Ordering::Release);
+        assert_eq!(
+            reconnect_drain_gate(&shutdown, &draining, &slot, &pending, &cleared, &drain_done),
+            ControlFlow::Break(()),
+            "draining + idle + completion flushed → exit"
+        );
+    }
+
+    /// bug_472: `wait_build_flushed` (used by both drain_done and
+    /// build_done watchers) must wait on `completion_pending`, not
+    /// just slot-idle. Pre-fix the watchers used bare `wait_idle()`
+    /// and fired `done.notify_one()` while the report was still in
+    /// `sink_rx`.
     #[tokio::test(start_paused = true)]
-    async fn slot_wait_idle_no_missed_notification() {
+    async fn wait_build_flushed_gates_on_pending() {
+        let slot = Arc::new(BuildSlot::default()); // idle
+        let pending = Arc::new(AtomicBool::new(true));
+        let cleared = Arc::new(Notify::new());
+
+        let (s, p, c) = (
+            Arc::clone(&slot),
+            Arc::clone(&pending),
+            Arc::clone(&cleared),
+        );
+        let waiter = tokio::spawn(async move { wait_build_flushed(&s, &p, &c).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "slot idle but completion pending → still waiting"
+        );
+
+        pending.store(false, Ordering::Release);
+        cleared.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("pending=false + notify → returns")
+            .unwrap();
+    }
+
+    /// bug_472: `relay_loop` clears `completion_pending` (and notifies)
+    /// after `grpc_tx.send()` Ok for a `Msg::Completion` — and ONLY
+    /// for Completion (not Register/LogBatch). This is the clear-side
+    /// of the drain gate; `send_completion` is the set-side.
+    #[tokio::test]
+    async fn relay_clears_completion_pending_on_send() {
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let pending = Arc::new(AtomicBool::new(false));
+        let cleared = Arc::new(Notify::new());
+        let relay = tokio::spawn(relay_loop(
+            sink_rx,
+            target_rx,
+            Arc::clone(&pending),
+            Arc::clone(&cleared),
+        ));
+
+        let (live_tx, mut live_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(live_tx));
+
+        // Non-Completion: pending unchanged.
+        pending.store(true, Ordering::Release);
+        sink_tx.send(msg("register")).await.unwrap();
+        live_rx.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.load(Ordering::Acquire),
+            "Register send must NOT clear completion_pending"
+        );
+
+        // Completion: pending cleared.
+        sink_tx
+            .send(completion_msg("/nix/store/aaa-x.drv"))
+            .await
+            .unwrap();
+        live_rx.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "Completion send Ok → completion_pending cleared"
+        );
+
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// bug_444 regression. Pins the invariant the SIGTERM arm now
+    /// upholds: park the relay (`send_replace(None)`) BEFORE the old
+    /// stream drops on `continue 'reconnect`. With the relay parked,
+    /// a `Completion` queued during the gap stays in `sink_rx` and
+    /// reaches the NEW target after swap-after-Ok. The negative half
+    /// shows the pre-fix path (target stays `Some(old)` across the
+    /// gap) loses the message into the doomed buffer.
+    #[tokio::test]
+    async fn relay_target_none_across_sigterm_reconnect() {
+        // ── Positive: SIGTERM arm parks relay before continue ──
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = spawn_relay(sink_rx, target_rx);
+
+        let (old_tx, old_rx) = mpsc::channel::<ExecutorMessage>(8);
+        target_tx.send_replace(Some(old_tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // SIGTERM arm: park FIRST, then drop old stream.
+        target_tx.send_replace(None);
+        drop(old_rx);
+        // Build completes during the gap.
+        sink_tx.send(completion_msg("cr")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Next iteration: swap-after-Ok.
+        let (new_tx, mut new_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(new_tx));
+        let r = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(r.msg, Some(executor_message::Msg::Completion(_))),
+            "completion queued while relay parked → delivered to new target"
+        );
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // ── Negative pin: pre-fix (no send_replace(None)) loses it ──
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = spawn_relay(sink_rx, target_rx);
+
+        let (old_tx, old_rx) = mpsc::channel::<ExecutorMessage>(8);
+        target_tx.send_replace(Some(old_tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Pre-fix SIGTERM arm: NO send_replace(None). Build completes;
+        // relay (still pointed at old_tx, old_rx alive in tonic's body
+        // task) pumps it into the doomed buffer.
+        sink_tx.send(completion_msg("cr")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(old_rx); // tonic body task RSTs → buffer discarded
+
+        let (new_tx, mut new_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(new_tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut survived = 0;
+        while new_rx.try_recv().is_ok() {
+            survived += 1;
+        }
+        assert!(
+            survived <= 0,
+            "pre-fix SIGTERM ordering loses completion (got {survived})"
+        );
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Exercises the `is_busy()` short-circuit — guard drops before
+    /// the watcher is first polled (current_thread). Does NOT exercise
+    /// `enable()` ordering; see `slot_wait_idle_wakes_after_busy_observed`.
+    ///
+    /// bug_333: previously named `_no_missed_notification` and claimed
+    /// to test slot.rs:113 `enable()`, but under current_thread the
+    /// spawned task isn't polled until L1676's `.await` — by then the
+    /// guard already dropped synchronously, `is_busy()==false`, and
+    /// `wait_idle` early-returns at slot.rs:115. Deleting `enable()`
+    /// or rewriting `wait_idle` as the naive `if busy { notified()
+    /// .await }` both passed this test.
+    #[tokio::test(start_paused = true)]
+    async fn slot_wait_idle_returns_when_idle_before_first_poll() {
         let slot = Arc::new(BuildSlot::default());
         let guard = slot.try_claim("/nix/store/ccc-z.drv").unwrap();
 
         let watch_slot = Arc::clone(&slot);
         let drain = tokio::spawn(async move { watch_slot.wait_idle().await });
-        // Drop the guard BEFORE the watcher gets scheduled. With a
-        // naive `if busy { notified().await }`, notify_waiters() would
-        // fire into the void here and the watcher would park forever.
+        // Drop BEFORE the watcher is first polled. notify_waiters()
+        // fires into the void (no registered waiter); the watcher then
+        // sees is_busy()==false and short-circuits.
         drop(guard);
 
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
-            .expect("enable() before is_busy() avoids the missed-notification race")
+            .expect("is_busy() short-circuit")
+            .expect("watcher didn't panic");
+    }
+
+    /// Exercises the wake path (slot.rs:117 `notified.await`): the
+    /// watcher polls once and observes `is_busy()==true`, parks on
+    /// `notified.await`, THEN the guard drops and `notify_waiters()`
+    /// has a registered waiter to wake.
+    ///
+    /// Honesty note: under current_thread the naive `if busy {
+    /// notified().await }` ALSO passes here (no preemption between
+    /// slot.rs:114 and :117). Fully killing the `enable()` mutant
+    /// deterministically requires `loom` — slot.rs:113's correctness
+    /// is asserted by code review of the documented tokio pattern,
+    /// not by this test. This test does newly exercise slot.rs:117
+    /// (line-hit coverage), which the sibling above never reaches.
+    #[tokio::test(start_paused = true)]
+    async fn slot_wait_idle_wakes_after_busy_observed() {
+        let slot = Arc::new(BuildSlot::default());
+        let guard = slot.try_claim("/nix/store/ccc-z.drv").unwrap();
+
+        let watch_slot = Arc::clone(&slot);
+        let drain = tokio::spawn(async move { watch_slot.wait_idle().await });
+        // Let the watcher poll once: is_busy()==true → reaches
+        // notified.await (slot.rs:117).
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "watcher parked at notified.await");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("notify_waiters wakes parked watcher")
             .expect("watcher didn't panic");
     }
 
@@ -1851,8 +2161,10 @@ mod tests {
 // r[verify sched.lease.generation-fence]
 #[cfg(test)]
 mod fence_tests {
+    use super::heartbeat::apply_heartbeat_response;
     use super::is_stale_assignment;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use rio_proto::types::HeartbeatResponse;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     #[test]
     fn fence_rejects_strictly_less() {
@@ -1886,19 +2198,67 @@ mod fence_tests {
         assert!(!is_stale_assignment(1, 0));
     }
 
-    /// fetch_max monotonicity: during the 15s Lease TTL split-brain
-    /// window, both old and new leader answer heartbeats with
-    /// accepted=true. If responses interleave new-then-old, `store`
-    /// would REGRESS the fence. `fetch_max` is monotone.
+    /// During the 15s Lease TTL split-brain window, both old and new
+    /// leader answer heartbeats with `accepted=true`. If responses
+    /// interleave new-then-old, `store` would REGRESS the fence.
+    ///
+    /// bug_417: previously called `fetch_max` on a local `AtomicU64`
+    /// directly — that tested `std::sync::atomic`, not
+    /// `apply_heartbeat_response`. Mutating heartbeat.rs's
+    /// `fetch_max → store` (the regression named in this doc-comment)
+    /// passed the old test. This version drives the production
+    /// response-handling path; the same mutation now FAILS here.
     #[test]
     fn heartbeat_gen_monotone_under_interleaving() {
         let g = AtomicU64::new(0);
-        g.fetch_max(3, Ordering::Relaxed); // new leader's heartbeat lands first
-        g.fetch_max(1, Ordering::Relaxed); // stale leader's heartbeat lands second
+        let ready = AtomicBool::new(false);
+        // new leader's heartbeat lands first
+        apply_heartbeat_response(
+            Ok(HeartbeatResponse {
+                accepted: true,
+                generation: 3,
+            }),
+            &ready,
+            &g,
+        );
+        // stale leader's heartbeat lands second
+        apply_heartbeat_response(
+            Ok(HeartbeatResponse {
+                accepted: true,
+                generation: 1,
+            }),
+            &ready,
+            &g,
+        );
         assert_eq!(
             g.load(Ordering::Relaxed),
             3,
             "fence must not regress under out-of-order heartbeat responses"
         );
+        assert!(ready.load(Ordering::Relaxed));
+    }
+
+    /// `accepted=false` (scheduler reachable but rejecting us) MUST
+    /// NOT advance the generation fence. Kills a hypothetical "remove
+    /// `if resp.accepted` guard" mutant — without the guard, a
+    /// rejecting standby's stale generation would be written.
+    #[test]
+    fn heartbeat_gen_ignores_rejected() {
+        let g = AtomicU64::new(2);
+        let ready = AtomicBool::new(true);
+        apply_heartbeat_response(
+            Ok(HeartbeatResponse {
+                accepted: false,
+                generation: 99,
+            }),
+            &ready,
+            &g,
+        );
+        assert_eq!(
+            g.load(Ordering::Relaxed),
+            2,
+            "rejected heartbeat must not touch the fence"
+        );
+        assert!(!ready.load(Ordering::Relaxed), "rejected → not ready");
     }
 }

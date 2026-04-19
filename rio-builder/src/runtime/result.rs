@@ -4,8 +4,13 @@
 //! infrastructure status decision and the SLI outcome label live next to
 //! each other instead of inline in a 300-line spawned async block.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::mpsc;
+
 use rio_proto::types::{
-    BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport, ResourceUsage,
+    BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport, ExecutorMessage,
+    ResourceUsage, executor_message,
 };
 
 use crate::executor::{ExecutionResult, ExecutorError};
@@ -147,5 +152,96 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
             _ => "failure",
         },
         None => "failure",
+    }
+}
+
+/// Single chokepoint for delivering a `CompletionReport` to the
+/// permanent sink. Every terminal build outcome (success, error,
+/// cancel, panic) MUST go through here so:
+///
+/// - `rio_builder_builds_total{outcome}` increments exactly once per
+///   build (observability.md:202 SLI). bug_174: the panic-catcher
+///   previously open-coded the send and skipped the counter, so a
+///   worker that panicked on 1/100 builds reported the same success
+///   rate as a healthy one.
+/// - `completion_pending` is set BEFORE the message enters `sink_rx`.
+///   The drain machinery (`reconnect_drain_gate`, `wait_build_flushed`)
+///   keys off this — NOT `slot.is_busy()` — to decide whether the
+///   reconnect loop may exit. bug_472: `_slot_guard` drops AFTER this
+///   send, so "slot idle" alone meant "completion queued in sink_rx"
+///   when `relay_target=None`, and `run_teardown` dropped it on the
+///   floor. `relay_loop` clears the flag only after a successful
+///   `grpc_tx.send()` into a confirmed-open stream.
+pub(super) async fn send_completion(
+    stream_tx: &mpsc::Sender<ExecutorMessage>,
+    completion_pending: &AtomicBool,
+    completion: CompletionReport,
+) {
+    completion_pending.store(true, Ordering::Release);
+    metrics::counter!("rio_builder_builds_total", "outcome" => outcome_label(&completion))
+        .increment(1);
+    let msg = ExecutorMessage {
+        msg: Some(executor_message::Msg::Completion(completion)),
+    };
+    if let Err(e) = stream_tx.send(msg).await {
+        tracing::error!(error = %e, "failed to send completion report");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::metrics::CountingRecorder;
+
+    /// bug_174 regression: the panic path's `InfrastructureFailure`
+    /// completion MUST increment `rio_builder_builds_total{outcome=
+    /// "infra_failure"}`. Pre-fix, only the `executor_future` send
+    /// site (mod.rs:359) incremented; the panic-catcher (mod.rs:382)
+    /// open-coded the send without the counter, so panicked builds
+    /// were invisible to the worker-side SLI while the scheduler
+    /// correctly received `InfrastructureFailure`.
+    ///
+    /// Tests the chokepoint directly: both call sites now route
+    /// through `send_completion`, so a counter assertion here covers
+    /// both. `with_local_recorder` is sync — call `send_completion`
+    /// inside the closure via `block_in_place` would need a runtime;
+    /// instead use `set_default_local_recorder` (guard-scoped, visible
+    /// across `.await` on current_thread).
+    #[tokio::test]
+    async fn send_completion_increments_counter_for_panic_status() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let pending = AtomicBool::new(false);
+        let completion = panic_completion(
+            "/nix/store/aaa-x.drv".into(),
+            "tok".into(),
+            CompletionStamp {
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+            },
+        );
+
+        send_completion(&tx, &pending, completion).await;
+
+        assert_eq!(
+            rec.get("rio_builder_builds_total{outcome=infra_failure}"),
+            1,
+            "panic-path completion must increment the SLI counter \
+             (saw keys: {:?})",
+            rec.all_keys()
+        );
+        assert!(
+            pending.load(Ordering::Acquire),
+            "completion_pending set before sink send (drain-gate hook)"
+        );
+        // Message actually landed in the sink.
+        let msg = rx.recv().await.unwrap();
+        assert!(matches!(
+            msg.msg,
+            Some(executor_message::Msg::Completion(_))
+        ));
     }
 }
