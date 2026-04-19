@@ -1,31 +1,34 @@
 //! Critical-path priority computation.
 //!
-//! Priority = `est_duration + max(children's priority)`. Bottom-up: a
-//! leaf's priority is just its own duration; a root's priority is the
-//! sum of durations along the longest path through its subtree.
+//! Priority = `est_duration + max(non-terminal children's priority)`.
+//! Bottom-up: a leaf's priority is just its own duration; a root's
+//! priority is the sum of durations along the longest *remaining* path
+//! through its subtree.
 // r[impl sched.critical-path.incremental]
 //!
-//! Dispatching highest-priority-first means: work on the derivation
-//! whose completion unblocks the most remaining work. A short derivation
-//! that's on every build's critical path gets scheduled before a long
-//! one that's off to the side.
+//! Dispatching highest-priority-first approximates LPT once a node's
+//! children become terminal: a node's priority decays toward its own
+//! `est_duration`, so long derivations start early enough to overlap
+//! the tail. While children remain non-terminal, priority is the
+//! longest-remaining-chain length — derivations on the critical chain
+//! sort ahead of derivations on shorter side branches.
 //!
-//! # Why this matters
+//! # One recurrence, three entry points
 //!
-//! Without critical-path, FIFO dispatch means a 5-second derivation
-//! submitted just after a 2-hour derivation waits 2 hours even if the
-//! 5-second one is blocking 50 downstream builds. With critical-path,
-//! the 5-second one gets priority `5 + sum(downstream)` which is huge.
+//! All three entry points run the same [`topo_recompute`] over a chosen
+//! `scope` (children-first Kahn order, then `est_duration +
+//! nonterminal_child_max(...)`). They differ only in scope:
 //!
-//! # Incremental vs full
+//! - [`compute_initial`]: scope = `newly_inserted` (per SubmitBuild),
+//!   then propagates upward into pre-existing ancestors at the boundary.
+//! - [`update_ancestors`]: scope = upward-reachable cone from a
+//!   completed/changed node (per completion).
+//! - [`full_sweep`]: scope = all non-terminal nodes (Tick, ~60s,
+//!   belt-and-suspenders).
 //!
-//! - `compute_initial`: full bottom-up sweep for newly-merged nodes.
-//!   Called once per SubmitBuild. O(new nodes + affected existing nodes).
-//! - `update_ancestors`: incremental walk UP from a completed node.
-//!   Called once per completion. O(affected ancestors) — typically
-//!   small (only ancestors whose max-child-priority CHANGED).
-//! - Periodic full sweep on Tick (~60s) catches any drift from the
-//!   incremental updates. Belt-and-suspenders.
+//! Because every entry point reduces to the same recurrence, the spec
+//! invariant — "incremental updates and the periodic full sweep
+//! converge on the same priorities" — holds by construction.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -74,15 +77,12 @@ fn model_key_for(state: &DerivationState, builds: &HashMap<Uuid, BuildInfo>) -> 
 /// # Algorithm
 ///
 /// 1. For each newly-inserted node, set `est_duration` from the SLA cache.
-/// 2. Topo-sort the newly-inserted nodes (children before parents). We
-///    can't use a global topo-sort — the DAG has existing nodes mixed
-///    in. Instead: BFS from leaves, tracking in-degree within the new set.
-/// 3. In topo order, `priority = est_duration + max(child.priority)`.
+/// 2. [`topo_recompute`] over `newly_inserted`: children-first Kahn,
+///    then `priority = est_duration + nonterminal_child_max(...)`.
 ///    Children might be existing nodes (already have priority) or
 ///    newly-inserted (processed earlier in topo order).
-/// 4. For existing nodes that new edges connect to: if their priority
-///    would increase, update it AND propagate up their ancestors
-///    (same as `update_ancestors`).
+/// 3. For existing nodes that new edges connect to: propagate up their
+///    ancestors via [`update_ancestors`].
 pub fn compute_initial(
     dag: &mut DerivationDag,
     sla: &SlaEstimator,
@@ -102,63 +102,8 @@ pub fn compute_initial(
         }
     }
 
-    // --- Step 2: topo-sort within the new set ---
-    // In-degree = number of PARENTS in the new set. Leaves (in-degree
-    // 0) go first. Kahn's algorithm.
-    //
-    // Priority flows UP from children to parents, so we need children
-    // processed first. For Kahn's algorithm, edges point child→parent
-    // (data flow). A node's in-degree = number of children in the new
-    // set. When all children are processed (in-degree = 0), process
-    // the node.
-    let mut in_degree: HashMap<DrvHash, usize> = HashMap::new();
-    for hash in newly_inserted {
-        let children_in_new = dag
-            .get_children(hash)
-            .into_iter()
-            .filter(|c| newly_inserted.contains(c))
-            .count();
-        in_degree.insert(hash.clone(), children_in_new);
-    }
-
-    let mut queue: VecDeque<DrvHash> = in_degree
-        .iter()
-        .filter(|&(_, &d)| d == 0)
-        .map(|(h, _)| h.clone())
-        .collect();
-
-    let mut topo_order = Vec::with_capacity(newly_inserted.len());
-    while let Some(hash) = queue.pop_front() {
-        topo_order.push(hash.clone());
-        // Processing this node → decrement parents' in-degree.
-        for parent in dag.get_parents(&hash) {
-            if let Some(d) = in_degree.get_mut(&parent) {
-                *d -= 1;
-                if *d == 0 {
-                    queue.push_back(parent);
-                }
-            }
-        }
-    }
-
-    // --- Step 3: compute priority in topo order ---
-    for hash in &topo_order {
-        let children = dag.get_children(hash);
-        // Max child priority. Children might be new (just computed)
-        // OR existing (already had priority from a prior merge).
-        // Either way, their priority is set by now.
-        //
-        // f64::max with 0.0 as identity: a leaf (no children) gets
-        // priority = est_duration + 0.0 = est_duration.
-        let max_child: f64 = children
-            .iter()
-            .filter_map(|c| dag.node(c).map(|n| n.sched.priority))
-            .fold(0.0, f64::max);
-
-        if let Some(state) = dag.node_mut(hash) {
-            state.sched.priority = state.sched.est_duration + max_child;
-        }
-    }
+    // --- Steps 2+3: topo-sort + recompute within the new set ---
+    topo_recompute(dag, newly_inserted);
 
     // --- Step 4: propagate to existing nodes if priority increased ---
     // A new edge might connect a new node to an existing one. The
@@ -179,78 +124,66 @@ pub fn compute_initial(
     }
 }
 
+/// `max(non-terminal children's priority)` — the recurrence's right
+/// operand. Terminal children contribute 0: a Completed child is no
+/// longer on the critical path (its work is done); a Poisoned/
+/// DependencyFailed child will never complete (including its priority
+/// would be misleading). A leaf returns 0.0.
+fn nonterminal_child_max(dag: &DerivationDag, hash: &str) -> f64 {
+    dag.get_children(hash)
+        .iter()
+        .filter_map(|c| {
+            dag.node(c).and_then(|n| {
+                if n.status().is_terminal() {
+                    None
+                } else {
+                    Some(n.sched.priority)
+                }
+            })
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Recompute `priority` for every node in `scope` in children-first
+/// topo order via [`DerivationDag::kahn_topo`]. Reads children OUTSIDE
+/// `scope` as-is (their priority is already settled). The single
+/// implementation of the recurrence — all three entry points call
+/// through here so they cannot diverge.
+fn topo_recompute(dag: &mut DerivationDag, scope: &HashSet<DrvHash>) {
+    for hash in dag.kahn_topo(scope) {
+        let max_child = nonterminal_child_max(dag, &hash);
+        if let Some(state) = dag.node_mut(&hash) {
+            state.sched.priority = state.sched.est_duration + max_child;
+        }
+    }
+}
+
 /// Incrementally update ancestor priorities after a node's priority
 /// might have changed (completion, or new subgraph connection).
 ///
-/// Walks UP from `from` via parents. For each ancestor, recomputes
-/// `priority = est_duration + max(non-terminal children's priority)`.
-/// If unchanged → stop walking this branch (dirty-flag propagation).
+/// BFS-collects the upward-reachable cone from `get_parents(from)`,
+/// then [`topo_recompute`]s the whole cone. The Kahn order guarantees
+/// every ancestor reads its children's *post-update* priorities — a
+/// skip-level edge (E→D plus E→A→B→D, ubiquitous in Nix:
+/// pkg→glibc + pkg→stdenv→…→glibc) cannot leave E reading A's stale
+/// value, because Kahn won't emit E until A is processed. The previous
+/// BFS+dirty-flag walk dequeued E at depth 1 before A at depth 2, and
+/// the visited-set blocked the corrective re-visit.
 ///
-/// # Why "non-terminal children"
-///
-/// A Completed child is no longer on the critical path — it's DONE.
-/// Its work doesn't block anything. Excluding it from the max means
-/// the parent's priority drops when a child completes, which is
-/// correct: the parent is less urgent now (less remaining work below).
-///
-/// Poisoned/DependencyFailed children are also excluded — they'll
-/// never complete, so including their priority would be misleading.
-///
-/// # O(affected ancestors)
-///
-/// The dirty-flag stop (unchanged → don't walk further) keeps this
-/// small in practice. A completion typically only affects a few
-/// ancestors before the max-child-priority stabilizes.
+/// O(ancestors + their out-degree) — same as the old BFS paid to walk
+/// the cone; the dirty-flag early-stop is dropped (it was the
+/// correctness hazard).
 pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
-    // BFS up. Visited set prevents re-processing in diamond-shaped DAGs
-    // (A→B, A→C, B→D, C→D: walking up from D reaches A twice).
-    let mut visited: HashSet<DrvHash> = HashSet::new();
+    let mut cone: HashSet<DrvHash> = HashSet::new();
     let mut queue: VecDeque<DrvHash> = dag.get_parents(from).into_iter().collect();
-
     while let Some(hash) = queue.pop_front() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        let children = dag.get_children(&hash);
-        // Max priority among NON-TERMINAL children. Terminal children
-        // contribute 0 (their work is done or never-will-be-done).
-        let max_child: f64 = children
-            .iter()
-            .filter_map(|c| {
-                dag.node(c).and_then(|n| {
-                    if n.status().is_terminal() {
-                        None
-                    } else {
-                        Some(n.sched.priority)
-                    }
-                })
-            })
-            .fold(0.0, f64::max);
-
-        let Some(state) = dag.node_mut(&hash) else {
-            continue;
-        };
-
-        let new_priority = state.sched.est_duration + max_child;
-        // Dirty-flag: if priority didn't change, our ancestors'
-        // priorities won't change either (we're the only path through
-        // us). Stop this branch.
-        //
-        // f64 exact equality is fine here: we're comparing a value we
-        // SET to the same arithmetic we're about to do. Either the
-        // inputs changed (different result) or they didn't (same
-        // result, no float drift).
-        if new_priority == state.sched.priority {
-            continue;
-        }
-
-        state.sched.priority = new_priority;
-        // Changed → walk further up.
-        for parent in dag.get_parents(&hash) {
-            queue.push_back(parent);
+        if cone.insert(hash.clone()) {
+            for parent in dag.get_parents(&hash) {
+                queue.push_back(parent);
+            }
         }
     }
+    topo_recompute(dag, &cone);
 }
 
 /// Full priority sweep of all non-terminal nodes.
@@ -536,6 +469,154 @@ mod tests {
 
         assert_eq!(dag.node("a").unwrap().sched.priority, 120.0, "a unchanged");
         assert_eq!(dag.node("d").unwrap().sched.priority, 180.0, "d unchanged");
+    }
+
+    /// bug_041: `full_sweep` previously read terminal children's stale
+    /// pre-completion priorities (step 3 had no `is_terminal()` filter),
+    /// reverting the decrement that `update_ancestors` correctly applied.
+    /// After the unification both go through `nonterminal_child_max`.
+    // r[verify sched.critical-path.incremental]
+    #[test]
+    fn full_sweep_excludes_terminal_children() {
+        // a→b→c, a/b/c = 10/20/30s.
+        let mut dag = DerivationDag::new();
+        let merge = dag
+            .merge(
+                Uuid::new_v4(),
+                &[node("a"), node("b"), node("c")],
+                &[edge("a", "b"), edge("b", "c")],
+                "",
+            )
+            .unwrap();
+        let sla = test_sla();
+        compute_initial(&mut dag, &sla, &no_builds(), &merge.newly_inserted);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
+
+        // Complete c; incremental update drops b→20, a→30.
+        dag.node_mut("c")
+            .unwrap()
+            .transition(DerivationStatus::Completed)
+            .unwrap();
+        update_ancestors(&mut dag, "c");
+        assert_eq!(dag.node("b").unwrap().sched.priority, 20.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 30.0);
+
+        // Full sweep must agree, not revert a to 60.
+        full_sweep(&mut dag, &sla, &no_builds());
+        assert_eq!(
+            dag.node("b").unwrap().sched.priority,
+            20.0,
+            "full_sweep must exclude terminal c from b's max-child"
+        );
+        assert_eq!(
+            dag.node("a").unwrap().sched.priority,
+            30.0,
+            "full_sweep must not revert a (was: re-included completed c → 60)"
+        );
+    }
+
+    /// bug_433: skip-level edge E→D plus E→A→B→D. The old BFS+visited
+    /// dequeued E at depth 1 before A at depth 2; E read A's stale
+    /// priority and the visited-set blocked the corrective re-visit.
+    /// Kahn over the cone makes the bug unrepresentable.
+    // r[verify sched.critical-path.incremental]
+    #[test]
+    fn update_ancestors_skip_level_converges() {
+        // E→A, A→B, B→D, E→D (skip-level). All 60s (empty SLA).
+        let mut dag = DerivationDag::new();
+        let merge = dag
+            .merge(
+                Uuid::new_v4(),
+                &[node("E"), node("A"), node("B"), node("D")],
+                &[
+                    edge("E", "A"),
+                    edge("A", "B"),
+                    edge("B", "D"),
+                    edge("E", "D"),
+                ],
+                "",
+            )
+            .unwrap();
+        compute_initial(&mut dag, &empty_sla(), &no_builds(), &merge.newly_inserted);
+        // D=60, B=120, A=180, E=max(A,D)+60=240.
+        assert_eq!(dag.node("E").unwrap().sched.priority, 240.0);
+
+        // Complete D. B→60, A→120, E→max(A=120, D-terminal)+60=180.
+        dag.node_mut("D")
+            .unwrap()
+            .transition(DerivationStatus::Completed)
+            .unwrap();
+        update_ancestors(&mut dag, "D");
+
+        assert_eq!(dag.node("B").unwrap().sched.priority, 60.0);
+        assert_eq!(dag.node("A").unwrap().sched.priority, 120.0);
+        assert_eq!(
+            dag.node("E").unwrap().sched.priority,
+            180.0,
+            "E must read A's POST-update priority (was: stale 180 → E=240)"
+        );
+    }
+
+    /// Structural invariant: incrementally completing leaves with
+    /// `update_ancestors` after each MUST yield the same priorities as
+    /// a `full_sweep` from the same DAG state. Seeded-random 50-node
+    /// DAG; deterministic across runs.
+    // r[verify sched.critical-path.incremental]
+    #[test]
+    fn full_sweep_agrees_with_incremental() {
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0xDA6C1);
+        const N: usize = 50;
+        let nodes: Vec<_> = (0..N).map(|i| node(&format!("n{i:02}"))).collect();
+        // Each node i>0 depends on up to 3 random earlier nodes (acyclic
+        // by construction, with skip-level edges).
+        let mut edges = Vec::new();
+        for i in 1..N {
+            let fanout = rng.random_range(1..=3.min(i));
+            let mut picked: HashSet<usize> = HashSet::new();
+            while picked.len() < fanout {
+                picked.insert(rng.random_range(0..i));
+            }
+            for j in picked {
+                edges.push(edge(&format!("n{i:02}"), &format!("n{j:02}")));
+            }
+        }
+        let mut dag = DerivationDag::new();
+        let merge = dag.merge(Uuid::new_v4(), &nodes, &edges, "").unwrap();
+        let sla = empty_sla();
+        compute_initial(&mut dag, &sla, &no_builds(), &merge.newly_inserted);
+
+        // Complete 10 random leaves (no children) incrementally.
+        let leaves: Vec<_> = (0..N)
+            .map(|i| format!("n{i:02}"))
+            .filter(|h| dag.get_children(h).is_empty())
+            .collect();
+        assert!(!leaves.is_empty(), "DAG has at least n00 as a leaf");
+        for h in leaves.iter().take(10) {
+            dag.node_mut(h)
+                .unwrap()
+                .transition(DerivationStatus::Completed)
+                .unwrap();
+            update_ancestors(&mut dag, h);
+        }
+        let snapshot: HashMap<String, f64> = (0..N)
+            .map(|i| {
+                let h = format!("n{i:02}");
+                let p = dag.node(&h).unwrap().sched.priority;
+                (h, p)
+            })
+            .collect();
+
+        full_sweep(&mut dag, &sla, &no_builds());
+
+        for (h, p) in &snapshot {
+            assert_eq!(
+                dag.node(h).unwrap().sched.priority,
+                *p,
+                "full_sweep diverged from incremental at {h}"
+            );
+        }
     }
 
     #[test]

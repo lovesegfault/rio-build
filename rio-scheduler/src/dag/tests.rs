@@ -103,16 +103,14 @@ fn test_initial_states() -> anyhow::Result<()> {
     let edges = vec![make_edge("hashA", "hashB")];
 
     let newly = dag.merge(build_id, &nodes, &edges, "")?.newly_inserted;
-    let states = dag.compute_initial_states(&newly);
+    let states: HashMap<_, _> = dag.compute_initial_states(&newly).into_iter().collect();
 
-    // B has no deps -> Ready; A has dep on B -> Queued
-    for (hash, status) in &states {
-        if hash == "hashB" {
-            assert_eq!(*status, DerivationStatus::Ready);
-        } else if hash == "hashA" {
-            assert_eq!(*status, DerivationStatus::Queued);
-        }
-    }
+    // B has no deps -> Ready; A has dep on B -> Queued. Assert both
+    // are present (the previous for-loop form passed vacuously on
+    // `vec![]`).
+    assert_eq!(states.len(), 2);
+    assert_eq!(states["hashB"], DerivationStatus::Ready);
+    assert_eq!(states["hashA"], DerivationStatus::Queued);
     Ok(())
 }
 
@@ -961,10 +959,17 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     );
 
     // update_ancestors when the completed node WAS the unique max-child
-    // (priority strictly higher than siblings) — the dirty-flag stop
-    // doesn't fire and the walk goes the full DAG depth. Set node 0's
-    // priority above its siblings, propagate up, then complete it and
-    // propagate the drop back up.
+    // (priority strictly higher than siblings) — the walk reaches the
+    // full DAG depth. Set node 0's priority above its siblings,
+    // propagate up, then complete it and propagate the drop back up.
+    //
+    // Node 0 was set Completed above (i=0 in the FANOUT loop) — flip it
+    // back to Queued first, otherwise the priority bump is invisible
+    // (terminal children are filtered) and both timed cases below
+    // measure a depth-1 no-op.
+    dag.node_mut("h00000000")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Queued);
     dag.node_mut("h00000000").unwrap().sched.priority = 1e9;
     time!(
         "update_ancestors(propagate-up)",
@@ -979,6 +984,23 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
         15000,
         crate::critical_path::update_ancestors(&mut dag, "h00000000")
     );
+
+    // remove_build_interest_and_reap on a sole-interest build with all
+    // nodes terminal: K reaps × O(degree) each ≈ O(E). Regression guard
+    // for the O(K×N) `values_mut()` full-scan in `remove_node` (~2e10
+    // ops at this scale → would blow well past 15s).
+    for i in FANOUT..N {
+        let h = format!("h{i:08}");
+        dag.node_mut(&h)
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Completed);
+    }
+    let reaped = time!(
+        "reap-all",
+        2000,
+        dag.remove_build_interest_and_reap(build_id)
+    );
+    assert_eq!(reaped, N, "all sole-interest terminal nodes reaped");
     Ok(())
 }
 
@@ -1853,5 +1875,182 @@ fn test_find_roots_no_parents_still_root() -> anyhow::Result<()> {
     let roots = dag.find_roots(build_id);
     assert_eq!(roots.len(), 1);
     assert!(roots.iter().any(|h| h == "solo"));
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate+2]
+/// bug_383: result-size cap, not pop-count cap. With one trigger and
+/// 5×MAX direct Queued parents (fanout >> 1), the OLD pop-count cap
+/// returned 5×MAX nodes (one pop, 5×MAX pushes) and reported
+/// `cap_hit=false` (pops=1 < MAX). The fix bounds `reachable.len()`
+/// inside the inner push loop.
+#[test]
+fn ca_cutoff_result_cap_with_fanout() {
+    let mut dag = DerivationDag::new();
+    let n_parents = MAX_CASCADE_NODES * 5;
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let mut nodes = vec![make_node_with_path("trig", &path(0), "x86_64-linux")];
+    let mut edges = Vec::with_capacity(n_parents);
+    for i in 1..=n_parents {
+        nodes.push(make_node_with_path(
+            &format!("p{i:05}"),
+            &path(i),
+            "x86_64-linux",
+        ));
+        edges.push(make_edge_with_paths(&path(i), &path(0)));
+    }
+    dag.merge(Uuid::new_v4(), &nodes, &edges, "").unwrap();
+    dag.node_mut("trig")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    for i in 1..=n_parents {
+        dag.node_mut(&format!("p{i:05}"))
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Queued);
+    }
+
+    let (skipped, cap_hit) = dag.cascade_cutoff("trig", |_| true);
+
+    assert!(
+        cap_hit,
+        "single high-fanout expand must report cap_hit (was: pops=1 → false)"
+    );
+    assert_eq!(
+        skipped.len(),
+        MAX_CASCADE_NODES,
+        "result bounded at MAX_CASCADE_NODES exactly (was: 5×MAX)"
+    );
+}
+
+/// bug_470: `merge()` upgrades a pre-existing node's empty traceparent,
+/// but the mutation wasn't tracked for rollback. After a cycle reject,
+/// the rejected build's traceparent permanently stuck; the next
+/// submitter's `is_empty()` check at the upgrade site is false, so the
+/// build that actually drives the node never links its trace.
+#[test]
+fn test_cyclic_merge_reverts_traceparent_upgrade() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // B1 merges X with traceparent="" (recovery/poison-reset path).
+    let b1 = Uuid::new_v4();
+    dag.merge(b1, &[make_node("hashX", "x86_64-linux")], &[], "")?;
+    assert_eq!(dag.node("hashX").expect("hashX").traceparent, "");
+
+    // B2 merges {X, A↔B cycle} with a real traceparent. The X-upgrade
+    // fires before the cycle is detected.
+    let b2 = Uuid::new_v4();
+    let result = dag.merge(
+        b2,
+        &[
+            make_node("hashX", "x86_64-linux"),
+            make_node("hashA", "x86_64-linux"),
+            make_node("hashB", "x86_64-linux"),
+        ],
+        &[make_edge("hashA", "hashB"), make_edge("hashB", "hashA")],
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    );
+    assert!(matches!(result, Err(DagError::CycleDetected)));
+
+    assert_eq!(
+        dag.node("hashX").expect("hashX").traceparent,
+        "",
+        "rejected build's traceparent must not stick (was: permanently set)"
+    );
+
+    // B3 (the build that actually drives X) now gets its trace linked.
+    let b3 = Uuid::new_v4();
+    let r3 = dag.merge(b3, &[make_node("hashX", "x86_64-linux")], &[], "00-b3-01")?;
+    assert_eq!(r3.traceparent_upgraded, vec!["hashX"]);
+    assert_eq!(dag.node("hashX").expect("hashX").traceparent, "00-b3-01");
+    Ok(())
+}
+
+// r[verify sched.merge.dep-failed-transitive]
+/// bug_051: `compute_initial_states` decided every node against the
+/// pre-call snapshot. For chain A→B→X with X already Poisoned
+/// (non-retriable) and A,B newly inserted: B sees X→DepFailed; A sees
+/// B=Created→Queued. Under keepGoing=true the runtime cascade is never
+/// reached for merge-seeded DepFailed — A stays Queued forever.
+#[rstest]
+#[case::two_hop(&["B"])]
+#[case::three_hop(&["C", "B"])]
+fn test_initial_states_transitive_dep_failed(#[case] mids: &[&str]) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // Pre-insert X as Poisoned at the resubmit-retry limit
+    // (non-retriable; merge won't reset it).
+    dag.merge(Uuid::new_v4(), &[make_node("X", "x86_64-linux")], &[], "")?;
+    {
+        let x = dag.nodes.get_mut("X").expect("X");
+        x.set_status_for_test(DerivationStatus::Poisoned);
+        x.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    // Merge chain A→[mids…]→X.
+    let mut chain: Vec<&str> = vec!["A"];
+    chain.extend_from_slice(mids);
+    chain.push("X");
+    let nodes: Vec<_> = chain.iter().map(|h| make_node(h, "x86_64-linux")).collect();
+    let edges: Vec<_> = chain.windows(2).map(|w| make_edge(w[0], w[1])).collect();
+    let newly = dag
+        .merge(Uuid::new_v4(), &nodes, &edges, "")?
+        .newly_inserted;
+    // X already existed and is non-retriable → not in newly_inserted.
+    assert!(!newly.contains("X"));
+
+    let states: HashMap<_, _> = dag.compute_initial_states(&newly).into_iter().collect();
+    assert_eq!(states.len(), chain.len() - 1);
+    for h in &chain[..chain.len() - 1] {
+        assert_eq!(
+            states[*h],
+            DerivationStatus::DependencyFailed,
+            "{h} must be DependencyFailed transitively (was: A→Queued, build hangs)"
+        );
+    }
+    Ok(())
+}
+
+/// bug_401 correctness half: `remove_node` scrubs only the removed
+/// node's neighbors via the bidirectional-edge invariant — not all
+/// edge sets, and not too few.
+#[test]
+fn test_remove_node_scrubs_only_neighbors() -> anyhow::Result<()> {
+    // Diamond a→{b,c}→d.
+    let mut dag = DerivationDag::new();
+    dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("a", "x86_64-linux"),
+            make_node("b", "x86_64-linux"),
+            make_node("c", "x86_64-linux"),
+            make_node("d", "x86_64-linux"),
+        ],
+        &[
+            make_edge("a", "b"),
+            make_edge("a", "c"),
+            make_edge("b", "d"),
+            make_edge("c", "d"),
+        ],
+        "",
+    )?;
+
+    dag.remove_node(&"b".into());
+
+    assert!(!dag.nodes.contains_key("b"));
+    assert!(!dag.children.contains_key("b"), "children[b] scrubbed");
+    assert!(!dag.parents.contains_key("b"), "parents[b] scrubbed");
+    assert_eq!(
+        dag.children["a"],
+        HashSet::from(["c".into()]),
+        "a's children: b scrubbed, c retained"
+    );
+    assert_eq!(
+        dag.parents["d"],
+        HashSet::from(["c".into()]),
+        "d's parents: b scrubbed, c retained"
+    );
+    // Unrelated entries untouched.
+    assert_eq!(dag.children["c"], HashSet::from(["d".into()]));
+    assert_eq!(dag.parents["c"], HashSet::from(["a".into()]));
     Ok(())
 }

@@ -200,6 +200,9 @@ The scheduler maintains a single global DAG across all concurrent build requests
 - **Input-addressed derivations**: deduplicated by store path
 - **Content-addressed derivations**: deduplicated by modular derivation hash (as computed by `hashDerivationModulo` --- excludes output paths, depends only on the derivation's fixed attributes)
 
+r[sched.merge.dep-failed-transitive]
+When a newly-merged node transitively depends on a node already in a failure-terminal state (`Poisoned`/`DependencyFailed`/`Cancelled`), it is seeded directly to `DependencyFailed` --- at any depth, not just immediate children. Under `keepGoing=true` this is the only path that resolves such nodes; without it the build hangs Active.
+
 r[sched.merge.shared-priority-max]
 Each derivation node tracks a set of interested builds. Shared derivations are built once; all interested builds are notified on completion. **A shared derivation's priority is `max(priority of all interested builds)`, updated on merge.** When a new build raises a shared node's priority, the node's position in the priority queue is updated.
 

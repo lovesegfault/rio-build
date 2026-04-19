@@ -11,14 +11,14 @@ use uuid::Uuid;
 
 use crate::state::{DerivationState, DerivationStatus, DrvHash};
 
-/// CA-cutoff cascade node-count cap. Bounds work on pathological DAGs
-/// (e.g., a linear chain of 100k Queued nodes would otherwise walk
-/// the whole thing synchronously inside a single completion handler).
-/// Each iteration is one `find_cutoff_eligible_speculative` call
-/// (O(fanout × children)), so 1000 iterations × typical fanout ≈
-/// low-thousands of nodes skipped per cascade — ample for real-world
-/// DAGs, bounded for adversarial ones. This is a NODE-COUNT cap (pops
-/// from the frontier stack), not a BFS tree-depth cap.
+/// CA-cutoff cascade result-size cap. Bounds the number of nodes
+/// transitioned `Queued`→`Skipped` per cascade so an adversarial DAG
+/// (e.g., a linear chain of 100k Queued nodes, or a single node with
+/// 100k Queued parents) cannot stall the single-threaded completion
+/// handler. The BFS in [`DerivationDag::speculative_cascade_reachable`]
+/// stops pushing once `reachable.len() == MAX_CASCADE_NODES` — a hard
+/// bound on the result, not on the number of `expand()` calls. Ample
+/// for real-world DAGs, bounded for adversarial ones.
 pub const MAX_CASCADE_NODES: usize = 1000;
 
 /// Errors from DAG operations.
@@ -59,6 +59,12 @@ pub struct MergeResult {
     /// Without this, a `{retriable-X, cycle}` submission would wipe X
     /// and reset its `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
     pub removed_retriable: Vec<(DrvHash, DerivationState)>,
+    /// Hashes of pre-existing nodes whose empty `traceparent` was
+    /// upgraded to `submitter_traceparent` by this merge. Rollback
+    /// clears it back to `""` so a rejected build's trace ID does not
+    /// permanently stick (subsequent submitters would see `is_empty()
+    /// == false` and never link THEIR trace).
+    pub traceparent_upgraded: Vec<DrvHash>,
 }
 
 /// The global derivation DAG maintained by the actor.
@@ -258,6 +264,8 @@ impl DerivationDag {
         // merge leaves the DAG exactly as it was (status, interest set,
         // retry.count toward POISON_RESUBMIT_RETRY_LIMIT all preserved).
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
+        // Pre-existing nodes whose empty traceparent was upgraded below.
+        let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
 
         // Insert or update nodes
         for node in nodes {
@@ -305,11 +313,16 @@ impl DerivationDag {
                 None
             };
 
+            // Every mutation in this branch MUST be tracked for
+            // `rollback_merge` — a failed merge restores the exact
+            // pre-merge DAG. Currently: `interested_builds` (via
+            // `interest_added`) and `traceparent` (via
+            // `traceparent_upgraded`).
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
-                    interest_added.push(drv_hash);
+                    interest_added.push(drv_hash.clone());
                 }
                 // First submitter's traceparent wins — but recovery/
                 // poison-reset set "", which isn't a submitter. Upgrade
@@ -317,6 +330,7 @@ impl DerivationDag {
                 // failover gets their trace linked to the worker span.
                 if existing.traceparent.is_empty() && !submitter_traceparent.is_empty() {
                     existing.traceparent = submitter_traceparent.to_string();
+                    traceparent_upgraded.push(drv_hash);
                 }
             } else {
                 // New node. try_from_node validates drv_path: StorePath::parse.
@@ -334,6 +348,7 @@ impl DerivationDag {
                             &newly_inserted,
                             &new_edges,
                             &interest_added,
+                            &traceparent_upgraded,
                             build_id,
                             removed_retriable,
                         );
@@ -430,6 +445,7 @@ impl DerivationDag {
                     &newly_inserted,
                     &new_edges,
                     &interest_added,
+                    &traceparent_upgraded,
                     build_id,
                     removed_retriable,
                 );
@@ -443,6 +459,7 @@ impl DerivationDag {
             new_edges,
             interest_added,
             removed_retriable,
+            traceparent_upgraded,
         })
     }
 
@@ -526,6 +543,7 @@ impl DerivationDag {
         newly_inserted: &HashSet<DrvHash>,
         new_edges: &[(DrvHash, DrvHash)],
         interest_added: &[DrvHash],
+        traceparent_upgraded: &[DrvHash],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
     ) {
@@ -584,6 +602,14 @@ impl DerivationDag {
                 state.interested_builds.remove(&build_id);
             }
         }
+
+        // Revert traceparent upgrades on pre-existing nodes. The prior
+        // value was always "" (the upgrade only fires on `is_empty()`).
+        for hash in traceparent_upgraded {
+            if let Some(state) = self.nodes.get_mut(hash) {
+                state.traceparent.clear();
+            }
+        }
     }
 
     // r[impl sched.state.transitions]
@@ -640,6 +666,49 @@ impl DerivationDag {
             .get(child_hash)
             .map(|p| p.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Kahn's topo-sort over `scope`, children-before-parents.
+    ///
+    /// In-degree of a node = number of its children that are also in
+    /// `scope`. When all in-scope children have been emitted (in-degree
+    /// 0), emit the node. Edges to nodes OUTSIDE `scope` are ignored —
+    /// callers that need their state read it directly (they're already
+    /// settled by the time `scope` is processed). Shared by
+    /// [`crate::critical_path`] (priority flows up from children) and
+    /// [`Self::compute_initial_states`] (DependencyFailed flows up from
+    /// children). `merge()` guarantees `scope` is acyclic.
+    pub(crate) fn kahn_topo(&self, scope: &HashSet<DrvHash>) -> Vec<DrvHash> {
+        use std::collections::VecDeque;
+        let mut in_degree: HashMap<DrvHash, usize> = scope
+            .iter()
+            .map(|h| {
+                let d = self
+                    .children
+                    .get(h)
+                    .map(|cs| cs.iter().filter(|c| scope.contains(*c)).count())
+                    .unwrap_or(0);
+                (h.clone(), d)
+            })
+            .collect();
+        let mut queue: VecDeque<DrvHash> = in_degree
+            .iter()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut order = Vec::with_capacity(scope.len());
+        while let Some(hash) = queue.pop_front() {
+            for parent in self.get_parents(&hash) {
+                if let Some(d) = in_degree.get_mut(&parent) {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(parent);
+                    }
+                }
+            }
+            order.push(hash);
+        }
+        order
     }
 
     /// Get all child drv_hashes that the given parent depends on.
@@ -734,7 +803,7 @@ impl DerivationDag {
 
     /// Generic BFS walk collecting all nodes reachable via
     /// `expand(current, visited)` from `trigger`, capped at `max_nodes`
-    /// pops. Pure, non-mutating — the caller decides what to do with
+    /// results. Pure, non-mutating — the caller decides what to do with
     /// the result (transition, store-verify, persist).
     ///
     /// Used by:
@@ -765,20 +834,21 @@ impl DerivationDag {
         let mut reachable = Vec::new();
         let mut visited: HashSet<DrvHash> = HashSet::new();
         let mut frontier = vec![trigger.clone()];
-        let mut pops = 0usize;
         let mut cap_hit = false;
-        while let Some(current) = frontier.pop() {
-            if pops >= max_nodes {
-                cap_hit = true;
-                break;
-            }
+        'walk: while let Some(current) = frontier.pop() {
             for next in expand(&current, &visited) {
                 if visited.insert(next.clone()) {
                     reachable.push(next.clone());
+                    // Result-size cap (NOT pop-count): a single
+                    // high-fanout `expand()` would otherwise blow past
+                    // `max_nodes` before the next outer-loop check.
+                    if reachable.len() >= max_nodes {
+                        cap_hit = true;
+                        break 'walk;
+                    }
                     frontier.push(next);
                 }
             }
-            pops += 1;
         }
         (reachable, cap_hit)
     }
@@ -807,8 +877,9 @@ impl DerivationDag {
     /// `expand`'s return → not added to visited → not treated
     /// as-if-Skipped → their parents stay ineligible (cascade halts).
     ///
-    /// Depth-capped at [`MAX_CASCADE_NODES`]. Returns
-    /// `(skipped_hashes, depth_cap_hit)`.
+    /// Result-capped at [`MAX_CASCADE_NODES`] — at most that many
+    /// nodes are transitioned to `Skipped` per call. Returns
+    /// `(skipped_hashes, cap_hit)`.
     pub fn cascade_cutoff(
         &mut self,
         trigger: &str,
@@ -903,14 +974,23 @@ impl DerivationDag {
         if let Some(state) = self.nodes.remove(hash) {
             self.path_to_hash.remove(state.drv_path().as_str());
         }
-        self.children.remove(hash);
-        self.parents.remove(hash);
-        // Also scrub this hash from other nodes' edge sets.
-        for children in self.children.values_mut() {
-            children.remove(hash);
+        // The bidirectional edge invariant (every entry in `children[P]`
+        // is mirrored by `parents[C]∋P`, and vice versa) means
+        // `children[hash]` is exactly the set of C with `parents[C]∋hash`,
+        // and `parents[hash]` exactly the set of P with `children[P]∋hash`.
+        // Scrub only those — O(degree), not O(N). The previous
+        // `values_mut()` full scan made `remove_build_interest_and_reap`
+        // O(K×N) for K reaped nodes (≈10¹⁰ ops on a 100k-node sole-build
+        // completion → minutes of single-threaded actor stall).
+        for c in self.children.remove(hash).into_iter().flatten() {
+            if let Some(ps) = self.parents.get_mut(&c) {
+                ps.remove(hash);
+            }
         }
-        for parents in self.parents.values_mut() {
-            parents.remove(hash);
+        for p in self.parents.remove(hash).into_iter().flatten() {
+            if let Some(cs) = self.children.get_mut(&p) {
+                cs.remove(hash);
+            }
         }
     }
 
@@ -923,25 +1003,42 @@ impl DerivationDag {
     /// directly to DependencyFailed (pre-poisoned detection).
     ///
     /// Returns lists of (drv_hash, new_status) transitions.
+    // r[impl sched.merge.dep-failed-transitive]
     pub fn compute_initial_states(
         &self,
         newly_inserted: &HashSet<DrvHash>,
     ) -> Vec<(DrvHash, DerivationStatus)> {
-        let mut transitions = Vec::new();
+        // Topo (children-first) so transitive DependencyFailed propagates
+        // within this call. Iterating `newly_inserted` in arbitrary order
+        // and reading the pre-call snapshot means for chain A→B→X
+        // (X pre-Poisoned, A and B newly inserted): B sees X→DepFailed,
+        // but A sees B=Created→Queued. Under keepGoing=true the only
+        // cascade trigger is the runtime-poison epilogue, never reached
+        // for merge-seeded DepFailed — A would stay Queued forever. The
+        // `will_fail` set lets A see B's just-decided DepFailed.
+        let mut transitions = Vec::with_capacity(newly_inserted.len());
+        let mut will_fail: HashSet<DrvHash> = HashSet::new();
 
-        for drv_hash in newly_inserted {
-            if self.all_deps_completed(drv_hash) {
+        for drv_hash in self.kahn_topo(newly_inserted) {
+            let dep_failed_in_this_call = self
+                .children
+                .get(&drv_hash)
+                .is_some_and(|cs| cs.iter().any(|c| will_fail.contains(c)));
+            if self.all_deps_completed(&drv_hash) {
                 // No deps or all deps already completed -> directly to ready
                 // We go created -> queued -> ready
-                transitions.push((drv_hash.clone(), DerivationStatus::Ready));
-            } else if self.any_dep_terminally_failed(drv_hash) {
-                // A dep is already poisoned/failed. This node cannot complete.
-                // Mark DependencyFailed so the build terminates instead of
-                // hanging forever with this node stuck in Queued.
-                transitions.push((drv_hash.clone(), DerivationStatus::DependencyFailed));
+                transitions.push((drv_hash, DerivationStatus::Ready));
+            } else if self.any_dep_terminally_failed(&drv_hash) || dep_failed_in_this_call {
+                // A dep is already poisoned/failed (or just decided
+                // DependencyFailed in THIS call). This node cannot
+                // complete. Mark DependencyFailed so the build
+                // terminates instead of hanging forever with this node
+                // stuck in Queued.
+                will_fail.insert(drv_hash.clone());
+                transitions.push((drv_hash, DerivationStatus::DependencyFailed));
             } else {
                 // Has incomplete deps -> queued (waiting for deps)
-                transitions.push((drv_hash.clone(), DerivationStatus::Queued));
+                transitions.push((drv_hash, DerivationStatus::Queued));
             }
         }
 

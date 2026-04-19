@@ -1280,6 +1280,7 @@ impl DagActor {
             &merge_result.newly_inserted,
             &merge_result.new_edges,
             &merge_result.interest_added,
+            &merge_result.traceparent_upgraded,
             build_id,
             merge_result.removed_retriable,
         );
