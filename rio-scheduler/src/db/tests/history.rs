@@ -536,3 +536,38 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `read_sla_overrides` filters by cluster: rows scoped to a different
+/// cluster are excluded; NULL-cluster rows match everywhere. Before
+/// the `cluster IS NULL OR cluster = $1` clause, a `cluster:"east"`
+/// row matched in every region under shared-PG.
+#[tokio::test]
+async fn read_sla_overrides_filters_cluster() -> anyhow::Result<()> {
+    use crate::db::SlaOverrideRow;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let mk = |cluster: Option<&str>| SlaOverrideRow {
+        pname: "hello".into(),
+        cluster: cluster.map(Into::into),
+        cores: Some(4.0),
+        ..Default::default()
+    };
+    db.insert_sla_override(&mk(Some("east"))).await?;
+    db.insert_sla_override(&mk(Some("west"))).await?;
+    db.insert_sla_override(&mk(None)).await?;
+
+    let east = db.read_sla_overrides("east", None).await?;
+    let clusters: Vec<_> = east.iter().map(|r| r.cluster.as_deref()).collect();
+    assert_eq!(east.len(), 2, "east + NULL only; got {clusters:?}");
+    assert!(clusters.contains(&Some("east")));
+    assert!(clusters.contains(&None));
+    assert!(!clusters.contains(&Some("west")), "other-cluster filtered");
+
+    // Single-cluster default (cluster="") sees only NULL rows.
+    let global = db.read_sla_overrides("", None).await?;
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].cluster, None);
+
+    Ok(())
+}

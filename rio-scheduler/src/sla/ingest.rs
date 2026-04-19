@@ -147,7 +147,10 @@ pub fn refit(
     } else {
         fit_duration_staged(&cs_f, &ts_f, &w_f, &gate)
     };
-    let mut mem = fit_memory(&cs, &ms, &w, n_eff);
+    let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff);
+    if weak {
+        super::metrics::mem_fit_weak(&key.tenant);
+    }
 
     // r[impl sched.sla.prior-partial-pool]
     // Shrinkage blend: w·θ_pname + (1−w)·θ_prior with w = n_eff/(n_eff+n0).
@@ -1283,7 +1286,7 @@ mod tests {
                 mem_base: 1 << 30,
                 deadline_secs: 3600,
             },
-            default_tier_p90: 300.0,
+            default_tier_target: 300.0,
         };
         let fit = r_prior(&rows, &priors);
         assert!(fit.n_eff >= 5.0);

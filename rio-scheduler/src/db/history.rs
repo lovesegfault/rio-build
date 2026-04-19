@@ -366,9 +366,16 @@ impl SchedulerDb {
     /// — fine, the table is operator-written (tens of rows, not
     /// thousands).
     ///
+    /// `cluster` filters out rows scoped to a different cluster:
+    /// `cluster IS NULL OR cluster = $1`. Under the global-DB topology
+    /// (ADR-023 §2.13) sibling tables `sla_ema_state`/`interrupt_samples`
+    /// already scope `WHERE cluster = $1`; without this filter a row
+    /// written with `cluster:"prod-east"` would match in every region.
+    ///
     /// [`SlaEstimator::refresh`]: crate::sla::SlaEstimator::refresh
     pub async fn read_sla_overrides(
         &self,
+        cluster: &str,
         pname: Option<&str>,
     ) -> Result<Vec<SlaOverrideRow>, sqlx::Error> {
         sqlx::query_as!(
@@ -381,9 +388,11 @@ impl SchedulerDb {
                    created_by
             FROM sla_overrides
             WHERE (expires_at IS NULL OR expires_at > now())
-              AND ($1::text IS NULL OR pname = $1)
+              AND (cluster IS NULL OR cluster = $1)
+              AND ($2::text IS NULL OR pname = $2)
             ORDER BY created_at DESC
             "#,
+            cluster,
             pname,
         )
         .fetch_all(&self.pool)

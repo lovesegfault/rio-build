@@ -490,8 +490,9 @@ message AppendInterruptSampleRequest {
 message SlaOverride {
   int64 id = 1;
   string pname = 2;
-  // NULL system/tenant = wildcard (r[sched.sla.override-precedence]:
-  // pname+system+tenant > pname+system > pname).
+  // NULL system/tenant/cluster = wildcard (r[sched.sla.override-precedence]:
+  // each set field adds +1 specificity; ties break newest-wins). Rows
+  // with cluster set to a DIFFERENT cluster are filtered server-side.
   optional string system = 3;
   optional string tenant = 4;
   optional string cluster = 5;
@@ -583,8 +584,9 @@ message SlaCandidateRow {
   string tier = 1;
   optional double c_star = 2;
   optional uint64 mem_bytes = 3;
-  // "p90" | "serial-floor" | "discriminant" | "core-ceiling" |
-  // "mem-ceiling" | "disk-ceiling" | "-" (feasible).
+  // "no-bounds" (tier has no p50/p90/p99 → feasible at cap_c) |
+  // "serial-floor" | "envelope" | "mem-ceiling" | "disk-ceiling" |
+  // "-" (feasible).
   string binding_constraint = 4;
   bool feasible = 5;
 }

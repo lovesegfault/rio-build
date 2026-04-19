@@ -568,10 +568,10 @@ fn now_epoch() -> f64 {
 /// 2. Pending-watch sees the pod still `Pending` after
 ///    `hw_fallback_after_secs` → [`Self::mark`]`(b₀, c₀)`, deletes the
 ///    pod, re-runs `solve_full` (which now skips `(b₀, c₀)`).
-/// 3. Repeat up to [`Self::ladder_cap`] times. On exhaust at the
-///    terminal tier, fail with `infeasible_total{reason=
-///    capacity_exhausted}`; on exhaust at a non-terminal tier, demote
-///    one tier and reset `attempted`.
+/// 3. Repeat up to [`Self::ladder_cap`] times. With every cell backed
+///    off, `solve_full` finds no candidate at any tier and falls
+///    through to `BestEffort` (emits `infeasible_total{reason=
+///    solve_infeasible}`).
 ///
 /// Step 2 is scheduler-side: the actor records `(drv_hash → (band,
 /// cap, emitted_at))` when `solve_intent_for` first emits a
@@ -619,8 +619,8 @@ impl IceBackoff {
         raw.clamp(1, 8)
     }
 
-    /// Count of currently-live backoff entries. For
-    /// `infeasible_total{reason=capacity_exhausted}` and tests.
+    /// Count of currently-live backoff entries. For tests and
+    /// debugging.
     pub fn live(&self) -> usize {
         let now = Instant::now();
         self.0.iter().filter(|e| *e.value() > now).count()
@@ -1331,27 +1331,17 @@ mod tests {
             ice.0.get(&(Band::Hi, Cap::Spot)).is_none(),
             "expired entry removed on read"
         );
-        // exhausted() walks all 6 cells via is_infeasible — same hazard.
+        // Same lazy-reap hazard across all 6 cells.
         for b in Band::ALL {
             for c in Cap::ALL {
                 ice.0.insert((b, c), Instant::now());
             }
         }
-        assert!(!ice.exhausted(), "all expired → not exhausted, no deadlock");
-    }
-
-    #[test]
-    fn exhausted_only_when_all_six_marked() {
-        let ice = IceBackoff::default();
-        assert!(!ice.exhausted());
         for b in Band::ALL {
-            ice.mark(b, Cap::Spot);
+            for c in Cap::ALL {
+                assert!(!ice.is_infeasible(b, c), "expired → false, no deadlock");
+            }
         }
-        assert!(!ice.exhausted(), "on-demand cells still open");
-        for b in Band::ALL {
-            ice.mark(b, Cap::OnDemand);
-        }
-        assert!(ice.exhausted());
     }
 
     #[test]

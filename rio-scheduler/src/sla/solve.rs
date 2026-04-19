@@ -32,11 +32,15 @@ pub struct Tier {
 
 impl Tier {
     /// The single percentile this tier is bounded by, in canonical
-    /// precedence p90→p50→p99 (`r[sched.sla.reassign-schmitt]`). All
-    /// consumers that need "the tier's bound" — `solve_tiers()` sort
-    /// order, `reassign_tier()` Schmitt walk — go through this so they
-    /// agree on which percentile is binding. Returns wall-seconds (tier
-    /// targets are operator-facing, not reference-seconds).
+    /// precedence p90→p50→p99 (`r[sched.sla.reassign-schmitt]`). `None`
+    /// for a no-bounds tier — callers treat that as "always met".
+    ///
+    /// Single source of truth: the explore ×4/÷2 gate, envelope hit/miss
+    /// scoring, prior basis, `solve_tiers()` sort order, and the
+    /// `reassign_tier()` Schmitt walk all read this so a p50-only tier
+    /// (legal config — `validate()` doesn't require p90) gets ONE answer.
+    /// Returns wall-seconds (tier targets are operator-facing, not
+    /// reference-seconds).
     pub fn binding_bound(&self) -> Option<f64> {
         self.p90.or(self.p50).or(self.p99)
     }
@@ -139,10 +143,11 @@ pub struct SlaPrediction {
     /// Tier the solve picked (`SolveResult::Feasible.tier`). `None` for
     /// `BestEffort` / probe / override.
     pub tier: Option<String>,
-    /// p90 target of `tier` at dispatch time. Captured here so
-    /// completion's hit/miss check is robust to the tier ladder being
-    /// reconfigured mid-build.
-    pub tier_p90: Option<f64>,
+    /// [`Tier::binding_bound`] of `tier` at dispatch time. Captured here
+    /// so completion's hit/miss check is robust to the tier ladder being
+    /// reconfigured mid-build. `None` ⇔ `tier` is `None` OR the picked
+    /// tier has no bounds.
+    pub tier_target: Option<f64>,
 }
 
 /// Derivation-declared sizing hints (from drv.env / drv.system-features).
@@ -355,6 +360,41 @@ pub fn solve_envelope(
     }))
 }
 
+/// [`solve_envelope`] wrapper for [`super::explain::explain`]: returns
+/// `(c_star, reason)` where `reason` is a `binding_constraint` string.
+/// Mirrors `solve_mvp`'s per-tier outcome so the explain table can't
+/// drift from what dispatch actually did.
+///
+/// `(Some(c), "-")` → feasible at `c`; `(Some(cap_c), "no-bounds")` →
+/// no-bounds tier (matches `solve_envelope`'s `cap_c` early return);
+/// `(None, "serial-floor")` → `S` alone breaches the bound (no `c`
+/// helps); `(None, "envelope")` → infeasible at `cap_c` for some other
+/// reason (p50/p99 bound, or USL contention floor).
+pub fn explain_envelope(
+    fit: &FittedParams,
+    tier: &Tier,
+    cap_c: f64,
+) -> (Option<f64>, &'static str) {
+    if tier.p50.is_none() && tier.p90.is_none() && tier.p99.is_none() {
+        return (Some(cap_c), "no-bounds");
+    }
+    match solve_envelope(fit, tier, 1.0, cap_c, 1.0, 0.0) {
+        Some(c) => (Some(c.0), "-"),
+        None => {
+            // Distinguish "serial floor breaches the bound" from the
+            // general "envelope rejected at cap_c" so `sla explain`
+            // points the operator at S vs the tier targets. S is
+            // hw_factor=1 / lambda=0 here (matches solve_mvp).
+            let (s, _, _) = fit.fit.spq();
+            if tier.binding_bound().is_some_and(|b| s >= b) {
+                (None, "serial-floor")
+            } else {
+                (None, "envelope")
+            }
+        }
+    }
+}
+
 // r[impl sched.sla.solve-citardauq]
 // r[impl sched.sla.solve-reject-not-clamp]
 pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveResult {
@@ -395,11 +435,20 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
     {
         super::cost::ceiling_exhausted();
     }
-    // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
-    // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
-    // `solve_intent_for`'s floor.max() composes (a `disk_p90 > max_disk`
-    // here used to spawn a permanently-Pending pod). `cap_c` already
-    // includes `c_opt` so a USL fit isn't pushed into its slowdown region.
+    best_effort(fit, cap_c, h, disk, ceil)
+}
+
+/// `BestEffort` constructor shared by [`solve_mvp`] / [`solve_full`]:
+/// returns the clamped fallback shape. Callers emit the appropriate
+/// `rio_scheduler_sla_infeasible_total{reason=…}` (ceiling vs capacity)
+/// before calling — the gate differs between mvp/full.
+///
+/// D4: clamp at `ceil.max_*` — the Feasible arm gates on `mem/disk >
+/// ceil` (reject-not-clamp); BestEffort must clamp so
+/// `solve_intent_for`'s floor.max() composes (a `disk_p90 > max_disk`
+/// here used to spawn a permanently-Pending pod). `cap_c` already
+/// includes `c_opt` so a USL fit isn't pushed into its slowdown region.
+fn best_effort(fit: &FittedParams, cap_c: f64, h: f64, disk: u64, ceil: &Ceilings) -> SolveResult {
     let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
         c: RawCores(cap_c),
@@ -517,18 +566,9 @@ pub fn solve_full(
     {
         super::cost::ceiling_exhausted();
     }
-    // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
-    // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
-    // `solve_intent_for`'s floor.max() composes. `cap_c` already
-    // includes `c_opt` so a USL fit isn't pushed into its slowdown
-    // region (e.g. p̄=∞ with c_opt=20 must NOT return 64).
-    let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * h) as u64).min(ceil.max_mem);
-    SolveResult::BestEffort {
-        c: RawCores(cap_c),
-        mem: MemBytes(mem),
-        disk: DiskBytes(disk.min(ceil.max_disk)),
-        node_selector: None,
-    }
+    // `cap_c` already includes `c_opt` so a USL fit isn't pushed into
+    // its slowdown region (e.g. p̄=∞ with c_opt=20 must NOT return 64).
+    best_effort(fit, cap_c, h, disk, ceil)
 }
 
 /// Weighted-random pick over `candidates` by `exp(-e_cost/min/temp)`.

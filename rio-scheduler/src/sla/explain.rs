@@ -8,7 +8,7 @@
 
 use super::fit::headroom;
 use super::r#override::ResolvedTarget;
-use super::solve::{Ceilings, Tier};
+use super::solve::{self, Ceilings, Tier};
 use super::types::{DurationFit, FittedParams, MemFit, ModelKey, RawCores};
 
 /// One tier's solve attempt. `c_star`/`mem` are populated as far as the
@@ -19,9 +19,10 @@ pub struct CandidateRow {
     pub tier: String,
     pub c_star: Option<f64>,
     pub mem: Option<u64>,
-    /// `"p90"` (no p90 target on this tier) | `"serial-floor"` (β≥0) |
-    /// `"discriminant"` (disc<0) | `"core-ceiling"` (c*>cap_c) |
-    /// `"mem-ceiling"` | `"disk-ceiling"` | `"-"` (feasible).
+    /// `"no-bounds"` (tier has no p50/p90/p99 → feasible at `cap_c`) |
+    /// `"serial-floor"` (S alone breaches the bound) | `"envelope"`
+    /// (infeasible at `cap_c` against the tier's p50∧p90∧p99 envelope)
+    /// | `"mem-ceiling"` | `"disk-ceiling"` | `"-"` (feasible).
     pub binding_constraint: String,
     pub feasible: bool,
 }
@@ -106,7 +107,6 @@ pub fn explain(
         .filter(|t| pinned.is_none_or(|p| p == t.name))
         .collect();
 
-    let (s, p, q) = fit.fit.spq();
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
@@ -120,35 +120,17 @@ pub fn explain(
             binding_constraint: "-".into(),
             feasible: false,
         };
-        let Some(p90) = tier.p90 else {
-            row.binding_constraint = "p90".into();
+        // Delegate to the same `solve_envelope` `solve_mvp` calls so the
+        // two cannot drift. `explain_envelope` already handles no-bounds
+        // (→ cap_c, feasible) and the cap_c ceiling (→ None) so the
+        // separate `c_star > cap_c` core-ceiling check is gone.
+        let (c_star, reason) = solve::explain_envelope(fit, tier, cap_c);
+        row.binding_constraint = reason.into();
+        let Some(c_star) = c_star else {
             candidates.push(row);
             continue;
-        };
-        let beta = s - (-1.2816 * fit.sigma_resid).exp() * p90;
-        if beta >= 0.0 {
-            row.binding_constraint = "serial-floor".into();
-            candidates.push(row);
-            continue;
-        }
-        let disc = beta * beta - 4.0 * q * p;
-        if disc < 0.0 {
-            row.binding_constraint = "discriminant".into();
-            candidates.push(row);
-            continue;
-        }
-        let denom = -0.5 * (beta + beta.signum() * disc.sqrt());
-        let c_star = if denom.abs() < 1e-12 {
-            f64::INFINITY
-        } else {
-            (p / denom).max(1.0)
         };
         row.c_star = Some(c_star);
-        if c_star > cap_c {
-            row.binding_constraint = "core-ceiling".into();
-            candidates.push(row);
-            continue;
-        }
         let mem = (fit.mem.at(RawCores(c_star)).0 as f64 * h) as u64;
         row.mem = Some(mem);
         if mem > ceil.max_mem {
@@ -267,7 +249,7 @@ mod tests {
 
     #[test]
     fn records_every_tier_with_reason() {
-        // t0=60 → c* > p̄=4 → core-ceiling; t1=600 → feasible.
+        // t0=60 → infeasible at cap_c=p̄=4 → envelope; t1=600 → feasible.
         let fit = mk_fit(30.0, 100.0, 0.0, 4.0);
         let r = explain(
             &key(),
@@ -278,9 +260,9 @@ mod tests {
         );
         assert_eq!(r.candidates.len(), 2);
         assert_eq!(r.candidates[0].tier, "t0");
-        assert_eq!(r.candidates[0].binding_constraint, "core-ceiling");
+        assert_eq!(r.candidates[0].binding_constraint, "envelope");
         assert!(!r.candidates[0].feasible);
-        assert!(r.candidates[0].c_star.is_some());
+        assert!(r.candidates[0].c_star.is_none());
         assert_eq!(r.candidates[1].tier, "t1");
         assert!(r.candidates[1].feasible);
         assert_eq!(r.candidates[1].binding_constraint, "-");
@@ -289,7 +271,7 @@ mod tests {
 
     #[test]
     fn serial_floor_has_no_cstar() {
-        // S=400 > target → β≥0, quadratic never formed.
+        // S=400 > target → no c can help.
         let fit = mk_fit(400.0, 100.0, 0.0, 64.0);
         let r = explain(&key(), Some(&fit), &[t("t0", 300.0)], &ceil(), None);
         assert_eq!(r.candidates[0].binding_constraint, "serial-floor");
@@ -297,10 +279,52 @@ mod tests {
     }
 
     #[test]
-    fn discriminant_reject() {
+    fn envelope_reject() {
+        // USL contention floor: solve_envelope returns None at cap_c.
         let fit = mk_fit(30.0, 2000.0, 5.0, 64.0);
         let r = explain(&key(), Some(&fit), &[t("t0", 50.0)], &ceil(), None);
-        assert_eq!(r.candidates[0].binding_constraint, "discriminant");
+        assert_eq!(r.candidates[0].binding_constraint, "envelope");
+    }
+
+    #[test]
+    fn explain_matches_solve_mvp_on_chart_defaults() {
+        // helm-default-shaped ladder: a bounded `normal` tier and a
+        // no-bounds `best-effort` tier. A fit infeasible at `normal`
+        // (S=400 > p90=300) must show `best-effort` as FEASIBLE at
+        // cap_c — that's what `solve_mvp` dispatches it at. Before the
+        // `explain_envelope` delegation, the stale p90-only citardauq
+        // here marked `best-effort` as `binding_constraint="p90"` /
+        // `feasible=false`, contradicting dispatch.
+        let fit = mk_fit(400.0, 100.0, 0.0, 64.0);
+        let tiers = [
+            Tier {
+                name: "normal".into(),
+                p50: Some(120.0),
+                p90: Some(300.0),
+                p99: Some(1200.0),
+            },
+            Tier {
+                name: "best-effort".into(),
+                p50: None,
+                p90: None,
+                p99: None,
+            },
+        ];
+        let r = explain(&key(), Some(&fit), &tiers, &ceil(), None);
+        assert_eq!(r.candidates[1].tier, "best-effort");
+        assert!(r.candidates[1].feasible, "no-bounds tier always feasible");
+        assert_eq!(r.candidates[1].c_star, Some(64.0), "cap_c, not c_lo");
+        assert_eq!(r.candidates[1].binding_constraint, "no-bounds");
+        // And the bounded tier agrees with solve_mvp's reject.
+        assert!(!r.candidates[0].feasible);
+        // Cross-check first-feasible: explain and solve_mvp pick the
+        // same tier.
+        let solve::SolveResult::Feasible { tier, .. } = solve::solve_mvp(&fit, &tiers, &ceil())
+        else {
+            panic!()
+        };
+        let first_feasible = r.candidates.iter().find(|c| c.feasible).unwrap();
+        assert_eq!(first_feasible.tier, tier);
     }
 
     #[test]

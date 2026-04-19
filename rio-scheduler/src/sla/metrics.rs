@@ -14,7 +14,7 @@ pub fn describe_all() {
     describe_histogram!(
         "rio_scheduler_sla_prediction_ratio",
         Unit::Count,
-        "actual/predicted, by dimension (labeled dim=wall|mem|disk). \
+        "actual/predicted, by dimension (labeled dim=wall|mem). \
          1.0=perfect; >1.0=under-predicted."
     );
     describe_counter!(
@@ -133,11 +133,11 @@ pub struct CompletionScore {
 /// prediction (`pred.wall_secs`) is in **reference-seconds** — `t_at()`
 /// evaluates the ref-second-denominated fit — so `ratio_wall` first maps
 /// `actual_wall` to the same timeline. The envelope check stays
-/// wall-vs-wall (`tier_p90` is the operator-facing wall-second SLA).
+/// wall-vs-wall (`tier_target` is the operator-facing wall-second SLA).
 /// Pass `1.0` for unknown/absent hw_class.
 ///
-/// Envelope: `miss` if wall blew the tier's p90 OR memory blew the
-/// reservation (`constraint` names which). Memory-miss is the
+/// Envelope: `miss` if wall blew the tier's binding bound OR memory
+/// blew the reservation (`constraint` names which). Memory-miss is the
 /// OOM-adjacent case — the build fit because the controller's headroom
 /// pad absorbed it, but the model under-predicted.
 pub fn score_completion(
@@ -153,7 +153,7 @@ pub fn score_completion(
     let ratio_mem =
         (actual_mem > 0 && pred.mem_bytes > 0).then(|| actual_mem as f64 / pred.mem_bytes as f64);
     let envelope = pred.tier.as_ref().map(|tier| {
-        let wall_miss = pred.tier_p90.is_some_and(|p90| actual_wall > p90);
+        let wall_miss = pred.tier_target.is_some_and(|t| actual_wall > t);
         let mem_miss = actual_mem > 0 && actual_mem > pred.mem_bytes;
         let (result, constraint) = if wall_miss {
             ("miss", "wall")
@@ -188,12 +188,12 @@ pub fn emit_completion_score(s: &CompletionScore) {
 mod tests {
     use super::*;
 
-    fn pred(wall: f64, mem: u64, tier: &str, p90: f64) -> SlaPrediction {
+    fn pred(wall: f64, mem: u64, tier: &str, target: f64) -> SlaPrediction {
         SlaPrediction {
             wall_secs: Some(wall),
             mem_bytes: mem,
             tier: Some(tier.into()),
-            tier_p90: Some(p90),
+            tier_target: Some(target),
         }
     }
 
@@ -230,7 +230,7 @@ mod tests {
             wall_secs: Some(90.0),
             mem_bytes: 2 << 30,
             tier: None,
-            tier_p90: None,
+            tier_target: None,
         };
         assert_eq!(score_completion(100.0, 1.0, 1 << 30, &p).envelope, None);
     }

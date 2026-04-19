@@ -127,7 +127,10 @@ pub struct PriorSources {
     pub seed: HashMap<SeedKey, FitParams>,
     pub fleet: Option<FitParams>,
     pub operator: ProbeShape,
-    pub default_tier_p90: f64,
+    /// [`Tier::binding_bound`](super::solve::Tier::binding_bound) of
+    /// `[sla].default_tier`. Feeds [`operator_to_spq`]'s "a build the
+    /// operator expects to take `target` on `probe.cpu` cores".
+    pub default_tier_target: f64,
 }
 
 // r[impl sched.sla.prior-partial-pool]
@@ -142,27 +145,27 @@ pub fn prior_for(key: &ModelKey, src: &PriorSources) -> (FitParams, PriorSource)
     }
     if let Some(f) = &src.fleet {
         return (
-            clamp_to_operator(f, &src.operator, src.default_tier_p90),
+            clamp_to_operator(f, &src.operator, src.default_tier_target),
             PriorSource::Fleet,
         );
     }
     (
-        operator_to_spq(&src.operator, src.default_tier_p90),
+        operator_to_spq(&src.operator, src.default_tier_target),
         PriorSource::Operator,
     )
 }
 
 /// Map the operator's linear probe `{cpu, mem_per_core, mem_base}` into
 /// the (S, P, Q, a, b) basis. ADR §2.10: a build that the operator
-/// expects to take `tier_p90` on `probe.cpu` cores, half-serial half-
-/// parallel, with `M(c) = mem_base + c·mem_per_core`.
+/// expects to take `tier_target` on `probe.cpu` cores, half-serial
+/// half-parallel, with `M(c) = mem_base + c·mem_per_core`.
 ///
 /// `b = 1` (linear M(c) in log-log is slope 1 only at one point, but
 /// b=1 is the closest power-law to "linear in c"); `a = ln(M(1))`;
-/// `P = (p90/2)·cpu` (the parallel half scaled to 1 core);
-/// `S = p90/2`; `Q = 0`. Then `T(probe.cpu) = S + P/cpu = p90`.
-pub fn operator_to_spq(probe: &ProbeShape, tier_p90: f64) -> FitParams {
-    let half = tier_p90 / 2.0;
+/// `P = (target/2)·cpu` (the parallel half scaled to 1 core);
+/// `S = target/2`; `Q = 0`. Then `T(probe.cpu) = S + P/cpu = target`.
+pub fn operator_to_spq(probe: &ProbeShape, tier_target: f64) -> FitParams {
+    let half = tier_target / 2.0;
     FitParams {
         s: half,
         p: half * probe.cpu,
@@ -199,8 +202,8 @@ pub fn partial_pool(
 /// operator's probe is stale) — either way the operator's number wins
 /// at the band edge. Parameters whose operator value is zero (Q) are
 /// passed through unclamped: a [0.5×0, 2×0] band is degenerate.
-fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_p90: f64) -> FitParams {
-    let basis = operator_to_spq(op, tier_p90);
+fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_target: f64) -> FitParams {
+    let basis = operator_to_spq(op, tier_target);
     FitParams {
         s: clamp_field(fleet.s, basis.s, "s", false),
         p: clamp_field(fleet.p, basis.p, "p", false),
@@ -371,7 +374,7 @@ mod tests {
             seed,
             fleet: Some(fleet.clone()),
             operator: probe(),
-            default_tier_p90: 300.0,
+            default_tier_target: 300.0,
         };
         // exact-(pname,system) seed wins — tenant-agnostic, so a t1 key
         // hits the same seed.
@@ -389,7 +392,7 @@ mod tests {
             seed: HashMap::new(),
             fleet: None,
             operator: probe(),
-            default_tier_p90: 300.0,
+            default_tier_target: 300.0,
         };
         let (fp, prov) = prior_for(&key("world"), &src2);
         assert_eq!(prov, PriorSource::Operator);
@@ -579,7 +582,7 @@ mod tests {
             seed: HashMap::new(),
             fleet: Some(fp(150.0, 5000.0, 0.0, a_13gi, 1.0)),
             operator: probe(),
-            default_tier_p90: 300.0,
+            default_tier_target: 300.0,
         };
         let (got, prov) = prior_for(&key("anything"), &src);
         assert_eq!(prov, PriorSource::Fleet);

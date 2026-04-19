@@ -2,10 +2,13 @@
 //!
 //! Drives the cold-start probe ladder before a key has enough span/n_eff
 //! for `solve_mvp`. Walks `c` away from `cfg.probe.cpu` — ×4 up while
-//! the last build saturated AND missed its tier's p90, ÷2 down
-//! otherwise — until the observed `[min_c, max_c]` span reaches 4× (the
-//! fit gate), or hits a wall (`max_cores` / `1`). At that point the
-//! ladder freezes and `intent_for` switches to the solve path.
+//! the last build saturated AND missed its tier's SLA target
+//! ([`Tier::binding_bound`]), ÷2 down otherwise — until the observed
+//! `[min_c, max_c]` span reaches 4× (the fit gate), or hits a wall
+//! (`max_cores` / `1`). At that point the ladder freezes and
+//! `intent_for` switches to the solve path.
+//!
+//! [`Tier::binding_bound`]: super::solve::Tier::binding_bound
 
 use super::config::SlaConfig;
 use super::fit::headroom;
@@ -65,8 +68,8 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     if frozen(st, cfg.max_cores) {
         return decision(st.max_c.0, mem_for, disk);
     }
-    let target_p90 = tier_p90(f, cfg);
-    if st.saturated && st.last_wall.0 > target_p90 {
+    let target = tier_target(f, cfg);
+    if st.saturated && st.last_wall.0 > target {
         let c_up = (st.max_c.0 * 4.0).min(cfg.max_cores);
         if st.distinct_c >= 3 && c_up >= cfg.max_cores {
             metrics::suspicious_scaling(&f.key.tenant);
@@ -80,13 +83,21 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
 
 /// Freeze predicate, shared with [`super::solve::intent_for`]'s gate so
 /// "explore done" and "solve takes over" agree on the same boundary.
+///
+/// The wall checks are gated on `distinct_c >= 2`: a probe configured
+/// at the wall (`probe.cpu == max_cores` or `== 1.0`, both permitted by
+/// `validate()`) lands its first sample with `min_c == max_c == wall`;
+/// without the guard that's `frozen=true` → re-emit `wall` forever and
+/// the ladder never walks. With the guard, the first sample is treated
+/// as "started at the wall" (walk away from it), not "walked to the
+/// wall" (freeze).
 pub(crate) fn frozen(st: &super::types::ExploreState, max_cores: f64) -> bool {
     let span = if st.min_c.0 > 0.0 {
         st.max_c.0 / st.min_c.0
     } else {
         1.0
     };
-    span >= 4.0 || st.max_c.0 >= max_cores || st.min_c.0 <= 1.0
+    span >= 4.0 || (st.distinct_c >= 2 && (st.max_c.0 >= max_cores || st.min_c.0 <= 1.0))
 }
 
 fn decision(c: f64, mem_for: impl Fn(f64) -> MemBytes, disk: DiskBytes) -> ExploreDecision {
@@ -97,15 +108,17 @@ fn decision(c: f64, mem_for: impl Fn(f64) -> MemBytes, disk: DiskBytes) -> Explo
     }
 }
 
-/// p90 of `fit.tier` if assigned, else `cfg.default_tier`, else 1200s.
-/// Uses the config-side tier list (not `solve_tiers()`) since we only
-/// need a name lookup.
-fn tier_p90(fit: &FittedParams, cfg: &SlaConfig) -> f64 {
+/// [`Tier::binding_bound`] of `fit.tier` if assigned, else
+/// `cfg.default_tier`, else 1200s. Uses the config-side tier list (not
+/// `solve_tiers()`) since we only need a name lookup.
+///
+/// [`Tier::binding_bound`]: super::solve::Tier::binding_bound
+fn tier_target(fit: &FittedParams, cfg: &SlaConfig) -> f64 {
     cfg.tiers
         .iter()
         .find(|t| Some(&t.name) == fit.tier.as_ref())
         .or_else(|| cfg.tiers.iter().find(|t| t.name == cfg.default_tier))
-        .and_then(|t| t.p90)
+        .and_then(super::solve::Tier::binding_bound)
         .unwrap_or(1200.0)
 }
 
@@ -214,14 +227,40 @@ mod tests {
 
     // r[verify sched.sla.explore-freeze]
     #[test]
+    fn probe_at_ceiling_walks_down_not_freeze() {
+        // probe.cpu == max_cores: first sample lands min=max=64,
+        // distinct_c=1. Without the `distinct_c >= 2` guard this is
+        // frozen → re-emit 64 forever (the ceiling case never self-
+        // heals: solve_mvp's BestEffort fallback also returns
+        // cap_c=max_cores for Probe fits, so span never widens).
+        let f = fit(st(64.0, 64.0, 1, false, 100.0));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            32.0,
+            "single sample at ceiling → walk down, not freeze"
+        );
+        // probe.cpu == 1.0: same shape at the floor. (This case did
+        // self-heal after 3 wasted builds via BestEffort→max_cores,
+        // but it's still 3 wasted builds.)
+        let f = fit(st(1.0, 1.0, 1, true, 1500.0));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            4.0,
+            "single sample at floor → ×4, not freeze"
+        );
+        // Two distinct samples that reached the wall → freeze (the
+        // ladder DID walk there).
+        let f = fit(st(32.0, 64.0, 2, true, 1500.0));
+        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 64.0);
+    }
+
+    // r[verify sched.sla.explore-freeze]
+    #[test]
     fn freeze_at_span4() {
         // span = 16/4 = 4 → frozen, re-emit max_c.
         let f = fit(st(4.0, 16.0, 2, true, 1500.0));
         assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 16.0);
-        // max_c at ceiling → frozen.
-        let f = fit(st(32.0, 64.0, 2, true, 1500.0));
-        assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 64.0);
-        // min_c hit floor → frozen.
+        // min_c hit floor (after walking) → frozen.
         let f = fit(st(1.0, 2.0, 2, false, 100.0));
         assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 2.0);
     }
@@ -277,6 +316,39 @@ mod tests {
         let f = fit(st(32.0, 32.0, 1, false, 200.0));
         let d = next(Some(&f), &cfg(), &DrvHints::default());
         assert_eq!(d.mem.0, 16 * (2 << 30) + (4 << 30));
+    }
+
+    #[test]
+    fn tier_target_falls_back_to_p50() {
+        // p50-only tier (legal config): before `Tier::binding_bound`,
+        // `tier_p90` read `t.p90` only → None → 1200s default. With
+        // `fit.tier=Some("bulk")` (p50=7200) and last_wall=1500:
+        // 1500 < 7200 → ÷2 (correct); 1500 > 1200 → ×4 (the bug).
+        let mut c = cfg();
+        c.tiers = vec![
+            Tier {
+                name: "bulk".into(),
+                p50: Some(7200.0),
+                p90: None,
+                p99: None,
+            },
+            Tier {
+                name: "normal".into(),
+                p50: None,
+                p90: Some(1200.0),
+                p99: None,
+            },
+        ];
+        let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
+        f.tier = Some("bulk".into());
+        assert_eq!(
+            next(Some(&f), &c, &DrvHints::default()).c.0,
+            2.0,
+            "1500s met bulk's p50=7200 → halve, not ×4"
+        );
+        // Control: same fit on the p90-bounded tier still ×4's.
+        f.tier = Some("normal".into());
+        assert_eq!(next(Some(&f), &c, &DrvHints::default()).c.0, 16.0);
     }
 
     #[test]

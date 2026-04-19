@@ -528,7 +528,7 @@ impl DagActor {
                         .collect::<Vec<_>>()
                 });
                 let tiers = pinned.as_deref().unwrap_or(&self.sla_tiers);
-                let (tier, tier_p90) = if no_tier {
+                let (tier, tier_target) = if no_tier {
                     (None, None)
                 } else {
                     match full
@@ -541,7 +541,7 @@ impl DagActor {
                             self.sla_tiers
                                 .iter()
                                 .find(|t| t.name == *tier)
-                                .and_then(|t| t.p90),
+                                .and_then(solve::Tier::binding_bound),
                         ),
                         solve::SolveResult::BestEffort { .. } => (None, None),
                     }
@@ -550,7 +550,7 @@ impl DagActor {
                     wall_secs: Some(f.fit.t_at(RawCores(f64::from(cores))).0),
                     mem_bytes: mem,
                     tier,
-                    tier_p90,
+                    tier_target,
                 }
             });
         SolvedIntent {

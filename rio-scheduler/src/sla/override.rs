@@ -37,13 +37,21 @@ impl From<&SlaOverrideRow> for ResolvedTarget {
 }
 
 /// Specificity rank for precedence ordering. Higher = more specific.
-/// `pname` is required (every row has it), so the three tiers are:
-/// `pname`-only (0) < `pname+system` OR `pname+tenant` (1) <
-/// `pname+system+tenant` (2). `system` and `tenant` are treated
-/// symmetrically — neither is "more specific" than the other; ties
-/// break on `created_at` (newest wins).
+/// `pname` is required (every row has it), so the range is 0..=3:
+/// `pname`-only (0) < +1 each for `cluster`/`system`/`tenant` set.
+/// All three are treated symmetrically — none is "more specific" than
+/// another; ties break on `created_at` (newest wins).
+///
+/// `cluster` participates in the rank so a `{pname, cluster:"east"}`
+/// row beats a global `{pname}` row regardless of `created_at` — under
+/// the shared-PG topology a per-cluster pin must not be silently
+/// shadowed by a later all-clusters pin. Rows for OTHER clusters are
+/// already filtered out at SQL read time
+/// ([`SchedulerDb::read_sla_overrides`]).
+///
+/// [`SchedulerDb::read_sla_overrides`]: crate::db::SchedulerDb::read_sla_overrides
 fn specificity(r: &SlaOverrideRow) -> u8 {
-    u8::from(r.system.is_some()) + u8::from(r.tenant.is_some())
+    u8::from(r.cluster.is_some()) + u8::from(r.system.is_some()) + u8::from(r.tenant.is_some())
 }
 
 // r[impl sched.sla.override-precedence]
@@ -177,5 +185,27 @@ mod tests {
     #[test]
     fn empty_overrides_is_none() {
         assert!(resolve(&key("hello", "x", "t"), &[]).is_none());
+    }
+
+    #[test]
+    fn cluster_scoped_beats_global_same_shape() {
+        // {pname, cluster:"east"} (older) vs {pname} (newer): before
+        // `cluster` joined the specificity rank, both were rank 0 and
+        // the NEWER global row shadowed the per-cluster pin. With
+        // cluster in the rank, 1 > 0 → east wins. Rows for OTHER
+        // clusters are filtered at SQL read time, so `resolve()` only
+        // ever sees this-cluster + NULL.
+        let east = SlaOverrideRow {
+            cluster: Some("east".into()),
+            ..row("hello", None, None, 8.0, 1.0)
+        };
+        let global = row("hello", None, None, 4.0, 5.0);
+        assert_eq!(
+            resolve(&key("hello", "x", "t"), &[east, global])
+                .unwrap()
+                .forced_cores,
+            Some(8.0),
+            "cluster-scoped (specificity 1) beats global (0) despite older"
+        );
     }
 }

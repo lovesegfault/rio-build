@@ -330,7 +330,11 @@ fn irls_quantile(x: &[f64], y: &[f64], w: &[f64], tau: f64) -> (f64, f64, f64) {
 /// Koenker–Machado R¹≥0.7; below either threshold falls back to plain WLS with `r1=0.0`
 /// as a small-n sentinel (caller applies a Student-t PI factor). Degenerate design
 /// (constant c → undefined slope) falls through to an independent weighted p90.
-pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> MemFit {
+///
+/// Returns `(fit, weak)` where `weak = n_eff ≥ 10 ∧ R¹ < 0.7` (or
+/// non-finite IRLS) — i.e. enough data for the coupled fit, but the
+/// fit was rejected. Drives `rio_scheduler_sla_mem_fit_weak_total`.
+pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> (MemFit, bool) {
     // `.max(1.0)` floors before `.ln()`: completion.rs persists
     // `peak_memory_bytes = 0` as a legitimate sample point, but
     // `ln(0) = -∞` and `wls_loglinear` has no NaN handling — `-∞ - (-∞)
@@ -341,21 +345,26 @@ pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> MemFit {
     // symmetrically (`cpu_limit_cores` is `>= 1` in practice).
     let lc: Vec<f64> = cs.iter().map(|c| c.max(1.0).ln()).collect();
     let lm: Vec<f64> = ms.iter().map(|m| (*m as f64).max(1.0).ln()).collect();
+    let mut weak = false;
     if n_eff >= 10.0 {
         let (a, b, r1) = irls_quantile(&lc, &lm, w, 0.9);
         if r1 >= 0.7 && a.is_finite() && b.is_finite() {
-            return MemFit::Coupled { a, b, r1 };
+            return (MemFit::Coupled { a, b, r1 }, false);
         }
+        weak = true;
     }
     let (a, b, _sig) = wls_loglinear(&lc, &lm, w);
     if !a.is_finite() || !b.is_finite() {
         let mf: Vec<f64> = ms.iter().map(|&m| m as f64).collect();
         let p90 = weighted_quantile(&mf, w, 0.9);
-        return MemFit::Independent {
-            p90: MemBytes(p90 as u64),
-        };
+        return (
+            MemFit::Independent {
+                p90: MemBytes(p90 as u64),
+            },
+            weak,
+        );
     }
-    MemFit::Coupled { a, b, r1: 0.0 }
+    (MemFit::Coupled { a, b, r1: 0.0 }, weak)
 }
 
 /// Log-residual sigma: stddev of ln(obs/fit) weighted by w_i.
@@ -583,21 +592,37 @@ mod tests {
             })
             .collect();
         let w = vec![1.0; 15];
-        let MemFit::Coupled { b, r1, .. } = fit_memory(&cs, &ms, &w, 15.0) else {
+        let (MemFit::Coupled { b, r1, .. }, weak) = fit_memory(&cs, &ms, &w, 15.0) else {
             panic!("expected Coupled")
         };
         assert!((b - 0.7).abs() < 0.15, "b={b}");
         assert!(r1 >= 0.7, "r1={r1}");
+        assert!(!weak);
     }
 
     #[test]
     fn fit_memory_small_n_uses_ols() {
         let cs = [4.0, 8.0, 16.0];
         let ms = [1000u64, 1500, 2200];
-        let MemFit::Coupled { r1, .. } = fit_memory(&cs, &ms, &[1.0; 3], 3.0) else {
+        let (MemFit::Coupled { r1, .. }, weak) = fit_memory(&cs, &ms, &[1.0; 3], 3.0) else {
             panic!("expected Coupled")
         };
         assert_eq!(r1, 0.0); // small-n sentinel
+        assert!(!weak, "n_eff<10 → not weak (small-n is expected)");
+    }
+
+    #[test]
+    fn fit_memory_reports_weak_on_low_r1() {
+        // n_eff=15 with mem uncorrelated to c (constant + noise) →
+        // IRLS R¹ < 0.7 → weak=true. Wires
+        // `rio_scheduler_sla_mem_fit_weak_total` (described but never
+        // emitted before).
+        let cs: Vec<f64> = (1..=15).map(|i| (i * 2) as f64).collect();
+        let ms: Vec<u64> = (1..=15)
+            .map(|i| (1_000_000.0 * (1.0 + 0.05 * (i as f64 * 2.399).sin())) as u64)
+            .collect();
+        let (_, weak) = fit_memory(&cs, &ms, &[1.0; 15], 15.0);
+        assert!(weak, "uncorrelated mem at n_eff=15 → weak");
     }
 
     /// Regression: accept-gate at `> NNLS_TOL`, alpha-filter at `<= 0.0`
@@ -639,7 +664,7 @@ mod tests {
             .chain([0u64])
             .collect();
         let w = vec![1.0; 11];
-        let MemFit::Coupled { a, b, .. } = fit_memory(&cs, &ms, &w, 11.0) else {
+        let (MemFit::Coupled { a, b, .. }, _) = fit_memory(&cs, &ms, &w, 11.0) else {
             panic!("zero sample must not collapse Coupled → Independent");
         };
         assert!(a.is_finite() && b.is_finite(), "a={a} b={b}");
@@ -652,7 +677,7 @@ mod tests {
         let ms = [1000u64, 1100, 1050];
         assert!(matches!(
             fit_memory(&cs, &ms, &[1.0; 3], 3.0),
-            MemFit::Independent { .. }
+            (MemFit::Independent { .. }, false)
         ));
     }
 

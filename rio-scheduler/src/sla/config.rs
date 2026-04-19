@@ -185,8 +185,9 @@ impl SlaConfig {
     /// `probe.cpu ∈ [1, max_cores]`: was `[4, max_cores/4]` to give the
     /// explore walk span≥4 on both halve and ×4 sides, but that floor
     /// blocks VM-test pools where `max_cores < 16` from booting at all.
-    /// A degenerate-span `p̄` fit is recoverable (next sample fixes it);
-    /// a config that won't load is not.
+    /// `explore::frozen`'s `distinct_c >= 2` guard makes a probe placed
+    /// at either boundary recoverable (the ladder walks away from the
+    /// wall on the first sample); a config that won't load is not.
     pub fn validate(&self) -> anyhow::Result<()> {
         let hi = self.max_cores;
         anyhow::ensure!(
@@ -231,6 +232,9 @@ impl SlaConfig {
     /// `normal`.
     pub fn solve_tiers(&self) -> Vec<Tier> {
         let mut tiers = self.tiers.clone();
+        // Sort by `Tier::binding_bound` so the sort key agrees with
+        // `reassign_tier` / `explore::tier_target` on what "tightest"
+        // means; no-bounds tiers (None) sort last.
         tiers.sort_by_key(|t| {
             t.binding_bound()
                 .map(|d| (d * 1000.0) as u64)
@@ -339,6 +343,29 @@ mod tests {
         );
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("feature_probes[kvm]"), "{err}");
+    }
+
+    #[test]
+    fn rejects_feature_probe_cpu_out_of_range() {
+        let mut cfg = base();
+        cfg.feature_probes.insert(
+            "kvm".into(),
+            ProbeShape {
+                cpu: 96.0, // > max_cores=64
+                mem_per_core: 0,
+                mem_base: 0,
+                deadline_secs: 3600,
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("feature_probes[kvm].cpu") && err.contains("max_cores=64"),
+            "{err}"
+        );
+        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 0.5;
+        assert!(cfg.validate().is_err(), "<1 also rejected");
+        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 64.0;
+        cfg.validate().unwrap();
     }
 
     #[test]

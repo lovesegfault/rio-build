@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::db::{SchedulerDb, SlaOverrideRow};
 
@@ -59,8 +59,17 @@ pub struct SlaEstimator {
     /// ADR-023 §2.10 prior inputs. `seed` is loaded from
     /// `[sla].seed_corpus` at startup and/or `ImportSlaCorpus` at
     /// runtime; `fleet` is recomputed each refresh tick from the cache;
-    /// `operator`/`default_tier_p90` are static from config.
+    /// `operator`/`default_tier_target` are static from config.
     priors: Arc<RwLock<prior::PriorSources>>,
+    /// `[sla].seed_corpus` parsed but NOT yet rescaled. `new()` runs
+    /// before the first DB tick so `self.hw` is still the empty default
+    /// (`factor(anything)=1.0`); converting there would silently bypass
+    /// cross-fleet rescaling. [`Self::refresh`] one-shot-converts this
+    /// after the first `HwTable::load`.
+    pending_seed: Mutex<Option<prior::SeedCorpus>>,
+    /// `[sla].cluster` — passed to `read_sla_overrides` so rows scoped
+    /// to a different cluster are filtered at SQL read time.
+    cluster: String,
     last_tick: RwLock<f64>,
     halflife_secs: f64,
     ring_buffer: u32,
@@ -71,47 +80,63 @@ impl SlaEstimator {
         // Seed corpus load is best-effort: a missing/malformed file
         // warns and falls back to an empty seed table rather than
         // refusing to start. The corpus is an optimization (skip the
-        // probe ladder), not a correctness input.
-        let seed = cfg
-            .seed_corpus
-            .as_deref()
-            .and_then(|p| match prior::SeedCorpus::load(p) {
-                Ok(corpus) => {
-                    let (map, scale) = corpus.into_seed_map(&hw::HwTable::default());
-                    tracing::info!(
-                        entries = map.len(),
-                        rescale = scale,
-                        path = %p.display(),
-                        "sla seed corpus loaded"
-                    );
-                    Some(map)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "sla seed corpus load failed; starting empty");
-                    None
-                }
-            })
-            .unwrap_or_default();
-        let default_tier_p90 = cfg
+        // probe ladder), not a correctness input. Conversion to the
+        // seed map (which rescales by hw factor) is DEFERRED to the
+        // first refresh tick — `self.hw` is still empty here.
+        let pending_seed =
+            cfg.seed_corpus
+                .as_deref()
+                .and_then(|p| match prior::SeedCorpus::load(p) {
+                    Ok(corpus) => {
+                        tracing::info!(
+                            entries = corpus.entries.len(),
+                            path = %p.display(),
+                            "sla seed corpus parsed; rescale deferred to first refresh"
+                        );
+                        Some(corpus)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sla seed corpus load failed; starting empty");
+                        None
+                    }
+                });
+        let default_tier_target = cfg
             .tiers
             .iter()
             .find(|t| t.name == cfg.default_tier)
-            .and_then(|t| t.p90)
+            .and_then(solve::Tier::binding_bound)
             .unwrap_or(1200.0);
         let priors = Arc::new(RwLock::new(prior::PriorSources {
-            seed,
+            seed: HashMap::new(),
             fleet: None,
             operator: cfg.probe.clone(),
-            default_tier_p90,
+            default_tier_target,
         }));
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             overrides: Arc::new(RwLock::new(Vec::new())),
             hw: Arc::new(RwLock::new(hw::HwTable::default())),
             priors,
+            pending_seed: Mutex::new(pending_seed),
+            cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
             halflife_secs: cfg.halflife_secs,
             ring_buffer: cfg.ring_buffer,
+        }
+    }
+
+    /// One-shot: rescale and merge any pending startup seed corpus
+    /// against `hw`. Separate from `refresh()` so it can be unit-tested
+    /// without a `SchedulerDb`.
+    fn apply_pending_seed(&self, hw: &hw::HwTable) {
+        if let Some(corpus) = self.pending_seed.lock().take() {
+            let (map, scale) = corpus.into_seed_map(hw);
+            tracing::info!(
+                entries = map.len(),
+                rescale = scale,
+                "sla seed corpus applied"
+            );
+            self.priors.write().seed.extend(map);
         }
     }
 
@@ -288,7 +313,7 @@ impl SlaEstimator {
         // rows) and independent of the sample refit, so a PG blip on
         // the heavier incremental query below still leaves the override
         // cache fresh for this tick.
-        match db.read_sla_overrides(None).await {
+        match db.read_sla_overrides(&self.cluster, None).await {
             Ok(rows) => *self.overrides.write() = rows,
             Err(e) => tracing::warn!(error = %e, "sla override refresh failed; keeping previous"),
         }
@@ -297,7 +322,14 @@ impl SlaEstimator {
         // overrides (a few dozen rows from a view). Failure → keep
         // previous; an empty table is factor=1.0 everywhere.
         match hw::HwTable::load(db).await {
-            Ok(t) => *self.hw.write() = t,
+            Ok(t) => {
+                // Pending seed conversion gated on a SUCCESSFUL load:
+                // running it in the Err arm would rescale against the
+                // empty default (factor=1.0 everywhere) and `.take()`
+                // would consume the seed so the next tick can't retry.
+                self.apply_pending_seed(&t);
+                *self.hw.write() = t;
+            }
             Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
         }
         let hw_snapshot = self.hw.read().clone();
@@ -399,18 +431,21 @@ impl SlaEstimator {
             self.cache.write().insert(key.clone(), fit);
         }
 
-        // Persist outlier flags + per-key trim AFTER refit, each as a
-        // single batched round-trip. Best-effort — a failed trim is a
-        // transient leak the next tick fixes; a failed outlier-mark is
-        // re-detected next tick (the row reappears in `new_rows` since
-        // hwm advances past it only on success below… actually no, hwm
-        // advanced regardless — but the in-memory `retain` above already
-        // kept this tick's fit clean, and the next tick's batch read
-        // re-includes the row, where it's filtered again).
+        // Persist outlier flags BEFORE advancing `hwm`. NOT best-effort:
+        // if the UPDATE fails and `hwm` advances anyway, the unmarked
+        // row is past `hwm` on tick N+1 so it's never in `new_rows`
+        // again — the in-memory `retain` above only filters ids
+        // detected from `new_rows`, so the outlier contaminates
+        // `read_build_samples_for_keys` for up to `ring_buffer=32`
+        // refits. Propagating the error keeps `last_tick` unchanged so
+        // the row reappears next tick and is re-detected.
+        // `metrics::outlier_rejected` will double-count once on the
+        // retry — acceptable, it's a "this happened" counter not a
+        // billing meter.
         let outlier_ids: Vec<i64> = outlier_ids.into_iter().collect();
-        if let Err(e) = db.mark_outliers_excluded(&outlier_ids).await {
-            tracing::warn!(error = %e, n = outlier_ids.len(), "outlier mark failed");
-        }
+        db.mark_outliers_excluded(&outlier_ids).await?;
+        // Trim stays best-effort — a missed trim only affects ring-
+        // buffer size and is re-trimmed next tick with the same WHERE.
         if let Err(e) = db
             .trim_build_samples_batch(&pnames, &systems, &tenants, self.ring_buffer)
             .await
@@ -583,6 +618,53 @@ mod tests {
         est.seed(f);
         let w = est.ref_estimate(&fkey).expect("fitted → Some");
         assert!(w.is_finite() && w > 0.0);
+    }
+
+    #[test]
+    fn seed_corpus_rescaled_after_first_refresh() {
+        // ref_hw_class="fast" with one entry s=100. `new()` must NOT
+        // convert (hw table is empty → factor=1.0 → rescale silently
+        // bypassed); `apply_pending_seed` against a populated table
+        // must rescale by `factor[fast]/factor[reference]`.
+        let est = SlaEstimator::for_test(&cfg());
+        *est.pending_seed.lock() = Some(prior::SeedCorpus {
+            ref_hw_class: "fast".into(),
+            entries: vec![prior::SeedEntry {
+                pname: "hello".into(),
+                system: "x86_64-linux".into(),
+                s: 100.0,
+                p: 200.0,
+                q: 0.0,
+                p_bar: 0.0,
+                a: 22.0,
+                b: 0.5,
+                n: 5,
+            }],
+        });
+        assert!(
+            est.prior_sources().seed.is_empty(),
+            "new() defers conversion"
+        );
+
+        let mut m = HashMap::new();
+        m.insert("fast".into(), 2.0);
+        m.insert("slow".into(), 1.0);
+        let hw = hw::HwTable::from_map(m);
+        est.apply_pending_seed(&hw);
+
+        let seed = est.prior_sources().seed;
+        let entry = seed
+            .get(&("hello".into(), "x86_64-linux".into()))
+            .expect("seeded");
+        // scale = factor[fast]/factor[reference] = 2.0/1.0 (slow is
+        // reference, factor closest to 1.0).
+        assert_eq!(entry.s, 200.0, "s rescaled by 2.0");
+        assert_eq!(entry.p, 400.0, "p rescaled by 2.0");
+        assert_eq!(entry.a, 22.0, "mem params not rescaled");
+
+        // One-shot: second call is a no-op.
+        est.apply_pending_seed(&hw);
+        assert_eq!(est.prior_sources().seed.len(), 1);
     }
 
     #[test]

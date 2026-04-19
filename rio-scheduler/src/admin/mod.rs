@@ -623,7 +623,7 @@ impl AdminService for AdminServiceImpl {
         let pname = request.into_inner().pname;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db
-            .read_sla_overrides(pname.as_deref())
+            .read_sla_overrides(&self.cluster, pname.as_deref())
             .await
             .status_internal("read_sla_overrides")?;
         Ok(Response::new(ListSlaOverridesResponse {

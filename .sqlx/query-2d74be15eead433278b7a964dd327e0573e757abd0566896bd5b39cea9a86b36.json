@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, pname, system, tenant, cluster, tier,\n                   p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,\n                   EXTRACT(EPOCH FROM expires_at)::float8 AS \"expires_at\",\n                   EXTRACT(EPOCH FROM created_at)::float8 AS \"created_at!\",\n                   created_by\n            FROM sla_overrides\n            WHERE (expires_at IS NULL OR expires_at > now())\n              AND ($1::text IS NULL OR pname = $1)\n            ORDER BY created_at DESC\n            ",
+  "query": "\n            SELECT id, pname, system, tenant, cluster, tier,\n                   p50_secs, p90_secs, p99_secs, cores, mem_bytes, capacity_type,\n                   EXTRACT(EPOCH FROM expires_at)::float8 AS \"expires_at\",\n                   EXTRACT(EPOCH FROM created_at)::float8 AS \"created_at!\",\n                   created_by\n            FROM sla_overrides\n            WHERE (expires_at IS NULL OR expires_at > now())\n              AND (cluster IS NULL OR cluster = $1)\n              AND ($2::text IS NULL OR pname = $2)\n            ORDER BY created_at DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -81,6 +81,7 @@
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Text"
       ]
     },
@@ -102,5 +103,5 @@
       true
     ]
   },
-  "hash": "314fb77c71e2729883b48c9548a7f3536fc913a9b308b4ba1970bf134cee3c67"
+  "hash": "2d74be15eead433278b7a964dd327e0573e757abd0566896bd5b39cea9a86b36"
 }
