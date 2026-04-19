@@ -741,18 +741,15 @@ impl DagActor {
                 )
             })
             .filter_map(|(h, s)| match s.assigned_executor.as_ref() {
-                Some(w) if self.executors.contains_key(w) => {
-                    // Worker reconnected. Cross-check running_build:
-                    // if the worker's heartbeat doesn't include this
-                    // drv_hash, the assignment is phantom — PG says
-                    // Assigned+worker but the worker never got the
-                    // message (scheduler crashed between persist_status
-                    // and try_send). No running_since → backstop won't
-                    // fire → stuck forever without this check.
-                    //
-                    // Without this check, phantom-Assigned derivations
-                    // would be skipped entirely because the worker
-                    // reconnected. This cross-check reconciles them.
+                Some(w) if self.executors.get(w).is_some_and(|ws| ws.is_registered()) => {
+                    // Worker reconnected AND heartbeated — running_build
+                    // is authoritative. Cross-check: if the worker's
+                    // heartbeat doesn't include this drv_hash, the
+                    // assignment is phantom — PG says Assigned+worker
+                    // but the worker never got the message (scheduler
+                    // crashed between persist_status and try_send). No
+                    // running_since → backstop won't fire → stuck
+                    // forever without this check.
                     let hash: DrvHash = h.into();
                     if self
                         .executors
@@ -767,6 +764,21 @@ impl DagActor {
                               "reconcile: worker reconnected but phantom Assigned (not in worker.running_build) — reconciling");
                         Some((hash, Some(w.clone()), s.expected_output_paths.clone()))
                     }
+                }
+                // Stream connected but no heartbeat yet — running_build
+                // is NOT authoritative (None until executor.rs writes it
+                // from the first accepted heartbeat; I-048b drops
+                // pre-stream heartbeats). Defer: the heartbeat path's
+                // two-strike confirmed_phantoms will reconcile real
+                // phantoms once heartbeats flow. A worker that stream-
+                // connects but never heartbeats has is_registered()=false
+                // → has_capacity()=false → never dispatched-to; if its
+                // stream later drops, handle_worker_disconnected
+                // reassigns. No worse than spurious failure_count++.
+                Some(w) if self.executors.contains_key(w) => {
+                    debug!(drv_hash = ?h, executor_id = %w,
+                           "reconcile: worker stream-connected but not yet heartbeated — deferring");
+                    None
                 }
                 Some(w) => Some((h.into(), Some(w.clone()), s.expected_output_paths.clone())),
                 None => {

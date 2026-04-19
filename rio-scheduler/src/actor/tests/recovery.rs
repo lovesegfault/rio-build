@@ -662,6 +662,109 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     Ok(())
 }
 
+/// Phantom-check race with first-heartbeat-after-reconnect.
+///
+/// `collect_orphaned_assignments` reads `running_build`, which stays
+/// `None` from stream-connect until the first ACCEPTED heartbeat
+/// (I-048b drops pre-stream heartbeats; the worker's 10s tick doesn't
+/// fire-on-reconnect). Gating the phantom-check on `contains_key`
+/// alone misclassifies an actively-running build as phantom when the
+/// stream lands shortly before `RECONCILE_DELAY` but the heartbeat
+/// hasn't yet — spurious failure_count++ + duplicate dispatch.
+///
+/// Fix: gate on `is_registered()` (stream AND ≥1 heartbeat), defer
+/// otherwise. The heartbeat path's two-strike `confirmed_phantoms`
+/// catches real phantoms once heartbeats flow.
+#[tokio::test]
+async fn test_reconcile_defers_stream_connected_unregistered_worker() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let _rx = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("defer-drv")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'assigned', \
+             assigned_builder_id = 'defer-w1' WHERE drv_hash = 'defer-drv'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let (sched_db, handle) = (f.db, f.handle);
+
+    // Stream-connect ONLY — no heartbeat. is_registered()=false,
+    // running_build=None. NOT connect_executor() (which heartbeats).
+    let (stream_tx, _stream_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "defer-w1".into(),
+            stream_tx,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let pre = expect_drv(&handle, "defer-drv").await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+    assert_eq!(pre.assigned_executor.as_deref(), Some("defer-w1"));
+
+    // ReconcileAssignments while stream-connected-but-unregistered:
+    // must DEFER, not flag phantom.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "defer-drv").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Assigned,
+        "stream-connected-but-unheartbeated worker must defer, not reset"
+    );
+    assert_eq!(
+        post.assigned_executor.as_deref(),
+        Some("defer-w1"),
+        "assignment unchanged"
+    );
+    let retry_count: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM derivations WHERE drv_hash = 'defer-drv'")
+            .fetch_one(&sched_db.pool)
+            .await?;
+    assert_eq!(
+        retry_count, 0,
+        "deferral must NOT bump retry_count (was spurious failure before fix)"
+    );
+
+    // First heartbeat now arrives reporting the build IS running:
+    // is_registered() flips true; adopt path takes it. No failure
+    // recorded, no duplicate dispatch.
+    send_heartbeat_with(&handle, "defer-w1", "x86_64-linux", |hb| {
+        hb.running_build = Some(test_drv_path("defer-drv"));
+    })
+    .await?;
+    barrier(&handle).await;
+
+    let adopted = expect_drv(&handle, "defer-drv").await;
+    assert!(
+        matches!(
+            adopted.status,
+            DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "drv adopted after heartbeat, got {:?}",
+        adopted.status
+    );
+    assert_eq!(adopted.assigned_executor.as_deref(), Some("defer-w1"));
+    assert_eq!(adopted.retry.count, 0, "no spurious retry++ on adopt");
+
+    Ok(())
+}
+
 /// Recovery must skip rows with unparseable drv_path (StorePath::parse
 /// fails) and continue loading valid rows. A corrupted/hand-edited PG
 /// row shouldn't block recovery of the entire DAG.
