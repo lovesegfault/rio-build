@@ -108,6 +108,9 @@ pub enum NarError {
     #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
     NestingTooDeep(usize),
 
+    #[error("file {0:?} has an unsupported type (not regular/symlink/directory)")]
+    UnsupportedFileType(std::path::PathBuf),
+
     #[error("not a single-file NAR")]
     NotSingleFile,
 

@@ -31,7 +31,7 @@ const STREAM_CHUNK: usize = 256 * 1024;
 #[cfg(any(test, feature = "test-oracle"))]
 #[doc(hidden)]
 pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
-    let node = node_from_path(path)?;
+    let node = node_from_path(path, 0)?;
     let mut buf = Vec::new();
     serialize(&mut buf, &node)?;
     Ok(buf)
@@ -60,7 +60,7 @@ pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
 pub fn dump_path_streaming(path: &std::path::Path, w: &mut impl Write) -> Result<u64> {
     let mut counter = CountingWriter::new(w);
     write_str(&mut counter, NAR_MAGIC)?;
-    stream_node(&mut counter, path)?;
+    stream_node(&mut counter, path, 0)?;
     Ok(counter.written)
 }
 
@@ -91,7 +91,17 @@ impl<W: Write> Write for CountingWriter<W> {
 /// Streaming analogue of `serialize_node(node_from_path(path))`. Walks
 /// the filesystem and writes NAR framing directly, reading file contents
 /// in 256 KiB chunks.
-fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
+///
+/// Enforces the same `MAX_NAR_DEPTH` / `MAX_DIRECTORY_ENTRIES` limits as
+/// `restore_node` and rejects non-regular/symlink/directory file types
+/// (matching Nix `dump()`'s "unsupported type" error) — the producer must
+/// emit only what the consumer accepts, and untrusted derivation output
+/// must not be able to hang the worker (e.g. `mkfifo $out/pipe` would
+/// otherwise block in `open(O_RDONLY)` forever).
+fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Result<()> {
+    if depth > MAX_NAR_DEPTH {
+        return Err(NarError::NestingTooDeep(depth));
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     write_str(w, "(")?;
     write_str(w, "type")?;
@@ -111,6 +121,9 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
         // Collect + sort entries for deterministic output (same as
         // node_from_path — NAR requires sorted entries).
         let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(NarError::TooManyEntries(entries.len()));
+        }
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let name = entry.file_name().into_string().map_err(|os_str| {
@@ -123,10 +136,10 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
             write_str(w, "name")?;
             write_str(w, &name)?;
             write_str(w, "node")?;
-            stream_node(w, &entry.path())?;
+            stream_node(w, &entry.path(), depth + 1)?;
             write_str(w, ")")?;
         }
-    } else {
+    } else if metadata.file_type().is_file() {
         use std::os::unix::fs::PermissionsExt;
         let executable = metadata.permissions().mode() & 0o111 != 0;
         let len = metadata.len();
@@ -168,6 +181,11 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
         if pad > 0 {
             w.write_all(&ZERO_PAD[..pad])?;
         }
+    } else {
+        // FIFO/socket/device. A FIFO would hang File::open(O_RDONLY)
+        // forever; Nix throws "unsupported type" here. Builders are
+        // untrusted — fail fast.
+        return Err(NarError::UnsupportedFileType(path.to_path_buf()));
     }
 
     write_str(w, ")")?;
@@ -333,7 +351,10 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
 
 /// Build a [`NarNode`] tree from a filesystem path.
 #[cfg(any(test, feature = "test-oracle"))]
-fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
+fn node_from_path(path: &std::path::Path, depth: usize) -> Result<NarNode> {
+    if depth > MAX_NAR_DEPTH {
+        return Err(NarError::NestingTooDeep(depth));
+    }
     let metadata = std::fs::symlink_metadata(path)?;
 
     if metadata.is_symlink() {
@@ -347,6 +368,9 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
     } else if metadata.is_dir() {
         let mut entries: Vec<NarEntry> = Vec::new();
         let mut dir_entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        if dir_entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(NarError::TooManyEntries(dir_entries.len()));
+        }
         dir_entries.sort_by_key(|e| e.file_name());
 
         for entry in dir_entries {
@@ -356,12 +380,12 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
                 )))
             })?;
             let child_path = entry.path();
-            let node = node_from_path(&child_path)?;
+            let node = node_from_path(&child_path, depth + 1)?;
             entries.push(NarEntry { name, node });
         }
 
         Ok(NarNode::Directory { entries })
-    } else {
+    } else if metadata.file_type().is_file() {
         use std::os::unix::fs::PermissionsExt;
         let executable = metadata.permissions().mode() & 0o111 != 0;
         let contents = std::fs::read(path)?;
@@ -369,6 +393,8 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
             executable,
             contents,
         })
+    } else {
+        Err(NarError::UnsupportedFileType(path.to_path_buf()))
     }
 }
 
@@ -401,4 +427,85 @@ pub fn extract_to_path(node: &NarNode, path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `stream_node` must reject anything that isn't a regular file,
+    /// symlink, or directory. The motivating case is a FIFO (a derivation
+    /// running `mkfifo $out/pipe`): pre-fix, the `else` branch would call
+    /// `File::open(fifo)` which blocks forever in `open(O_RDONLY)`. We use
+    /// a Unix-domain socket here (no extra dep needed; pre-fix it errored
+    /// in `File::open` with ENXIO instead of returning the typed variant)
+    /// to assert the file-type guard is in place.
+    #[test]
+    fn dump_streaming_rejects_unsupported_file_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+        let mut sink = Vec::new();
+        let r = dump_path_streaming(dir.path(), &mut sink);
+        assert!(
+            matches!(r, Err(NarError::UnsupportedFileType(_))),
+            "got {r:?}"
+        );
+        // Test-oracle parity.
+        let r = dump_path(dir.path());
+        assert!(
+            matches!(r, Err(NarError::UnsupportedFileType(_))),
+            "got {r:?}"
+        );
+    }
+
+    /// Producer enforces the same `MAX_NAR_DEPTH` limit as the consumer
+    /// (`restore_node`); a NAR the consumer is guaranteed to reject must
+    /// not be emitted in the first place.
+    #[test]
+    fn dump_streaming_rejects_deep_nesting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = dir.path().to_path_buf();
+        // MAX_NAR_DEPTH+2 levels under the root → depth check trips.
+        for _ in 0..(MAX_NAR_DEPTH + 2) {
+            p.push("a");
+        }
+        std::fs::create_dir_all(&p).unwrap();
+
+        let mut sink = Vec::new();
+        let r = dump_path_streaming(dir.path(), &mut sink);
+        assert!(matches!(r, Err(NarError::NestingTooDeep(_))), "got {r:?}");
+        let r = dump_path(dir.path());
+        assert!(matches!(r, Err(NarError::NestingTooDeep(_))), "got {r:?}");
+    }
+
+    /// At exactly `MAX_NAR_DEPTH` the producer must succeed and the
+    /// consumer must accept the result — the streaming and oracle outputs
+    /// must be byte-identical (regression guard that the `is_file()` gate
+    /// doesn't reject regular files).
+    #[test]
+    fn dump_streaming_at_depth_limit_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = dir.path().to_path_buf();
+        // root is depth 0; MAX_NAR_DEPTH-1 nested dirs → deepest dir at
+        // depth MAX_NAR_DEPTH-1; file inside at depth MAX_NAR_DEPTH (the
+        // limit, inclusive).
+        for _ in 0..(MAX_NAR_DEPTH - 1) {
+            p.push("a");
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("file"), b"hello").unwrap();
+
+        let mut streamed = Vec::new();
+        let n = dump_path_streaming(dir.path(), &mut streamed).unwrap();
+        assert_eq!(n as usize, streamed.len());
+        let eager = dump_path(dir.path()).unwrap();
+        assert_eq!(streamed, eager, "streaming and oracle must agree");
+
+        // Consumer accepts.
+        let dest = tempfile::tempdir().unwrap();
+        let dest_root = dest.path().join("out");
+        restore_path_streaming(&mut streamed.as_slice(), &dest_root).unwrap();
+    }
 }
