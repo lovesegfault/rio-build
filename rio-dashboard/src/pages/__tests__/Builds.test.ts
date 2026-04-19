@@ -45,11 +45,14 @@ describe('Builds', () => {
   afterEach(teardownStandardAfterEach);
 
   it('renders one row per build with mixed states', async () => {
+    // Neutral buildIds — the row also renders buildId.slice(0,8), so a
+    // fixture id containing a state string would satisfy the
+    // toHaveTextContent assertions below regardless of BuildStatePill.
     listBuilds.mockResolvedValue({
       builds: [
-        mkBuild({ buildId: 'pending-1', state: 1 }),
-        mkBuild({ buildId: 'active-2', state: 2 }),
-        mkBuild({ buildId: 'failed-3', state: 4 }),
+        mkBuild({ buildId: 'b-001', state: 1 }),
+        mkBuild({ buildId: 'b-002', state: 2 }),
+        mkBuild({ buildId: 'b-003', state: 4 }),
       ],
       totalCount: 3,
     });
@@ -296,6 +299,55 @@ describe('Builds', () => {
     // And the stack is empty past index 0: Next disables (the old c1 is
     // gone, and the short filtered page didn't seed a new one).
     expect(next).toBeDisabled();
+  });
+
+  it('drops stale listBuilds response after filter change', async () => {
+    // Regression: the list $effect had no stale-response guard, so a
+    // mount-fetch (call A, unfiltered) resolving AFTER a filter click
+    // (call B, filtered) wrote A's cursor into B's reset stack — Next
+    // then paged into the unfiltered keyset under a 'failed' filter and
+    // silently skipped rows. The cleanup-return cancels A before B
+    // launches, so A's resolution must no-op.
+    type Resp = { builds: unknown[]; totalCount: number; nextCursor?: string };
+    let resolveA!: (v: Resp) => void;
+    let resolveB!: (v: Resp) => void;
+    listBuilds
+      .mockImplementationOnce(() => new Promise<Resp>((r) => (resolveA = r)))
+      .mockImplementationOnce(() => new Promise<Resp>((r) => (resolveB = r)))
+      .mockImplementation((req: { cursor?: string }) =>
+        Promise.resolve({ builds: [], totalCount: 0, seenCursor: req.cursor }),
+      );
+
+    render(Builds);
+    await tick();
+    expect(listBuilds).toHaveBeenCalledTimes(1);
+
+    // Click 'failed' before A resolves — setFilter resets cursors to
+    // [undefined] and re-runs the effect (cleanup cancels A, B fires).
+    const failedPill = screen.getByRole('button', { name: 'failed' });
+    await fireEvent.click(failedPill);
+    await tick();
+    expect(listBuilds).toHaveBeenCalledTimes(2);
+
+    // A resolves first (natural ordering — it started first). Its
+    // cursor 'cA' is from the UNFILTERED keyset and must be dropped.
+    resolveA({ builds: [mkBuild()], totalCount: 250, nextCursor: 'cA' });
+    await tick();
+    await tick();
+    // B resolves with the correct filtered cursor.
+    resolveB({ builds: [mkBuild()], totalCount: 5, nextCursor: 'cB' });
+    await tick();
+    await tick();
+
+    // Next must page using B's cursor, not the stale A cursor.
+    const next = screen.getByRole('button', { name: 'next' });
+    expect(next).not.toBeDisabled();
+    await fireEvent.click(next);
+    await tick();
+
+    expect(listBuilds).toHaveBeenCalledTimes(3);
+    expect(listBuilds.mock.calls[2][0].cursor).toBe('cB');
+    expect(listBuilds.mock.calls[2][0].statusFilter).toBe('failed');
   });
 
   it('resolves a deep-link id via broad fetch when not on current page', async () => {

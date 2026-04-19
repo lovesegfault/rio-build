@@ -66,6 +66,14 @@
     const sf = statusFilter;
     const idx = pageIdx;
     const cur = untrack(() => cursors[idx]);
+    // Stale-response guard: Svelte runs the returned cleanup before
+    // re-run and on unmount, so by the time a newer fetch launches,
+    // the prior one's `cancelled` is true and its resolution no-ops.
+    // Without this, an out-of-order resolution after a filter change
+    // stashes a cursor from the OLD result set into the reset stack
+    // (the length===idx+1 guard below is anti-duplicate, not
+    // anti-stale, and inverts correctness in that race).
+    let cancelled = false;
     (async () => {
       try {
         const r = await admin.listBuilds({
@@ -78,6 +86,7 @@
           cursor: cur,
           tenantFilter: '',
         });
+        if (cancelled) return;
         builds = r.builds;
         // total_count is a full-table COUNT — capture it once on the
         // first page and hold it for the "page N / M" footer. Later
@@ -94,9 +103,13 @@
         }
         error = null;
       } catch (e) {
+        if (cancelled) return;
         error = String(e);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   });
 
   // Deep-link resolver. Runs once per unique `id` (deepLinkTried gate
