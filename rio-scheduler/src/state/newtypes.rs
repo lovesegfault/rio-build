@@ -24,9 +24,7 @@
 macro_rules! arc_string_newtype {
     ($(#[$meta:meta])* $vis:vis struct $name:ident) => {
         $(#[$meta])*
-        // NOT deriving Hash/PartialEq/Eq/Ord: those would compare Arc
-        // POINTERS, not contents. Manual impls below hash/compare the str.
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
         $vis struct $name(::std::sync::Arc<str>);
 
         impl $name {
@@ -62,33 +60,14 @@ macro_rules! arc_string_newtype {
             type Target = str;
             fn deref(&self) -> &str { &self.0 }
         }
+        // Borrow<str> consistency: HashMap<X, _>::get(&str) requires
+        // X::hash("foo") == "foo".hash(). The derived Hash delegates to
+        // Arc<str>'s Hash, which hashes the str contents — so this holds.
         impl ::std::borrow::Borrow<str> for $name {
             fn borrow(&self) -> &str { &self.0 }
         }
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str { &self.0 }
-        }
-        // Hash/Eq/Ord on the str CONTENTS — same semantics as String-backed.
-        // Critical: HashMap<X, _>::get(&str) via Borrow<str> requires that
-        // X::hash("foo") == "foo".hash() — which str::hash guarantees.
-        impl ::std::hash::Hash for $name {
-            fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
-                (*self.0).hash(state)
-            }
-        }
-        impl PartialEq for $name {
-            fn eq(&self, o: &Self) -> bool { *self.0 == *o.0 }
-        }
-        impl Eq for $name {}
-        impl PartialOrd for $name {
-            fn partial_cmp(&self, o: &Self) -> Option<::std::cmp::Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        impl Ord for $name {
-            fn cmp(&self, o: &Self) -> ::std::cmp::Ordering {
-                (*self.0).cmp(&*o.0)
-            }
         }
         impl PartialEq<str> for $name {
             fn eq(&self, o: &str) -> bool { *self.0 == *o }

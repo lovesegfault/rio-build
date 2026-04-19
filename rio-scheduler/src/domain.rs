@@ -38,9 +38,7 @@ use rio_proto::types as proto;
 
 /// Domain mirror of [`rio_proto::types::DerivationNode`].
 ///
-/// Carries every proto field the scheduler reads. `drv_content` stays
-/// `bytes::Bytes` (prost's zero-copy type) — it's an opaque ATerm blob
-/// the scheduler only stores and forwards, never parses.
+/// Carries every proto field the scheduler reads.
 #[derive(Debug, Clone)]
 pub struct DerivationNode {
     pub drv_path: String,
