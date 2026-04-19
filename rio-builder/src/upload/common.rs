@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use rio_common::backoff::{Backoff, Jitter};
+use rio_common::grpc::GRPC_STREAM_TIMEOUT;
 use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_nix::store_path::StorePath;
@@ -21,6 +22,39 @@ use rio_proto::types::{PathInfo, PutPathRequest, PutPathTrailer, put_path_reques
 use rio_proto::validated::ValidatedPathInfo;
 
 use super::UploadError;
+
+/// Slack added to a join-timeout beyond the operation's own budget, so the
+/// inner timeout (gRPC) fires first and the join-timeout only catches the
+/// "blocking thread parked in syscall" case.
+pub(super) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
+
+/// Await a `spawn_blocking` dump `JoinHandle` with a deadline. On timeout
+/// the blocking thread leaks (tokio limitation — `spawn_blocking` is
+/// non-abortable); the worker regains control and fails the build instead
+/// of hanging.
+///
+/// `budget` is the operation's own timeout (e.g. `GRPC_STREAM_TIMEOUT`);
+/// [`DUMP_JOIN_SLACK`] is added so the inner timeout fires first under
+/// normal operation. This guard is for the case where the blocking thread
+/// is parked in `open(2)`/`read(2)` (FIFO in `$out`, wedged FUSE/overlay,
+/// suspended dm device) and never reaches `blocking_send` to observe
+/// rx-drop.
+pub(super) async fn await_dump_bounded<T>(
+    what: &'static str,
+    budget: Duration,
+    handle: tokio::task::JoinHandle<T>,
+) -> Result<T, tonic::Status> {
+    let deadline = budget + DUMP_JOIN_SLACK;
+    tokio::time::timeout(deadline, handle)
+        .await
+        .map_err(|_| {
+            tonic::Status::deadline_exceeded(format!(
+                "{what} stuck after {}s (disk read hung? FIFO in $out?)",
+                deadline.as_secs()
+            ))
+        })?
+        .map_err(|e| tonic::Status::internal(format!("{what} panicked: {e}")))
+}
 
 /// Maximum number of upload retry attempts. Aligned with the
 /// gateway's PutPath retry (`rio-gateway/src/handler/grpc.rs`): both
@@ -109,13 +143,73 @@ pub(super) async fn scan_references(
 ) -> Result<Vec<String>, tonic::Status> {
     let scan_path = output_path.to_path_buf();
     let cands = Arc::clone(candidates);
-    tokio::task::spawn_blocking(move || {
-        let mut sink = RefScanSink::new(cands.hashes());
-        nar::dump_path_streaming(&scan_path, &mut sink).map(|_| cands.resolve(&sink.into_found()))
-    })
-    .await
-    .map_err(|e| tonic::Status::internal(format!("ref-scan task panicked: {e}")))?
+    // Bounded join: a blocking thread parked in open()/read() (FIFO in
+    // $out, wedged FUSE) never returns and tokio cannot abort it; without
+    // the timeout this await would hang the worker forever. One output's
+    // local-disk scan is ≪ 300s; this fires only on a true hang.
+    await_dump_bounded(
+        "ref-scan",
+        GRPC_STREAM_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let mut sink = RefScanSink::new(cands.hashes());
+            nar::dump_path_streaming(&scan_path, &mut sink)
+                .map(|_| cands.resolve(&sink.into_found()))
+        }),
+    )
+    .await?
     .map_err(|e| nar_err_to_status(output_path, e))
+}
+
+/// One output's per-upload-invariant prep: parsed store path + scanned
+/// references. Built once by [`prepare_output`] and consumed by both the
+/// batch and per-output upload paths, so prep is never interleaved with
+/// streaming and metric emission has a single chokepoint.
+#[derive(Clone, Debug)]
+pub(super) struct PreparedOutput {
+    /// Basename under `upper_store` (`"abc…-hello"`).
+    pub basename: String,
+    /// `"/nix/store/{basename}"` — the string form sent in `PathInfo`.
+    pub store_path: String,
+    /// Validated parse of `store_path`.
+    pub parsed: StorePath,
+    /// Sorted resolved references from [`scan_references`].
+    pub references: Vec<String>,
+}
+
+/// Single prep chokepoint: parse → scan_references (timeout-bounded) →
+/// emit `rio_builder_upload_references_count`. Called once per output,
+/// BEFORE any byte is sent to the store, so a prep failure on output k
+/// cannot leave outputs 0..k-1 partially committed
+/// (`r[store.atomic.multi-output]`).
+///
+/// This is the ONLY emission site for `rio_builder_upload_references_count`
+/// — both batch and single paths route through here.
+// r[impl builder.upload.references-scanned]
+pub(super) async fn prepare_output(
+    upper_store: &Path,
+    basename: &str,
+    candidates: &Arc<CandidateSet>,
+) -> Result<PreparedOutput, UploadError> {
+    let store_path = format!("/nix/store/{basename}");
+    let parsed = StorePath::parse(&store_path).map_err(|e| UploadError::UploadExhausted {
+        path: store_path.clone(),
+        source: tonic::Status::invalid_argument(format!(
+            "output store path {store_path:?} from overlay upper is malformed: {e}"
+        )),
+    })?;
+    let references = scan_references(&upper_store.join(basename), candidates)
+        .await
+        .map_err(|source| UploadError::UploadExhausted {
+            path: store_path.clone(),
+            source,
+        })?;
+    metrics::histogram!("rio_builder_upload_references_count").record(references.len() as f64);
+    Ok(PreparedOutput {
+        basename: basename.to_string(),
+        store_path,
+        parsed,
+        references,
+    })
 }
 
 /// Construct the trailer-mode `PathInfo` (empty hash/size → store

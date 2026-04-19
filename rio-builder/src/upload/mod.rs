@@ -30,7 +30,7 @@ pub(crate) mod common;
 mod single;
 
 use batch::upload_outputs_batch;
-use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES};
+use common::{MAX_PARALLEL_UPLOADS, MAX_UPLOAD_RETRIES, UPLOAD_BACKOFF, prepare_output};
 use single::upload_output;
 
 // Re-exports for the test module's `use super::*` (private mechanics
@@ -172,50 +172,90 @@ pub async fn upload_all_outputs(
     // is a pointer copy, not a full HashMap clone.
     let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
+    // Prep ALL outputs (parse + ref-scan) BEFORE any byte hits the wire.
+    // A prep failure on output k returns Err here; the batch producer is
+    // prep-free, so partial server commit (`r[store.atomic.multi-output]`)
+    // is unrepresentable. Serial — scan_references is spawn_blocking
+    // disk-read; matches MAX_BATCH_OUTPUTS=16 small-N shape. Retries
+    // (batch and per-output) do NOT re-scan.
+    //
+    // TODO(P0433): trailer-refs protocol extension — move refs into the
+    // PutPath trailer so the scan happens inline with the upload tee
+    // (avoiding this extra disk pass). Gated on measuring pre-scan cost
+    // at scale (see worker.md § pre-scan cost). Deferred P0181 remainder.
+    let mut prepared = Vec::with_capacity(to_upload.len());
+    for b in &to_upload {
+        prepared.push(prepare_output(upper_store, b, &candidates).await?);
+    }
+
     // Branch: ≥2 outputs TO UPLOAD → atomic batch; ≤1 → independent
     // (atomicity is vacuous for a single output). The count is against the
     // post-idempotency-pre-check set — if 3 outputs exist but 2 are already
     // in the store, only 1 needs upload and PutPath is sufficient. See
     // store.atomic.multi-output in the store spec.
-    if to_upload.len() >= 2 {
+    if prepared.len() >= 2 {
         tracing::info!(
-            to_upload = to_upload.len(),
+            to_upload = prepared.len(),
             skipped = skipped_results.len(),
             "uploading build outputs (atomic batch)"
         );
-        match upload_outputs_batch(
-            store_client,
-            upper_store,
-            &to_upload,
-            assignment_token,
-            deriver,
-            &candidates,
-        )
-        .await
-        {
-            Ok(mut results) => {
-                results.append(&mut skipped_results);
-                return Ok(results);
+        // Retry mirrors single.rs's MAX_UPLOAD_RETRIES/UPLOAD_BACKOFF —
+        // multi-output derivations hit the same store-side placeholder
+        // contention (I-068/I-125b) that motivated the 8-retry budget.
+        // Prep is hoisted, so each retry is a fresh gRPC stream + N disk
+        // dumps (no re-scan). `Aborted: concurrent` poll-then-adopt is
+        // NOT ported: per-path adoption doesn't compose across N paths;
+        // I-125a drop-cleanup releases the placeholder before the next
+        // attempt's backoff expires.
+        let mut last_err = None;
+        'batch: for attempt in 0..MAX_UPLOAD_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(UPLOAD_BACKOFF.duration(attempt - 1)).await;
             }
-            Err(UploadError::UploadExhausted { source, .. })
-                if source.code() == tonic::Code::FailedPrecondition =>
+            match upload_outputs_batch(
+                store_client,
+                upper_store,
+                &prepared,
+                assignment_token,
+                deriver,
+            )
+            .await
             {
-                // v1 batch handler is inline-only; an output was too large.
-                // Fall through to independent PutPath (loses atomicity —
-                // pre-P0267 behavior, which `gt13_multi_output_not_atomic`
-                // documents).
-                tracing::warn!(
-                    error = %source,
-                    "batch upload rejected (output too large for inline); \
-                     falling back to independent PutPath — partial registration possible"
-                );
+                Ok(mut results) => {
+                    results.append(&mut skipped_results);
+                    return Ok(results);
+                }
+                Err(UploadError::UploadExhausted { source, .. })
+                    if source.code() == tonic::Code::FailedPrecondition =>
+                {
+                    // Defensive fallthrough: the store may signal "use
+                    // independent PutPath" via FailedPrecondition. Loses
+                    // atomicity (pre-P0267 behavior, which
+                    // `gt13_multi_output_not_atomic` documents).
+                    tracing::warn!(
+                        error = %source,
+                        "batch upload rejected with FailedPrecondition; \
+                         falling back to independent PutPath — partial registration possible"
+                    );
+                    last_err = None;
+                    break 'batch;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "batch upload attempt failed");
+                    last_err = Some(e);
+                }
             }
-            Err(e) => return Err(e),
         }
+        if let Some(e) = last_err {
+            metrics::counter!("rio_builder_uploads_total", "status" => "exhausted")
+                .increment(prepared.len() as u64);
+            return Err(e);
+        }
+        // FailedPrecondition fallthrough → per-output PutPath below.
     }
 
     tracing::info!(
-        to_upload = to_upload.len(),
+        to_upload = prepared.len(),
         skipped = skipped_results.len(),
         max_parallel = MAX_PARALLEL_UPLOADS,
         "uploading build outputs (independent PutPath)"
@@ -226,24 +266,13 @@ pub async fn upload_all_outputs(
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
     let deriver = deriver.to_string();
-    let results: Vec<Result<ValidatedPathInfo, UploadError>> = stream::iter(to_upload)
-        .map(|output| {
+    let results: Vec<Result<ValidatedPathInfo, UploadError>> = stream::iter(prepared)
+        .map(|p| {
             let mut client = store_client.clone();
             let upper_store = upper_store.clone();
             let token = token.clone();
             let deriver = deriver.clone();
-            let candidates = Arc::clone(&candidates);
-            async move {
-                upload_output(
-                    &mut client,
-                    &upper_store,
-                    &output,
-                    &token,
-                    &deriver,
-                    candidates,
-                )
-                .await
-            }
+            async move { upload_output(&mut client, &upper_store, p, &token, &deriver).await }
         })
         .buffer_unordered(MAX_PARALLEL_UPLOADS)
         .collect()
@@ -392,13 +421,24 @@ mod tests {
         Arc::new(CandidateSet::from_paths(std::iter::empty::<&str>()))
     }
 
+    /// Prep helper for tests calling `upload_output` directly: runs the
+    /// real `prepare_output` chokepoint (parse + scan_references).
+    async fn prep_one(
+        store_dir: &Path,
+        basename: &str,
+        candidates: &Arc<CandidateSet>,
+    ) -> Result<common::PreparedOutput, UploadError> {
+        prepare_output(store_dir, basename, candidates).await
+    }
+
     #[tokio::test]
     async fn test_upload_output_success() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("hello");
         let (_tmp, store_dir) = make_output_file(&basename, b"hello world")?;
 
-        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", "")
             .await
             .expect("upload should succeed");
 
@@ -426,7 +466,8 @@ mod tests {
         let basename = test_store_basename("retry");
         let (_tmp, store_dir) = make_output_file(&basename, b"retry me")?;
 
-        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", "")
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -449,7 +490,8 @@ mod tests {
         let basename = test_store_basename("exhaust");
         let (_tmp, store_dir) = make_output_file(&basename, b"never uploads")?;
 
-        let err = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let err = upload_output(&mut client, &store_dir, p, "", "")
             .await
             .expect_err("upload should exhaust retries");
 
@@ -488,7 +530,8 @@ mod tests {
             nar.clone(),
         );
 
-        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", "")
             .await
             .expect("should adopt concurrent uploader's result");
 
@@ -523,7 +566,8 @@ mod tests {
         let basename = test_store_basename("clears");
         let (_tmp, store_dir) = make_output_file(&basename, b"clears eventually")?;
 
-        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", "")
             .await
             .expect("should retry upload after poll window");
 
@@ -588,12 +632,11 @@ mod tests {
     }
 
     /// ENOENT during streaming dump → UploadExhausted (wraps the NAR error).
-    /// With the pre-scan pass, the ENOENT is caught BEFORE the gRPC stream
-    /// opens (pre-scan reads from disk first). The error still surfaces as
+    /// The ENOENT is caught in `prepare_output` (pre-scan reads from disk
+    /// first), BEFORE any gRPC stream opens. The error surfaces as
     /// UploadExhausted with a NAR-serialization message.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
-        let (_store, mut client) = spawn_mock_store_inproc().await?;
         let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
         let store_dir = tmp.path().join("nix/store");
@@ -602,9 +645,9 @@ mod tests {
         // Use a VALID basename (32-char hash) so we get past the path
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
-        let err = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+        let err = prep_one(&store_dir, &basename, &no_candidates())
             .await
-            .expect_err("should fail NAR serialization");
+            .expect_err("should fail NAR serialization in prep");
 
         // NAR error happens in the pre-scan pass (before the retry loop) —
         // same ENOENT every time → UploadExhausted. Error message still
@@ -661,8 +704,8 @@ mod tests {
         let basename = test_store_basename("tee-hash");
         let (_tmp, store_dir) = make_output_file(&basename, b"tee upload test data")?;
 
-        let result =
-            upload_output(&mut client, &store_dir, &basename, "", "", no_candidates()).await?;
+        let p = prep_one(&store_dir, &basename, &no_candidates()).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", "").await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.
@@ -716,8 +759,8 @@ mod tests {
         // legal — binaries embed their own store path in rpaths).
         let candidates = Arc::new(CandidateSet::from_paths([&dep_a, &dep_b, &self_path]));
 
-        let result =
-            upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
+        let p = prep_one(&store_dir, &basename, &candidates).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
 
         // Result carries the scanned refs. Sorted: /nix/store/7rjj...
         // < /nix/store/aaaa... (self). dep-B absent.
@@ -756,8 +799,8 @@ mod tests {
         let dep = format!("/nix/store/{DEP_HASH_A}-dep");
         let candidates = Arc::new(CandidateSet::from_paths([&dep]));
 
-        let result =
-            upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
+        let p = prep_one(&store_dir, &basename, &candidates).await?;
+        let result = upload_output(&mut client, &store_dir, p, "", &deriver).await?;
 
         assert!(result.references.is_empty(), "no refs in output contents");
         let puts = store.calls.put_calls.read().unwrap();
@@ -771,8 +814,12 @@ mod tests {
 
     /// Reference scanning in upload_all_outputs: candidate set built once,
     /// shared across all outputs. Each output gets its own scan result.
+    /// Also asserts `rio_builder_upload_references_count` is recorded on
+    /// the batch path (bug_248: was only emitted from single.rs).
     #[tokio::test]
     async fn test_upload_all_outputs_per_output_refs() -> anyhow::Result<()> {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (store, client, _h) = spawn_mock_store_with_client().await?;
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
@@ -820,6 +867,13 @@ mod tests {
         for p in puts.iter() {
             assert_eq!(p.deriver, deriver);
         }
+        // bug_248: 2 outputs → batch path; histogram MUST have been
+        // recorded (single chokepoint in `prepare_output`). Pre-fix this
+        // was 0 samples on batch.
+        assert!(
+            recorder.histogram_touched("rio_builder_upload_references_count"),
+            "references-count histogram must be recorded on the batch path"
+        );
         Ok(())
     }
 
@@ -1025,5 +1079,149 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch atomicity / retry / liveness regressions
+    // -----------------------------------------------------------------------
+
+    // r[verify builder.upload.batch+2]
+    // r[verify store.atomic.multi-output]
+    /// bug_392: prep failure on output k must NOT leave outputs 0..k-1
+    /// committed server-side. Two outputs on disk; output 1's basename
+    /// has no file (scan_references ENOENTs). Pre-fix: producer streamed
+    /// output 0 fully, then errored → MockStore committed `{0}` →
+    /// put_calls.len() == 1. Post-fix: prep loop fails BEFORE any gRPC
+    /// → put_calls.len() == 0.
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_prep_failure_no_partial_commit() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+
+        let b_ok = format!("{DEP_HASH_A}-ok");
+        let b_bad = format!("{DEP_HASH_B}-unreadable");
+        fs::write(store_dir.join(&b_ok), b"ok contents")?;
+        // b_bad: directory with mode 0 → scan_new_outputs lists it (the
+        // dirent is visible), but dump_path_streaming → read_dir() fails
+        // EACCES inside scan_references.
+        let bad_dir = store_dir.join(&b_bad);
+        fs::create_dir(&bad_dir)?;
+        fs::set_permissions(
+            &bad_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )?;
+        // Restore permissions on drop so tempdir cleanup succeeds.
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(
+                    &self.0,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                );
+            }
+        }
+        let _restore = Restore(bad_dir);
+
+        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+            .await
+            .expect_err("prep must fail on the unreadable output");
+        assert!(matches!(err, UploadError::UploadExhausted { .. }));
+
+        assert_eq!(
+            store.calls.put_calls.read().unwrap().len(),
+            0,
+            "prep failure must not partially commit — zero PutPath/PutPathBatch entries"
+        );
+        Ok(())
+    }
+
+    /// bug_167: batch path retries transient store errors with the same
+    /// MAX_UPLOAD_RETRIES budget as the single-output path. Pre-fix: a
+    /// single `Unavailable` on a 2-output derivation hit `return Err(e)`
+    /// → InfrastructureFailure → full re-build.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_all_outputs_batch_retries_transient() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        // First two batch RPCs return Unavailable; third succeeds.
+        store.faults.fail_next_puts.store(2, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        let (b1, b2) = (format!("{DEP_HASH_A}-one"), format!("{DEP_HASH_B}-two"));
+        fs::write(store_dir.join(&b1), b"one")?;
+        fs::write(store_dir.join(&b2), b"two")?;
+
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
+            .await
+            .expect("batch upload should succeed on 3rd attempt");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            store.calls.put_calls.read().unwrap().len(),
+            2,
+            "both outputs committed on the successful attempt"
+        );
+        assert_eq!(
+            store.faults.fail_next_puts.load(Ordering::SeqCst),
+            0,
+            "all injected failures consumed"
+        );
+        Ok(())
+    }
+
+    /// bug_167 (exhaustion): batch retries exhaust → UploadExhausted, NOT
+    /// fallthrough to per-output. `Unavailable` ≠ `FailedPrecondition`.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_all_outputs_batch_exhausts_transient() -> anyhow::Result<()> {
+        let (store, client) = spawn_mock_store_inproc().await?;
+        store
+            .faults
+            .fail_next_puts
+            .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(format!("{DEP_HASH_A}-a")), b"a")?;
+        fs::write(store_dir.join(format!("{DEP_HASH_B}-b")), b"b")?;
+
+        let err = upload_all_outputs(&client, &store_dir, "", "", &[])
+            .await
+            .expect_err("batch should exhaust retries");
+        assert!(matches!(err, UploadError::UploadExhausted { .. }));
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
+        Ok(())
+    }
+
+    /// bug_388/429/D1: `await_dump_bounded` returns DeadlineExceeded when
+    /// the join handle never completes. Uses an async (not blocking)
+    /// pending task so paused-time auto-advance fires — a real
+    /// spawn_blocking parked in open() inhibits auto-advance, which is
+    /// exactly the production hang this guard exists to break.
+    #[tokio::test(start_paused = true)]
+    async fn test_await_dump_bounded_times_out() {
+        use std::time::Duration;
+        let h: tokio::task::JoinHandle<Result<(), tonic::Status>> =
+            tokio::spawn(async { std::future::pending().await });
+        let r = common::await_dump_bounded("test-dump", Duration::from_secs(10), h).await;
+        let status = r.expect_err("must time out");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            status.message().contains("stuck"),
+            "message names the hang: {status:?}"
+        );
+    }
+
+    /// `await_dump_bounded` happy path: task completes → result passes
+    /// through unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn test_await_dump_bounded_ok_passthrough() {
+        use std::time::Duration;
+        let h = tokio::spawn(async { 42u64 });
+        let r = common::await_dump_bounded("test-dump", Duration::from_secs(10), h).await;
+        assert_eq!(r.expect("ok"), 42);
     }
 }
