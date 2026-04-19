@@ -559,9 +559,33 @@ impl DagActor {
         let start = Instant::now();
         let result = self.recover_from_pg().await;
 
+        // Stale-pin cleanup: crash-between-pin-and-unpin (scheduler
+        // crashed after dispatch pin but before completion unpin)
+        // leaves rows in scheduler_live_pins for terminal drvs.
+        // Sweep them — safe to remove (drv is terminal, inputs no
+        // longer in-use). Best-effort; grace period is fallback.
+        // Runs BEFORE the gen re-check so a lease flap during this
+        // await is caught at the TOCTOU gate below — this is the
+        // second async PG round-trip in handle_leader_acquired and
+        // must be inside the gen_at_entry window. The DELETE is
+        // DB-side terminal-status based, independent of `result`.
+        match self.db.sweep_stale_live_pins().await {
+            Ok(n) if n > 0 => {
+                info!(
+                    swept = n,
+                    "swept stale scheduler_live_pins (crash recovery)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to sweep stale live pins (best-effort)");
+            }
+        }
+
         // Test-only interleave gate: lets a test bump `generation`
-        // between recovery completion and the gen re-check below,
-        // deterministically proving the TOCTOU fix. Signal "reached"
+        // between the awaits above and the gen re-check below,
+        // deterministically proving the TOCTOU fix covers BOTH
+        // recover_from_pg AND sweep_stale_live_pins. Signal "reached"
         // then wait for "release".
         #[cfg(test)]
         if let Some((reached_tx, release_rx)) = self.recovery_toctou_gate.take() {
@@ -632,25 +656,6 @@ impl DagActor {
                             new_gen = target,
                             "seeded generation from PG high-water mark (defensive monotonicity)"
                         );
-                    }
-                }
-
-                // Stale-pin cleanup: crash-between-pin-and-unpin
-                // (scheduler crashed after dispatch pin but before
-                // completion unpin) leaves rows in scheduler_live_
-                // pins for terminal drvs. Sweep them — they're
-                // safe to remove (drv is terminal, inputs no longer
-                // in-use). Best-effort; grace period is fallback.
-                match self.db.sweep_stale_live_pins().await {
-                    Ok(n) if n > 0 => {
-                        info!(
-                            swept = n,
-                            "swept stale scheduler_live_pins (crash recovery)"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(error = %e, "failed to sweep stale live pins (best-effort)");
                     }
                 }
                 self.leader.set_recovery_complete();
