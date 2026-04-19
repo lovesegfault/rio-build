@@ -621,6 +621,14 @@ pub async fn walk_dependent_realisations(
         .fetch_all(pool)
         .await?;
         for (h, n, path, oh) in rows {
+            if found.len() >= max_nodes {
+                // A single high-fanout reverse-deps query (glibc,
+                // stdenv) can return ≫max_nodes rows; the outer-loop
+                // check alone overshoots by one full fetch. Cap here so
+                // the caller's "bounded by MAX_CASCADE_NODES" linear
+                // scan (completion.rs) actually holds.
+                break;
+            }
             let key = (h, n);
             if visited.insert(key.clone()) {
                 let Ok(oh32) = oh.as_slice().try_into() else {
@@ -1183,6 +1191,63 @@ mod tests {
             "only orig_src; IA path skipped"
         );
         assert!(resolved.lookups.is_empty());
+        Ok(())
+    }
+
+    // r[verify sched.ca.cutoff-propagate+2]
+    /// Regression: the `found.len() >= max_nodes` check ran only at the
+    /// top of each `frontier.pop()`, BEFORE the unbounded `fetch_all`.
+    /// A single high-fanout reverse-deps query (glibc, stdenv) could
+    /// return ≫`max_nodes` rows, all inserted into `found` before the
+    /// next outer-loop check. The caller's "bounded by
+    /// MAX_CASCADE_NODES" linear scan (completion.rs) then ran on the
+    /// full set, outside the 2s timeout, in the actor's single-threaded
+    /// loop.
+    #[tokio::test]
+    async fn walk_dependent_realisations_caps_single_high_fanout() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed: one realisation with N dependents all pointing back at it
+        // via realisation_deps — a single reverse-deps query returns N.
+        let seed_hash: [u8; 32] = [0u8; 32];
+        insert_realisation(&db.pool, &seed_hash, "out", "/nix/store/seed", &[0xaa; 32]).await?;
+
+        const N: u8 = 50;
+        for i in 1..=N {
+            let dep_hash: [u8; 32] = [i; 32];
+            insert_realisation(
+                &db.pool,
+                &dep_hash,
+                "out",
+                &format!("/nix/store/dep-{i}"),
+                &[0xbb; 32],
+            )
+            .await?;
+            sqlx::query(
+                "INSERT INTO realisation_deps \
+                 (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+                 VALUES ($1, 'out', $2, 'out')",
+            )
+            .bind(dep_hash.as_slice())
+            .bind(seed_hash.as_slice())
+            .execute(&db.pool)
+            .await?;
+        }
+
+        let seeds = [(seed_hash.to_vec(), "out".to_string())];
+
+        // Regression assertion: cap respected even when ONE query
+        // returns more than max_nodes.
+        let out = walk_dependent_realisations(&db.pool, &seeds, 10).await?;
+        assert!(
+            out.len() <= 10,
+            "single high-fanout query must not overshoot max_nodes; got {}",
+            out.len()
+        );
+
+        // Sanity: with cap above fanout, all dependents returned.
+        let out = walk_dependent_realisations(&db.pool, &seeds, 100).await?;
+        assert_eq!(out.len(), usize::from(N));
         Ok(())
     }
 
