@@ -228,10 +228,13 @@ impl<'a> StderrLoop<'a> {
             // r[impl builder.log-limit+2]
             AddLineResult::LimitExceeded { reason } => {
                 // Flush what's buffered so client sees output up to
-                // the limit. Best-effort: channel-closed is moot,
-                // we're breaking with LogLimitExceeded anyway.
-                if self.batcher.has_pending() {
-                    let _ = send_batch(self.log_tx, self.batcher.flush()).await;
+                // the limit. Unconditional: flush() drains
+                // lines_dropped_this_window even when self.lines is
+                // empty (has_pending() doesn't cover that). Best-effort:
+                // channel-closed is moot, we're breaking anyway.
+                let batch = self.batcher.flush();
+                if !batch.lines.is_empty() {
+                    let _ = send_batch(self.log_tx, batch).await;
                 }
                 tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
                 Break(Ok(Some(BuildResult::failure(
@@ -340,8 +343,12 @@ impl<'a> StderrLoop<'a> {
     /// Best-effort final flush after the loop exits. The build result is
     /// already determined; if the log channel is closed, just drop.
     async fn final_flush(&mut self) {
-        if self.batcher.has_pending() {
-            let _ = send_batch(self.log_tx, self.batcher.flush()).await;
+        // Unconditional: flush() drains lines_dropped_this_window even
+        // when self.lines is empty (the case has_pending() deliberately
+        // doesn't cover — see its doc). Skip the send if nothing came out.
+        let batch = self.batcher.flush();
+        if !batch.lines.is_empty() {
+            let _ = send_batch(self.log_tx, batch).await;
         }
     }
 }

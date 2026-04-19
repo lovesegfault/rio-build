@@ -319,7 +319,7 @@ pub fn validate_dag(
     // multi-tenant build farm. A malicious .drv could use this
     // to exfiltrate secrets from the worker.
     if let Some((_, node, _)) = iter_cached_drvs(nodes, drv_cache, "validate_dag")
-        .find(|(_, _, drv)| drv.env().get("__noChroot").is_some_and(|v| v == "1"))
+        .find(|(_, _, drv)| StructuredEnv::new(drv.env()).bool("__noChroot") == Some(true))
     {
         return Err(format!(
             "derivation {} requests __noChroot (sandbox escape) — not permitted",
@@ -330,23 +330,6 @@ pub fn validate_dag(
     Ok(())
 }
 
-/// Build the proto `DerivationNode` for any [`DerivationLike`].
-///
-/// Both [`Derivation`] (full BFS path) and
-/// [`BasicDerivation`](rio_nix::derivation::BasicDerivation)
-/// (single-node fallback) route through here — the
-/// [`DerivationLike`] trait (P0384) unifies the accessor surface so
-/// the struct-literal is written once. Before the trait existed the
-/// two paths were hand-rolled separately and drifted on every
-/// `DerivationNode` field-add (the `is_fixed_output` divergence P0384
-/// fixed; the dual `is_content_addressed` annotations P0250 added).
-///
-/// `drv_content` is left zeroed — [`filter_and_inline_drv`] fills it
-/// AFTER FindMissingPaths batching (see call-site comments on the
-/// wrappers).
-///
-/// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
-/// predicate (single `out` with both `hash_algo` AND `hash` set) —
 /// `__structuredAttrs`-aware env lookup, mirroring Nix's
 /// `ParsedDerivation::get{String,Bool,Strings}Attr`.
 ///
@@ -354,15 +337,16 @@ pub fn validate_dag(
 /// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
 /// they do NOT appear as separate env keys. Direct `env.get("foo")`
 /// returns None, so the ADR-023 sizing hints (and pre-existing
-/// `requiredSystemFeatures`) were always None for structuredAttrs drvs.
-/// JSON is checked first, then raw env, matching upstream semantics.
-struct StructuredEnv<'a> {
+/// `requiredSystemFeatures` / `__noChroot`) were always None for
+/// structuredAttrs drvs. JSON is checked first, then raw env, matching
+/// upstream semantics.
+pub(crate) struct StructuredEnv<'a> {
     env: &'a std::collections::BTreeMap<String, String>,
     json: Option<serde_json::Value>,
 }
 
 impl<'a> StructuredEnv<'a> {
-    fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
+    pub(crate) fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
         let json = env.get("__json").and_then(|s| serde_json::from_str(s).ok());
         Self { env, json }
     }
@@ -374,7 +358,7 @@ impl<'a> StructuredEnv<'a> {
             .or_else(|| self.env.get(key).cloned())
     }
 
-    fn bool(&self, key: &str) -> Option<bool> {
+    pub(crate) fn bool(&self, key: &str) -> Option<bool> {
         self.json
             .as_ref()
             .and_then(|j| j.get(key)?.as_bool())
@@ -401,6 +385,23 @@ impl<'a> StructuredEnv<'a> {
     }
 }
 
+/// Build the proto `DerivationNode` for any [`DerivationLike`].
+///
+/// Both [`Derivation`] (full BFS path) and
+/// [`BasicDerivation`](rio_nix::derivation::BasicDerivation)
+/// (single-node fallback) route through here — the
+/// [`DerivationLike`] trait (P0384) unifies the accessor surface so
+/// the struct-literal is written once. Before the trait existed the
+/// two paths were hand-rolled separately and drifted on every
+/// `DerivationNode` field-add (the `is_fixed_output` divergence P0384
+/// fixed; the dual `is_content_addressed` annotations P0250 added).
+///
+/// `drv_content` is left zeroed — [`filter_and_inline_drv`] fills it
+/// AFTER FindMissingPaths batching (see call-site comments on the
+/// wrappers).
+///
+/// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
+/// predicate (single `out` with both `hash_algo` AND `hash` set) —
 /// matches the worker's strict recompute at executor/mod.rs:344.
 // r[impl sched.ca.detect]
 // Both CA kinds: floating (hash_algo set, hash empty) and

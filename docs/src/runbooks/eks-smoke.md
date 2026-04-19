@@ -94,7 +94,7 @@ EOF
 # Builder Jobs spawn on demand once a build is queued — no standing pods to wait for.
 # Per-pod cpu/mem/disk come from the scheduler's per-drv SpawnIntent (ADR-023),
 # NOT from Pool.spec — there is no resources field.
-rio-cli pool describe smoke-test    # or: kubectl -n rio-builders get pool smoke-test -o yaml
+rio-cli pool describe smoke-test -n rio-builders    # or: kubectl -n rio-builders get pool smoke-test -o yaml
 ```
 
 **Troubleshooting if workers stuck ContainerCreating:**

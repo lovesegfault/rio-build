@@ -322,11 +322,13 @@ in
         # (writes /var/lib/kubelet/kubeconfig) — otherwise the fresh
         # empty XFS overmounts and shadows them → kubelet can't register
         # / builder pods CreateContainerError on the Localhost profile.
-        # That rules out delegating assembly to nodeadm
-        # (instanceStorePolicy=RAID0): nodeadm's LocalDisk aspect would
-        # mkfs.ext4 + mount /dev/md0 itself, AND nodeadm-init runs after
-        # tmpfiles. So this unit owns the whole mdadm→mkfs→mount chain
-        # and the rio-nvme EC2NodeClass leaves instanceStorePolicy unset.
+        # That rules out delegating assembly to nodeadm: its LocalDisk
+        # aspect would mkfs.ext4 + mount /dev/md0 itself, AND nodeadm-init
+        # runs after tmpfiles. The rio-nvme EC2NodeClass DOES set
+        # instanceStorePolicy: RAID0, but only so Karpenter's bin-pack sim
+        # sees NVMe capacity — `nodeadm init --skip run` never executes
+        # the local-disk aspect, so this unit owns the whole
+        # mdadm→mkfs→mount chain.
         #
         # ConditionPathExistsGlob gates on the EC2 instance-store by-id
         # link: ebs-only nodes (rio-default/rio-metal NodeClass) skip

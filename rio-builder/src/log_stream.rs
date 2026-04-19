@@ -205,9 +205,14 @@ impl LogBatcher {
     /// exceeds the rate and then exits within the same 1s window never
     /// triggers `add_line()`'s window-reset, so the suppression marker +
     /// metric would otherwise be lost (silent truncation, undercounted
-    /// `rio_builder_log_lines_suppressed_total`). All exit paths
-    /// (`STDERR_LAST`, `LimitExceeded`, silence-timeout, `BatchReady`) go
-    /// through here.
+    /// `rio_builder_log_lines_suppressed_total`).
+    ///
+    /// Callers: `BatchReady` (mid-build, lines always non-empty), the
+    /// periodic `flush_tick` (gated on `has_pending()` so it never fires
+    /// during pure suppression — the marker stays single-per-window per
+    /// `r[builder.log-limit+2]`), and the exit paths (`STDERR_LAST`,
+    /// `LimitExceeded`, silence-timeout) which call unconditionally and
+    /// skip the send when the resulting batch is empty.
     pub fn flush(&mut self) -> BuildLogBatch {
         let dropped = std::mem::take(&mut self.lines_dropped_this_window);
         if dropped > 0 {
@@ -233,13 +238,17 @@ impl LogBatcher {
         }
     }
 
-    /// Whether there are any buffered lines or an unreported suppression
-    /// count.
+    /// Whether there are buffered lines waiting to be sent.
     ///
-    /// Used by `executor/daemon/stderr_loop.rs` to decide whether to
-    /// `flush()` before sending the final batch on stream close.
+    /// Used by `executor/daemon/stderr_loop.rs` to gate the periodic
+    /// `flush_tick`. Deliberately does NOT check
+    /// `lines_dropped_this_window`: during sustained suppression `lines`
+    /// stays empty and the 100ms tick must be a no-op, otherwise it emits
+    /// a fragmentary marker every tick instead of the spec's single
+    /// marker at window-reset (`r[builder.log-limit+2]`). Exit paths
+    /// drain drops by calling `flush()` unconditionally.
     pub fn has_pending(&self) -> bool {
-        !self.lines.is_empty() || self.lines_dropped_this_window > 0
+        !self.lines.is_empty()
     }
 }
 
@@ -380,7 +389,10 @@ mod tests {
             batcher.add_line(b"l".to_vec());
         }
         // No sleep, no further add_line — straight to final flush.
-        assert!(batcher.has_pending(), "has_pending sees unreported drops");
+        // has_pending() is true here because 3 lines are buffered; it
+        // does NOT report the 4 drops (flush_tick must stay quiet during
+        // pure suppression). Exit paths call flush() unconditionally.
+        assert!(batcher.has_pending());
         let batch = batcher.flush();
         assert_eq!(batch.lines.len(), 4, "3 accepted + 1 marker");
         let marker = std::str::from_utf8(&batch.lines[3]).unwrap();

@@ -936,12 +936,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // A malicious client could send __noChroot=1 via wopBuildDerivation
     // (which sends an inline BasicDerivation, not a store path) to
     // escape the sandbox. This catches it at the gateway.
-    if basic_drv
-        .env()
-        .get("__noChroot")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if translate::StructuredEnv::new(basic_drv.env()).bool("__noChroot") == Some(true) {
         warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
         stderr_err!(
             stderr,
