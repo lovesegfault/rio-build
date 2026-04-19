@@ -391,6 +391,9 @@ pub const M_029: () = ();
 /// short-circuits" (the in-mem `cached_count`). The original SQL's
 /// `NOT EXISTS (assignments)` heuristic is equivalent in practice —
 /// both mean "completed without dispatch".
+///
+/// **Known defect:** the backfill predicate matches only `'completed'`,
+/// missing `'skipped'` (added by M_021). See [`M_048`] for the recount.
 pub const M_030: () = ();
 
 /// `migrations/031_manifests_uploading_idx.sql`
@@ -726,6 +729,25 @@ pub const M_046: () = ();
 /// in-process `HashSet`) so a controller restart — the most reliable
 /// trigger; every rolling deploy re-counts the past hour — is covered.
 pub const M_047: () = ();
+
+/// `migrations/048_builds_denorm_recount_skipped.sql`
+///
+/// [`M_030`]'s backfill counted only `d.status = 'completed'`, but the
+/// runtime model treats `Skipped` as completed (`dag/mod.rs`:
+/// `Completed | Skipped => summary.completed += 1`, persisted via
+/// `db/builds.rs::persist_build_counts`). M_021 added `'skipped'`
+/// before 030 shipped, so persistent DBs that accumulated CA-cutoff
+/// skips between those deploys had permanently undercounted
+/// `completed_drvs`/`cached_drvs` for terminal builds — `ListBuilds`
+/// reads the columns directly with no `derivations` join.
+///
+/// 030 is checksum-frozen (`migration_checksums_frozen`), so this
+/// re-runs the aggregate with `IN ('completed','skipped')` instead of
+/// editing 030 in place. The `b.status IN ('succeeded','failed',
+/// 'cancelled')` guard restricts the rewrite to terminal builds so it
+/// doesn't race the live `persist_build_counts` path on active builds
+/// (which self-heal on the next tick anyway). Idempotent.
+pub const M_048: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

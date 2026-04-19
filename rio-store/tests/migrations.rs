@@ -152,6 +152,7 @@ fn migration_checksums_frozen() {
         (45, "5887729e799f5aa01a59b8f153c74101418377ed8a262507727dc0adbabbe05cb951c6509cc5a22be4e35b4612cc73fd"),
         (46, "bacacfa2a3a0e0f516d868b6a3f70c9bbc5235fc5f1a510e3f32e272affb80c7517ec1007c1a775acc30b67922cea156"),
         (47, "0217805341c7bdceb715de6b59c7a7d96db79ed9bcd5d5647ee0266a55f58d69e991edd775f6fa84d66939f0f1517886"),
+        (48, "324d53bc92cf2964c8dc4384603a7fc02723c19a74cb714b2aeaef9b32e3dbd73cb3e792ddd345a2cc661d7660340091"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -251,4 +252,77 @@ async fn cross_service_schema_contract() {
              dependent queries",
         );
     }
+}
+
+/// M_048 regression: M_030's backfill matched only `'completed'`, missing
+/// `'skipped'` (M_021). For terminal builds — which never re-fire
+/// `persist_build_counts` — the undercount was permanent. M_048 recounts
+/// with `IN ('completed','skipped')`, guarded to terminal builds so it
+/// doesn't race the live write path on active ones.
+///
+/// Seeds the post-030/pre-048 undercount directly (TestDb already
+/// applied 048 against an empty DB), then re-executes 048 idempotently.
+#[tokio::test]
+async fn migration_048_recounts_skipped_as_completed() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // Two builds: b1 terminal (succeeded) — must be recounted;
+    // b2 active — must be left alone (terminal-status guard).
+    // Each linked to 3 derivations: completed, completed, skipped.
+    // Seeded completed_drvs=2 simulates M_030's undercount.
+    let (b1, b2): (sqlx::types::Uuid, sqlx::types::Uuid) = sqlx::query_as(
+        r#"
+        WITH b AS (
+          INSERT INTO builds (status, total_drvs, completed_drvs, cached_drvs)
+          VALUES ('succeeded', 3, 2, 2), ('active', 3, 2, 2)
+          RETURNING build_id
+        ),
+        bid AS (SELECT array_agg(build_id) AS ids FROM b),
+        d AS (
+          INSERT INTO derivations (drv_hash, drv_path, system, status)
+          VALUES
+            ('h1', '/nix/store/h1-x.drv', 'x86_64-linux', 'completed'),
+            ('h2', '/nix/store/h2-x.drv', 'x86_64-linux', 'completed'),
+            ('h3', '/nix/store/h3-x.drv', 'x86_64-linux', 'skipped'),
+            ('h4', '/nix/store/h4-x.drv', 'x86_64-linux', 'completed'),
+            ('h5', '/nix/store/h5-x.drv', 'x86_64-linux', 'completed'),
+            ('h6', '/nix/store/h6-x.drv', 'x86_64-linux', 'skipped')
+          RETURNING derivation_id
+        ),
+        did AS (SELECT array_agg(derivation_id) AS ids FROM d),
+        bd AS (
+          INSERT INTO build_derivations (build_id, derivation_id)
+          SELECT (SELECT ids[1] FROM bid), unnest((SELECT ids[1:3] FROM did))
+          UNION ALL
+          SELECT (SELECT ids[2] FROM bid), unnest((SELECT ids[4:6] FROM did))
+        )
+        SELECT ids[1], ids[2] FROM bid
+        "#,
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // Re-execute 048 idempotently against the seeded data. raw_sql:
+    // file has a comment line + statement, `query` would treat it as
+    // a single prepared statement and choke on the leading comment in
+    // some PG configs — raw_sql sends it as a simple-query batch.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/048_builds_denorm_recount_skipped.sql"
+    ))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let row = |b| {
+        sqlx::query_as::<_, (i32, i32)>(
+            "SELECT completed_drvs, cached_drvs FROM builds WHERE build_id = $1",
+        )
+        .bind(b)
+    };
+    // b1 terminal → recounted: skipped now counts.
+    assert_eq!(row(b1).fetch_one(&db.pool).await.unwrap(), (3, 3));
+    // b2 active → guard skipped it: seeded undercount preserved (live
+    // path owns active builds; 048 must not race it).
+    assert_eq!(row(b2).fetch_one(&db.pool).await.unwrap(), (2, 2));
 }
