@@ -239,6 +239,20 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         "metric incremented with pool label; saw keys: {:?}",
         recorder.all_keys(),
     );
+    // HELP text + observability.md claim only `pool` — assert no other
+    // label sneaks in (regression guard for the phantom-`class` drift).
+    let reap_keys: Vec<_> = recorder
+        .all_keys()
+        .into_iter()
+        .filter(|k| k.starts_with("rio_controller_ephemeral_jobs_reaped_total"))
+        .collect();
+    for k in &reap_keys {
+        assert!(!k.contains("class="), "phantom `class` label emitted: {k}");
+        assert_eq!(
+            k, "rio_controller_ephemeral_jobs_reaped_total{pool=med-pool}",
+            "label set must be exactly {{pool}}"
+        );
+    }
 }
 
 /// m027 deferral: a Pending Job whose `rio.build/intent-selector`
