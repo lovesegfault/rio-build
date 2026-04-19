@@ -46,6 +46,15 @@ use rio_proto::types::{GcProgress, GcRequest};
 /// own `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wall-clock budget for one tick body (TriggerGC + progress-stream
+/// drain). `connect_single` applies NO h2 keepalive, so a SIGKILLed
+/// store hangs `stream.message()` for ~2h kernel TCP keepalive; a
+/// store-side `run_gc` deadlock (PG advisory lock) hangs it forever.
+/// GC mark/sweep on a multi-TB store is O(minutes); 1h is generous and
+/// far below the 24h cron interval so `MissedTickBehavior::Skip` never
+/// compounds. On timeout → `RpcFailure` (store reached, then hung).
+pub(crate) const GC_TICK_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// Minimum delay before the FIRST `TriggerGC` after controller start.
 /// Jitter (0..=60 s) added on top so a multi-controller-replica restart
 /// (operator misconfig — see module doc) doesn't thunder.
@@ -114,9 +123,11 @@ pub async fn run(store_addr: String, tick: Duration, shutdown: rio_common::signa
 /// is NOT at t≈0. A controller restart still triggers GC within
 /// minutes (not delayed by the full 24 h `tick`).
 ///
-/// `MissedTickBehavior::Skip`: a tick body that takes >24h (store
-/// hung, stream drains slowly) doesn't fire twice immediately
-/// after. Catch up on the next normal interval boundary.
+/// The tick body is bounded by [`GC_TICK_TIMEOUT`] and races
+/// `shutdown.cancelled()` — a hung store cannot stall the cron past
+/// 1h or block shutdown. `MissedTickBehavior::Skip`: a slow (but
+/// sub-timeout) tick doesn't fire twice immediately after; catch up
+/// on the next normal interval boundary.
 ///
 /// Not `spawn_periodic`: this is an `async fn` (not spawned) so
 /// tests can await it directly with a mock `tick_fn` — the three
@@ -143,7 +154,25 @@ pub(crate) async fn run_loop<F, Fut>(
             _ = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
-        let result = tick_fn().await;
+        // Race the tick body against shutdown AND a wall-clock budget.
+        // `connect_single` skips h2 keepalive, so a hung store can
+        // wedge `tick_once` indefinitely; without this the loop never
+        // returns to `select!` to observe the next interval or
+        // cancellation.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            r = tokio::time::timeout(GC_TICK_TIMEOUT, tick_fn()) => match r {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_secs = GC_TICK_TIMEOUT.as_secs(),
+                        "GC cron: tick exceeded budget; abandoning this run"
+                    );
+                    TickResult::RpcFailure
+                }
+            },
+        };
         metrics::counter!("rio_controller_gc_runs_total", "result" => result.label()).increment(1);
     }
 }
@@ -442,6 +471,115 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "no post-cancel tick (biased select)"
+        );
+    }
+
+    /// A hung tick body (store SIGKILLed mid-stream, or `run_gc`
+    /// deadlocked on a PG advisory lock — `stream.message()` blocks
+    /// forever) is bounded by `GC_TICK_TIMEOUT` → `rpc_failure`, and
+    /// the loop SURVIVES to fire the next interval. Regression: the
+    /// tick body used to be awaited outside any `select!`/timeout, so
+    /// a single hung store silently killed the 24h cron.
+    #[tokio::test(start_paused = true)]
+    async fn hung_tick_times_out_and_loop_survives() {
+        let recorder = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let shutdown = rio_common::signal::Token::new();
+        let sd = shutdown.clone();
+
+        let h = tokio::spawn(async move {
+            run_loop(Duration::from_secs(24 * 3600), sd, move || {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        // Hung store: never resolves.
+                        std::future::pending::<TickResult>().await
+                    } else {
+                        TickResult::Success
+                    }
+                }
+            })
+            .await;
+        });
+
+        settle().await;
+        tokio::time::advance(PAST_STARTUP).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first tick started");
+        assert_eq!(
+            recorder.get("rio_controller_gc_runs_total{result=rpc_failure}"),
+            0,
+            "tick still hung; timeout not yet elapsed"
+        );
+
+        // Advance past the per-tick budget → loop abandons the hung
+        // tick as RpcFailure.
+        tokio::time::advance(GC_TICK_TIMEOUT + Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            recorder.get("rio_controller_gc_runs_total{result=rpc_failure}"),
+            1,
+            "hung tick abandoned as rpc_failure; keys={:?}",
+            recorder.all_keys()
+        );
+
+        // +24h: loop MUST still be alive → second tick fires and
+        // succeeds.
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "loop survived hung tick");
+        assert_eq!(
+            recorder.get("rio_controller_gc_runs_total{result=success}"),
+            1
+        );
+
+        shutdown.cancel();
+        h.await.unwrap();
+    }
+
+    /// Shutdown cancels MID-tick. Regression: with the tick body
+    /// awaited outside the `select!`, a hung store blocked shutdown
+    /// (the "GC cron stopped" log never printed).
+    #[tokio::test(start_paused = true)]
+    async fn hung_tick_is_cancellable() {
+        let recorder = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let shutdown = rio_common::signal::Token::new();
+        let sd = shutdown.clone();
+
+        let h = tokio::spawn(async move {
+            run_loop(Duration::from_secs(24 * 3600), sd, move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<TickResult>()
+            })
+            .await;
+        });
+
+        settle().await;
+        tokio::time::advance(PAST_STARTUP).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tick started, hung");
+
+        // Cancel mid-tick (well before GC_TICK_TIMEOUT). Loop must
+        // exit without recording a result.
+        shutdown.cancel();
+        settle().await;
+        h.await.unwrap();
+        assert_eq!(
+            recorder.get("rio_controller_gc_runs_total{result=rpc_failure}"),
+            0,
+            "cancelled mid-tick → no result recorded; keys={:?}",
+            recorder.all_keys()
+        );
+        assert_eq!(
+            recorder.get("rio_controller_gc_runs_total{result=success}"),
+            0
         );
     }
 }
