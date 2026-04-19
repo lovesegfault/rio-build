@@ -187,6 +187,11 @@ fn test_valid_config() -> Config {
     |c: &mut Config| { c.retry.backoff_base_secs = 10.0; c.retry.backoff_max_secs = 5.0; },
     &["backoff_max_secs", ">= backoff_base_secs"]
 )]
+// infra_retry_window <= 0 → elapsed > window always true → infra_count never
+// accumulates → max_infra_retries cap defeated → silent hot-loop.
+#[case::negative_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = -300.0, &["infra_retry_window_secs", "-300"])]
+#[case::zero_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = 0.0, &["infra_retry_window_secs"])]
+#[case::nan_infra_window(|c: &mut Config| c.retry.infra_retry_window_secs = f64::NAN, &[])]
 fn config_rejects(#[case] mutate: fn(&mut Config), #[case] expected: &[&str]) {
     let mut cfg = test_valid_config();
     mutate(&mut cfg);

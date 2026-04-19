@@ -256,6 +256,23 @@ impl rio_common::config::ValidateConfig for Config {
             cfg.retry.backoff_max_secs,
             cfg.retry.backoff_base_secs
         );
+        // `actor/completion.rs` resets the per-executor `infra_count` when
+        // `last.elapsed().as_secs_f64() > infra_retry_window_secs`. `as_secs_f64()`
+        // is always >= 0.0, so a negative window (or 0.0) makes the comparison
+        // true on EVERY non-floor-counted infra failure → `infra_count` never
+        // accumulates → `max_infra_retries` cap never reached → the documented
+        // 9748-dispatch hot-loop (state/executor.rs) re-enabled silently. NaN
+        // makes the comparison false (also wrong: window-reset disabled).
+        // Tests that want "window-reset disabled" should use a large finite
+        // value (1e9 or `RetryPolicy::default().infra_retry_window_secs`), not 0.
+        anyhow::ensure!(
+            cfg.retry.infra_retry_window_secs.is_finite()
+                && cfg.retry.infra_retry_window_secs > 0.0,
+            "retry.infra_retry_window_secs must be finite and positive, got {} \
+         (<=0 makes the elapsed-reset comparison always true → max_infra_retries \
+         cap never reached → infra-failure hot-loop)",
+            cfg.retry.infra_retry_window_secs
+        );
         // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
         // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
         // Every derivation instantly poisons. threshold=1 is the practical
