@@ -879,26 +879,28 @@ impl DagActor {
     }
 
     /// Reconcile path for an orphaned assignment whose outputs are NOT
-    /// in the store: worker died mid-build. Record the failure (in-mem +
-    /// PG) and check poison threshold (same
-    /// [`record_failure_and_check_poison`](Self::record_failure_and_check_poison)
-    /// helper as `reassign_derivations`); if not poisoned,
-    /// `reset_to_ready` + retry++ + re-queue.
+    /// in the store: worker died mid-build (or phantom: never received
+    /// the assignment). Same semantics as
+    /// [`reassign_derivations`](Self::reassign_derivations): an
+    /// orphaned assignment is an infrastructure event, not a derivation
+    /// failure — re-read existing poison state only, do NOT record a
+    /// failure or bump `retry.count`. `executor_id` is kept for logging
+    /// parity with `reassign_derivations(.., lost_worker)`.
+    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+4]
     async fn reset_orphan_to_ready(
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &Option<ExecutorId>,
     ) {
-        let should_poison = if let Some(w) = executor_id {
-            self.record_failure_and_check_poison(drv_hash, w)
-                .await
-                .reached_poison
-        } else {
-            self.dag
-                .node(drv_hash)
-                .map(|s| self.poison_config.is_poisoned(s))
-                .unwrap_or(false)
-        };
+        // Re-read existing poison state so 3 prior REAL failures
+        // (recorded by handle_transient_failure) + this disconnect
+        // → poison instead of dispatching a 4th time. The orphan
+        // event itself never increments the count.
+        let should_poison = self
+            .dag
+            .node(drv_hash)
+            .map(|s| self.poison_config.is_poisoned(s))
+            .unwrap_or(false);
         if should_poison {
             info!(drv_hash = %drv_hash, executor_id = ?executor_id,
                   "reconcile: poison threshold reached, poisoning");
@@ -913,11 +915,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, error = %e, "reset_to_ready failed");
                 return;
             }
-            state.retry.count += 1;
             self.push_ready(drv_hash.clone());
-        }
-        if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
         }
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;

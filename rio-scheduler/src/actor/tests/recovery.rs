@@ -605,16 +605,11 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
 
     // Worker reconnects: BuildExecution stream + heartbeat with
     // EMPTY running_build (because it never actually got the
-    // assignment — the try_send never happened).
-    let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux").await?;
-    // Second worker so the post-reconcile dispatch has somewhere to go.
-    // I-065: reconcile records w1 in failed_builders (phantom counts as
-    // a failed attempt on that worker's infra); with a single-worker
-    // fleet that would be exhaustion → poison. Two workers preserves
-    // this test's intent (verify phantom RECONCILES) without hitting
-    // the exhaustion case, which test_fleet_exhaustion_static_eligibility
-    // covers separately.
-    let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux").await?;
+    // assignment — the try_send never happened). Single worker
+    // suffices: reset_orphan_to_ready does NOT record the phantom
+    // as a failure (r[sched.reassign.no-promote-on-ephemeral-
+    // disconnect]), so w1 stays eligible and receives the retry.
+    let mut worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // Verify: drv is Assigned, worker is in self.executors, but
@@ -647,24 +642,30 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
         "phantom-Assigned should be reconciled (Ready or re-dispatched to Assigned), got {:?}",
         post.status
     );
-    // If it's Assigned again, it should have been re-dispatched
-    // to our connected worker (not stale "phantom-w1"). Actually
-    // we DID connect phantom-w1, so re-dispatch goes to the same
-    // worker — that's fine, the worker now ACTUALLY has it.
-    //
-    // More precise: it should NOT be the OLD Assigned (stuck).
-    // The way to tell: if reset_to_ready ran, PG has retry_count
-    // bumped OR the assignment row was cleaned. Check retry_count.
-    let retry_count: i32 =
-        sqlx::query_scalar("SELECT retry_count FROM derivations WHERE drv_hash = 'phantom-drv'")
-            .fetch_one(&sched_db.pool)
-            .await?;
-    // retry_count was 0 before recovery. reset_to_ready bumps it.
-    // If reconciled → retry_count >= 1. If stuck → still 0.
+    // Reconcile must NOT count the phantom as a derivation failure
+    // (alignment with reassign_derivations).
     assert!(
-        retry_count >= 1,
-        "phantom Assigned should be reset (retry_count bumped), got {retry_count}"
+        post.retry.failed_builders.is_empty(),
+        "phantom reconcile must NOT insert into failed_builders, got {:?}",
+        post.retry.failed_builders
     );
+    assert_eq!(
+        post.retry.count, 0,
+        "phantom reconcile must NOT bump retry.count"
+    );
+    let (retry_count, failed): (i32, Vec<String>) = sqlx::query_as(
+        "SELECT retry_count, failed_builders FROM derivations WHERE drv_hash = 'phantom-drv'",
+    )
+    .fetch_one(&sched_db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "PG retry_count must NOT be bumped");
+    assert!(failed.is_empty(), "PG failed_builders must NOT be appended");
+
+    // Proof reconcile actually ran (not the OLD stuck Assigned): the
+    // post-reconcile dispatch_ready re-assigned to w1, so w1's stream
+    // now has the assignment.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, test_drv_path("phantom-drv"));
 
     Ok(())
 }
@@ -976,16 +977,21 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
     );
 
     // Drv should be Ready (NOT Completed — store couldn't verify
-    // outputs) and retry_count bumped.
+    // outputs). retry.count NOT bumped: orphan reset is an
+    // infrastructure event (alignment with reassign_derivations).
     let post = expect_drv(&handle, "z4-drv").await;
     assert_eq!(
         post.status,
         DerivationStatus::Ready,
         "store unreachable → assume incomplete → reset to Ready"
     );
+    assert_eq!(
+        post.retry.count, 0,
+        "orphan reset is an infra event, not a derivation failure"
+    );
     assert!(
-        post.retry.count >= 1,
-        "retry_count should be bumped (this is a retry)"
+        post.assigned_executor.is_none(),
+        "reset_to_ready clears assigned_executor"
     );
 
     Ok(())
@@ -1310,6 +1316,76 @@ async fn test_reconcile_skipped_when_not_leader() -> TestResult {
     assert!(
         failed.is_empty(),
         "ex-leader reconcile must NOT append failed_builders (got {failed:?})"
+    );
+    Ok(())
+}
+
+/// `reset_orphan_to_ready` must NOT count an orphaned assignment as a
+/// derivation failure — same semantics as `reassign_derivations`. An
+/// orphan (worker died OR phantom) is an infrastructure event, not a
+/// build failure; counting it penalized innocent workers and pushed
+/// derivations toward poison purely because the scheduler restarted.
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
+#[tokio::test]
+async fn test_reset_orphan_does_not_record_failure() -> TestResult {
+    // Seed Assigned drv on worker 'dead-w' that won't reconnect.
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let _rx = merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("orphan-nofail")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'assigned', \
+             assigned_builder_id = 'dead-w' WHERE drv_hash = 'orphan-nofail'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let (db, handle) = (f.db, f.handle);
+
+    // No store client → outputs_present_in_store=false → reset path.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "orphan-nofail").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Ready,
+        "orphan should reset to Ready"
+    );
+    assert!(
+        post.retry.failed_builders.is_empty(),
+        "orphan reset must NOT record failed_builders (got {:?})",
+        post.retry.failed_builders
+    );
+    assert_eq!(
+        post.retry.count, 0,
+        "orphan reset must NOT bump retry.count"
+    );
+    assert_eq!(
+        post.retry.failure_count, 0,
+        "orphan reset must NOT bump failure_count"
+    );
+
+    let (retry_count, failed): (i32, Vec<String>) = sqlx::query_as(
+        "SELECT retry_count, failed_builders FROM derivations WHERE drv_hash = 'orphan-nofail'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "PG retry_count must be 0");
+    assert!(
+        failed.is_empty(),
+        "PG failed_builders must be empty (got {failed:?})"
     );
     Ok(())
 }
