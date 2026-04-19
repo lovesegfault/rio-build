@@ -87,13 +87,11 @@ pub(super) async fn get_build_logs(
     // typically has drv_path (that's what the gateway speaks). We
     // could resolve drv_path→drv_hash via the actor, but the DAG entry
     // is likely gone by now (CleanupTerminalBuild removes it ~30s after
-    // completion). Instead: accept EITHER in derivation_path. If it
-    // parses as a store path, use the hash-name part; otherwise assume
-    // it's already a hash.
-    //
-    // This is a soft interface contract. The phase4 dashboard will know
-    // both and pass drv_hash explicitly.
-    let drv_hash = extract_drv_hash(&req.derivation_path);
+    // completion). Instead: accept EITHER in derivation_path —
+    // `drv_log_hash` normalizes full path / basename / bare hash to
+    // the 32-char hash. Same helper the flusher uses for the PG row,
+    // so the lookup key can't drift from what was written.
+    let drv_hash = crate::logs::drv_log_hash(&req.derivation_path);
 
     match try_s3(s3, pool, &build_id, &drv_hash, req.since_line).await {
         Ok(Some(chunks)) => {
@@ -310,12 +308,4 @@ pub(super) fn err_stream<T: Send + 'static>(status: Status) -> ReceiverStream<Re
     // try_send: capacity is 1 and we're the sole sender, can't fail.
     let _ = tx.try_send(Err(status));
     ReceiverStream::new(rx)
-}
-
-/// Extract a drv_hash-shaped key from a derivation_path-ish input.
-///
-/// `/nix/store/{32-char-hash}-{name}.drv` → `{32-char-hash}-{name}.drv`
-/// Already-hash-shaped input → unchanged.
-pub(super) fn extract_drv_hash(s: &str) -> String {
-    rio_nix::store_path::basename(s).unwrap_or(s).to_string()
 }

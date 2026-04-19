@@ -1,10 +1,11 @@
-//! `GetBuildLogs` RPC tests + `extract_drv_hash`/`gunzip_and_chunk` helpers.
+//! `GetBuildLogs` RPC tests + `drv_log_hash`/`gunzip_and_chunk` helpers.
 //!
 //! Split from the 1732L monolithic `admin/tests.rs` (P0386) to mirror the
 //! `admin/logs.rs` submodule seam introduced by P0383.
 
 use super::*;
-use crate::admin::logs::{extract_drv_hash, gunzip_and_chunk};
+use crate::admin::logs::gunzip_and_chunk;
+use crate::logs::drv_log_hash;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
@@ -98,14 +99,15 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         enc.finish()?
     };
 
-    // Seed the PG row the flusher would have written.
+    // Seed the PG row the flusher would have written. drv_hash is the
+    // 32-char store hash only (drv_log_hash output), NOT the basename.
     sqlx::query(
         "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
          VALUES ($1, $2, $3, $4, true)",
     )
     .bind(build_id)
-    .bind("abc-test.drv")
-    .bind(format!("logs/{build_id}/abc-test.drv.log.gz"))
+    .bind("abc")
+    .bind(format!("logs/{build_id}/abc.log.gz"))
     .bind(3_i64)
     .execute(&db.pool)
     .await?;
@@ -221,9 +223,24 @@ async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
 }
 
 #[test]
-fn extract_drv_hash_strips_store_prefix() {
-    assert_eq!(extract_drv_hash("/nix/store/abc-foo.drv"), "abc-foo.drv");
-    assert_eq!(extract_drv_hash("already-a-hash"), "already-a-hash");
+fn drv_log_hash_extracts_store_hash() {
+    // Full realistic store path → 32-char hash only (the spec key shape).
+    assert_eq!(
+        drv_log_hash("/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-firefox-unwrapped-149.0.drv"),
+        "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2"
+    );
+    // Basename → hash.
+    assert_eq!(
+        drv_log_hash("amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-firefox.drv"),
+        "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2"
+    );
+    // Bare hash (dashboard input) → unchanged.
+    assert_eq!(
+        drv_log_hash("amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2"),
+        "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2"
+    );
+    // Short test fixture (parse fails on length) → still strips to hash part.
+    assert_eq!(drv_log_hash("/nix/store/abc-foo.drv"), "abc");
 }
 
 #[test]

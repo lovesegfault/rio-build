@@ -25,10 +25,52 @@
 use std::collections::VecDeque;
 
 use dashmap::{DashMap, DashSet};
+use rio_nix::store_path::StorePath;
 use rio_proto::types::BuildLogBatch;
+use uuid::Uuid;
 
 mod flush;
 pub use flush::{FlushRequest, LogFlusher};
+
+/// Extract the 32-char nixbase32 store-path hash from a derivation
+/// identifier for use as the PG `build_logs.drv_hash` column and the
+/// `{drv_hash}` component of the S3 key.
+///
+/// This is the SINGLE source of truth shared by the flusher (write side,
+/// [`log_s3_key`] + `insert_log_rows`) and `AdminService.GetBuildLogs`
+/// (read side, PG lookup) so the derivation can never drift. Before this
+/// helper existed, the write side keyed on the full `/nix/store/...` path
+/// while the read side keyed on the basename — the PG lookup never matched
+/// and S3 keys had embedded `//nix/store/` (double-slash from
+/// `format!("{prefix}/.../{full_path}")`).
+///
+/// Accepts any of:
+/// - full store path `/nix/store/{hash}-{name}.drv` → `{hash}`
+/// - basename `{hash}-{name}.drv` → `{hash}`
+/// - bare hash `{hash}` → unchanged (dashboard passes this directly)
+pub fn drv_log_hash(s: &str) -> String {
+    // Full store path → parsed hash_part. Validates nixbase32 + length.
+    if let Ok(sp) = StorePath::parse(s) {
+        return sp.hash_part();
+    }
+    // Not a parseable store path (no prefix, short test hash, or invalid
+    // name char). Best-effort: strip `/nix/store/` if present, then take
+    // the part before the first `-`. No `-` → already hash-shaped.
+    let base = rio_nix::store_path::basename(s).unwrap_or(s);
+    base.split_once('-')
+        .map(|(h, _)| h)
+        .unwrap_or(base)
+        .to_string()
+}
+
+/// Construct the canonical S3 key for a completed derivation's log blob:
+/// `{prefix}/{build_id}/{drv_hash}.log.gz` per `observability.md`.
+///
+/// `drv_path` is the full `/nix/store/...` path (the ring-buffer key);
+/// the hash is extracted via [`drv_log_hash`].
+pub fn log_s3_key(prefix: &str, build_id: &Uuid, drv_path: &str) -> String {
+    format!("{prefix}/{build_id}/{}.log.gz", drv_log_hash(drv_path))
+}
 
 /// Max lines retained per derivation. Beyond this, oldest lines are evicted.
 ///

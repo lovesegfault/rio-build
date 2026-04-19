@@ -331,7 +331,6 @@ impl DagActor {
         };
         self.events.try_log_flush(crate::logs::FlushRequest {
             drv_path,
-            drv_hash: drv_hash.clone(),
             interested_builds,
         });
     }

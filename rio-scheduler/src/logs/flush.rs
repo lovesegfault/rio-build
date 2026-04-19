@@ -36,8 +36,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::LogBuffers;
-use crate::state::DrvHash;
+use super::{LogBuffers, drv_log_hash, log_s3_key};
 
 /// How often to snapshot active buffers to S3. Per `observability.md:38-40`:
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
@@ -48,10 +47,10 @@ const PERIODIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// flush — failed builds still have useful logs).
 #[derive(Debug)]
 pub struct FlushRequest {
-    /// The buffer key.
+    /// The buffer key — full `/nix/store/{hash}-{name}.drv` path. Also
+    /// the source for the S3 key (`logs/{build_id}/{drv_hash}.log.gz`)
+    /// and PG `drv_hash` column via [`drv_log_hash`].
     pub drv_path: String,
-    /// For the S3 key (`logs/{build_id}/{drv_hash}.log.gz`) and PG row.
-    pub drv_hash: DrvHash,
     /// One PG row per build, all pointing at the same S3 blob. The derivation
     /// builds exactly once even if N builds want it (DAG merging).
     pub interested_builds: Vec<Uuid>,
@@ -177,24 +176,18 @@ impl LogFlusher {
                 continue;
             };
 
-            // Periodic flush doesn't know drv_hash or interested_builds —
-            // those live in the actor's DAG, which we deliberately don't
-            // touch. So periodic snapshots use drv_path as the S3 key
-            // component and write NO PG rows. The on-completion flush
-            // (which DOES know hash+builds) writes the authoritative PG
+            // Periodic flush doesn't know interested_builds — that lives
+            // in the actor's DAG, which we deliberately don't touch. So
+            // periodic snapshots write NO PG rows. The on-completion
+            // flush (which DOES know builds) writes the authoritative PG
             // rows + the canonical S3 key.
             //
             // Periodic snapshots are for crash recovery only: "the
             // scheduler died, but here's what was in the ring buffer ~30s
             // ago". A human operator can find them by S3 list on
             // `logs/periodic/`. They're NOT served by AdminService.
-            //
-            // drv_path has chars that aren't S3-safe (/nix/store/...), so
-            // use the basename (hash-name.drv part).
-            let basename = drv_path.rsplit('/').next().unwrap_or(&drv_path).to_string();
             let req = FlushRequest {
                 drv_path,
-                drv_hash: format!("periodic/{basename}").into(),
                 interested_builds: Vec::new(), // no PG rows for periodic
             };
             self.upload_and_record(req, line_count, raw_bytes, lines, false)
@@ -221,19 +214,24 @@ impl LogFlusher {
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        // S3 key: for finals, `{prefix}/{first_build_id}/{drv_hash}.log.gz`.
-        // Per spec (observability.md:12-14). We use the FIRST interested
-        // build's id for the key path (arbitrary but deterministic — the
-        // spec doesn't say which build_id when N>1, and PG rows all point
-        // at the same s3_key anyway).
+        // S3 key: for finals, `{prefix}/{first_build_id}/{drv_hash}.log.gz`
+        // via `log_s3_key()`. Per spec (observability.md:12-14). We use the
+        // FIRST interested build's id for the key path (arbitrary but
+        // deterministic — the spec doesn't say which build_id when N>1, and
+        // PG rows all point at the same s3_key anyway).
         //
-        // For periodic: drv_hash already has the "periodic/{basename}"
-        // prefix and interested_builds is empty → key is
-        // `{prefix}/periodic/{basename}.log.gz`.
+        // For periodic: interested_builds is empty → key is
+        // `{prefix}/periodic/{drv_hash}.log.gz`.
+        let drv_hash = drv_log_hash(&req.drv_path);
+        debug_assert!(
+            !drv_hash.is_empty(),
+            "drv_log_hash({:?}) yielded empty hash — drv_path not store-path-shaped",
+            req.drv_path
+        );
         let s3_key = if let Some(bid) = req.interested_builds.first() {
-            format!("{}/{}/{}.log.gz", self.prefix, bid, req.drv_hash)
+            log_s3_key(&self.prefix, bid, &req.drv_path)
         } else {
-            format!("{}/{}.log.gz", self.prefix, req.drv_hash)
+            format!("{}/periodic/{drv_hash}.log.gz", self.prefix)
         };
 
         // Gzip in spawn_blocking. ~10 MiB of log compresses in ~50ms on
@@ -304,7 +302,7 @@ impl LogFlusher {
             && let Err(e) = insert_log_rows(
                 &self.pool,
                 &req.interested_builds,
-                &req.drv_hash,
+                &drv_hash,
                 &s3_key,
                 line_count,
                 is_final,
@@ -344,7 +342,7 @@ fn gzip_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
 async fn insert_log_rows(
     pool: &PgPool,
     build_ids: &[Uuid],
-    drv_hash: &DrvHash,
+    drv_hash: &str,
     s3_key: &str,
     line_count: u64,
     is_complete: bool,
@@ -362,7 +360,7 @@ async fn insert_log_rows(
                  created_at = now()",
         )
         .bind(bid)
-        .bind(drv_hash.as_str())
+        .bind(drv_hash)
         .bind(s3_key)
         .bind(line_count as i64)
         .bind(is_complete)
@@ -474,9 +472,15 @@ mod tests {
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
+        // Use a realistic full store path — regression guard for the bug
+        // where the S3 key embedded the entire `/nix/store/{hash}-{name}.drv`
+        // (producing `logs/{bid}//nix/store/...`) instead of just `{hash}`.
+        let drv_path = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-firefox-unwrapped-149.0.drv";
+        let drv_hash = "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2";
+
         let (s3, captured) = mock_s3_capturing_puts();
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch("drv-a", 0, &[b"line0", b"line1", b"line2"]));
+        buffers.push(&mk_batch(drv_path, 0, &[b"line0", b"line1", b"line2"]));
         assert_eq!(buffers.active_count(), 1);
 
         let flusher = LogFlusher::new(
@@ -489,8 +493,7 @@ mod tests {
 
         flusher
             .flush_final(FlushRequest {
-                drv_path: "drv-a".into(),
-                drv_hash: "abc123hash".into(),
+                drv_path: drv_path.into(),
                 interested_builds: vec![build_id],
             })
             .await;
@@ -506,7 +509,11 @@ mod tests {
         let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
         assert_eq!(puts.len(), 1);
         let (key, body) = &puts[0];
-        assert_eq!(key, &format!("logs/{build_id}/abc123hash.log.gz"));
+        assert_eq!(key, &format!("logs/{build_id}/{drv_hash}.log.gz"));
+        assert!(
+            !key.contains("/nix/store/"),
+            "S3 key must not embed the store prefix"
+        );
         assert_eq!(&body[..2], &[0x1f, 0x8b], "should be gzipped");
 
         // PG row inserted with is_complete=true.
@@ -514,7 +521,7 @@ mod tests {
             "SELECT line_count, is_complete FROM build_logs WHERE build_id = $1 AND drv_hash = $2",
         )
         .bind(build_id)
-        .bind("abc123hash")
+        .bind(drv_hash)
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, 3, "line_count");
@@ -542,7 +549,6 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "nonexistent".into(),
-                drv_hash: "hash".into(),
                 interested_builds: vec![Uuid::new_v4()],
             })
             .await;
@@ -588,7 +594,7 @@ mod tests {
         let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();
         assert_eq!(puts.len(), 1);
         let (key, _body) = &puts[0];
-        assert_eq!(key, "logs/periodic/aaaa-test.drv.log.gz");
+        assert_eq!(key, "logs/periodic/aaaa.log.gz");
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_logs")
             .fetch_one(&db.pool)
@@ -614,9 +620,8 @@ mod tests {
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
-        let hash = DrvHash::from("hash");
-        insert_log_rows(&db.pool, &[build_id], &hash, "key-v1", 10, false).await?;
-        insert_log_rows(&db.pool, &[build_id], &hash, "key-v2", 50, true).await?;
+        insert_log_rows(&db.pool, &[build_id], "hash", "key-v1", 10, false).await?;
+        insert_log_rows(&db.pool, &[build_id], "hash", "key-v2", 50, true).await?;
 
         let row: (String, i64, bool) = sqlx::query_as(
             "SELECT s3_key, line_count, is_complete FROM build_logs
@@ -653,9 +658,10 @@ mod tests {
             seed_build(&db.pool, b).await?;
         }
 
+        let drv_path = "/nix/store/ssssssssssssssssssssssssssssssss-shared.drv";
         let (s3, captured) = mock_s3_capturing_puts();
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch("drv-shared", 0, &[b"shared-line"]));
+        buffers.push(&mk_batch(drv_path, 0, &[b"shared-line"]));
 
         let flusher = LogFlusher::new(
             s3,
@@ -667,22 +673,23 @@ mod tests {
 
         flusher
             .flush_final(FlushRequest {
-                drv_path: "drv-shared".into(),
-                drv_hash: "sharedhash".into(),
+                drv_path: drv_path.into(),
                 interested_builds: vec![b1, b2, b3],
             })
             .await;
 
         // ONE S3 PUT.
         assert_eq!(captured.lock().unwrap().len(), 1);
-        let expected_key = format!("logs/{b1}/sharedhash.log.gz");
+        let expected_key = format!("logs/{b1}/ssssssssssssssssssssssssssssssss.log.gz");
         assert_eq!(captured.lock().unwrap()[0].0, expected_key);
 
         // THREE PG rows, all same s3_key.
-        let rows: Vec<(Uuid, String)> =
-            sqlx::query_as("SELECT build_id, s3_key FROM build_logs WHERE drv_hash = 'sharedhash'")
-                .fetch_all(&db.pool)
-                .await?;
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT build_id, s3_key FROM build_logs \
+             WHERE drv_hash = 'ssssssssssssssssssssssssssssssss'",
+        )
+        .fetch_all(&db.pool)
+        .await?;
         assert_eq!(rows.len(), 3);
         for (_bid, key) in &rows {
             assert_eq!(key, &expected_key, "all rows point at same blob");
@@ -736,7 +743,6 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drv-fail".into(),
-                drv_hash: "failhash".into(),
                 interested_builds: vec![build_id],
             })
             .await;
@@ -750,7 +756,6 @@ mod tests {
         flusher
             .flush_final(FlushRequest {
                 drv_path: "drv-ok".into(),
-                drv_hash: "okhash".into(),
                 interested_builds: vec![build_id],
             })
             .await;
@@ -760,7 +765,7 @@ mod tests {
             .fetch_all(&db.pool)
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "okhash");
+        assert_eq!(rows[0].0, "drv");
         Ok(())
     }
 }
