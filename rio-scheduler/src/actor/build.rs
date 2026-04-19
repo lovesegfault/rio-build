@@ -659,9 +659,20 @@ impl DagActor {
         self.events.remove(build_id);
 
         // Remove build interest from DAG and reap orphaned+terminal nodes.
-        let reaped = self.dag.remove_build_interest_and_reap(build_id);
-        if reaped > 0 {
-            debug!(build_id = %build_id, reaped, "reaped orphaned terminal DAG nodes");
+        // Discard each reaped node's log buffer: in the happy path
+        // `flush_final` already drained it (no-op here), but if the
+        // completion `FlushRequest` was dropped (channel-full burst),
+        // the buffer would otherwise leak for the process lifetime and
+        // `flush_periodic` would re-upload it every 30s. This bounds
+        // that leak to the ~30s CleanupTerminalBuild delay.
+        let reaped_paths = self.dag.remove_build_interest_and_reap(build_id);
+        if let Some(bufs) = &self.log_buffers {
+            for path in &reaped_paths {
+                bufs.discard(path);
+            }
+        }
+        if !reaped_paths.is_empty() {
+            debug!(build_id = %build_id, reaped = reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
 
         // GC the persisted event log. Fire-and-forget: this is

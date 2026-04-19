@@ -202,8 +202,11 @@ impl BuildEventBus {
     /// (tests, or `RIO_LOG_S3_BUCKET` unset).
     ///
     /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
-    /// cap and the flusher's S3 PUT latency is sub-second), drop silently.
-    /// The 30s periodic tick will still snapshot until CleanupTerminalBuild.
+    /// cap and the flusher's S3 PUT latency is sub-second), drop. The 30s
+    /// periodic tick still snapshots the (sealed) buffer to
+    /// `logs/periodic/` until `CleanupTerminalBuild` reaps the DAG node
+    /// and discards the buffer (~30s later); no canonical PG row is
+    /// written, so the dashboard sees only the last periodic snapshot.
     pub(super) fn try_log_flush(&self, req: crate::logs::FlushRequest) {
         let Some(tx) = &self.flush_tx else {
             return;
@@ -249,10 +252,20 @@ impl DagActor {
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
-        self.dag
+        // Sorted: `interested_builds` is a HashSet (RandomState), so raw
+        // iteration order is process-dependent. The flusher uses
+        // `.first()` to pick the S3-key build_id; without a sort,
+        // re-dispatch across a restart can land the same drv under a
+        // different `logs/{bid}/` prefix → ON CONFLICT repoints PG rows
+        // and orphans the previous blob. Sorting at the chokepoint makes
+        // `.first()` == min(UUID) for all callers.
+        let mut v: Vec<Uuid> = self
+            .dag
             .node(drv_hash)
             .map(|s| s.interested_builds.iter().copied().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
     }
 
     /// Resolve drv_path → drv_hash → interested_builds, then emit
@@ -319,10 +332,9 @@ impl DagActor {
     /// Called from `handle_completion_success` AND `handle_permanent_failure`
     /// — both paths flush because failed builds still have useful logs.
     /// NOT called from `handle_transient_failure`: the derivation gets
-    /// re-queued, a new worker builds it from scratch, and that worker's
-    /// logs replace the partial ones. The seal is `unseal()`ed by the
-    /// BuildExecution recv task on worker disconnect; the flusher's
-    /// `flush_final` removes the buffer.
+    /// re-queued, a new worker builds it from scratch, and the next
+    /// `assign_to_worker` calls [`Self::discard_log_buffer`] so the old
+    /// partial buffer is dropped before the new worker's first push.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
         let Some(drv_path) = self.dag.path_for_hash(drv_hash).map(String::from) else {
             // Should be impossible at this call site (completion handlers
@@ -351,5 +363,24 @@ impl DagActor {
             return;
         };
         bufs.seal(drv_path);
+    }
+
+    /// Drop any stale log buffer (and seal) for `drv_hash`. Called from
+    /// [`super::dispatch`]'s `assign_to_worker` immediately after the
+    /// `Ready→Assigned` transition so every fresh attempt starts with a
+    /// clean buffer. Covers transient-retry (old worker's partial lines
+    /// would otherwise prefix the new worker's), poison-clear-resubmit
+    /// (stale seal would silently drop the retry's pushes), and any
+    /// dropped-FlushRequest leak that survived to re-dispatch.
+    /// Idempotent: first-ever dispatch finds no entry. No-op if
+    /// `log_buffers` unwired (tests).
+    pub(super) fn discard_log_buffer(&self, drv_hash: &DrvHash) {
+        let Some(bufs) = &self.log_buffers else {
+            return;
+        };
+        let Some(drv_path) = self.dag.path_for_hash(drv_hash) else {
+            return;
+        };
+        bufs.discard(drv_path);
     }
 }

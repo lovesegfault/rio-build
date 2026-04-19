@@ -1102,6 +1102,12 @@ impl DagActor {
         if !self.transition_to_assigned(drv_hash, executor_id) {
             return false;
         }
+        // Fresh attempt → clean log buffer. Clears any stale partial
+        // from a transient-failure predecessor (whose lines would
+        // otherwise prefix this attempt's with overlapping numbers)
+        // and any stale seal from a poison-clear (which would silently
+        // drop this attempt's pushes). No-op for first dispatch.
+        self.discard_log_buffer(drv_hash);
 
         // Single atomic load. The lease task may fetch_add the
         // generation between the DB insert and the WorkAssignment send

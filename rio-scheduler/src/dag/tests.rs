@@ -709,7 +709,11 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
         .expect("hashA")
         .transition(DerivationStatus::Completed)?;
     let reaped = dag.remove_build_interest_and_reap(b1);
-    assert_eq!(reaped, 1, "hashA should be reaped (terminal, no interest)");
+    assert_eq!(
+        reaped,
+        vec![p_a.clone()],
+        "hashA should be reaped (terminal, no interest); returns drv_path for log-buffer discard"
+    );
     assert_eq!(
         dag.hash_for_path(&p_a),
         None,

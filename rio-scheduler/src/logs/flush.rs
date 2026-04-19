@@ -14,11 +14,12 @@
 //!
 //! The flusher NEVER blocks the actor. It's mpsc-fed (`try_send`, bounded
 //! channel); if the channel is full, the actor's completion flush is
-//! dropped and the next periodic tick catches it. The only cost of a
-//! dropped completion-flush is that `is_complete` stays `false` until
-//! `CleanupTerminalBuild` evicts the buffer (~30s later) and then there's
-//! no buffer to snapshot either → the log is the last periodic snapshot,
-//! which is slightly stale but still useful.
+//! dropped. The buffer stays in `LogBuffers.buffers` (sealed) and the next
+//! periodic tick still snapshots it to `logs/periodic/{hash}` — so the
+//! content survives at the periodic key, but no `build_logs` PG row is
+//! written and the dashboard sees only the last `is_complete=false`
+//! snapshot. `CleanupTerminalBuild` (~30s later) reaps the DAG node and
+//! discards the buffer (`LogBuffers::discard`), bounding the leak.
 //!
 //! Compression is CPU-bound; runs in `spawn_blocking` so it doesn't hog a
 //! tokio worker thread during the typical 10-100ms compression of a few-MB log.
@@ -107,16 +108,17 @@ impl LogFlusher {
             );
 
             // Not spawn_periodic: the select is recv-vs-tick, not
-            // shutdown-vs-tick (exits when flush_rx closes). The
-            // `biased;` below is about completion-over-periodic
-            // priority, not shutdown-over-tick.
+            // shutdown-vs-tick (exits when flush_rx closes). NOT
+            // `biased;`: with biased, a sustained completion burst
+            // (arrival > ~7/s drain rate) would starve `tick.tick()`
+            // indefinitely — a concurrent long-running build would get
+            // zero periodic snapshots, defeating the ≤30s log-loss
+            // bound at r[obs.log.periodic-flush]. Fair (random) select
+            // guarantees the tick fires within O(1) iterations once
+            // ready; the worst case is one redundant periodic PUT just
+            // before a final, which is harmless.
             loop {
                 tokio::select! {
-                    // `biased` gives completion-flush priority over the tick.
-                    // A completion landing right at a tick boundary should get
-                    // the final `is_complete=true` flush, not a snapshot.
-                    biased;
-
                     maybe = flush_rx.recv() => {
                         match maybe {
                             Some(req) => self.flush_final(req).await,
@@ -217,11 +219,12 @@ impl LogFlusher {
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        // S3 key: for finals, `{prefix}/{first_build_id}/{drv_hash}.log.zst`
+        // S3 key: for finals, `{prefix}/{min_build_id}/{drv_hash}.log.zst`
         // via `log_s3_key()`. Per spec (observability.md:12-14). We use the
-        // FIRST interested build's id for the key path (arbitrary but
-        // deterministic — the spec doesn't say which build_id when N>1, and
-        // PG rows all point at the same s3_key anyway).
+        // MIN interested build's id for the key path (deterministic:
+        // `get_interested_builds()` sorts, so `.first()` is min(UUID) — the
+        // spec doesn't say which build_id when N>1, and PG rows all point
+        // at the same s3_key anyway).
         //
         // For periodic: interested_builds is empty → key is
         // `{prefix}/periodic/{drv_hash}.log.zst`.
@@ -245,15 +248,11 @@ impl LogFlusher {
         let compressed = match tokio::task::spawn_blocking(move || compress_lines(&lines)).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
-                error!(s3_key = %s3_key, error = %e, "zstd compress failed; log dropped");
-                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "compress")
-                    .increment(1);
+                flush_failure(is_final, "compress", &s3_key, &e, &req.drv_path);
                 return;
             }
             Err(e) => {
-                error!(s3_key = %s3_key, error = %e, "zstd compress task panicked; log dropped");
-                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "compress")
-                    .increment(1);
+                flush_failure(is_final, "compress", &s3_key, &e, &req.drv_path);
                 return;
             }
         };
@@ -273,20 +272,11 @@ impl LogFlusher {
             .await;
 
         if let Err(e) = put {
-            error!(
-                s3_key = %s3_key,
-                error = %e,
-                is_final,
-                "S3 PutObject failed; log for {} is lost (buffer already drained)",
-                req.drv_path
-            );
-            metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "s3")
-                .increment(1);
-            // We COULD re-push the lines back into the buffer here, but
-            // we already moved `lines` into spawn_blocking. Caching a
-            // clone before the spawn would double peak memory during
-            // flush. Instead: accept the loss, alert on the metric above.
-            // This is no worse than the pre-flusher state (no S3 at all).
+            // Re-push on final-flush failure was considered: we already
+            // moved `lines` into spawn_blocking, and caching a clone
+            // before the spawn would double peak memory. Accept the loss
+            // for finals (alert on the metric); periodic retries itself.
+            flush_failure(is_final, "s3", &s3_key, &e, &req.drv_path);
             return;
         }
 
@@ -321,6 +311,37 @@ impl LogFlusher {
             metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "pg")
                 .increment(1);
         }
+    }
+}
+
+/// Log + metric for a compress/S3 failure. Level depends on `is_final`:
+/// final flushes already drained the buffer (data is gone → `error!`);
+/// periodic flushes snapshotted (buffer intact, next tick retries →
+/// `warn!`). Prevents an S3 blip from emitting N false "log is lost"
+/// `error!`s every 30s when nothing was lost.
+fn flush_failure(
+    is_final: bool,
+    phase: &'static str,
+    s3_key: &str,
+    error: &dyn std::fmt::Display,
+    drv_path: &str,
+) {
+    metrics::counter!(
+        "rio_scheduler_log_flush_failures_total",
+        "phase" => phase,
+        "is_final" => if is_final { "true" } else { "false" },
+    )
+    .increment(1);
+    if is_final {
+        error!(
+            s3_key = %s3_key, error = %error, is_final, phase,
+            "log flush failed; log for {drv_path} is lost (buffer already drained)"
+        );
+    } else {
+        warn!(
+            s3_key = %s3_key, error = %error, is_final, phase,
+            "log flush failed; periodic snapshot for {drv_path} will retry next tick"
+        );
     }
 }
 
@@ -699,6 +720,11 @@ mod tests {
         Ok(())
     }
 
+    // bug_032 regression (S3-key determinism via sorted interested_builds)
+    // is at `actor::tests::misc::get_interested_builds_is_sorted` — it
+    // exercises the production `get_interested_builds()` path; testing
+    // here would require re-implementing the sort locally (vacuous).
+
     #[tokio::test]
     async fn s3_failure_logs_error_but_flusher_survives() -> anyhow::Result<()> {
         // S3 returns 500. Flusher must NOT panic or hang — it logs, increments
@@ -766,6 +792,104 @@ mod tests {
             .await?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "drv");
+        Ok(())
+    }
+
+    /// Regression for bug_367: a periodic-flush S3 failure used to
+    /// `error!("log is lost (buffer already drained)")` — false: periodic
+    /// `snapshot()`s, doesn't drain; the buffer is intact and retries next
+    /// tick. Only final flushes (which `drain()`) lose data on S3 fail.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn s3_failure_periodic_warns_not_errors() -> anyhow::Result<()> {
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let rule_fail = mock!(S3Client::put_object).then_error(|| {
+            PutObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("InternalError")
+                    .message("simulated S3 500")
+                    .build(),
+            )
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule_fail]);
+
+        let buffers = Arc::new(LogBuffers::new());
+        buffers.push(&mk_batch(
+            "/nix/store/pppppppppppppppppppppppppppppppp-periodic.drv",
+            0,
+            &[b"still-running"],
+        ));
+        let flusher = LogFlusher::new(
+            client,
+            "test-bucket".into(),
+            "logs".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+        );
+
+        flusher.flush_periodic().await;
+
+        // Buffer is intact — snapshot, not drain.
+        assert_eq!(buffers.active_count(), 1);
+        // warn-level retry message, NOT the error-level "is lost" claim.
+        assert!(logs_contain("will retry next tick"));
+        assert!(!logs_contain("is lost"));
+        assert!(!logs_contain("buffer already drained"));
+        Ok(())
+    }
+
+    /// Smoke for bug_365: the spawn loop's periodic tick must fire on
+    /// schedule. The actual starvation (`biased;` + recv-never-empty)
+    /// requires arrival_rate ≥ drain_rate, which depends on real
+    /// ~150ms S3 latency — with a mock client each flush_final is μs,
+    /// so the channel always empties before the tick deadline and the
+    /// starvation can't be reproduced without injecting artificial
+    /// latency. The fix (drop `biased;`) is correct by `select!`
+    /// semantics; this test guards the surrounding loop wiring.
+    #[tokio::test]
+    async fn periodic_tick_fires_in_spawn_loop() -> anyhow::Result<()> {
+        // TestDb before pause(): sqlx pool acquire uses tokio::time
+        // for its timeout, which PoolTimedOuts under paused time.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        tokio::time::pause();
+
+        let (s3, captured) = mock_s3_capturing_puts();
+        let buffers = Arc::new(LogBuffers::new());
+        let ongoing_hash = "ongoingxxxxxxxxxxxxxxxxxxxxxxxxx";
+        buffers.push(&mk_batch(
+            &format!("/nix/store/{ongoing_hash}-llvm.drv"),
+            0,
+            &[b"compiling"],
+        ));
+
+        let (tx, rx) = mpsc::channel::<FlushRequest>(8);
+        LogFlusher::new(
+            s3,
+            "b".into(),
+            "logs".into(),
+            db.pool.clone(),
+            Arc::clone(&buffers),
+        )
+        .spawn(rx);
+
+        // Auto-advance drives the interval; tx open so the loop is
+        // recv-vs-tick (not the channel-close final sweep).
+        tokio::time::sleep(Duration::from_secs(65)).await;
+
+        let ongoing_key = format!("logs/periodic/{ongoing_hash}.log.zst");
+        let periodic = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == &ongoing_key)
+            .count();
+        assert!(
+            periodic >= 2,
+            "two ticks in 65s → ≥2 periodic PUTs, got {periodic}"
+        );
+        drop(tx);
         Ok(())
     }
 }

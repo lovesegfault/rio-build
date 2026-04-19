@@ -195,14 +195,14 @@ impl LogBuffers {
         buf.iter().filter(|(n, _)| *n >= since).cloned().collect()
     }
 
-    /// Discard a buffer without returning its contents.
+    /// Discard a buffer without returning its contents. Also un-seals.
     ///
-    /// Called on worker disconnect mid-build when the derivation gets
-    /// reassigned — the new worker's logs replace the old ones from scratch
-    /// (the old partial log is meaningless without the build that produced it).
-    /// Also un-seals: re-dispatch after a terminal state (e.g. poison-clear)
-    /// goes through the same reassign path, and the new worker's pushes must
-    /// land.
+    /// Called by the actor's `assign_to_worker` (every fresh dispatch
+    /// starts clean — clears a transient-failure predecessor's partial
+    /// lines and any stale seal from a poison-clear) and by
+    /// `handle_cleanup_terminal_build` for each reaped DAG node (bounds a
+    /// dropped-FlushRequest leak to the ~30s cleanup delay). Idempotent;
+    /// no-op on a missing entry.
     pub fn discard(&self, drv_path: &str) {
         self.buffers.remove(drv_path);
         self.sealed.remove(drv_path);
@@ -499,6 +499,51 @@ mod tests {
         // Unseal re-opened: a fresh push lands.
         bufs.push(&mk_batch("drv-a", 0, &[b"fresh"]));
         assert_eq!(bufs.active_count(), 1);
+    }
+
+    /// Regression for merged_bug_128 secondary: transient-failure
+    /// reassignment must not concatenate the old worker's partial lines
+    /// with the new worker's. `assign_to_worker` now calls `discard()`
+    /// before the new worker's first push.
+    #[test]
+    fn transient_retry_discard_clears_stale_partial() {
+        let bufs = LogBuffers::new();
+        // Worker W1 pushes 5 lines, then disconnects (transient failure).
+        bufs.push(&mk_batch(
+            "drv-a",
+            0,
+            &[b"w1-0", b"w1-1", b"w1-2", b"w1-3", b"w1-4"],
+        ));
+        // Re-dispatch: actor's assign_to_worker discards.
+        bufs.discard("drv-a");
+        // Worker W2 pushes from line 0 (fresh attempt).
+        bufs.push(&mk_batch("drv-a", 0, &[b"w2-0", b"w2-1", b"w2-2"]));
+        // Final flush drains: must be exactly W2's 3 lines, not 8.
+        let (count, _bytes, lines) = bufs.drain("drv-a").expect("buffer exists");
+        assert_eq!(count, 3, "stale W1 partial must be gone");
+        assert_eq!(
+            lines,
+            vec![b"w2-0".to_vec(), b"w2-1".to_vec(), b"w2-2".to_vec()]
+        );
+    }
+
+    /// Regression for bug_241: a dropped FlushRequest (channel-full burst)
+    /// leaves the buffer in place; before the fix nothing ever removed it
+    /// (perpetual 30s S3 PUTs + ~10MiB held). `CleanupTerminalBuild` now
+    /// discards reaped nodes' buffers.
+    #[test]
+    fn dropped_flush_request_buffer_reaped_by_cleanup_discard() {
+        let bufs = LogBuffers::new();
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0", b"l1"]));
+        // Actor seals on completion, then try_send fails (channel full) —
+        // flush_final never runs. Buffer is still present + sealed.
+        bufs.seal("drv-a");
+        assert_eq!(bufs.active_count(), 1, "dropped request leaves buffer");
+        assert_eq!(bufs.sealed_count(), 1);
+        // ~30s later: CleanupTerminalBuild reaps the DAG node and discards.
+        bufs.discard("drv-a");
+        assert_eq!(bufs.active_count(), 0, "cleanup discard frees buffer");
+        assert_eq!(bufs.sealed_count(), 0, "cleanup discard also unseals");
     }
 
     #[test]

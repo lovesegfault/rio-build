@@ -7,6 +7,40 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing_test::traced_test;
 
+/// Regression for bug_032: `DerivationState.interested_builds` is a
+/// `HashSet<Uuid>` (RandomState); the flusher uses `.first()` on the vec
+/// returned here to pick the S3-key build_id. Before the fix this was
+/// HashSet-iteration-ordered → re-flush across a restart could pick a
+/// different bid → new S3 key → ON CONFLICT repoints PG rows and orphans
+/// the previous blob. `get_interested_builds()` now sorts, so `.first()`
+/// is always min(UUID). Reverting the sort fails this test (P(false-pass)
+/// = 1/8! ≈ 2.5e-5 — HashSet would have to iterate in sorted order by
+/// chance).
+#[tokio::test]
+async fn get_interested_builds_is_sorted() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("h", None, "x86_64-linux", false);
+
+    let bids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+    actor
+        .dag
+        .node_mut("h")
+        .unwrap()
+        .interested_builds
+        .extend(bids.iter().copied());
+
+    let result = actor.get_interested_builds(&DrvHash::from("h"));
+    let mut sorted = bids.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        result, sorted,
+        "get_interested_builds() must sort (S3-key determinism); \
+         flusher's .first() relies on result[0] == min(UUID)"
+    );
+    assert_eq!(result.first(), sorted.first());
+}
+
 // ---------------------------------------------------------------------------
 // Leader/recovery dispatch gate
 // ---------------------------------------------------------------------------

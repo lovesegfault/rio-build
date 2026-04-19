@@ -927,12 +927,14 @@ impl DerivationDag {
 
     /// Remove a build's interest from all its derivations, and reap (delete)
     /// any nodes that are now orphaned (no builds interested) AND in a terminal
-    /// state. Returns the number of nodes reaped.
+    /// state. Returns the `drv_path`s of reaped nodes (captured BEFORE
+    /// removal so the caller can discard their log buffers — `path_for_hash`
+    /// would not resolve afterwards).
     ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for
     /// a different code path, though this shouldn't happen in practice).
-    pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> usize {
+    pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> Vec<String> {
         let mut to_reap = Vec::new();
 
         for (hash, state) in &mut self.nodes {
@@ -949,16 +951,16 @@ impl DerivationDag {
                 && state.status().is_terminal()
                 && state.status() != DerivationStatus::Poisoned
             {
-                to_reap.push(hash.clone());
+                to_reap.push((hash.clone(), state.drv_path().to_string()));
             }
         }
 
-        let reaped = to_reap.len();
-        for hash in to_reap {
+        let mut reaped_paths = Vec::with_capacity(to_reap.len());
+        for (hash, path) in to_reap {
             self.remove_node(&hash);
+            reaped_paths.push(path);
         }
-
-        reaped
+        reaped_paths
     }
 
     /// Remove a single node and scrub all edge references to it.
