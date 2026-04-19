@@ -78,6 +78,66 @@ pub(super) async fn collect_stream(
     stream.filter_map(|r| r.ok()).collect::<Vec<_>>().await
 }
 
+/// `append_interrupt_sample` is idempotent on `event_uid`. The
+/// controller's spot-interrupt watcher consumes `.applied_objects()`,
+/// which re-yields every still-extant `SpotInterrupted` Event on
+/// relist (controller restart, watch reconnect). Without dedup each
+/// relist double-counts into λ's numerator (`refresh_lambda` SUMs
+/// `kind='interrupt'` rows) → `solve_full` biases away from spot.
+///
+/// Exposure rows pass `event_uid=None` and are unconstrained — the
+/// M_047 partial unique index only covers non-NULL uids.
+#[tokio::test]
+async fn append_interrupt_sample_idempotent_on_event_uid() {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+
+    let interrupt = |uid: Option<&str>| AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "interrupt".into(),
+        value: 1.0,
+        event_uid: uid.map(String::from),
+    };
+
+    // Same Event uid twice → one row.
+    svc.append_interrupt_sample(Request::new(interrupt(Some("ev-abc"))))
+        .await
+        .unwrap();
+    svc.append_interrupt_sample(Request::new(interrupt(Some("ev-abc"))))
+        .await
+        .unwrap();
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM interrupt_samples WHERE event_uid = 'ev-abc'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 1, "same event_uid re-delivered → deduped to one row");
+
+    // Distinct uid → second row.
+    svc.append_interrupt_sample(Request::new(interrupt(Some("ev-def"))))
+        .await
+        .unwrap();
+    // NULL uid (exposure path) twice → both inserted (partial index
+    // only covers non-NULL).
+    let exposure = AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "exposure".into(),
+        value: 60.0,
+        event_uid: None,
+    };
+    svc.append_interrupt_sample(Request::new(exposure.clone()))
+        .await
+        .unwrap();
+    svc.append_interrupt_sample(Request::new(exposure))
+        .await
+        .unwrap();
+
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM interrupt_samples")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 4, "ev-abc(1) + ev-def(1) + 2×NULL exposure = 4 rows");
+}
+
 /// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
 ///
 /// `get_build_logs` returns errors as stream items (not handler-level

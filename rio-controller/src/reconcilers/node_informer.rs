@@ -500,11 +500,17 @@ pub async fn run_spot_interrupt_watcher(
             debug!(%node, "spot-interrupt: node not in cache; skipping");
             continue;
         };
+        // `event_uid` makes the INSERT idempotent: `.applied_objects()`
+        // re-yields every still-extant Event on relist (controller
+        // restart, apiserver restart, watch reconnect). Without dedup
+        // each relist double-counts into λ's numerator → `solve_full`
+        // biases away from spot.
         let r = admin
             .append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
                 hw_class: hw_class.clone(),
                 kind: "interrupt".into(),
                 value: 1.0,
+                event_uid: ev.metadata.uid.clone(),
             })
             .await;
         match r {
@@ -523,6 +529,9 @@ async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: Stri
             hw_class,
             kind: "exposure".into(),
             value: secs,
+            // Timer-driven, no K8s Event → NULL uid (unconstrained by
+            // the M_047 partial unique index).
+            event_uid: None,
         })
         .await
     {

@@ -707,6 +707,26 @@ pub const M_045: () = ();
 /// highest-`id` (most recent) row per key before adding the constraint.
 pub const M_046: () = ();
 
+/// `migrations/047_interrupt_event_uid.sql`
+///
+/// `event_uid TEXT` + partial `UNIQUE WHERE event_uid IS NOT NULL` on
+/// `interrupt_samples`. The controller's spot-interrupt watcher
+/// consumes `watcher(...).applied_objects()`, which re-yields every
+/// still-extant `SpotInterrupted` Event on every relist (controller
+/// restart, apiserver restart, `resourceVersion too old`, routine
+/// ~5min watch timeout). M_041's INSERT had no dedup column, so each
+/// relist appended duplicate `kind='interrupt'` rows; `refresh_lambda`
+/// then `SUM`med them into λ's numerator while exposure (timer-driven)
+/// stayed correct → λ read high → `solve_full` biased away from spot.
+///
+/// `event_uid` carries the K8s Event `metadata.uid`; the scheduler's
+/// `AppendInterruptSample` is `ON CONFLICT (event_uid) WHERE event_uid
+/// IS NOT NULL DO NOTHING`. Partial index → exposure rows and legacy
+/// rows (NULL uid) are unconstrained. DB-backed dedup (not an
+/// in-process `HashSet`) so a controller restart — the most reliable
+/// trigger; every rolling deploy re-counts the past hour — is covered.
+pub const M_047: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

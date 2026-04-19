@@ -809,6 +809,14 @@ impl AdminService for AdminServiceImpl {
     /// this is a production write path). NOT leader-gated: the
     /// controller's balanced channel routes to the leader anyway, and
     /// the table is append-only so a stray standby write is harmless.
+    ///
+    /// Idempotent on `event_uid`: the watcher consumes
+    /// `.applied_objects()` which re-yields every still-extant Event on
+    /// relist/reconnect/controller-restart. `ON CONFLICT (event_uid)
+    /// WHERE event_uid IS NOT NULL DO NOTHING` (partial unique index,
+    /// M_047) deduplicates `kind='interrupt'` rows so λ's numerator
+    /// doesn't inflate; exposure rows pass `event_uid=None` and are
+    /// unconstrained.
     #[instrument(skip(self, request), fields(rpc = "AppendInterruptSample"))]
     async fn append_interrupt_sample(
         &self,
@@ -817,13 +825,15 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let r = request.into_inner();
         sqlx::query(
-            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, event_uid) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (event_uid) WHERE event_uid IS NOT NULL DO NOTHING",
         )
         .bind(&self.cluster)
         .bind(&r.hw_class)
         .bind(&r.kind)
         .bind(r.value)
+        .bind(r.event_uid.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| Status::internal(format!("append_interrupt_sample: {e}")))?;

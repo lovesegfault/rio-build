@@ -472,6 +472,13 @@ message AppendInterruptSampleRequest {
   string hw_class = 1;
   string kind = 2;
   double value = 3;
+  // K8s Event metadata.uid for kind="interrupt" rows. The watcher
+  // consumes `.applied_objects()` which re-yields every still-extant
+  // Event on relist/reconnect/controller-restart; the INSERT is
+  // `ON CONFLICT (event_uid) DO NOTHING` so re-delivery doesn't
+  // double-count into λ's numerator. NULL for exposure rows
+  // (timer-driven, no Event).
+  optional string event_uid = 4;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
