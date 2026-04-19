@@ -15,8 +15,9 @@
 //! immediately; a freestanding loop would only see it on the next
 //! poll. The 10s tick is `Action::requeue(10s)`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::jiff::Timestamp;
@@ -78,11 +79,23 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
             // solve_intent_for per Ready drv and serialize the full
             // intent vec — wasted work for a u32 ClusterStatus already
             // carries.
-            let cs = ctx.admin.clone().cluster_status(()).await.map_err(|e| {
-                Error::InvalidSpec(format!(
-                    "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
-                ))
-            })?;
+            // Timeout: connect_timeout+h2 keepalive on `ctx.admin`
+            // detect dead TCP, NOT a stalled handler. kube-rs
+            // serializes per-object reconciles with no deadline, so
+            // an unbounded await here would silently stop scaling
+            // until controller restart (bug_464). Elapsed →
+            // InvalidSpec → error_policy 30s requeue keeps the loop
+            // alive.
+            let cs = tokio::time::timeout(LOAD_RPC_TIMEOUT, ctx.admin.clone().cluster_status(()))
+                .await
+                .map_err(|_| {
+                    Error::InvalidSpec("ClusterStatus timed out; check scheduler readiness".into())
+                })?
+                .map_err(|e| {
+                    Error::InvalidSpec(format!(
+                        "ClusterStatus failed: {e}; check schedulerAddr / scheduler readiness"
+                    ))
+                })?;
             decide::total_builders(&cs.into_inner())
         }
     };
@@ -111,7 +124,11 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // field still exists for `kubectl get` observability — populated
     // from the in-process counter, but the reconciler reads from Ctx.
     let key = error_key(cs.as_ref());
-    let low_ticks_in = ctx.scaler.low_ticks.lock().get(&key).copied().unwrap_or(0);
+    let (low_ticks_in, last_status_write) = {
+        let low = ctx.scaler.low_ticks.lock().get(&key).copied().unwrap_or(0);
+        let last = ctx.scaler.last_status_write.lock().get(&key).copied();
+        (low, last)
+    };
     let since_up = status.last_scale_up_time.as_ref().and_then(since);
     let mut status_in = status.clone();
     status_in.low_load_ticks = low_ticks_in;
@@ -119,7 +136,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     ctx.scaler
         .low_ticks
         .lock()
-        .insert(key, decision.low_load_ticks);
+        .insert(key.clone(), decision.low_load_ticks);
 
     publish_metrics(&cs, &decision, max_load);
     debug!(
@@ -140,30 +157,51 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
         .increment(1);
     }
 
-    // ── Status (only on material change) ─────────────────────────
-    // SSA-apply with identical content is a no-op apiserver-side
-    // (no resourceVersion bump → no watch event), but float-
-    // formatting jitter on observedLoadFactor can defeat that.
-    // Explicitly skip when nothing the operator cares about
-    // changed; the 10s requeue is the next tick.
-    if status_changed(&status, &decision, max_load) {
+    // ── Status (rate-limited + only on material change) ──────────
+    // `status_changed` alone is insufficient: `decide()` mutates
+    // `learnedRatio` on every high-load tick, so under sustained
+    // load every reconcile would write → watch fires → re-reconcile
+    // at loop-rate (bug_213). `status_write_due` caps to once per
+    // REQUEUE window via in-process timestamp (same pattern as
+    // `low_ticks`). Worst case: 2 reconciles/10s (the requeue + one
+    // watch-echo whose status-write is suppressed).
+    if status_write_due(last_status_write) && status_changed(&status, &decision, max_load) {
         let cs_api: Api<ComponentScaler> = Api::namespaced(ctx.client.clone(), &ns);
         patch_status(&cs_api, &cs, spec, &status, &decision, max_load).await?;
+        ctx.scaler
+            .last_status_write
+            .lock()
+            .insert(key, Instant::now());
     }
 
     Ok(Action::requeue(REQUEUE))
 }
 
 /// Resolve `loadEndpoint` (headless-svc DNS) → per-pod GetLoad →
-/// max utilization. `None` on total failure (DNS unresolved, all
-/// RPCs failed) — the caller skips ratio correction this tick.
+/// max utilization. `None` on total failure (endpoint malformed,
+/// DNS unresolved, all RPCs failed) — the caller skips ratio
+/// correction this tick.
 ///
-/// Fan-out is sequential (not concurrent): ≤14 pods × sub-ms RPC =
-/// negligible. Concurrent would need a JoinSet + per-pod channel;
-/// not worth it for the latency budget.
+/// Fan-out is concurrent (JoinSet): bounds total latency to one
+/// `LOAD_RPC_TIMEOUT` regardless of pod count or health. Sequential
+/// would cost N×2s under N stale headless-DNS endpoints (rolling
+/// restart, drained node) — 5 stale = the entire `REQUEUE` budget
+/// gone before `decide()` runs (bug_194).
 async fn poll_max_load(endpoint: &str) -> Option<f64> {
-    let (host, port) = endpoint.rsplit_once(':')?;
-    let port: u16 = port.parse().ok()?;
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        warn!(
+            endpoint,
+            "componentscaler: loadEndpoint missing ':port'; fix spec.loadEndpoint"
+        );
+        return None;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        warn!(
+            endpoint,
+            "componentscaler: loadEndpoint port not a u16; fix spec.loadEndpoint"
+        );
+        return None;
+    };
 
     let addrs: Vec<_> = match tokio::net::lookup_host((host, port)).await {
         Ok(it) => it.collect(),
@@ -176,23 +214,35 @@ async fn poll_max_load(endpoint: &str) -> Option<f64> {
         debug!(host, "componentscaler: loadEndpoint resolved to 0 addrs");
         return None;
     }
+    poll_max_load_addrs(addrs).await
+}
 
-    let mut max: Option<f64> = None;
+/// Concurrent per-pod `GetLoad` fan-out → max. Split from
+/// [`poll_max_load`] so the timeout-aggregate behavior is
+/// unit-testable without DNS.
+async fn poll_max_load_addrs(addrs: Vec<SocketAddr>) -> Option<f64> {
+    // `connect_store_admin_at` (not the balanced channel): we need
+    // each pod's individual GetLoad reading for the max(), so dial
+    // every resolved IP directly — p2c would route all calls to one
+    // or two pods.
+    let mut set = tokio::task::JoinSet::new();
     for addr in addrs {
-        // `connect_store_admin_at` (not `connect_single`): the
-        // per-pod connect must override the TLS-verify domain to
-        // `rio-store` (the cert's SAN), since we dial a pod IP. The
-        // plain helper would SAN-check against the IP and fail under
-        // mTLS.
-        let load = async {
-            let mut c = rio_proto::client::balance::connect_store_admin_at(addr).await?;
-            let r = c
-                .get_load(rio_proto::types::GetLoadRequest {})
-                .await?
-                .into_inner();
-            anyhow::Ok(r.pg_pool_utilization as f64)
-        };
-        match tokio::time::timeout(LOAD_RPC_TIMEOUT, load).await {
+        set.spawn(async move {
+            let load = async {
+                let mut c = rio_proto::client::balance::connect_store_admin_at(addr).await?;
+                let r = c
+                    .get_load(rio_proto::types::GetLoadRequest {})
+                    .await?
+                    .into_inner();
+                anyhow::Ok(r.pg_pool_utilization as f64)
+            };
+            (addr, tokio::time::timeout(LOAD_RPC_TIMEOUT, load).await)
+        });
+    }
+    let mut max: Option<f64> = None;
+    while let Some(joined) = set.join_next().await {
+        let Ok((addr, res)) = joined else { continue };
+        match res {
             Ok(Ok(l)) => max = Some(max.map_or(l, |m: f64| m.max(l))),
             Ok(Err(e)) => debug!(%addr, error = %e, "componentscaler: GetLoad failed"),
             Err(_) => debug!(%addr, "componentscaler: GetLoad timed out"),
@@ -220,11 +270,23 @@ async fn patch_scale(api: &Api<Deployment>, name: &str, replicas: i32) -> Result
     Ok(())
 }
 
+/// True if at least `REQUEUE` has elapsed since the last successful
+/// `patch_status` for this CR. The watch-loop guard: status writes
+/// bump resourceVersion → watch fires → re-reconcile, so without
+/// this a `learnedRatio` change every tick collapses the 10s cadence
+/// to loop-body-latency. The caller stamps `last` on a successful
+/// patch.
+pub(super) fn status_write_due(last: Option<Instant>) -> bool {
+    last.is_none_or(|t| t.elapsed() >= REQUEUE)
+}
+
 /// True if the new status would differ from `prev` in a way that
 /// matters to operators (or to the next reconcile). `low_load_ticks`
 /// is held in-process and excluded; `observed_load_factor` is
 /// compared to one decimal place — sub-0.1 jitter isn't worth a CR
-/// write (and would risk watch-loop if SSA byte-compares the float).
+/// write. The watch-loop guard is at the caller via
+/// [`status_write_due`] — this predicate alone is insufficient
+/// (`learned_ratio` changes every high-load tick).
 fn status_changed(prev: &ComponentScalerStatus, d: &Decision, max_load: Option<f64>) -> bool {
     let load_bucket = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
     prev.learned_ratio.map(|r| r.to_bits()) != Some(d.learned_ratio.to_bits())
@@ -310,4 +372,52 @@ fn since(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<Dur
 /// genuine spec errors.
 pub fn error_policy(cs: Arc<ComponentScaler>, err: &Error, ctx: Arc<Ctx>) -> Action {
     standard_error_policy("componentscaler", cs, err, ctx, Duration::from_secs(30))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bug_213 regression: status writes rate-limited to once per
+    /// REQUEUE window. First reconcile (no last) → due; immediately
+    /// after a write → suppressed; after REQUEUE elapsed → due again.
+    #[test]
+    fn status_write_rate_limited() {
+        assert!(status_write_due(None), "first reconcile → due");
+        assert!(
+            !status_write_due(Some(Instant::now())),
+            "just wrote → suppressed (watch-echo doesn't re-write)"
+        );
+        let past = Instant::now()
+            .checked_sub(REQUEUE + Duration::from_secs(1))
+            .expect("monotonic clock far enough past boot");
+        assert!(status_write_due(Some(past)), "REQUEUE elapsed → due");
+    }
+
+    /// bug_194 regression: per-pod fan-out is concurrent, so total
+    /// latency is bounded by ONE `LOAD_RPC_TIMEOUT` regardless of how
+    /// many endpoints hang. Three never-accepting listeners would
+    /// cost 3×2s sequential; the outer 2× timeout asserts ≤4s.
+    /// Wall-clock with 100% slack budget — sequential at 6s cleanly
+    /// fails the 4s outer timeout, concurrent at ~2s cleanly passes.
+    #[tokio::test]
+    async fn poll_max_load_bounded_under_hang() {
+        // Listeners that never accept(): TCP connect lands in the
+        // backlog, then the gRPC h2 handshake hangs → per-task
+        // LOAD_RPC_TIMEOUT fires.
+        let mut listeners = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(l.local_addr().unwrap());
+            listeners.push(l);
+        }
+        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 2, poll_max_load_addrs(addrs)).await;
+        assert!(
+            res.is_ok(),
+            "concurrent fan-out must complete within 2×LOAD_RPC_TIMEOUT \
+             (sequential would take 3× = 6s and fail this)"
+        );
+        assert_eq!(res.unwrap(), None, "all hung → no reading");
+    }
 }

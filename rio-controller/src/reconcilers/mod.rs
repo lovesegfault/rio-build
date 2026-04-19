@@ -104,6 +104,14 @@ pub struct ScalerState {
     /// provisioning) — acceptable. `learnedRatio` (the durable
     /// bit) stays in `.status`.
     pub low_ticks: Mutex<HashMap<String, u32>>,
+    /// Per-ComponentScaler last successful `patch_status` time,
+    /// keyed by `{ns}/{name}`. Rate-limits status writes to once
+    /// per `REQUEUE` window: `decide()` mutates `learnedRatio` on
+    /// every high-load tick, so without this gate every write →
+    /// resourceVersion bump → watch fires → re-reconcile at
+    /// loop-rate, and the 5%-per-10s decay becomes 5%-per-loop-
+    /// iteration (ratio 50→1 in seconds, not ~13min). bug_213.
+    pub last_status_write: Mutex<HashMap<String, Instant>>,
 }
 
 impl Ctx {
