@@ -92,7 +92,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_actor_cmd_seconds` | Histogram | Per-`ActorCommand` handling latency (labeled by `cmd`). The DAG actor is single-threaded — a slow command head-of-line blocks every queued RPC. Alert on p99 > 1s sustained. |
 | `rio_scheduler_merge_phase_seconds` | Histogram | Per-phase MergeDag latency (labeled by `phase`). Decomposes `actor_cmd_seconds{cmd=MergeDag}`; a single phase >1s is the I-139 signal (N sequential PG awaits in the actor). |
 | `rio_scheduler_build_duration_seconds` | Histogram | Total build duration |
-| `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `existing`=pre-existing completed) |
+| `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `reprobe`=Poisoned reprobe, `existing`=pre-existing completed, `dispatch`=dispatch-time substitute hit) |
 | `rio_scheduler_cache_hit_deferred_total` | Counter | Cache-hit drvs deferred to Queued because their inputDrvs are not yet Completed (closure-race guard). |
 | `rio_scheduler_cache_check_failures_total` | Counter | Scheduler cache check (store FindMissingPaths) failures. Alert if rate > 0 sustained: indicates store connectivity issue, every submission treated as 100% cache miss. |
 | `rio_scheduler_substitute_fetch_failures_total` | Counter | Substitutable-path eager fetches (QueryPathInfo) that failed. Path demoted to cache-miss; derivation falls through to normal dispatch. Alert if rate > 0 sustained: upstream reported path available but fetch failed --- upstream lying or transient network. |
@@ -124,8 +124,8 @@ r[obs.metric.scheduler]
 | `rio_scheduler_event_persist_dropped_total` | Counter | BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained. |
 | `rio_scheduler_lease_acquired_total` | Counter | Kubernetes Lease acquire transitions (standby → leader). *Internal — primary use is VM test observability.* |
 | `rio_scheduler_lease_lost_total` | Counter | Kubernetes Lease loss transitions (leader → standby). *Internal — non-zero on a single-replica deployment is a bug.* |
-| `rio_scheduler_recovery_total` | Counter | State recovery runs (on LeaderAcquired). Labeled by `outcome`: `success`/`failure`. |
-| `rio_scheduler_recovery_duration_seconds` | Histogram | Time to reload non-terminal builds/derivations from PostgreSQL. |
+| `rio_scheduler_recovery_total` | Counter | State recovery runs (on LeaderAcquired). Labeled by `outcome`: `success`/`failure`/`discarded_flap`. |
+| `rio_scheduler_recovery_duration_seconds` | Histogram | Time to reload non-terminal builds/derivations from PostgreSQL. Labeled by `outcome`: `success`/`failure`. |
 | `rio_scheduler_reconcile_dropped_total` | Counter | Post-recovery `ReconcileAssignments` command dropped because the actor channel was full. Assigned-but-executor-gone derivations leak until the next recovery pass. Rare (channel is 1024-deep); alert if > 0. |
 | `rio_scheduler_backstop_timeouts_total` | Counter | Running derivations reset to Ready by the backstop timeout (running_since > max(est_duration×3, daemon_timeout+10m)). Non-zero indicates wedged executors. |
 | `rio_scheduler_build_timeouts_total` | Counter | Builds failed by per-build wall-clock timeout (`BuildOptions.build_timeout` seconds since submission). Distinct from `backstop_timeouts_total` (per-derivation heuristic). |

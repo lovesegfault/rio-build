@@ -364,15 +364,17 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_recovery_total",
-        "Scheduler state recoveries from PG after LeaderAcquired"
+        "Scheduler state recoveries from PG after LeaderAcquired \
+         (labeled by outcome=success|failure|discarded_flap)"
     );
     describe_histogram!(
         "rio_scheduler_recovery_duration_seconds",
-        "Time to reconstruct actor state from PG on LeaderAcquired"
+        "Time to reconstruct actor state from PG on LeaderAcquired \
+         (labeled by outcome=success|failure)"
     );
     describe_counter!(
         "rio_scheduler_worker_disconnects_total",
-        "Worker stream disconnects (graceful and ungraceful; labeled by reason if available)"
+        "Worker stream disconnects (graceful and ungraceful)"
     );
     describe_counter!(
         "rio_scheduler_cancel_signals_total",
@@ -405,10 +407,12 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_ca_hash_compares_total",
         "CA early-cutoff output-hash lookups against the content index on \
-         successful completion (labeled by outcome=match|miss|skipped_after_miss). \
-         High match ratio → CA derivations rebuilding identical content; \
-         cutoff-propagate will skip downstream work. skipped_after_miss counts \
-         outputs short-circuited after an earlier miss in the same derivation."
+         successful completion (labeled by outcome=match|miss|skipped_after_miss|\
+         malformed|error). High match ratio → CA derivations rebuilding identical \
+         content; cutoff-propagate will skip downstream work. skipped_after_miss \
+         counts outputs short-circuited after an earlier miss in the same \
+         derivation. malformed = executor sent empty output_path; error = PG \
+         lookup failed/timed out (alert if rate>0)."
     );
     describe_counter!(
         "rio_scheduler_ca_cutoff_saves_total",
