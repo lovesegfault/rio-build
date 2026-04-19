@@ -25,7 +25,9 @@ use crate::metadata;
 use super::{StoreServiceImpl, putpath_metadata_status};
 
 pub(super) mod common;
-pub(super) use common::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
+pub(super) use common::{
+    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
+};
 
 /// Drain remaining messages from a streaming request.
 ///

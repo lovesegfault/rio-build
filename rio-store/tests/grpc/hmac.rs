@@ -409,6 +409,60 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
+// r[verify sec.authz.ca-path-derived]
+/// `PutPathBatch` is the multi-output endpoint builders use; the CA
+/// path-derivation gate must apply there too. Same attack as
+/// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
+#[tokio::test]
+async fn hmac_is_ca_batch_wrong_path_rejected() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    let (nar, _) = make_nar(b"evil batch content");
+    let path = test_store_path("evil-batch-target");
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    let wrap = |m| PutPathBatchRequest {
+        output_index: 0,
+        inner: Some(PutPathRequest { msg: Some(m) }),
+    };
+    tx.send(wrap(put_path_request::Msg::Metadata(PutPathMetadata {
+        info: Some(info),
+    })))
+    .await
+    .unwrap();
+    tx.send(wrap(put_path_request::Msg::NarChunk(nar)))
+        .await
+        .unwrap();
+    tx.send(wrap(put_path_request::Msg::Trailer(trailer)))
+        .await
+        .unwrap();
+    drop(tx);
+
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    let token = sign_claims_full("test-worker", vec![String::new()], true, 60);
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+
+    let err = client
+        .put_path_batch(req)
+        .await
+        .expect_err("is_ca batch to non-derived path → reject");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("content-derived CA path"),
+        "msg: {}",
+        err.message()
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // AppendHwPerfSample: pod_id derived from claims, not body
 // ---------------------------------------------------------------------------

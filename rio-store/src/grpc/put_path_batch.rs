@@ -37,7 +37,9 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
-use super::put_path::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
+use super::put_path::{
+    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
+};
 use super::{StoreServiceImpl, putpath_metadata_status};
 use rio_common::limits::MAX_BATCH_OUTPUTS;
 
@@ -113,6 +115,10 @@ impl StoreServiceImpl {
                 bail!(e);
             }
             if let Err(e) = verify_nar(&accum.nar_data, info, &ctx) {
+                bail!(e);
+            }
+            // r[impl sec.authz.ca-path-derived]
+            if let Err(e) = verify_ca_store_path(info, auth.hmac_claims.as_ref(), &ctx) {
                 bail!(e);
             }
 
