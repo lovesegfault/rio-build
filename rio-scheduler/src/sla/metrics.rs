@@ -55,8 +55,8 @@ pub fn describe_all() {
     );
     describe_gauge!(
         "rio_scheduler_sla_prior_divergence",
-        "fleet prior hit clamp: per-tenant fit diverged from the \
-         fleet prior by more than the partial-pooling band"
+        "fleet-median prior parameter ÷ operator-probe basis (labeled \
+         `param`); outside [0.5, 2.0] ⇒ clamped to the band edge"
     );
     describe_gauge!(
         "rio_scheduler_sla_hw_cost_stale_seconds",

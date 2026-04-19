@@ -149,7 +149,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_sla_suspicious_scaling_total` | Counter | ADR-023: exploration froze at `max_cores` still saturated (labeled `tenant`). The build wants more cores than the cluster offers. |
 | `rio_scheduler_sla_outlier_rejected_total` | Counter | ADR-023: MAD-rejected `build_samples` rows (labeled `tenant`). Row stays in PG (`outlier_excluded=TRUE`) for forensics; refit excludes it (`r[sched.sla.outlier-mad-reject]`). |
 | `rio_scheduler_sla_mem_fit_weak_total` | Counter | ADR-023: `M(c)` Koenker-Machado pseudo-R¹ < 0.7 → fell back to independent recency-weighted p90 (labeled `tenant`). |
-| `rio_scheduler_sla_prior_divergence` | Gauge | ADR-023: per-tenant fit diverged from the fleet prior by more than the partial-pooling band (`r[sched.sla.prior-partial-pool]`). |
+| `rio_scheduler_sla_prior_divergence` | Gauge | ADR-023: fleet-median prior parameter ÷ operator-probe basis (labeled `param`); outside `[0.5, 2.0]` ⇒ clamped to the band edge (`r[sched.sla.prior-partial-pool]`). Set every refit, so an in-band value clears the alert. |
 | `rio_scheduler_sla_hw_cost_stale_seconds` | Gauge | ADR-023: age of the hw-band `$/vCPU·hr` snapshot. Climbs when the lease-gated spot-price poller is failing or this replica is standby. |
 | `rio_scheduler_sla_ice_backoff_total` | Counter | ADR-023 §2.8: `(band, cap)` cells marked ICE-infeasible by the Pending-watch (no heartbeat within `hw_fallback_after_secs` of first emitting a band-targeted SpawnIntent). Labeled `band`, `cap`. |
 

@@ -256,7 +256,12 @@ fn median_fitparams(v: &[&FitParams]) -> FitParams {
 }
 
 fn clamp_field(fleet: f64, op: f64, param: &'static str) -> f64 {
+    let g = ::metrics::gauge!("rio_scheduler_sla_prior_divergence", "param" => param);
     if op.abs() < f64::EPSILON {
+        // Degenerate band (operator basis 0, e.g. q): pass fleet
+        // through and report "in band" so a previously-set value for
+        // this param doesn't stick.
+        g.set(1.0);
         return fleet;
     }
     let (lo, hi) = if op > 0.0 {
@@ -264,11 +269,11 @@ fn clamp_field(fleet: f64, op: f64, param: &'static str) -> f64 {
     } else {
         (2.0 * op, 0.5 * op)
     };
-    let clamped = fleet.clamp(lo, hi);
-    if clamped != fleet {
-        ::metrics::gauge!("rio_scheduler_sla_prior_divergence", "param" => param).set(fleet / op);
-    }
-    clamped
+    // Unconditional: in-band → ratio ∈ [0.5, 2.0] and the alert
+    // (`> 2 ∨ < 0.5`) auto-clears when fleet converges. Gating on
+    // `clamped != fleet` left the last out-of-band ratio stale forever.
+    g.set(fleet / op);
+    fleet.clamp(lo, hi)
 }
 
 #[cfg(test)]
@@ -399,6 +404,35 @@ mod tests {
         assert!((clamped.s - 100.0).abs() < 1e-9);
         // q: operator basis is 0 → passed through
         assert!((clamped.q - 0.3).abs() < 1e-9);
+    }
+
+    // r[verify sched.sla.prior-partial-pool]
+    #[test]
+    fn prior_divergence_gauge_resets_in_band() {
+        use rio_test_support::metrics::CountingRecorder;
+        let rec = CountingRecorder::default();
+        let key = "rio_scheduler_sla_prior_divergence{param=p}";
+        // Out-of-band: 10/3 ≈ 3.33 > 2.
+        ::metrics::with_local_recorder(&rec, || {
+            clamp_field(10.0, 3.0, "p");
+        });
+        let v = rec.gauge_value(key).expect("set out-of-band");
+        assert!((v - 10.0 / 3.0).abs() < 1e-9, "got {v}");
+        // In-band: 3.3/3 = 1.1. Gauge must follow, not stick at 3.33.
+        ::metrics::with_local_recorder(&rec, || {
+            clamp_field(3.3, 3.0, "p");
+        });
+        let v = rec.gauge_value(key).expect("still set");
+        assert!(
+            (v - 1.1).abs() < 1e-9,
+            "in-band refit resets gauge to current ratio (got {v}, not stale 3.33)"
+        );
+        // Degenerate band (op≈0) → reports 1.0, not stale.
+        ::metrics::with_local_recorder(&rec, || {
+            clamp_field(10.0, 0.0, "p");
+        });
+        let v = rec.gauge_value(key).unwrap();
+        assert!((v - 1.0).abs() < 1e-9, "op≈0 clears to 1.0 (got {v})");
     }
 
     fn fp(s: f64, p: f64, q: f64, a: f64, b: f64) -> FitParams {
