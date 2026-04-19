@@ -144,14 +144,32 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("kubernetes client connected");
 
+    // ---- Health server ----
+    // r[impl ctrl.health.ready-gates-connect]
+    // BEFORE dependency connect: liveness = process alive + runtime
+    // responsive (server.rs `/healthz` is unconditional 200), so it
+    // must answer immediately or the chart's livenessProbe
+    // (periodSeconds:10, failureThreshold:3, no startupProbe) kills
+    // the pod at ~20-30s — re-introducing the CrashLoopBackOff that
+    // `connect_forever` exists to avoid. Readiness = dependencies
+    // reachable: `/readyz` is 503 until `ready` flips after
+    // `connect_forever` returns.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rio_common::server::spawn_axum(
+        "health-server",
+        cfg.health_addr,
+        rio_common::server::health_router(ready.clone()),
+        shutdown.clone(),
+    );
+
     // ---- Scheduler clients (autoscaler + reconcilers) ----
     // Retry until connected via connect_forever (shutdown-aware,
     // exponential backoff). All rio-* pods start in parallel via
     // helm; this process can reach here before the scheduler Service
-    // has endpoints. Pod stays not-Ready (health server below hasn't
-    // spawned) while retrying. Observed 2/2 coverage-full failures
-    // 2026-03-16 before retry was added (CrashLoopBackOff ate the
-    // 180s test budget).
+    // has endpoints. Pod stays NotReady (`/readyz` → 503) while
+    // retrying; `/healthz` already serves 200 so livenessProbe
+    // passes. Observed 2/2 coverage-full failures 2026-03-16 before
+    // retry was added (CrashLoopBackOff ate the 180s test budget).
     //
     // Once connected: hold the channel for process lifetime. Balanced
     // when scheduler_balance_host is set — the standby returns
@@ -166,17 +184,7 @@ async fn main() -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-
-    // ---- Health server ----
-    // AFTER kube + scheduler connect: liveness should pass only
-    // once the things we depend on are reachable. Before this line,
-    // pod is not-ready; after, /healthz returns 200.
-    //
-    // Simple axum with always-200 /healthz. No readiness gate
-    // beyond "process is up" — the controller has no "I'm
-    // connected but not yet leading" state (no leader election;
-    // single replica per controller.md design).
-    spawn_health_server(cfg.health_addr, shutdown.clone());
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // ---- Events Recorder ----
     // Reporter identifies US (the controller) in emitted events.
@@ -326,20 +334,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("controller shutting down");
     Ok(())
-}
-
-/// Spawn a `/healthz` + `/readyz` server. Always 200 on both —
-/// the controller has no "connected but not ready" state (kube-
-/// client connect happens before this is called; reconcilers run
-/// or don't independent of readiness).
-fn spawn_health_server(addr: std::net::SocketAddr, shutdown: rio_common::signal::Token) {
-    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    rio_common::server::spawn_axum(
-        "health-server",
-        addr,
-        rio_common::server::health_router(ready),
-        shutdown,
-    );
 }
 
 #[cfg(test)]

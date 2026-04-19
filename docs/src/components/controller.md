@@ -329,14 +329,17 @@ Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/r
 r[ctrl.probe.named-service]
 Health probes against `grpc.health.v1.Health/Check` MUST target a named service (e.g., `rio.scheduler.SchedulerService`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- a probe on `""` stays green through drain and through standby.
 
-> **Note:** This requirement applies to the **client-side balancer** (`rio-proto/src/client/balance.rs`), which probes the named service to find the leader. It does NOT apply to K8s probes: `infra/helm/rio-build/templates/scheduler.yaml` intentionally uses `tcpSocket` for both readiness and liveness --- standby replicas report `NOT_SERVING` on the gRPC health endpoint (they haven't won the lease), so gRPC-based K8s probes would crash-loop them. TCP-accept succeeding proves the process is live; leader-election is client-side routing's concern, not K8s'. `store.yaml` does use `grpc.service: rio.store.StoreService` for readiness (store is not leader-elected, so `NOT_SERVING` only means drain or PG/S3 unhealthy --- correct to take out of rotation). Executor probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
+> **Note:** This requirement applies to the **client-side balancer** (`rio-proto/src/client/balance.rs`), which probes the named service to find the leader. It does NOT apply to K8s probes: `infra/helm/rio-build/templates/scheduler.yaml` intentionally uses `tcpSocket` for both readiness and liveness --- standby replicas report `NOT_SERVING` on the gRPC health endpoint (they haven't won the lease), so gRPC-based K8s probes would crash-loop them. TCP-accept succeeding proves the process is live; leader-election is client-side routing's concern, not K8s'. `store.yaml` does use `grpc.service: rio.store.StoreService` for readiness (store is not leader-elected, so `NOT_SERVING` only means drain or PG/S3 unhealthy --- correct to take out of rotation). Controller and executor probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
+
+r[ctrl.health.ready-gates-connect]
+The controller binds its HTTP health server **before** awaiting `connect_forever` for the scheduler. `/healthz` (liveness) returns 200 unconditionally once the kube client is constructed; `/readyz` (readiness) returns 503 until the scheduler admin channel connects, then 200. Spawning the health server *after* `connect_forever` would leave nothing listening during scheduler cold-start and the chart's livenessProbe (`periodSeconds:10`, `failureThreshold:3`, no `startupProbe`) would SIGTERM the pod at ~20-30s --- re-introducing the CrashLoopBackOff that `connect_forever` was added to fix.
 
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
 | Scheduler | TCP socket (gRPC health is leader-election-aware, unsuitable for K8s probes on HA standby) | TCP socket — process is live, port is bound. Leader election happens; client-side balancer routes to leader via named-service health. | TCP socket. Startup budget sized for state recovery (reload non-terminal builds from PG). |
 | Store | TCP socket | gRPC health check on named service --- after PostgreSQL + S3 reachable | — |
-| Controller | HTTP `/healthz` | After kube-client + scheduler gRPC connect (intentionally before CRD watches; single-replica, no leader election) | — |
+| Controller | HTTP `/healthz` (unconditional 200; bound before `connect_forever`) | HTTP `/readyz` — 503 until scheduler gRPC connected, then 200 (single-replica, no leader election) | — |
 | Executor | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 
 ## Executor Lifecycle

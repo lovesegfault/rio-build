@@ -78,4 +78,58 @@ scope: with scope; ''
           pf_close(tag="pf-health")
       print("health-shared PASS: standby NOT_SERVING, leader SERVING "
             "(lease-gated named service on main gRPC port)")
+
+  # ══════════════════════════════════════════════════════════════════
+  # controller HTTP health: liveness bound BEFORE connect_forever,
+  # readiness gated ON it (ctrl.health.ready-gates-connect)
+  # ══════════════════════════════════════════════════════════════════
+  # Regression: pre-fix the health server spawned AFTER
+  # connect_forever, so a >~20s scheduler cold-start = 3× connection-
+  # refused on livenessProbe = SIGTERM = CrashLoopBackOff. The chart
+  # also pointed readinessProbe at /healthz (always-200), so readiness
+  # never reflected scheduler reachability.
+  #
+  # Structural assertions (no scheduler restart needed — that would
+  # disrupt the stable 2-replica state for downstream subtests):
+  #   1. readinessProbe.path == /readyz  (was /healthz pre-fix)
+  #   2. /healthz and /readyz both 200 in steady state
+  #   3. controller Running (not CrashLoopBackOff) — proves the health
+  #      server bound during the cold-start that already happened at
+  #      waitReady
+  with subtest("health-shared: controller /healthz live, /readyz gated on scheduler"):
+      ctrl_pod = kubectl(
+          "get pod -l app.kubernetes.io/name=rio-controller "
+          "-o jsonpath='{.items[0].metadata.name}'"
+      )
+      ready_path = kubectl(
+          "get pod " + ctrl_pod + " -o "
+          "jsonpath='{.spec.containers[0].readinessProbe.httpGet.path}'"
+      )
+      assert ready_path == "/readyz", (
+          f"readinessProbe must target /readyz (gated on scheduler "
+          f"connect), got {ready_path!r}"
+      )
+      restarts = kubectl(
+          "get pod " + ctrl_pod + " -o "
+          "jsonpath='{.status.containerStatuses[0].restartCount}'"
+      )
+      assert restarts == "0", (
+          f"controller restarted {restarts}× during cold-start "
+          f"(livenessProbe killed it before health server bound?)"
+      )
+      # --retry-connrefused: pf_open's nc-probe proves the LOCAL bind
+      # is up, but kubectl port-forward's upstream dial can lag a few
+      # hundred ms (and cilium interface churn briefly drops it).
+      # --fail: non-2xx → exit 22 → succeed() raises.
+      pf_open(ctrl_pod, 19194, 9194, tag="pf-ctrl-health")
+      try:
+          for path in ("/healthz", "/readyz"):
+              k3s_server.succeed(
+                  "curl -sS --fail --retry 5 --retry-connrefused "
+                  f"--retry-delay 1 http://localhost:19194{path}"
+              )
+      finally:
+          pf_close(tag="pf-ctrl-health")
+      print("health-shared PASS: controller readinessProbe=/readyz, "
+            "0 restarts, /healthz+/readyz=200")
 ''

@@ -65,8 +65,10 @@ const CONNECT_BACKOFF: Backoff = Backoff {
 /// - `None`: retry forever. Returns `Ok(T)` or `Cancelled`, never
 ///   `Exhausted`. Use for binaries where "can't reach dependency" =
 ///   "useless process" (gateway without scheduler, builder without
-///   store) — the pod stays not-Ready, kubelet doesn't restart it,
-///   and it recovers the instant the dependency appears.
+///   store) — caller spawns its health server FIRST so `/healthz`
+///   answers liveness while this retries; `/readyz` flips to 200
+///   after this returns. The pod stays NotReady (kubelet doesn't
+///   restart it) and recovers the instant the dependency appears.
 /// - `Some(n)`: give up after `n` failed attempts. Use when the
 ///   dependency is optional and the caller can degrade gracefully
 ///   (scheduler's store client: missing → CA-cutoff disabled, not

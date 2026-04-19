@@ -203,8 +203,8 @@ where
 /// | `/readyz` | readiness | 200 iff `ready` is `true`; 503 otherwise. |
 ///
 /// `ready` is the binary's own gate (e.g. rio-builder flips it on the
-/// first accepted heartbeat; rio-controller passes a constant `true`
-/// — it has no "connected but not ready" state).
+/// first accepted heartbeat; rio-controller flips it after
+/// `connect_forever` reaches the scheduler).
 ///
 /// Serve via [`spawn_axum`] for graceful shutdown wiring. Distinct
 /// from [`spawn_health_server`] (gRPC `grpc.health.v1.Health` for

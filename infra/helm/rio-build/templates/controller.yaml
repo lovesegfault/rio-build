@@ -76,11 +76,13 @@ spec:
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
-          # /healthz serves 200 once kube client + scheduler admin client
-          # connected. Controller that can't watch CRDs is useless → NotReady
-          # is correct. Already plaintext HTTP — no TLS retarget needed.
+          # /healthz: unconditional 200 (process alive + tokio
+          # responsive) — bound BEFORE connect_forever so liveness
+          # passes during scheduler cold-start. /readyz: 503 until
+          # scheduler admin client connected. Already plaintext HTTP —
+          # no TLS retarget needed.
           readinessProbe:
-            httpGet: {path: /healthz, port: health}
+            httpGet: {path: /readyz, port: health}
             periodSeconds: 5
           livenessProbe:
             httpGet: {path: /healthz, port: health}
