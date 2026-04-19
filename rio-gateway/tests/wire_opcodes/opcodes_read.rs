@@ -568,6 +568,178 @@ async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ===========================================================================
+// Regression: realisation lookup error propagation + soft-fail (C4/C5/C6)
+// ===========================================================================
+
+/// Floating-CA ATerm: hash_algo set, hash empty, path empty. The single
+/// caller is the C5/C6 regression set below; output name is fixed at "out".
+fn floating_ca_aterm() -> &'static str {
+    r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","")])"#
+}
+
+/// QueryRealisation (43): non-NotFound store error → STDERR_ERROR, not
+/// `count=0`. Before the fix, Unavailable was swallowed as a cache miss
+/// after STDERR_LAST had already been sent.
+#[tokio::test]
+async fn test_query_realisation_store_unavailable_stderr_error() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.store
+        .faults
+        .fail_query_realisation
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let id = format!("sha256:{}!out", "aa".repeat(32));
+    wire_send!(&mut h.stream; u64: 43, string: &id);
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("store error"),
+        "should surface store error, got: {}",
+        err.message
+    );
+    h.finish().await;
+    Ok(())
+}
+
+/// QueryDerivationOutputMap (41): non-NotFound store error during CA
+/// realisation lookup → STDERR_ERROR. Before the fix, Unavailable was
+/// info!-logged and `""` written → client `assert(maybeOutputPath)` at
+/// nix-build.cc:722 with no indication the store was unreachable.
+#[tokio::test]
+async fn test_query_derivation_output_map_store_unavailable_stderr_error() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = "/nix/store/44444444444444444444444444444444-ca.drv";
+    h.store
+        .seed_with_content(drv_path, floating_ca_aterm().as_bytes());
+    h.store
+        .faults
+        .fail_query_realisation
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    wire_send!(&mut h.stream; u64: 41, string: drv_path);
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("store error"),
+        "should surface store error, got: {}",
+        err.message
+    );
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.query-missing]
+/// QueryMissing (40): floating-CA drv that IS realised + present → NOT in
+/// willBuild. Before the fix, `out.path().is_empty()` unconditionally
+/// inserted into forced_build with the comment "Can't query; must build" —
+/// `nix build --dry-run` lied for already-realised CA derivations.
+#[tokio::test]
+async fn test_query_missing_realised_floating_ca_not_in_willbuild() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = "/nix/store/55555555555555555555555555555555-ca.drv";
+    h.store
+        .seed_with_content(drv_path, floating_ca_aterm().as_bytes());
+
+    // Compute the modular hash the gateway will use (drv_cache resolves
+    // nothing — this drv has no inputDrvs so the resolver is never hit).
+    let drv = rio_nix::derivation::Derivation::parse(floating_ca_aterm())?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+
+    // Realised → present in store. willBuild should be empty.
+    let realised_out = "/nix/store/66666666666666666666666666666666-ca-out";
+    h.store.seed_with_content(realised_out, b"ca-output");
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+
+    wire_send!(&mut h.stream; u64: 40, strings: &[format!("{drv_path}!out")]);
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let will_build = wire::read_strings(&mut h.stream).await?;
+    let will_substitute = wire::read_strings(&mut h.stream).await?;
+    let _unknown = wire::read_strings(&mut h.stream).await?;
+    let _dl = wire::read_u64(&mut h.stream).await?;
+    let _nar = wire::read_u64(&mut h.stream).await?;
+
+    assert!(
+        will_build.is_empty(),
+        "realised floating-CA drv should NOT be in willBuild, got: {will_build:?}"
+    );
+    assert!(
+        will_substitute.is_empty(),
+        "output is present (not just substitutable) → not in willSubstitute"
+    );
+    h.finish().await;
+    Ok(())
+}
+
+/// QueryMissing (40): floating-CA drv NOT realised → willBuild (fallback
+/// when the Realisations table has no entry — NotFound, not an error).
+#[tokio::test]
+async fn test_query_missing_unrealised_floating_ca_in_willbuild() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let drv_path = "/nix/store/77777777777777777777777777777777-ca.drv";
+    h.store
+        .seed_with_content(drv_path, floating_ca_aterm().as_bytes());
+
+    wire_send!(&mut h.stream; u64: 40, strings: &[format!("{drv_path}!out")]);
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let will_build = wire::read_strings(&mut h.stream).await?;
+    let _ws = wire::read_strings(&mut h.stream).await?;
+    let _u = wire::read_strings(&mut h.stream).await?;
+    let _dl = wire::read_u64(&mut h.stream).await?;
+    let _ns = wire::read_u64(&mut h.stream).await?;
+
+    assert_eq!(will_build, vec![drv_path.to_string()]);
+    h.finish().await;
+    Ok(())
+}
+
+/// RegisterDrvOutput (42): missing/garbage `outPath` → soft-fail
+/// (STDERR_LAST + Ok), NOT STDERR_ERROR. Before the fix, the unparseable
+/// `out_path` flowed through to RegisterRealisation → store-side
+/// `validate_store_path` → `Status::invalid_argument` → session-terminating
+/// `stderr_err!`, contradicting the documented soft-fail policy.
+#[rstest]
+#[case::missing(r#"{"id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!out","signatures":[]}"#)]
+#[case::garbage(r#"{"id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!out","outPath":"garbage","signatures":[]}"#)]
+#[tokio::test]
+async fn test_register_drv_output_bad_outpath_soft_fails(#[case] json: &str) -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    wire_send!(&mut h.stream; u64: 42, string: json);
+    // Soft-fail: STDERR_LAST, no STDERR_ERROR, no response data.
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // Nothing was registered.
+    assert!(
+        h.store.state.realisations.read().unwrap().is_empty(),
+        "malformed outPath should not reach RegisterRealisation"
+    );
+
+    // Session stays usable: a follow-up opcode works.
+    wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_MISSING);
+    drain_stderr_until_last(&mut h.stream).await?;
+    let _ = wire::read_bool(&mut h.stream).await?;
+
+    h.finish().await;
+    Ok(())
+}
+
 /// QueryValidPaths with empty input returns empty output.
 #[tokio::test]
 async fn test_query_valid_paths_empty() -> anyhow::Result<()> {

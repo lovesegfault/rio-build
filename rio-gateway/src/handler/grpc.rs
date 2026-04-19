@@ -7,8 +7,11 @@
 //! store-side tenant-scoped operations (substitution, narinfo
 //! visibility gate) short-circuit — see `r[gw.jwt.issue]`.
 
+use std::collections::HashMap;
+
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;
+use rio_nix::derivation::Derivation;
 use rio_nix::store_path::StorePath;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
@@ -17,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tonic::transport::Channel;
 
 use super::{GatewayError, attach_service_token, jwt_metadata, with_jwt};
+use crate::translate;
 
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(crate) async fn grpc_query_path_info(
@@ -32,6 +36,103 @@ pub(crate) async fn grpc_query_path_info(
     )
     .await
     .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
+}
+
+/// QueryRealisation with NotFound→None mapping. Any non-NotFound status
+/// is returned as Err — caller MUST `stderr_err!` it. Never swallow.
+///
+/// Chokepoint for the four CA-aware opcode handlers (40, 41, 43, 46) and
+/// opcode 36's output-enrichment. `NotFound` is the *only* store status
+/// that maps to wire-level "no result"; `Unavailable` / `DeadlineExceeded`
+/// / `Internal` are infrastructure errors that the client must see via
+/// `STDERR_ERROR` — otherwise (per the doc-comment on
+/// `handle_query_derivation_output_map`) the client receives `outPath=""`
+/// → `assert(maybeOutputPath)` at nix-build.cc:722 with no indication
+/// the store was unreachable.
+pub(super) async fn grpc_query_realisation(
+    client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
+    drv_hash: [u8; 32],
+    output_name: &str,
+) -> anyhow::Result<Option<types::Realisation>> {
+    let req = with_jwt(
+        types::QueryRealisationRequest {
+            drv_hash: drv_hash.to_vec(),
+            output_name: output_name.to_string(),
+        },
+        jwt_token,
+    )?;
+    match rio_common::grpc::with_timeout(
+        "QueryRealisation",
+        DEFAULT_GRPC_TIMEOUT,
+        client.query_realisation(req),
+    )
+    .await
+    {
+        Ok(resp) => Ok(Some(resp.into_inner())),
+        Err(e)
+            if e.downcast_ref::<tonic::Status>()
+                .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// For each floating-CA output of `drv`, query the Realisations table.
+///
+/// Returns `(modular_hash, name→output_path)`. NotFound entries are absent
+/// from the map (caller falls back to `""` / `forced_build`).
+/// `modular_hash` is `None` iff [`compute_modular_hash_cached`] failed
+/// (already `warn!`-logged) — IA outputs are still resolvable from the
+/// `.drv`, only floating-CA stays empty.
+///
+/// Non-NotFound store errors propagate as `Err` — caller `stderr_err!`s.
+///
+/// Shared resolver for opcodes 36/40/41/46; before this extraction each
+/// caller open-coded the same `compute_modular_hash_cached → per-output
+/// QueryRealisation` loop with inconsistent error handling (two of the
+/// four swallowed non-NotFound — see [`grpc_query_realisation`]).
+///
+/// [`compute_modular_hash_cached`]: crate::translate::compute_modular_hash_cached
+pub(super) async fn resolve_floating_outputs(
+    drv: &Derivation,
+    drv_path: &str,
+    store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
+    drv_cache: &HashMap<StorePath, Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> anyhow::Result<(Option<[u8; 32]>, HashMap<String, String>)> {
+    let mut realized: HashMap<String, String> = HashMap::new();
+    let has_floating = drv.outputs().iter().any(|o| o.path().is_empty());
+    if !has_floating {
+        return Ok((None, realized));
+    }
+    let Some(hash) = translate::compute_modular_hash_cached(drv, drv_path, drv_cache, hash_cache)
+    else {
+        // compute_modular_hash_cached already warn!-logged. IA outputs
+        // still get their .drv paths; CA outputs stay unresolved.
+        return Ok((None, realized));
+    };
+    for out in drv.outputs() {
+        if !out.path().is_empty() {
+            continue;
+        }
+        match grpc_query_realisation(store_client, jwt_token, hash, out.name()).await? {
+            Some(r) => {
+                realized.insert(out.name().to_string(), r.output_path);
+            }
+            None => {
+                tracing::info!(
+                    drv_hash = %hex::encode(hash),
+                    output = %out.name(),
+                    "no realisation for floating-CA output (not yet built)"
+                );
+            }
+        }
+    }
+    Ok((Some(hash), realized))
 }
 
 /// Check validity via QueryPathInfo -- returns true if path exists.

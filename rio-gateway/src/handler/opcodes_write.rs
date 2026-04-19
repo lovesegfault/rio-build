@@ -313,11 +313,39 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
         Err(e) => stderr_err!(stderr, "invalid content-address method '{cam_str}': {e}"),
     };
 
-    let content_hash = NixHash::compute(hash_algo, &dump_data);
-
     let ref_paths = match parse_reference_paths(&references, "wopAddToStore") {
         Ok(p) => p,
         Err(e) => stderr_err!(stderr, "{e}"),
+    };
+
+    // Two SHA-256 passes + a NAR-serialize over a buffer bounded only
+    // by MAX_FRAMED_TOTAL = 4 GiB. ~16 s of pinned CPU per 4 GiB import
+    // → cross-tenant tail-latency / authenticated-DoS if run on a
+    // reactor thread. The inputs are owned/Copy so they move into the
+    // blocking closure cleanly. ref_paths / StorePath::make_* stay on
+    // the async side (cheap, and `name` stays available for stderr_err!
+    // formatting without cloning into the closure).
+    let hash_result = tokio::task::spawn_blocking(move || {
+        let content_hash = NixHash::compute(hash_algo, &dump_data);
+        let nar_data = if is_recursive {
+            dump_data
+        } else {
+            let node = NarNode::Regular {
+                executable: false,
+                contents: dump_data,
+            };
+            let mut buf = Vec::new();
+            nar::serialize(&mut buf, &node)?;
+            buf
+        };
+        let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
+        anyhow::Ok((content_hash, nar_data, nar_hash))
+    })
+    .await;
+    let (content_hash, nar_data, nar_hash) = match hash_result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}"),
+        Err(e) => stderr_err!(stderr, "internal: hash task: {e}"),
     };
 
     let path = if is_text {
@@ -338,21 +366,6 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
         }
     };
 
-    let nar_data = if is_recursive {
-        dump_data
-    } else {
-        let node = NarNode::Regular {
-            executable: false,
-            contents: dump_data,
-        };
-        let mut buf = Vec::new();
-        if let Err(e) = nar::serialize(&mut buf, &node) {
-            stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}");
-        }
-        buf
-    };
-
-    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
     let nar_size = nar_data.len() as u64;
 
     let ca = {
@@ -422,11 +435,32 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 
     debug!(name = %name, text_len = text.len(), "wopAddTextToStore");
 
-    let content_hash = NixHash::compute(HashAlgo::SHA256, text.as_bytes());
-
     let ref_paths = match parse_reference_paths(&references, "wopAddTextToStore") {
         Ok(p) => p,
         Err(e) => stderr_err!(stderr, "{e}"),
+    };
+
+    // Same spawn_blocking discipline as handle_add_to_store. `text` is
+    // bounded by MAX_STRING_LEN = 64 MiB (~130 ms worst-case) — small,
+    // but consistency keeps the crate free of multi-MB sync hashing on
+    // reactor threads.
+    let text_bytes = text.into_bytes();
+    let hash_result = tokio::task::spawn_blocking(move || {
+        let content_hash = NixHash::compute(HashAlgo::SHA256, &text_bytes);
+        let node = NarNode::Regular {
+            executable: false,
+            contents: text_bytes,
+        };
+        let mut nar_data = Vec::new();
+        nar::serialize(&mut nar_data, &node)?;
+        let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
+        anyhow::Ok((content_hash, nar_data, nar_hash))
+    })
+    .await;
+    let (content_hash, nar_data, nar_hash) = match hash_result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}"),
+        Err(e) => stderr_err!(stderr, "internal: hash task: {e}"),
     };
 
     let path = match StorePath::make_text(&name, &content_hash, &ref_paths) {
@@ -437,16 +471,6 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
         ),
     };
 
-    let node = NarNode::Regular {
-        executable: false,
-        contents: text.into_bytes(),
-    };
-    let mut nar_data = Vec::new();
-    if let Err(e) = nar::serialize(&mut nar_data, &node) {
-        stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}");
-    }
-
-    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
     let nar_size = nar_data.len() as u64;
 
     let ca = format!(
@@ -475,6 +499,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 /// Parse a content-address method string. Errors are formatted for the
 /// Nix client (sole caller `stderr_err!`s the result; nothing matches on
 /// variants).
+// r[impl gw.opcode.add-to-store.cam-git-rejected]
 fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
     let algo = |s: &str| s.parse::<HashAlgo>().map_err(|e| e.to_string());
     if let Some(s) = cam_str.strip_prefix("text:") {
@@ -487,10 +512,18 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
         }
         Ok((true, false, a))
     } else if let Some(rest) = cam_str.strip_prefix("fixed:") {
-        if let Some(s) = rest
-            .strip_prefix("r:")
-            .or_else(|| rest.strip_prefix("git:"))
-        {
+        // `git:` is NOT semantically equivalent to `r:` — Nix's
+        // makeFixedOutputPath uses inner fingerprint
+        // `"fixed:out:git:..."` (not `"fixed:out:r:..."`) and emits CA
+        // `"fixed:git:..."`. Collapsing them would silently produce a
+        // wrong store path + wrong CA, and treat git-tree dump bytes as
+        // a NAR. Explicit rejection until git-hashing stabilizes
+        // upstream and a `FileIngestionMethod` enum is threaded through
+        // `make_fixed_output`.
+        if rest.starts_with("git:") {
+            return Err("git ingestion mode is not supported by rio-gateway".into());
+        }
+        if let Some(s) = rest.strip_prefix("r:") {
             Ok((false, true, algo(s)?))
         } else {
             Ok((false, false, algo(rest)?))
@@ -738,20 +771,25 @@ mod tests {
         Ok(())
     }
 
+    // r[verify gw.opcode.add-to-store.cam-git-rejected]
     #[test]
-    fn test_parse_cam_str_fixed_git_sha1() -> anyhow::Result<()> {
-        let (is_text, is_recursive, algo) = parse_cam_str("fixed:git:sha1").unwrap();
-        assert!(!is_text);
-        assert!(is_recursive, "git: should be treated as recursive");
-        assert_eq!(algo, HashAlgo::SHA1);
-        Ok(())
+    fn test_parse_cam_str_rejects_git() {
+        // git: is NOT semantically equivalent to r: — different store
+        // path computation. Reject explicitly rather than silently
+        // produce a wrong path/CA.
+        let err = parse_cam_str("fixed:git:sha1").unwrap_err();
+        assert!(
+            err.contains("git ingestion"),
+            "error should name git ingestion mode, got: {err}"
+        );
+        assert!(parse_cam_str("fixed:git:sha256").is_err());
     }
 
     #[test]
     fn test_parse_cam_str_fixed_flat_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:sha256").unwrap();
         assert!(!is_text);
-        assert!(!is_recursive, "no r:/git: prefix should be flat");
+        assert!(!is_recursive, "no r: prefix should be flat");
         assert_eq!(algo, HashAlgo::SHA256);
         Ok(())
     }

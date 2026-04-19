@@ -120,6 +120,11 @@ pub struct MockStoreFaults {
     /// completes; `delay > idle_timeout` proves the per-chunk timeout
     /// trips on the first stalled chunk.
     pub get_path_chunk_delay_ms: Arc<AtomicU64>,
+    /// If true, `query_realisation` returns Unavailable. For gateway
+    /// CA-resolution error-path tests (opcodes 36/40/41/43/46) — proving
+    /// non-NotFound store errors surface as STDERR_ERROR rather than
+    /// being swallowed as "no realisation".
+    pub fail_query_realisation: Arc<AtomicBool>,
 }
 
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
@@ -749,6 +754,11 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::QueryRealisationRequest>,
     ) -> Result<Response<types::Realisation>, Status> {
+        if self.faults.fail_query_realisation.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "mock: injected query_realisation failure",
+            ));
+        }
         let req = request.into_inner();
         let key = (req.drv_hash, req.output_name.clone());
         match self.state.realisations.read().unwrap().get(&key) {

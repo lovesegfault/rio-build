@@ -86,14 +86,38 @@ impl NarCollectError {
 ///
 /// Enforces `max_size` (callers typically pass `rio_common::limits::MAX_NAR_SIZE`).
 /// Ignores empty messages (proto-mismatch safety).
+///
+/// `idle_timeout`: when `Some`, bounds the time between successive stream
+/// messages — a stalled store (no chunks arriving) trips at the timeout,
+/// but a healthy-but-slow store (steady chunks) completes regardless of
+/// total NAR size. `None` = unbounded (caller wraps the whole call, as
+/// [`get_path_nar`] does). Mirrors [`collect_nar_stream_to_writer`].
 pub async fn collect_nar_stream(
     stream: &mut Streaming<GetPathResponse>,
     max_size: u64,
+    idle_timeout: Option<Duration>,
 ) -> Result<(Option<PathInfo>, Vec<u8>), NarCollectError> {
     let mut info = None;
     let mut nar = Vec::new();
 
-    while let Some(msg) = stream.message().await? {
+    loop {
+        // Per-message idle timeout — same I-211 pattern as
+        // collect_nar_stream_to_writer. Each `stream.message()` is a
+        // fresh deadline; receiving any message (Info or NarChunk) is
+        // progress. h2 keepalive PINGs are answered transport-side
+        // regardless of application progress, so without this a store
+        // that stalls mid-stream holds the caller indefinitely.
+        let next = match idle_timeout {
+            Some(t) => tokio::time::timeout(t, stream.message())
+                .await
+                .map_err(|_| {
+                    NarCollectError::Stream(tonic::Status::deadline_exceeded(format!(
+                        "GetPath stream idle for {t:?} (no chunk received)"
+                    )))
+                })??,
+            None => stream.message().await?,
+        };
+        let Some(msg) = next else { break };
         match msg.msg {
             Some(get_path_response::Msg::Info(i)) => {
                 // I-180 fix C: server sends Info first with the final
@@ -130,7 +154,7 @@ pub async fn collect_nar_stream(
 /// I-180: the builder's FUSE fetch path uses this to spool GB-scale NARs
 /// to a tempfile, then [`rio_nix::nar::restore_path_streaming`] extracts
 /// from the spool. The in-memory [`collect_nar_stream`] stays for
-/// small-payload callers (.drv files, gateway `wopNarFromPath`).
+/// small-payload callers (.drv files).
 ///
 /// On error, `w` may have been partially written — caller is responsible
 /// for truncating/discarding the spool before retry.
@@ -374,7 +398,9 @@ pub async fn get_path_nar(
             Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
             Err(status) => return Err(NarCollectError::Stream(status)),
         };
-        let (info, nar) = collect_nar_stream(&mut stream, max_nar_size).await?;
+        // Whole-call wrap below already bounds this; `None` preserves
+        // existing await structure (test-timing-sensitive — see fn doc).
+        let (info, nar) = collect_nar_stream(&mut stream, max_nar_size, None).await?;
         match info {
             Some(raw) => {
                 let validated = ValidatedPathInfo::try_from(raw)?;

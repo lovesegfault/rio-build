@@ -94,7 +94,10 @@ Legacy content-addressed store path import. The client sends a name, a content-a
 | `text:sha256` | Text import (builtins.toFile-style); hash is over raw bytes; store path via `makeTextPath` |
 | `fixed:sha256` | Flat fixed-output; hash is over raw bytes; gateway wraps in a single-file NAR |
 | `fixed:r:sha256` | Recursive fixed-output; dump IS a NAR; hash is over the NAR bytes |
-| `fixed:git:sha1` | Git tree import; treated as recursive |
+| `fixed:git:sha1` | Git tree import; **rejected** (not supported — would compute wrong store path) |
+
+r[gw.opcode.add-to-store.cam-git-rejected]
+The `fixed:git:` content-address method is rejected with `STDERR_ERROR`. Git ingestion is a distinct `FileIngestionMethod` in Nix (inner fingerprint `"fixed:out:git:..."`, CA `"fixed:git:..."`); collapsing it into recursive mode would silently produce a different store path than the client computed.
 
 Response (after `STDERR_LAST`) is a full `ValidPathInfo`:
 

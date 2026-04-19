@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
 use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::Derivation;
 use rio_nix::protocol::build::{
@@ -19,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tonic::transport::Channel;
 use tracing::{debug, instrument, warn};
 
-use super::grpc::grpc_is_valid_path;
+use super::grpc::{grpc_is_valid_path, resolve_floating_outputs};
 use super::{GatewayError, PROGRAM_NAME, SessionContext, with_jwt};
 use crate::drv_cache::resolve_derivation;
 use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
@@ -904,6 +903,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Ok(v) => v,
         Err(e) => stderr_err!(stderr, "wopBuildDerivation: {e}"),
     };
+    tracing::Span::current().record("path", drv_path_str.as_str());
     let Ok(basic_drv) = read_basic_derivation(reader).await else {
         stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
     };
@@ -1010,7 +1010,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let request =
         translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
 
-    let build_result = match submit_and_process_build(
+    let mut build_result = match submit_and_process_build(
         stderr,
         scheduler_client,
         request,
@@ -1029,6 +1029,40 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         }
     };
 
+    // Populate builtOutputs (matching opcode 46). Without this, the
+    // ssh-ng:// build-hook path receives `built_outputs=[]` and cannot
+    // locate floating-CA output paths → nix-build.cc:722 assert. Needs
+    // the full Derivation (with inputDrvs) for hash_derivation_modulo;
+    // the inline BasicDerivation lacks inputDrvs so the modular hash
+    // would diverge from CppNix for non-leaf drvs. If full_drv resolve
+    // failed (single-node fallback above), leave builtOutputs empty —
+    // no worse than before, and IA output paths are still recoverable
+    // client-side from the BasicDerivation it sent.
+    if build_result.status.is_success()
+        && let Ok(drv) = &full_drv
+    {
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        match enrich_build_result_with_outputs(
+            build_result.clone(),
+            drv,
+            drv_path.as_str(),
+            ctx,
+            &mut hash_cache,
+        )
+        .await
+        {
+            Ok(r) => build_result = r,
+            // Build succeeded but the store is unreachable for the
+            // realisation lookup. Better to report the store outage
+            // than to write empty builtOutputs and let the client
+            // assert. We're before stderr.finish().
+            Err(e) => stderr_err!(
+                stderr,
+                "store error querying realisation for {drv_path_str}: {e}"
+            ),
+        }
+    }
+
     debug!(
         status = ?build_result.status,
         error_msg = %build_result.error_msg,
@@ -1038,6 +1072,52 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     stderr.finish().await?;
     write_build_result(stderr.inner_mut(), &build_result, negotiated_version).await?;
     Ok(())
+}
+
+/// Populate `build_result.built_outputs` from `drv` + Realisations lookup.
+///
+/// Shared by opcodes 36 and 46. Floating-CA outputs have `path=""` in the
+/// `.drv` — the real store path is computed post-build from the NAR hash.
+/// Queries the store's Realisations table (scheduler's `insert_realisation`
+/// wrote it before the `Completed` event). Without this, the client
+/// receives empty `outPath` → `maybeOutputPath == nullopt` → assert at
+/// nix-build.cc:722.
+///
+/// Non-NotFound store errors propagate as `Err` — caller `stderr_err!`s.
+/// If `compute_modular_hash_cached` fails (already `warn!`-logged), the
+/// result is returned unchanged: IA outputs can't be enriched without the
+/// hash either, and the caller's degrade-gracefully path is to push the
+/// bare `BuildResult`.
+async fn enrich_build_result_with_outputs(
+    build_result: BuildResult,
+    drv: &Derivation,
+    drv_path: &str,
+    ctx: &mut SessionContext,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> anyhow::Result<BuildResult> {
+    let (hash, realized) = resolve_floating_outputs(
+        drv,
+        drv_path,
+        &mut ctx.store_client,
+        ctx.jwt_token.as_deref(),
+        &ctx.drv_cache,
+        hash_cache,
+    )
+    .await?;
+    // resolve_floating_outputs only computes the modular hash when the drv
+    // HAS floating outputs. For pure-IA drvs we still need the hash for the
+    // builtOutputs id (`sha256:<hex>!<name>`).
+    let hash = match hash {
+        Some(h) => h,
+        None => {
+            match translate::compute_modular_hash_cached(drv, drv_path, &ctx.drv_cache, hash_cache)
+            {
+                Some(h) => h,
+                None => return Ok(build_result),
+            }
+        }
+    };
+    Ok(build_result.with_outputs_from_drv(drv, &hex::encode(hash), &realized))
 }
 
 /// Dedup DAG nodes by `drv_path` and edges by `(parent, child)`.
@@ -1331,61 +1411,26 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 results.push(opaque);
             } else if build_result.status.is_success()
                 && let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx)
-                && let Some(hash) = translate::compute_modular_hash_cached(
+            {
+                match enrich_build_result_with_outputs(
+                    build_result.clone(),
                     drv_obj,
                     drv_path,
-                    &ctx.drv_cache,
+                    ctx,
                     &mut hash_cache,
                 )
-            {
-                // Floating-CA outputs have path="" in the .drv — the real
-                // store path is computed post-build from the NAR hash.
-                // Query the store's Realisations table (scheduler's
-                // insert_realisation wrote it at completion). Without
-                // this, the client receives empty outPath →
-                // maybeOutputPath == nullopt → assert at
-                // nix-build.cc:722.
-                let mut realized: HashMap<String, String> = HashMap::new();
-                for out in drv_obj.outputs() {
-                    if !out.path().is_empty() {
-                        continue; // IA/fixed-CA: path is in the .drv
-                    }
-                    let req = types::QueryRealisationRequest {
-                        drv_hash: hash.to_vec(),
-                        output_name: out.name().to_string(),
-                    };
-                    match rio_common::grpc::with_timeout(
-                        "QueryRealisation",
-                        DEFAULT_GRPC_TIMEOUT,
-                        ctx.store_client.query_realisation(req),
-                    )
-                    .await
-                    {
-                        Ok(resp) => {
-                            realized.insert(out.name().to_string(), resp.into_inner().output_path);
-                        }
-                        Err(e) => {
-                            // Scheduler's insert_realisation runs BEFORE
-                            // the Completed event fires, so NotFound here
-                            // means a real gap (store blip, or a CA drv
-                            // that wasn't actually built). Log and pass
-                            // "" through — the client assert surfaces
-                            // the problem rather than masking it.
-                            warn!(
-                                drv_path = %drv_path,
-                                output = %out.name(),
-                                error = %e,
-                                "QueryRealisation failed for CA output; \
-                                 client will receive empty outPath"
-                            );
-                        }
-                    }
+                .await
+                {
+                    Ok(r) => results.push(r),
+                    // Non-NotFound store error during realisation lookup
+                    // — this is one batch-wide store outage, aborting is
+                    // correct (the next opcode would hit the same dead
+                    // store anyway). We're before stderr.finish().
+                    Err(e) => stderr_err!(
+                        stderr,
+                        "store error querying realisation for {drv_path}: {e}"
+                    ),
                 }
-                results.push(build_result.clone().with_outputs_from_drv(
-                    drv_obj,
-                    &hex::encode(hash),
-                    &realized,
-                ));
             } else {
                 results.push(build_result.clone());
             }

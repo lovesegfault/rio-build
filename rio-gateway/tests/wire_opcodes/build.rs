@@ -283,6 +283,85 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.build-derivation+2]
+/// wopBuildDerivation (36): builtOutputs is populated for floating-CA
+/// outputs via the Realisations table — same enrichment as opcode 46.
+/// Before the fix, this handler wrote `BuildResult::success()` with
+/// `built_outputs=[]`; the ssh-ng:// build-hook path then couldn't locate
+/// the CA output → `assert(maybeOutputPath)` at nix-build.cc:722.
+#[tokio::test]
+async fn test_build_derivation_floating_ca_populates_built_outputs() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/88888888888888888888888888888888-ca.drv";
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","")])"#;
+    // Seed the .drv so resolve_derivation succeeds (full_drv path,
+    // required for hash_derivation_modulo).
+    h.store.seed_with_content(drv_path, aterm.as_bytes());
+
+    let drv = rio_nix::derivation::Derivation::parse(aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/99999999999999999999999999999999-ca-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        // BasicDerivation matching the seeded ATerm:
+        u64: 1,                             // 1 output
+        string: "out", string: "",          // floating-CA: path empty
+        string: "r:sha256", string: "",     // hash_algo set, hash empty
+        strings: wire::NO_STRINGS,          // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "true"],
+        u64: 1, string: "out", string: "",  // env
+        u64: 0,                             // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(status, 0, "Built");
+    let _err = wire::read_string(&mut h.stream).await?;
+    let _tb = wire::read_u64(&mut h.stream).await?;
+    let _nd = wire::read_bool(&mut h.stream).await?;
+    let _st = wire::read_u64(&mut h.stream).await?;
+    let _sp = wire::read_u64(&mut h.stream).await?;
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    if wire::read_u64(&mut h.stream).await? == 1 {
+        let _ = wire::read_u64(&mut h.stream).await?;
+    }
+    let outs = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(outs, 1, "builtOutputs should be populated (was 0 pre-fix)");
+    let drv_output_id = wire::read_string(&mut h.stream).await?;
+    assert_eq!(drv_output_id, format!("sha256:{}!out", hex::encode(hash)));
+    let realisation_json = wire::read_string(&mut h.stream).await?;
+    assert!(
+        realisation_json.contains("99999999999999999999999999999999-ca-out"),
+        "outPath should be the realised path, got: {realisation_json}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// Consume the tail of a BuildResult after status+errorMsg have been read.
 /// Shared by the two DAG-reject regression tests below.
 async fn drain_build_result_tail(stream: &mut tokio::io::DuplexStream) -> anyhow::Result<()> {

@@ -12,10 +12,11 @@ use rio_proto::types;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, error, info, instrument, warn};
 
-use super::grpc::{grpc_is_valid_path, grpc_query_path_info};
+use super::grpc::{
+    grpc_is_valid_path, grpc_query_path_info, grpc_query_realisation, resolve_floating_outputs,
+};
 use super::{PROGRAM_NAME, SessionContext, read_store_path, with_jwt};
 use crate::drv_cache::resolve_derivation;
-use crate::translate;
 
 /// JWT for store lookups — but NOT for `.drv` paths.
 ///
@@ -326,6 +327,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
         Ok(v) => v,
         Err(e) => stderr_err!(stderr, "{e}"),
     };
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopNarFromPath");
 
     // Fetch the FULL NAR before sending STDERR_LAST. We can't stream
@@ -354,13 +356,22 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
             ),
         };
 
-    let (_info, nar_data) =
-        match rio_proto::client::collect_nar_stream(&mut stream, rio_common::limits::MAX_NAR_SIZE)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => stderr_err!(stderr, "gRPC GetPath for {path_str}: {e}"),
-        };
+    // Per-chunk idle timeout: DEFAULT_GRPC_TIMEOUT above only bounds
+    // obtaining the Streaming handle, not the per-message reads. h2
+    // keepalive PINGs are answered transport-side regardless of
+    // application progress, and OPCODE_IDLE_TIMEOUT covers only
+    // inter-opcode reads — without this, a store stalled mid-stream
+    // holds ≤4 GiB of buffered NAR + the SSH session indefinitely.
+    let (_info, nar_data) = match rio_proto::client::collect_nar_stream(
+        &mut stream,
+        rio_common::limits::MAX_NAR_SIZE,
+        Some(rio_common::grpc::GRPC_STREAM_TIMEOUT),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => stderr_err!(stderr, "gRPC GetPath for {path_str}: {e}"),
+    };
 
     // STDERR_LAST first, then raw NAR bytes. Client's copyNAR reads until
     // the NAR's closing ')' sentinel — no length prefix.
@@ -555,6 +566,19 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     } else {
         format!("{}{out_path_raw}", rio_nix::store_path::STORE_PREFIX)
     };
+    // Same soft-fail guard as `id` below: validate client input BEFORE
+    // the gRPC call so the line-627 assumption ("gRPC error here IS a
+    // hard fail — store unreachable, not client input") holds. Without
+    // this, a missing/garbage outPath flows through as
+    // `RegisterRealisation("/nix/store/")` → store-side
+    // `validate_store_path` → `Status::invalid_argument` →
+    // session-terminating `stderr_err!`, contradicting the soft-fail
+    // policy at the top of this function.
+    if StorePath::parse(&out_path).is_err() {
+        warn!(out_path = %out_path, "wopRegisterDrvOutput: malformed outPath, discarding");
+        stderr.finish().await?;
+        return Ok(());
+    }
 
     let Some((drv_hash, output_name)) = parse_drv_output_id(id) else {
         warn!(id = %id, "wopRegisterDrvOutput: malformed DrvOutput id, discarding");
@@ -674,26 +698,12 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
         "wopQueryRealisation"
     );
 
-    let req = with_jwt(
-        types::QueryRealisationRequest {
-            drv_hash: drv_hash.to_vec(),
-            output_name: output_name.clone(),
-        },
-        jwt_token,
-    )?;
-    let result = rio_common::grpc::with_timeout(
-        "QueryRealisation",
-        DEFAULT_GRPC_TIMEOUT,
-        store_client.query_realisation(req),
-    )
-    .await;
-
-    stderr.finish().await?;
-    let w = stderr.inner_mut();
-
-    match result {
-        Ok(resp) => {
-            let r = resp.into_inner();
+    // Resolve BEFORE stderr.finish() so a non-NotFound store error
+    // (Unavailable / DeadlineExceeded) can surface via STDERR_ERROR.
+    // The Ok payload is a ~200-byte in-memory JSON — there is nothing
+    // to "buffer". Same shape as handle_query_path_from_hash_part.
+    let json = match grpc_query_realisation(store_client, jwt_token, drv_hash, &output_name).await {
+        Ok(Some(r)) => {
             // Wire outPath is a BASENAME — CppNix Realisation::fromJSON
             // feeds it to StorePath::parse, which rejects '/' with
             // "illegal base-32 char '/'". Strip the prefix. Reference:
@@ -703,7 +713,8 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
             let out_path_basename = r
                 .output_path
                 .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-                .unwrap_or(&r.output_path);
+                .unwrap_or(&r.output_path)
+                .to_owned();
             // Reconstruct the Nix Realisation JSON. id is the same string
             // we got; outPath from the store; signatures from the store;
             // dependentRealisations is always empty (phase 5 populates it).
@@ -711,44 +722,40 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
             // serde_json::json! macro gives us correct escaping for free —
             // outPath could theoretically contain JSON-special chars (it
             // won't, store paths are nixbase32+name, but defensive).
-            let json = serde_json::json!({
-                "id": id,
-                "outPath": out_path_basename,
-                "signatures": r.signatures,
-                "dependentRealisations": {}
-            });
-            wire::write_u64(w, 1).await?;
-            wire::write_string(w, &json.to_string()).await?;
+            Some(
+                serde_json::json!({
+                    "id": id,
+                    "outPath": out_path_basename,
+                    "signatures": r.signatures,
+                    "dependentRealisations": {}
+                })
+                .to_string(),
+            )
         }
         // NOT_FOUND is a cache miss → empty set. Normal during
         // substituter probes; WRONG if the build just completed (means
         // scheduler's insert_realisation used a different hash — check
         // the `drv_hash` field on its #[instrument] span vs the one
         // logged above).
-        Err(e)
-            if e.downcast_ref::<tonic::Status>()
-                .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
-        {
+        Ok(None) => {
             info!(
                 drv_hash = %hex::encode(drv_hash),
                 output = %output_name,
                 "wopQueryRealisation: miss (no realisation)"
             );
-            wire::write_u64(w, 0).await?;
+            None
         }
-        // Other gRPC errors (store unreachable) ARE errors. But we've
-        // already sent STDERR_LAST above — too late for STDERR_ERROR.
-        // Return empty set + log. The next opcode on this session will
-        // hit the same store and fail properly via its own error path.
-        //
-        // Why not check the error BEFORE stderr.finish()? Because we'd
-        // need to buffer the response. This is a rare degraded path
-        // (store blip during a CA cache check); the consequence is one
-        // missed cache hit, not corruption.
-        Err(e) => {
-            warn!(error = %e, "wopQueryRealisation: store error after STDERR_LAST, returning empty");
-            wire::write_u64(w, 0).await?;
+        Err(e) => stderr_err!(stderr, "store error: {e}"),
+    };
+
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+    match json {
+        Some(s) => {
+            wire::write_u64(w, 1).await?;
+            wire::write_string(w, &s).await?;
         }
+        None => wire::write_u64(w, 0).await?,
     }
 
     Ok(())
@@ -803,8 +810,10 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     let mut query_src: Vec<usize> = Vec::new();
     // .drv paths forced to willBuild without a store query: the .drv
     // couldn't be resolved (not in store — client needs to upload then
-    // build) or the output is floating-CA (path unknown until built).
+    // build) or the output is floating-CA with no realisation yet.
     let mut forced_build: HashSet<String> = HashSet::new();
+    // Shared across all .drvs in the request — sub-hashes reused.
+    let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
 
     for (idx, dp) in derived.iter().enumerate() {
         match dp {
@@ -824,6 +833,26 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
                         continue;
                     }
                 };
+                // Floating-CA outputs: query the Realisations table
+                // (same lookup as opcodes 41/46). If realised, the
+                // output path flows through the normal
+                // missing/substitutable partition below; only
+                // un-realised CA derivations land in willBuild.
+                // Non-NotFound store errors → STDERR_ERROR (consistent
+                // with the FindMissingPaths error arm below).
+                let (_hash, realized) = match resolve_floating_outputs(
+                    &drv_data,
+                    drv.as_str(),
+                    store_client,
+                    jwt_token,
+                    drv_cache,
+                    &mut hash_cache,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => stderr_err!(stderr, "store error: {e}"),
+                };
                 for out in drv_data.outputs() {
                     let matches = match outputs {
                         OutputSpec::All => true,
@@ -833,9 +862,15 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
                         continue;
                     }
                     if out.path().is_empty() {
-                        // Floating-CA: output path computed post-build
-                        // from NAR hash. Can't query; must build.
-                        forced_build.insert(drv.to_string());
+                        match realized.get(out.name()) {
+                            Some(p) => {
+                                query_paths.push(p.clone());
+                                query_src.push(idx);
+                            }
+                            None => {
+                                forced_build.insert(drv.to_string());
+                            }
+                        }
                     } else {
                         query_paths.push(out.path().to_string());
                         query_src.push(idx);
@@ -942,6 +977,7 @@ pub(super) async fn handle_query_derivation_output_map<
         Ok(v) => v,
         Err(e) => stderr_err!(stderr, "{e}"),
     };
+    tracing::Span::current().record("path", drv_path_str.as_str());
     info!(path = %drv_path_str, "wopQueryDerivationOutputMap");
 
     let drv = match resolve_derivation(&drv_path, store_client, drv_cache).await {
@@ -949,77 +985,30 @@ pub(super) async fn handle_query_derivation_output_map<
         Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
 
-    // Floating-CA: .drv has path="" — resolve via Realisations. Same
-    // pattern as handle_build_paths_with_results (layer-7 fix), but
-    // nix-build uses the legacy wopBuildPaths path which doesn't
-    // return builtOutputs, so it comes back here instead.
-    let mut realized: HashMap<String, String> = HashMap::new();
-    let has_floating = drv.outputs().iter().any(|o| o.path().is_empty());
-    if has_floating {
-        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        if let Some(hash) = translate::compute_modular_hash_cached(
-            &drv,
-            drv_path.as_str(),
-            drv_cache,
-            &mut hash_cache,
-        ) {
-            info!(
-                drv_hash = %hex::encode(hash),
-                path = %drv_path_str,
-                "wopQueryDerivationOutputMap: querying realisations for CA outputs"
-            );
-            for out in drv.outputs() {
-                if !out.path().is_empty() {
-                    continue;
-                }
-                let req = with_jwt(
-                    types::QueryRealisationRequest {
-                        drv_hash: hash.to_vec(),
-                        output_name: out.name().to_string(),
-                    },
-                    jwt_token,
-                )?;
-                match rio_common::grpc::with_timeout(
-                    "QueryRealisation",
-                    DEFAULT_GRPC_TIMEOUT,
-                    store_client.query_realisation(req),
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        let path = resp.into_inner().output_path;
-                        info!(
-                            drv_hash = %hex::encode(hash),
-                            output = %out.name(),
-                            realized_path = %path,
-                            "wopQueryDerivationOutputMap: CA output resolved"
-                        );
-                        realized.insert(out.name().to_string(), path);
-                    }
-                    Err(e) => {
-                        // NotFound = build not yet complete (normal
-                        // during pre-build queryMissing probes) OR
-                        // hash_derivation_modulo mismatch between
-                        // gateway and scheduler. Compare `drv_hash`
-                        // here vs scheduler's insert_realisation
-                        // instrument field. Pass "" through; client
-                        // sees nullopt (correct for unbuilt, surfaces
-                        // the real problem for mismatch).
-                        info!(
-                            drv_hash = %hex::encode(hash),
-                            output = %out.name(),
-                            error = %e,
-                            "wopQueryDerivationOutputMap: no realisation for CA output"
-                        );
-                    }
-                }
-            }
-        } else {
-            // compute_modular_hash_cached already warn!-logged. Fall
-            // through — IA outputs still get their .drv paths, CA
-            // outputs get "" (nullopt to client).
-        }
-    }
+    // Floating-CA: .drv has path="" — resolve via Realisations. Shared
+    // helper with opcodes 36/40/46; nix-build uses the legacy
+    // wopBuildPaths path which doesn't return builtOutputs, so it
+    // comes back here instead. Non-NotFound store errors propagate
+    // to STDERR_ERROR (we're before stderr.finish()) — passing ""
+    // through would make the client `assert(maybeOutputPath)` at
+    // nix-build.cc:722 with no indication the store was unreachable.
+    let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+    let (_hash, realized) = match resolve_floating_outputs(
+        &drv,
+        drv_path.as_str(),
+        store_client,
+        jwt_token,
+        drv_cache,
+        &mut hash_cache,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => stderr_err!(
+            stderr,
+            "store error querying realisation for {drv_path_str}: {e}"
+        ),
+    };
 
     let outputs = drv.outputs();
 
