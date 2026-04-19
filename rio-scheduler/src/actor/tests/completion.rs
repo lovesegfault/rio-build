@@ -544,6 +544,372 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.ca.cutoff-propagate+2]
+/// bug_009 regression: `verify_cutoff_candidates` matched prior
+/// outputs by string suffix (`p.ends_with("-{pname}")`). A prior
+/// `…-python-requests` satisfied `.ends_with("-requests")`, so a
+/// candidate with `pname="requests"` cross-matched a DIFFERENT
+/// package, was Skipped, and a poisoned `(candidate_modular →
+/// wrong_path)` realisation row was written to PG.
+///
+/// Setup: A→B and A→C (siblings). B's pname=`python-requests`,
+/// C's pname=`requests`. Seed prior realisations for A and B only;
+/// realisation_deps(B depends on A). C has NO prior realisation —
+/// it MUST NOT be Skipped, and PG MUST have no realisation row for
+/// C's modular_hash.
+///
+/// Mutation check: revert to `ends_with("-{pname}")` → C
+/// cross-matches B's `…-python-requests` path → C goes Skipped →
+/// the `assert_ne` below fails.
+#[tokio::test]
+async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let pool = db.pool.clone();
+    let _db = db;
+
+    let a_modular: [u8; 32] = [0xA0; 32];
+    let b_modular: [u8; 32] = [0xB0; 32];
+    let c_modular: [u8; 32] = [0xC0; 32];
+    let a_prior: [u8; 32] = [0xA1; 32];
+    let b_prior: [u8; 32] = [0xB1; 32];
+
+    let a_out = test_store_path("xmatch-a");
+    // Load-bearing: b_out's name segment is `python-requests`, which
+    // ends with `-requests` (C's pname). With suffix matching, C
+    // would cross-match this path.
+    let b_out = test_store_path("python-requests");
+
+    let mut node_a = make_node("xmatch-a");
+    node_a.is_content_addressed = true;
+    node_a.ca_modular_hash = a_modular.to_vec();
+    node_a.pname = "xmatch-a".into();
+    let mut node_b = make_node("xmatch-b");
+    node_b.is_content_addressed = true;
+    node_b.ca_modular_hash = b_modular.to_vec();
+    node_b.pname = "python-requests".into();
+    let mut node_c = make_node("xmatch-c");
+    node_c.is_content_addressed = true;
+    node_c.ca_modular_hash = c_modular.to_vec();
+    node_c.pname = "requests".into();
+
+    let _rx = connect_executor(&handle, "xmatch-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![node_a, node_b, node_c],
+        vec![
+            make_test_edge("xmatch-b", "xmatch-a"),
+            make_test_edge("xmatch-c", "xmatch-a"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Seed PRIOR build's realisations for A and B; realisation_deps
+    // B→A so the walk from A's prior modular_hash finds B.
+    seed_realisation(&pool, &a_prior, "out", &a_out, &[0xAA; 32]).await?;
+    seed_realisation(&pool, &b_prior, "out", &b_out, &[0xBB; 32]).await?;
+    sqlx::query(
+        "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+         VALUES ($1, 'out', $2, 'out')",
+    )
+    .bind(b_prior.as_slice())
+    .bind(a_prior.as_slice())
+    .execute(&pool)
+    .await?;
+
+    store.seed_with_content(&b_out, b"b-content");
+
+    complete_ca(
+        &handle,
+        "xmatch-worker",
+        &test_drv_path("xmatch-a"),
+        &[("out", &a_out, vec![0xAA; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info_a = expect_drv(&handle, "xmatch-a").await;
+    assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
+
+    // B: Skipped, stamped with the CORRECT path (its own).
+    let info_b = expect_drv(&handle, "xmatch-b").await;
+    assert_eq!(
+        info_b.status,
+        DerivationStatus::Skipped,
+        "B has prior realisation + output present → Skipped"
+    );
+    assert_eq!(info_b.output_paths, vec![b_out.clone()]);
+
+    // C: NOT Skipped. With the suffix-match bug, C would cross-match
+    // b_out (…-python-requests ends_with -requests) and go Skipped.
+    let info_c = expect_drv(&handle, "xmatch-c").await;
+    assert_ne!(
+        info_c.status,
+        DerivationStatus::Skipped,
+        "C MUST NOT cross-match B's `…-python-requests` path \
+         (bug_009: suffix-match would Skip C here)"
+    );
+    assert!(
+        matches!(
+            info_c.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "C builds normally; got {:?}",
+        info_c.status
+    );
+
+    // Poisoned-PG check: no realisation row for C's modular_hash.
+    // With the bug, `(c_modular, out) → b_out` would have been
+    // inserted — gateway QueryRealisation would return python-
+    // requests' content for `requests`.
+    let (n_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM realisations WHERE drv_hash = $1")
+        .bind(c_modular.as_slice())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        n_rows, 0,
+        "no poisoned realisation row written for C's modular_hash"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate+2]
+/// bug_009 ambiguity-guard regression: when TWO prior outputs share
+/// the exact same name segment, the candidate is excluded (degrades
+/// to no-skip). The old `.find()` took whichever the HashMap
+/// happened to yield first — non-deterministic, no ambiguity check.
+///
+/// Setup: A→B. Seed two prior realisations whose output_paths BOTH
+/// have name segment exactly `ambig-pkg` (different hash-parts,
+/// different prior modular hashes), both reachable via
+/// realisation_deps from A's prior. B's pname=`ambig-pkg`. The
+/// match is ambiguous → B MUST NOT be Skipped.
+#[tokio::test]
+async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let pool = db.pool.clone();
+    let _db = db;
+
+    let a_modular: [u8; 32] = [0xA0; 32];
+    let b_modular: [u8; 32] = [0xB0; 32];
+    let a_prior: [u8; 32] = [0xA1; 32];
+    let b_prior_1: [u8; 32] = [0xB1; 32];
+    let b_prior_2: [u8; 32] = [0xB2; 32];
+
+    let a_out = test_store_path("ambig-a");
+    // Two distinct store paths, SAME name segment `ambig-pkg`.
+    let b_out_1 = test_store_path("ambig-pkg");
+    let b_out_2 = format!("/nix/store/{}-ambig-pkg", "b".repeat(32));
+
+    let mut node_a = make_node("ambig-a");
+    node_a.is_content_addressed = true;
+    node_a.ca_modular_hash = a_modular.to_vec();
+    node_a.pname = "ambig-a".into();
+    let mut node_b = make_node("ambig-b");
+    node_b.is_content_addressed = true;
+    node_b.ca_modular_hash = b_modular.to_vec();
+    node_b.pname = "ambig-pkg".into();
+
+    let _rx = connect_executor(&handle, "ambig-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![node_a, node_b],
+        vec![make_test_edge("ambig-b", "ambig-a")],
+        false,
+    )
+    .await?;
+
+    seed_realisation(&pool, &a_prior, "out", &a_out, &[0xAA; 32]).await?;
+    seed_realisation(&pool, &b_prior_1, "out", &b_out_1, &[0xB1; 32]).await?;
+    seed_realisation(&pool, &b_prior_2, "out", &b_out_2, &[0xB2; 32]).await?;
+    // Both prior B's depend on prior A → walk_dependent_realisations
+    // returns both → two exact-name hits for `ambig-pkg`.
+    for prior in [&b_prior_1, &b_prior_2] {
+        sqlx::query(
+            "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+             VALUES ($1, 'out', $2, 'out')",
+        )
+        .bind(prior.as_slice())
+        .bind(a_prior.as_slice())
+        .execute(&pool)
+        .await?;
+    }
+    store.seed_with_content(&b_out_1, b"b1");
+    store.seed_with_content(&b_out_2, b"b2");
+
+    complete_ca(
+        &handle,
+        "ambig-worker",
+        &test_drv_path("ambig-a"),
+        &[("out", &a_out, vec![0xAA; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info_a = expect_drv(&handle, "ambig-a").await;
+    assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
+
+    let info_b = expect_drv(&handle, "ambig-b").await;
+    assert_ne!(
+        info_b.status,
+        DerivationStatus::Skipped,
+        "two prior outputs both named `ambig-pkg` → ambiguous → \
+         B excluded from cascade (must build, not skip)"
+    );
+    assert!(
+        matches!(
+            info_b.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "B builds normally; got {:?}",
+        info_b.status
+    );
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate+2]
+// r[verify sched.db.batch-unnest]
+/// bug_012 functional-equivalence guard: the batched
+/// `ca_cutoff_cascade` writes the SAME PG state as the per-item
+/// loop did. 5-node CA chain A→B→C→D→E; seed prior realisations for
+/// A-D, NOT E. After A completes:
+///
+/// - B,C,D go Skipped → PG `derivations.status='skipped'` for each
+///   (proves `persist_status_batch` ran).
+/// - PG `realisations` has rows for `(b|c|d_modular, out)` (proves
+///   `insert_realisation_batch` ran).
+/// - E goes Ready (proves the batched ready-promotion ran) → PG
+///   `derivations.status='ready'` for E.
+///
+/// Per ci-failure-patterns.md ("structural > retry > widen"): the
+/// N→3 round-trip reduction is verified structurally (no per-item
+/// `.await` left in the loop body) + the `insert_realisation_batch`
+/// unit test, NOT by wall-clock.
+#[tokio::test]
+async fn cascade_batch_persists_skipped_and_ready() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let pool = db.pool.clone();
+    let _db = db;
+
+    let tags = ["batch-a", "batch-b", "batch-c", "batch-d", "batch-e"];
+    let modular: [[u8; 32]; 5] = [[0xA0; 32], [0xB0; 32], [0xC0; 32], [0xD0; 32], [0xE0; 32]];
+    let prior: [[u8; 32]; 4] = [[0xA1; 32], [0xB1; 32], [0xC1; 32], [0xD1; 32]];
+    let outs: Vec<String> = tags.iter().map(|t| test_store_path(t)).collect();
+
+    let nodes: Vec<_> = tags
+        .iter()
+        .zip(&modular)
+        .map(|(t, m)| {
+            let mut n = make_node(t);
+            n.is_content_addressed = true;
+            n.ca_modular_hash = m.to_vec();
+            n.pname = (*t).into();
+            n
+        })
+        .collect();
+
+    let _rx = connect_executor(&handle, "batch-worker", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        nodes,
+        vec![
+            make_test_edge("batch-b", "batch-a"),
+            make_test_edge("batch-c", "batch-b"),
+            make_test_edge("batch-d", "batch-c"),
+            make_test_edge("batch-e", "batch-d"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Seed PRIOR realisations + chain deps for A-D (not E). Seed
+    // B-D's outputs in MockStore so FindMissingPaths finds them.
+    for i in 0..4 {
+        seed_realisation(&pool, &prior[i], "out", &outs[i], &[0x77; 32]).await?;
+        if i > 0 {
+            sqlx::query(
+                "INSERT INTO realisation_deps \
+                 (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+                 VALUES ($1, 'out', $2, 'out')",
+            )
+            .bind(prior[i].as_slice())
+            .bind(prior[i - 1].as_slice())
+            .execute(&pool)
+            .await?;
+            store.seed_with_content(&outs[i], b"content");
+        }
+    }
+
+    complete_ca(
+        &handle,
+        "batch-worker",
+        &test_drv_path("batch-a"),
+        &[("out", &outs[0], vec![0x77; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info_a = expect_drv(&handle, "batch-a").await;
+    assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
+
+    // B,C,D Skipped in-mem AND in PG.
+    for (i, tag) in tags[1..4].iter().enumerate() {
+        let info = expect_drv(&handle, tag).await;
+        assert_eq!(
+            info.status,
+            DerivationStatus::Skipped,
+            "{tag} should be Skipped"
+        );
+        assert_eq!(
+            info.output_paths,
+            vec![outs[i + 1].clone()],
+            "{tag} stamped with prior output_path"
+        );
+        let (st,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(st, "skipped", "{tag} PG status (persist_status_batch ran)");
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM realisations WHERE drv_hash = $1")
+            .bind(modular[i + 1].as_slice())
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(n, 1, "{tag} realisation row (insert_realisation_batch ran)");
+    }
+
+    // E: Ready (batched ready-promotion ran). PG status = 'ready'.
+    let info_e = expect_drv(&handle, "batch-e").await;
+    assert!(
+        matches!(
+            info_e.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "E goes Ready after D Skipped; got {:?}",
+        info_e.status
+    );
+    let (st_e,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+        .bind("batch-e")
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        st_e == "ready" || st_e == "assigned",
+        "E PG status persisted (batched ready-promotion ran); got {st_e}"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.ca.cutoff-compare]
 /// Short-circuit on first miss: a 4-output CA completion where
 /// output[0] misses (no prior realisation) should record exactly

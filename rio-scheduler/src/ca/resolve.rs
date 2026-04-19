@@ -591,7 +591,8 @@ pub type RealisationOutput = (String, [u8; 32]);
 ///
 /// Returns `(drv_hash, output_name) → (output_path, output_hash)`.
 /// The caller matches these against the current DAG's cascade
-/// candidates by name-suffix (output_path ends with `-{pname}`).
+/// candidates by exact store-path name segment (the portion after
+/// the 32-char hash equals `{pname}` / `{pname}-{output}`).
 // r[impl sched.ca.cutoff-propagate+2]
 #[instrument(skip(pool, seeds))]
 pub async fn walk_dependent_realisations(
@@ -697,6 +698,50 @@ pub async fn insert_realisation(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Batch [`insert_realisation`]: one UNNEST round-trip for N rows.
+///
+/// Same `ON CONFLICT DO NOTHING` idempotence and same empty-
+/// `signatures` semantics as the single-row variant. Used by
+/// `ca_cutoff_cascade` where the per-item loop was N sequential PG
+/// awaits inside the single-threaded actor — same N+1 actor-stall
+/// class as `persist_status_batch` / `upsert_path_tenants_for_batch`
+/// (I-139, "5281 sequential PG awaits → ~20s head-of-line blocking").
+// r[impl sched.db.batch-unnest]
+#[instrument(skip(pool, rows), fields(n_rows = rows.len()))]
+pub async fn insert_realisation_batch(
+    pool: &PgPool,
+    rows: &[([u8; 32], String, String, [u8; 32])],
+) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut h: Vec<&[u8]> = Vec::with_capacity(rows.len());
+    let mut n: Vec<&str> = Vec::with_capacity(rows.len());
+    let mut p: Vec<&str> = Vec::with_capacity(rows.len());
+    let mut oh: Vec<&[u8]> = Vec::with_capacity(rows.len());
+    for (mh, on, op, ohash) in rows {
+        h.push(mh.as_slice());
+        n.push(on.as_str());
+        p.push(op.as_str());
+        oh.push(ohash.as_slice());
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO realisations (drv_hash, output_name, output_path, output_hash, signatures)
+        SELECT h, n, p, oh, '{}'::text[]
+        FROM UNNEST($1::bytea[], $2::text[], $3::text[], $4::bytea[]) AS t(h, n, p, oh)
+        ON CONFLICT (drv_hash, output_name) DO NOTHING
+        "#,
+    )
+    .bind(&h)
+    .bind(&n)
+    .bind(&p)
+    .bind(&oh)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Serialize a resolved derivation back to ATerm with `inputDrvs`
@@ -1248,6 +1293,55 @@ mod tests {
         // Sanity: with cap above fanout, all dependents returned.
         let out = walk_dependent_realisations(&db.pool, &seeds, 100).await?;
         assert_eq!(out.len(), usize::from(N));
+        Ok(())
+    }
+
+    // r[verify sched.db.batch-unnest]
+    /// `insert_realisation_batch` round-trips N rows in one UNNEST and
+    /// is idempotent (`ON CONFLICT DO NOTHING`) — same contract as the
+    /// single-row [`insert_realisation`].
+    #[tokio::test]
+    async fn insert_realisation_batch_inserts_and_is_idempotent() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let rows: Vec<([u8; 32], String, String, [u8; 32])> = (0u8..5)
+            .map(|i| {
+                (
+                    [i; 32],
+                    "out".to_string(),
+                    format!("/nix/store/{}-pkg-{i}", "a".repeat(32)),
+                    [0xEE; 32],
+                )
+            })
+            .collect();
+
+        // Empty batch is a cheap no-op.
+        assert_eq!(insert_realisation_batch(&db.pool, &[]).await?, 0);
+
+        let n = insert_realisation_batch(&db.pool, &rows).await?;
+        assert_eq!(n, 5, "all five rows inserted");
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM realisations")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count, 5);
+
+        // Same rows again → ON CONFLICT DO NOTHING.
+        let n2 = insert_realisation_batch(&db.pool, &rows).await?;
+        assert_eq!(n2, 0, "duplicate batch insert is a no-op");
+
+        // Spot-check one row landed with the right values, and that
+        // signatures defaulted to '{}'.
+        let (path, sigs): (String, Vec<String>) = sqlx::query_as(
+            "SELECT output_path, signatures FROM realisations \
+             WHERE drv_hash = $1 AND output_name = 'out'",
+        )
+        .bind([3u8; 32].as_slice())
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(path, format!("/nix/store/{}-pkg-3", "a".repeat(32)));
+        assert!(sigs.is_empty(), "batch insert leaves signatures empty");
+
         Ok(())
     }
 

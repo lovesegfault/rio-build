@@ -243,9 +243,10 @@ impl DagActor {
     ///
     /// The walk: `trigger`'s prior modular_hash → `realisation_deps`
     /// reverse → prior downstream modular_hashes + output_paths.
-    /// Match prior outputs to current DAG candidates by name-suffix
-    /// (`output_path` ends with `-{pname}` or `-{pname}-{output}` for
-    /// non-out outputs). Verify existence via FindMissingPaths.
+    /// Match prior outputs to current DAG candidates by exact store-
+    /// path name segment (`StorePath::parse(p).name() == {pname}` or
+    /// `{pname}-{output}` for non-out). Verify existence via
+    /// FindMissingPaths.
     ///
     /// The realisation-based trigger check (`query_prior_realisation`)
     /// already ensures a prior build existed — first-ever builds
@@ -316,14 +317,24 @@ impl DagActor {
             return HashMap::new();
         }
 
-        // Match current DAG candidates to prior outputs by name
-        // suffix. A CA output_path is `/nix/store/HASH-{name}` (or
-        // `-{name}-{outputName}` for non-out). `pname` is the most
-        // reliable invariant across builds with different drv hashes
-        // but identical content. Multiple prior outputs may share a
-        // name suffix (pathological: two versions of the same pname
-        // in one prior build) — first match wins; ambiguity degrades
-        // to no-skip for that candidate (conservative).
+        // Match current DAG candidates to prior outputs by EXACT
+        // store-path name segment. A CA output_path is
+        // `/nix/store/{32-char-hash}-{name}` (or `…-{name}-{outName}`
+        // for non-out). `pname` is the most reliable invariant across
+        // builds with different drv hashes but identical content.
+        //
+        // The match MUST be on the parsed name segment, not a string
+        // suffix: `…-python-requests".ends_with("-requests")` is true,
+        // so a suffix match cross-matches different packages (`tools`
+        // vs `bootstrap-tools`, `foo` vs `lib-foo`, …) and writes the
+        // WRONG path into `state.output_paths` + a poisoned
+        // realisation row to PG.
+        //
+        // Ambiguity (>1 prior output with the exact same name segment
+        // — e.g. two versions of one pname in one prior build, or two
+        // nodes that fell through to the same `name=` fallback)
+        // degrades to no-skip for that candidate: we cannot know
+        // which prior path is the right one, so build it.
         let mut cand_to_prior: HashMap<DrvHash, Vec<CaCutoffVerified>> = HashMap::new();
         let mut check_paths: Vec<String> = Vec::new();
         for hash in &candidates {
@@ -331,29 +342,45 @@ impl DagActor {
                 continue;
             };
             let Some(pname) = &state.pname else {
-                // No pname → can't match by suffix → conservative exclude.
+                // No pname → can't match by name → conservative exclude.
                 continue;
             };
             let mut matched: Vec<CaCutoffVerified> = Vec::new();
             for out_name in &state.output_names {
-                let suffix = if out_name == "out" {
-                    format!("-{pname}")
+                let expected_name = if out_name == "out" {
+                    pname.clone()
                 } else {
-                    format!("-{pname}-{out_name}")
+                    format!("{pname}-{out_name}")
                 };
-                // Find a prior output whose path ends with this
-                // suffix. Linear scan over prior_outputs — bounded
-                // by MAX_CASCADE_NODES, so small-N.
-                if let Some(((_, prior_out), (path, oh))) = prior_outputs
-                    .iter()
-                    .find(|((_, on), (p, _))| on == out_name && p.ends_with(&suffix))
-                {
-                    matched.push(CaCutoffVerified {
-                        output_name: prior_out.clone(),
-                        output_path: path.clone(),
-                        output_hash: *oh,
-                    });
-                    check_paths.push(path.clone());
+                // Linear scan over prior_outputs — bounded by
+                // MAX_CASCADE_NODES, so small-N. Count hits so the
+                // ambiguity guard below can fire.
+                let mut hits = prior_outputs.iter().filter(|((_, on), (p, _))| {
+                    on == out_name
+                        && rio_nix::store_path::StorePath::parse(p)
+                            .ok()
+                            .is_some_and(|sp| sp.name() == expected_name)
+                });
+                match (hits.next(), hits.next()) {
+                    (Some(((_, prior_out), (path, oh))), None) => {
+                        matched.push(CaCutoffVerified {
+                            output_name: prior_out.clone(),
+                            output_path: path.clone(),
+                            output_hash: *oh,
+                        });
+                        check_paths.push(path.clone());
+                    }
+                    (Some(_), Some(_)) => {
+                        // >1 prior output with this exact name →
+                        // ambiguous. Conservative: drop the whole
+                        // candidate (clear matched so the len()
+                        // check below rejects it).
+                        debug!(drv_hash = %hash, %expected_name,
+                               "CA cutoff verify: ambiguous prior match; excluding candidate");
+                        matched.clear();
+                        break;
+                    }
+                    (None, _) => {} // no match → len() check excludes
                 }
             }
             // All outputs must have a prior match. Partial match →
@@ -1155,15 +1182,25 @@ impl DagActor {
                 .sum();
             metrics::counter!("rio_scheduler_ca_cutoff_seconds_saved")
                 .increment(seconds_saved.max(0.0) as u64);
+            // First pass: in-memory only, NO .await. Stamp output_
+            // paths, collect realisation tuples + interested_builds.
+            // The per-item PG awaits previously here (insert_
+            // realisation / upsert_path_tenants_for / persist_status
+            // per node) were ~3×N sequential round-trips inside the
+            // single-threaded actor — at the MAX_CASCADE_NODES=1000
+            // cap, ~15-20s of head-of-line blocking on heartbeats and
+            // dispatch (same class as I-139 / `apply_cached_hits`).
+            //
+            // Stamp each skipped node with the prior build's output_
+            // paths AND collect realisations keyed on THIS build's
+            // modular_hash. Without the realisation, the gateway's
+            // QueryRealisation for (M2_b, out) returns NotFound →
+            // client gets empty outPath → assert at nix-build.cc:722.
+            // The prior build's realisation is keyed on M1_b
+            // (different modular_hash) so the gateway can't find it
+            // without this bridge row.
+            let mut realisations: Vec<([u8; 32], String, String, [u8; 32])> = Vec::new();
             for hash in &skipped {
-                // Stamp the skipped node with the prior build's
-                // output_paths AND insert realisations keyed on THIS
-                // build's modular_hash. Without the realisation, the
-                // gateway's QueryRealisation for (M2_b, out) returns
-                // NotFound → client gets empty outPath → assert at
-                // nix-build.cc:722. The prior build's realisation is
-                // keyed on M1_b (different modular_hash) so the
-                // gateway can't find it without this bridge row.
                 if let Some(prior_outs) = verified.get(hash) {
                     if let Some(state) = self.dag.node_mut(hash) {
                         state.output_paths =
@@ -1173,43 +1210,42 @@ impl DagActor {
                         && let Some(modular) = state.ca.modular_hash
                     {
                         for o in prior_outs {
-                            if let Err(e) = crate::ca::insert_realisation(
-                                self.db.pool(),
-                                &modular,
-                                &o.output_name,
-                                &o.output_path,
-                                &o.output_hash,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    drv_hash = %hash,
-                                    output = %o.output_name,
-                                    error = %e,
-                                    "CA cutoff: realisation insert for skipped node failed \
-                                     (best-effort; gateway QueryRealisation may return empty)"
-                                );
-                            }
+                            realisations.push((
+                                modular,
+                                o.output_name.clone(),
+                                o.output_path.clone(),
+                                o.output_hash,
+                            ));
                         }
                     }
                 }
-                // Collect interested_builds BEFORE persist (though
-                // persist doesn't clear them — just for locality with
-                // the node-mut block above).
                 if let Some(state) = self.dag.node(hash) {
                     skipped_interested.extend(state.interested_builds.iter().copied());
                 }
-                // r[impl sched.gc.path-tenants-upsert]
-                // Skipped node's output_paths (from the prior build's
-                // realization, stamped above) need tenant attribution
-                // — the build's tenant wants them retained, same as
-                // if the node had actually built them.
-                self.upsert_path_tenants_for(hash).await;
-                self.persist_status(hash, DerivationStatus::Skipped, None)
-                    .await;
                 debug!(drv_hash = %hash, trigger = %drv_hash,
                        "CA cutoff: skipped (output already in store)");
             }
+            // Batch the PG writes — three round-trips total instead
+            // of 3×N. All best-effort (log on Err, never block the
+            // in-mem transitions).
+            if let Err(e) = crate::ca::insert_realisation_batch(self.db.pool(), &realisations).await
+            {
+                warn!(
+                    n_rows = realisations.len(),
+                    error = %e,
+                    "CA cutoff: batch realisation insert for skipped nodes failed \
+                     (best-effort; gateway QueryRealisation may return empty)"
+                );
+            }
+            // r[impl sched.gc.path-tenants-upsert]
+            // Skipped nodes' output_paths (from the prior build's
+            // realization, stamped above) need tenant attribution —
+            // the build's tenant wants them retained, same as if the
+            // node had actually built them.
+            self.upsert_path_tenants_for_batch(&skipped).await;
+            let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();
+            self.persist_status_batch(&skipped_refs, DerivationStatus::Skipped)
+                .await;
             // H1 fix (P0399): each newly-Skipped node may have Queued
             // parents whose all-deps are now Completed|Skipped. The
             // find_newly_ready(drv_hash) below at :732 only walks
@@ -1221,9 +1257,32 @@ impl DagActor {
             // (B is Skipped, not Queued); find_newly_ready(B) returns
             // [C] (C is Queued and all_deps_completed — Skipped now
             // accepted there).
+            //
+            // Batched: collect all newly-ready across all skipped
+            // nodes (a parent may be returned by several skipped
+            // children — dedup), transition + push_ready in-mem, then
+            // one persist_status_batch(Ready). Inline expansion of
+            // `promote_newly_ready` with the per-item await hoisted
+            // out; the other promote_newly_ready callsites are
+            // single-node so per-item is correct there.
+            let mut newly_ready: Vec<DrvHash> = Vec::new();
+            let mut seen_ready: HashSet<DrvHash> = HashSet::new();
             for s in &skipped {
-                self.promote_newly_ready(s).await;
+                for ready_hash in self.dag.find_newly_ready(s) {
+                    if !seen_ready.insert(ready_hash.clone()) {
+                        continue;
+                    }
+                    if let Some(state) = self.dag.node_mut(&ready_hash)
+                        && state.transition(DerivationStatus::Ready).is_ok()
+                    {
+                        newly_ready.push(ready_hash.clone());
+                        self.push_ready(ready_hash);
+                    }
+                }
             }
+            let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
+            self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
+                .await;
             if cap_hit {
                 tracing::warn!(
                     trigger = %drv_hash,
