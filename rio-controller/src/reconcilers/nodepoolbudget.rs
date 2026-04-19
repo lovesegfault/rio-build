@@ -175,16 +175,41 @@ fn extract_cpu_millis(v: &serde_json::Value) -> Option<u64> {
     v.as_f64().map(|f| (f * 1000.0).round() as u64)
 }
 
-/// `"64"` → 64000, `"64000m"` → 64000, `"1.5"` → 1500. Malformed → 0.
-/// Only the `m` (milli) suffix is handled — Karpenter never emits
-/// binary-SI (`Ki`/`Mi`) for CPU.
+/// `"64"` → 64000, `"64000m"` → 64000, `"1.5"` → 1500, `"1k"` →
+/// 1_000_000. Malformed → `warn!` + 0.
+///
+/// Handles all decimal-SI suffixes (`n`/`u`/`m`/`k`/`M`/`G`/`T`/`P`/
+/// `E`). apimachinery's `Quantity.String()` canonicalizes a DecimalSI
+/// value of exactly N×1000 cores as `"Nk"` (rule: largest suffix with
+/// no fractional digits) — Karpenter's `status.resources.cpu` is a
+/// summed `v1.ResourceList`, so a governed pool at e.g. 125 ×
+/// c5.2xlarge = 1000 cores serializes as `"1k"`. The pre-fix parser
+/// returned 0 for that, defeating `r[ctrl.nodepoolbudget]`'s
+/// `limit ≥ used` guarantee. Binary-SI (`Ki`/`Mi`) is still
+/// unhandled — never emitted for CPU.
 pub(crate) fn parse_cpu_millis(q: &str) -> u64 {
-    if let Some(m) = q.strip_suffix('m') {
-        return m.parse().unwrap_or(0);
-    }
-    q.parse::<f64>()
-        .map(|c| (c * 1000.0).round() as u64)
-        .unwrap_or(0)
+    // Suffix → multiplier (cores). Longest first so `"m"` doesn't
+    // shadow nothing-relevant here, but consistent with the idiom.
+    let (num, mult): (&str, f64) = [
+        ("n", 1e-9),
+        ("u", 1e-6),
+        ("m", 1e-3),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ]
+    .iter()
+    .find_map(|(s, m)| q.strip_suffix(*s).map(|n| (n, *m)))
+    .unwrap_or((q, 1.0));
+    num.parse::<f64>()
+        .map(|c| (c * mult * 1000.0).round() as u64)
+        .unwrap_or_else(|_| {
+            warn!(quantity = %q, "unparseable CPU Quantity; treating as 0");
+            0
+        })
 }
 
 #[cfg(test)]
@@ -200,6 +225,41 @@ mod tests {
         assert_eq!(parse_cpu_millis("0m"), 0);
         assert_eq!(parse_cpu_millis("garbage"), 0);
         assert_eq!(parse_cpu_millis(""), 0);
+        // Decimal-SI suffixes — apimachinery canonicalizes round
+        // multiples of 1000 to these. `"1k"` → 0 was the bug.
+        assert_eq!(parse_cpu_millis("1k"), 1_000_000);
+        assert_eq!(parse_cpu_millis("10k"), 10_000_000);
+        assert_eq!(parse_cpu_millis("2M"), 2_000_000_000);
+        assert_eq!(parse_cpu_millis("999"), 999_000); // just below k
+        assert_eq!(parse_cpu_millis("1500m"), 1_500); // m via table
+        assert_eq!(parse_cpu_millis("500u"), 1); // 0.5 millicore rounds
+    }
+
+    /// Regression for `"1k"` → 0: a pool whose `status.resources.cpu`
+    /// canonicalizes to a decimal-SI suffix must not produce a limit
+    /// below its actual usage. Before the fix, `extract_cpu_millis
+    /// ("1k")` returned 0, so `compute_limits` set `a`'s limit to
+    /// `0 + headroom` — well under its real 1_000_000m usage when
+    /// headroom is small.
+    // r[verify ctrl.nodepoolbudget]
+    #[test]
+    fn compute_limits_never_below_used_with_k_suffix() {
+        use serde_json::json;
+        // Pool `a` at exactly 1000 cores → Karpenter writes `"1k"`.
+        let a_used = extract_cpu_millis(&json!("1k")).unwrap();
+        assert_eq!(a_used, 1_000_000, "decimal-SI parsed");
+        let used = BTreeMap::from([("a".into(), a_used), ("b".into(), 480_000u64)]);
+        // Tight budget: real headroom is 1_200_000 − 1_480_000 = 0
+        // (saturating). Correct: every limit == used. Bug: a's limit
+        // would be `0 + (1_200_000 − 480_000) = 720_000` < 1_000_000.
+        let out = compute_limits(&used, 1_200_000);
+        for (k, &lim) in &out {
+            assert!(
+                lim >= used[k],
+                "pool {k}: limit {lim} < used {} (r[ctrl.nodepoolbudget])",
+                used[k]
+            );
+        }
     }
 
     #[test]
