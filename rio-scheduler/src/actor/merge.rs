@@ -769,8 +769,8 @@ impl DagActor {
         let newly_inserted = &merge_result.newly_inserted;
         let pending_sub: HashSet<&str> =
             pending_substitute.iter().map(|(h, _)| h.as_str()).collect();
-        let mut cached = 0u32;
         let mut first_failed: Option<DrvHash> = None;
+        let mut preexisting_completed: Vec<DrvHash> = Vec::new();
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;
@@ -803,18 +803,17 @@ impl DagActor {
                 // from a prior CA-cutoff. Same semantics as a cache
                 // hit from the build's perspective.
                 DerivationStatus::Completed | DerivationStatus::Skipped => {
-                    cached += 1;
-                    metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
-                        .increment(1);
                     // r[impl sched.gc.path-tenants-upsert]
                     // Pre-existing Completed/Skipped merged from
                     // another build: this build's tenant now also
                     // wants those output_paths retained. The node's
                     // interested_builds already includes this build
                     // (merge() added it); output_paths was set when
-                    // the node originally completed.
-                    self.upsert_path_tenants_for(&node.drv_hash.as_str().into())
-                        .await;
+                    // the node originally completed. Batched after
+                    // the loop — I-139 shape: a 5k-node resubmit
+                    // with 4800 prior-Completed nodes was ~8.6s of
+                    // sequential PG awaits in the actor loop here.
+                    preexisting_completed.push(node.drv_hash.as_str().into());
                 }
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
                     first_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
@@ -826,6 +825,13 @@ impl DagActor {
                 }
                 _ => {}
             }
+        }
+        let cached = preexisting_completed.len() as u32;
+        if cached > 0 {
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
+                .increment(u64::from(cached));
+            self.upsert_path_tenants_for_batch(&preexisting_completed)
+                .await;
         }
         (cached, first_failed)
     }

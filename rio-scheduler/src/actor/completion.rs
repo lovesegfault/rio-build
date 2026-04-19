@@ -159,6 +159,10 @@ impl DagActor {
     /// skipped nodes, merge-time cache hits, merge-time pre-existing
     /// Completed, recovery orphan-completion. Missing any of these =
     /// paths GC'd prematurely under that tenant's retention policy.
+    ///
+    /// Single-node only — for N>1 inside an actor loop use
+    /// [`upsert_path_tenants_for_batch`](Self::upsert_path_tenants_for_batch)
+    /// (per-node sequential awaits here are an I-139 actor-stall).
     pub(super) async fn upsert_path_tenants_for(&self, drv_hash: &DrvHash) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
