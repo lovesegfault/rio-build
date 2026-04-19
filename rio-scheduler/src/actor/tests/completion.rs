@@ -696,12 +696,12 @@ async fn test_transient_retry_different_worker() -> TestResult {
 #[tokio::test]
 async fn test_transient_failure_max_retries_poisons() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux").await?;
-    // Pad workers (non-matching system) so the all-workers-failed
-    // clamp doesn't fire before max_retries — we're testing the
-    // max_retries branch specifically, worker_count must exceed
-    // threshold=3.
-    let _rx2 = connect_executor(&handle, "mr-pad2", "aarch64-linux").await?;
-    let _rx3 = connect_executor(&handle, "mr-pad3", "aarch64-linux").await?;
+    // Pad workers (statically-eligible — same system) so the
+    // fleet-exhaustion clamp (`r[sched.dispatch.fleet-exhaust]`)
+    // doesn't fire before max_retries; we're testing the max_retries
+    // branch specifically.
+    let _rx2 = connect_executor(&handle, "mr-pad2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "mr-pad3", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let p_maxretry = test_drv_path("maxretry-hash");
@@ -715,14 +715,12 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     // initial dispatch happened) bypasses backoff so the completion
     // handler sees Assigned state and processes the failure.
     for attempt in 0..3 {
-        if attempt > 0 {
-            // Force back to Assigned: backoff would block real
-            // dispatch, and failed_builders now excludes flaky-worker.
-            let ok = handle
-                .debug_force_assign("maxretry-hash", "flaky-worker")
-                .await?;
-            assert!(ok, "force-assign should succeed for Ready derivation");
-        }
+        // Force-assign (including attempt=0): with 3 statically-
+        // eligible workers, natural dispatch may pick a padding worker.
+        let ok = handle
+            .debug_force_assign("maxretry-hash", "flaky-worker")
+            .await?;
+        assert!(ok, "force-assign should succeed (attempt {attempt})");
         complete_failure(
             &handle,
             "flaky-worker",
@@ -1345,9 +1343,11 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
 ///   NOT poisoned via threshold (would need 3 DISTINCT workers).
 ///   `max_retries` raised so the `retry_count>=2` branch doesn't mask.
 ///
-/// Both: 3 workers (one real + 2 aarch64 padding) so the
-/// all-workers-failed clamp (`min(threshold, worker_count)`) doesn't
-/// fire before `failure_count=3`.
+/// Both: 3 x86 workers so the statically-eligible fleet is 3 and the
+/// fleet-exhaustion clamp (`r[sched.dispatch.fleet-exhaust]`) doesn't
+/// fire before `failure_count=3`. (Padding workers used to be aarch64,
+/// which only worked because the clamp was system-blind — that bug is
+/// now fixed.)
 #[rstest]
 #[case::non_distinct(false, true)]
 #[case::distinct(true, false)]
@@ -1369,8 +1369,8 @@ async fn test_same_worker_poison_threshold_distinct_mode(
     let _db = db;
 
     let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "pad-w2", "aarch64-linux").await?;
-    let _rx3 = connect_executor(&handle, "pad-w3", "aarch64-linux").await?;
+    let _rx2 = connect_executor(&handle, "pad-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "pad-w3", "x86_64-linux").await?;
 
     let drv_hash = "distinct-mode-drv";
     let drv_path = test_drv_path(drv_hash);
@@ -1378,9 +1378,11 @@ async fn test_same_worker_poison_threshold_distinct_mode(
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
     for i in 0..3 {
-        if i > 0 {
-            assert!(handle.debug_force_assign(drv_hash, "solo-worker").await?);
-        }
+        // Always force-assign (including i=0): with 3 statically-
+        // eligible workers, natural dispatch from merge may pick a
+        // padding worker. debug_force_assign resets Assigned→Ready
+        // then re-assigns to solo-worker.
+        assert!(handle.debug_force_assign(drv_hash, "solo-worker").await?);
         complete_failure(
             &handle,
             "solo-worker",

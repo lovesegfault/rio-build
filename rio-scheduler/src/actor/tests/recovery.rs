@@ -209,13 +209,19 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
 async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // Connect worker + submit build → dispatch. Second worker is
-    // padding so the all-workers-failed clamp doesn't poison after
-    // a single failure (worker_count=1 would clamp threshold to 1).
+    // Connect worker + submit build → dispatch. Padding worker is
+    // statically-eligible (same system) so the fleet-exhaustion clamp
+    // doesn't poison after a single failure (1-worker fleet would);
+    // running_build=Some keeps it at-capacity so dispatch
+    // deterministically picks w-x4 and the post-failure Ready isn't
+    // immediately re-dispatched.
     let (handle, _task, mut stream_rx) = {
         let (h, t) = setup_actor(db.pool.clone());
         let rx = connect_executor(&h, "w-x4", "x86_64-linux").await?;
-        let _pad = connect_executor(&h, "w-x4-pad", "aarch64-linux").await?;
+        let _pad = connect_executor_with(&h, "w-x4-pad", "x86_64-linux", true, |hb| {
+            hb.running_build = Some("busy".into());
+        })
+        .await?;
         (h, t, rx)
     };
     let build_id = Uuid::new_v4();
@@ -605,7 +611,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // a failed attempt on that worker's infra); with a single-worker
     // fleet that would be exhaustion → poison. Two workers preserves
     // this test's intent (verify phantom RECONCILES) without hitting
-    // the exhaustion case, which test_fleet_exhaustion_is_kind_aware
+    // the exhaustion case, which test_fleet_exhaustion_static_eligibility
     // covers separately.
     let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux").await?;
     barrier(&handle).await;

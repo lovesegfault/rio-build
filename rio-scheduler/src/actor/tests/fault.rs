@@ -77,9 +77,14 @@ async fn test_completion_db_fault_build_sample_logged() -> TestResult {
 #[tracing_test::traced_test]
 async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
     let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux").await?;
-    // Pad worker so the all-workers-failed clamp doesn't poison after
-    // a single failure — we need the retry-persist branch, not poison.
-    let _pad = connect_executor(&handle, "tfault-pad", "aarch64-linux").await?;
+    // Pad worker (statically-eligible — same system) so the fleet-
+    // exhaustion clamp doesn't poison after a single failure; we need
+    // the retry-persist branch. running_build=Some keeps it at-capacity
+    // so dispatch deterministically picks tfault-worker.
+    let _pad = connect_executor_with(&handle, "tfault-pad", "x86_64-linux", true, |hb| {
+        hb.running_build = Some("busy".into());
+    })
+    .await?;
 
     let build_id = Uuid::new_v4();
     let _evt_rx =

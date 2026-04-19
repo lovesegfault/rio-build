@@ -104,6 +104,35 @@ pub fn rejection_reason(w: &ExecutorState, drv: &DerivationState) -> Option<&'st
     None
 }
 
+/// Static eligibility: would `w` be a candidate for `drv` ignoring
+/// per-tick dynamic state (capacity / draining / degraded / stream-
+/// closed / intent-reserved / failed-on / resource-fit)?
+///
+/// This is the subset of [`rejection_reason`] that does not change
+/// without the executor reconfiguring or disconnecting. Used by
+/// `failed_builders_exhausts_fleet` (I-065) so its definition of "the
+/// fleet" matches what `find_executor` actually considers — drift
+/// between the two was a multi-arch silent-hang: a kind-only filter
+/// counted system-/feature-mismatched workers toward the fleet, so an
+/// x86 drv that failed on every x86 worker deferred forever while
+/// aarch64 workers kept the fleet "non-exhausted".
+///
+/// NOT implemented as `matches!(rejection_reason(..), <dynamic>)`
+/// because `rejection_reason` short-circuits — a *draining aarch64*
+/// worker returns `Some("draining")` before reaching the system check,
+/// which the matches! form would mis-classify as statically eligible.
+/// `statically_eligible_agrees_with_rejection_reason` (test below)
+/// pins the two together.
+pub fn statically_eligible(w: &ExecutorState, drv: &DerivationState) -> bool {
+    drv.is_fixed_output == (w.kind == ExecutorKind::Fetcher)
+        && w.is_registered()
+        && w.systems.iter().any(|s| s == &drv.system)
+        && drv
+            .required_features
+            .iter()
+            .all(|f| w.supported_features.contains(f))
+}
+
 /// Hard filter: executor-kind, capacity, system/feature match,
 /// not-previously-failed, resource-fit. The SAME predicate that both
 /// warm-pass and cold-fallback use in [`best_executor`] — extracted so
@@ -462,6 +491,129 @@ mod tests {
         // above. Spot-check one of each polarity.
         assert!(!hard_filter(&busy, &drv));
         assert!(hard_filter(&tight, &drv)); // last_intent=None → fits
+    }
+
+    // r[verify sched.dispatch.fleet-exhaust]
+    /// `statically_eligible(w,d)` MUST agree with `rejection_reason(w,d)`
+    /// on the static clauses. Guards against a future
+    /// `rejection_reason` clause being added without updating
+    /// `statically_eligible` — the two diverging is exactly the
+    /// I-065-on-system/features bug shape.
+    ///
+    /// Can't be `statically_eligible == matches!(rejection_reason,
+    /// <dynamic>)` directly: `rejection_reason` short-circuits (a
+    /// draining aarch64 worker returns "draining", masking
+    /// "system-mismatch"). So the ineligible direction builds a
+    /// best-case-dynamic clone and asserts THAT clone hits a static
+    /// reason.
+    #[test]
+    fn statically_eligible_agrees_with_rejection_reason() {
+        const STATIC: &[&str] = &[
+            "kind-mismatch",
+            "not-registered",
+            "system-mismatch",
+            "feature-missing",
+        ];
+        // Best-case-dynamic clone: idle, not draining/degraded, no
+        // intent. Preserves kind/systems/features AND stream presence
+        // — `is_registered()` is fleet-membership (which workers exist
+        // at all), not per-tick dynamic, so a None stream stays None.
+        let best_dyn = |w: &ExecutorState| {
+            let mut c = ExecutorState::new(w.executor_id.clone());
+            c.kind = w.kind;
+            c.systems = w.systems.clone();
+            c.supported_features = w.supported_features.clone();
+            if w.stream_tx.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                std::mem::forget(rx);
+                c.stream_tx = Some(tx);
+            }
+            c
+        };
+
+        // Hand-built matrix covering every rejection_reason branch.
+        // ExecutorState isn't Clone (stream_tx) → builders.
+        let drv = make_drv();
+        let mut feat_drv = make_drv();
+        feat_drv.required_features = vec!["kvm".into()];
+        let mut arm_drv = make_drv();
+        "aarch64-linux".clone_into(&mut arm_drv.system);
+        let mut failed_drv = make_drv();
+        failed_drv.retry.failed_builders.insert("w".into());
+
+        type Case<'a> = (Box<dyn Fn() -> ExecutorState>, &'a DerivationState);
+        let cases: Vec<Case<'_>> = vec![
+            (Box::new(|| make_worker("w", 0)), &drv), // baseline accept
+            (
+                Box::new(|| {
+                    let mut w = make_worker("w", 0);
+                    w.kind = ExecutorKind::Fetcher;
+                    w
+                }),
+                &drv,
+            ), // kind-mismatch
+            (
+                Box::new(|| {
+                    let mut w = make_worker("w", 1);
+                    w.draining = true;
+                    w
+                }),
+                &arm_drv,
+            ), // draining MASKS system-mismatch (the short-circuit case)
+            (
+                Box::new(|| {
+                    let mut w = make_worker("w", 0);
+                    w.store_degraded = true;
+                    w
+                }),
+                &drv,
+            ), // store-degraded (dynamic)
+            (
+                Box::new(|| {
+                    let mut w = make_worker("w", 0);
+                    w.stream_tx = None;
+                    w
+                }),
+                &drv,
+            ), // not-registered
+            (Box::new(|| make_worker_closed_stream("w")), &drv), // stream-closed (dynamic)
+            (Box::new(|| make_worker("w", 1)), &drv), // at-capacity (dynamic)
+            (
+                Box::new(|| {
+                    let mut w = make_worker("w", 0);
+                    w.intent_id = Some("other".into());
+                    w
+                }),
+                &drv,
+            ), // intent-reserved (dynamic)
+            (Box::new(|| make_worker("w", 0)), &arm_drv), // system-mismatch
+            (Box::new(|| make_worker("w", 0)), &feat_drv), // feature-missing
+            (Box::new(|| make_worker("w", 0)), &failed_drv), // failed-on (dynamic)
+        ];
+
+        for (i, (mk_w, d)) in cases.iter().enumerate() {
+            let w = mk_w();
+            let elig = statically_eligible(&w, d);
+            if elig {
+                // Eligible → rejection_reason is None or dynamic-only.
+                let r = rejection_reason(&w, d);
+                assert!(
+                    r.is_none() || !STATIC.contains(&r.unwrap()),
+                    "case {i}: statically_eligible=true but rejection_reason={r:?} is a STATIC reason"
+                );
+            } else {
+                // Ineligible → with all dynamic gates relaxed, a static
+                // reason MUST surface.
+                let bw = best_dyn(&w);
+                let r = rejection_reason(&bw, d);
+                assert!(
+                    r.is_some() && STATIC.contains(&r.unwrap()),
+                    "case {i}: statically_eligible=false but best-case-dynamic \
+                     rejection_reason={r:?} is not a static reason — \
+                     statically_eligible drifted from rejection_reason"
+                );
+            }
+        }
     }
 
     #[test]

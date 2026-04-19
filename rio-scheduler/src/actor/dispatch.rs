@@ -22,10 +22,16 @@ use super::backdate;
 /// method without 6-positional-`&mut` signatures.
 #[derive(Default)]
 struct DispatchTickCtx {
+    // ── per-PASS (survive outer-loop iterations) ───────────────────
     /// Hashes the batch FOD pre-pass already checked (I-163).
     /// `try_dispatch_one` skips the per-FOD store RPC for these.
     batch_checked: HashSet<DrvHash>,
-    /// Derivations that couldn't dispatch this pass (backoff not
+    /// Successful assign_to_worker calls (for the >1s debug log).
+    n_assigned: u64,
+    // ── per-ITERATION (cleared at top of each outer `while
+    //    dispatched_any` cycle; the FINAL iteration's values feed
+    //    publish_dispatch_gauges) ──────────────────────────────────
+    /// Derivations that couldn't dispatch this iteration (backoff not
     /// elapsed, no eligible worker, or assignment send failed).
     /// Re-pushed onto the ready queue at end of each cycle.
     deferred: Vec<DrvHash>,
@@ -36,8 +42,6 @@ struct DispatchTickCtx {
     /// executors of the matching kind. Per-system count → gauge + a
     /// single WARN on first observation (operator action: add a pool).
     unroutable_systems: HashMap<String, u64>,
-    /// Successful assign_to_worker calls (for the >1s debug log).
-    n_assigned: u64,
 }
 
 /// I-025 freeze detector: state machine that WARNs when derivations are
@@ -169,6 +173,14 @@ impl DagActor {
         let mut dispatched_any = true;
         while dispatched_any {
             dispatched_any = false;
+            // Per-ITERATION accumulators: only the final iteration's
+            // counts are the true end-of-pass backlog. Without the
+            // clear, iter1 dispatching ≥1 drv → iter2 re-pops the same
+            // deferred set and re-increments → gauges report ~2× true.
+            // `ctx.deferred` is already per-iteration via `mem::take`
+            // below; these two were not.
+            ctx.kind_deferred.clear();
+            ctx.unroutable_systems.clear();
 
             while let Some(drv_hash) = self.ready_queue.pop() {
                 n_popped += 1;
@@ -962,23 +974,29 @@ impl DagActor {
     }
 
     /// I-065: has `failed_builders` excluded EVERY currently-registered
-    /// worker of the matching kind?
+    /// statically-eligible worker (matching kind + system + features)?
     ///
     /// Live example: 2-builder cluster, `diffutils.drv` accumulates
     /// `failed_builders=[b0,b1]`. `hard_filter`'s `!contains()` rejects
     /// both → defer forever. `PoisonConfig.threshold=3` never reached.
     /// The build hangs `[Active]` with no log signal.
     ///
-    /// Predicate is "every kind-matching registered worker is in the
-    /// failed set", not `failed_builders.len() >= total`. The latter
+    /// Predicate is "every statically-eligible worker is in the failed
+    /// set", not `failed_builders.len() >= total`. The latter
     /// over-counts stale IDs: b0 fails, b0 is replaced by b2, b1 fails
     /// → set={b0,b1} len=2, total=2 → would poison, but b2 was never
-    /// tried.
+    /// tried. The fleet filter MUST match the static-eligibility subset
+    /// of `rejection_reason` — a kind-only filter let an x86 drv that
+    /// failed on every x86 worker defer forever in a multi-arch cluster
+    /// because aarch64 workers (which `find_executor` rejects on
+    /// system-mismatch) kept the fleet "non-exhausted".
     ///
-    /// Returns false (don't poison) when zero workers of that kind are
-    /// registered — that's "no workers connected", a transient that the
-    /// freeze detector + autoscaler handle. Poisoning then would brick
-    /// builds during a deployment rollout.
+    /// Returns false (don't poison) when zero statically-eligible
+    /// workers are registered — that's "no pool connected for this
+    /// system/features", a transient that the freeze detector +
+    /// unroutable-system gauge + autoscaler handle. Poisoning then
+    /// would brick builds during a deployment rollout.
+    // r[impl sched.dispatch.fleet-exhaust]
     pub(super) fn failed_builders_exhausts_fleet(&self, drv_hash: &DrvHash) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;
@@ -986,11 +1004,10 @@ impl DagActor {
         if state.retry.failed_builders.is_empty() {
             return false;
         }
-        let want_kind = crate::state::kind_for_drv(state.is_fixed_output);
         let mut fleet = self
             .executors
             .values()
-            .filter(|w| w.kind == want_kind && w.is_registered());
+            .filter(|w| crate::assignment::statically_eligible(w, state));
         // `all()` on an empty iterator is vacuously true — peek first.
         let Some(first) = fleet.next() else {
             return false;
@@ -1001,10 +1018,12 @@ impl DagActor {
         if exhausted {
             warn!(
                 drv_hash = %drv_hash,
-                kind = ?want_kind,
+                system = %state.system,
+                required_features = ?state.required_features,
                 failed_on = state.retry.failed_builders.len(),
-                "failed_builders excludes every registered worker; poisoning \
-                 (would otherwise defer forever — see I-065)"
+                "failed_builders excludes every statically-eligible worker \
+                 (kind+system+features); poisoning (would otherwise defer \
+                 forever — see I-065)"
             );
             metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
         }

@@ -122,6 +122,9 @@ dev deployments). The retry backoff curve is likewise a `[retry]`
 table. `failed_builders` persisted to PG; infrastructure retry count
 is in-memory only.
 
+r[sched.dispatch.fleet-exhaust]
+When `find_executor` returns `None` and every *statically-eligible* registered worker (matching kind, `system`, and `required_features`) is already in `failed_builders`, the derivation is poisoned immediately rather than deferring. The fleet filter MUST match the static-eligibility subset of `rejection_reason` (`r[sched.admin.inspect-dag]`); a narrower filter (e.g. kind-only) lets a drv defer forever in a multi-arch or feature-partitioned cluster with no INFO-level signal (the I-065 hang shape on the system/features axis).
+
 ```toml
 # scheduler.toml — poison + retry knobs. All fields optional; absent
 # keys fall through to the Default impl shown in comments.

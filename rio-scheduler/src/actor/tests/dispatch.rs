@@ -2081,3 +2081,196 @@ async fn connect_executor_with_intent(
         .await?;
     Ok(rx)
 }
+
+// ---------------------------------------------------------------------------
+// I-065 fleet-exhaustion: system/feature awareness
+// ---------------------------------------------------------------------------
+
+// r[verify sched.dispatch.fleet-exhaust]
+/// I-065 on the system/features axis: when every statically-eligible
+/// worker is in `failed_builders`, poison — even if other-system or
+/// feature-lacking workers of the same kind exist.
+///
+/// Pre-fix `failed_builders_exhausts_fleet` filtered the fleet by
+/// `kind && is_registered()` only. An x86 drv that transient-failed on
+/// both x86 builders deferred forever (find_executor: failed-on /
+/// system-mismatch → None; exhausts_fleet: aarch64 not in failed set
+/// → false; is_poisoned: 2 < threshold=3 → false; defer).
+#[rstest::rstest]
+#[case::system("aarch64-linux", &[])] // padding mismatched on system
+#[case::features("x86_64-linux", &[])] // padding mismatched on features (drv needs kvm)
+#[tokio::test]
+async fn test_fleet_exhaustion_static_eligibility(
+    #[case] pad_system: &str,
+    #[case] pad_features: &[&str],
+) -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.poison = crate::PoisonConfig {
+            threshold: 3,
+            require_distinct_workers: true,
+        };
+        c.retry_policy.max_retries = 10;
+    });
+    let _db = db;
+
+    // 2 statically-eligible x86+kvm builders. The drv will fail on both.
+    let _b1 = connect_executor_with(&handle, "b1", "x86_64-linux", true, |hb| {
+        hb.supported_features = vec!["kvm".into()];
+    })
+    .await?;
+    let _b2 = connect_executor_with(&handle, "b2", "x86_64-linux", true, |hb| {
+        hb.supported_features = vec!["kvm".into()];
+    })
+    .await?;
+    // 2 padding builders that ARE kind-matching+registered but NOT
+    // statically-eligible: wrong system (case::system) or lacking kvm
+    // (case::features). Pre-fix these counted toward "the fleet" and
+    // kept exhausts_fleet false.
+    let pad_feats: Vec<String> = pad_features.iter().map(|s| s.to_string()).collect();
+    let _p1 = connect_executor_with(&handle, "pad1", pad_system, true, |hb| {
+        hb.supported_features = pad_feats.clone();
+    })
+    .await?;
+    let _p2 = connect_executor_with(&handle, "pad2", pad_system, true, |hb| {
+        hb.supported_features = pad_feats.clone();
+    })
+    .await?;
+
+    // x86 drv requiring kvm.
+    let mut node = make_node("fe-drv");
+    node.required_features = vec!["kvm".into()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // Fail on both eligible workers.
+    fail_on_workers(
+        &handle,
+        "fe-drv",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        &["b1", "b2"],
+    )
+    .await?;
+    tick(&handle).await?;
+
+    let info = expect_drv(&handle, "fe-drv").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "every statically-eligible (kind+system+features) worker in \
+         failed_builders → poison; pre-fix this stayed Ready forever \
+         because {pad_system}/{pad_features:?} padding kept the kind-only \
+         fleet non-exhausted"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_poison_fleet_exhausted_total{}"),
+        1,
+        "fleet-exhausted counter incremented once"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust]
+/// Negative: a statically-eligible worker NOT in `failed_builders` keeps
+/// the fleet non-exhausted (defer, don't poison). Guards against the
+/// fix over-filtering.
+#[tokio::test]
+async fn test_fleet_exhaustion_spare_eligible_defers() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.poison.threshold = 3;
+        c.retry_policy.max_retries = 10;
+    });
+    let _db = db;
+
+    let _b1 = connect_executor(&handle, "b1", "x86_64-linux").await?;
+    let _b2 = connect_executor(&handle, "b2", "x86_64-linux").await?;
+    // b3 is statically eligible AND not in failed_builders → fleet not
+    // exhausted; drv should defer (or dispatch to b3), NOT poison.
+    let _b3 = connect_executor(&handle, "b3", "x86_64-linux").await?;
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "fe-spare",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    fail_on_workers(
+        &handle,
+        "fe-spare",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        &["b1", "b2"],
+    )
+    .await?;
+    tick(&handle).await?;
+
+    let info = expect_drv(&handle, "fe-spare").await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "b3 statically-eligible and untried → fleet NOT exhausted"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// queue_depth / unroutable_ready gauge exactness under active dispatch
+// ---------------------------------------------------------------------------
+
+// r[verify obs.metric.scheduler]
+/// `queue_depth` / `unroutable_ready` gauges report the FINAL-iteration
+/// deferral count, not the sum across outer-loop iterations. Regression
+/// for the per-iteration accumulator never being cleared: with 1 idle
+/// worker + N ready, iter1 dispatches 1 + defers N-1 → iter2 re-defers
+/// N-1 → exit. Gauge must read N-1, not 2×(N-1).
+#[rstest::rstest]
+#[case::queue_depth(
+    &["x86_64-linux"; 5],
+    "rio_scheduler_queue_depth{kind=EXECUTOR_KIND_BUILDER}",
+    4.0
+)]
+#[case::unroutable(
+    // 1 x86 (dispatches → dispatched_any=true → 2nd iteration) + 3 riscv
+    // (no advertiser → unroutable). Pre-fix gauge read 6.0.
+    &["x86_64-linux", "riscv64-linux", "riscv64-linux", "riscv64-linux"],
+    "rio_scheduler_unroutable_ready{system=riscv64-linux}",
+    3.0
+)]
+#[tokio::test]
+async fn test_queue_depth_gauge_exact_under_active_dispatch(
+    #[case] systems: &[&str],
+    #[case] gauge_key: &str,
+    #[case] expected: f64,
+) -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+
+    let mut rx = connect_executor(&handle, "qd-w1", "x86_64-linux").await?;
+    let nodes: Vec<_> = systems
+        .iter()
+        .enumerate()
+        .map(|(i, sys)| make_test_node(&format!("qd-{i}"), sys))
+        .collect();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    let _asgn = recv_assignment(&mut rx).await; // exactly 1 dispatched
+
+    let got = recorder.gauge_value(gauge_key).unwrap_or_else(|| {
+        panic!(
+            "gauge {gauge_key} not set; gauges={:?}",
+            recorder.gauge_names()
+        )
+    });
+    assert_eq!(
+        got,
+        expected,
+        "{gauge_key}: 1 worker, {} ready → 1 dispatched + {expected} deferred; \
+         pre-fix this read {} (double-counted across outer-loop iterations)",
+        systems.len(),
+        2.0 * expected
+    );
+    Ok(())
+}

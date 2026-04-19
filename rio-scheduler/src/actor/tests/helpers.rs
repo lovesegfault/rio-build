@@ -342,7 +342,7 @@ pub(crate) async fn connect_executor_no_ack_kind(
 /// below pass the 1-2 fields they care about; when
 /// `ActorCommand::ExecutorConnected` / `Heartbeat` grow a field, this
 /// is the only edit.
-async fn connect_executor_with(
+pub(crate) async fn connect_executor_with(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
