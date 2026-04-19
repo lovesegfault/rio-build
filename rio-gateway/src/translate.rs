@@ -225,11 +225,14 @@ fn populate_ca_modular_hashes(
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-    // IA nodes: ca_modular_hash stays empty — dead bytes on the
-    // wire (scheduler's resolve gates on is_ca).
+    // IA nodes with statically-known paths: ca_modular_hash stays
+    // empty — dead bytes on the wire. Deferred-IA (empty output
+    // path) DOES need it: the scheduler writes a realisation on
+    // completion keyed by this hash so the gateway's
+    // wopQueryDerivationOutputMap can answer the client.
     let hashes: Vec<(usize, Vec<u8>)> =
         iter_cached_drvs(nodes, drv_cache, "populate_ca_modular_hashes")
-            .filter(|(_, node, _)| node.is_content_addressed)
+            .filter(|(_, node, drv)| node.is_content_addressed || drv.has_unknown_output_paths())
             .filter_map(|(idx, node, drv)| {
                 compute_modular_hash_cached(drv, &node.drv_path, drv_cache, &mut hash_cache)
                     .map(|h| (idx, h.to_vec()))

@@ -632,7 +632,7 @@ fn ca_on_ca_fixture() -> (
     )
 }
 
-// r[verify sched.ca.resolve+2]
+// r[verify sched.ca.resolve+3]
 /// Recovered CA-on-CA dispatch: scheduler restart cleared
 /// `drv_content`, but the store has the `.drv` — `maybe_resolve_ca`
 /// fetches it via `GetPath`, NAR-unwraps, and resolves placeholders.
@@ -810,7 +810,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 // maybe_resolve_ca gate-path passthrough coverage
 // -----------------------------------------------------------------------------
 
-// r[verify sched.ca.resolve+2]
+// r[verify sched.ca.resolve+3]
 /// IA passthrough: `state.ca.needs_resolve = false` → gate at
 /// dispatch.rs:681 fails → `drv_content` returned unchanged. No
 /// resolve fires, no ContentLookup, no PG query. The cheapest path —
@@ -835,7 +835,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.resolve+2]
+// r[verify sched.ca.resolve+3]
 /// FOD passthrough: `is_ca = true` BUT `needs_resolve = false` (FOD
 /// output path is eval-time known; gateway doesn't set needs_resolve
 /// unless an inputDrv is floating-CA). ADR-018 `shouldResolve` table:
@@ -878,7 +878,7 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.resolve+2]
+// r[verify sched.ca.resolve+3]
 /// No-CA-inputs passthrough: floating-CA derivation whose children
 /// are all IA → `collect_ca_inputs` returns `[]` → gate at
 /// dispatch.rs:694 fails → passthrough. The common case: a CA

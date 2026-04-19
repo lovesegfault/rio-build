@@ -212,14 +212,16 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     // Connect worker + submit build → dispatch. Padding worker is
     // statically-eligible (same system) so the fleet-exhaustion clamp
     // doesn't poison after a single failure (1-worker fleet would);
-    // running_build=Some keeps it at-capacity so dispatch
-    // deterministically picks w-x4 and the post-failure Ready isn't
-    // immediately re-dispatched.
+    // store_degraded keeps it ineligible for dispatch so w-x4 is
+    // deterministically picked and the post-failure Ready isn't
+    // immediately re-dispatched. NOT `running_build=Some("busy")`:
+    // heartbeat reconcile resolves the path against the DAG and
+    // "busy" → None → pad becomes idle (HashMap-order-dependent flake).
     let (handle, _task, mut stream_rx) = {
         let (h, t) = setup_actor(db.pool.clone());
         let rx = connect_executor(&h, "w-x4", "x86_64-linux").await?;
         let _pad = connect_executor_with(&h, "w-x4-pad", "x86_64-linux", true, |hb| {
-            hb.running_build = Some("busy".into());
+            hb.store_degraded = true;
         })
         .await?;
         (h, t, rx)

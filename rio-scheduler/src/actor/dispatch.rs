@@ -1382,7 +1382,7 @@ impl DagActor {
         // (node() + collect_ca_inputs both &-borrow) so the lookups
         // can be stashed via node_mut() below before the main
         // WorkAssignment construction takes its own & borrow.
-        let (drv_content_to_send, resolve_lookups) = {
+        let (drv_content_to_send, resolve_lookups, resolved_output_paths) = {
             let state = self.dag.node(drv_hash)?;
             self.maybe_resolve_ca(drv_hash, state).await
         };
@@ -1392,10 +1392,23 @@ impl DagActor {
         // realisation row to exist, which only happens post-build).
         // Empty vec → no-op; non-empty only for CA-on-CA chains
         // that actually resolved.
-        if !resolve_lookups.is_empty()
+        //
+        // Deferred-IA: also overwrite expected_output_paths with the
+        // post-resolve computed paths (index-aligned with output_names)
+        // so the HMAC `expected_outputs` claim below carries the real
+        // path, not `""`. Floating-CA leaves resolved_output_paths
+        // empty → no overwrite (its HMAC path is `is_ca` instead).
+        if (!resolve_lookups.is_empty() || !resolved_output_paths.is_empty())
             && let Some(state) = self.dag.node_mut(drv_hash)
         {
             state.ca.pending_realisation_deps = resolve_lookups;
+            for (name, path) in resolved_output_paths {
+                if let Some(i) = state.output_names.iter().position(|n| n == &name)
+                    && let Some(slot) = state.expected_output_paths.get_mut(i)
+                {
+                    *slot = path;
+                }
+            }
         }
 
         let state = self.dag.node(drv_hash)?;
@@ -1590,7 +1603,11 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
-    ) -> (Vec<u8>, Vec<crate::ca::RealisationLookup>) {
+    ) -> (
+        Vec<u8>,
+        Vec<crate::ca::RealisationLookup>,
+        Vec<(String, String)>,
+    ) {
         // Gate: ADR-018 Appendix B `shouldResolve`. Gateway computes
         // `needs_resolve = has_ca_floating_outputs() || any inputDrv
         // is floating-CA` at translate time. Covers both floating-CA
@@ -1598,7 +1615,7 @@ impl DagActor {
         // placeholder is embedded in this drv's env/args and needs
         // rewriting to the realized path).
         if !state.ca.needs_resolve {
-            return (state.drv_content.clone(), Vec::new());
+            return (state.drv_content.clone(), Vec::new(), Vec::new());
         }
 
         // Build the input lists: walk DAG children, split into CA
@@ -1619,7 +1636,7 @@ impl DagActor {
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         let ia_inputs = self.collect_ia_inputs(drv_hash);
         if ca_inputs.is_empty() && ia_inputs.is_empty() {
-            return (state.drv_content.clone(), Vec::new());
+            return (state.drv_content.clone(), Vec::new(), Vec::new());
         }
 
         // No drv_content → recovered derivation (scheduler restart,
@@ -1643,7 +1660,7 @@ impl DagActor {
         // and `pending_realisation_deps` (best-effort cache,
         // reconstituted here on each resolve).
         //
-        // r[impl sched.ca.resolve+2]
+        // r[impl sched.ca.resolve+3]
         let drv_content = if state.drv_content.is_empty() {
             match self.fetch_drv_content_from_store(drv_hash, state).await {
                 Some(bytes) => bytes,
@@ -1658,7 +1675,7 @@ impl DagActor {
                         "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
                          dispatching unresolved (worker will fail on placeholder)"
                     );
-                    return (state.drv_content.clone(), Vec::new());
+                    return (state.drv_content.clone(), Vec::new(), Vec::new());
                 }
             }
         } else {
@@ -1676,7 +1693,11 @@ impl DagActor {
                     n_lookups = resolved.lookups.len(),
                     "CA resolve: rewrote placeholders + collapsed inputSrcs for dispatch"
                 );
-                (resolved.drv_content, resolved.lookups)
+                (
+                    resolved.drv_content,
+                    resolved.lookups,
+                    resolved.output_paths,
+                )
             }
             Err(e) => {
                 // Swallow-to-warn for ALL ResolveError variants,
@@ -1702,7 +1723,7 @@ impl DagActor {
                 // Return the (possibly fetched-from-store) bytes
                 // unresolved. If the fetch succeeded but resolve
                 // failed, the worker at least skips its own GetPath.
-                (drv_content, Vec::new())
+                (drv_content, Vec::new(), Vec::new())
             }
         }
     }

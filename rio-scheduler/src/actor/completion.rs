@@ -921,7 +921,7 @@ impl DagActor {
 
     /// Phase 2: realisation insert. Best-effort — PG blip degrades
     /// CA-on-CA resolve, not the build itself.
-    // r[impl sched.ca.resolve+2]
+    // r[impl sched.ca.resolve+3]
     async fn ca_insert_realisations(
         &self,
         drv_hash: &DrvHash,
@@ -947,8 +947,14 @@ impl DagActor {
         // (after the companion fix), giving PG time to recover. The
         // in-mem transition to Completed already happened; a missing
         // realisation degrades CA-on-CA resolve, not the build itself.
+        //
+        // Gate on `is_ca || needs_resolve`: deferred-IA (`is_ca=false`,
+        // `needs_resolve=true`) ALSO needs a realisation row — the
+        // .drv on disk has `path=""`, so the gateway's
+        // `wopQueryDerivationOutputMap` realisation-lookup is the only
+        // way the client learns the post-resolve output path.
         if let Some(state) = self.dag.node(drv_hash)
-            && state.ca.is_ca
+            && (state.ca.is_ca || state.ca.needs_resolve)
             && let Some(modular_hash) = state.ca.modular_hash
         {
             // Log the hash in the same hex-encoding the gateway's
@@ -1300,7 +1306,7 @@ impl DagActor {
     /// `pending_realisation_deps` (recorded at dispatch-time CA-on-CA
     /// resolve) into PG. Best-effort — `realisation_deps` is rio's
     /// derived-build-trace cache, not correctness-critical.
-    // r[impl sched.ca.resolve+2]
+    // r[impl sched.ca.resolve+3]
     async fn ca_insert_realisation_deps(
         &mut self,
         drv_hash: &DrvHash,

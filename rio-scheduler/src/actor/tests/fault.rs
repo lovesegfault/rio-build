@@ -79,10 +79,14 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
     let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux").await?;
     // Pad worker (statically-eligible — same system) so the fleet-
     // exhaustion clamp doesn't poison after a single failure; we need
-    // the retry-persist branch. running_build=Some keeps it at-capacity
-    // so dispatch deterministically picks tfault-worker.
+    // the retry-persist branch. store_degraded keeps it ineligible for
+    // dispatch (rejection_reason → "store-degraded") while still
+    // counting toward `statically_eligible` fleet size. NOT
+    // `running_build=Some("busy")`: heartbeat reconcile resolves the
+    // path against the DAG and "busy" → None → pad becomes idle →
+    // dispatch may pick it (HashMap-order-dependent flake).
     let _pad = connect_executor_with(&handle, "tfault-pad", "x86_64-linux", true, |hb| {
-        hb.running_build = Some("busy".into());
+        hb.store_degraded = true;
     })
     .await?;
 

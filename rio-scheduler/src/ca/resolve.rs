@@ -22,12 +22,12 @@
 //! scheduler computes from its own `realisations` table. It never
 //! crosses the wire; `wopRegisterDrvOutput`'s `dependentRealisations`
 //! field is always `{}` from current Nix (ADR-018 Finding).
-// r[impl sched.ca.resolve+2]
+// r[impl sched.ca.resolve+3]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rio_nix::derivation::{BasicDerivation, Derivation, DerivationError};
-use rio_nix::store_path::{StorePath, StorePathError, nixbase32};
+use rio_nix::store_path::{StorePath, StorePathError, nixbase32, output_path_name};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use thiserror::Error;
@@ -159,6 +159,14 @@ pub struct ResolvedDerivation {
     /// Every `(dep_modular_hash, dep_output_name) → realized_path`
     /// lookup that succeeded. Fed to [`insert_realisation_deps`].
     pub lookups: Vec<RealisationLookup>,
+    /// `(output_name, store_path)` for every deferred-IA output whose
+    /// path was computed post-resolve via
+    /// [`BasicDerivation::fill_deferred_outputs`]. Empty for
+    /// floating-CA-self (its outputs stay `""` — nix-daemon computes
+    /// scratch paths) and for concrete IA. Dispatch overwrites
+    /// `state.expected_output_paths` from this so the HMAC
+    /// `expected_outputs` claim carries the real path, not `""`.
+    pub output_paths: Vec<(String, String)>,
 }
 
 /// Compute the Nix `DownstreamPlaceholder` rendering for an input
@@ -189,18 +197,10 @@ pub fn downstream_placeholder(drv_path: &StorePath, output_name: &str) -> String
         .strip_suffix(".drv")
         .unwrap_or(drv_path.name());
 
-    // outputPathName: `name` for "out", `name-outputName` otherwise.
-    // Matches `derivation-common.cc:outputPathName`.
-    let output_path_name = if output_name == "out" {
-        drv_name.to_string()
-    } else {
-        format!("{drv_name}-{output_name}")
-    };
-
     let cleartext = format!(
         "nix-upstream-output:{}:{}",
         drv_path.hash_part(),
-        output_path_name
+        output_path_name(drv_name, output_name)
     );
     let hash: [u8; 32] = Sha256::digest(cleartext.as_bytes()).into();
     format!("/{}", nixbase32::encode(&hash))
@@ -350,11 +350,26 @@ pub async fn resolve_ca_inputs(
         // (the `inputDrvs` value set). Most IA derivations have a
         // single `"out"` so this is a 1:1 pass; multi-output (dev,
         // doc, lib) get filtered here.
+        //
+        // ALSO record a placeholder→path rewrite. For concrete-IA
+        // inputs the placeholder doesn't appear in the parent ATerm
+        // (env already has the literal path) so the replace is a
+        // no-op. For DEFERRED-IA inputs (IA-on-IA-on-CA chains —
+        // ca-chain.nix iaLevels≥2) the parent's env carries the
+        // placeholder exactly like a CA input would, and Nix's
+        // `tryResolveInput` (`derivations.cc:1221`) performs the same
+        // `rewrites.emplace` for every input, CA or not. Skip empty
+        // paths (deferred child not yet completed → no rewrite
+        // available; the parent's resolve will retry).
+        let input_sp = StorePath::parse(input_drv_path)?;
         for (i, name) in ia.output_names.iter().enumerate() {
             if wanted_names.contains(name)
                 && let Some(path) = ia.output_paths.get(i)
             {
                 new_input_srcs.push(path.clone());
+                if !path.is_empty() {
+                    rewrites.insert(downstream_placeholder(&input_sp, name), path.clone());
+                }
             }
         }
     }
@@ -388,21 +403,41 @@ pub async fn resolve_ca_inputs(
     // path (CA realized + IA expected, both collected above).
 
     let n_input_srcs_added = new_input_srcs.len();
+    let mut basic = BasicDerivation::from_resolved(&rewritten_drv, new_input_srcs);
 
-    // Serialize with inputDrvs unconditionally empty and inputSrcs
-    // expanded with both CA realized paths and IA expected paths.
-    let resolved_aterm = serialize_resolved(&rewritten_drv, new_input_srcs);
+    // Phase 2 — own-output path fill for deferred-IA. After inputDrvs
+    // collapse, a deferred-IA's `outputs[i].path` and `env[out_name]`
+    // are both still `""`; nix-daemon takes that literally → build
+    // runs with `$out=""`. Nix's post-tryResolve step rehashes the
+    // resolved drv (`hashDerivationModulo(resolved, mask=true)`) and
+    // calls `makeOutputPath` per output. `fill_deferred_outputs` does
+    // exactly that, leaving floating-CA outputs untouched (nix-daemon
+    // computes their scratch paths internally from hash_algo).
+    //
+    // `drv_name` from env: `derivationStrict` always sets `env.name`.
+    // Only consulted when an output is actually deferred-IA, so
+    // floating-CA-self resolves with no `name` env still succeed.
+    let drv_name = rewritten_drv
+        .env()
+        .get("name")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let output_paths = basic.fill_deferred_outputs(drv_name)?;
+
+    let resolved_aterm = basic.to_aterm();
 
     debug!(
         n_rewrites = rewrites.len(),
         n_lookups = lookups.len(),
         n_input_srcs_added,
+        n_outputs_filled = output_paths.len(),
         "CA resolve complete"
     );
 
     Ok(ResolvedDerivation {
         drv_content: resolved_aterm.into_bytes(),
         lookups,
+        output_paths,
     })
 }
 
@@ -744,22 +779,6 @@ pub async fn insert_realisation_batch(
     Ok(result.rows_affected())
 }
 
-/// Serialize a resolved derivation back to ATerm with `inputDrvs`
-/// unconditionally emptied and `extra_input_srcs` merged into the
-/// existing `inputSrcs` set.
-///
-/// Per Nix's `tryResolve` (`derivations.cc:1204`), the resolved
-/// derivation is a `BasicDerivation` — `inputDrvs` is NOT a
-/// `BasicDerivation` field, so the slice-copy
-/// `BasicDerivation resolved{*this}` drops it entirely. Both CA AND
-/// IA entries are gone. ADR-018 Appendix B step 3.
-fn serialize_resolved(
-    drv: &Derivation,
-    extra_input_srcs: impl IntoIterator<Item = String>,
-) -> String {
-    BasicDerivation::from_resolved(drv, extra_input_srcs).to_aterm()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -769,7 +788,7 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    // r[verify sched.ca.resolve+2]
+    // r[verify sched.ca.resolve+3]
     /// Golden value from upstream Nix's own unit test
     /// (`nix/src/libstore-tests/downstream-placeholder.cc:16-20`):
     ///
@@ -858,7 +877,7 @@ mod tests {
         assert_eq!(p, expected);
     }
 
-    // r[verify sched.ca.resolve+2]
+    // r[verify sched.ca.resolve+3]
     /// CA drv with one CA inputDrv. Mock realisations table returns
     /// the realized path. Assert resolved drv has the realized path
     /// in inputSrcs, placeholder is gone from env, and the
@@ -995,6 +1014,129 @@ mod tests {
         Ok(())
     }
 
+    // r[verify sched.ca.resolve+3]
+    /// Deferred-IA on CA input: parent output is `("out","","","")`
+    /// (no `hash_algo` — Nix's `DerivationOutput::Deferred`). After
+    /// `resolve_ca_inputs`, the parent's own `$out` MUST be a real
+    /// store path in BOTH `outputs[0].path` and `env["out"]`, and
+    /// `ResolvedDerivation.output_paths` must surface it for the
+    /// dispatch-side `expected_output_paths` overwrite.
+    ///
+    /// Regression: pre-fix, `resolve_ca_inputs` only did phase 1
+    /// (input collapse + placeholder rewrite); the resolved ATerm
+    /// still had `("out","","","")` and `env["out"]=""` → builder
+    /// ran with `$out=""` → `mkdir -p $out` → busybox usage error.
+    #[tokio::test]
+    async fn resolve_fills_deferred_ia_out() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let input_modular: [u8; 32] = [0x11; 32];
+        let realized_path = "/nix/store/22222222222222222222222222222222-dep-out";
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(input_modular.as_slice())
+        .bind(realized_path)
+        .bind([0x33u8; 32].as_slice())
+        .execute(&db.pool)
+        .await?;
+
+        let input_drv_path = "/nix/store/44444444444444444444444444444444-dep.drv";
+        let input_sp = StorePath::parse(input_drv_path)?;
+        let placeholder = downstream_placeholder(&input_sp, "out");
+
+        // Deferred-IA parent: ("out","","","") — no hash_algo, no path.
+        let parent_aterm = format!(
+            r#"Derive([("out","","","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","parent"),("out",""),("system","x86_64-linux")])"#
+        );
+
+        let ca_inputs = vec![CaResolveInput {
+            drv_path: input_drv_path.into(),
+            modular_hash: input_modular,
+            output_names: vec!["out".into()],
+        }];
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool).await?;
+
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+
+        // The fix: own output path is computed and written into both
+        // outputs[0].path and env["out"].
+        let out_path = reparsed.outputs()[0].path();
+        assert!(
+            out_path.starts_with("/nix/store/") && out_path.ends_with("-parent"),
+            "deferred-IA $out must be filled post-resolve; got {out_path:?}"
+        );
+        assert_eq!(
+            reparsed.env().get("out").map(String::as_str),
+            Some(out_path),
+            "env[\"out\"] must match outputs[0].path"
+        );
+        // Surfaced for dispatch's expected_output_paths overwrite.
+        assert_eq!(
+            resolved.output_paths,
+            vec![("out".to_string(), out_path.to_string())]
+        );
+        // Phase 1 still happened: input placeholder rewritten,
+        // inputDrvs collapsed.
+        assert_eq!(
+            reparsed.env().get("DEP").map(String::as_str),
+            Some(realized_path)
+        );
+        assert!(reparsed.input_drvs().is_empty());
+        assert!(reparsed.input_srcs().contains(realized_path));
+        Ok(())
+    }
+
+    /// Floating-CA-self with a CA input: `("out","","sha256","")`.
+    /// `fill_deferred_outputs` must leave it alone — nix-daemon
+    /// computes the scratch path internally from `hash_algo`.
+    /// `output_paths` stays empty so dispatch doesn't clobber
+    /// `expected_output_paths` with a wrong value.
+    #[tokio::test]
+    async fn resolve_floating_ca_self_leaves_out_empty() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let input_modular: [u8; 32] = [0x11; 32];
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+             VALUES ($1, 'out', '/nix/store/22222222222222222222222222222222-dep', $2)",
+        )
+        .bind(input_modular.as_slice())
+        .bind([0x33u8; 32].as_slice())
+        .execute(&db.pool)
+        .await?;
+
+        let input_drv_path = "/nix/store/44444444444444444444444444444444-dep.drv";
+        let placeholder = downstream_placeholder(&StorePath::parse(input_drv_path)?, "out");
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",[],[("DEP","{placeholder}"),("name","parent"),("out","")])"#
+        );
+
+        let ca_inputs = vec![CaResolveInput {
+            drv_path: input_drv_path.into(),
+            modular_hash: input_modular,
+            output_names: vec!["out".into()],
+        }];
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool).await?;
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+
+        assert_eq!(
+            reparsed.outputs()[0].path(),
+            "",
+            "floating-CA output path must stay empty for nix-daemon scratch handling"
+        );
+        assert!(
+            resolved.output_paths.is_empty(),
+            "floating-CA → no output_paths surfaced"
+        );
+        Ok(())
+    }
+
     /// Missing realisation → `RealisationMissing` error. The parent
     /// should be deferred and redispatched after the input's
     /// realisation lands.
@@ -1052,18 +1194,13 @@ mod tests {
         Ok(())
     }
 
-    // r[verify sched.ca.resolve+2]
-    /// `serialize_resolved` drops ALL `inputDrvs` (CA and IA alike)
-    /// and merges `inputSrcs` in sorted order — matching Nix's
-    /// `BasicDerivation resolved{*this}` slice-copy semantics
+    // r[verify sched.ca.resolve+3]
+    /// `BasicDerivation::from_resolved` drops ALL `inputDrvs` (CA and
+    /// IA alike) and merges `inputSrcs` in sorted order — matching
+    /// Nix's `BasicDerivation resolved{*this}` slice-copy semantics
     /// (`derivations.cc:1204`, ADR-018 Appendix B step 3).
-    ///
-    /// This test exercises `serialize_resolved` directly (not the
-    /// full `resolve_ca_inputs`). The caller is responsible for
-    /// passing both CA realized paths AND IA expected paths via
-    /// `extra_input_srcs`; serialize_resolved merges them all.
     #[test]
-    fn serialize_resolved_drops_all_inputdrvs() -> anyhow::Result<()> {
+    fn from_resolved_drops_all_inputdrvs() -> anyhow::Result<()> {
         // Parent with TWO inputDrvs: one CA, one IA. Both must be
         // dropped. Both the realized CA path AND the IA expected
         // path land in inputSrcs (caller passes both).
@@ -1071,10 +1208,11 @@ mod tests {
         let drv = Derivation::parse(aterm)?;
 
         // Caller-collected: realized CA path + IA expected path.
-        let resolved = serialize_resolved(
+        let resolved = BasicDerivation::from_resolved(
             &drv,
             ["/nix/store/ccc-realized", "/nix/store/ddd-ia-out"].map(String::from),
-        );
+        )
+        .to_aterm();
 
         let reparsed = Derivation::parse(&resolved)?;
         // ALL inputDrvs dropped — resolved derivation is a
@@ -1100,11 +1238,12 @@ mod tests {
     /// replacement + realized path in `inputSrcs` + empty `inputDrvs`.
     /// This is the minimal `tryResolve` shape.
     #[test]
-    fn serialize_resolved_ca_only() -> anyhow::Result<()> {
+    fn from_resolved_ca_only() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","","sha256","")],[("/nix/store/aaa-ca.drv",["out"])],["/nix/store/orig-src"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#;
         let drv = Derivation::parse(aterm)?;
 
-        let resolved = serialize_resolved(&drv, ["/nix/store/realized-ca".to_string()]);
+        let resolved =
+            BasicDerivation::from_resolved(&drv, ["/nix/store/realized-ca".to_string()]).to_aterm();
 
         let reparsed = Derivation::parse(&resolved)?;
         assert!(reparsed.input_drvs().is_empty());
@@ -1113,7 +1252,7 @@ mod tests {
         Ok(())
     }
 
-    // r[verify sched.ca.resolve+2]
+    // r[verify sched.ca.resolve+3]
     /// End-to-end CA+IA resolve: parent with one CA input and one IA
     /// input. After `resolve_ca_inputs`:
     ///
@@ -1350,7 +1489,7 @@ mod tests {
     //   DAG expected_output_paths), so a byte-for-byte compare
     //   against a Nix-generated resolved .drv is meaningful. The
     //   remaining diff would only be inputSrcs ordering, which
-    //   serialize_resolved already sorts canonically. ADR-018
+    //   BasicDerivation::from_resolved already sorts canonically. ADR-018
     //   Appendix B captures the transformation but no byte-exact
     //   fixture exists yet. Adjacent golden-fixture work: P0311-T62
     //   (downstream_placeholder golden — landed above as

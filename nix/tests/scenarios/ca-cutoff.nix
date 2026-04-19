@@ -46,17 +46,20 @@ pkgs.testers.runNixOSTest {
 
     store_url = "ssh-ng://${gatewayHost}"
 
-    def build_ca_chain(marker):
+    def build_ca_chain(marker, ia_levels=0, sleep_secs=8):
         """Build the floating-CA A→B→C chain. marker goes into the
         ATerm env (distinct drv hashes across calls) but NOT into
         $out/chain (identical nar_hash → cutoff fires). --impure for
-        builtins.currentSystem in ca-chain.nix."""
+        builtins.currentSystem in ca-chain.nix. ia_levels stacks N
+        deferred-IA steps above the CA chain."""
         try:
             return client.succeed(
                 "nix-build --no-out-link --impure "
                 f"--store '{store_url}' "
                 "--arg busybox '(builtins.storePath ${common.busybox})' "
                 f"--argstr marker '{marker}' "
+                f"--arg iaLevels {ia_levels} "
+                f"--arg sleepSecs {sleep_secs} "
                 "${drvs.caChain} 2>&1"
             )
         except Exception:
@@ -137,21 +140,41 @@ pkgs.testers.runNixOSTest {
             f"(same content → same CA path); got {path1!r} vs {path2!r}"
         )
 
-    # TODO: ia.deferred end-to-end (build_ca_chain("ia2", ia_levels=2,
-    # sleep_secs=1)). The gateway side is fixed (populate_needs_resolve
-    # uses has_unknown_output_paths — see translate.rs unit test
-    # populate_needs_resolve_ia_deferred_chain), but the scheduler-side
-    # maybe_resolve_ca (dispatch.rs) does not yet compute the deferred-IA
-    # $out path post-resolve: the level-1 IA step builds with $out=""
-    # → busybox mkdir prints usage. iaFinal=true was never wired before
-    # so this never ran end-to-end. Wire the subtest below once the
-    # scheduler computes the IA output path after input resolution; the
-    # ca-chain.nix iaLevels arg is ready.
-    #
-    #     with subtest("ia-deferred-2-level: IA-on-IA-on-CA resolves"):
-    #         out_ia = build_ca_chain("ia2", ia_levels=2, sleep_secs=1)
-    #         assert "/nix/store/" in out_ia
-    #         assert " /1" not in out_ia
+    # ══════════════════════════════════════════════════════════════════
+    # ia.deferred: IA-on-CA. C is input-addressed with floating-CA B as
+    # input — C's own $out is empty in the ATerm (DerivationOutput::
+    # Deferred). The scheduler must compute it post-resolve via
+    # makeOutputPath; without that the build runs with $out="" and
+    # `mkdir -p $out` prints busybox usage. ia_levels=2 additionally
+    # stacks D (IA-on-deferred-IA) — regression target for the gateway's
+    # has_unknown_output_paths predicate (translate.rs).
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("ia-deferred: IA-on-CA builds with computed $out"):
+        out_ia1 = build_ca_chain("ia1", ia_levels=1, sleep_secs=1)
+        path_c = next(
+            (ln for ln in out_ia1.splitlines() if ln.startswith("/nix/store/")),
+            None,
+        )
+        assert path_c and "rio-ia-c" in path_c, (
+            "deferred-IA C should produce a concrete rio-ia-c store path; "
+            f"got output:\n{out_ia1[-400:]}"
+        )
+
+    with subtest("ia-deferred-2-level: IA-on-IA-on-CA resolves"):
+        out_ia2 = build_ca_chain("ia2", ia_levels=2, sleep_secs=1)
+        path_d = next(
+            (ln for ln in out_ia2.splitlines() if ln.startswith("/nix/store/")),
+            None,
+        )
+        assert path_d and "rio-ia-d" in path_d, (
+            "deferred-IA D should produce a concrete rio-ia-d store path; "
+            f"got output:\n{out_ia2[-400:]}"
+        )
+        # No unresolved /1<hash> placeholder leaked into the build log.
+        assert " /1" not in out_ia2, (
+            "unresolved downstream-placeholder leaked into IA build "
+            f"output:\n{out_ia2[-400:]}"
+        )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

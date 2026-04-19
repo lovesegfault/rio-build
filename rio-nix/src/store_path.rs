@@ -30,6 +30,20 @@ pub const HASH_BYTES: usize = 20;
 /// Maximum length of the name component (from Nix source).
 pub const MAX_NAME_LEN: usize = 211;
 
+/// Compute the store-path name for a derivation output.
+///
+/// Nix `outputPathName` (`derivations.cc`): `drv_name` for the `"out"`
+/// output, `{drv_name}-{output_name}` for any other output. This is the
+/// `name` component of the resulting store path (the part after the
+/// 32-char hash and dash).
+pub fn output_path_name(drv_name: &str, output_name: &str) -> String {
+    if output_name == "out" {
+        drv_name.to_owned()
+    } else {
+        format!("{drv_name}-{output_name}")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorePathError {
     #[error("path does not start with {STORE_DIR}/")]
@@ -246,6 +260,36 @@ impl StorePath {
             hex::encode(inner_digest),
         );
         Self::from_fingerprint(name, &fingerprint)
+    }
+
+    /// Compute the store path for an input-addressed derivation output.
+    ///
+    /// Nix `StoreDirConfig::makeOutputPath` (`store-dir-config.cc`):
+    ///
+    /// ```text
+    /// fingerprint = "output:{id}:sha256:{hex(hash)}:/nix/store:{outputPathName(name, id)}"
+    /// pathHash = compressHash(SHA-256(fingerprint), 20)
+    /// ```
+    ///
+    /// `drv_hash` is the 32-byte SHA-256 from `hashDerivationModulo` —
+    /// the value Nix uses to derive every IA output path. For a
+    /// **resolved** `BasicDerivation` (`inputDrvs = []`, deferred
+    /// outputs already masked to `path=""` / `env[out]=""`), this is
+    /// simply `Sha256(drv.to_aterm())` — see
+    /// [`BasicDerivation::fill_deferred_outputs`].
+    ///
+    /// [`BasicDerivation::fill_deferred_outputs`]: crate::derivation::BasicDerivation::fill_deferred_outputs
+    pub fn make_output(
+        output_name: &str,
+        drv_hash: &[u8; 32],
+        drv_name: &str,
+    ) -> Result<Self, StorePathError> {
+        let name = output_path_name(drv_name, output_name);
+        let fingerprint = format!(
+            "output:{output_name}:sha256:{}:{STORE_DIR}:{name}",
+            hex::encode(drv_hash),
+        );
+        Self::from_fingerprint(&name, &fingerprint)
     }
 
     /// Compute the store path for a text file (used by `builtins.toFile`).
@@ -747,6 +791,54 @@ mod tests {
             "make_text must be insensitive to caller ref ordering"
         );
         assert_eq!(p_sorted.name(), "mytext");
+        Ok(())
+    }
+
+    #[test]
+    fn test_output_path_name_out_vs_named() {
+        assert_eq!(output_path_name("hello", "out"), "hello");
+        assert_eq!(output_path_name("hello", "dev"), "hello-dev");
+        assert_eq!(output_path_name("hello", "lib"), "hello-lib");
+    }
+
+    /// `make_output` formula proof: rebuild the fingerprint by hand
+    /// and assert `from_fingerprint` agrees. Catches regressions in
+    /// the `output:{id}:sha256:{hex}:...` shape (vs the inner-hash
+    /// `make_fixed_output` shape, which uses `output:out` literally).
+    #[test]
+    fn test_make_output_formula() -> anyhow::Result<()> {
+        let drv_hash = [0x42u8; 32];
+        let p = StorePath::make_output("dev", &drv_hash, "hello")?;
+        let expected = StorePath::from_fingerprint(
+            "hello-dev",
+            &format!(
+                "output:dev:sha256:{}:/nix/store:hello-dev",
+                hex::encode(drv_hash)
+            ),
+        )?;
+        assert_eq!(p, expected);
+        assert_eq!(p.name(), "hello-dev");
+        // "out" → bare drv_name, and the id in the fingerprint is "out".
+        let p_out = StorePath::make_output("out", &drv_hash, "hello")?;
+        assert_eq!(p_out.name(), "hello");
+        assert_ne!(p, p_out, "different output names → different paths");
+        Ok(())
+    }
+
+    /// Golden against real Nix: `nix-instantiate --expr 'derivation
+    /// { name="g"; system="x86_64-linux"; builder="/bin/sh"; }'`
+    /// yields `outputs.out.path = j2lgnh3rczrp15ls9sfk074jsn4s97n5-g`.
+    /// `hashDerivationModulo` of a leaf IA with no inputDrvs is just
+    /// SHA-256 of the ATerm with own-output paths masked to `""`.
+    /// Catches hex-encoding / fingerprint-format drift that the
+    /// formula test above can't.
+    #[test]
+    fn test_make_output_golden() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let masked = r#"Derive([("out","","","")],[],[],"x86_64-linux","/bin/sh",[],[("builder","/bin/sh"),("name","g"),("out",""),("system","x86_64-linux")])"#;
+        let drv_hash: [u8; 32] = Sha256::digest(masked.as_bytes()).into();
+        let p = StorePath::make_output("out", &drv_hash, "g")?;
+        assert_eq!(p.as_str(), "/nix/store/j2lgnh3rczrp15ls9sfk074jsn4s97n5-g");
         Ok(())
     }
 

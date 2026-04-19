@@ -55,6 +55,9 @@ pub enum DerivationError {
 
     #[error("derivation content is not valid UTF-8: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
+
+    #[error("computed output path is invalid: {0}")]
+    InvalidOutputPath(#[from] crate::store_path::StorePathError),
 }
 
 /// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).
@@ -388,6 +391,61 @@ impl BasicDerivation {
         basic
     }
 
+    /// Compute and fill the store path for every deferred-IA output
+    /// (`path == "" && hash_algo == ""`). Writes the computed path
+    /// into both `outputs[i].path` AND `env[outputs[i].name]` —
+    /// matching Nix's post-`tryResolve` rehash step
+    /// (`derivation-resolution-goal.cc`).
+    ///
+    /// Returns the `(name, path)` pairs that were filled. Empty when
+    /// no output is deferred-IA — i.e., floating-CA outputs
+    /// (`hash_algo` set, path empty) and concrete IA outputs (path
+    /// already set) are left untouched.
+    ///
+    /// **Precondition:** `self` must be a *resolved* `BasicDerivation`
+    /// — `inputDrvs` already collapsed into `inputSrcs` and
+    /// placeholders rewritten. Under that precondition, with deferred
+    /// outputs already at `path=""` / `env[name]=""`,
+    /// `Sha256(self.to_aterm())` is byte-identical to Nix's
+    /// `hashDerivationModulo(resolved, maskOutputs=true)`: the modulo
+    /// machinery (a) replaces each `inputDrv` key with its modular
+    /// hash — vacuous when `inputDrvs=[]`; and (b) masks own-output
+    /// paths to `""` — already true for deferred outputs by
+    /// construction. So no separate masking pass is needed.
+    pub fn fill_deferred_outputs(
+        &mut self,
+        drv_name: &str,
+    ) -> Result<Vec<(String, String)>, DerivationError> {
+        // Find deferred-IA outputs first. Floating-CA (hash_algo set,
+        // path empty) MUST stay empty — nix-daemon computes a scratch
+        // path internally for those. Concrete IA (path already set)
+        // needs no fill.
+        let deferred: Vec<usize> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.path.is_empty() && o.hash_algo.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if deferred.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        use crate::store_path::StorePath;
+        use sha2::{Digest, Sha256};
+        let drv_hash: [u8; 32] = Sha256::digest(self.to_aterm().as_bytes()).into();
+
+        let mut filled = Vec::with_capacity(deferred.len());
+        for i in deferred {
+            let out_name = self.outputs[i].name.clone();
+            let path = StorePath::make_output(&out_name, &drv_hash, drv_name)?.to_string();
+            self.outputs[i].path = path.clone();
+            self.env.insert(out_name.clone(), path.clone());
+            filled.push((out_name, path));
+        }
+        Ok(filled)
+    }
+
     /// The derivation outputs.
     pub fn outputs(&self) -> &[DerivationOutput] {
         &self.outputs
@@ -449,6 +507,94 @@ mod tests {
         assert_eq!(basic.builder(), "/bin/bash");
         assert_eq!(basic.args(), &["-e", "script.sh"]);
         assert_eq!(basic.env().get("name").unwrap(), "hello");
+        Ok(())
+    }
+
+    fn mk_basic(outs: Vec<DerivationOutput>, env: &[(&str, &str)]) -> BasicDerivation {
+        BasicDerivation::new(
+            outs,
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            env.iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fill_deferred_outputs_ia() -> anyhow::Result<()> {
+        let mut basic = mk_basic(
+            vec![DerivationOutput::new("out", "", "", "")?],
+            &[("name", "p"), ("out", "")],
+        );
+        let filled = basic.fill_deferred_outputs("p")?;
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].0, "out");
+        let path = &filled[0].1;
+        assert!(path.starts_with("/nix/store/"), "got {path}");
+        assert!(path.ends_with("-p"), "got {path}");
+        assert_eq!(basic.outputs()[0].path(), path.as_str());
+        assert_eq!(
+            basic.env().get("out").map(String::as_str),
+            Some(path.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_deferred_outputs_floating_ca_noop() -> anyhow::Result<()> {
+        // Floating-CA: hash_algo set, hash empty, path empty. nix-daemon
+        // computes a scratch path internally — must NOT be filled here.
+        let mut basic = mk_basic(
+            vec![DerivationOutput::new("out", "", "r:sha256", "")?],
+            &[("name", "p"), ("out", "")],
+        );
+        let filled = basic.fill_deferred_outputs("p")?;
+        assert!(filled.is_empty(), "floating-CA must not be filled");
+        assert_eq!(basic.outputs()[0].path(), "");
+        assert_eq!(basic.env().get("out").map(String::as_str), Some(""));
+        Ok(())
+    }
+
+    #[test]
+    fn fill_deferred_outputs_concrete_ia_noop() -> anyhow::Result<()> {
+        let known = "/nix/store/00000000000000000000000000000000-p";
+        let mut basic = mk_basic(
+            vec![DerivationOutput::new("out", known, "", "")?],
+            &[("name", "p"), ("out", known)],
+        );
+        let filled = basic.fill_deferred_outputs("p")?;
+        assert!(filled.is_empty(), "concrete IA must not be re-filled");
+        assert_eq!(basic.outputs()[0].path(), known);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_deferred_outputs_multi() -> anyhow::Result<()> {
+        let mut basic = mk_basic(
+            vec![
+                DerivationOutput::new("dev", "", "", "")?,
+                DerivationOutput::new("out", "", "", "")?,
+            ],
+            &[("dev", ""), ("name", "p"), ("out", "")],
+        );
+        let filled = basic.fill_deferred_outputs("p")?;
+        assert_eq!(filled.len(), 2);
+        let (dev, out) = (&filled[0].1, &filled[1].1);
+        assert_ne!(dev, out, "distinct outputs → distinct paths");
+        assert!(dev.ends_with("-p-dev"));
+        assert!(out.ends_with("-p"));
+        assert_eq!(
+            basic.env().get("dev").map(String::as_str),
+            Some(dev.as_str())
+        );
+        assert_eq!(
+            basic.env().get("out").map(String::as_str),
+            Some(out.as_str())
+        );
         Ok(())
     }
 
