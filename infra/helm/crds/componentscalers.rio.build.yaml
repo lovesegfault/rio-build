@@ -147,6 +147,9 @@ spec:
             - replicas
             - targetRef
             type: object
+            x-kubernetes-validations:
+            - message: loadEndpoint must be host:port (e.g. rio-store-headless.rio-store:9002)
+              rule: self.loadEndpoint.matches('^.+:[0-9]{1,5}$')
           status:
             description: "ComponentScaler status. The reconciler writes ALL fields\
               \ (single\nSSA field-manager \u2014 there's no separate autoscaler task\

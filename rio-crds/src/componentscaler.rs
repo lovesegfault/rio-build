@@ -155,6 +155,11 @@ fn default_seed_ratio() -> f64 {
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[x_kube(
+    validation = Rule::new("self.loadEndpoint.matches('^.+:[0-9]{1,5}$')").message(
+        "loadEndpoint must be host:port (e.g. rio-store-headless.rio-store:9002)"
+    )
+)]
 pub struct ComponentScalerSpec {
     /// The Deployment to scale. Same-namespace.
     pub target_ref: TargetRef,
@@ -295,6 +300,10 @@ mod tests {
         assert!(
             json.contains("self.low < self.high"),
             "LoadThresholds CEL renders"
+        );
+        assert!(
+            json.contains("self.loadEndpoint.matches('^.+:[0-9]{1,5}$')"),
+            "loadEndpoint host:port CEL renders (bug_463: silent ratio-learn disable on malformed endpoint)"
         );
     }
 
