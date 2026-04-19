@@ -171,8 +171,10 @@ def _mark_done(done: Path, entry: dict) -> None:
 BATCH_SIZE = 32
 BATCH_WAIT_S = 2.0
 
-# Stall timeout for the niks3 subprocess. Not an upload budget — if
-# niks3 makes progress it won't hit this. Catches wedged subprocesses
+# Wall-clock cap on one `niks3 push` batch. subprocess.run(timeout=)
+# kills the child after this many seconds elapsed — it is NOT a stall
+# detector. Sized for BATCH_SIZE paths at CI-runner→cache bandwidth
+# with headroom; bump alongside BATCH_SIZE. Catches wedged subprocesses
 # (server hang, network black hole) that would otherwise wedge drain.
 PUSH_TIMEOUT_S = 300
 

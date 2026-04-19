@@ -54,7 +54,7 @@ const SWEEP_BATCH_SIZE: usize = 2;
 /// Long enough to cover a stalled-then-retried PutPath; short
 /// enough that a genuinely abandoned chunk leaks storage for only
 /// 5 minutes before the next sweep reaps it. Compare
-/// `orphan::STALE_THRESHOLD` (2h) — that's for stale `uploading`
+/// `orphan::STALE_THRESHOLD` (15min) — that's for stale `uploading`
 /// manifests, whose false-positive reaping is costlier (a whole
 /// NAR re-upload).
 ///

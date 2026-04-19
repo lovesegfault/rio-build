@@ -58,7 +58,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 > **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
 
-> **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 2h). See [store: GC](./components/store.md#two-phase-garbage-collection).
+> **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 15min). See [store: GC](./components/store.md#two-phase-garbage-collection).
 
 ## Builder
 
