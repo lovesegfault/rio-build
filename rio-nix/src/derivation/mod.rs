@@ -361,7 +361,7 @@ impl BasicDerivation {
         env: BTreeMap<String, String>,
     ) -> Result<Self, DerivationError> {
         if outputs.is_empty() {
-            return Err(DerivationError::EmptyOutputName(0));
+            return Err(DerivationError::NoOutputs);
         }
         Ok(BasicDerivation {
             outputs,
@@ -462,6 +462,9 @@ mod tests {
             vec![],
             std::collections::BTreeMap::new(),
         );
-        assert!(result.is_err());
+        // Variant matters: `EmptyOutputName(0)` describes a different
+        // failure (output[0].name == "") and would mislead anyone
+        // debugging a wopBuildDerivation wire codec sending count=0.
+        assert!(matches!(result, Err(DerivationError::NoOutputs)));
     }
 }
