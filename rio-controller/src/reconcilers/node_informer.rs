@@ -24,7 +24,7 @@
 //! images list — kilobytes each). We need three label strings. A
 //! hand-rolled `HashMap<String, HwClass>` is the lightweight version.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,6 +165,31 @@ impl NodeLabelCache {
         by_hw.into_iter().collect()
     }
 
+    /// Evict every cached entry whose name is NOT in `seen`, returning
+    /// each evicted spot entry's final exposure slice. Called on
+    /// `InitDone` after a watch-gap relist: the raw `watcher` does NOT
+    /// synthesize `Delete` for nodes gone during the gap, so without
+    /// this they linger and feed [`Self::drain_live_spot_exposure`]
+    /// ~60 phantom node-seconds/min forever — biasing λ\[h\] low and
+    /// `solve_full` toward spot. Mirrors the `Delete` arm's residual
+    /// flush so the evicted node's last slice still lands in the
+    /// denominator.
+    pub fn prune_absent(&self, seen: &HashSet<String>, now_epoch: f64) -> Vec<(String, f64)> {
+        let mut evicted = Vec::new();
+        self.0.write().retain(|name, m| {
+            if seen.contains(name) {
+                return true;
+            }
+            if m.capacity_type.as_deref() == Some("spot")
+                && let Some(last) = m.last_exposure_at
+            {
+                evicted.push((m.hw.as_string(), (now_epoch - last).max(0.0)));
+            }
+            false
+        });
+        evicted
+    }
+
     /// Current cache size. For the `rio_controller_node_cache_size`
     /// gauge and tests.
     pub fn len(&self) -> usize {
@@ -239,6 +264,10 @@ pub async fn run(
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Names seen between Init and InitDone. `Some` only during a
+    // relist; `None` during steady-state Apply/Delete.
+    let mut relist_seen: Option<HashSet<String>> = None;
+
     info!("Node informer started");
 
     loop {
@@ -268,12 +297,24 @@ pub async fn run(
         };
 
         // Apply/InitApply → upsert; Delete → remove. Init/InitDone
-        // are relist bookends — we don't buffer-and-swap (a node
-        // deleted during a watch-gap lingers until process restart;
-        // Karpenter node names are IP-derived and not reused, so the
-        // worst case is a bounded stale-entry leak, not a wrong join).
+        // bracket a relist: Init opens a seen-set, InitApply both
+        // upserts AND records the name, InitDone prunes any cached
+        // entry NOT re-seen. The raw watcher synthesizes no Delete
+        // for nodes gone during a watch gap; before the periodic
+        // drain_live_spot_exposure flush this was a harmless stale-
+        // entry leak (passive lookup), but now a leaked spot entry
+        // would feed phantom node-seconds into λ's denominator until
+        // controller restart.
         match event {
-            watcher::Event::Apply(node) | watcher::Event::InitApply(node) => {
+            watcher::Event::Apply(node) => {
+                cache.apply(&node);
+            }
+            watcher::Event::InitApply(node) => {
+                if let Some(seen) = relist_seen.as_mut()
+                    && let Some(name) = &node.metadata.name
+                {
+                    seen.insert(name.clone());
+                }
                 cache.apply(&node);
             }
             watcher::Event::Delete(node) => {
@@ -288,7 +329,16 @@ pub async fn run(
                 }
                 cache.delete(&node);
             }
-            watcher::Event::Init | watcher::Event::InitDone => {}
+            watcher::Event::Init => {
+                relist_seen = Some(HashSet::new());
+            }
+            watcher::Event::InitDone => {
+                if let Some(seen) = relist_seen.take() {
+                    for (hw, secs) in cache.prune_absent(&seen, now_epoch()) {
+                        report_exposure(&mut admin, hw, secs).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -627,6 +677,47 @@ mod tests {
         // full lifetime (periodic flush already banked 1000..1120).
         let (_, secs) = cache.spot_exposure("c", 1150.0).unwrap();
         assert!((secs - 30.0).abs() < 1e-6);
+    }
+
+    /// Watch-gap relist: a spot node deleted during the gap gets no
+    /// Delete event. `prune_absent` (called on InitDone) must evict it
+    /// — returning its final exposure slice — so it stops feeding
+    /// `drain_live_spot_exposure` phantom node-seconds.
+    #[test]
+    fn prune_absent_evicts_nodes_missing_from_relist() {
+        let cache = NodeLabelCache::default();
+        cache.apply(&spot_node("a", "7", 1000));
+        cache.apply(&spot_node("b", "7", 1000));
+        cache.apply(&spot_node("c", "6", 1020));
+        // On-demand: evicted but contributes no exposure slice.
+        let mut od = node("od", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
+        od.metadata.creation_timestamp = spot_node("x", "7", 1000).metadata.creation_timestamp;
+        cache.apply(&od);
+
+        // Periodic flush at t=1060 advances all cursors to 1060.
+        let _ = cache.drain_live_spot_exposure(1060.0);
+
+        // Relist at t=1090 saw only {a, c}. b and od deleted during
+        // the gap → prune. b's residual (1060..1090) is returned;
+        // od is not spot → no exposure slice.
+        let seen: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
+        let evicted = cache.prune_absent(&seen, 1090.0);
+        assert_eq!(evicted, vec![("unknown-7-ebs".into(), 30.0)]);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.hw_class_of("b").is_none());
+        assert!(cache.hw_class_of("od").is_none());
+
+        // Next periodic drain at t=1120: only survivors contribute —
+        // no phantom 60s from b.
+        let mut d = cache.drain_live_spot_exposure(1120.0);
+        d.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            d,
+            vec![
+                ("unknown-6-ebs".into(), 60.0),
+                ("unknown-7-ebs".into(), 60.0),
+            ]
+        );
     }
 
     fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {

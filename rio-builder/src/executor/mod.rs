@@ -278,6 +278,13 @@ pub struct ExecutionResult {
     /// usage_usec. `delta_usec / elapsed_usec`, max over build lifetime.
     /// Tree-wide. 0.0 = build failed before any sample (exited <1s).
     pub peak_cpu_cores: f64,
+    /// Project-quota `dqb_curspace` for the overlay upper dir, sampled
+    /// IMMEDIATELY BEFORE `teardown_overlay()`. `dqb_curspace` is
+    /// CURRENT bytes (not a kernel-tracked peak), so reading it after
+    /// teardown's `remove_dir_all` returns ≈0 — hence stash here
+    /// instead of in `cgroup::final_sample()`. `None` = no prjquota
+    /// (tmpfs / node without `-o prjquota`).
+    pub peak_disk_bytes: Option<u64>,
     /// `RIO_BUILDER_SCRIPT` override for `CompletionReport.final_resources`.
     /// `None` on every real build; `Some` only from
     /// `fixture::scripted_result` (feature `test-fixtures`). When set,
@@ -542,6 +549,14 @@ pub async fn execute_build(
     // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
     // centralized so ?-early-returns and panics also count); with one build
     // per pod a leaked mount is reclaimed when the pod is discarded.
+    //
+    // Sample prjquota BEFORE teardown — `dqb_curspace` is current bytes,
+    // and `remove_dir_all` of the upper dir drops it to ≈0. Stashed on
+    // ExecutionResult so `final_sample()` (which runs AFTER this returns)
+    // doesn't read post-teardown zero.
+    let peak_disk_bytes = crate::quota::peak_bytes(&env.overlay_base_dir)
+        .ok()
+        .flatten();
     let merged_path = overlay_mount.merged_dir().to_path_buf();
     if let Err(e) = overlay::teardown_overlay(overlay_mount) {
         tracing::error!(
@@ -558,6 +573,7 @@ pub async fn execute_build(
         assignment_token: assignment.assignment_token.clone(),
         peak_memory_bytes,
         peak_cpu_cores,
+        peak_disk_bytes,
         fixture_resources: None,
     })
 }

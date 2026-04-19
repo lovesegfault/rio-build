@@ -707,11 +707,17 @@ pub type ResourceSnapshotHandle =
 /// `memory_*`, `disk_*`) are left as-is from `prev`; they don't feed
 /// the SLA fit and a 10s-stale value there is harmless.
 ///
-/// Unreadable file → keeps `prev`'s value (matches the loop's
+/// `peak_disk_bytes` is supplied by the caller (sampled inside
+/// `execute_build` BEFORE `teardown_overlay`): `dqb_curspace` is
+/// CURRENT allocated bytes, not a kernel-tracked peak, so reading it
+/// here — after the overlay upper dir has been `remove_dir_all`ed —
+/// would return ≈0 and bias short-build `disk_p90` to zero.
+///
+/// Unreadable file / `None` → keeps `prev`'s value (matches the loop's
 /// degrade-silently semantics).
 pub fn final_sample(
     root: &Path,
-    overlay_base: &Path,
+    peak_disk_bytes: Option<u64>,
     prev: rio_proto::types::ResourceUsage,
 ) -> rio_proto::types::ResourceUsage {
     let cpu_seconds_total = fs::read_to_string(root.join("cpu.stat"))
@@ -724,9 +730,7 @@ pub fn final_sample(
         .and_then(|s| parse_io_pressure_some_avg10(&s))
         .map(|p| prev.peak_io_pressure_pct.map_or(p, |prev_p| prev_p.max(p)))
         .or(prev.peak_io_pressure_pct);
-    let peak_disk_bytes = crate::quota::peak_bytes(overlay_base)
-        .ok()
-        .flatten()
+    let peak_disk_bytes = peak_disk_bytes
         .map(|q| prev.peak_disk_bytes.map_or(q, |prev_q| prev_q.max(q)))
         .or(prev.peak_disk_bytes);
     rio_proto::types::ResourceUsage {
@@ -1196,10 +1200,11 @@ mod tests {
     }
 
     /// `final_sample` refreshes `cpu_seconds_total` from cpu.stat and
-    /// max-merges `peak_io_pressure_pct` against `prev` — the
-    /// completion-time read that closes the reporter loop's ≤10s
-    /// staleness window. `peak_disk_bytes` falls through to `prev` here
-    /// (tmpdir has no prjquota).
+    /// max-merges `peak_io_pressure_pct` / `peak_disk_bytes` against
+    /// `prev` — the completion-time read that closes the reporter
+    /// loop's ≤10s staleness window. `peak_disk_bytes` is caller-
+    /// supplied (sampled pre-teardown in `execute_build`; reading
+    /// quota here would see ≈0 after the upper dir is deleted).
     #[test]
     fn final_sample_refreshes_cpu_seconds_and_maxes_peaks() {
         let root = tempfile::tempdir().unwrap();
@@ -1221,7 +1226,8 @@ mod tests {
             cpu_fraction: 0.42,
             ..Default::default()
         };
-        let out = final_sample(root.path(), root.path(), prev);
+        // Pre-teardown sample (1200M) > prev (800M) → fresh wins.
+        let out = final_sample(root.path(), Some(1200 << 20), prev);
         assert_eq!(
             out.cpu_seconds_total,
             Some(120.0),
@@ -1234,16 +1240,22 @@ mod tests {
         );
         assert_eq!(
             out.peak_disk_bytes,
-            Some(800 << 20),
-            "no prjquota on tmpdir → prev preserved"
+            Some(1200 << 20),
+            "caller-supplied pre-teardown sample maxes against prev"
         );
         assert_eq!(out.cpu_fraction, 0.42, "heartbeat-only fields untouched");
 
-        // Unreadable root → all three fall through to prev.
+        // Unreadable root + None disk → all three fall through to prev.
         let nowhere = Path::new("/nonexistent/cgroup");
-        let out2 = final_sample(nowhere, nowhere, prev);
+        let out2 = final_sample(nowhere, None, prev);
         assert_eq!(out2.cpu_seconds_total, Some(108.0));
         assert_eq!(out2.peak_io_pressure_pct, Some(50.0));
         assert_eq!(out2.peak_disk_bytes, Some(800 << 20));
+
+        // prev=None + fresh nonzero → fresh (the short-build case the
+        // pre-teardown sample exists to fix: previously this wrote ≈0).
+        let prev_none = rio_proto::types::ResourceUsage::default();
+        let out3 = final_sample(nowhere, Some(600 << 20), prev_none);
+        assert_eq!(out3.peak_disk_bytes, Some(600 << 20));
     }
 }

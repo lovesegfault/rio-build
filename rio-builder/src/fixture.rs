@@ -106,6 +106,7 @@ pub fn scripted_result(
         assignment_token: assignment_token.to_string(),
         peak_memory_bytes: o.peak_mem,
         peak_cpu_cores: o.peak_cpu,
+        peak_disk_bytes: o.peak_disk,
         fixture_resources: Some(ResourceUsage {
             cpu_limit_cores: Some(f64::from(cpu_limit)),
             cpu_seconds_total: Some(o.cpu_seconds),

@@ -147,14 +147,20 @@ impl BuildSpawnContext {
     /// would systematically under-report into `build_samples`, biasing
     /// the SLA p̄ fit and disk_p90 low for short builds.
     /// [`cgroup::final_sample`] forces one synchronous read on top.
-    fn completion_stamp(&self) -> result::CompletionStamp {
+    ///
+    /// `peak_disk_bytes` is the prjquota sample `execute_build` took
+    /// BEFORE `teardown_overlay` — by the time this runs, the upper
+    /// dir is gone and `dqb_curspace` ≈ 0. `None` on the Err path
+    /// (no `ExecutionResult`); `final_sample` then returns `prev`'s
+    /// reporter-loop value, which is the best available.
+    fn completion_stamp(&self, peak_disk_bytes: Option<u64>) -> result::CompletionStamp {
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
             node_name: self.node_name.clone(),
             hw_class: self.hw_class.clone(),
             final_resources: Some(crate::cgroup::final_sample(
                 &self.cgroup_parent,
-                &self.overlay_base_dir,
+                peak_disk_bytes,
                 prev,
             )),
         }
@@ -314,7 +320,8 @@ pub async fn spawn_build_task(
         // is read BEFORE deciding the status — Acquire pairs with
         // try_cancel_build's Release (not strictly needed, no other state
         // to synchronize, but cheap and documents the pairing).
-        let stamp = ctx.completion_stamp();
+        let peak_disk_bytes = result.as_ref().ok().and_then(|r| r.peak_disk_bytes);
+        let stamp = ctx.completion_stamp(peak_disk_bytes);
         let completion = match result {
             Ok(exec_result) => ok_completion(exec_result, stamp),
             Err(e) => err_completion(
