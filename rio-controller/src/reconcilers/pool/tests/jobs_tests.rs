@@ -18,7 +18,7 @@ use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
-    SpawnOutcome, reap_excess_pending, spawn_for_each, try_spawn_job,
+    SpawnOutcome, is_active_job, reap_excess_pending, spawn_for_each, try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
 use rio_crds::pool::ExecutorKind;
@@ -416,10 +416,25 @@ async fn reap_stale_at_ceiling_saturation() {
         ),
     ]);
 
+    // ceiling=2, active=2 → pre-reap headroom=0.
+    let headroom = 2usize.saturating_sub(existing.iter().filter(|j| is_active_job(j)).count());
+    assert_eq!(headroom, 0);
     // Reap over the FULL intent set (NOT a headroom-truncated slice).
     let reaped =
         reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
     assert_eq!(reaped.len(), 2, "both drifted Pending reaped");
+    // Freed = reaped that were active → headroom=2 post-reap.
+    let freed = existing
+        .iter()
+        .filter(|j| {
+            is_active_job(j)
+                && j.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| reaped.contains(n))
+        })
+        .count();
+    let headroom = headroom + freed;
 
     // Skip-set = existing names minus reaped → empty → spawn fires
     // for both intents this tick.
@@ -428,7 +443,13 @@ async fn reap_stale_at_ceiling_saturation() {
         .filter_map(|j| j.metadata.name.clone())
         .filter(|n| !reaped.contains(n))
         .collect();
-    let spawned = spawn_for_each(&jobs_api, &intents, &skip, "p", |i| {
+    let to_spawn: Vec<_> = intents
+        .iter()
+        .filter(|i| !skip.contains(&format!("rio-builder-p-{}", i.intent_id)))
+        .take(headroom)
+        .cloned()
+        .collect();
+    let spawned = spawn_for_each(&jobs_api, &to_spawn, &skip, "p", |i| {
         Ok(Job {
             metadata: ObjectMeta {
                 name: Some(format!("rio-builder-p-{}", i.intent_id)),

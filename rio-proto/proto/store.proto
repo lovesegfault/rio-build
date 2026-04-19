@@ -100,8 +100,9 @@ service StoreService {
 
   // r[sched.sla.hw-bench-append-only]
   // ADR-023 phase-10: builder appends one hw_perf_samples row at init.
-  // Append-only; the hw_perf_factors view aggregates to per-hw_class
-  // median. Best-effort from the builder side — a failed append degrades
+  // One row per (hw_class, pod_id), upserted (M_046); the hw_perf_factors
+  // view aggregates to per-hw_class median. Best-effort from the builder
+  // side — a failed append degrades
   // normalization (hw_class stays factor=1.0), not the build itself.
   rpc AppendHwPerfSample(rio.types.AppendHwPerfSampleRequest) returns (google.protobuf.Empty);
 }

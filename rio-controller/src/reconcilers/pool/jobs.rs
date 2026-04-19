@@ -172,6 +172,22 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // consume headroom, so the cap doesn't apply.
     let reaped =
         reap_stale_for_intents(&jobs_api, &jobs.items, &intents, &name, pool.spec.kind).await;
+    // Reaped active Jobs (selector-drifted Pending) free slots THIS
+    // tick; terminal reaped Jobs weren't counted in `active` so don't
+    // double-count. Without this `+ freed`, ceiling-saturation reap
+    // still spawns 0 (`.take(0)`) and respawn waits one extra tick.
+    let freed = jobs
+        .items
+        .iter()
+        .filter(|j| {
+            is_active_job(j)
+                && j.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| reaped.contains(n))
+        })
+        .count();
+    let headroom = headroom.saturating_add(freed);
 
     // Names already present (minus what we just reaped) are skipped
     // in the spawn pass to avoid a create()→409 per still-Ready
