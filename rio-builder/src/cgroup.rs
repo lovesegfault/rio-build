@@ -641,7 +641,7 @@ pub(crate) fn parse_memory_events_oom_kill(content: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-// r[impl builder.oom.cgroup-watch]
+// r[impl builder.oom.cgroup-watch+2]
 /// Read the `oom_kill` count from `parent/memory.events`.
 ///
 /// `parent` is the delegated root (pod-level cgroup in k8s). The pod's
@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(parse_io_pressure_some_avg10(""), None);
     }
 
-    // r[verify builder.oom.cgroup-watch]
+    // r[verify builder.oom.cgroup-watch+2]
     #[test]
     fn parse_memory_events_oom_kill_line() {
         let content = "low 0\n\

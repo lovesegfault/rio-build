@@ -5,7 +5,7 @@
 //! (atomic-f64-max compare-exchange, kill+drain poll loop) live next to
 //! each other instead of interleaved with daemon-lifecycle orchestration.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -31,17 +31,37 @@ pub(super) struct CgroupMonitors {
     oom_watch: tokio::task::JoinHandle<()>,
     peak_cpu: Arc<AtomicU64>,
     oom_detected: Arc<AtomicBool>,
+    /// Pod-level cgroup (where `memory.events` lives). Held so
+    /// `stop()` can do a final synchronous `read_oom_kill`.
+    parent: PathBuf,
+    /// `oom_kill` count at spawn. `None` ⇒ memory controller off /
+    /// non-k8s test env — no OOM watching possible.
+    baseline: Option<u64>,
 }
 
 impl CgroupMonitors {
     /// Abort both monitor tasks and return `(peak_cpu_cores, oom_detected)`.
     /// `abort()` doesn't wait — both tasks are pure read, no cleanup needed.
+    ///
+    /// Performs one final synchronous `read_oom_kill` against the stored
+    /// baseline: an OOM that lands in the <1s gap between the watcher's
+    /// last tick and build-exit would otherwise be missed. Fast-exit
+    /// toolchains (cargo / single `cc` / `python setup.py`) exit ~100ms
+    /// after a child OOM, so the 1Hz watcher misses ~90% of those —
+    /// `MiscFailure → PermanentFailure` poisons the drv instead of
+    /// `CgroupOom → InfrastructureFailure → bump resource_floor`.
+    /// `memory.events oom_kill` is cumulative and outlives the killed
+    /// process; the build cgroup is destroyed *later* by
+    /// `drain_build_cgroup`.
     pub(super) fn stop(self) -> (f64, bool) {
         self.cpu_poll.abort();
         self.oom_watch.abort();
+        let final_oom = self
+            .baseline
+            .is_some_and(|b| crate::cgroup::read_oom_kill(&self.parent).is_some_and(|n| n > b));
         (
             f64::from_bits(self.peak_cpu.load(Ordering::Acquire)),
-            self.oom_detected.load(Ordering::SeqCst),
+            self.oom_detected.load(Ordering::SeqCst) || final_oom,
         )
     }
 }
@@ -129,7 +149,7 @@ pub(super) fn spawn_cgroup_monitors(
         }
     });
 
-    // r[impl builder.oom.cgroup-watch]
+    // r[impl builder.oom.cgroup-watch+2]
     // OOM watcher (I-196 defense-in-depth). Polls the POD-level
     // `memory.events` (delegated root — where k8s set memory.max; the
     // per-build sub-cgroup has no limit of its own) for `oom_kill`
@@ -146,11 +166,12 @@ pub(super) fn spawn_cgroup_monitors(
     // task idles harmlessly; the build_cores clamp is the primary fix
     // anyway.
     let oom_detected = Arc::new(AtomicBool::new(false));
+    let parent = cgroup_parent.to_path_buf();
+    let baseline = crate::cgroup::read_oom_kill(&parent);
     let oom_watch = {
-        let parent = cgroup_parent.to_path_buf();
+        let parent = parent.clone();
         let kill_path = build_cgroup.path().to_path_buf();
         let flag = Arc::clone(&oom_detected);
-        let baseline = crate::cgroup::read_oom_kill(&parent);
         tokio::spawn(async move {
             let Some(baseline) = baseline else {
                 return; // can't watch — no memory.events
@@ -184,6 +205,8 @@ pub(super) fn spawn_cgroup_monitors(
         oom_watch,
         peak_cpu,
         oom_detected,
+        parent,
+        baseline,
     }
 }
 
@@ -237,4 +260,68 @@ pub(super) async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup)
     }
     // build_cgroup drops here. rmdir succeeds if the drain above emptied
     // it; otherwise Drop warns EBUSY + leaks (cleared on pod restart).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `CgroupMonitors` directly (no real cgroup, no spawned
+    /// pollers — both handles are no-op tasks). `stop()`'s final-sample
+    /// read only needs `parent`/`baseline` populated.
+    fn mk_monitors(parent: PathBuf, baseline: Option<u64>) -> CgroupMonitors {
+        CgroupMonitors {
+            cpu_poll: tokio::spawn(async {}),
+            oom_watch: tokio::spawn(async {}),
+            peak_cpu: Arc::new(AtomicU64::new(0)),
+            oom_detected: Arc::new(AtomicBool::new(false)),
+            parent,
+            baseline,
+        }
+    }
+
+    fn write_oom_kill(dir: &Path, n: u64) {
+        std::fs::write(dir.join("memory.events"), format!("oom 0\noom_kill {n}\n")).unwrap();
+    }
+
+    // r[verify builder.oom.cgroup-watch+2]
+    /// `stop()` MUST do a final synchronous `read_oom_kill`: an OOM that
+    /// lands between the watcher's last 1Hz tick and build-exit (fast-exit
+    /// toolchains: cargo / single cc exit ~100ms after a child OOM) would
+    /// otherwise read `oom_detected=false` and the `CgroupOom` override
+    /// would be skipped → `MiscFailure → PermanentFailure` instead of
+    /// `InfrastructureFailure → bump resource_floor`.
+    #[tokio::test]
+    async fn test_stop_final_sample_catches_oom_between_ticks() {
+        let parent = tempfile::tempdir().unwrap();
+        write_oom_kill(parent.path(), 0);
+        let monitors = mk_monitors(parent.path().to_path_buf(), Some(0));
+        // OOM lands AFTER the (no-op) watcher was spawned but BEFORE stop().
+        // The watcher never observed it (no tick fired); stop() must.
+        write_oom_kill(parent.path(), 1);
+        let (_, oom) = monitors.stop();
+        assert!(oom, "final-sample read must see oom_kill 0→1");
+    }
+
+    /// Sensitivity: no increment → `stop()` reports `false`.
+    #[tokio::test]
+    async fn test_stop_final_sample_no_oom() {
+        let parent = tempfile::tempdir().unwrap();
+        write_oom_kill(parent.path(), 0);
+        let monitors = mk_monitors(parent.path().to_path_buf(), Some(0));
+        let (_, oom) = monitors.stop();
+        assert!(!oom);
+    }
+
+    /// `baseline=None` (memory controller off / non-k8s test env) →
+    /// graceful degradation: final-sample read is skipped, returns `false`
+    /// even if `memory.events` later appears with `oom_kill > 0`.
+    #[tokio::test]
+    async fn test_stop_final_sample_baseline_none() {
+        let parent = tempfile::tempdir().unwrap();
+        write_oom_kill(parent.path(), 5);
+        let monitors = mk_monitors(parent.path().to_path_buf(), None);
+        let (_, oom) = monitors.stop();
+        assert!(!oom, "baseline=None means no OOM watching");
+    }
 }

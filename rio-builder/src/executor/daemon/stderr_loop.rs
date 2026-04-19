@@ -200,16 +200,10 @@ impl<'a> StderrLoop<'a> {
     }
 
     /// Shared log-line handling for `STDERR_NEXT` and `STDERR_RESULT`
-    /// `BuildLogLine` — both need msg_count bound check + `batcher.add_line`
-    /// + `AddLineResult` dispatch. On `Continue`, bumps `last_output`.
+    /// `BuildLogLine` — `batcher.add_line` + `AddLineResult` dispatch.
+    /// On `Continue`, bumps `last_output`.
     async fn on_log_line(&mut self, line: Vec<u8>) -> std::ops::ControlFlow<LoopOutcome> {
         use std::ops::ControlFlow::*;
-        self.msg_count += 1;
-        if self.msg_count >= MAX_BUILD_STDERR_MESSAGES {
-            return Break(Err(wire::WireError::Io(std::io::Error::other(
-                "exceeded maximum STDERR messages during build",
-            ))));
-        }
         match self.batcher.add_line(line) {
             AddLineResult::Buffered => {
                 self.last_output = Instant::now();
@@ -270,8 +264,22 @@ impl<'a> StderrLoop<'a> {
 
     /// Classify one parsed `StderrMessage` and dispatch to the
     /// appropriate handler. Called from the `msg_rx.recv()` arm.
+    ///
+    /// Every parsed message flows through here, so this is where
+    /// [`MAX_BUILD_STDERR_MESSAGES`] is enforced — a single choke
+    /// point that no arm (including `Result{104}` → `forward_phase`
+    /// and the discard arm) can bypass. Counting only in
+    /// `on_log_line` let a malicious build flood the scheduler with
+    /// `BuildPhase` frames via `@nix {"action":"setPhase",...}` on
+    /// `NIX_LOG_FD` for the full `build_timeout`.
     async fn dispatch(&mut self, msg: StderrMessage) -> std::ops::ControlFlow<LoopOutcome> {
         use std::ops::ControlFlow::*;
+        self.msg_count += 1;
+        if self.msg_count >= MAX_BUILD_STDERR_MESSAGES {
+            return Break(Err(wire::WireError::Io(std::io::Error::other(
+                "exceeded maximum STDERR messages during build",
+            ))));
+        }
         match msg {
             StderrMessage::Last => Break(Ok(None)),
             StderrMessage::Error(e) => Break(Ok(Some(misc_fail(&e.message)))),
@@ -1449,5 +1457,82 @@ mod tests {
             "5 within rate + 1 suppression marker on final flush"
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch() msg_count cap — single choke point for ALL StderrMessage
+    // variants. Regression: forward_phase / discard arm previously bypassed.
+    // -----------------------------------------------------------------------
+
+    fn mk_stderr_loop(tx: &mpsc::Sender<ExecutorMessage>) -> StderrLoop<'_> {
+        let batcher = LogBatcher::new(
+            "/nix/store/t.drv".into(),
+            "w".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
+        StderrLoop::new(batcher, tx, Duration::ZERO)
+    }
+
+    /// `Result{104}` (SetPhase) MUST count toward `MAX_BUILD_STDERR_MESSAGES`.
+    /// Previously `forward_phase` bypassed `msg_count` entirely → a malicious
+    /// build could flood unbounded `BuildPhase` frames for `build_timeout`.
+    #[tokio::test]
+    async fn test_dispatch_msg_cap_covers_set_phase() {
+        use std::ops::ControlFlow::*;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx);
+        state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
+        let phase_msg = || StderrMessage::Result {
+            activity_id: 0,
+            result_type: 104,
+            fields: vec![ResultField::String("x".into())],
+        };
+        assert!(matches!(state.dispatch(phase_msg()).await, Continue(())));
+        assert!(
+            matches!(state.dispatch(phase_msg()).await, Break(Err(_))),
+            "SetPhase (Result{{104}}) MUST count toward MAX_BUILD_STDERR_MESSAGES"
+        );
+    }
+
+    /// Discard arm (`StartActivity` / `StopActivity` / `Write` / other
+    /// `Result`) MUST also count — zero-length `StartActivity` spam is the
+    /// same threat as zero-length `STDERR_NEXT` spam the cap was added for.
+    #[tokio::test]
+    async fn test_dispatch_msg_cap_covers_discard_arm() {
+        use std::ops::ControlFlow::*;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx);
+        state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
+        let act_msg = || StderrMessage::StartActivity {
+            id: 1,
+            level: 0,
+            activity_type: 0,
+            text: String::new(),
+            fields: vec![],
+            parent_id: 0,
+        };
+        assert!(matches!(state.dispatch(act_msg()).await, Continue(())));
+        assert!(
+            matches!(state.dispatch(act_msg()).await, Break(Err(_))),
+            "discard arm MUST count toward MAX_BUILD_STDERR_MESSAGES"
+        );
+    }
+
+    /// Sensitivity: the original `Next` path still hits the cap after
+    /// the check moved from `on_log_line` to `dispatch`.
+    #[tokio::test]
+    async fn test_dispatch_msg_cap_covers_next() {
+        use std::ops::ControlFlow::*;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut state = mk_stderr_loop(&tx);
+        state.msg_count = MAX_BUILD_STDERR_MESSAGES - 2;
+        assert!(matches!(
+            state.dispatch(StderrMessage::Next("a".into())).await,
+            Continue(())
+        ));
+        assert!(matches!(
+            state.dispatch(StderrMessage::Next("b".into())).await,
+            Break(Err(_))
+        ));
     }
 }

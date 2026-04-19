@@ -36,16 +36,6 @@ impl FodHashAlgo {
             _ => None,
         }
     }
-
-    /// Digest a byte slice with this algo. Returns the raw digest.
-    fn digest(self, data: &[u8]) -> Vec<u8> {
-        use sha2::Digest;
-        match self {
-            Self::Sha1 => sha1::Sha1::digest(data).to_vec(),
-            Self::Sha256 => sha2::Sha256::digest(data).to_vec(),
-            Self::Sha512 => sha2::Sha512::digest(data).to_vec(),
-        }
-    }
 }
 
 /// Writer adapter that feeds every byte written into a digest.
@@ -74,6 +64,31 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
         let mut w = DigestWriter { digest: D::new() };
         rio_nix::nar::dump_path_streaming(path, &mut w)
             .with_context(|| format!("NAR streaming failed for {}", path.display()))?;
+        Ok(w.digest.finalize().to_vec())
+    }
+    match algo {
+        FodHashAlgo::Sha1 => with::<sha1::Sha1>(path),
+        FodHashAlgo::Sha256 => with::<sha2::Sha256>(path),
+        FodHashAlgo::Sha512 => with::<sha2::Sha512>(path),
+    }
+}
+
+/// Compute the flat (raw-content) hash of a local file using the
+/// specified algo. Streams via `io::copy` → [`DigestWriter`] — O(1)
+/// memory regardless of file size. Blocking I/O; call via
+/// `spawn_blocking` in async contexts.
+///
+/// nixpkgs `fetchurl` is flat-hashed by default and routinely pulls
+/// multi-GB blobs (CUDA runfiles, JDK bundles, model weights) into
+/// fetcher pods sized at `LOCAL_MEM_BYTES` ≈ 2 GiB; a `fs::read` here
+/// would OOM the pod after the download already succeeded.
+fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<u8>> {
+    fn with<D: sha2::Digest>(path: &Path) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context;
+        let mut f = std::fs::File::open(path)
+            .with_context(|| format!("failed to open FOD output {}", path.display()))?;
+        let mut w = DigestWriter { digest: D::new() };
+        std::io::copy(&mut f, &mut w)?;
         Ok(w.digest.finalize().to_vec())
     }
     match algo {
@@ -133,10 +148,10 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             // output is rejected without entering the store.
             compute_local_nar_hash(&fs_path, algo)?
         } else {
-            // Flat hash — read file and hash contents directly.
-            let content = std::fs::read(&fs_path)
-                .with_context(|| format!("failed to read FOD output file {}", fs_path.display()))?;
-            algo.digest(&content)
+            // Flat hash — stream file contents through a digest
+            // sink. Same O(1)-memory contract as the recursive
+            // branch above (see compute_local_flat_hash doc).
+            compute_local_flat_hash(&fs_path, algo)?
         };
 
         if computed != expected {
@@ -516,6 +531,25 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Flat-hash a file much larger than `io::copy`'s internal stack
+    /// buffer (8 KiB) — proves the streaming path stitches digest state
+    /// across many chunk boundaries and produces the same digest as the
+    /// in-memory oracle. Regression test for the `fs::read` OOM: the
+    /// structural guarantee that we DON'T allocate the file is the
+    /// deletion of `FodHashAlgo::digest(&[u8])`; this test proves
+    /// multi-chunk correctness.
+    #[test]
+    fn test_verify_fod_flat_large_file_streams() -> anyhow::Result<()> {
+        use sha2::Digest;
+        // 16 MiB of pseudo-random-ish bytes (not all-zero — we want a
+        // digest that changes if a chunk is dropped or reordered).
+        let content: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (_tmp, store_dir) = seed_output("test-flat-large", &content)?;
+        let expected = hex::encode(sha2::Sha256::digest(&content));
+        let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
+        verify_fod_hashes(&drv, &store_dir)
     }
 
     /// Unknown algo (e.g., md5 — Nix doesn't support it, but be defensive):

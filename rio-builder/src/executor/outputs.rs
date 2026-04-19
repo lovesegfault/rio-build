@@ -110,9 +110,9 @@ pub(super) async fn collect_outputs(
     // before the mismatch is noticed.
     //
     // spawn_blocking: verify_fod_hashes does sync filesystem I/O
-    // (fs::read for flat, dump_path_streaming for recursive) +
-    // hashing. Typical FOD outputs are small (fetchurl), so
-    // this is fast.
+    // (io::copy for flat, dump_path_streaming for recursive) +
+    // hashing. Both branches stream — O(1) memory regardless of
+    // output size (fetchurl flat-hashed blobs reach multi-GB).
     if is_fod {
         let drv_for_verify = drv.clone();
         let upper_store_for_verify = overlay_mount.upper_store();
