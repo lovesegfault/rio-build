@@ -631,6 +631,9 @@ pub async fn spot_price_poller(
         if let Err(e) = snap.refresh_lambda(&db).await {
             tracing::warn!(error = %e, "λ refresh failed; keeping previous");
         }
+        if let Err(e) = sweep_interrupt_samples(&db, &snap.cluster).await {
+            tracing::warn!(error = %e, "interrupt_samples retention sweep failed");
+        }
         if let Err(e) = snap.persist(&db).await {
             tracing::warn!(error = %e, "cost-table persist failed");
         }
@@ -638,6 +641,25 @@ pub async fn spot_price_poller(
         *cost.write() = snap;
         metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(stale);
     }
+}
+
+/// Retention sweep for `interrupt_samples`. The 24h-halflife EMA in
+/// [`CostTable::refresh_lambda`] means rows >7d contribute ≈0, but the
+/// controller's 60s exposure flush writes ~N_hw_classes `kind=
+/// 'exposure'` rows/min with `event_uid=NULL` (unconstrained by M_047)
+/// — append-only ~5-10M rows/yr/cluster without this. Mirrors the
+/// `build_samples` age-sweep at `db/history.rs`; the `(cluster, at)`
+/// index from M_043 makes the range delete cheap. Lease-gated via the
+/// caller (one writer).
+pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "DELETE FROM interrupt_samples \
+         WHERE cluster = $1 AND at < now() - interval '7 days'",
+    )
+    .bind(cluster)
+    .execute(db.pool())
+    .await?;
+    Ok(r.rows_affected())
 }
 
 /// Representative instance types per band for the spot-price poll. The
@@ -981,6 +1003,44 @@ mod tests {
         .unwrap();
         t.refresh_lambda(&sdb).await.unwrap();
         assert_eq!(t.lambda[&Band::Hi].updated_at, 1500.0);
+    }
+
+    /// `interrupt_samples` is bounded: rows >7d are swept (the 24h-
+    /// halflife EMA gives them ≈0 weight). Regression: the 60s
+    /// exposure flush wrote ~N_hw_classes rows/min with no retention
+    /// — append-only ~5-10M rows/yr/cluster. Per-cluster scoped: a
+    /// stale row in another cluster is not swept.
+    #[tokio::test]
+    async fn interrupt_samples_retention_sweep() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) VALUES \
+             ('c', 'aws-8-nvme-hi', 'exposure', 60, now() - interval '8 days'), \
+             ('c', 'aws-8-nvme-hi', 'exposure', 60, now() - interval '6 days'), \
+             ('c', 'aws-8-nvme-hi', 'exposure', 60, now()), \
+             ('other', 'aws-8-nvme-hi', 'exposure', 60, now() - interval '8 days')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let n = sweep_interrupt_samples(&sdb, "c").await.unwrap();
+        assert_eq!(n, 1, "exactly the >7d row in cluster c");
+        let left: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT cluster, EXTRACT(EPOCH FROM now() - at)::float8 \
+             FROM interrupt_samples ORDER BY cluster, at",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(left.len(), 3, "kept: 2×c (≤7d) + 1×other (untouched)");
+        assert!(
+            left.iter()
+                .filter(|(c, _)| c == "c")
+                .all(|(_, age)| *age < 7.0 * 86400.0),
+            "all surviving cluster-c rows ≤7d"
+        );
+        assert!(left.iter().any(|(c, _)| c == "other"));
     }
 
     #[test]
