@@ -177,12 +177,23 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 }
 
 /// Active AND `status.ready > 0` — the Job's pod container has
-/// started. Complement of [`is_pending_job`] within the active set.
-/// The orphan-reap boundary for `r[ctrl.ephemeral.reap-orphan-
-/// running]`: only Running Jobs are candidates (Pending is handled by
-/// `reap_excess_pending`; Complete/Failed by TTL).
+/// started. Complement of [`is_pending_job`] within the active set
+/// (both predicates exclude terminating Jobs). The orphan-reap
+/// boundary for `r[ctrl.ephemeral.reap-orphan-running]`: only Running
+/// Jobs are candidates (Pending is handled by `reap_excess_pending`;
+/// Complete/Failed by TTL).
+///
+/// A Job with `deletionTimestamp` set is NOT running — it's already
+/// terminating (foreground-delete in flight). Re-selecting it would
+/// re-delete + re-fire `ListExecutors` (defeating the lazy-RPC
+/// pre-filter) + double-count `rio_controller_orphan_jobs_reaped_total`
+/// every tick until the pod's `job-tracking` finalizer clears. A
+/// D-state pod (the I-165 case this reaper exists for) ignores SIGTERM
+/// and stays listed for up to `terminationGracePeriodSeconds`.
 pub(super) fn is_running_job(j: &Job) -> bool {
-    is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) > 0
+    j.metadata.deletion_timestamp.is_none()
+        && is_active_job(j)
+        && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) > 0
 }
 
 /// Minimum age before a Running Job is orphan-reapable. 5min: MUST
@@ -1241,6 +1252,15 @@ mod tests {
             !is_running_job(&job_with("a", Some(0), Some(1), 0)),
             "Completed → not running"
         );
+        // deletionTimestamp set → already terminating (foreground delete
+        // in flight). NOT running — re-selecting it re-deletes + re-fires
+        // ListExecutors + double-counts the orphan-reaped metric every tick.
+        let mut terminating = job_with("a", Some(1), Some(0), 0);
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        assert!(!is_running_job(&terminating));
     }
 
     /// Minimal `ExecutorInfo`. Only `executor_id` + `busy` are read
@@ -1300,6 +1320,17 @@ mod tests {
             job_with("rio-builder-x86-done01", Some(0), Some(1), 600),
             // Old Running, no executor → reaped.
             job_with("rio-builder-x86-stuck1", Some(1), Some(0), 600),
+            // Old Running, deletionTimestamp set → NOT reaped (foreground
+            // delete already in flight; re-selecting double-counts the
+            // metric and re-fires ListExecutors every tick).
+            {
+                let mut j = job_with("rio-builder-x86-term01", Some(1), Some(0), 600);
+                j.metadata.deletion_timestamp =
+                    Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::now(),
+                    ));
+                j
+            },
         ];
         let orphans = select_orphan_running(&jobs, &[], ORPHAN_REAP_GRACE);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
