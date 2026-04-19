@@ -1851,7 +1851,6 @@ impl DagActor {
             inputs.push(crate::ca::CaResolveInput {
                 drv_path: child.drv_path().to_string(),
                 modular_hash,
-                output_names: child.output_names.clone(),
             });
         }
         inputs

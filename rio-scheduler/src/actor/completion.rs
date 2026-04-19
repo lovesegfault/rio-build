@@ -931,8 +931,9 @@ impl DagActor {
         // `(modular_hash, output_name) → (output_path, output_hash)`
         // to PG NOW, before `find_newly_ready` below queues the
         // dependents for dispatch. The dependents' `maybe_resolve_ca`
-        // → `query_realisation` reads this row; without it, resolve
-        // fails with `RealisationMissing` and the scheduler dispatches
+        // → `resolve_ca_inputs` → `realisations::query_batch` reads
+        // this row; without it, resolve fails with
+        // `RealisationMissing` and the scheduler dispatches
         // unresolved content → worker fetches the floating-CA input's
         // `.drv` → reads `out.path() == ""` → `invalid store path ""`.
         //

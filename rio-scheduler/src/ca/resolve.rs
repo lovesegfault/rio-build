@@ -83,9 +83,8 @@ pub enum ResolveError {
     NoDrvContent,
 }
 
-/// One CA input to resolve: the `.drv` store path, the modular
-/// derivation hash (realisations PK), and the output names this
-/// parent derivation depends on.
+/// One CA input to resolve: the `.drv` store path and the modular
+/// derivation hash (realisations PK).
 ///
 /// The modular hash must be the 32-byte SHA-256 from
 /// `hash_derivation_modulo` — the same value Nix sends as the
@@ -94,6 +93,14 @@ pub enum ResolveError {
 /// the gateway via `DerivationNode.ca.modular_hash` (computed
 /// post-BFS from the full drv_cache — see
 /// `rio-gateway/src/translate.rs:populate_ca_modular_hashes`).
+///
+/// **No `output_names` field** — the parent's parsed `inputDrvs`
+/// (from the ATerm) is the SOLE source of truth for which output
+/// names to resolve. The DAG's per-child `output_names` is the
+/// child's full output list, not the parent's wanted-subset; using
+/// it here over-resolves (Nix-incompat resolved ATerm) and can
+/// spuriously `RealisationMissing` on an output the parent never
+/// references.
 #[derive(Debug, Clone)]
 pub struct CaResolveInput {
     /// Store path of the input `.drv` file. Matches an `inputDrvs`
@@ -102,9 +109,6 @@ pub struct CaResolveInput {
     /// Modular derivation hash (`hashDerivationModulo`). The
     /// `drv_hash` half of the `realisations` composite PK.
     pub modular_hash: [u8; 32],
-    /// Output names the parent depends on (from the `inputDrvs`
-    /// value set). Usually just `["out"]`.
-    pub output_names: Vec<String>,
 }
 
 /// One IA (input-addressed) input for resolve: the `.drv` store
@@ -278,99 +282,115 @@ pub async fn resolve_ca_inputs(
     let mut lookups: Vec<RealisationLookup> = Vec::new();
     let mut new_input_srcs: Vec<String> = Vec::new();
 
-    for input in ca_inputs {
-        let input_path = StorePath::parse(&input.drv_path)?;
-
-        for output_name in &input.output_names {
-            // Step 2 of ADR-018 Appendix B: query realisations.
-            let realized = query_realisation(pool, &input.modular_hash, output_name)
-                .await?
-                .ok_or_else(|| ResolveError::RealisationMissing {
-                    drv_path: input.drv_path.clone(),
-                    output_name: output_name.clone(),
-                    modular_hex: hex::encode(input.modular_hash),
-                })?;
-
-            // Step 3: insert into inputSrcs.
-            new_input_srcs.push(realized.clone());
-
-            // Step 4: placeholder → realized path rewrite.
-            let placeholder = downstream_placeholder(&input_path, output_name);
-            rewrites.insert(placeholder, realized.clone());
-
-            // Step 5 (caller's side-effect): record the dependency
-            // edge for realisation_deps.
-            lookups.push(RealisationLookup {
-                dep_modular_hash: input.modular_hash,
-                dep_output_name: output_name.clone(),
-                realized_path: realized,
-            });
-        }
-    }
-
-    // IA-input half: for each inputDrv NOT in `ca_inputs`, look up
-    // its output paths in `ia_inputs` (pre-collected from the DAG's
-    // `expected_output_paths`). These are deterministic — the
-    // gateway computed them at submit time from the parsed `.drv`
-    // and plumbed them via `DerivationNode.expected_output_paths`.
-    // No store RPC needed.
-    //
-    // Nix's `tryResolveInput` (derivations.cc:1206-1234) iterates
-    // every inputDrv regardless of addressing mode, adding each
-    // output path to `inputSrcs`. IA outputs are concrete; CA
-    // outputs come from realisations. The CA loop above handles the
-    // CA half; this loop closes the IA half.
-    let ca_drv_paths: HashSet<&str> = ca_inputs.iter().map(|c| c.drv_path.as_str()).collect();
+    // drv_path → modular_hash (CA) and drv_path → IaResolveInput (IA).
+    // The parsed ATerm's `inputDrvs` map is the SINGLE source of
+    // truth for which outputs to resolve — `ca_inputs`/`ia_inputs`
+    // only supply per-child metadata (modular hash, expected paths).
+    let ca_by_path: HashMap<&str, [u8; 32]> = ca_inputs
+        .iter()
+        .map(|c| (c.drv_path.as_str(), c.modular_hash))
+        .collect();
     let ia_by_path: HashMap<&str, &IaResolveInput> = ia_inputs
         .iter()
         .map(|ia| (ia.drv_path.as_str(), ia))
         .collect();
 
+    // Pass 1 — collect (modular_hash, output_name) pairs for ONE
+    // batched realisations lookup. Nix's `tryResolveInput`
+    // (derivations.cc:1206-1234) iterates the parent's `inputDrvs`
+    // wanted-subset, NOT the child's full output list — driving
+    // from `drv.input_drvs()` here makes over-resolve impossible.
+    let mut pairs: Vec<([u8; 32], String)> = Vec::new();
     for (input_drv_path, wanted_names) in drv.input_drvs() {
-        if ca_drv_paths.contains(input_drv_path.as_str()) {
-            // CA — already handled above via realisation lookup.
-            continue;
+        if let Some(&mh) = ca_by_path.get(input_drv_path.as_str()) {
+            for name in wanted_names {
+                pairs.push((mh, name.clone()));
+            }
         }
-        let Some(ia) = ia_by_path.get(input_drv_path.as_str()) else {
-            // Parent references an IA input not in `ia_inputs` — the
-            // submission didn't include this transitive dep in the
-            // DAG slice, or it was a recovered node with
-            // `expected_output_paths` not persisted. Unusual but
-            // not an error: the worker's FUSE layer will
+    }
+
+    // Step 2 of ADR-018 Appendix B: query realisations. ONE PG
+    // round-trip — the per-pair sequential await was an I-139
+    // actor-stall site (N×M serial queries inside the single-
+    // threaded actor per CA dispatch).
+    let realised: HashMap<([u8; 32], String), String> =
+        rio_store::realisations::query_batch(pool, &pairs)
+            .await?
+            .into_iter()
+            .map(|r| ((r.drv_hash, r.output_name), r.output_path))
+            .collect();
+
+    // Pass 2 — single walk over `inputDrvs` handles BOTH CA and IA.
+    // Nix's `tryResolveInput` iterates every inputDrv regardless of
+    // addressing mode, adding each output path to `inputSrcs`. IA
+    // outputs are concrete; CA outputs come from realisations.
+    for (input_drv_path, wanted_names) in drv.input_drvs() {
+        let input_sp = StorePath::parse(input_drv_path)?;
+        if let Some(&mh) = ca_by_path.get(input_drv_path.as_str()) {
+            for output_name in wanted_names {
+                let realized = realised
+                    .get(&(mh, output_name.clone()))
+                    .ok_or_else(|| ResolveError::RealisationMissing {
+                        drv_path: input_drv_path.clone(),
+                        output_name: output_name.clone(),
+                        modular_hex: hex::encode(mh),
+                    })?
+                    .clone();
+                // Step 3: insert into inputSrcs.
+                new_input_srcs.push(realized.clone());
+                // Step 4: placeholder → realized path rewrite.
+                rewrites.insert(
+                    downstream_placeholder(&input_sp, output_name),
+                    realized.clone(),
+                );
+                // Step 5 (caller's side-effect): record the
+                // dependency edge for realisation_deps.
+                lookups.push(RealisationLookup {
+                    dep_modular_hash: mh,
+                    dep_output_name: output_name.clone(),
+                    realized_path: realized,
+                });
+            }
+        } else if let Some(ia) = ia_by_path.get(input_drv_path.as_str()) {
+            // `output_names` and `output_paths` are index-paired.
+            // Collect only the paths for output names the parent
+            // actually wants (the `inputDrvs` value set). Most IA
+            // derivations have a single `"out"` so this is a 1:1
+            // pass; multi-output (dev, doc, lib) get filtered here.
+            //
+            // ALSO record a placeholder→path rewrite. For
+            // concrete-IA inputs the placeholder doesn't appear in
+            // the parent ATerm (env already has the literal path) so
+            // the replace is a no-op. For DEFERRED-IA inputs
+            // (IA-on-IA-on-CA chains — ca-chain.nix iaLevels≥2) the
+            // parent's env carries the placeholder exactly like a CA
+            // input would, and Nix's `tryResolveInput`
+            // (`derivations.cc:1221`) performs the same
+            // `rewrites.emplace` for every input, CA or not. Skip
+            // empty paths (deferred child not yet completed → no
+            // rewrite available; the parent's resolve will retry).
+            for (i, name) in ia.output_names.iter().enumerate() {
+                if wanted_names.contains(name)
+                    && let Some(path) = ia.output_paths.get(i)
+                {
+                    new_input_srcs.push(path.clone());
+                    if !path.is_empty() {
+                        rewrites.insert(downstream_placeholder(&input_sp, name), path.clone());
+                    }
+                }
+            }
+        } else {
+            // Parent references an input not in `ca_inputs` OR
+            // `ia_inputs` — the submission didn't include this
+            // transitive dep in the DAG slice, or it was a recovered
+            // node with `expected_output_paths` not persisted.
+            // Unusual but not an error: the worker's FUSE layer will
             // on-demand-fetch. Log at debug, skip (preserves
             // pre-existing behavior for this edge).
             debug!(
                 input_drv_path = %input_drv_path,
-                "IA input not in DAG slice — skipping inputSrcs add"
+                "input not in DAG slice — skipping inputSrcs add"
             );
-            continue;
-        };
-        // `output_names` and `output_paths` are index-paired. Collect
-        // only the paths for output names the parent actually wants
-        // (the `inputDrvs` value set). Most IA derivations have a
-        // single `"out"` so this is a 1:1 pass; multi-output (dev,
-        // doc, lib) get filtered here.
-        //
-        // ALSO record a placeholder→path rewrite. For concrete-IA
-        // inputs the placeholder doesn't appear in the parent ATerm
-        // (env already has the literal path) so the replace is a
-        // no-op. For DEFERRED-IA inputs (IA-on-IA-on-CA chains —
-        // ca-chain.nix iaLevels≥2) the parent's env carries the
-        // placeholder exactly like a CA input would, and Nix's
-        // `tryResolveInput` (`derivations.cc:1221`) performs the same
-        // `rewrites.emplace` for every input, CA or not. Skip empty
-        // paths (deferred child not yet completed → no rewrite
-        // available; the parent's resolve will retry).
-        let input_sp = StorePath::parse(input_drv_path)?;
-        for (i, name) in ia.output_names.iter().enumerate() {
-            if wanted_names.contains(name)
-                && let Some(path) = ia.output_paths.get(i)
-            {
-                new_input_srcs.push(path.clone());
-                if !path.is_empty() {
-                    rewrites.insert(downstream_placeholder(&input_sp, name), path.clone());
-                }
-            }
         }
     }
 
@@ -525,29 +545,6 @@ pub async fn insert_realisation_deps(
 // Internal
 // ---------------------------------------------------------------------------
 
-/// Query the realisations table for one (modular_hash, output_name).
-///
-/// Returns `None` for a cache miss (realisation not registered).
-/// The scheduler accesses `realisations` directly (both crates share
-/// the PG pool and migrations), not via the store gRPC. ADR-018 §3:
-/// "resolution logic belongs in the scheduler."
-///
-/// Thin wrapper over [`rio_store::realisations::query`] that drops the
-/// fields resolve doesn't need (only `output_path` matters here). The
-/// `schema` feature on rio-store keeps that dep lean — just sqlx +
-/// thiserror, none of the aws-sdk-s3/axum/moka server tree.
-pub(crate) async fn query_realisation(
-    pool: &PgPool,
-    modular_hash: &[u8; 32],
-    output_name: &str,
-) -> Result<Option<String>, rio_store::error::MetadataError> {
-    Ok(
-        rio_store::realisations::query(pool, modular_hash, output_name)
-            .await?
-            .map(|r| r.output_path),
-    )
-}
-
 /// A prior realisation: some OTHER derivation that produced the same
 /// output_path. Used by CA cutoff to detect "this content existed
 /// before this build" — for CA, same content → same path, so finding
@@ -700,8 +697,9 @@ pub async fn walk_dependent_realisations(
 /// speaks gRPC, not wire protocol — its upload flow is `PutPath →
 /// CompletionReport`, with no RegisterRealisation call. Without this
 /// insert, a CA-on-CA chain built entirely by rio-builders never lands
-/// a realisation row, so the next dispatch's `query_realisation`
-/// returns `None` → `RealisationMissing` → dispatch-unresolved →
+/// a realisation row, so the next dispatch's resolve-time
+/// [`query_batch`](rio_store::realisations::query_batch) finds nothing
+/// → `RealisationMissing` → dispatch-unresolved →
 /// worker crashes on the empty-string output path from the floating-
 /// CA input's `.drv`. Observed: 9748 retry events in ~10min before
 /// this fix (InfrastructureFailure has no backoff).
@@ -921,7 +919,6 @@ mod tests {
         let ca_inputs = vec![CaResolveInput {
             drv_path: input_drv_path.into(),
             modular_hash: input_modular,
-            output_names: vec!["out".into()],
         }];
 
         let resolved =
@@ -1054,7 +1051,6 @@ mod tests {
         let ca_inputs = vec![CaResolveInput {
             drv_path: input_drv_path.into(),
             modular_hash: input_modular,
-            output_names: vec!["out".into()],
         }];
 
         let resolved =
@@ -1118,7 +1114,6 @@ mod tests {
         let ca_inputs = vec![CaResolveInput {
             drv_path: input_drv_path.into(),
             modular_hash: input_modular,
-            output_names: vec!["out".into()],
         }];
 
         let resolved =
@@ -1153,7 +1148,6 @@ mod tests {
         let ca_inputs = vec![CaResolveInput {
             drv_path: input_drv_path.into(),
             modular_hash: [0x77; 32], // Not in realisations table.
-            output_names: vec!["out".into()],
         }];
 
         let err = resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool)
@@ -1297,7 +1291,6 @@ mod tests {
         let ca_inputs = vec![CaResolveInput {
             drv_path: ca_drv.into(),
             modular_hash: ca_modular,
-            output_names: vec!["out".into()],
         }];
         let ia_inputs = vec![IaResolveInput {
             drv_path: ia_drv.into(),
@@ -1340,6 +1333,176 @@ mod tests {
         assert_eq!(resolved.lookups.len(), 1);
         assert_eq!(resolved.lookups[0].dep_modular_hash, ca_modular);
 
+        Ok(())
+    }
+
+    // r[verify sched.ca.resolve+3]
+    /// Multi-output CA child where the parent only wants `["out"]`.
+    /// `ca_inputs` carries no per-edge subset (the DAG only knows the
+    /// child's FULL output list); the parsed `inputDrvs` is the sole
+    /// source of truth for which outputs to resolve.
+    ///
+    /// Regression: pre-fix the CA loop iterated `child.output_names`
+    /// (`["out","dev"]`) → resolved `inputSrcs` contained `dev`'s
+    /// realized path (Nix-incompat ATerm bytes) and recorded a
+    /// spurious `realisation_deps` edge for `dev`.
+    #[tokio::test]
+    async fn resolve_ca_multi_output_filters_to_wanted_subset() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let input_modular: [u8; 32] = [0x11; 32];
+        let out_path = "/nix/store/22222222222222222222222222222222-libfoo-out";
+        let dev_path = "/nix/store/33333333333333333333333333333333-libfoo-dev";
+        for (name, path, oh) in [("out", out_path, 0xaau8), ("dev", dev_path, 0xbb)] {
+            sqlx::query(
+                "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(input_modular.as_slice())
+            .bind(name)
+            .bind(path)
+            .bind([oh; 32].as_slice())
+            .execute(&db.pool)
+            .await?;
+        }
+
+        let input_drv_path = "/nix/store/44444444444444444444444444444444-libfoo.drv";
+        let placeholder = downstream_placeholder(&StorePath::parse(input_drv_path)?, "out");
+        // Parent inputDrvs: libfoo → ["out"] only.
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",[],[("DEP","{placeholder}"),("name","app")])"#
+        );
+
+        let ca_inputs = vec![CaResolveInput {
+            drv_path: input_drv_path.into(),
+            modular_hash: input_modular,
+        }];
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool).await?;
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+
+        let srcs = reparsed.input_srcs();
+        assert!(
+            srcs.contains(out_path),
+            "wanted 'out' realized in inputSrcs"
+        );
+        assert!(
+            !srcs.contains(dev_path),
+            "unwanted 'dev' MUST NOT be in inputSrcs — Nix tryResolve only adds wanted-subset"
+        );
+        assert_eq!(
+            resolved.lookups.len(),
+            1,
+            "exactly one realisation_deps lookup (out only, no spurious dev edge)"
+        );
+        assert_eq!(resolved.lookups[0].dep_output_name, "out");
+        Ok(())
+    }
+
+    // r[verify sched.ca.resolve+3]
+    /// Multi-output CA child where `dev`'s realisation was never
+    /// inserted (best-effort PG insert at completion lost it). Parent
+    /// only wants `["out"]` — resolve MUST succeed.
+    ///
+    /// Regression: pre-fix the CA loop queried `dev` regardless and
+    /// returned `RealisationMissing{output_name: "dev"}`, aborting
+    /// resolve for an output the parent never references → parent
+    /// dispatched unresolved → worker crashed on placeholder → infinite
+    /// retry-with-backoff.
+    #[tokio::test]
+    async fn resolve_ca_multi_output_unwanted_missing_ok() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let input_modular: [u8; 32] = [0x11; 32];
+        let out_path = "/nix/store/22222222222222222222222222222222-libfoo-out";
+        // Only `out` realisation present. `dev` absent.
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(input_modular.as_slice())
+        .bind(out_path)
+        .bind([0xaau8; 32].as_slice())
+        .execute(&db.pool)
+        .await?;
+
+        let input_drv_path = "/nix/store/44444444444444444444444444444444-libfoo.drv";
+        let placeholder = downstream_placeholder(&StorePath::parse(input_drv_path)?, "out");
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",[],[("DEP","{placeholder}"),("name","app")])"#
+        );
+
+        let ca_inputs = vec![CaResolveInput {
+            drv_path: input_drv_path.into(),
+            modular_hash: input_modular,
+        }];
+
+        let resolved = resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool)
+            .await
+            .expect("resolve must succeed when only an UNWANTED output's realisation is missing");
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+        assert!(reparsed.input_srcs().contains(out_path));
+        assert_eq!(
+            reparsed.env().get("DEP").map(String::as_str),
+            Some(out_path)
+        );
+        Ok(())
+    }
+
+    /// Three CA inputs, all single-output `["out"]` wanted. Asserts
+    /// the batch→map→lookup wiring doesn't drop entries when
+    /// `query_batch` returns multiple rows. Passes before+after the
+    /// per-pair-await → batch refactor; guards correctness across the
+    /// refactor (the structural single-await is verified by code
+    /// inspection — only one `query_batch().await?` between ATerm
+    /// parse and rewrite apply).
+    #[tokio::test]
+    async fn resolve_ca_multiple_inputs_single_roundtrip() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let mut ca_inputs = Vec::new();
+        let mut input_drvs_aterm = String::new();
+        let mut realized_paths = Vec::new();
+        for i in 1u8..=3 {
+            let modular: [u8; 32] = [i; 32];
+            let realized = format!("/nix/store/{:032}-dep{i}-out", i);
+            sqlx::query(
+                "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+                 VALUES ($1, 'out', $2, $3)",
+            )
+            .bind(modular.as_slice())
+            .bind(&realized)
+            .bind([0x99u8; 32].as_slice())
+            .execute(&db.pool)
+            .await?;
+            let drv_path = format!("/nix/store/{:032}-dep{i}.drv", i + 0x40);
+            if i > 1 {
+                input_drvs_aterm.push(',');
+            }
+            input_drvs_aterm.push_str(&format!(r#"("{drv_path}",["out"])"#));
+            ca_inputs.push(CaResolveInput {
+                drv_path,
+                modular_hash: modular,
+            });
+            realized_paths.push(realized);
+        }
+
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[{input_drvs_aterm}],[],"x86_64-linux","/bin/sh",[],[("name","app")])"#
+        );
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool).await?;
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+
+        for p in &realized_paths {
+            assert!(
+                reparsed.input_srcs().contains(p),
+                "realized path {p} missing from inputSrcs"
+            );
+        }
+        assert_eq!(resolved.lookups.len(), 3, "all three CA inputs recorded");
         Ok(())
     }
 
