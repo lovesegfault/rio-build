@@ -95,9 +95,10 @@ pub(crate) struct Config {
     /// Default: `["rio-gateway", "rio-scheduler"]`.
     pub service_bypass_callers: Vec<String>,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
-    /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT=16`
-    /// (scheduler side, P0473) this caps total in-flight S3 puts at
-    /// ~512, under the aws-sdk's ~1024 default pool. Raise if the
+    /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT` (scheduler
+    /// side; helm-default 16, code-default 256, P0473) this caps
+    /// total in-flight S3 puts at ~512 under helm settings, under
+    /// the aws-sdk's ~1024 default pool. Raise if the
     /// store runs with a larger aws-sdk pool; lower if you see
     /// `DispatchFailure` in store logs during large-NAR ingest.
     /// Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
@@ -110,7 +111,7 @@ pub(crate) struct Config {
     /// policy handles but exhausts at 3. Set via `RIO_S3_MAX_ATTEMPTS`.
     pub s3_max_attempts: u32,
     /// Cap on paths in a FindMissingPaths request (DoS guard).
-    /// Default 100k — ~8 MB of path strings per request. Set via
+    /// Default 1M — ~80 MB of path strings per request. Set via
     /// `RIO_MAX_BATCH_PATHS`.
     pub max_batch_paths: usize,
     /// PG connection pool size. Default 50 (was hardcoded 20). The

@@ -23,7 +23,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// I-194 regression: 3 concurrent `migrations::run()` against one
 /// fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
-/// migrations (011, 022) land valid indexes.
+/// migration (022) lands a valid index. (011's CIC index is dropped
+/// by 035, so nothing left to assert there.)
 ///
 /// Under sqlx's default blocking `pg_advisory_lock`, replica B's
 /// blocked `SELECT pg_advisory_lock(...)` holds a virtualxid that

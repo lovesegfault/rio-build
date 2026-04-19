@@ -253,8 +253,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_substitute_probe_skipped_total",
         "check_available batches that exceeded SUBSTITUTE_PROBE_MAX_PATHS and \
-         skipped HEAD probes entirely. Non-zero means large merges are not \
-         getting upstream-substitution coverage at merge time."
+         were truncated to the first 4096 paths for HEAD probing. Non-zero \
+         means large merges get partial coverage this tick; the 1h probe_cache \
+         converges on retry."
     );
 
     // r[impl obs.metric.store-pg-pool]

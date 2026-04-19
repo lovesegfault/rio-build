@@ -239,7 +239,7 @@ pub struct StoreServiceImpl {
     /// `.with_chunk_upload_max_concurrent()`.
     chunk_upload_max_concurrent: usize,
     /// Cap on paths in a FindMissingPaths request (DoS guard). Default
-    /// [`DEFAULT_MAX_BATCH_PATHS`] (100k); override via
+    /// [`DEFAULT_MAX_BATCH_PATHS`] (1M); override via
     /// `.with_max_batch_paths()`.
     max_batch_paths: usize,
 }

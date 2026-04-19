@@ -49,9 +49,10 @@ pub fn should_chunk(
 /// Default max concurrent S3 chunk uploads per `put_chunked` call.
 ///
 /// Tuned against P0473's scheduler-side `RIO_SUBSTITUTE_MAX_CONCURRENT`
-/// (default 16): 16 scheduler RPCs × 32 store-side uploads = 512
-/// in-flight S3 PutObjects, comfortably under the aws-sdk's ~1024
-/// default connection pool with headroom for other store traffic.
+/// (helm-default 16; code-default 256): 16 scheduler RPCs × 32
+/// store-side uploads = 512 in-flight S3 PutObjects, comfortably
+/// under the aws-sdk's ~1024 default connection pool with headroom
+/// for other store traffic.
 ///
 /// Unbounded fan-out on large NARs (python3: 374 MB → ~1900 chunks)
 /// saturates the pool → `DispatchFailure` cascades → substitution

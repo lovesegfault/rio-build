@@ -103,10 +103,8 @@ pub const M_009: () = ();
 /// ## "No race" — true, but not for the stated reason
 ///
 /// The original comment block claimed `PutChunk` does `INSERT chunks`
-/// → `INSERT chunk_tenants` "same txn, no race." **True, but sqlx
-/// runs each migration in autocommit mode** — the two `CREATE`
-/// statements in 018 are NOT atomic (two separate autocommit
-/// statements). The "no race" property holds at *application* time
+/// → `INSERT chunk_tenants` "same txn, no race." **It is not one
+/// txn.** The "no race" property holds at *application* time
 /// because `PutChunk` does `INSERT chunks` (autocommit) THEN
 /// `INSERT chunk_tenants` (autocommit) — two separate statements,
 /// chunks commits BEFORE junction, FK satisfied sequentially. If the
