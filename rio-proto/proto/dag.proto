@@ -36,6 +36,7 @@ message DerivationNode {
   // that won't build. Per-node ≤64KB (gateway enforces); scheduler
   // validates ≤256KB defensively. 16MB total budget across the DAG.
   bytes drv_content = 9;
+  reserved 10;  // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
 
   // Phase 5 CA cutoff: set by gateway translate.rs from
   // has_ca_floating_outputs() || is_fixed_output(). Scheduler uses

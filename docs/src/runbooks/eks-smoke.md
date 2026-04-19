@@ -75,7 +75,7 @@ apiVersion: rio.build/v1alpha1
 kind: Pool
 metadata:
   name: smoke-test
-  namespace: rio-system
+  namespace: rio-builders   # NOT rio-system: builder pods need CAP_SYS_ADMIN; rio-system is PSA-restricted
 spec:
   kind: Builder
   image: rio-builder:latest
@@ -83,9 +83,9 @@ spec:
   features: []
   maxConcurrent: 4
   nodeSelector:
-    rio.build/node-role: worker
+    rio.build/node-role: builder
   tolerations:
-    - key: rio.build/worker
+    - key: rio.build/builder
       operator: Equal
       value: "true"
       effect: NoSchedule
@@ -94,7 +94,7 @@ EOF
 # Builder Jobs spawn on demand once a build is queued — no standing pods to wait for.
 # Per-pod cpu/mem/disk come from the scheduler's per-drv SpawnIntent (ADR-023),
 # NOT from Pool.spec — there is no resources field.
-rio-cli pool describe smoke-test    # or: kubectl -n rio-system get pool smoke-test -o yaml
+rio-cli pool describe smoke-test    # or: kubectl -n rio-builders get pool smoke-test -o yaml
 ```
 
 **Troubleshooting if workers stuck ContainerCreating:**
@@ -130,7 +130,7 @@ BUILD_PID=$!
 
 # Wait for dispatch, then kill a worker
 sleep 10
-kubectl -n rio-system delete pod \
+kubectl -n rio-builders delete pod \
   -l rio.build/pool=smoke-test --wait=false \
   --field-selector=status.phase=Running | head -1
 
@@ -155,7 +155,7 @@ cargo xtask k8s cli -p eks -- trigger-gc --dry-run --grace-period-hours 2
 ## Cleanup
 
 ```bash
-kubectl -n rio-system delete pool smoke-test
+kubectl -n rio-builders delete pool smoke-test
 helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
 ```
 

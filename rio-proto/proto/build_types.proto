@@ -347,6 +347,7 @@ message HeartbeatRequest {
   repeated string systems = 5;
   repeated string supported_features = 6; // requiredSystemFeatures this executor supports
   reserved 7;                             // was max_builds (P0537: always 1)
+  reserved 8;                             // was size_class (ADR-023: SLA per-drv sizing)
   // FUSE circuit breaker open — executor cannot fetch from store.
   // Scheduler treats like `draining`: `has_capacity()` returns false.
   // Cleared when breaker closes/half-opens. Default false — wire-compatible

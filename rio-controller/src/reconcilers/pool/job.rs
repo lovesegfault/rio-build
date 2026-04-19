@@ -487,13 +487,11 @@ pub(super) async fn reap_orphan_running(
 /// forces exhaustive handling.
 pub(super) enum SpawnOutcome {
     Spawned,
-    /// 409 AlreadyExists — name collision. Next tick picks a fresh
-    /// name. Not worth propagating — would trigger error_policy
-    /// backoff for what is expected-noise.
-    ///
-    /// Two sources: random-suffix collision (36^6 ≈ 2 billion, TTL
-    /// 60s, birthday-negligible but K8s handles it) or a concurrent
-    /// reconcile racing the same pool.
+    /// 409 AlreadyExists — Job for this `intent_id` already exists
+    /// (deterministic name = intentional dedupe, 9ff95c7). The
+    /// `skip_existing` pre-filter in `spawn_for_each` makes this the
+    /// rare list-race fallback. Not worth propagating — would trigger
+    /// error_policy backoff for what is expected-noise.
     NameCollision,
     /// Spawn failed (quota blip, admission webhook, apiserver flap).
     /// NOT a bail — P0516 (`33424b8a`): one spawn error shouldn't
@@ -512,8 +510,8 @@ pub(super) enum SpawnOutcome {
 /// `PostParams::default` (not SSA): Jobs are create-once. SSA's
 /// patch-merge semantics don't fit — there's no "update existing Job
 /// to match spec," the Job is immutable after create (K8s rejects
-/// most spec edits). A 409 is retried next tick with a fresh random
-/// name.
+/// most spec edits). A 409 means the intent's Job already exists
+/// (deterministic naming) — `spawn_for_each` skips it next tick.
 pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,
@@ -702,13 +700,6 @@ pub(super) fn scheduler_unreachable_condition(
     })
 }
 
-/// 6-char lowercase-alphanumeric random suffix for Job names.
-///
-/// Not `generate_name`: K8s's generateName appends 5 chars AFTER
-/// a create, meaning we don't know the name until the apiserver
-/// returns. We want to log the name in the create-error path
-/// (409, other API errors). Generating our own suffix is the
-/// same collision math with better observability.
 /// Classify a Pod's termination reason from k8s PodStatus.
 ///
 /// Precedence:
