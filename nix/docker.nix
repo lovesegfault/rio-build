@@ -273,6 +273,39 @@ let
   # time failure not a runtime surprise. If a deploy renames the
   # Gateway or moves it to a different namespace, this config needs
   # a matching rebuild.
+  #
+  # r[dash.auth.method-gate+2] readonly allow-list. MUST match the
+  # rio-scheduler-readonly HTTPRoute in dashboard-gateway.yaml — the
+  # dashboard-method-gate-parity check (nix/misc-checks.nix) diffs the
+  # two and fails CI on divergence. nginx is reached via `kubectl
+  # port-forward svc/rio-dashboard` (in-cluster, hits nginx directly,
+  # NOT the Gateway), so it must enforce the same allow-list or
+  # mutating RPCs are fail-OPEN to any port-forwarded browser.
+  dashboardReadonlyAdmin = [
+    "ClusterStatus"
+    "ListExecutors"
+    "ListPoisoned"
+    "ListBuilds"
+    "GetBuildLogs"
+    "ListTenants"
+    "GetBuildGraph"
+    "GetSpawnIntents"
+  ];
+  dashboardReadonlyScheduler = [
+    "WatchBuild"
+    "QueryBuildStatus"
+  ];
+  # Shared proxy_pass directives for both allow-list locations (admin
+  # + scheduler). Unbuffered streaming + long read-timeout are LOAD-
+  # BEARING — see the in-config comment.
+  dashboardProxyDirectives = ''
+    proxy_pass http://rio_scheduler;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_set_header Content-Type $content_type;
+    proxy_set_header X-Grpc-Web $http_x_grpc_web;
+  '';
   dashboardNginxConf = pkgs.writeText "nginx.conf" ''
     # Non-root container (runAsUser, readOnlyRootFilesystem). Master
     # process runs foreground; no `user` directive (we're already
@@ -321,52 +354,36 @@ let
           try_files $uri /index.html;
         }
 
-        # r[dash.auth.method-gate]: mutating AdminService methods are
-        # NOT exposed via the dashboard nginx by default (matches
-        # `dashboard.enableMutatingMethods: false`). The browser SPA
-        # never calls these; rio-cli with mTLS does. 404 here means a
-        # crafted POST from the browser origin can't ClearPoison/
-        # DrainExecutor/etc. even though the upstream would accept it.
-        # This block must be FIRST — nginx evaluates regex locations
-        # in config order, first-match wins.
-        location ~ ^/rio\.admin\.AdminService/(ClearPoison|DrainExecutor|CreateTenant|TriggerGC)$ {
-          return 404;
-        }
-
-        # gRPC-Web is plain HTTP/1.1 POST with a length-prefixed
-        # proto body. nginx proxies straight to rio-scheduler:9001
-        # (D3: scheduler's tonic-web layer handles gRPC-Web on the
-        # same port as native gRPC). No translation proxy in between.
+        # r[dash.auth.method-gate+2] ALLOW-LIST: only the readonly
+        # methods enumerated above are proxied; everything else under
+        # /rio.* falls through to the catch-all 404 below. This was a
+        # 4-method DENY-list, which fail-OPENED ~10 mutating RPCs
+        # (ResetSlaModel, SubmitBuild, CancelBuild, ReportExecutor-
+        # Termination, …) to any port-forwarded browser. Allow-list
+        # polarity matches the Cilium Gateway HTTPRoute and is
+        # CI-enforced via dashboard-method-gate-parity.
         #
-        # Pattern matches /rio.admin.AdminService/* and
-        # /rio.scheduler.SchedulerService/* — the two services the
-        # dashboard calls. No trailing / after the second \. — the
-        # next token is the ServiceName, not a path segment.
-        location ~ ^/rio\.(admin|scheduler)\. {
-          proxy_pass http://rio_scheduler;
-          proxy_http_version 1.1;
-
-          # LOAD-BEARING: without proxy_buffering off, nginx buffers
-          # the entire server-streaming response before flushing to
-          # the client. GetBuildLogs / WatchBuild are live-tailing
-          # streams — a build that runs for minutes would produce
-          # ZERO output in the browser until completion. Envoy's
-          # grpc_web filter emits length-prefixed DATA frames as they
-          # arrive; nginx must pass them through unbuffered. Same
-          # constraint the sidecar design had.
-          proxy_buffering off;
-          # nginx default proxy_read_timeout is 60s. The scheduler's
-          # http2_keepalive_interval(30s) (D3: Server::builder) keeps
-          # quiet GetBuildLogs streams alive for the LLVM-cold-ccache
-          # case. Match here or nginx cuts the stream first.
-          proxy_read_timeout 3600s;
-
-          # Pass through the headers envoy's CORS SecurityPolicy
-          # allow-lists. Content-Type carries the application/
-          # grpc-web+proto marker; X-Grpc-Web is the spec'd client
-          # flag.
-          proxy_set_header Content-Type $content_type;
-          proxy_set_header X-Grpc-Web $http_x_grpc_web;
+        # nginx evaluates regex locations in config order, first-match
+        # wins — proxy locations FIRST, catch-all 404 LAST.
+        #
+        # gRPC-Web is plain HTTP/1.1 POST with a length-prefixed proto
+        # body; rio-scheduler's tonic-web layer (D3) handles gRPC-Web
+        # on the same port as native gRPC.
+        location ~ ^/rio\.admin\.AdminService/(${lib.concatStringsSep "|" dashboardReadonlyAdmin})$ {
+          # LOAD-BEARING proxy_buffering off: GetBuildLogs is a live-
+          # tailing stream; with buffering on, nginx flushes nothing
+          # until completion. proxy_read_timeout 3600s: matches the
+          # scheduler's http2_keepalive_interval(30s) so quiet streams
+          # survive. (Same directives in dashboardProxyDirectives.)
+          ${dashboardProxyDirectives}
+        }
+        location ~ ^/rio\.scheduler\.SchedulerService/(${lib.concatStringsSep "|" dashboardReadonlyScheduler})$ {
+          ${dashboardProxyDirectives}
+        }
+        # Fail-closed catch-all for any other /rio.* path (mutating
+        # admin RPCs, SubmitBuild/CancelBuild, future methods).
+        location ~ ^/rio\. {
+          return 404;
         }
       }
     }
@@ -419,6 +436,15 @@ let
     };
 in
 rec {
+  # Full /service/method paths for the readonly allow-list. Consumed
+  # by the dashboard-method-gate-parity check (nix/misc-checks.nix) to
+  # diff against the Cilium Gateway HTTPRoute — closes the drift class
+  # where nginx and the Gateway implement r[dash.auth.method-gate+2]
+  # independently.
+  dashboardReadonlyMethods =
+    map (m: "/rio.admin.AdminService/${m}") dashboardReadonlyAdmin
+    ++ map (m: "/rio.scheduler.SchedulerService/${m}") dashboardReadonlyScheduler;
+
   gateway = mkImage {
     name = "gateway";
     bins = [ rio-crates.rio-gateway ];
@@ -467,11 +493,13 @@ rec {
   # Needs nix (nix-store --generate-binary-cache-key), awscli2, openssl.
   # IRSA via the rio-bootstrap ServiceAccount gives it
   # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
-  bootstrap =
-    let
-      script = pkgs.writeShellScript "rio-bootstrap" ''
-        set -euo pipefail
-        : "''${AWS_REGION:?}" "''${CHUNK_BUCKET:?}"
+  #
+  # Exposed (not let-local) so the bootstrap-idempotent check
+  # (nix/misc-checks.nix) can run it against a mocked aws CLI and
+  # assert the signing-key block converges from partial state.
+  bootstrapScript = pkgs.writeShellScript "rio-bootstrap" ''
+    set -euo pipefail
+    : "''${AWS_REGION:?}" "''${CHUNK_BUCKET:?}"
 
         if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
           echo "[bootstrap] rio/hmac already exists, skipping"
@@ -496,8 +524,15 @@ rec {
             --secret-binary fileb:///tmp/service-hmac
         fi
 
-        if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1; then
-          echo "[bootstrap] rio/signing-key already exists, skipping"
+        # Guard on BOTH halves. With one guard and two creates, a Job
+        # retry after dying between the two creates (or a rotation by
+        # deleting only the private half) left a permanently mismatched
+        # pair while the Job reported success — every client signature
+        # check then fails. Guarding both + create||put converges from
+        # any partial state.
+        if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1 \
+           && aws secretsmanager describe-secret --secret-id rio/signing-key-pub >/dev/null 2>&1; then
+          echo "[bootstrap] rio/signing-key{,-pub} already exist, skipping"
         else
           echo "[bootstrap] generating rio/signing-key"
           tmp=$(mktemp -d)
@@ -509,13 +544,21 @@ rec {
           nix-store --store dummy:// \
             --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
             "$tmp/key.sec" "$tmp/key.pub"
-          aws secretsmanager create-secret --name rio/signing-key \
-            --secret-string "file://$tmp/key.sec"
-          # Public half separately so operators can `get-secret-value`
-          # it for their nix.conf trusted-public-keys without access to
-          # the private half.
+          # Pub FIRST, create||put: a half-done prior run or a delete-
+          # private-only rotation converges instead of leaving a stale
+          # pub. If we die after pub-create, retry's guard fails (private
+          # missing) → regenerate both → pub overwritten via put.
+          # Public half stored separately so operators can `get-secret-
+          # value` it for their nix.conf trusted-public-keys without
+          # access to the private half.
           aws secretsmanager create-secret --name rio/signing-key-pub \
-            --secret-string "file://$tmp/key.pub"
+            --secret-string "file://$tmp/key.pub" 2>/dev/null \
+            || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
+                 --secret-string "file://$tmp/key.pub"
+          aws secretsmanager create-secret --name rio/signing-key \
+            --secret-string "file://$tmp/key.sec" 2>/dev/null \
+            || aws secretsmanager put-secret-value --secret-id rio/signing-key \
+                 --secret-string "file://$tmp/key.sec"
           echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
           cat "$tmp/key.pub"
         fi
@@ -535,52 +578,51 @@ rec {
           aws secretsmanager create-secret --name rio/gateway-host-key \
             --secret-string "file://$tmp/host_key"
           echo "[bootstrap] gateway host key fingerprint (for known_hosts pinning):"
-          ssh-keygen -l -f "$tmp/host_key.pub"
-        fi
-      '';
-    in
-    buildZstd {
-      name = "rio-bootstrap";
-      tag = "dev";
-      maxLayers = 20;
-      contents =
-        baseContents
-        ++ nonrootEtc
-        ++ [
-          pkgs.awscli2
-          pkgs.openssl
-          pkgs.openssh
-          pkgs.nix
-          pkgs.bash
-          pkgs.coreutils
-        ];
-      config = {
-        Entrypoint = [ "${script}" ];
-        # PSA restricted (rio.podSecurityContext) sets runAsNonRoot=true.
-        # Without an image-level User, kubelet would need runAsUser
-        # explicitly; setting it here matches the other control-plane
-        # images and makes bare `docker run` unprivileged too.
-        User = nonrootUser;
-        Env = [
-          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-          "PATH=${
-            lib.makeBinPath [
-              pkgs.awscli2
-              pkgs.openssl
-              pkgs.openssh
-              pkgs.nix
-              pkgs.coreutils
-            ]
-          }"
-        ];
-      };
-      # mktemp needs /tmp.
-      extraCommands = ''
-        ${derefEtc}
-        mkdir -p tmp
-        chmod 1777 tmp
-      '';
+      ssh-keygen -l -f "$tmp/host_key.pub"
+    fi
+  '';
+  bootstrap = buildZstd {
+    name = "rio-bootstrap";
+    tag = "dev";
+    maxLayers = 20;
+    contents =
+      baseContents
+      ++ nonrootEtc
+      ++ [
+        pkgs.awscli2
+        pkgs.openssl
+        pkgs.openssh
+        pkgs.nix
+        pkgs.bash
+        pkgs.coreutils
+      ];
+    config = {
+      Entrypoint = [ "${bootstrapScript}" ];
+      # PSA restricted (rio.podSecurityContext) sets runAsNonRoot=true.
+      # Without an image-level User, kubelet would need runAsUser
+      # explicitly; setting it here matches the other control-plane
+      # images and makes bare `docker run` unprivileged too.
+      User = nonrootUser;
+      Env = [
+        "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "PATH=${
+          lib.makeBinPath [
+            pkgs.awscli2
+            pkgs.openssl
+            pkgs.openssh
+            pkgs.nix
+            pkgs.coreutils
+          ]
+        }"
+      ];
     };
+    # mktemp needs /tmp.
+    extraCommands = ''
+      ${derefEtc}
+      mkdir -p tmp
+      chmod 1777 tmp
+    '';
+  };
 
   # Builder needs the nix toolchain + FUSE runtime + mount utilities.
   builder = mkImage {

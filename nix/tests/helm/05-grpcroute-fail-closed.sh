@@ -1,4 +1,4 @@
-# r[dash.auth.method-gate] fail-closed proof.
+# r[dash.auth.method-gate+2] fail-closed proof.
 #
 # Default values (enableMutatingMethods=false) MUST NOT render the
 # mutating HTTPRoute. If this assert fails, a values.yaml typo (or a

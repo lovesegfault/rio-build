@@ -40,7 +40,7 @@ spec:
           - kind: HTTPRoute
 ---
 # ── Read-only methods: routed unconditionally ─────────────────────────
-# r[dash.auth.method-gate] — the method split is here. Status/list/log/
+# r[dash.auth.method-gate+2] — the method split is here. Status/list/log/
 # graph RPCs are idempotent reads; the dashboard hits these on every
 # page load. Exposing them via gRPC-Web is low-risk (worst case: an
 # attacker learns cluster state they could also learn from /metrics).

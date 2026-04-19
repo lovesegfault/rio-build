@@ -147,17 +147,38 @@ pkgs.testers.runNixOSTest {
             timeout=60,
         )
 
-    # ── (5) method-gate via nginx: ClearPoison → 404 ─────────────────
-    # nginx's mutating-method location block (docker.nix
-    # dashboardNginxConf) returns 404 BEFORE proxy_pass — proves the
-    # browser-origin can't reach mutating AdminService methods even
-    # though the upstream scheduler would accept them.
-    with subtest("method-gate via nginx: ClearPoison 404"):
+    # ── (5) method-gate via nginx: allow-list fail-closed ────────────
+    # nginx's catch-all /rio.* location (docker.nix dashboardNginxConf)
+    # returns 404 for anything NOT in the readonly allow-list — proves
+    # the browser-origin can't reach mutating methods even though the
+    # upstream scheduler would accept them. Before the allow-list
+    # conversion, nginx had a 4-method DENY-list that fail-OPENED ~10
+    # mutating RPCs (ResetSlaModel, CancelBuild, …) — those reached the
+    # scheduler and returned a gRPC error encoded as HTTP 200.
+    with subtest("method-gate via nginx: allow-list fail-closed"):
+        # Original deny-list entry — still blocked.
         k3s_server.succeed(
             "curl -s -o /dev/null -w '%{http_code}' -X POST "
             "http://localhost:18081/rio.admin.AdminService/ClearPoison -d x "
             "| grep -qx 404"
         )
+        # Mutating admin RPC NOT in old deny-list → was 200 before fix.
+        k3s_server.succeed(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST "
+            "http://localhost:18081/rio.admin.AdminService/ResetSlaModel -d x "
+            "| grep -qx 404"
+        )
+        # Mutating scheduler RPC → old deny-list never gated
+        # SchedulerService at all; was 200 before fix.
+        k3s_server.succeed(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST "
+            "http://localhost:18081/rio.scheduler.SchedulerService/CancelBuild -d x "
+            "| grep -qx 404"
+        )
+        # (Readonly methods reaching the scheduler is already proven by
+        # the ClusterStatus 0x00 + GetBuildLogs 0x80 subtests above —
+        # both use the proper grpc-web headers; a bare `-d x` curl here
+        # would hit tonic-web's content-type check, not nginx.)
 
     k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")
 
