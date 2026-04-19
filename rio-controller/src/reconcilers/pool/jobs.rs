@@ -523,17 +523,20 @@ pub(super) fn build_job(
 /// Quantities rendered as raw byte counts (no SI suffix): k8s parses
 /// bare integers as base-unit and they roundtrip exactly.
 ///
-/// `ephemeral-storage` = `disk_bytes` (overlay writes, from the SLA
-/// model's prjquota fit) + the per-pool FUSE cache budget (input
-/// closure, NOT captured by `disk_p90`) + log/scratch headroom. The
-/// FUSE budget is [`pod::fuse_cache_bytes`] — the SAME value that
-/// sets the `fuse-cache` emptyDir sizeLimit, so kubelet's pod-level
-/// sum (writable-layer + logs + disk-backed emptyDirs) cannot exceed
-/// the limit before the volume-level limit fires.
+/// `ephemeral-storage` = `disk_bytes × OVERLAY_HEADROOM` (overlay
+/// writes, from the SLA model's prjquota fit, plus the variance
+/// cushion) + the per-pool FUSE cache budget (input closure, NOT
+/// captured by `disk_p90`) + log/scratch headroom. BOTH addends are
+/// the SAME values that set the `overlays` / `fuse-cache` emptyDir
+/// sizeLimits, so kubelet's pod-level sum (writable-layer + logs +
+/// disk-backed emptyDirs) cannot exceed the limit before a volume-
+/// level limit fires. Budgeting bare `disk_bytes` (1.0×) here while
+/// the overlay sizeLimit is 1.5× made the headroom unreachable —
+/// pods evicted at ≈p90 instead of 1.5×p90.
 // r[impl sched.sla.disk-reaches-ephemeral-storage]
 fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) {
-    let ephemeral = i
-        .disk_bytes
+    let overlay_limit = (i.disk_bytes as f64 * OVERLAY_HEADROOM) as u64;
+    let ephemeral = overlay_limit
         .saturating_add(pod::fuse_cache_bytes(pool))
         .saturating_add(LOG_BUDGET_BYTES);
     let map: BTreeMap<String, Quantity> = BTreeMap::from([
@@ -575,8 +578,9 @@ fn apply_intent_resources(pod_spec: &mut PodSpec, pool: &Pool, i: &SpawnIntent) 
         }
     }
 
-    // Overlay emptyDir sizeLimit = disk_bytes × headroom.
-    let overlay_limit = (i.disk_bytes as f64 * OVERLAY_HEADROOM) as u64;
+    // Overlay emptyDir sizeLimit — same `overlay_limit` used as the
+    // overlay addend above so kubelet's pod-level sum cannot fire
+    // before the volume cap.
     if let Some(volumes) = pod_spec.volumes.as_mut() {
         for v in volumes.iter_mut() {
             if v.name == "overlays"
@@ -916,8 +920,8 @@ mod tests {
         assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
         assert_eq!(
             req["ephemeral-storage"],
-            Quantity(((40 + 8 + 1) * GI).to_string()),
-            "disk_bytes + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
+            Quantity(((60 + 8 + 1) * GI).to_string()),
+            "disk_bytes×OVERLAY_HEADROOM + BUILDER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES"
         );
         assert_eq!(
             res.limits.as_ref(),
@@ -991,11 +995,71 @@ mod tests {
                 .and_then(|r| r.limits.as_ref())
                 .map(|l| l["ephemeral-storage"].clone())
                 .unwrap();
+            let overlay_limit = ((5 * GI) as f64 * OVERLAY_HEADROOM) as u64;
             assert_eq!(
                 eph,
-                Quantity((5 * GI + expect + LOG_BUDGET_BYTES).to_string()),
+                Quantity((overlay_limit + expect + LOG_BUDGET_BYTES).to_string()),
                 "{kind:?} ephemeral-storage budget must include the SAME \
                  fuse-cache bytes as the emptyDir sizeLimit"
+            );
+        }
+    }
+
+    /// Structural invariant: container `ephemeral-storage` limit ≥
+    /// Σ(disk-backed emptyDir sizeLimits) + LOG_BUDGET. Kubelet sums
+    /// all disk-backed emptyDirs against the container limit and
+    /// evicts when the sum exceeds it — independent of per-volume
+    /// sizeLimit. If the container limit is smaller, the per-volume
+    /// caps are unreachable (the OVERLAY_HEADROOM cushion becomes
+    /// phantom; pods evict at ≈p90 instead of 1.5×p90).
+    ///
+    /// Invariant under future `OVERLAY_HEADROOM` changes (ADR-023
+    /// phase-2 will replace the constant with `headroom(n_eff)`).
+    #[test]
+    fn disk_backed_emptydir_sizelimits_fit_ephemeral_limit() {
+        const GI: u64 = 1 << 30;
+        for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
+            let pool = test_pool("p", kind);
+            let job = build_job(
+                &pool,
+                crate::fixtures::oref(&pool),
+                &test_sched_addrs(),
+                &test_store_addrs(),
+                &SpawnIntent {
+                    intent_id: "abc".into(),
+                    disk_bytes: 40 * GI,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let pod_spec = job
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .unwrap();
+            let eph: u64 = pod_spec.containers[0]
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .map(|l| l["ephemeral-storage"].0.parse().unwrap())
+                .unwrap();
+            // Sum every disk-backed emptyDir sizeLimit. `medium` unset
+            // (default) = node disk; `medium=Memory` (tmpfs) doesn't
+            // count against ephemeral-storage.
+            let sum_sizelimits: u64 = pod_spec
+                .volumes
+                .iter()
+                .flatten()
+                .filter_map(|v| v.empty_dir.as_ref())
+                .filter(|ed| ed.medium.as_deref() != Some("Memory"))
+                .filter_map(|ed| ed.size_limit.as_ref())
+                .map(|q| q.0.parse::<u64>().unwrap())
+                .sum();
+            assert!(
+                eph >= sum_sizelimits + LOG_BUDGET_BYTES,
+                "{kind:?}: ephemeral-storage limit {eph} < Σ(disk-backed \
+                 emptyDir sizeLimits) {sum_sizelimits} + LOG_BUDGET — \
+                 kubelet evicts before any volume cap fires"
             );
         }
     }
