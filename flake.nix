@@ -668,12 +668,11 @@
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
           #   vm-ca-cutoff-standalone — CA-on-CA cutoff propagation
           #   vm-chaos-standalone — fault injection
-          #   vm-lifecycle-{core,recovery,autoscale,bps}-k3s
+          #   vm-lifecycle-{core,recovery,autoscale,pool,prod-parity}-k3s
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #   vm-security-nonpriv-k3s — privileged-hardening e2e
           #   vm-cli-k3s — rio-cli integration
           #   vm-dashboard-k3s, vm-dashboard-gateway-k3s — gRPC-Web + envoy
-          #   vm-fod-proxy-k3s — fixed-output derivation proxy
           #   vm-netpol-k3s — NetworkPolicy enforcement
           #
           # mkVmTests: build the attrset for a given (workspace,
@@ -762,11 +761,8 @@
                 vm-lifecycle-core-k3s = 8;
                 vm-lifecycle-recovery-k3s = 8;
                 vm-lifecycle-autoscale-k3s = 8;
-                vm-lifecycle-bps-k3s = 8;
                 vm-le-stability-k3s = 8;
                 vm-le-build-k3s = 8;
-                # k3s + one extra airgap image (squid). Does builds.
-                vm-fod-proxy-k3s = 8;
                 # k3s nonpriv e2e (base_runtime_spec /dev/fuse +
                 # cgroup rw-remount).
                 vm-security-nonpriv-k3s = 8;
@@ -784,6 +780,21 @@
                 vm-lifecycle-prod-parity-k3s = 8;
               };
             in
+            # Dead-entry guard: every cpuHints key must name a real test.
+            # Before this assert, vm-lifecycle-bps-k3s and vm-fod-proxy-k3s
+            # sat here for months after deletion — the old comment claimed a
+            # "T539" check caught dead entries; that check never existed.
+            # Gated on !coverage: vmTestsCov's allTests is a strict subset
+            # (vm-dashboard-k3s is optionalAttrs-gated on dockerImages?
+            # dashboard, absent in coverage mode); checking the full set
+            # once is sufficient.
+            assert
+              coverage
+              ||
+                pkgs.lib.assertMsg (pkgs.lib.all (k: allTests ? ${k}) (pkgs.lib.attrNames cpuHints))
+                  "cpuHints has entries for tests not in nix/tests/default.nix: ${
+                    toString (pkgs.lib.filter (k: !(allTests ? ${k})) (pkgs.lib.attrNames cpuHints))
+                  }";
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
               pkgs.lib.mapAttrs (
                 name:
@@ -793,8 +804,7 @@
                     # 8-core. Every -k3s test in the table is 8; encode that as
                     # the suffix default so new -k3s tests don't fall through to
                     # 4. Catchup-fix precedent: d6f74e27 + fa55ef13 both added
-                    # forgotten -k3s entries. T539 catches the OTHER direction
-                    # (dead entries for deleted tests).
+                    # forgotten -k3s entries. Dead entries fail the assert above.
                     or (if pkgs.lib.hasSuffix "-k3s" name then 8 else 4)
                 )
               ) allTests
@@ -963,23 +973,24 @@
           # too — on Darwin it's {} (harmless).
           githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             matrix = {
-              # Rust + static checks. Excludes `coverage` (superseded
-              # by the coverage matrix below — Codecov merges flags).
-              checks = {
-                clippy = crateChecks.clippyCheck;
-                doc = crateChecks.docCheck;
-                inherit (crateChecks) nextest;
-                inherit (miscChecks)
-                  deny
-                  tracey-validate
-                  mdbook
-                  helm-lint
-                  crds-drift
-                  tfvars-fresh
-                  ;
-                inherit (config.checks) pre-commit;
-                dashboard = rioDashboard;
-              };
+              # Rust + static checks. Derived from config.checks — same
+              # P0525 rationale as .#ci above: a manual list had drifted
+              # to miss executor-seed-layer-parity, node-ami-eval, and
+              # codecov-matrix-sync (the very check P0525 added .#ci
+              # derivation for). Subtract what other matrices already
+              # cover (fuzz, vm-test, coverage) plus `build` (clippy/
+              # nextest deps already build the workspace). attrNames
+              # forces only key names, not values — codecov-matrix-sync's
+              # value reads githubActions.matrix.coverage, but its KEY is
+              # a literal, so no recursion.
+              checks = builtins.removeAttrs config.checks (
+                [
+                  "build"
+                  "coverage"
+                ]
+                ++ builtins.attrNames fuzz.runs
+                ++ builtins.attrNames vmTests
+              );
               # 2min fuzz runs, one matrix entry per target. Keys are
               # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
               # entry rebuilds the shared fuzz-build derivation, but
@@ -1168,6 +1179,10 @@
                   builtins.removeAttrs dockerImages [
                     "executorSeed"
                     "executorSeedLayerParity"
+                    # Non-image attrs exposed for misc-checks (parity diff,
+                    # idempotency mock harness).
+                    "dashboardReadonlyMethods"
+                    "bootstrapScript"
                     "vmTestSeed"
                   ]
                 )
@@ -1355,6 +1370,10 @@
           # added without bumping the Codecov gate.
           # Linux-only because githubActions is optionalAttrs isLinux.
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Regression: per-node profraw extract must not drop
+            # filename-colliding profraws across multi-worker nodes.
+            # No KVM needed (synthetic tarballs).
+            cov-extract-nocollide = coverage.extractNoCollide;
             codecov-matrix-sync =
               let
                 expected = builtins.length (builtins.attrNames githubActions.matrix.coverage);
