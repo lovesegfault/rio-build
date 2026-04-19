@@ -9,7 +9,7 @@
 // cover.
 import { describe, expect, it } from 'vitest';
 import { AdminService } from '../api/types';
-import { adminMock } from './admin-mock';
+import { adminMock, teardownStandardAfterEach } from './admin-mock';
 
 describe('adminMock surface parity', () => {
   it('stubs every AdminService method', () => {
@@ -28,5 +28,16 @@ describe('adminMock surface parity', () => {
     for (const k of Object.keys(adminMock)) {
       expect(protoMethods.has(k), `stray stub ${k} not in AdminService`).toBe(true);
     }
+  });
+
+  it('getBuildGraph default survives mockReset()', async () => {
+    // Regression: .mockResolvedValue() is set post-construction and is
+    // wiped by mockReset(); only the vi.fn(impl) constructor-arg form
+    // survives teardownStandardAfterEach(). A bare vi.fn() returning
+    // undefined would crash Graph.svelte on r.nodes.
+    teardownStandardAfterEach();
+    const r = await adminMock.getBuildGraph({});
+    expect(r).toBeDefined();
+    expect(r.nodes).toEqual([]);
   });
 });

@@ -32,8 +32,10 @@ import { type Mock, vi } from 'vitest';
 // default so `for await (const chunk of admin.getBuildLogs(...))`
 // doesn't throw `undefined is not iterable` when a page renders a
 // LogViewer child but the test doesn't care about the stream body.
-// vitest's mockReset() restores the constructor-time implementation,
-// so these defaults survive teardownStandardAfterEach().
+// vitest's mockReset() resets to a bare vi.fn() returning undefined
+// (it does NOT restore the constructor argument), so
+// teardownStandardAfterEach() re-applies these defaults explicitly
+// after the reset loop.
 //
 // Every stub is typed `Mock` (untyped Procedure), not the inferred
 // `Mock<() => AsyncGenerator<never, ...>>`: the empty-generator default
@@ -41,6 +43,12 @@ import { type Mock, vi } from 'vitest';
 // rejects mockImplementation calls that yield real chunk shapes. The
 // blanket `Mock` loosening matches what per-file `vi.fn()` gave before.
 const emptyStream = async function* () {};
+const emptyGraph = async () => ({
+  nodes: [],
+  edges: [],
+  truncated: false,
+  totalNodes: 0,
+});
 export const adminMock = {
   clusterStatus: vi.fn(),
   listExecutors: vi.fn(),
@@ -57,9 +65,7 @@ export const adminMock = {
   // Empty-default so pages embedding Graph (which calls
   // getBuildGraph at mount) don't crash on undefined.nodes. Per-test
   // overrides via .mockResolvedValueOnce(...) still work.
-  getBuildGraph: vi
-    .fn()
-    .mockResolvedValue({ nodes: [], edges: [], truncated: false, totalNodes: 0 }),
+  getBuildGraph: vi.fn(emptyGraph) as Mock,
   getSpawnIntents: vi.fn(),
   ackSpawnedIntents: vi.fn(),
   reportExecutorTermination: vi.fn(),
@@ -116,16 +122,28 @@ export function setupStandardBeforeEach(
   vi.stubGlobal('confirm', vi.fn(() => true));
 }
 
+// Re-apply non-undefined defaults after mockReset() — vitest's reset
+// returns a bare vi.fn() (constructor-arg is NOT restored), so without
+// this a second-or-later test that mounts Graph/LogViewer without an
+// explicit stub would hit undefined.nodes / undefined-not-iterable.
+function applyDefaults(): void {
+  adminMock.getBuildLogs.mockImplementation(emptyStream);
+  adminMock.triggerGC.mockImplementation(emptyStream);
+  adminMock.getBuildGraph.mockImplementation(emptyGraph);
+}
+
 /**
- * Standard afterEach: undo globals, reset every adminMock stub (which
- * for the streaming ones restores the empty-generator default), reset
- * toastMock, back to real timers. Call-order mirrors setup: globals
- * first so a stray `confirm` in a teardown effect sees the stub gone,
- * then mocks, then timers.
+ * Standard afterEach: undo globals, reset every adminMock stub then
+ * re-apply the non-undefined defaults (empty-generator for the
+ * streaming ones, empty-graph for getBuildGraph), reset toastMock,
+ * back to real timers. Call-order mirrors setup: globals first so a
+ * stray `confirm` in a teardown effect sees the stub gone, then
+ * mocks, then timers.
  */
 export function teardownStandardAfterEach(): void {
   vi.unstubAllGlobals();
   for (const fn of Object.values(adminMock)) fn.mockReset();
+  applyDefaults();
   toastMock.info.mockReset();
   toastMock.error.mockReset();
   vi.useRealTimers();
