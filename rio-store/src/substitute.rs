@@ -161,12 +161,17 @@ pub struct Substituter {
     /// URL. TTL [`SUBSTITUTE_PROBE_CACHE_TTL`]. moka `get_with`
     /// singleflights concurrent fetches.
     upstream_info: Cache<String, UpstreamInfo>,
-    /// Per-path HEAD-probe result cache: store-path → "present at any
-    /// upstream". Positive AND negative results cached. TTL
-    /// [`SUBSTITUTE_PROBE_CACHE_TTL`], cap [`SUBSTITUTE_PROBE_CACHE_CAP`].
-    /// Makes overlapping `FindMissingPaths` for the same closure cheap
-    /// (the deep-1024x case where the client retries after a timeout).
-    probe_cache: Cache<String, bool>,
+    /// Per-path HEAD-probe result cache: `(tenant_id, store-path)` →
+    /// "present at any of THIS TENANT's upstreams". Positive AND
+    /// negative results cached. TTL [`SUBSTITUTE_PROBE_CACHE_TTL`],
+    /// cap [`SUBSTITUTE_PROBE_CACHE_CAP`]. Makes overlapping
+    /// `FindMissingPaths` for the same closure cheap (the deep-1024x
+    /// case where the client retries after a timeout). Keyed by
+    /// tenant for the same reason [`inflight`](Self::inflight) is:
+    /// upstreams are per-tenant (`tenant_upstreams` table), so a
+    /// path-only key would let tenant B's miss poison tenant A's
+    /// lookup for the full TTL.
+    probe_cache: Cache<(Uuid, String), bool>,
 }
 
 impl Substituter {
@@ -756,7 +761,7 @@ impl Substituter {
         let mut uncached = Vec::new();
         let (mut cache_hits, mut cache_misses) = (0u64, 0u64);
         for p in paths {
-            match self.probe_cache.get(p).await {
+            match self.probe_cache.get(&(tenant_id, p.clone())).await {
                 Some(true) => {
                     cache_hits += 1;
                     hits.push(p.clone());
@@ -841,7 +846,9 @@ impl Substituter {
             .await;
 
         for (path, present) in probed {
-            self.probe_cache.insert(path.clone(), present).await;
+            self.probe_cache
+                .insert((tenant_id, path.clone()), present)
+                .await;
             if present {
                 hits.push(path);
             }
@@ -1256,11 +1263,17 @@ mod tests {
             "fake upstream 404s all generated paths → 0 substitutable"
         );
         assert!(
-            sub.probe_cache.get(&paths[0]).await.is_some(),
+            sub.probe_cache
+                .get(&(tid, paths[0].clone()))
+                .await
+                .is_some(),
             "head of batch must be probed and cached"
         );
         assert!(
-            sub.probe_cache.get(paths.last().unwrap()).await.is_none(),
+            sub.probe_cache
+                .get(&(tid, paths.last().unwrap().clone()))
+                .await
+                .is_none(),
             "tail past truncation point must NOT be probed"
         );
     }
@@ -1303,6 +1316,58 @@ mod tests {
 
         let second = sub.check_available(tid, &batch).await.unwrap();
         assert_eq!(second, vec![path], "cached positive + negative results");
+    }
+
+    /// `probe_cache` is keyed by `(tenant_id, path)`: tenant B's miss
+    /// must not poison tenant A's lookup. Upstreams are per-tenant
+    /// (`tenant_upstreams`), so the cached boolean is a per-tenant
+    /// answer; a path-only key would corrupt cross-tenant scheduling
+    /// decisions for the full TTL (1h).
+    #[tokio::test]
+    async fn check_available_probe_cache_isolated_by_tenant() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid_a = seed_tenant(&db.pool, "sub-isol-a").await;
+        let tid_b = seed_tenant(&db.pool, "sub-isol-b").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar, "cache.isol").await;
+
+        // A has the upstream that serves `path`; B has a dead one.
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_a,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_b,
+            "http://127.0.0.1:1", // refused → miss
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let batch = std::slice::from_ref(&path);
+
+        // B probes first → caches `(B, path) = false`.
+        let b = sub.check_available(tid_b, batch).await.unwrap();
+        assert!(b.is_empty(), "B's upstream is dead → miss");
+
+        // A probes second → MUST hit A's upstream, not return B's
+        // cached miss. With a path-only key this would be `[]`.
+        let a = sub.check_available(tid_a, batch).await.unwrap();
+        assert_eq!(a, vec![path.clone()], "A's upstream serves the path");
+
+        // Reverse leakage: A's hit must not leak to B.
+        let b2 = sub.check_available(tid_b, batch).await.unwrap();
+        assert!(b2.is_empty(), "B still misses (cached per-tenant)");
     }
 
     #[test]
