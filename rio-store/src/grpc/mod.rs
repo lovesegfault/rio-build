@@ -564,11 +564,15 @@ impl StoreService for StoreServiceImpl {
         self.tenant_quota_impl(request).await
     }
 
-    /// ADR-023 phase-10: builder appends one `hw_perf_samples` row at
-    /// init. Append-only; the `hw_perf_factors` view aggregates to
-    /// per-hw_class median. Validation is minimal (non-empty hw_class,
-    /// finite positive factor) — the builder controls all three fields,
-    /// and a garbage row from a misbehaving pod is one rank in a median.
+    /// ADR-023 phase-10: builder writes one `hw_perf_samples` row at
+    /// init. Upsert on `(hw_class, pod_id)` — the `hw_perf_factors`
+    /// view's median is over ALL rows (only the `HAVING` is
+    /// distinct-pod), so without the UNIQUE constraint (M_046) a single
+    /// pod spamming N inserts would dominate the median once 3 honest
+    /// pods exist. With it, a garbage row from a misbehaving pod really
+    /// is one rank in a median. Validation stays minimal (non-empty
+    /// hw_class, finite positive factor) — the builder controls all
+    /// three fields.
     // r[impl sched.sla.hw-bench-append-only]
     #[instrument(skip(self, request), fields(rpc = "AppendHwPerfSample"))]
     async fn append_hw_perf_sample(
@@ -583,7 +587,9 @@ impl StoreService for StoreServiceImpl {
             return Err(Status::invalid_argument("factor must be finite and > 0"));
         }
         sqlx::query!(
-            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3)",
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3) \
+             ON CONFLICT (hw_class, pod_id) \
+             DO UPDATE SET factor = EXCLUDED.factor, measured_at = now()",
             req.hw_class,
             req.pod_id,
             req.factor,
@@ -675,5 +681,33 @@ mod tests {
         assert_eq!(svc.request_tenant_id(&mk(Some("rio-scheduler"))), Some(tid));
         // Non-allowlisted caller → ignored.
         assert_eq!(svc.request_tenant_id(&mk(Some("rogue"))), None);
+    }
+
+    /// `AppendHwPerfSample` is one-row-per-`(hw_class, pod_id)`: a
+    /// second call upserts, it does not append. Regression for the
+    /// "one rank in a median" claim — pre-M_046 a single pod could
+    /// stuff the `hw_perf_factors` median with N rows.
+    #[tokio::test]
+    async fn append_hw_perf_sample_upserts_on_duplicate_pod() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreServiceImpl::new(db.pool.clone());
+        let mk = |f: f64| {
+            Request::new(AppendHwPerfSampleRequest {
+                hw_class: "aws-8-ebs-hi".into(),
+                pod_id: "p0".into(),
+                factor: f,
+            })
+        };
+        svc.append_hw_perf_sample(mk(0.9)).await.unwrap();
+        svc.append_hw_perf_sample(mk(1.1)).await.unwrap();
+        let (n, factor): (i64, f64) = sqlx::query_as(
+            "SELECT count(*), max(factor) FROM hw_perf_samples \
+             WHERE hw_class = 'aws-8-ebs-hi' AND pod_id = 'p0'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "duplicate (hw_class, pod_id) must upsert, not append");
+        assert!((factor - 1.1).abs() < 1e-9, "upsert keeps latest factor");
     }
 }

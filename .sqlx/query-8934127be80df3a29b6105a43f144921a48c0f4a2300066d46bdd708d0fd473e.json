@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3) ON CONFLICT (hw_class, pod_id) DO UPDATE SET factor = EXCLUDED.factor, measured_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8934127be80df3a29b6105a43f144921a48c0f4a2300066d46bdd708d0fd473e"
+}

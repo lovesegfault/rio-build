@@ -362,9 +362,18 @@ impl CostTable {
         )
         .fetch_all(db.pool())
         .await?;
-        let now = now_epoch();
+        // HWM from the rows' MAX(at), NOT wall-clock now(): a row whose
+        // PG-stamped `at` is behind the scheduler clock (skew, or commit
+        // lagged the SELECT) would otherwise be permanently skipped on
+        // the next tick. Same pattern as `SlaEstimator::refresh`.
+        let mut hwm = self
+            .lambda
+            .values()
+            .map(|e| e.updated_at)
+            .fold(0.0, f64::max);
         let mut per_band: HashMap<Band, (f64, f64)> = HashMap::new();
-        for (hw_class, kind, sum, _) in rows {
+        for (hw_class, kind, sum, max_at) in rows {
+            hwm = hwm.max(max_at);
             let Some(band) = band_of_hw_class(&hw_class) else {
                 continue;
             };
@@ -379,7 +388,7 @@ impl CostTable {
             self.lambda
                 .entry(band)
                 .or_default()
-                .update(n, d, now, LAMBDA_HALFLIFE_SECS);
+                .update(n, d, hwm, LAMBDA_HALFLIFE_SECS);
         }
         Ok(())
     }
@@ -934,6 +943,44 @@ mod tests {
         b.persist(&sdb).await.unwrap();
         let a4 = CostTable::load(&sdb, "us-east-1").await.unwrap();
         assert!((a4.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+    }
+
+    /// `refresh_lambda` advances `updated_at` to the rows' `MAX(at)`,
+    /// not the scheduler's wall-clock. Regression: the SQL always
+    /// computed `MAX(at)` but the destructure discarded it and used
+    /// `now_epoch()` — a row whose PG-stamped `at` was behind the
+    /// scheduler clock (skew / commit-lag) was permanently skipped on
+    /// the next tick.
+    #[tokio::test]
+    async fn refresh_lambda_hwm_from_rows_not_wallclock() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        // Row stamped well in the past — wall-clock now() is ~56 years
+        // ahead of this.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('c', 'aws-8-nvme-hi', 'interrupt', 1, to_timestamp(1000)), \
+                    ('c', 'aws-8-nvme-hi', 'exposure', 100, to_timestamp(1500))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut t = CostTable::seeded("c");
+        t.refresh_lambda(&sdb).await.unwrap();
+        let hwm = t.lambda[&Band::Hi].updated_at;
+        assert_eq!(hwm, 1500.0, "HWM must be MAX(at), got {hwm}");
+        // Second tick with a row at at=1200 (between prev rows): the
+        // `at > to_timestamp(1500)` filter excludes it, AND hwm stays
+        // 1500 — does not jump to wall-clock.
+        sqlx::query(
+            "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, at) \
+             VALUES ('c', 'aws-8-nvme-hi', 'exposure', 50, to_timestamp(1200))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        t.refresh_lambda(&sdb).await.unwrap();
+        assert_eq!(t.lambda[&Band::Hi].updated_at, 1500.0);
     }
 
     #[test]

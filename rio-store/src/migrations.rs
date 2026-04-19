@@ -693,6 +693,20 @@ pub const M_044: () = ();
 ///   (M_044); recovery loads those, not this.
 pub const M_045: () = ();
 
+/// `migrations/046_hw_perf_unique.sql`
+///
+/// `UNIQUE(hw_class, pod_id)` on `hw_perf_samples`. M_041's doc claimed
+/// "a garbage row from a misbehaving pod is one rank in a median", but
+/// nothing enforced one row per pod: the `hw_perf_factors` view's
+/// `percentile_cont(0.5)` runs over EVERY row — only the `HAVING
+/// count(DISTINCT pod_id) >= 3` is distinct. A compromised builder
+/// could spam N inserts and dominate the median (cross-tenant: the
+/// factor feeds every tenant's T(c) ref-second normalization). The
+/// constraint plus `ON CONFLICT … DO UPDATE` in `AppendHwPerfSample`
+/// makes the one-rank claim true. Greenfield dedup keeps the
+/// highest-`id` (most recent) row per key before adding the constraint.
+pub const M_046: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
