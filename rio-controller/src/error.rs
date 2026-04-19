@@ -34,6 +34,28 @@ pub enum Error {
 /// Result alias used throughout reconcilers.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Unwrap `Finalizer(ApplyFailed|CleanupFailed(e))` to `e`. Those
+/// variants wrap the reconcile body's *own* error, not a finalizer-
+/// patch failure — `finalized()` (reconcilers/mod.rs) wraps every
+/// `apply`/`cleanup` result in them. `AddFinalizer`/`RemoveFinalizer`
+/// /`UnnamedObject`/`InvalidFinalizer` stay as `Finalizer` (genuinely
+/// a finalizer-layer failure).
+///
+/// Called at the top of [`error_kind`] and `standard_error_policy` so
+/// a Pool-reconciler `Error::Kube` shows as `error_kind="kube"` (not
+/// `"finalizer"`) and a wrapped `InvalidSpec` takes the fixed-requeue
+/// arm. Recursive: defends against a future `finalized(finalized(..))`.
+pub fn leaf(err: &Error) -> &Error {
+    use kube::runtime::finalizer::Error as Fin;
+    match err {
+        Error::Finalizer(b) => match &**b {
+            Fin::ApplyFailed(e) | Fin::CleanupFailed(e) => leaf(e),
+            _ => err,
+        },
+        _ => err,
+    }
+}
+
 /// Discriminator string for metric labels. Stable across
 /// error-message changes; low cardinality (3 values).
 ///
@@ -42,9 +64,59 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// dynamic data (addresses, status codes) that would explode
 /// metric cardinality.
 pub fn error_kind(err: &Error) -> &'static str {
-    match err {
+    match leaf(err) {
         Error::Kube(_) => "kube",
         Error::Finalizer(_) => "finalizer",
         Error::InvalidSpec(_) => "invalid_spec",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::runtime::finalizer::Error as Fin;
+
+    fn wrap(inner: Error) -> Error {
+        Error::Finalizer(Box::new(Fin::ApplyFailed(inner)))
+    }
+
+    fn kube_503() -> kube::Error {
+        kube::Error::Api(Box::new(
+            kube::core::Status::failure("boom", "ServiceUnavailable").with_code(503),
+        ))
+    }
+
+    /// Regression: `finalized()` wraps every Pool reconcile-body error
+    /// as `Finalizer(ApplyFailed(inner))`; before `leaf()` the metric
+    /// label collapsed to `"finalizer"` for all of them.
+    #[test]
+    fn leaf_unwraps_apply_failed() {
+        assert_eq!(error_kind(&wrap(Error::Kube(kube_503()))), "kube");
+    }
+
+    #[test]
+    fn leaf_unwraps_invalid_spec() {
+        let e = wrap(Error::InvalidSpec("bad".into()));
+        assert_eq!(error_kind(&e), "invalid_spec");
+        // CleanupFailed too.
+        let e = Error::Finalizer(Box::new(Fin::CleanupFailed(Error::InvalidSpec("x".into()))));
+        assert_eq!(error_kind(&e), "invalid_spec");
+    }
+
+    /// `AddFinalizer`/`RemoveFinalizer` are genuine finalizer-layer
+    /// failures (couldn't patch metadata.finalizers) — stay labeled
+    /// `"finalizer"`.
+    #[test]
+    fn leaf_preserves_add_finalizer() {
+        let e = Error::Finalizer(Box::new(Fin::AddFinalizer(kube_503())));
+        assert_eq!(error_kind(&e), "finalizer");
+        let e = Error::Finalizer(Box::new(Fin::RemoveFinalizer(kube_503())));
+        assert_eq!(error_kind(&e), "finalizer");
+    }
+
+    #[test]
+    fn leaf_passthrough_unwrapped() {
+        assert_eq!(error_kind(&Error::Kube(kube_503())), "kube");
+        assert_eq!(error_kind(&Error::InvalidSpec("x".into())), "invalid_spec");
     }
 }

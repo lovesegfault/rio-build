@@ -305,6 +305,11 @@ pub fn standard_error_policy<K>(
 where
     K: kube::Resource<DynamicType = ()> + kube::ResourceExt,
 {
+    // Unwrap `Finalizer(ApplyFailed|CleanupFailed(e))` → `e`: the
+    // reconcile body's real error. Without this every Pool error
+    // labels `error_kind="finalizer"` and a wrapped InvalidSpec takes
+    // the exponential arm below instead of fixed `invalid_requeue`.
+    let err = crate::error::leaf(err);
     metrics::counter!("rio_controller_reconcile_errors_total",
         "reconciler" => name, "error_kind" => error_kind(err))
     .increment(1);
