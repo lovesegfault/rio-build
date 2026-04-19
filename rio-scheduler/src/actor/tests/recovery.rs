@@ -7,6 +7,7 @@
 // lease.rs tests (sched.lease.generation-fence verify).
 
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Seed PG with a build + 2-derivation chain (parent depends on child),
 /// spawn a FRESH actor (simulating new leader after failover), send
@@ -156,37 +157,35 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
 /// TRUE with empty DAG. Degrade, don't block. The alternative (leave
 /// recovery_complete=false) would block dispatch forever while the
 /// scheduler holds the lease.
+// r[verify sched.recovery.gate-dispatch]
 #[tokio::test]
 async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
+    // Inject an observable recovery_complete via from_parts (same
+    // pattern as test_recovery_toctou_on_lease_flap below).
+    let recovery_complete = Arc::new(AtomicBool::new(false));
+    let rc = Arc::clone(&recovery_complete);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(AtomicBool::new(true)),
+            rc,
+        );
+    });
     // Close the pool BEFORE sending LeaderAcquired — all PG queries
     // will fail. This simulates PG going down mid-recovery.
-    let (handle, _task) = setup_actor(db.pool.clone());
     db.pool.close().await;
 
-    // LeaderAcquired → recover_from_pg → PG fails → catch → set
+    // LeaderAcquired → recover_from_pg → PG fails → Err arm → set
     // recovery_complete=true with EMPTY DAG.
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
 
-    // Can't directly check recovery_complete (not exposed) but we
-    // CAN check that dispatch isn't blocked: connect a worker,
-    // submit a build, assert it dispatches. If recovery_complete
-    // were false, dispatch_ready would early-return and the
-    // derivation would stay Ready.
-    //
-    // But PG is closed so MergeDag will fail on insert_build.
-    // Better indirect test: just verify the actor is alive and
-    // responsive (quiesce succeeded above). A panicked handle_
-    // leader_acquired would have killed the actor task.
     assert!(
-        handle.is_alive(),
-        "actor should survive recovery failure (degrade not crash)"
+        recovery_complete.load(Ordering::Acquire),
+        "Err arm must set recovery_complete=true (degrade, don't block dispatch)"
     );
-
-    // Also: DAG should be empty (recovery cleared it, failure
-    // re-cleared it).
     let info = handle.debug_query_derivation("anything").await?;
     assert!(info.is_none(), "DAG should be empty after recovery failure");
 
@@ -1190,8 +1189,6 @@ async fn test_recovery_poisoned_orphan_build_fails(#[case] keep_going: bool) -> 
 //   Generation snapshot + re-check: if the lease flaps (lose→
 //   reacquire) mid-recovery, discard the stale DAG instead of
 //   dispatching from it with the NEW generation stamped on.
-
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Recovery TOCTOU: if the lease flaps (lose→reacquire, generation
 /// bumps) mid-recovery, discard the stale DAG instead of dispatching
