@@ -111,10 +111,10 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the b
 r[builder.fuse.listxattr-empty]
 `listxattr` on a FUSE-served store path MUST return an empty list (not an error) when queried with a non-zero buffer; replying with a `fuse_getxattr_out{size:0}` struct to a non-zero-buffer query trips the kernel's `fuse_verify_xattr_list` zero-length-name check and surfaces as `-EIO` to the caller (e.g., Python's `shutil.copy2`).
 
-r[builder.fuse.circuit-breaker+2]
+r[builder.fuse.circuit-breaker+3]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
-opens the circuit): (a) `threshold` (default 5) consecutive
-`ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
+opens the circuit): (a) `threshold` (default 5) consecutive fetch
+failures; (b) `last_success.elapsed() > wall_clock_trip`
 (default 720s) AND at least one failure since the last success — catches
 the degraded-but-alive store (accepting connections, serving slowly)
 without waiting for 5×fetch-timeout. The failure-gate on (b) is
@@ -123,7 +123,11 @@ has a stale `last_success` but a healthy store — without the gate, the
 first post-idle fetch trips → EIO on upload → InfrastructureFailure →
 reassign loop. After `auto_close_after` (default 30s) the circuit goes
 half-open: the next `check()` probes — success closes the circuit,
-failure re-opens it. The fetch timeout is `fuse_fetch_timeout_secs`
+failure re-opens it. Every singleflight `Fetch` owner (`ensure_cached`
+AND `prefetch_path_blocking`) checks the breaker before fetching and
+records the outcome after — under singleflight a prefetch-owned failure
+is observed by FUSE waiters via EIO, so prefetch is NOT silent and MUST
+feed the breaker. The fetch timeout is `fuse_fetch_timeout_secs`
 (default 180) from `builder.toml` — NOT the global `GRPC_STREAM_TIMEOUT`.
 **CRITICAL: std::sync ONLY** — FUSE callbacks run on fuser's thread
 pool, NOT in a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero

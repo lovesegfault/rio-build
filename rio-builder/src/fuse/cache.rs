@@ -57,6 +57,11 @@ pub enum FetchClaim<'a> {
     Fetch(FetchGuard<'a>),
     /// Another thread is already fetching. Caller should wait on the entry.
     WaitFor(Arc<InflightEntry>),
+    /// Another thread already committed this path to the cache between the
+    /// caller's `get_path()` miss and this `try_start_fetch()` call. Closes
+    /// the get_path→try_start_fetch TOCTOU; the caller should treat this
+    /// exactly like a `get_path()` hit.
+    AlreadyCached(PathBuf),
 }
 
 /// RAII guard for an in-flight fetch claim.
@@ -320,6 +325,17 @@ impl Cache {
             tracing::error!("inflight lock poisoned, recovering");
             e.into_inner()
         });
+        // Close the get_path→try_start_fetch TOCTOU: a thread preempted
+        // between the two can otherwise re-fetch a path another fetcher
+        // just committed → rename onto non-empty dir → ENOTEMPTY → spurious
+        // EIO + false circuit.record(false). `cache.insert` strictly
+        // happens-before the fetcher's guard-drop (which takes this same
+        // `inflight` lock), so re-checking `cached` here under `inflight`
+        // is sufficient. Lock order `inflight → cached` is unique to this
+        // site; no other site nests them, so deadlock-free.
+        if self.cached.lock().ignore_poison().contains(store_path) {
+            return FetchClaim::AlreadyCached(self.cache_dir.join(store_path));
+        }
         match inflight.entry(store_path.to_string()) {
             Entry::Occupied(e) => FetchClaim::WaitFor(Arc::clone(e.get())),
             Entry::Vacant(e) => {
@@ -504,8 +520,40 @@ mod tests {
                         "waiter should be notified"
                     );
                 }
+                FetchClaim::AlreadyCached(_) => {
+                    unreachable!("test never inserts into cached")
+                }
             }
             start.elapsed()
+        }
+    }
+
+    /// Regression: get_path→try_start_fetch TOCTOU. A thread that observed
+    /// `get_path() == None` but was preempted past another thread's commit
+    /// tail (rename → cache.insert → guard-drop) MUST get `AlreadyCached`,
+    /// not `Fetch`. Before the fix, `try_start_fetch` consulted only
+    /// `inflight` (now empty) → returned `Fetch` → re-download → rename
+    /// onto non-empty dir → ENOTEMPTY → spurious EIO + false
+    /// circuit.record(false).
+    #[test]
+    fn test_try_start_fetch_after_insert_returns_already_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"));
+
+        // Simulate T2's commit tail: cache.insert, guard already gone
+        // (inflight is empty for this path).
+        cache.insert("abc-committed");
+
+        // T1 (which earlier saw get_path() == None) now calls
+        // try_start_fetch. inflight is Vacant, but cached has the entry.
+        match cache.try_start_fetch("abc-committed") {
+            FetchClaim::AlreadyCached(p) => {
+                assert_eq!(p, dir.path().join("cache").join("abc-committed"));
+            }
+            FetchClaim::Fetch(_) => {
+                panic!("TOCTOU: must not re-fetch a path already in `cached`")
+            }
+            FetchClaim::WaitFor(_) => panic!("inflight is empty"),
         }
     }
 

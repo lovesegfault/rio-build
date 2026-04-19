@@ -649,6 +649,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                                 rt.prefetch.runtime.clone(),
                                 Arc::clone(&rt.prefetch.sem),
                                 rt.prefetch.fetch_timeout,
+                                Arc::clone(&rt.prefetch.circuit),
                                 // Warm-gate ACK goes through the
                                 // permanent sink (same as completions
                                 // and log batches) — survives stream
@@ -2021,6 +2022,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
             tx,
         );
 
@@ -2082,6 +2084,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
             tx,
         );
 
@@ -2139,6 +2142,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Arc::new(crate::fuse::circuit::CircuitBreaker::default()),
             tx,
         );
 

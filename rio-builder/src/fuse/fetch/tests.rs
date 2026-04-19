@@ -81,13 +81,15 @@ use rio_test_support::grpc::{MockStore, spawn_mock_store};
 const TEST_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Harness: spawn MockStore + Cache in a tempdir. Returns everything the
-/// tests need, including the runtime handle for prefetch's block_on calls.
+/// tests need, including the runtime handle for prefetch's block_on calls
+/// and a fresh `CircuitBreaker` (default config, closed).
 async fn setup_fetch_harness() -> (
     Arc<Cache>,
     StoreClients,
     MockStore,
     tempfile::TempDir,
     Handle,
+    Arc<CircuitBreaker>,
     tokio::task::JoinHandle<()>,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -98,7 +100,8 @@ async fn setup_fetch_harness() -> (
         .expect("connect");
     let clients = StoreClients::from_channel(ch);
     let rt = Handle::current();
-    (cache, clients, store, dir, rt, server_handle)
+    let circuit = Arc::new(CircuitBreaker::default());
+    (cache, clients, store, dir, rt, circuit, server_handle)
 }
 
 /// Seed MockStore with a valid single-file NAR → prefetch fetches,
@@ -108,7 +111,7 @@ async fn setup_fetch_harness() -> (
 // r[verify builder.fuse.fetch-bounded-memory]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_success_roundtrip() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     // Seed: single-file NAR containing "hello". Basename must be a valid
     // nixbase32 store path basename (32-char hash + name).
@@ -127,6 +130,7 @@ async fn test_prefetch_success_roundtrip() {
             &cache_cl,
             &clients_cl,
             &rt,
+            &circuit,
             TEST_FETCH_TIMEOUT,
             &basename_cl,
         )
@@ -174,7 +178,7 @@ async fn test_prefetch_directory_nar() {
     use rio_nix::nar::{NarEntry, NarNode, serialize};
     use sha2::Digest;
 
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("dirfetch");
     let store_path = format!("/nix/store/{basename}");
@@ -221,6 +225,7 @@ async fn test_prefetch_directory_nar() {
             &cache_cl,
             &clients_cl,
             &rt,
+            &circuit,
             TEST_FETCH_TIMEOUT,
             &basename_cl,
         )
@@ -257,10 +262,10 @@ async fn test_prefetch_directory_nar() {
 /// ensure_cached:166 then records this as a breaker SUCCESS (path
 /// definitively absent = store gave a healthy answer, even though we
 /// never asked it).
-// r[verify builder.fuse.circuit-breaker+2]
+// r[verify builder.fuse.circuit-breaker+3]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_invalid_basename_enoent_no_grpc() {
-    let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
     // Arm Unavailable: if we DO call GetPath, we get retry→EIO not ENOENT.
     store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
@@ -269,7 +274,14 @@ async fn test_prefetch_invalid_basename_enoent_no_grpc() {
     let placeholder = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libidn2-2.3.8";
     let start = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, placeholder)
+        prefetch_path_blocking(
+            &cache,
+            &clients,
+            &rt,
+            &circuit,
+            TEST_FETCH_TIMEOUT,
+            placeholder,
+        )
     })
     .await
     .expect("spawn_blocking join");
@@ -297,11 +309,18 @@ async fn test_prefetch_invalid_basename_enoent_no_grpc() {
 /// MockStore has no seeded paths → GetPath returns NotFound → ENOENT.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_not_found_returns_enoent() {
-    let (cache, clients, _store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, _store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("missing");
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
+        prefetch_path_blocking(
+            &cache,
+            &clients,
+            &rt,
+            &circuit,
+            TEST_FETCH_TIMEOUT,
+            &basename,
+        )
     })
     .await
     .expect("spawn_blocking join");
@@ -320,13 +339,20 @@ async fn test_prefetch_not_found_returns_enoent() {
 /// Covers the retry-exhausted arm in fetch_extract_insert.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_store_unavailable_returns_eio() {
-    let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
     store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
     let basename = test_store_basename("unavail");
     let start = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
+        prefetch_path_blocking(
+            &cache,
+            &clients,
+            &rt,
+            &circuit,
+            TEST_FETCH_TIMEOUT,
+            &basename,
+        )
     })
     .await
     .expect("spawn_blocking join");
@@ -352,7 +378,7 @@ async fn test_prefetch_store_unavailable_returns_eio() {
 /// not EIO).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_transient_unavailable_recovers() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     // Seed valid path so the post-recovery fetch has something to return.
     let basename = test_store_basename("transient");
@@ -372,6 +398,7 @@ async fn test_prefetch_transient_unavailable_recovers() {
             &cache_cl,
             &clients_cl,
             &rt,
+            &circuit,
             TEST_FETCH_TIMEOUT,
             &basename_cl,
         )
@@ -400,7 +427,7 @@ async fn test_prefetch_transient_unavailable_recovers() {
 /// Covers the NAR parse-error arm in fetch_extract_insert.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_nar_parse_error_returns_eio() {
-    let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     // Seed a valid PathInfo (so the MockStore lookup finds it) but
     // enable garbage mode so the NAR bytes are malformed.
@@ -411,7 +438,14 @@ async fn test_prefetch_nar_parse_error_returns_eio() {
     store.faults.get_path_garbage.store(true, Ordering::SeqCst);
 
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
+        prefetch_path_blocking(
+            &cache,
+            &clients,
+            &rt,
+            &circuit,
+            TEST_FETCH_TIMEOUT,
+            &basename,
+        )
     })
     .await
     .expect("spawn_blocking join");
@@ -427,7 +461,7 @@ async fn test_prefetch_nar_parse_error_returns_eio() {
 // r[verify builder.fuse.fetch-progress-timeout]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     // 320 KiB payload → 5+ NarChunks at MockStore's 64 KiB stride.
     let payload = vec![0xab; 320 * 1024];
@@ -443,7 +477,7 @@ async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
     let idle = Duration::from_millis(500);
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, idle, &basename)
+        prefetch_path_blocking(&cache, &clients, &rt, &circuit, idle, &basename)
     })
     .await
     .expect("spawn_blocking join");
@@ -470,7 +504,7 @@ async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
 // r[verify builder.fuse.fetch-progress-timeout]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
-    let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("i211-stall");
     let store_path = format!("/nix/store/{basename}");
@@ -485,7 +519,7 @@ async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
     let idle = Duration::from_millis(300);
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&cache, &clients, &rt, idle, &basename)
+        prefetch_path_blocking(&cache, &clients, &rt, &circuit, idle, &basename)
     })
     .await
     .expect("spawn_blocking join");
@@ -506,7 +540,7 @@ async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
 /// (fast path hits cache.get_path() → Some).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_already_cached_skip() {
-    let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("twice");
     let store_path = format!("/nix/store/{basename}");
@@ -514,23 +548,30 @@ async fn test_prefetch_already_cached_skip() {
     store.seed(make_path_info(&store_path, &nar, hash), nar);
 
     // First fetch: Ok(None) — actually fetched.
-    let (c1, cl1, r1, b1) = (
+    let (c1, cl1, r1, cb1, b1) = (
         Arc::clone(&cache),
         clients.clone(),
         rt.clone(),
+        Arc::clone(&circuit),
         basename.clone(),
     );
     let first = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&c1, &cl1, &r1, TEST_FETCH_TIMEOUT, &b1)
+        prefetch_path_blocking(&c1, &cl1, &r1, &cb1, TEST_FETCH_TIMEOUT, &b1)
     })
     .await
     .expect("join");
     assert!(matches!(first, Ok(None)), "first fetch: {first:?}");
 
     // Second fetch: Ok(Some(AlreadyCached)) — fast-path skip.
-    let (c2, cl2, r2, b2) = (Arc::clone(&cache), clients.clone(), rt.clone(), basename);
+    let (c2, cl2, r2, cb2, b2) = (
+        Arc::clone(&cache),
+        clients.clone(),
+        rt.clone(),
+        Arc::clone(&circuit),
+        basename,
+    );
     let second = tokio::task::spawn_blocking(move || {
-        prefetch_path_blocking(&c2, &cl2, &r2, TEST_FETCH_TIMEOUT, &b2)
+        prefetch_path_blocking(&c2, &cl2, &r2, &cb2, TEST_FETCH_TIMEOUT, &b2)
     })
     .await
     .expect("join");
@@ -582,7 +623,7 @@ fn make_fs(
 // r[verify builder.fuse.lookup-caches+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, _circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("slowfetch");
     let store_path = format!("/nix/store/{basename}");
@@ -645,7 +686,7 @@ async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
 // r[verify builder.fuse.jit-lookup]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
-    let (cache, clients, _store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, _store, dir, rt, _circuit, _srv) = setup_fetch_harness().await;
     let fs = make_fs(Arc::clone(&cache), clients, rt, 4);
 
     let basename = test_store_basename("guard-drop-eio");
@@ -698,7 +739,7 @@ async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
 /// forever — every subsequent lookup would ENOENT in the caller's stat.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ensure_cached_self_heals_index_disk_divergence() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+    let (cache, clients, store, dir, rt, _circuit, _srv) = setup_fetch_harness().await;
 
     let basename = test_store_basename("diverge");
     let store_path = format!("/nix/store/{basename}");
@@ -750,4 +791,191 @@ async fn test_ensure_cached_self_heals_index_disk_divergence() {
         "index entry re-inserted after self-heal fetch"
     );
     drop(dir);
+}
+
+// ========================================================================
+// Circuit-breaker integration with prefetch (bug_207) and TOCTOU (bug_363)
+// ========================================================================
+
+/// bug_207: prefetch-owned fetch failures MUST feed `circuit.record(false)`.
+/// Under singleflight, when prefetch wins the claim and a FUSE thread lands
+/// in `WaitFor`, the FUSE thread does NOT record (per the "fetcher records"
+/// contract). If prefetch ALSO doesn't record, the breaker is blind to up
+/// to 100 warm-gate failures. Five prefetch failures against a down store
+/// MUST open the circuit.
+// r[verify builder.fuse.circuit-breaker+3]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_prefetch_failure_records_circuit() {
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
+    store.faults.fail_get_path.store(true, Ordering::SeqCst);
+
+    assert!(!circuit.is_open(), "precondition: breaker closed");
+
+    // Five distinct paths (singleflight is per-path) → five Fetch claims →
+    // five record(false) → threshold reached → open.
+    for i in 0..5 {
+        let basename = test_store_basename(&format!("circuit-fail-{i}"));
+        let (c, cl, r, cb) = (
+            Arc::clone(&cache),
+            clients.clone(),
+            rt.clone(),
+            Arc::clone(&circuit),
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&c, &cl, &r, &cb, TEST_FETCH_TIMEOUT, &basename)
+        })
+        .await
+        .expect("join");
+        let err = result.expect_err("store unavailable → Err");
+        assert_eq!(err.code(), Errno::EIO.code());
+    }
+
+    assert!(
+        circuit.is_open(),
+        "5 prefetch-owned failures MUST open the circuit; \
+         before bug_207 fix prefetch never called record() → breaker blind"
+    );
+}
+
+/// bug_207: when the breaker is open, prefetch MUST fail fast with EIO
+/// WITHOUT contacting the store (no retry backoff observed).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_prefetch_skipped_when_circuit_open() {
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
+    // Arm Unavailable: if circuit.check() were skipped, we'd see retry→EIO
+    // taking ≥ RETRY_BACKOFF total.
+    store.faults.fail_get_path.store(true, Ordering::SeqCst);
+
+    // Open the breaker directly (5× record(false)).
+    for _ in 0..5 {
+        circuit.record(false);
+    }
+    assert!(circuit.is_open(), "precondition: breaker open");
+
+    let basename = test_store_basename("circuit-open");
+    let (c, cl, r, cb) = (
+        Arc::clone(&cache),
+        clients.clone(),
+        rt.clone(),
+        Arc::clone(&circuit),
+    );
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        prefetch_path_blocking(&c, &cl, &r, &cb, TEST_FETCH_TIMEOUT, &basename)
+    })
+    .await
+    .expect("join");
+
+    let err = result.expect_err("circuit open → Err(EIO)");
+    assert_eq!(err.code(), Errno::EIO.code());
+    // No retry backoff → never reached the gRPC loop.
+    let backoff_floor: Duration = RETRY_BACKOFF.iter().sum::<Duration>().mul_f64(0.5);
+    assert!(
+        start.elapsed() < backoff_floor,
+        "expected immediate EIO from circuit.check(), got {:?} \
+         (≥ {backoff_floor:?} suggests gRPC retry loop ran)",
+        start.elapsed()
+    );
+}
+
+/// bug_363: a thread that observed `get_path() == None`, was preempted past
+/// another thread's commit tail (rename → cache.insert → guard-drop), and
+/// then enters `try_start_fetch` MUST NOT re-fetch. Before the fix it got
+/// `Fetch` (inflight Vacant), re-downloaded, hit ENOTEMPTY on rename →
+/// spurious EIO + false circuit.record(false). The fix re-checks `cached`
+/// under the `inflight` lock → `AlreadyCached` → `PrefetchSkip`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrent_commit_then_claim_no_refetch() {
+    let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
+    // Arm the store to fail: if the second prefetch DID re-fetch, it
+    // would hit gRPC and we'd see retry backoff. AlreadyCached skips
+    // gRPC entirely.
+    store.faults.fail_get_path.store(true, Ordering::SeqCst);
+
+    let basename = test_store_basename("toctou");
+    // Simulate T2's commit tail completing AFTER T1's get_path() miss
+    // but BEFORE T1's try_start_fetch: just insert into the cache index.
+    // T1 (this prefetch) saw get_path() == None at some prior point;
+    // here we model it by calling prefetch with the path already in
+    // `cached` but never having gone through fetch in this process.
+    cache.insert(&basename);
+
+    let (c, cl, r, cb, bn) = (
+        Arc::clone(&cache),
+        clients.clone(),
+        rt.clone(),
+        Arc::clone(&circuit),
+        basename.clone(),
+    );
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        prefetch_path_blocking(&c, &cl, &r, &cb, TEST_FETCH_TIMEOUT, &bn)
+    })
+    .await
+    .expect("join");
+
+    // Got AlreadyCached (fast-path or TOCTOU re-check), NOT Err(EIO).
+    assert!(
+        matches!(result, Ok(Some(PrefetchSkip::AlreadyCached))),
+        "TOCTOU re-check must return AlreadyCached, got {result:?}"
+    );
+    // And it was immediate (no gRPC contact).
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "AlreadyCached must skip gRPC, got {:?}",
+        start.elapsed()
+    );
+    // Breaker untouched.
+    assert!(!circuit.is_open());
+}
+
+/// bug_313: commit_to_cache's error-path cleanup must remove a regular-
+/// file `tmp_path` (single-file NAR root: `toFile`, `writeText`, flat
+/// `fetchurl`). Before the fix, `let _ = remove_dir_all(&tmp_path)`
+/// returned `ENOTDIR` (swallowed) → the partial file leaked. On the
+/// ENOSPC path that's a multi-GB leak worsening disk pressure.
+///
+/// Mechanism: write a single-file NAR to a spool, pre-create
+/// `local_path` as a NON-EMPTY directory so the rename hits
+/// `ENOTEMPTY` → the cleanup path runs. Assert no `*.tmp-*` files
+/// remain in cache_dir.
+#[test]
+fn test_commit_to_cache_cleanup_removes_file_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(dir.path().to_path_buf()).expect("Cache::new");
+
+    let basename = test_store_basename("file-root-cleanup");
+    let local_path = dir.path().join(&basename);
+    // Force rename failure: local_path is a non-empty directory.
+    std::fs::create_dir(&local_path).unwrap();
+    std::fs::write(local_path.join("blocker"), b"x").unwrap();
+
+    // Spool a valid single-file NAR (root is a regular file, NOT a dir).
+    let (nar, _hash) = make_nar(b"single-file payload");
+    let spool_path = dir.path().join(format!("{basename}.nar-test"));
+    std::fs::write(&spool_path, &nar).unwrap();
+
+    let result = commit_to_cache(
+        &cache,
+        &spool_path,
+        &local_path,
+        &format!("/nix/store/{basename}"),
+        &basename,
+    );
+    let err = result.expect_err("rename onto non-empty dir → Err");
+    assert_eq!(err.code(), Errno::EIO.code());
+
+    // The `*.tmp-*` extraction path (a regular file, since the NAR root
+    // is a regular file) MUST be gone. Before the fix, remove_dir_all
+    // failed ENOTDIR and the file leaked.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.contains(".tmp-")))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "tmp file (single-file NAR root) must be removed on error path; \
+         found: {leftovers:?}"
+    );
 }

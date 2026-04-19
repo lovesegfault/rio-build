@@ -88,8 +88,10 @@ pub struct NixStoreFs {
     /// consecutive failures OR `wall_clock_trip` since last success.
     /// `Arc` so P0210's heartbeat can clone a handle before
     /// `fuser::spawn_mount2` consumes `self` — same pattern as `cache`.
-    /// Checked/recorded in `ensure_cached` ONLY (not prefetch: prefetch
-    /// is a hint; failing silently is acceptable). See `circuit.rs`.
+    /// Checked/recorded by every singleflight `Fetch` owner
+    /// (`ensure_cached` AND `prefetch_path_blocking`): under singleflight,
+    /// a prefetch-owned failure is NOT silent — a FUSE waiter parked in
+    /// `WaitFor` gets EIO and the build fails. See `circuit.rs`.
     circuit: Arc<CircuitBreaker>,
 }
 

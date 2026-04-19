@@ -43,6 +43,7 @@ pub(super) struct PrefetchDeps {
     pub(super) runtime: tokio::runtime::Handle,
     pub(super) sem: Arc<Semaphore>,
     pub(super) fetch_timeout: Duration,
+    pub(super) circuit: Arc<crate::fuse::circuit::CircuitBreaker>,
 }
 
 /// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
@@ -62,10 +63,11 @@ pub(super) struct PrefetchDeps {
 ///
 /// No JoinHandle leak: if the worker SIGTERMs mid-prefetch, the tasks
 /// abort with the runtime — the partial fetch is in a .tmp-XXXX sibling
-/// dir (see fetch_extract_insert) which cache init cleans up on next
-/// start. The joiner task also aborts; no ACK is sent — that's fine,
-/// we're shutting down.
+/// dir (see fetch_extract_insert) which dies with the pod (emptyDir).
+/// The joiner task also aborts; no ACK is sent — that's fine, we're
+/// shutting down.
 #[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
+#[allow(clippy::too_many_arguments)]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,
@@ -73,6 +75,7 @@ pub fn handle_prefetch_hint(
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
+    circuit: Arc<crate::fuse::circuit::CircuitBreaker>,
     stream_tx: mpsc::Sender<ExecutorMessage>,
 ) {
     // Collect JoinHandles for the ACK-joiner task. A typical hint
@@ -110,6 +113,7 @@ pub fn handle_prefetch_hint(
         let clients = clients.clone();
         let rt = rt.clone();
         let sem = Arc::clone(&sem);
+        let circuit = Arc::clone(&circuit);
 
         let handle = tokio::spawn(async move {
             // Permit BEFORE spawn_blocking: if the
@@ -188,7 +192,14 @@ pub fn handle_prefetch_hint(
             let result = tokio::task::spawn_blocking(move || {
                 use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
                 let _permit = _permit; // hold through blocking work
-                match prefetch_path_blocking(&cache, &clients, &rt, fetch_timeout, &basename) {
+                match prefetch_path_blocking(
+                    &cache,
+                    &clients,
+                    &rt,
+                    &circuit,
+                    fetch_timeout,
+                    &basename,
+                ) {
                     Ok(None) => "fetched",
                     Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
                     Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",

@@ -254,9 +254,9 @@ pub async fn setup(
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),
         resources: Arc::clone(&resource_snapshot),
-        // FUSE circuit breaker: polled each tick. move into the task:
-        // setup() has no other use for the handle.
-        circuit: fuse_circuit,
+        // FUSE circuit breaker: polled each tick. Shared with PrefetchDeps
+        // (prefetch is a singleflight owner and feeds the breaker).
+        circuit: Arc::clone(&fuse_circuit),
         draining: Arc::clone(&draining),
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
@@ -326,6 +326,7 @@ pub async fn setup(
             // 100 parallel NARs when the scheduler sends a big hint list).
             sem: Arc::new(Semaphore::new(8)),
             fetch_timeout: fuse_fetch_timeout,
+            circuit: fuse_circuit,
         },
         idle_timeout: cfg.idle_timeout,
         _balance_guard,

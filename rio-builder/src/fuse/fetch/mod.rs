@@ -39,6 +39,7 @@ use tracing::instrument;
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, InflightEntry};
+use super::circuit::CircuitBreaker;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
 /// I/O directly in `poll_write`.
@@ -155,9 +156,9 @@ pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
 /// retry IS the herd. Per-attempt jitter breaks lockstep; the extra
 /// 10 s step buys one more drain window.
 ///
-/// Sits BELOW the circuit breaker: `ensure_cached` checks the breaker
-/// before calling here, so if the store has been down long enough to
-/// trip it we never reach this loop. The retry handles the transition
+/// Sits BELOW the circuit breaker: callers check the breaker before
+/// calling here, so if the store has been down long enough to trip it
+/// we never reach this loop. The retry handles the transition
 /// window (was-up → briefly-down → up-again); the breaker handles
 /// the steady-state (down-for-a-while → fail-fast).
 ///
@@ -305,6 +306,14 @@ impl NixStoreFs {
                 }
                 result
             }
+            FetchClaim::AlreadyCached(p) => {
+                // get_path→try_start_fetch TOCTOU: another thread committed
+                // this path between our get_path() miss above and the claim.
+                // Treat exactly like the get_path() fast-path hit. No
+                // circuit.record() — we never contacted the store.
+                let _ = self.cache.take_manifest_hint(store_basename);
+                Ok(p)
+            }
             FetchClaim::WaitFor(entry) => {
                 // Another thread is fetching. The fetcher has `fetch_timeout`
                 // to finish; a single wait(30s) returning false means "slow",
@@ -429,6 +438,7 @@ pub fn prefetch_path_blocking(
     cache: &Cache,
     clients: &StoreClients,
     runtime: &Handle,
+    circuit: &CircuitBreaker,
     fetch_timeout: Duration,
     store_basename: &str,
 ) -> Result<Option<PrefetchSkip>, Errno> {
@@ -439,13 +449,35 @@ pub fn prefetch_path_blocking(
         return Ok(Some(PrefetchSkip::AlreadyCached));
     }
 
+    // Circuit breaker: same placement as ensure_cached — AFTER the
+    // cache-hit fast-path (cache hits don't touch the store), BEFORE
+    // try_start_fetch (no point claiming a fetch we won't perform).
+    circuit.check()?;
+
     match cache.try_start_fetch(store_basename) {
         FetchClaim::Fetch(_guard) => {
             // We own it. _guard's Drop notifies FUSE waiters (if any
             // arrive while we're fetching). Same free-fn delegation
-            // as ensure_cached.
-            fetch_extract_insert(cache, clients, runtime, fetch_timeout, store_basename)
-                .map(|_| None)
+            // as ensure_cached — and the same circuit.record() contract:
+            // the singleflight OWNER records, waiters observe. When
+            // prefetch wins singleflight and a FUSE thread lands in
+            // WaitFor, prefetch's record() is the only feed the breaker
+            // gets for that fetch.
+            let result =
+                fetch_extract_insert(cache, clients, runtime, fetch_timeout, store_basename);
+            match &result {
+                Ok(_) => circuit.record(true),
+                Err(e) if e.code() == Errno::ENOENT.code() => circuit.record(true),
+                Err(_) => circuit.record(false),
+            }
+            result.map(|_| None)
+        }
+        FetchClaim::AlreadyCached(_) => {
+            // get_path→try_start_fetch TOCTOU: another thread committed
+            // between our get_path() miss and the claim. Same as the
+            // fast-path skip; no circuit.record() — store not contacted.
+            let _ = cache.take_manifest_hint(store_basename);
+            Ok(Some(PrefetchSkip::AlreadyCached))
         }
         FetchClaim::WaitFor(_entry) => {
             // Someone else has it. Don't wait — we'd hold the
@@ -524,8 +556,9 @@ fn fetch_extract_insert(
     // Transient errors (Unavailable/Unknown — store pod restarting,
     // transport disconnect) are retried with backoff: see RETRY_BACKOFF.
     // Singleflight + fetch_sem mean only one FUSE thread per unique-path
-    // is parked here; the 8s worst-case retry window doesn't starve the
-    // mount. Non-transient errors (NotFound, SizeExceeded, DeadlineExceeded,
+    // is parked here; the jittered worst-case retry window (see
+    // RETRY_BACKOFF) doesn't starve the mount. Non-transient errors
+    // (NotFound, SizeExceeded, DeadlineExceeded,
     // InvalidArgument) fail immediately — those won't fix themselves.
     // r[impl builder.fuse.fetch-bounded-memory]
     // I-180: stream NAR bytes to a same-FS spool file, then extract via
@@ -555,7 +588,7 @@ fn fetch_extract_insert(
         .join(format!("{store_basename}.nar-{:016x}", next_temp_suffix()));
     // Guard: remove the spool on ANY exit (success or error). Runs after
     // the `?` early-returns below; the only way to leak a spool is a hard
-    // kill, which the startup sweeper handles.
+    // kill (covered by emptyDir lifetime — see above).
     let _spool_guard = scopeguard::guard(spool_path.clone(), |p| {
         let _ = std::fs::remove_file(&p);
     });
@@ -717,13 +750,21 @@ fn stream_nar_to_spool(
     Ok(info)
 }
 
+/// Best-effort removal of a temp NAR-extraction path. `tmp_path` may be a
+/// regular file (single-file NAR root: `toFile`, `writeText`, flat
+/// `fetchurl`), a symlink, or a directory. `remove_dir_all` on a regular
+/// file fails `ENOTDIR` on Linux; try `remove_file` first (also covers
+/// symlink roots), fall back to `remove_dir_all` for directory roots.
+fn remove_path_best_effort(p: &Path) {
+    let _ = std::fs::remove_file(p).or_else(|_| std::fs::remove_dir_all(p));
+}
+
 /// Extract `spool_path` → temp sibling tree → atomic rename into
 /// `local_path` → record in `cache` index.
 ///
 /// SYNC (caller is on a blocking thread). If extraction fails mid-way
-/// (disk full, corrupt NAR), the partial tree stays in the tmp dir and is
-/// cleaned up on next cache init, rather than being served as a broken
-/// store path by subsequent lookups.
+/// (disk full, corrupt NAR), the partial tree leaks for pod lifetime
+/// (emptyDir wipe); this fn's error arms remove it best-effort.
 fn commit_to_cache(
     cache: &Cache,
     spool_path: &Path,
@@ -750,12 +791,13 @@ fn commit_to_cache(
                 error = %e,
                 "NAR extraction failed → EIO"
             );
-            // Best-effort: remove the partial tmp tree.
-            let _ = std::fs::remove_dir_all(&tmp_path);
+            // Best-effort: tmp_path may be a file (single-file NAR root)
+            // or a dir — remove_dir_all on a file fails ENOTDIR.
+            remove_path_best_effort(&tmp_path);
             Errno::EIO
         })?;
     std::fs::rename(&tmp_path, local_path).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&tmp_path);
+        remove_path_best_effort(&tmp_path);
         tracing::error!(
             store_path = %store_path,
             tmp_path = %tmp_path.display(),
