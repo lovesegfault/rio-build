@@ -308,16 +308,25 @@ pub struct CliArgs {
 
 /// Detect the system architecture (e.g. "x86_64-linux").
 pub fn detect_system() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    // Map Rust arch names to Nix system names
+    nix_system(std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// Map Rust `std::env::consts::{ARCH,OS}` to a Nix system double.
+/// Factored out so the mapping is unit-testable (consts can't be
+/// overridden at runtime).
+pub(crate) fn nix_system(arch: &str, os: &str) -> String {
+    // Map Rust arch/OS names to Nix system names.
     let nix_arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
         "x86" => "i686",
         other => other,
     };
-    format!("{nix_arch}-{os}")
+    let nix_os = match os {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{nix_arch}-{nix_os}")
 }
 
 #[cfg(test)]
@@ -425,4 +434,17 @@ mod tests {
         );
         assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(60));
     });
+
+    /// `detect_system()`'s contract is "Nix-style system double". Rust's
+    /// `std::env::consts::OS` is `"macos"` on Darwin; passing it through
+    /// unchanged would advertise `"aarch64-macos"` and make
+    /// `validate_host_arch` reject correct `RIO_SYSTEMS=aarch64-darwin`.
+    #[test]
+    fn detect_system_maps_nix_conventions() {
+        assert_eq!(nix_system("x86_64", "linux"), "x86_64-linux");
+        assert_eq!(nix_system("aarch64", "linux"), "aarch64-linux");
+        assert_eq!(nix_system("x86", "linux"), "i686-linux");
+        assert_eq!(nix_system("aarch64", "macos"), "aarch64-darwin");
+        assert_eq!(nix_system("x86_64", "macos"), "x86_64-darwin");
+    }
 }
