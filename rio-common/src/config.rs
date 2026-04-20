@@ -296,13 +296,30 @@ where
 pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !value.trim().is_empty(),
-        "{field} is required (set --{flag}, RIO_{env}, or {component}.toml)",
-        flag = field.replace(['_', '.'], "-"),
-        // `.` is figment's nesting separator → `__` in env. So
-        // `scheduler.addr` → `RIO_SCHEDULER__ADDR`.
-        env = field.replace('.', "__").to_uppercase(),
+        "{field} is required (set {})",
+        config_hint(field, component),
     );
     Ok(())
+}
+
+/// Derive the operator-facing `--flag, RIO_ENV, or component.toml` hint
+/// from a config field name. Used by [`ensure_required`] and any error
+/// message that names a config knob — keeps the three surfaces (clap
+/// kebab-case, figment `RIO_` prefix, toml filename) in lockstep with
+/// the field name so a rename can't strand a string literal (bug_156:
+/// `worker_id`→`executor_id` rename left `--worker-id, RIO_WORKER_ID,
+/// or worker.toml` in `resolve_executor_identity`'s error; an operator
+/// following it set `RIO_WORKER_ID`, figment silently ignored it, same
+/// error looped).
+///
+/// `.` in `field` is figment's nesting separator → `__` in env, `-` in
+/// flag. So `scheduler.addr` → `--scheduler-addr`, `RIO_SCHEDULER__ADDR`.
+pub fn config_hint(field: &str, component: &str) -> String {
+    format!(
+        "--{flag}, RIO_{env}, or {component}.toml",
+        flag = field.replace(['_', '.'], "-"),
+        env = field.replace('.', "__").to_uppercase(),
+    )
 }
 
 /// Startup-time bounds checks on operator-settable config fields.
@@ -1113,5 +1130,21 @@ mod tests {
         assert!(err.contains("--database-url"), "flag derived: {err}");
         assert!(err.contains("RIO_DATABASE_URL"), "env derived: {err}");
         assert!(err.contains("store.toml"), "toml from component: {err}");
+    }
+
+    /// bug_156: factored out of `ensure_required` so error messages
+    /// that name a config knob can't hand-type the three surfaces and
+    /// drift on rename. Pins both the flat-field and dotted-field
+    /// (figment-nested) derivations.
+    #[test]
+    fn config_hint_derives_names() {
+        assert_eq!(
+            config_hint("executor_id", "builder"),
+            "--executor-id, RIO_EXECUTOR_ID, or builder.toml"
+        );
+        assert_eq!(
+            config_hint("scheduler.addr", "builder"),
+            "--scheduler-addr, RIO_SCHEDULER__ADDR, or builder.toml"
+        );
     }
 }

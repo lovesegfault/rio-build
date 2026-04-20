@@ -374,9 +374,14 @@ pub(super) fn resolve_executor_identity(
             .ok()
             .and_then(|h| h.into_string().ok())
             .ok_or_else(|| {
+                // bug_156: derive the hint — hand-typed `--worker-id,
+                // RIO_WORKER_ID, or worker.toml` here survived the
+                // worker_id→executor_id rename and sent operators to
+                // a knob figment silently ignores.
                 anyhow::anyhow!(
                     "cannot determine executor_id: gethostname() failed and \
-                     executor_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
+                     executor_id not set ({})",
+                    rio_common::config::config_hint("executor_id", "builder")
                 )
             })?
     } else {

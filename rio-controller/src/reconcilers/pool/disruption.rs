@@ -167,7 +167,7 @@ pub async fn run(client: Client, mut admin: AdminClient, shutdown: rio_common::s
 /// Pure filter: does this Pod have `DisruptionTarget=True`?
 ///
 /// Returns `Some(pod_name)` if so. Pod name == executor_id (set via
-/// `RIO_WORKER_ID=$(POD_NAME)` downward API in `build_pod_spec`).
+/// `RIO_EXECUTOR_ID=$(POD_NAME)` downward API in `build_pod_spec`).
 ///
 /// Returns `None` for:
 ///   - No `DisruptionTarget` condition (never evicted — normal)

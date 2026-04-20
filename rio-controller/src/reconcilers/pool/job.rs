@@ -408,7 +408,7 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 /// such an executor exists with `busy == false` (registered but
 /// idle past the builder's own 120s idle-exit — process can't act,
 /// I-165 D-state). The `{job_name}-` prefix match relies on
-/// `RIO_WORKER_ID=$(POD_NAME)` via downward API; Job pod is
+/// `RIO_EXECUTOR_ID=$(POD_NAME)` via downward API; Job pod is
 /// `{job_name}-{5char}`.
 ///
 /// A Job whose executor reports `busy == true` is excluded —

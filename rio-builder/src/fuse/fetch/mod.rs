@@ -567,7 +567,7 @@ fn fetch_extract_insert(
     tracing::debug!(store_path = %store_path, "fetching from remote store");
 
     // Fetch NAR data via gRPC (async bridged to sync). `fetch_timeout`
-    // (60s default from worker.toml) is an IDLE bound — it applies to the
+    // (60s default from builder.toml) is an IDLE bound — it applies to the
     // initial RPC and to each subsequent stream message, NOT the whole
     // fetch wall-clock (I-211). A stalled store still trips at 60s and
     // unparks this FUSE thread; a healthy store streaming a 2.9 GB NAR

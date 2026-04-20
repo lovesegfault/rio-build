@@ -110,7 +110,7 @@ pub struct ExecutorEnv {
     /// tests that don't mount FUSE — both calls are skipped.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
-    /// (`worker.toml fuse_fetch_timeout_secs`, default 60s). JIT
+    /// (`builder.toml fuse_fetch_timeout_secs`, default 60s). JIT
     /// `lookup` uses `jit_fetch_timeout(this, nar_size)` per path so
     /// large inputs get a size-proportional budget (I-178). Same
     /// value passed to the `PrefetchHint` handler.

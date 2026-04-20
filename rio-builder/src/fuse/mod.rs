@@ -79,7 +79,7 @@ pub struct NixStoreFs {
     /// fuse-blockon-thread-exhaustion.
     fetch_sem: cache::FetchSemaphore,
     /// Timeout for the `GetPath` gRPC fetch inside `fetch_extract_insert`.
-    /// From `worker.toml fuse_fetch_timeout_secs` (default 60s). NOT the
+    /// From `builder.toml fuse_fetch_timeout_secs` (default 60s). NOT the
     /// global `GRPC_STREAM_TIMEOUT` (300s) — FUSE fetches are the build-
     /// critical path; uploads/passthrough keep the longer deadline. The
     /// singleflight `WaitFor` loop's deadline is `fetch_timeout + 30s` slop.
