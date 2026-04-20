@@ -1953,9 +1953,12 @@ impl DagActor {
         // row → poison at 99.7%.
         //
         // Substring match mirrors `is_concurrent_put_path` in
-        // rio-builder/src/upload.rs (the store emits this exact
-        // phrase in its Aborted status).
-        let exempt_from_cap = floor_outcome.promoted || error_msg.contains("concurrent PutPath");
+        // rio-builder/src/upload.rs; both reference
+        // `rio_proto::CONCURRENT_PUTPATH_MSG` so the contract can't
+        // drift between store emit sites (PutPath / PutPathBatch) and
+        // the two consumer match sites.
+        let exempt_from_cap =
+            floor_outcome.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG);
 
         // I-127 time-window reset: if the last counted infra failure
         // was longer ago than `infra_retry_window_secs`, treat this as

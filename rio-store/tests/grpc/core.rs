@@ -980,6 +980,58 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
     Ok(())
 }
 
+/// bug_210: empty NarChunk → `acquire_many(0)` succeeds with 0
+/// permits but pushes a `SemaphorePermit` (~16 B) into `held_permits`.
+/// An infinite empty-chunk stream OOMs the store with the byte budget
+/// untouched. `accumulate_chunk` now rejects empty chunks outright.
+// r[verify store.put.nar-bytes-budget+2]
+#[tokio::test]
+async fn accumulate_chunk_rejects_empty() -> TestResult {
+    let mut s = StoreSession::new().await?;
+    let path = test_store_path("empty-chunk");
+    let (nar, _) = make_nar(b"x");
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .unwrap();
+    // Empty chunk between metadata and trailer.
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(vec![])),
+    })
+    .await
+    .unwrap();
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    let err = s
+        .client
+        .put_path(ReceiverStream::new(rx))
+        .await
+        .expect_err("empty NarChunk → reject");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("empty NarChunk"),
+        "msg: {}",
+        err.message()
+    );
+
+    Ok(())
+}
+
 // Note: the "manifest not found for" branch in GetPath is defense-in-depth
 // for a race between query_path_info and get_manifest (both filter on
 // manifests.status='complete'). Not normally reachable; no test.

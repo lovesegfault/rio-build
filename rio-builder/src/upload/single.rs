@@ -172,9 +172,12 @@ pub(super) async fn upload_output(
 /// I-125b: matches the store's placeholder-contention response. Other
 /// `Aborted` reasons (GC mark serialization, admin cancel) keep the
 /// plain retry — only this specific message gets the wait-then-adopt
-/// treatment. Message substring is stable (rio-store/src/grpc/put_path.rs).
+/// treatment. Message substring is [`rio_proto::CONCURRENT_PUTPATH_MSG`]
+/// (single source of truth shared with both store emit sites and the
+/// scheduler's I-127 cap-exemption match).
 pub(super) fn is_concurrent_put_path(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::Aborted && status.message().contains("concurrent PutPath")
+    status.code() == tonic::Code::Aborted
+        && status.message().contains(rio_proto::CONCURRENT_PUTPATH_MSG)
 }
 
 /// I-125b: poll [`query_path_info_opt`] with exponential backoff until

@@ -188,23 +188,42 @@ pub async fn persist_nar(
     Ok(())
 }
 
-// r[impl store.put.drop-cleanup]
-/// Drop-safety for a [`PlaceholderClaim::Owned`] placeholder: if the
-/// owning future is DROPPED (tonic aborts on client RST_STREAM; a
-/// `try_substitute` caller times out) without having reached
-/// [`abort_placeholder`] or flipped to `'complete'`, this guard's spawn
-/// cleans it up. `reap_one` filters `status='uploading'` so firing after
-/// an explicit abort/complete is a harmless no-op. Defuse with
-/// `ScopeGuard::into_inner` on success.
-///
-/// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
-/// in a request handler future and so share the same drop hazard.
-pub fn spawn_placeholder_guard(
+/// Heartbeat cadence for [`PlaceholderGuard`]. Matches
+/// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat) and is
+/// ≪ `SUBSTITUTE_STALE_THRESHOLD` (300s), so a live owner survives ≥9
+/// missed heartbeats before stale-reclaim takes it.
+const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// RAII owner of an `'uploading'` placeholder: heartbeats while held,
+/// reaps on drop. See [`spawn_placeholder_guard`].
+// r[impl store.put.drop-cleanup+2]
+pub(crate) struct PlaceholderGuard {
+    heartbeat: tokio::task::JoinHandle<()>,
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     store_path_hash: Vec<u8>,
-) -> scopeguard::ScopeGuard<(), impl FnOnce(())> {
-    scopeguard::guard((), move |()| {
+    defused: bool,
+}
+
+impl PlaceholderGuard {
+    /// Stop heartbeating and skip the drop-path reap. Call after the
+    /// placeholder has been flipped to `'complete'` (or explicitly
+    /// `abort_upload`ed — the reap would be a no-op, but the spawn is
+    /// wasted).
+    pub(crate) fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+        if self.defused {
+            return;
+        }
+        let pool = self.pool.clone();
+        let chunk_backend = self.chunk_backend.take();
+        let store_path_hash = std::mem::take(&mut self.store_path_hash);
         tokio::spawn(async move {
             if let Err(e) =
                 crate::gc::orphan::reap_one(&pool, &store_path_hash, None, chunk_backend.as_ref())
@@ -217,7 +236,52 @@ pub fn spawn_placeholder_guard(
                 );
             }
         });
-    })
+    }
+}
+
+// r[impl store.put.drop-cleanup+2]
+/// Drop-safety + liveness for a [`PlaceholderClaim::Owned`] placeholder.
+/// Returns a [`PlaceholderGuard`] that:
+///
+/// - **heartbeats** `manifests.updated_at` every 30s while held, so
+///   `r[store.put.stale-reclaim]`'s `reap_one(SUBSTITUTE_STALE_
+///   THRESHOLD)` never reaps a live owner during a long ingest
+///   (6 GB/50 Mbps ≈ 16 min);
+/// - **on Drop** (owning future dropped — tonic aborts on client
+///   RST_STREAM; a `try_substitute` caller times out — without an
+///   explicit [`abort_placeholder`] or `'complete'` flip), spawns
+///   `reap_one`. `reap_one` filters `status='uploading'` so firing after
+///   an explicit abort/complete is a harmless no-op.
+///
+/// Call [`PlaceholderGuard::defuse`] on success.
+///
+/// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
+/// in a request handler future and so share the same drop hazard.
+pub fn spawn_placeholder_guard(
+    pool: PgPool,
+    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    store_path_hash: Vec<u8>,
+) -> PlaceholderGuard {
+    let heartbeat = {
+        let pool = pool.clone();
+        let hash = store_path_hash.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PLACEHOLDER_HEARTBEAT_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // first tick fires immediately; skip it
+            loop {
+                tick.tick().await;
+                cas::heartbeat_uploading(&pool, &hash).await;
+            }
+        })
+    };
+    PlaceholderGuard {
+        heartbeat,
+        pool,
+        chunk_backend,
+        store_path_hash,
+        defused: false,
+    }
 }
 
 /// Best-effort placeholder cleanup after a failed ingest. Chunk-aware

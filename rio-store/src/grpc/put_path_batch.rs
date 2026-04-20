@@ -19,14 +19,13 @@
 //! atomic tx (chunks uploaded + refcounted, manifest still
 //! `status='uploading'`); the tx then flips inline AND chunked outputs
 //! to `'complete'` together. On batch failure the staged chunks orphan
-//! (refcount-zero after `abort_batch`'s `reap_one`, GC-eligible).
+//! (refcount-zero after `PlaceholderGuard` drop-reap, GC-eligible).
 //! Bound: ≤1 NAR-size of orphaned blob per failed output.
 // r[impl store.atomic.multi-output]
 
 use std::collections::BTreeMap;
 
-use super::put_path::common::NarPersist;
-
+use sha2::Digest;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::warn;
 
@@ -37,11 +36,12 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
+use super::put_path::common::{NarPersist, PlaceholderGuard};
 use super::put_path::{
     PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
 use super::{StoreServiceImpl, putpath_metadata_status};
-use rio_common::limits::MAX_BATCH_OUTPUTS;
+use rio_common::limits::{MAX_BATCH_OUTPUTS, MAX_NAR_SIZE};
 
 /// Per-output accumulation state. One of these per `output_index` seen
 /// on the stream.
@@ -55,6 +55,9 @@ struct OutputAccum {
     store_path_hash: Vec<u8>,
     /// Accumulated NAR bytes. Bounded by `MAX_NAR_SIZE` per output.
     nar_data: Vec<u8>,
+    /// Incremental NAR digest, fed by `accumulate_chunk`. Finalized in
+    /// phase 2 for [`verify_nar`].
+    hasher: sha2::Sha256,
     /// The trailer, once received. Used to verify hash/size.
     trailer: Option<PutPathTrailer>,
     /// Idempotency: this output was already `status='complete'` before
@@ -73,7 +76,14 @@ impl StoreServiceImpl {
         request: Request<Streaming<PutPathBatchRequest>>,
     ) -> Result<Response<PutPathBatchResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Duration histogram via scopeguard so ALL exits record —
+        // mirrors `put_path_impl` exactly (same metric name → same
+        // semantics; observability.md SLI assumes it).
         let start = std::time::Instant::now();
+        let _duration_guard = scopeguard::guard((), move |()| {
+            metrics::histogram!("rio_store_put_path_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
+        });
 
         let auth = self.authorize(&request)?;
         let mut stream = request.into_inner();
@@ -85,15 +95,24 @@ impl StoreServiceImpl {
         if outputs.is_empty() {
             return Err(Status::invalid_argument("PutPathBatch: empty stream"));
         }
+        let n_outputs = outputs.len();
 
-        // store_path_hashes of placeholders WE inserted (and thus own
-        // and must clean up on error). Separate from `outputs` so the
-        // bail! macro can borrow it while a phase-2/3 loop holds
-        // `&mut outputs`.
-        let mut owned_placeholders: Vec<Vec<u8>> = Vec::new();
+        // PlaceholderGuards for placeholders WE inserted (and thus own).
+        // Each guard heartbeats while held and reaps on Drop — so a
+        // `return Err` (or future-drop on RST_STREAM) anywhere in
+        // phase-2/3 cleans up every owned placeholder without an
+        // explicit cleanup loop. Separate from `outputs` so it can be
+        // pushed while a phase-2/3 loop holds `&mut outputs`.
+        let mut placeholder_guards: Vec<PlaceholderGuard> = Vec::new();
+        // Count of outputs for which `claim_placeholder` already fired
+        // `{result="exists"}` (AlreadyComplete arm). The error metric
+        // unit is per-store-path; on bail! we increment by the number
+        // NOT yet resolved as `exists`.
+        let mut n_exists_emitted: usize = 0;
         macro_rules! bail {
             ($status:expr) => {{
-                self.abort_batch(&owned_placeholders).await;
+                metrics::counter!("rio_store_put_path_total", "result" => "error")
+                    .increment((n_outputs - n_exists_emitted) as u64);
                 return Err($status);
             }};
         }
@@ -114,7 +133,8 @@ impl StoreServiceImpl {
             if let Err(e) = apply_trailer(info, t, &ctx) {
                 bail!(e);
             }
-            if let Err(e) = verify_nar(&accum.nar_data, info, &ctx) {
+            let computed: [u8; 32] = std::mem::take(&mut accum.hasher).finalize().into();
+            if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
                 bail!(e);
             }
             // r[impl sec.authz.ca-path-derived]
@@ -134,13 +154,16 @@ impl StoreServiceImpl {
             {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
+                    n_exists_emitted += 1;
                     continue;
                 }
                 Ok(PlaceholderClaim::Owned) => {
-                    owned_placeholders.push(accum.store_path_hash.clone());
+                    placeholder_guards
+                        .push(self.spawn_placeholder_guard(accum.store_path_hash.clone()));
                 }
                 Ok(PlaceholderClaim::Concurrent) => bail!(Status::aborted(format!(
-                    "{ctx}: concurrent upload in progress; retry"
+                    "{ctx}: {}; retry",
+                    rio_proto::CONCURRENT_PUTPATH_MSG
                 ))),
                 Err(e) => bail!(putpath_metadata_status(
                     "PutPathBatch: claim_placeholder",
@@ -167,21 +190,10 @@ impl StoreServiceImpl {
             Err(e) => bail!(e),
         };
 
-        metrics::histogram!("rio_store_put_path_duration_seconds")
-            .record(start.elapsed().as_secs_f64());
-        Ok(Response::new(PutPathBatchResponse { created }))
-    }
-
-    /// Clean up every placeholder we own. Best-effort: errors are logged
-    /// (no way to surface them to a client we're already erroring out to).
-    /// Takes owned store_path_hashes (not the full `OutputAccum` map) so
-    /// the caller's `bail!` macro can invoke this while a `for … iter_mut()`
-    /// loop holds `&mut outputs`.
-    async fn abort_batch(&self, owned_placeholders: &[Vec<u8>]) {
-        for hash in owned_placeholders {
-            crate::ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), hash).await;
+        for g in placeholder_guards {
+            g.defuse();
         }
-        metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
+        Ok(Response::new(PutPathBatchResponse { created }))
     }
 
     /// Phase 1: demux the batch stream into per-`output_index`
@@ -204,6 +216,13 @@ impl StoreServiceImpl {
         // need to fill it in order regardless of stream arrival order.
         let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
         let mut held_permits = Vec::new();
+        // Cumulative NAR bytes across ALL outputs. Per-output is capped
+        // at MAX_NAR_SIZE inside `accumulate_chunk`; without a
+        // cumulative cap, MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB
+        // could be demanded against a 32 GiB budget — `acquire_many`
+        // would block on permits THIS task holds (self-deadlock).
+        // r[impl store.put.nar-bytes-budget+2]
+        let mut total_bytes: u64 = 0;
 
         while let Some(msg) = stream.message().await? {
             let idx = msg.output_index;
@@ -232,7 +251,8 @@ impl StoreServiceImpl {
                         Status::invalid_argument(format!("{ctx}: PutPathMetadata missing PathInfo"))
                     })?;
                     let info = validate_put_metadata(raw_info, hmac_claims, &ctx)?;
-                    accum.store_path_hash = info.store_path.sha256_digest().to_vec();
+                    // Server-derived in validate_put_metadata (step 7).
+                    accum.store_path_hash = info.store_path_hash.clone();
                     accum.info = Some(info);
                 }
                 put_path_request::Msg::NarChunk(chunk) => {
@@ -246,8 +266,20 @@ impl StoreServiceImpl {
                             "{ctx}: nar_chunk after trailer"
                         )));
                     }
+                    total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                    if total_bytes >= MAX_NAR_SIZE {
+                        // FailedPrecondition (not InvalidArgument) so
+                        // the builder's batch fallback at
+                        // upload/mod.rs falls through to independent
+                        // PutPath — each output then gets its own
+                        // MAX_NAR_SIZE without a cumulative cap.
+                        return Err(Status::failed_precondition(format!(
+                            "PutPathBatch: cumulative NAR bytes {total_bytes} exceed \
+                             MAX_NAR_SIZE {MAX_NAR_SIZE}; fall back to per-output PutPath"
+                        )));
+                    }
                     let permit = self
-                        .accumulate_chunk(&mut accum.nar_data, &chunk, &ctx)
+                        .accumulate_chunk(&mut accum.nar_data, &mut accum.hasher, &chunk, &ctx)
                         .await?;
                     held_permits.push(permit);
                 }
@@ -302,7 +334,7 @@ impl StoreServiceImpl {
     /// Phase 3: open ONE transaction, flip every owned output to
     /// `status='complete'` (inline or chunked-staged), commit, then
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
-    /// return; caller `abort_batch`es on `Err` to reap placeholders +
+    /// return; caller's `PlaceholderGuard`s reap placeholders on Drop +
     /// staged chunk refcounts (committed in phase-2's separate txs).
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]

@@ -547,3 +547,94 @@ async fn append_hw_perf_sample_service_token_rejected() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// store_path_hash forgery — server MUST recompute (sec.boundary.grpc-hmac)
+// ---------------------------------------------------------------------------
+
+/// bug_068: HMAC binds `store_path` (string), not `store_path_hash`.
+/// A worker holding a token for path A sends `{store_path: A,
+/// store_path_hash: sha256(B)}`. The HMAC gate passes (store_path is
+/// in claims); pre-fix, the server keyed A's narinfo under B's slot —
+/// poisoning B's hash lookups. Post-fix, `validate_put_metadata`
+/// recomputes `store_path_hash` from the gated `store_path`
+/// unconditionally; the wire value is ignored.
+// r[verify sec.boundary.grpc-hmac]
+#[tokio::test]
+async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
+    use sha2::{Digest, Sha256};
+
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+
+    let path_a = test_store_path("hmac-hashforge-a");
+    let path_b = test_store_path("hmac-hashforge-b");
+    let (nar, _) = make_nar(b"authorized payload for A");
+    let info = make_path_info_for_nar(&path_a, &nar);
+
+    // Token authorizes path A only.
+    let token = sign_claims(vec![path_a.clone()], 60);
+
+    // Forge: store_path=A (passes HMAC) but store_path_hash=sha256(B).
+    let mut raw: PathInfo = info.into();
+    raw.store_path_hash = Sha256::digest(path_b.as_bytes()).to_vec();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut raw.nar_hash),
+        nar_size: std::mem::take(&mut raw.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(raw),
+        })),
+    })
+    .await
+    .unwrap();
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .unwrap();
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    req.metadata_mut().insert(
+        rio_proto::ASSIGNMENT_TOKEN_HEADER,
+        token.parse().expect("ascii token"),
+    );
+    let created = s.client.put_path(req).await?.into_inner().created;
+    assert!(created, "upload of A with forged hash succeeds");
+
+    // B's slot MUST be untouched.
+    let b_result = s
+        .client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: path_b.clone(),
+        })
+        .await;
+    assert_eq!(
+        b_result.expect_err("B was never uploaded").code(),
+        tonic::Code::NotFound,
+        "forged store_path_hash must NOT key A's narinfo under B's slot"
+    );
+
+    // A's slot MUST hold the upload (server-derived hash).
+    let a_info = s
+        .client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: path_a.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        a_info.store_path, path_a,
+        "A keyed under its own server-derived hash"
+    );
+
+    Ok(())
+}

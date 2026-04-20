@@ -161,7 +161,7 @@ Scheduler state gauges (`_builds_active`, `_derivations_queued`, `_derivations_r
 r[obs.metric.store]
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_store_put_path_total` | Counter | Total PutPath operations |
+| `rio_store_put_path_total` | Counter | Total PutPath operations (per store path; PutPathBatch counts each output) |
 | `rio_store_putpath_retries_total` | Counter | PutPath retriable rejections (labeled by `reason`: `serialization`/`deadlock`/`placeholder_missing`/`connection`/`resource_exhausted`/`concurrent_upload`). Client retries on `aborted`/`unavailable`. Sustained high `deadlock`/`connection` rate = PG-side problem. GC no longer blocks PutPath (I-192). |
 | `rio_store_put_path_duration_seconds` | Histogram | PutPath latency |
 | `rio_store_integrity_failures_total` | Counter | GetPath content integrity check failures (bitrot/corruption) |

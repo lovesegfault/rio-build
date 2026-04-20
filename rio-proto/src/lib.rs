@@ -16,6 +16,16 @@ pub use rio_common::grpc::{
     TENANT_TOKEN_HEADER, TRACE_ID_HEADER,
 };
 
+/// Substring carried in the `Status::aborted` message when PutPath /
+/// PutPathBatch find a live `'uploading'` placeholder for the same
+/// store path. This is a wire-protocol contract: rio-builder
+/// (`is_concurrent_put_path`, I-125b wait-then-adopt) and
+/// rio-scheduler (`exempt_from_cap`, I-127 infra-retry exemption) both
+/// `.contains()`-match it. Single source of truth — both store emit
+/// sites and both consumer match sites use this constant so the string
+/// can't drift again.
+pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
+
 pub mod client;
 pub mod interceptor;
 pub mod status;

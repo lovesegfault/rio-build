@@ -23,6 +23,7 @@
 //! around the same state machine.
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tonic::{Request, Status, Streaming};
 use tracing::warn;
 
@@ -30,7 +31,7 @@ use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::grpc::StatusExt;
-use rio_common::limits::MAX_NAR_SIZE;
+use rio_common::limits::{MAX_NAR_SIZE, MIN_NAR_CHUNK_CHARGE};
 
 use crate::cas;
 use crate::grpc::{StoreServiceImpl, putpath_metadata_status, storage_error};
@@ -74,14 +75,17 @@ pub(in crate::grpc) struct PutAuth {
 /// Shared validation shared by both upload RPCs: (1) nar_hash-empty
 /// enforcement (trailer-only mode), (2) references bound,
 /// (3) signatures bound, (4) placeholder hash fill,
-/// (5) ValidatedPathInfo::try_from, (6) HMAC path-in-claims check.
+/// (5) ValidatedPathInfo::try_from, (6) HMAC path-in-claims check,
+/// (7) `store_path_hash` recomputed server-side.
 ///
 /// `ctx_label` goes into error messages for client-side disambiguation
 /// ("PutPath" vs "output N").
 ///
-/// Returns the validated info; on HMAC path-not-in-claims failure,
-/// increments the `hmac_rejected_total{reason=path_not_in_claims}`
-/// counter before erroring.
+/// Returns the validated info with `store_path_hash` populated from the
+/// HMAC-gated `store_path` (NEVER from the wire — see step 7); on HMAC
+/// path-not-in-claims failure, increments the
+/// `hmac_rejected_total{reason=path_not_in_claims}` counter before
+/// erroring.
 // r[impl sec.boundary.grpc-hmac]
 pub(in crate::grpc) fn validate_put_metadata(
     mut raw_info: rio_proto::types::PathInfo,
@@ -122,7 +126,17 @@ pub(in crate::grpc) fn validate_put_metadata(
 
     // Step 5: centralized validation — store_path parses, nar_hash is
     // 32 bytes (placeholder), each reference parses.
-    let info = ValidatedPathInfo::try_from(raw_info).status_invalid(ctx_label)?;
+    let mut info = ValidatedPathInfo::try_from(raw_info).status_invalid(ctx_label)?;
+
+    // Step 7: derive store_path_hash from the parsed store_path,
+    // unconditionally overwriting whatever the client sent. The HMAC
+    // gate (step 6) binds `store_path`, NOT `store_path_hash` — a
+    // worker holding a token for path A could otherwise send
+    // {store_path: A, store_path_hash: sha256(B)} and key A's narinfo
+    // under B's slot. Doing this at the chokepoint means no caller
+    // can forget; all downstream `info.store_path_hash` reads are
+    // server-derived.
+    info.store_path_hash = info.store_path.sha256_digest().to_vec();
 
     // Step 6: HMAC path-in-claims check. None = verifier disabled OR
     // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
@@ -208,37 +222,41 @@ pub(in crate::grpc) async fn read_first_metadata(
 
 // r[impl store.integrity.verify-on-put]
 // r[impl sec.drv.validate]
-/// Hash the buffered NAR and check against the trailer-declared
-/// `nar_hash` / `nar_size` (already applied to `info` via
-/// [`apply_trailer`]). The integrity gate of
+/// Compare a server-computed NAR digest+size against the
+/// trailer-declared `nar_hash` / `nar_size` (already applied to `info`
+/// via [`apply_trailer`]). The integrity gate of
 /// `r[store.integrity.verify-on-put]` — server computes the digest
 /// independently of the client.
+///
+/// `computed_hash` is the finalized output of an incremental
+/// `sha2::Sha256` that [`StoreServiceImpl::accumulate_chunk`] fed every
+/// chunk into. Hashing happens chunk-by-chunk during the gRPC receive
+/// loop (which `await`s between chunks), so a 4 GiB NAR never blocks a
+/// tokio worker for a multi-second one-shot `Sha256::digest`.
 ///
 /// Status messages contain the substrings "size mismatch" / "hash
 /// mismatch"; protocol tests assert on those.
 pub(in crate::grpc) fn verify_nar(
-    nar_data: &[u8],
+    computed_hash: [u8; 32],
+    actual_size: u64,
     info: &ValidatedPathInfo,
     ctx_label: &str,
 ) -> Result<(), Status> {
-    use sha2::{Digest, Sha256};
     let fail = |e: String| {
         warn!(store_path = %info.store_path, error = %e, "{ctx_label}: NAR validation failed");
         Status::invalid_argument(format!("{ctx_label}: NAR validation failed: {e}"))
     };
-    let actual_size = nar_data.len() as u64;
     if actual_size != info.nar_size {
         return Err(fail(format!(
             "NAR size mismatch: declared {}, actual {actual_size}",
             info.nar_size
         )));
     }
-    let actual_hash: [u8; 32] = Sha256::digest(nar_data).into();
-    if actual_hash != info.nar_hash {
+    if computed_hash != info.nar_hash {
         return Err(fail(format!(
             "NAR hash mismatch: declared {}, computed {}",
             hex::encode(info.nar_hash),
-            hex::encode(actual_hash)
+            hex::encode(computed_hash)
         )));
     }
     Ok(())
@@ -324,6 +342,8 @@ pub(in crate::grpc) fn verify_ca_store_path(
     Ok(())
 }
 
+pub(in crate::grpc) use crate::ingest::PlaceholderGuard;
+
 impl StoreServiceImpl {
     // r[impl sec.boundary.grpc-hmac]
     /// HMAC token verify + JWT tenant extraction. Shared step-0 of the
@@ -352,12 +372,21 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.nar-bytes-budget]
+    // r[impl store.put.nar-bytes-budget+2]
     /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
-    /// and the GLOBAL `nar_bytes_budget` semaphore. Returns the held
-    /// permit; the caller pushes it into a `Vec` so drop-on-any-exit
-    /// releases capacity. `await` here backpressures the client via
-    /// gRPC flow control when the budget is exhausted.
+    /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
+    /// into the caller's incremental `hasher` so [`verify_nar`] never
+    /// has to one-shot-hash a multi-GiB buffer on a tokio worker.
+    /// Returns the held permit; the caller pushes it into a `Vec` so
+    /// drop-on-any-exit releases capacity. `await` here backpressures
+    /// the client via gRPC flow control when the budget is exhausted.
+    ///
+    /// Empty chunks are rejected outright (legit clients never send
+    /// them; an infinite empty-chunk stream would otherwise
+    /// `acquire_many(0)` forever and grow `held_permits` unbounded by
+    /// the byte budget). Tiny chunks are charged
+    /// [`MIN_NAR_CHUNK_CHARGE`] so per-permit tracking overhead is
+    /// itself bounded by the budget.
     ///
     /// `>=` so a single chunk of exactly 2³² bytes is rejected before
     /// it reaches `acquire_many(0)` and silently bypasses the budget.
@@ -366,9 +395,15 @@ impl StoreServiceImpl {
     pub(in crate::grpc) async fn accumulate_chunk<'a>(
         &'a self,
         nar_data: &mut Vec<u8>,
+        hasher: &mut Sha256,
         chunk: &[u8],
         ctx_label: &str,
     ) -> Result<tokio::sync::SemaphorePermit<'a>, Status> {
+        if chunk.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "{ctx_label}: empty NarChunk (protocol violation)"
+            )));
+        }
         let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
         if new_len >= MAX_NAR_SIZE {
             return Err(Status::invalid_argument(format!(
@@ -377,20 +412,21 @@ impl StoreServiceImpl {
         }
         let permit = self
             .nar_bytes_budget
-            .acquire_many(chunk.len() as u32)
+            .acquire_many((chunk.len() as u32).max(MIN_NAR_CHUNK_CHARGE))
             .await
             .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
         nar_data.extend_from_slice(chunk);
+        hasher.update(chunk);
         Ok(permit)
     }
 
     /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
     /// supplying `self.pool` / `self.chunk_backend`. See that fn's doc
-    /// for the drop-cleanup invariant.
+    /// for the drop-cleanup + heartbeat invariants.
     pub(in crate::grpc) fn spawn_placeholder_guard(
         &self,
         store_path_hash: Vec<u8>,
-    ) -> scopeguard::ScopeGuard<(), impl FnOnce(())> {
+    ) -> PlaceholderGuard {
         crate::ingest::spawn_placeholder_guard(
             self.pool.clone(),
             self.chunk_backend.clone(),
@@ -414,6 +450,7 @@ impl StoreServiceImpl {
         hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
     ) -> Result<(Vec<u8>, Vec<tokio::sync::SemaphorePermit<'a>>), Status> {
         let mut nar_data = Vec::new();
+        let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
         let mut held_permits = Vec::new();
         loop {
@@ -433,7 +470,7 @@ impl StoreServiceImpl {
                         ));
                     }
                     let permit = self
-                        .accumulate_chunk(&mut nar_data, &chunk, "PutPath")
+                        .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "PutPath")
                         .await?;
                     held_permits.push(permit);
                 }
@@ -461,7 +498,12 @@ impl StoreServiceImpl {
             )
         })?;
         apply_trailer(info, &t, "PutPath")?;
-        verify_nar(&nar_data, info, "PutPath")?;
+        verify_nar(
+            hasher.finalize().into(),
+            nar_data.len() as u64,
+            info,
+            "PutPath",
+        )?;
         verify_ca_store_path(info, hmac_claims, "PutPath")?;
         Ok((nar_data, held_permits))
     }
@@ -565,8 +607,8 @@ impl StoreServiceImpl {
     /// the `inline_blob` arg to [`metadata::complete_manifest_in_conn`].
     ///
     /// On `stage_chunked` error this output's placeholder is already
-    /// rolled back; the batch's `abort_batch` handles other outputs'
-    /// placeholders.
+    /// rolled back; the batch's [`PlaceholderGuard`]s handle other
+    /// outputs' placeholders on Drop.
     pub(in crate::grpc) async fn stage_nar_for_batch(
         &self,
         info: &ValidatedPathInfo,
@@ -597,16 +639,43 @@ mod verify_nar_tests {
     use super::*;
     use rio_test_support::fixtures::{make_path_info_for_nar, test_store_path};
 
+    fn digest(d: &[u8]) -> [u8; 32] {
+        Sha256::digest(d).into()
+    }
+
     #[test]
     fn verify_nar_size_and_hash() {
         let data = b"valid nar data";
         let info = make_path_info_for_nar(&test_store_path("v"), data);
-        assert!(verify_nar(data, &info, "t").is_ok());
+        assert!(verify_nar(digest(data), data.len() as u64, &info, "t").is_ok());
 
-        let e = verify_nar(b"short", &info, "t").unwrap_err();
+        let e = verify_nar(digest(b"short"), 5, &info, "t").unwrap_err();
         assert!(e.message().contains("size mismatch"), "got: {e:?}");
 
-        let e = verify_nar(b"different data", &info, "t").unwrap_err();
+        let e = verify_nar(digest(b"different data"), data.len() as u64, &info, "t").unwrap_err();
         assert!(e.message().contains("hash mismatch"), "got: {e:?}");
+    }
+
+    /// Incremental hashing through `accumulate_chunk` produces the same
+    /// digest as one-shot `Sha256::digest`. Structural — not timing-based.
+    #[tokio::test]
+    async fn verify_nar_incremental_matches_oneshot() {
+        let svc = StoreServiceImpl::new(
+            sqlx::PgPool::connect_lazy("postgres://unused").expect("lazy pool"),
+        );
+        let chunks: &[&[u8]] = &[b"first ", b"second ", b"third"];
+        let mut buf = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut permits = Vec::new();
+        for c in chunks {
+            permits.push(
+                svc.accumulate_chunk(&mut buf, &mut hasher, c, "t")
+                    .await
+                    .expect("chunk under bounds"),
+            );
+        }
+        let incremental: [u8; 32] = hasher.finalize().into();
+        assert_eq!(incremental, digest(&buf));
+        assert_eq!(buf, b"first second third");
     }
 }

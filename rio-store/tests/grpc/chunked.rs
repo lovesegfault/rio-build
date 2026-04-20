@@ -426,20 +426,16 @@ async fn gt13_batch_reclaims_stale_uploading() -> TestResult {
     Ok(())
 }
 
-/// The `bail!` macro at `put_path_batch.rs:82-87` is load-bearing: it
-/// calls `abort_batch()` before returning. A bare `?` bypasses it —
-/// `owned_placeholders` leak, and the next `PutPathBatch` for those
-/// paths gets `Status::aborted("concurrent upload in progress")` until
-/// the 2h orphan sweep reclaims stale `'uploading'` rows.
-///
-/// P0342 fixed the lone `?` on `insert_manifest_uploading` (the
-/// `.map_err(...)?` call). This test catches any future
-/// reintroduction: every error return in phase-2/phase-3 MUST go
-/// through `bail!` — no bare `?` after the first placeholder may be
-/// pushed.
+/// The `bail!` macro in `put_path_batch_impl` is load-bearing: it
+/// emits the per-output `result="error"` metric before returning.
+/// Placeholder cleanup is now structural (PlaceholderGuard's Drop
+/// reaps owned placeholders on ANY exit including a bare `?`), but a
+/// `?` still bypasses the metric increment — the SLI at
+/// observability.md:351 would over-report availability. Every error
+/// return in phase-2/phase-3 MUST go through `bail!`.
 ///
 /// Brittle-by-design: a false-positive on a `?` inside a closure or a
-/// pre-placeholder helper is preferable to the silent 2h wedge. If a
+/// pre-placeholder helper is preferable to silent metric drift. If a
 /// legitimate `?` is added, slice the body more tightly or convert the
 /// `?` to `match + bail!`.
 #[test]
@@ -447,25 +443,19 @@ fn put_path_batch_impl_no_question_mark_bypass() {
     let src = include_str!("../../src/grpc/put_path_batch.rs");
 
     // Slice the impl body: between `fn put_path_batch_impl(` and
-    // `async fn abort_batch(` (the next sibling fn). Every `?` in the
-    // phase-2/3 part of that slice is a suspect.
+    // `async fn drain_batch_stream` (the next sibling fn). Every `?`
+    // in the phase-2/3 part of that slice is a suspect.
     let start = src
         .find("fn put_path_batch_impl(")
         .expect("put_path_batch_impl present");
     let end = src[start..]
-        .find("async fn abort_batch(")
-        .expect("abort_batch sibling present")
+        .find("async fn drain_batch_stream")
+        .expect("drain_batch_stream sibling present")
         + start;
     let body = &src[start..end];
 
-    // Phase-2/3: after placeholders MAY be inserted (phase-2's
-    // `owned_placeholders.push` happens inside the per-output loop —
-    // output-0 is pushed before output-1's insert runs). A `?` anywhere in
-    // phase-2/3 leaks output-0's placeholder if output-1 errors.
-    //
-    // Phase-1 (stream drain) never pushes placeholders, so a `?` there
-    // is harmless (abort_batch on an empty list is a no-op). Slice from
-    // the phase-2 marker.
+    // Phase-1 (stream drain) never arms guards or counts outputs, so a
+    // `?` there is harmless. Slice from the phase-2 marker.
     let phase2_start = body.find("--- Phase 2:").expect("phase-2 marker present");
     let tail = &body[phase2_start..];
 
@@ -551,24 +541,35 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     let status = r.expect_err("batch must fail — output-1 slot owned by concurrent uploader");
     assert_eq!(status.code(), tonic::Code::Aborted);
     assert!(
-        status.message().contains("concurrent upload in progress"),
-        "expected concurrent-upload message, got: {}",
+        status.message().contains(rio_proto::CONCURRENT_PUTPATH_MSG),
+        "expected CONCURRENT_PUTPATH_MSG, got: {}",
         status.message()
     );
 
-    // THE CLEANUP ASSERTION: output-0's placeholder was deleted by
-    // abort_batch. Only output-1's (pre-seeded, not owned by this
-    // handler — never pushed to owned_placeholders) remains. Total
-    // 'uploading' rows = 1, and it's output-1's hash.
-    let uploading: Vec<(Vec<u8>,)> =
-        sqlx::query_as("SELECT store_path_hash FROM manifests WHERE status = 'uploading'")
-            .fetch_all(&s.db.pool)
-            .await?;
+    // THE CLEANUP ASSERTION: output-0's placeholder was deleted by the
+    // PlaceholderGuard's drop-spawn. Only output-1's (pre-seeded, not
+    // owned by this handler — never armed a guard) remains. Total
+    // 'uploading' rows = 1, and it's output-1's hash. The guard's reap
+    // is spawned async on Drop — poll until it lands.
+    let uploading: Vec<(Vec<u8>,)> = {
+        let mut tries = 0;
+        loop {
+            let rows: Vec<(Vec<u8>,)> =
+                sqlx::query_as("SELECT store_path_hash FROM manifests WHERE status = 'uploading'")
+                    .fetch_all(&s.db.pool)
+                    .await?;
+            if rows.len() <= 1 || tries >= 50 {
+                break rows;
+            }
+            tries += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
     assert_eq!(
         uploading.len(),
         1,
         "only the pre-seeded output-1 placeholder survives; \
-         output-0's placeholder was cleaned up by abort_batch"
+         output-0's placeholder was cleaned up by PlaceholderGuard drop"
     );
     assert_eq!(
         uploading[0].0, out1_hash,
@@ -908,4 +909,115 @@ async fn send_batch_output(
     })
     .await
     .expect("fresh channel");
+}
+
+/// bug_142: a single batch's `held_permits` accumulates ALL outputs'
+/// permits until handler return. Per-output cap × MAX_BATCH_OUTPUTS
+/// can exceed the global budget → `acquire_many` blocks on permits the
+/// SAME task holds (self-deadlock). Fixed by the cumulative MAX_NAR_SIZE
+/// cap in `drain_batch_stream`; a batch under that cap (≤ 1/8 of the
+/// default budget) can never self-deadlock. Verified here with a 2 MiB
+/// budget and 3 × 600 KiB outputs (1.8 MiB cumulative — under both
+/// MAX_NAR_SIZE and the budget, so no rejection AND no deadlock).
+// r[verify store.put.nar-bytes-budget+2]
+#[tokio::test]
+async fn batch_no_self_deadlock_under_budget() -> TestResult {
+    let s =
+        StoreSession::build(|pool| StoreServiceImpl::new(pool).with_nar_budget(2 * 1024 * 1024))
+            .await?;
+    let mut client = s.client.clone();
+
+    let (nar0, info0, _) = make_large_nar(50, 600 * 1024);
+    let (nar1, info1, _) = make_large_nar(51, 600 * 1024);
+    let (nar2, info2, _) = make_large_nar(52, 600 * 1024);
+
+    let (tx, rx) = mpsc::channel(32);
+    send_batch_output(&tx, 0, info0.into(), nar0).await;
+    send_batch_output(&tx, 1, info1.into(), nar1).await;
+    send_batch_output(&tx, 2, info2.into(), nar2).await;
+    drop(tx);
+
+    // 30s is enormous headroom for a sub-2-MiB inline batch on
+    // ephemeral PG; pre-fix this would hang forever once cumulative
+    // bytes > 2 MiB budget.
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.put_path_batch(ReceiverStream::new(rx)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("PutPathBatch self-deadlocked on its own permits"))??
+    .into_inner();
+    assert_eq!(resp.created, vec![true, true, true]);
+
+    Ok(())
+}
+
+/// bug_063: batch armed NO drop-guard for owned placeholders. If the
+/// handler future was DROPPED (tonic RST_STREAM, server shutdown), N
+/// placeholders leaked at `'uploading'` for 5 min. With
+/// `PlaceholderGuard`, dropping the future spawns `reap_one` for each
+/// owned placeholder.
+///
+/// We can't easily drop the in-process tonic handler future from the
+/// client side, so this test reuses the bail!-path machinery: phase-2
+/// inserts output-0's placeholder, output-1 fails verify_nar, the
+/// `return Err` drops `placeholder_guards`. Unlike the
+/// `gt13_batch_placeholder_cleanup_on_midloop_abort` test (which also
+/// asserted cleanup but via the explicit `abort_batch` loop), this
+/// asserts the GUARD's drop-spawn does the work — `abort_batch` no
+/// longer exists.
+// r[verify store.put.drop-cleanup+2]
+#[tokio::test]
+async fn batch_guard_drop_reaps_placeholders() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    let out0_path = test_store_path("guarddrop-out0");
+    let (out0_nar, _) = make_nar(b"guard zero");
+    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
+
+    let out1_path = test_store_path("guarddrop-out1");
+    let (out1_nar, _) = make_nar(b"guard one");
+    // Metadata declares hash-of-"guard one" but we'll send corrupted
+    // bytes — verify_nar fails AFTER output-0's placeholder is owned.
+    // Actually: send order is metadata-0, chunk-0, trailer-0,
+    // metadata-1, BAD-chunk-1, trailer-1; phase-2 iterates 0 then 1.
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
+    let out1_bad_nar = vec![0xFFu8; out1_nar.len()];
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.clone().into(), out0_nar).await;
+    send_batch_output(&tx, 1, out1_info.into(), out1_bad_nar).await;
+    drop(tx);
+
+    let mut client = s.client.clone();
+    let r = client.put_path_batch(ReceiverStream::new(rx)).await;
+    let status = r.expect_err("output-1 hash mismatch → batch fails");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("hash mismatch"));
+
+    // Guard's drop-spawn is async — give it a moment to land.
+    let mut tries = 0;
+    let uploading = loop {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
+                .fetch_one(&s.db.pool)
+                .await?;
+        if n == 0 || tries >= 50 {
+            break n;
+        }
+        tries += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        uploading, 0,
+        "PlaceholderGuard drop must reap output-0's placeholder \
+         (no abort_batch loop anymore)"
+    );
+
+    // And output-0 is uploadable again (claim returns Owned, not
+    // Concurrent) — proven by a successful single PutPath.
+    let recreated = put_path(&mut client, out0_info, make_nar(b"guard zero").0).await?;
+    assert!(recreated, "output-0 slot freed by guard drop");
+
+    Ok(())
 }

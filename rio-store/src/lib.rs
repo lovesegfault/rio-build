@@ -106,7 +106,10 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 
-    describe_counter!("rio_store_put_path_total", "Total PutPath operations");
+    describe_counter!(
+        "rio_store_put_path_total",
+        "Total PutPath operations (per store path; PutPathBatch counts each output)"
+    );
     describe_counter!(
         "rio_store_putpath_retries_total",
         "PutPath retriable rejections (labeled by reason: serialization|\

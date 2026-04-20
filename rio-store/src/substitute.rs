@@ -596,7 +596,7 @@ impl Substituter {
             }
         }
 
-        // r[impl store.put.drop-cleanup]
+        // r[impl store.put.drop-cleanup+2]
         // We OWN the placeholder. Guard against future-drop (client
         // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
         // path between here and the defuse below is abandoned.
@@ -652,7 +652,7 @@ impl Substituter {
 
         match persist {
             Ok(()) => {
-                scopeguard::ScopeGuard::into_inner(placeholder_guard);
+                placeholder_guard.defuse();
                 Ok(UpstreamOutcome::Hit(Box::new(info)))
             }
             Err(e) => {
@@ -660,7 +660,7 @@ impl Substituter {
                 // next upstream in `do_substitute`'s loop sees a clean
                 // slate (the guard's tokio::spawn fires too late for
                 // that). threshold=None: our placeholder.
-                scopeguard::ScopeGuard::into_inner(placeholder_guard);
+                placeholder_guard.defuse();
                 ingest::abort_placeholder(
                     &self.pool,
                     self.chunk_backend.as_ref(),

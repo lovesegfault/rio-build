@@ -589,14 +589,21 @@ mod tests {
     /// flavour.
     #[test]
     fn test_is_concurrent_put_path_matcher() {
-        assert!(is_concurrent_put_path(&tonic::Status::aborted(
-            "concurrent PutPath in progress for this path; retry"
-        )));
+        // Single PutPath shape.
+        assert!(is_concurrent_put_path(&tonic::Status::aborted(format!(
+            "{} for this path; retry",
+            rio_proto::CONCURRENT_PUTPATH_MSG
+        ))));
+        // PutPathBatch shape (output-index prefix + suffix).
+        assert!(is_concurrent_put_path(&tonic::Status::aborted(format!(
+            "output 1: {}; retry",
+            rio_proto::CONCURRENT_PUTPATH_MSG
+        ))));
         assert!(!is_concurrent_put_path(&tonic::Status::aborted(
             "GC mark in progress"
         )));
         assert!(!is_concurrent_put_path(&tonic::Status::unavailable(
-            "concurrent PutPath in progress"
+            rio_proto::CONCURRENT_PUTPATH_MSG
         )));
     }
 

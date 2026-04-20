@@ -1699,6 +1699,56 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
     Ok(())
 }
 
+/// bug_468 / I-127: PutPathBatch's `Aborted` message used to read
+/// "concurrent upload in progress" — `.contains("concurrent PutPath")`
+/// never matched, so multi-output drvs hitting placeholder contention
+/// got `infra_count++` and poisoned. Both store emit sites now use
+/// `rio_proto::CONCURRENT_PUTPATH_MSG`; this test feeds the BATCH
+/// shape (output-index prefix + suffix) and asserts the exemption.
+#[tokio::test]
+async fn i127_batch_concurrent_putpath_exempt() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("batch-w", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "batch-putpath-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    let batch_msg = format!(
+        "output upload failed: output 1: {}; retry",
+        rio_proto::CONCURRENT_PUTPATH_MSG
+    );
+    for attempt in 0..15 {
+        let ok = handle.debug_force_assign(drv_hash, "batch-w").await?;
+        assert!(ok, "force-assign should succeed at attempt {attempt}");
+        complete_failure(
+            &handle,
+            "batch-w",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            &batch_msg,
+        )
+        .await?;
+    }
+
+    let after = expect_drv(&handle, drv_hash).await;
+    assert!(
+        matches!(
+            after.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "batch-shape concurrent-PutPath → exempt from cap, got {:?}",
+        after.status
+    );
+    assert_eq!(
+        after.retry.infra_count, 0,
+        "batch-shape concurrent-PutPath must NOT increment infra_retry_count"
+    );
+
+    Ok(())
+}
+
 /// `require_distinct_workers` mode: 3× TransientFailure on the SAME
 /// worker poisons iff `require_distinct_workers=false`. Same inputs,
 /// opposite config, opposite outcome.

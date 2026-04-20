@@ -36,6 +36,17 @@ pub const MAX_REFERENCES: usize = 10_000;
 /// Maximum number of signatures in a single PathInfo.
 pub const MAX_SIGNATURES: usize = 100;
 
+/// Minimum NAR-budget charge per `NarChunk` message, in bytes.
+///
+/// `accumulate_chunk` charges `chunk.len().max(MIN_NAR_CHUNK_CHARGE)`
+/// against the global `nar_bytes_budget` semaphore. Without a floor, a
+/// 1-byte chunk acquires 1 permit but pushes a `SemaphorePermit`
+/// (~16 B) plus a `Vec` slot into `held_permits` — a 1-byte stream
+/// amplifies tracking overhead unbounded by the byte budget. 256 covers
+/// the permit struct + Vec growth amortization with headroom; legit
+/// clients chunk at ≥4 KiB so the floor never applies on the hot path.
+pub const MIN_NAR_CHUNK_CHARGE: u32 = 256;
+
 /// Maximum number of outputs in a single PutPathBatch request.
 ///
 /// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,

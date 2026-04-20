@@ -148,11 +148,9 @@ impl StoreServiceImpl {
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
         let mut info = validate_put_metadata(raw_info, auth.hmac_claims.as_ref(), "PutPath")?;
-        let store_path_hash = if info.store_path_hash.is_empty() {
-            info.store_path.sha256_digest().to_vec()
-        } else {
-            info.store_path_hash.clone()
-        };
+        // Server-derived in validate_put_metadata (step 7) — never the
+        // wire value. r[sec.boundary.grpc-hmac].
+        let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
@@ -182,9 +180,10 @@ impl StoreServiceImpl {
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
                 debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
-                return Err(Status::aborted(
-                    "concurrent PutPath in progress for this path; retry",
-                ));
+                return Err(Status::aborted(format!(
+                    "{} for this path; retry",
+                    rio_proto::CONCURRENT_PUTPATH_MSG
+                )));
             }
             Err(e) => {
                 drain_stream(&mut stream).await;
@@ -205,9 +204,8 @@ impl StoreServiceImpl {
             }
         };
 
-        info.store_path_hash = store_path_hash;
         self.finalize_single(info, nar_data, auth.tenant_id).await?;
-        scopeguard::ScopeGuard::into_inner(placeholder_guard);
+        placeholder_guard.defuse();
         Ok(Response::new(PutPathResponse { created: true }))
     }
 }
