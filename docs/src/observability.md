@@ -265,8 +265,9 @@ r[obs.metric.controller]
 | `rio_scheduler_dispatch_wait_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
 | `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
 | `rio_builder_upload_references_count` | `[1, 5, 10, 25, 50, 100, 250, 500]` (count) |
+| `rio_builder_fuse_fetch_duration_seconds`, `rio_store_substitute_duration_seconds` | `[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (NAR fetch + drain; GB-scale paths via I-212 JIT span 60-127s) |
 
-Histograms not listed here (e.g., `rio_gateway_opcode_duration_seconds`, `rio_store_put_path_duration_seconds`, `rio_builder_fuse_fetch_duration_seconds`) use the default buckets — those are genuinely sub-second request latencies.
+Histograms not listed here (e.g., `rio_gateway_opcode_duration_seconds`, `rio_store_put_path_duration_seconds`) use the default buckets — those are genuinely sub-second request latencies.
 
 ## Graceful Drain
 

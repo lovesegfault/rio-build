@@ -119,15 +119,6 @@ let
   # (phase3b.nix:85-99) applies verbatim — a shorter sleep lets the build
   # finish during the failover gap → PG has 0 non-terminal rows →
   # recovery loads nothing → hollow test.
-  #
-  # 60s (was 90s): the FUSE circuit breaker's wall_clock_trip default is
-  # 90s (rio-builder/src/fuse/circuit.rs DEFAULT_WALL_CLOCK_TRIP). With
-  # sleepSecs=90 the gap between the slow build's input fetch and the
-  # post-recovery recoveryDrv's input fetch is ~95-100s, tripping the
-  # circuit → EIO → handle_infrastructure_failure retry loop → test
-  # timeout. At 60s the gap is ~65-70s, safely under. Under KVM the
-  # failover window is <5s (observed: lease-moved 0.2s, recovery 1.8s),
-  # so 60s still amply survives the gap.
   recoverySlowDrv = drvs.mkTrivial {
     marker = "lifecycle-recovery-slow";
     sleepSecs = 60;

@@ -79,6 +79,16 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_builder_upload_references_count",
         REFERENCES_COUNT_BUCKETS,
     ),
+    (
+        // I-212 size-cap → JIT path means GB-scale NARs are fetched on
+        // demand; fuse/fetch/mod.rs documents 60-127s for those. The
+        // [0.005..10.0] default would put every >10s sample in {le="+Inf"}
+        // and saturate `histogram_quantile(0.99,…)` at 10.0. Mirrors
+        // rio-store SUBSTITUTE_DURATION_BUCKETS — same operation
+        // (NAR fetch + drain), opposite end.
+        "rio_builder_fuse_fetch_duration_seconds",
+        &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
+    ),
 ];
 
 /// Register `# HELP` descriptions for all worker metrics.
@@ -100,7 +110,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_uploads_total",
-        "Output uploads (labeled by status: success/exhausted)"
+        "Output uploads (labeled by status: success/adopted/exhausted; \
+         adopted = concurrent uploader won, result polled via QueryPathInfo)"
     );
     describe_histogram!(
         "rio_builder_build_duration_seconds",

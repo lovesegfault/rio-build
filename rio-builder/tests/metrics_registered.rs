@@ -13,8 +13,5 @@ rio_test_support::metrics_suite! {
     histogram_buckets: rio_builder::HISTOGRAM_BUCKETS,
     spec_floor: 10,
     emit_floor: 15,
-    default_buckets_ok: [
-        // gRPC GetPath + stream drain — sub-second typical, [0.005..10.0] fits.
-        "rio_builder_fuse_fetch_duration_seconds",
-    ],
+    default_buckets_ok: [],
 }
