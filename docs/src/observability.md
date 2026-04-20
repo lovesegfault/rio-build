@@ -21,6 +21,9 @@ Metadata (byte offsets, timestamps, line counts) is stored in PostgreSQL for eff
 r[obs.log.batch-64-100ms]
 Log lines are batched (up to 64 lines or 100ms, whichever first) in `BuildLogBatch` messages.
 
+r[obs.log.ring-byte-cap]
+The scheduler-side per-derivation ring buffer is bounded by both line count (`RING_CAPACITY`) and bytes (`RING_BYTE_CAP`, 16 MiB). Individual lines are truncated to `MAX_LINE_LEN` (64 KiB) before storage. Scheduler-side defense against an untrusted worker pushing few-but-huge lines that the line-count cap alone would not evict.
+
 r[obs.log.periodic-flush]
 The scheduler flushes buffers to S3 periodically (every 30s) during active builds, not only on completion --- bounds log loss to at most 30s on failover.
 
@@ -106,7 +109,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_malformed_built_output_total` | Counter | Worker-supplied `BuiltOutput.output_path` that failed `StorePath::parse` and was dropped at the `handle_completion` proto→domain boundary. Alert if rate > 0: indicates a buggy or compromised builder. |
 | `rio_scheduler_log_lines_forwarded_total` | Counter | Log lines forwarded via `BuildEvent::Log` (executor → scheduler → actor → gateway broadcast). Direct signal that the log pipeline's internal plumbing is live. |
 | `rio_scheduler_log_flush_total` | Counter | Successful S3 log flushes (labeled by `kind`: `final`/`periodic`). |
-| `rio_scheduler_log_flush_failures_total` | Counter | Failed S3 log flushes (labeled by `phase`: `s3`/`pg`). Alert if rate > 0 sustained: build logs are being lost. |
+| `rio_scheduler_log_flush_failures_total` | Counter | Failed log flushes (labeled by `phase`: `compress`/`s3`/`pg`, `is_final`: `true`/`false`). Alert if `is_final=true` rate > 0 sustained: build logs are being lost (final flushes already drained the buffer). |
 | `rio_scheduler_log_flush_dropped_total` | Counter | Final-flush requests dropped due to flusher channel backpressure. Periodic tick will snapshot instead. |
 | `rio_scheduler_log_forward_dropped_total` | Counter | Live log forwards dropped due to actor channel backpressure. Lines remain in the ring buffer (serveable via AdminService) but the gateway misses the live stream. Sustained non-zero → actor is saturated. |
 | `rio_scheduler_log_unknown_drv_dropped_total` | Counter | LogBatch messages dropped because a single BuildExecution stream exceeded `MAX_DRVS_PER_STREAM` distinct `derivation_path` values. Non-zero → buggy or hostile worker (one drv per pod is the invariant). |

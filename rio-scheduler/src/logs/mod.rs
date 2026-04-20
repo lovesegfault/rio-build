@@ -85,10 +85,32 @@ pub fn log_s3_key(prefix: &str, build_id: &Uuid, drv_path: &str) -> String {
 /// one runaway build to OOM the scheduler while the worker-side limit catches up.
 pub(crate) const RING_CAPACITY: usize = 100_000;
 
+// r[impl obs.log.ring-byte-cap]
+/// Max bytes retained per derivation. Beyond this, oldest lines are
+/// evicted. The worker is NOT trusted (executor_service.rs threat
+/// model) — `RING_CAPACITY` alone bounds line COUNT, so a hostile
+/// worker sending ~40 single-line ~256 MiB batches could pin ~10 GiB
+/// without ever hitting line-count eviction (bug_080). 16 MiB matches
+/// the doc's "~10 MiB" intent with headroom.
+pub(crate) const RING_BYTE_CAP: usize = 16 * 1024 * 1024;
+
+/// Max bytes per stored line. Longer lines are truncated at push so a
+/// single line can't blow [`RING_BYTE_CAP`] on its own.
+pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
+
 /// (absolute line number, line bytes). Line number is the worker-assigned
 /// `first_line_number + offset_within_batch` — absolute across the whole
 /// build, not batch-local.
 type Line = (u64, Vec<u8>);
+
+/// Per-derivation ring buffer with intrinsic byte-tracking.
+/// `bytes` is `lines.iter().map(|(_, l)| l.len()).sum()` — maintained
+/// incrementally so [`LogBuffers::push`] doesn't re-sum on every batch.
+#[derive(Default)]
+struct RingBuf {
+    lines: VecDeque<Line>,
+    bytes: usize,
+}
 
 /// Per-derivation log ring buffers, keyed by `drv_path`.
 ///
@@ -97,7 +119,7 @@ type Line = (u64, Vec<u8>);
 /// so one ring buffer per drv_path is correct — the S3 flush writes one
 /// blob and N `build_logs` PG rows (one per interested build, same s3_key).
 pub struct LogBuffers {
-    buffers: DashMap<String, VecDeque<Line>>,
+    buffers: DashMap<String, RingBuf>,
     /// Tombstone set: derivations that have reached a terminal state.
     /// [`Self::push`] drops batches for sealed paths so a late
     /// `LogBatch` (still in flight on the BuildExecution stream after
@@ -139,15 +161,24 @@ impl LogBuffers {
 
         let base = batch.first_line_number;
         for (i, line) in batch.lines.iter().enumerate() {
-            buf.push_back((base + i as u64, line.clone()));
+            let mut l = line.clone();
+            if l.len() > MAX_LINE_LEN {
+                l.truncate(MAX_LINE_LEN);
+            }
+            buf.bytes += l.len();
+            buf.lines.push_back((base + i as u64, l));
         }
 
-        // Evict oldest lines if over capacity. `pop_front` is O(1) on VecDeque.
-        // We evict AFTER push (not before) so a single batch larger than
-        // RING_CAPACITY doesn't leave the buffer empty — instead it keeps
-        // the tail of that batch.
-        while buf.len() > RING_CAPACITY {
-            buf.pop_front();
+        // Evict oldest lines if over capacity (line count OR bytes).
+        // `pop_front` is O(1) on VecDeque. We evict AFTER push (not
+        // before) so a single batch larger than RING_CAPACITY doesn't
+        // leave the buffer empty — instead it keeps the tail of that
+        // batch.
+        while buf.lines.len() > RING_CAPACITY || buf.bytes > RING_BYTE_CAP {
+            let Some((_, l)) = buf.lines.pop_front() else {
+                break;
+            };
+            buf.bytes -= l.len();
         }
     }
 
@@ -162,16 +193,10 @@ impl LogBuffers {
     /// will reflect (starts at a non-zero line number). That's the
     /// intentional tradeoff of a ring buffer.
     pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, Vec<Vec<u8>>)> {
-        let (_key, deque) = self.buffers.remove(drv_path)?;
-        let line_count = deque.len() as u64;
-        let mut total_bytes = 0u64;
-        let lines: Vec<Vec<u8>> = deque
-            .into_iter()
-            .map(|(_n, bytes)| {
-                total_bytes += bytes.len() as u64;
-                bytes
-            })
-            .collect();
+        let (_key, rb) = self.buffers.remove(drv_path)?;
+        let line_count = rb.lines.len() as u64;
+        let total_bytes = rb.bytes as u64;
+        let lines: Vec<Vec<u8>> = rb.lines.into_iter().map(|(_n, bytes)| bytes).collect();
         Some((line_count, total_bytes, lines))
     }
 
@@ -195,7 +220,13 @@ impl LogBuffers {
         // buffer that's already in-memory. Linear scan is fine until
         // profiling says otherwise; premature optimization would just
         // obscure the invariant that makes bisection valid.
-        Some(buf.iter().filter(|(n, _)| *n >= since).cloned().collect())
+        Some(
+            buf.lines
+                .iter()
+                .filter(|(n, _)| *n >= since)
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Discard a buffer without returning its contents. Also un-seals.
@@ -276,15 +307,9 @@ impl LogBuffers {
     /// `observability.md:38-40`).
     pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, Vec<Vec<u8>>)> {
         let buf = self.buffers.get(drv_path)?;
-        let line_count = buf.len() as u64;
-        let mut total_bytes = 0u64;
-        let lines: Vec<Vec<u8>> = buf
-            .iter()
-            .map(|(_n, bytes)| {
-                total_bytes += bytes.len() as u64;
-                bytes.clone()
-            })
-            .collect();
+        let line_count = buf.lines.len() as u64;
+        let total_bytes = buf.bytes as u64;
+        let lines: Vec<Vec<u8>> = buf.lines.iter().map(|(_n, bytes)| bytes.clone()).collect();
         Some((line_count, total_bytes, lines))
     }
 }
@@ -580,5 +605,44 @@ mod tests {
         bufs.discard("drv-a");
         bufs.push(&mk_batch("drv-a", 0, &[b"fresh"]));
         assert_eq!(bufs.active_count(), 1, "discard must clear seal");
+    }
+
+    /// bug_080: `RING_CAPACITY` bounds line COUNT only; an untrusted
+    /// worker sending few-but-large lines must not OOM the scheduler.
+    // r[verify obs.log.ring-byte-cap]
+    #[test]
+    fn push_evicts_on_byte_cap() {
+        let bufs = LogBuffers::new();
+        // 300 × MAX_LINE_LEN = ~18.75 MiB total, 300 lines — well
+        // under RING_CAPACITY=100k but > RING_BYTE_CAP=16 MiB.
+        // (Lines must be ≤ MAX_LINE_LEN or push() truncates them
+        // BEFORE byte-accounting — that's `push_truncates_oversized_line`.)
+        let line = vec![b'x'; MAX_LINE_LEN];
+        let batch: Vec<&[u8]> = (0..300).map(|_| line.as_slice()).collect();
+        bufs.push(&mk_batch("drv-a", 0, &batch));
+        let (count, bytes, _) = bufs.drain("drv-a").unwrap();
+        assert!(
+            bytes <= RING_BYTE_CAP as u64,
+            "bug_080: total bytes must be ≤ RING_BYTE_CAP; got {bytes} \
+             (pre-fix: line-count cap alone → all 300 lines / ~18.75 MiB retained)"
+        );
+        assert!(
+            count <= (RING_BYTE_CAP / MAX_LINE_LEN) as u64,
+            "byte-cap eviction: 300 × 64 KiB → ≤256 lines retained, got {count}"
+        );
+    }
+
+    #[test]
+    fn push_truncates_oversized_line() {
+        let bufs = LogBuffers::new();
+        let huge = vec![b'x'; 200 * 1024];
+        bufs.push(&mk_batch("drv-a", 0, &[&huge]));
+        let (_, bytes, lines) = bufs.drain("drv-a").unwrap();
+        assert_eq!(
+            lines[0].len(),
+            MAX_LINE_LEN,
+            "single line truncated to MAX_LINE_LEN"
+        );
+        assert_eq!(bytes, MAX_LINE_LEN as u64);
     }
 }
