@@ -586,18 +586,18 @@ mod tests {
         let sla = empty_sla();
         compute_initial(&mut dag, &sla, &no_builds(), &merge.newly_inserted);
 
-        // Complete 10 random leaves (no children) incrementally.
-        let leaves: Vec<_> = (0..N)
-            .map(|i| format!("n{i:02}"))
-            .filter(|h| dag.get_children(h).is_empty())
-            .collect();
-        assert!(!leaves.is_empty(), "DAG has at least n00 as a leaf");
-        for h in leaves.iter().take(10) {
-            dag.node_mut(h)
+        // Complete n00..n09 in dependency order (n_i depends only on
+        // j<i, so this is always a valid completion prefix) — exercises
+        // 10 sequential update_ancestors calls against state mutated by
+        // prior calls. Previously a leaf-filter yielded exactly ["n00"]
+        // (fanout≥1 for all i≥1) so only 1 iteration ran (bug_115).
+        for i in 0..10 {
+            let h = format!("n{i:02}");
+            dag.node_mut(&h)
                 .unwrap()
                 .transition(DerivationStatus::Completed)
                 .unwrap();
-            update_ancestors(&mut dag, h);
+            update_ancestors(&mut dag, &h);
         }
         let snapshot: HashMap<String, f64> = (0..N)
             .map(|i| {

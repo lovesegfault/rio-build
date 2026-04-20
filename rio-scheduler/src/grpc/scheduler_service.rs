@@ -101,9 +101,20 @@ impl SchedulerService for SchedulerGrpc {
         // stuck in Ready forever). Bound node count to protect memory.
         rio_common::grpc::check_bound("nodes", req.nodes.len(), rio_common::limits::MAX_DAG_NODES)?;
         rio_common::grpc::check_bound("edges", req.edges.len(), rio_common::limits::MAX_DAG_EDGES)?;
+        let mut seen_hashes = std::collections::HashSet::with_capacity(req.nodes.len());
         for node in &req.nodes {
             if node.drv_hash.is_empty() {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
+            }
+            // bug_155: a duplicate drv_hash reaches
+            // `batch_upsert_derivations`' UNNEST → PG 21000
+            // cardinality_violation → opaque Internal. Reject at the
+            // boundary so the error names the offending hash.
+            if !seen_hashes.insert(node.drv_hash.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate drv_hash {:?} in nodes[]",
+                    node.drv_hash
+                )));
             }
             // Structural validation: drv_path must parse as a valid
             // /nix/store/{32-char-nixbase32}-{name}.drv path. Checking

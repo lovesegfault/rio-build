@@ -368,15 +368,18 @@ pub async fn resolve_ca_inputs(
             // (`derivations.cc:1221`) performs the same
             // `rewrites.emplace` for every input, CA or not. Skip
             // empty paths (deferred child not yet completed → no
-            // rewrite available; the parent's resolve will retry).
+            // rewrite available); unreachable today (children always
+            // completed-with-paths or absent from DAG by
+            // parent-dispatch time) but defended for parity with the
+            // three sibling consumers (assignment.rs, snapshot.rs,
+            // translate.rs) that filter `!p.is_empty()`.
             for (i, name) in ia.output_names.iter().enumerate() {
                 if wanted_names.contains(name)
                     && let Some(path) = ia.output_paths.get(i)
+                    && !path.is_empty()
                 {
                     new_input_srcs.push(path.clone());
-                    if !path.is_empty() {
-                        rewrites.insert(downstream_placeholder(&input_sp, name), path.clone());
-                    }
+                    rewrites.insert(downstream_placeholder(&input_sp, name), path.clone());
                 }
             }
         } else {
@@ -641,16 +644,23 @@ pub async fn walk_dependent_realisations(
             break;
         }
         // Join realisation_deps (reverse) → realisations to get
-        // dependent's output_path in one round-trip.
+        // dependent's output_path in one round-trip. LIMIT pushes the
+        // bound to PG so a single high-fanout reverse-deps query
+        // (glibc, stdenv: 10⁵-10⁶ rows) doesn't `fetch_all` into an
+        // unbounded Vec before the inner-loop break runs (bug_130).
+        // The function is a best-effort bounded sample, not an
+        // exhaustive walk; LIMIT preserves the contract.
         let rows: Vec<(Vec<u8>, String, String, Vec<u8>)> = sqlx::query_as(
             "SELECT rd.drv_hash, rd.output_name, r.output_path, r.output_hash \
              FROM realisation_deps rd \
              JOIN realisations r \
                ON r.drv_hash = rd.drv_hash AND r.output_name = rd.output_name \
-             WHERE rd.dep_drv_hash = $1 AND rd.dep_output_name = $2",
+             WHERE rd.dep_drv_hash = $1 AND rd.dep_output_name = $2 \
+             LIMIT $3",
         )
         .bind(&dep_hash)
         .bind(&dep_name)
+        .bind(max_nodes as i64)
         .fetch_all(pool)
         .await?;
         for (h, n, path, oh) in rows {
@@ -1243,6 +1253,39 @@ mod tests {
         assert!(reparsed.input_drvs().is_empty());
         assert!(reparsed.input_srcs().contains("/nix/store/realized-ca"));
         assert!(reparsed.input_srcs().contains("/nix/store/orig-src"));
+        Ok(())
+    }
+
+    /// bug_049: an empty `output_paths[i]` must NOT land in the
+    /// resolved drv's `inputSrcs`. Pre-fix the `!path.is_empty()`
+    /// guard wrapped only `rewrites.insert`, not `new_input_srcs.push`
+    /// — `""` would feed into `hashDerivationModulo`. Unreachable
+    /// today (children always completed-with-paths or absent from DAG
+    /// by parent-dispatch time) but the asymmetry contradicted both
+    /// the comment and the three sibling consumers that filter
+    /// `!p.is_empty()`.
+    #[tokio::test]
+    async fn resolve_ia_empty_output_path_skipped() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let ia_drv = "/nix/store/88888888888888888888888888888888-ia.drv";
+        let orig_src = "/nix/store/55555555555555555555555555555555-src";
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{ia_drv}",["out"])],["{orig_src}"],"x86_64-linux","/bin/sh",["-c","build"],[("name","parent"),("out",""),("system","x86_64-linux")])"#
+        );
+        let ia_inputs = vec![IaResolveInput {
+            drv_path: ia_drv.into(),
+            output_names: vec!["out".into()],
+            output_paths: vec![String::new()],
+        }];
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &[], &ia_inputs, &db.pool).await?;
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+        assert!(
+            !reparsed.input_srcs().contains(""),
+            "bug_049: empty IA output_path must not be pushed into inputSrcs"
+        );
+        assert!(reparsed.input_srcs().contains(orig_src));
         Ok(())
     }
 

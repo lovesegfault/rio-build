@@ -304,12 +304,14 @@ impl LogFlusher {
         {
             warn!(
                 s3_key = %s3_key,
-                error = %e,
                 "PG build_logs insert failed; S3 blob exists but dashboard \
                  won't find it. Manual: SELECT from build_logs or S3 list."
             );
-            metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "pg")
-                .increment(1);
+            // Route through the chokepoint helper so the counter has a
+            // consistent {phase, is_final} label set (bug_018: the
+            // inline emit had `phase` only → `{is_final="true"}` queries
+            // silently excluded PG failures).
+            flush_failure(is_final, "pg", &s3_key, &e, &req.drv_path);
         }
     }
 }

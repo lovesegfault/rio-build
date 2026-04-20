@@ -284,7 +284,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_failures_total",
-        "Failed S3 log flushes (labeled by phase: compress/s3/pg); alert if rate > 0 sustained"
+        "Failed log flushes (labeled by phase: compress/s3/pg, is_final: true/false); \
+         alert on is_final=true rate > 0 sustained"
     );
     describe_counter!(
         "rio_scheduler_log_flush_dropped_total",
