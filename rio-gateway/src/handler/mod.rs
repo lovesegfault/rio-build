@@ -56,7 +56,13 @@ const PROGRAM_NAME: &str = "rio-gateway";
 /// Explicit per-call, not a tonic `Interceptor` layer — matches the
 /// trace-context design in `rio-proto/src/interceptor.rs` (keeps
 /// `StoreServiceClient<Channel>` as the concrete type; no 33-site
-/// type churn to `InterceptedService<Channel, F>`).
+/// type churn to `InterceptedService<Channel, F>`). The per-call
+/// discipline only works if every site remembers; the
+/// `with_jwt_audit` integration test grep-scans `_client.method(`
+/// callers to enforce it. Legitimate JWT-less calls (anonymous
+/// `.drv` lookup, best-effort cancel) carry a `// no-jwt:` comment
+/// at the call site so the audit can distinguish intent from
+/// omission.
 pub(crate) fn with_jwt<T>(body: T, jwt_token: Option<&str>) -> anyhow::Result<tonic::Request<T>> {
     let mut req = tonic::Request::new(body);
     rio_proto::interceptor::inject_current(req.metadata_mut());

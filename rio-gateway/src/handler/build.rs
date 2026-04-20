@@ -124,8 +124,12 @@ async fn quota_check<W: AsyncWrite + Unpin>(
     quota_cache: &QuotaCache,
     store_client: &mut StoreServiceClient<Channel>,
     tenant_name: Option<&NormalizedName>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<bool> {
-    match quota_cache.check(store_client, tenant_name).await {
+    match quota_cache
+        .check(store_client, tenant_name, jwt_token)
+        .await
+    {
         QuotaVerdict::Under { .. } | QuotaVerdict::Unlimited => Ok(false),
         QuotaVerdict::Over { used, limit } => {
             // `Over` is unreachable for `None` (quota_cache.check
@@ -570,6 +574,8 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
         rio_common::grpc::SUBMIT_BUILD_TIMEOUT,
+        // no-jwt: `request` is `tonic::Request<_>` — caller wraps via
+        // with_jwt at the submit_and_process_build entry point.
         scheduler_client.submit_build(request),
     )
     .await
@@ -772,13 +778,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 // internally), and the underlying channel may have
                 // auto-reconnected. If that fails (channel dead),
                 // WatchBuild will Err and we retry.
-                match scheduler_client
-                    .watch_build(types::WatchBuildRequest {
+                let watch_req = with_jwt(
+                    types::WatchBuildRequest {
                         build_id: build_id.clone(),
                         since_sequence: since_seq,
-                    })
-                    .await
-                {
+                    },
+                    jwt_token,
+                )?;
+                match scheduler_client.watch_build(watch_req).await {
                     Ok(resp) => {
                         tracing::info!(%build_id, since_seq, "reconnected via WatchBuild");
                         event_stream = resp.into_inner();
@@ -1003,7 +1010,15 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(());
     }
-    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
+    if quota_check(
+        stderr,
+        quota_cache,
+        store_client,
+        tenant_name.as_ref(),
+        jwt.token(),
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -1190,7 +1205,15 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(DagSubmitOutcome::Gated);
     }
-    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
+    if quota_check(
+        stderr,
+        quota_cache,
+        store_client,
+        tenant_name.as_ref(),
+        jwt.token(),
+    )
+    .await?
+    {
         return Ok(DagSubmitOutcome::Gated);
     }
 

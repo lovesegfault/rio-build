@@ -96,6 +96,7 @@ impl QuotaCache {
         &self,
         store_client: &mut StoreServiceClient<Channel>,
         tenant_name: Option<&NormalizedName>,
+        jwt_token: Option<&str>,
     ) -> QuotaVerdict {
         // Single-tenant mode → no quota row to gate on. The type
         // carries the normalization guarantee; None IS the mode flag.
@@ -121,12 +122,25 @@ impl QuotaCache {
         // transient store error. with_timeout_status (not
         // with_timeout) preserves the tonic::Status so the NotFound
         // branch still matches.
+        let req = match crate::handler::with_jwt(
+            TenantQuotaRequest {
+                tenant_name: tenant_name.to_string(),
+            },
+            jwt_token,
+        ) {
+            Ok(r) => r,
+            // with_jwt only fails on a malformed JWT (MetadataValue
+            // try_from). Fail-open like every other transport error
+            // here — quota is a soft gate.
+            Err(e) => {
+                warn!(tenant = %tenant_name, error = %e, "with_jwt failed; fail-open");
+                return QuotaVerdict::Unlimited;
+            }
+        };
         let fetched = match with_timeout_status(
             "TenantQuota",
             DEFAULT_GRPC_TIMEOUT,
-            store_client.tenant_quota(TenantQuotaRequest {
-                tenant_name: tenant_name.to_string(),
-            }),
+            store_client.tenant_quota(req),
         )
         .await
         {

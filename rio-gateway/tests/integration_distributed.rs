@@ -398,7 +398,7 @@ async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
         store_client,
         scheduler_client,
         None,
-        None,
+        rio_gateway::handler::SessionJwt::none(),
         None,
         rio_gateway::TenantLimiter::disabled(),
         rio_gateway::QuotaCache::new(),
