@@ -376,7 +376,7 @@ pub fn build_executor_pod_spec(
                 // are budgeted under `ephemeral-storage` from
                 // `disk_bytes` — `medium: Memory` made a 6+ GiB
                 // unpack OOM the pod while the disk reservation sat
-                // unused, AND `quota::peak_bytes()` (XFS prjquota)
+                // unused, AND `quota::current_bytes()` (XFS prjquota)
                 // returned None on tmpfs so `peak_disk_bytes` never
                 // fitted (bug_074).
                 Volume {

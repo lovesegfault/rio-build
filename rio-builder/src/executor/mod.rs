@@ -530,7 +530,11 @@ pub async fn execute_build(
                     effective_cores,
                     o,
                 );
-                if let Err(e) = overlay::teardown_overlay(overlay_mount) {
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || overlay::teardown_overlay(overlay_mount))
+                        .await
+                        .map_err(ExecutorError::OverlayTaskPanic)?
+                {
                     tracing::warn!(error = %e, "fixture-path overlay teardown failed");
                 }
                 return Ok(PreDaemon::Fixture(r));
@@ -651,7 +655,7 @@ pub async fn execute_build(
     // mounted on this path) so an OOM'd build also reports
     // peak_disk_bytes. Previously sampled only at line 11 (teardown),
     // which the `?` at build_result skipped.
-    let peak_disk_bytes = crate::quota::peak_bytes(&env.overlay_base_dir)
+    let peak_disk_bytes = crate::quota::current_bytes(&env.overlay_base_dir)
         .ok()
         .flatten();
     let post_err = |e| ExecuteOutcome {
@@ -692,13 +696,20 @@ pub async fn execute_build(
     // centralized so ?-early-returns and panics also count); with one build
     // per pod a leaked mount is reclaimed when the pod is discarded.
     let merged_path = overlay_mount.merged_dir().to_path_buf();
-    if let Err(e) = overlay::teardown_overlay(overlay_mount) {
-        tracing::error!(
-            error = %e,
-            merged = %merged_path.display(),
-            "overlay teardown failed; mount leaked"
-        );
-        // Metric incremented in Drop (see overlay.rs).
+    // teardown_overlay does `remove_dir_all` over upper/nix/store/ —
+    // multi-GB / 100k+ inodes for large builds. Same heartbeat-starvation
+    // concern as setup_overlay above; same spawn_blocking treatment.
+    match tokio::task::spawn_blocking(move || overlay::teardown_overlay(overlay_mount)).await {
+        Err(join_err) => return post_err(ExecutorError::OverlayTaskPanic(join_err)),
+        Ok(Err(e)) => {
+            tracing::error!(
+                error = %e,
+                merged = %merged_path.display(),
+                "overlay teardown failed; mount leaked"
+            );
+            // Metric incremented in Drop (see overlay.rs).
+        }
+        Ok(Ok(())) => {}
     }
 
     ExecuteOutcome {

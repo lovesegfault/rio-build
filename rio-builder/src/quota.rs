@@ -3,10 +3,13 @@
 //! kubelet assigns a project ID to each emptyDir when the node filesystem
 //! is mounted with `-o prjquota` (NixOS AMIs do this for the gp3-root
 //! pool). The kernel then tracks `dqb_curspace` per project — the
-//! allocation high-water mark for the build's overlay upper dir,
-//! INCLUDING short-lived temp files that `du` would miss.
+//! CURRENT allocated bytes for the build's overlay upper dir at the
+//! instant of the call (NOT a kernel-tracked high-water mark; `struct
+//! dqblk` has no HWM field). The cgroup poll loop max-tracks across
+//! samples to derive the peak. Unlike a `du` walk, this counts
+//! unlinked-but-still-open files.
 //!
-//! `peak_bytes()` reads the project ID via `FS_IOC_FSGETXATTR` on the
+//! `current_bytes()` reads the project ID via `FS_IOC_FSGETXATTR` on the
 //! emptyDir, then `quotactl_fd(Q_GETQUOTA, PRJQUOTA, projid)` for the
 //! current usage. `quotactl_fd` (Linux 5.14+) takes an open fd instead
 //! of a block-device path, so no `/proc/mounts` grovel.
@@ -54,7 +57,7 @@ fn qcmd(cmd: libc::c_int, typ: libc::c_int) -> libc::c_int {
 /// `io::Result` only for the initial `open()` — every other failure mode
 /// is `Ok(None)` so the cgroup poll loop's `?`-free max-track stays simple.
 // r[impl sched.sla.disk-scalar]
-pub fn peak_bytes(dir: &Path) -> io::Result<Option<u64>> {
+pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
     let f = File::open(dir)?;
     let mut x = Fsxattr::default();
     // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
@@ -101,7 +104,7 @@ mod tests {
     // r[verify sched.sla.disk-scalar]
     #[test]
     fn returns_none_on_tmpfs() {
-        let r = peak_bytes(std::path::Path::new("/tmp"));
+        let r = current_bytes(std::path::Path::new("/tmp"));
         assert!(matches!(r, Ok(None)), "got {r:?}");
     }
 }

@@ -824,8 +824,9 @@ pub async fn utilization_reporter_loop_with_shutdown(
     // PSI io.pressure some avg10 — track max over the loop. The 10s
     // poll cadence matches avg10's window, so each sample is independent.
     let mut peak_io_pressure_pct = 0.0_f64;
-    // Project-quota dqb_curspace on the overlay emptyDir. Kernel-tracked
-    // allocation (includes short-lived temp files `du` would miss).
+    // Project-quota dqb_curspace on the overlay emptyDir. Point-in-time
+    // CURRENT allocation (not a kernel-tracked peak — hence the .max()
+    // below); counts unlinked-but-still-open files unlike a `du` walk.
     // None = node fs has no -o prjquota; falls back to statvfs disk_used.
     let mut peak_disk_bytes: Option<u64> = None;
 
@@ -862,7 +863,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
             peak_io_pressure_pct = peak_io_pressure_pct.max(p);
         }
 
-        if let Ok(Some(q)) = crate::quota::peak_bytes(&overlay_base) {
+        if let Ok(Some(q)) = crate::quota::current_bytes(&overlay_base) {
             peak_disk_bytes = Some(peak_disk_bytes.map_or(q, |prev| prev.max(q)));
         }
 

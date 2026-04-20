@@ -146,9 +146,26 @@ impl OverlayMount {
     pub fn merged_dir(&self) -> &Path {
         &self.merged
     }
+
+    /// Test-only constructor that mirrors `setup_overlay`'s field
+    /// computation without touching the filesystem or requiring
+    /// CAP_SYS_ADMIN. `mounted=false` so `Drop` is a no-op.
+    #[cfg(test)]
+    fn for_test(build_dir: PathBuf) -> Self {
+        Self {
+            upper: build_dir.join("upper"),
+            merged: build_dir.join("nix/store"),
+            build_dir,
+            mounted: false,
+        }
+    }
 }
 
 impl Drop for OverlayMount {
+    /// Synchronous last-resort fallback for `?`-early-returns and panics.
+    /// The explicit `teardown_overlay()` calls in `executor::execute_build`
+    /// are `spawn_blocking`-wrapped; Drop structurally can't be, but
+    /// single-shot pods mean Drop-time blocking only ever delays exit.
     fn drop(&mut self) {
         if self.mounted {
             if let Err(e) = teardown_overlay_inner(&self.merged, &self.build_dir) {
@@ -210,14 +227,17 @@ pub fn setup_overlay(
     // directly under `build_dir` for the same reason.
     let merged = build_dir.join("nix/store");
 
-    mkdir_all(&store_upper)?;
-    mkdir_all(&work)?;
-    mkdir_all(&merged)?;
-    // Any `?` from here until the mount succeeds would leave build_dir on
-    // disk with no OverlayMount to Drop it. Defused on success below.
+    // Any `?` from here (the very first mkdir) until the mount succeeds
+    // would leave build_dir on disk with no OverlayMount to Drop it.
+    // Armed BEFORE mkdir so a partial mkdir failure (ENOSPC/EACCES on
+    // the second/third dir) is also cleaned. remove_dir_all on a missing
+    // path is harmless. Defused on success below.
     let cleanup = scopeguard::guard(build_dir.clone(), |d| {
         let _ = fs::remove_dir_all(d);
     });
+    mkdir_all(&store_upper)?;
+    mkdir_all(&work)?;
+    mkdir_all(&merged)?;
     // nix's `LocalStore` refuses to open a chroot store if any ancestor
     // of the root is world-writable (S_IWOTH), to prevent symlink-swap
     // attacks. The k8s emptyDir mounted at `base_dir` is 0777 by
@@ -358,27 +378,22 @@ pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
 mod tests {
     use super::*;
 
+    /// Pin the accessor → on-disk-layout mapping. `setup_overlay` needs
+    /// CAP_SYS_ADMIN so this exercises `OverlayMount::for_test`, which
+    /// duplicates `setup_overlay`'s field computation; the
+    /// `vm-lifecycle-core-k3s` end-to-end test covers the real-mount path.
     #[test]
     fn test_overlay_mount_paths() {
-        let base = PathBuf::from("/tmp/overlays");
-        let build_id = "test-build-42";
+        let build_dir = PathBuf::from("/tmp/overlays/test-build-42");
+        let m = OverlayMount::for_test(build_dir.clone());
 
-        let expected_upper = base.join(build_id).join("upper");
-        let expected_work = base.join(build_id).join("work");
-        let expected_merged = base.join(build_id).join("merged");
-
-        assert_eq!(
-            expected_upper,
-            PathBuf::from("/tmp/overlays/test-build-42/upper")
-        );
-        assert_eq!(
-            expected_work,
-            PathBuf::from("/tmp/overlays/test-build-42/work")
-        );
-        assert_eq!(
-            expected_merged,
-            PathBuf::from("/tmp/overlays/test-build-42/merged")
-        );
+        assert_eq!(m.root_dir(), build_dir.as_path());
+        // chroot-store layout: nix-daemon `--store local?root={build_dir}`
+        // expects realStoreDir at `{build_dir}/nix/store`.
+        assert_eq!(m.merged_dir(), build_dir.join("nix/store").as_path());
+        assert_eq!(m.upper_store(), build_dir.join("upper/nix/store"));
+        assert_eq!(m.upper_synth_db(), build_dir.join("nix/var/nix/db"));
+        assert_eq!(m.upper_nix_conf(), build_dir.join("etc/nix"));
     }
 
     #[test]
@@ -420,8 +435,12 @@ mod tests {
         Ok(())
     }
 
-    /// Early-return after mkdir (e.g. SameFilesystem) must not leak the
-    /// build_dir tree — the scopeguard removes it. base_dir itself survives.
+    /// Early-return at any `?` from the first mkdir through mount (e.g.
+    /// SameFilesystem here) must not leak the build_dir tree — the
+    /// scopeguard armed BEFORE mkdir removes it. base_dir itself survives.
+    /// (A unit-test trigger for mkdir-itself-failing is unreliable in the
+    /// nix sandbox; the guard placement is verified by inspection — it
+    /// precedes every fallible call after `build_dir` is computed.)
     #[test]
     fn test_setup_overlay_cleans_build_dir_on_error() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

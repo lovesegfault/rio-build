@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(
             overlay.medium, None,
             "fetcher overlay must be disk-backed so disk_bytes budgets \
-             ephemeral-storage and quota::peak_bytes() sees prjquota"
+             ephemeral-storage and quota::current_bytes() sees prjquota"
         );
         assert!(overlay.size_limit.is_some(), "sizeLimit still applied");
     }
