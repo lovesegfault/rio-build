@@ -247,17 +247,22 @@ pkgs.testers.runNixOSTest {
         # -n "$r"` returns instantly on the OLD value. To prove the
         # NEW controller has reconciled: capture old pod name, delete
         # with --wait=true (so kubectl wait below can't match the dying
-        # old pod), wait for NEW pod Ready, then poll RV.
+        # old pod), THEN capture rv_before, wait for NEW pod Ready,
+        # then poll RV. rv_before MUST be read AFTER --wait=true
+        # returns: kube-rs drains in-flight reconciles during the 30s
+        # grace period (REQUEUE=10s), so a pre-delete capture can
+        # anchor to the OLD controller's second-to-last write — the
+        # poll loop then breaks on its LAST write and `after` is read
+        # before the NEW controller has reconciled at all.
         old_pod = kubectl(
             "get pod -l app.kubernetes.io/name=rio-controller "
             "-o jsonpath='{.items[0].metadata.name}'",
         ).strip()
+        kubectl(f"delete pod {old_pod} --wait=true")
         rv_before = int(kubectl(
             "get componentscaler store -o jsonpath='{.metadata.resourceVersion}'",
             ns="${nsStore}",
         ).strip())
-
-        kubectl(f"delete pod {old_pod} --wait=true")
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} wait --for=condition=Ready "
             "pod -l app.kubernetes.io/name=rio-controller --timeout=120s",

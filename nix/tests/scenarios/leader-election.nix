@@ -600,16 +600,20 @@ let
           )
           print(f"sigkill: leader={old_leader} on {node_name}, "
                 f"host-pid={host_pid}, tx={tx_before}, rc={rc_before}")
-          # Anchor: capture renewTime BEFORE the kill. The freshness
-          # check below must observe a write that POST-DATES the kill;
-          # with RENEW_INTERVAL=5s, the dead leader's last renew is
-          # ≤5s old at kill time, so a bare age<10 check would pass on
-          # the stale write before any live process renews.
+          host_vm.succeed(f"kill -9 {host_pid}")
+          # Anchor: capture renewTime AFTER the kill. SIGKILL is
+          # synchronous — the dead process cannot write again, and the
+          # restarted container's first renew is seconds out (standby
+          # steal ~15s out), so this is guaranteed to be the dead
+          # leader's FINAL write. Capturing BEFORE the kill is a
+          # TOCTOU: the still-live leader may complete one more renew
+          # (RENEW_INTERVAL=5s) in the ~100-800ms succeed()-round-trip
+          # gap, and the renewTime!=renew_before check below would
+          # then fire on a PRE-kill write.
           renew_before = k3s_server.succeed(
               "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
               "-o jsonpath='{.spec.renewTime}'"
           ).strip()
-          host_vm.succeed(f"kill -9 {host_pid}")
 
           # ── kubelet restarted the container in-place ──────────────────
           # Proves we hit the crash path (pod survives, restartCount+1)
