@@ -40,7 +40,7 @@ enum BuildResultStatus {
 
 // Executor resource usage reported in heartbeats and progress updates.
 message ResourceUsage {
-  double cpu_fraction = 1;                // CPU usage as fraction [0.0, 1.0]
+  double cpu_fraction = 1;                // CPU utilization in cores-equivalent (1.0 = one core fully used; >1.0 on multi-core). Comparable to cpu_limit_cores.
   uint64 memory_used_bytes = 2;           // Current memory usage
   uint64 memory_total_bytes = 3;          // Total available memory
   uint64 disk_used_bytes = 4;             // Disk usage (SSD cache)

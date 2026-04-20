@@ -227,8 +227,6 @@ impl BalancedChannel {
     ///   `rio.scheduler.SchedulerService` --- proto package +
     ///   service, NOT empty string (the scheduler only toggles
     ///   the named service, not `""`)
-    ///   Typically the ClusterIP Service name (`rio-scheduler`)
-    ///   since that's what cert-manager puts in `dnsNames`.
     /// - `probe_interval`: how often to re-resolve + re-probe.
     ///   Should be ≤ CoreDNS TTL (5s default) or we miss flips.
     ///

@@ -129,8 +129,9 @@ where
 {
     // Install BEFORE spawning — same race as shutdown_signal: a
     // SIGHUP delivered between return and the task's first poll
-    // would hit the default handler (ignore for SIGHUP, but that
-    // means the first rotation silently no-ops).
+    // would hit the default handler (terminate — or silently dropped
+    // by the kernel when we're PID 1 — either way the first rotation
+    // is lost).
     let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
 
     tokio::spawn(async move {
