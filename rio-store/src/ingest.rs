@@ -117,10 +117,13 @@ pub async fn claim_placeholder(
                     "{}: stale 'uploading' placeholder — reclaimed", hooks.ctx_label,
                 );
                 metrics::counter!(hooks.stale_reclaimed_metric).increment(1);
+                // Propagate (?) — after reap_one Ok(true) the
+                // placeholder is gone; collapsing Err into the
+                // Concurrent path here would silently swallow a DB
+                // failure with no log (asymmetric with line 101).
                 inserted =
                     metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs)
-                        .await
-                        .unwrap_or(false);
+                        .await?;
             }
             Ok(false) => {} // not stale → live concurrent uploader
             Err(e) => warn!(error = %e,

@@ -99,7 +99,7 @@ pub(crate) struct Config {
     /// side; helm-default 16, code-default 256, P0473) this caps
     /// total in-flight S3 puts at ~512 under helm settings, under
     /// the aws-sdk's ~1024 default pool. Raise if the
-    /// store runs with a larger aws-sdk pool; lower if you see
+    /// store runs with a larger aws-sdk pool; lower (min 1) if you see
     /// `DispatchFailure` in store logs during large-NAR ingest.
     /// Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
     pub chunk_upload_max_concurrent: usize,
@@ -184,6 +184,19 @@ impl rio_common::config::ValidateConfig for Config {
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
         required(&self.database_url, "database_url", "store")?;
+        // 0 → buffer_unordered(0) returns Pending forever (no waker):
+        // every put_chunked silently hangs the data plane.
+        anyhow::ensure!(
+            self.chunk_upload_max_concurrent >= 1,
+            "chunk_upload_max_concurrent must be >= 1 (0 hangs uploads); \
+             set RIO_CHUNK_UPLOAD_MAX_CONCURRENT"
+        );
+        // 0 → aws-sdk RetryConfig::with_max_attempts(0) makes zero
+        // attempts: every S3 op fails immediately.
+        anyhow::ensure!(
+            self.s3_max_attempts >= 1,
+            "s3_max_attempts must be >= 1; set RIO_S3_MAX_ATTEMPTS"
+        );
         Ok(())
     }
 }
@@ -277,6 +290,36 @@ mod tests {
         assert!(!d.jwt.required);
         assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
         assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
+    }
+
+    /// `chunk_upload_max_concurrent=0` → `buffer_unordered(0)` hangs
+    /// every put_chunked permanently. validate() must reject at
+    /// startup, not silently hang the data plane.
+    #[test]
+    fn validate_rejects_zero_upload_concurrency() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            chunk_upload_max_concurrent: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("chunk_upload_max_concurrent"),
+            "error names the field: {err}"
+        );
+    }
+
+    /// Discovered alongside chunk_upload_max_concurrent: aws-sdk
+    /// RetryConfig::with_max_attempts(0) makes zero attempts.
+    #[test]
+    fn validate_rejects_zero_s3_attempts() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            s3_max_attempts: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("s3_max_attempts"), "got: {err}");
     }
 
     // r[verify store.cas.s3-retry]

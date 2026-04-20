@@ -66,7 +66,12 @@ pub fn mem_backend() -> std::sync::Arc<MemoryChunkBackend> {
 pub async fn spawn_store_service(
     service: StoreServiceImpl,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    let router = Server::builder().add_service(StoreServiceServer::new(service));
+    let max = rio_common::grpc::max_message_size();
+    let router = Server::builder().add_service(
+        StoreServiceServer::new(service)
+            .max_decoding_message_size(max)
+            .max_encoding_message_size(max),
+    );
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let client = rio_proto::client::connect_single(&addr.to_string()).await?;
     Ok((client, server))

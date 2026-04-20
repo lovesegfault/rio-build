@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
             // Prior cluster keys for sig_visibility_gate after rotation.
             // Loaded once at startup — rotation is a human-driven op that
             // restarts the store anyway (new Signer = new process).
-            let prior = TenantSigner::load_prior_cluster(&pool)
+            let prior = TenantSigner::load_prior_cluster(&pool, s.key_name())
                 .await
                 .map_err(|e| anyhow::anyhow!("cluster_key_history load: {e}"))?;
             if !prior.is_empty() {
@@ -247,9 +247,21 @@ async fn main() -> anyhow::Result<()> {
             rio_auth::jwt_interceptor::jwt_interceptor(jwt_pubkey),
         ))
         .add_service(health_service)
-        .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
-        .add_service(ChunkServiceServer::new(chunk_service))
-        .add_service(StoreAdminServiceServer::new(admin_service))
+        .add_service(
+            StoreServiceServer::new(store_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
+            ChunkServiceServer::new(chunk_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
+        .add_service(
+            StoreAdminServiceServer::new(admin_service)
+                .max_decoding_message_size(max_msg_size)
+                .max_encoding_message_size(max_msg_size),
+        )
         .serve_with_shutdown(addr, serve_shutdown.cancelled_owned())
         .await?;
 

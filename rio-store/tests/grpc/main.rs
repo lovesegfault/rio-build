@@ -208,6 +208,7 @@ pub async fn put_path_with_token(
 // Test submodules (each `use super::*;`)
 // ===========================================================================
 
+mod admin;
 mod chunk_service;
 mod chunked;
 mod core;

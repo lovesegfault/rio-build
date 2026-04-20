@@ -111,6 +111,8 @@ impl From<sqlx::Error> for MetadataError {
     /// Codes per the PG docs, Appendix A:
     /// - `23505` unique_violation, `23503` foreign_key_violation
     /// - `40001` serialization_failure
+    /// - class `57` operator intervention (`57P01` admin_shutdown,
+    ///   `57P02` crash_shutdown, `57P03` cannot_connect_now)
     ///
     /// Connection-level errors (`Io`, `Tls`, `PoolTimedOut`, `PoolClosed`)
     /// are distinguished from query-level errors so callers can retry with
@@ -124,6 +126,12 @@ impl From<sqlx::Error> for MetadataError {
                 }
                 Some("40001") => MetadataError::Serialization,
                 Some("40P01") => MetadataError::Deadlock(e),
+                // Class-57 operator intervention: PG is restarting/
+                // recovering. Arrives as Database(..) (PG sends
+                // ErrorResponse before close), NOT Io — without this
+                // arm a routine PG rolling restart would surface as
+                // non-retriable Internal.
+                Some("57P01") | Some("57P02") | Some("57P03") => MetadataError::Connection(e),
                 _ => MetadataError::Other(e),
             },
             // PoolTimedOut: all connections checked out, waited

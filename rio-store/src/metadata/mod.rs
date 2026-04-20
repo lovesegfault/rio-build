@@ -435,6 +435,32 @@ mod tests {
         );
     }
 
+    /// Real 57P01 admin_shutdown → Connection (retriable, NOT Other).
+    /// PG sends class-57 as `ErrorResponse` on the wire (→
+    /// `sqlx::Error::Database`, not `Io`); without the explicit match
+    /// arm a routine PG rolling restart surfaces as non-retriable
+    /// `Internal`. PL/pgSQL `RAISE … USING ERRCODE` produces a real
+    /// `Database` error carrying the SQLSTATE.
+    #[tokio::test]
+    async fn integration_admin_shutdown_is_connection() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        for code in ["57P01", "57P02", "57P03"] {
+            let err: MetadataError = sqlx::query(&format!(
+                "DO $$ BEGIN RAISE EXCEPTION 'shutdown' USING ERRCODE = '{code}'; END $$"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap_err()
+            .into();
+
+            assert!(
+                matches!(err, MetadataError::Connection(_)),
+                "expected Connection for {code}, got {err:?}"
+            );
+        }
+    }
+
     /// PlaceholderMissing: call complete_manifest_inline WITHOUT
     /// insert_manifest_uploading first. rows_affected() == 0 on both
     /// UPDATEs → PlaceholderMissing, NOT a sqlx error.
