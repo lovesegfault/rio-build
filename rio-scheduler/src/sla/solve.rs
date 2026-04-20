@@ -19,6 +19,7 @@ const LOCAL_MEM_BYTES: u64 = 2 << 30;
 const LOCAL_DISK_BYTES: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tier {
     pub name: String,
     #[serde(default)]
@@ -188,8 +189,21 @@ pub fn intent_for(
     tiers: &[Tier],
     ceil: &Ceilings,
 ) -> (u32, u64, u64) {
-    let probe_mem =
-        (cfg.probe.cpu * cfg.probe.mem_per_core as f64 + cfg.probe.mem_base as f64) as u64;
+    // Feature-aware probe + headroom-scaled mem hoisted ONCE so every
+    // early-return branch reads the same definitions as `solve_mvp` /
+    // `solve_full` / `explore::next`. Before, the forced_cores /
+    // serial branches read `f.mem.at(c)` raw (no `× headroom(n_eff)` —
+    // breaking r[sched.sla.headroom-confidence-scaled]) and `probe_mem`
+    // ignored `feature_probes` (the exact case `kvm` overrides exist
+    // for: a 1-core kvm build needs the high mem floor).
+    let probe = hints
+        .required_features
+        .iter()
+        .find_map(|f| cfg.feature_probes.get(f))
+        .unwrap_or(&cfg.probe);
+    let probe_mem = (probe.cpu * probe.mem_per_core as f64 + probe.mem_base as f64) as u64;
+    let fit_mem_at =
+        |c: f64| fit.map(|f| (f.mem.at(RawCores(c)).0 as f64 * headroom(f.n_eff)) as u64);
     // disk_p90 is core-independent (r[sched.sla.disk-scalar]); resolve
     // and clamp once so every early-return branch is self-consistent
     // for `explain.rs`. The `solve_intent_for` chokepoint applies the
@@ -209,7 +223,7 @@ pub fn intent_for(
         let cores = (c.ceil() as u32).max(1);
         let mem = o
             .forced_mem
-            .unwrap_or_else(|| fit.map(|f| f.mem.at(RawCores(c)).0).unwrap_or(probe_mem));
+            .unwrap_or_else(|| fit_mem_at(c).unwrap_or(probe_mem));
         return (cores, mem, fit_disk);
     }
     // Drv hints pin ONLY cores; mem/disk fall back to the fit when
@@ -232,9 +246,7 @@ pub fn intent_for(
         return (LOCAL_CORES, forced_mem.unwrap_or(LOCAL_MEM_BYTES), disk);
     }
     if hints.enable_parallel_building == Some(false) {
-        let mem = forced_mem
-            .or_else(|| fit.map(|f| f.mem.at(RawCores(1.0)).0))
-            .unwrap_or(probe_mem);
+        let mem = forced_mem.or_else(|| fit_mem_at(1.0)).unwrap_or(probe_mem);
         return (1, mem, fit_disk);
     }
     let fit = match fit {
@@ -373,6 +385,16 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
             node_selector: None,
         };
     }
+    // Infeasible-at-any-tier — the operator-facing alerting hook
+    // (observability.md). Gated on "≥1 tier had bounds": a pure
+    // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
+    // (unknown pinned-tier override) is not an exhaust event.
+    if tiers
+        .iter()
+        .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
+    {
+        super::cost::ceiling_exhausted();
+    }
     // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
     // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
     // `solve_intent_for`'s floor.max() composes (a `disk_p90 > max_disk`
@@ -486,6 +508,14 @@ pub fn solve_full(
                 node_selector: Some(chosen.selector()),
             };
         }
+    }
+    if ice.exhausted() {
+        super::cost::capacity_exhausted();
+    } else if tiers
+        .iter()
+        .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
+    {
+        super::cost::ceiling_exhausted();
     }
     // D4: clamp at `ceil.max_*` — the Feasible arm above gates on
     // `mem/disk > ceil` (reject-not-clamp); BestEffort must clamp so
@@ -913,7 +943,8 @@ mod tests {
     #[test]
     fn intent_for_serial_pins_one_core() {
         // enable_parallel_building=false pins ONLY cores=1; mem/disk
-        // come from the fit (M(1), disk_p90), not probe defaults.
+        // come from the fit (M(1) × headroom, disk_p90), not probe
+        // defaults.
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let hints = DrvHints {
             enable_parallel_building: Some(false),
@@ -921,11 +952,86 @@ mod tests {
         };
         let (c, m, d) = intent(Some(&fit), &hints);
         assert_eq!(c, 1);
-        assert_eq!(m, 2 << 30, "MemFit::Independent.p90, not probe_mem");
+        let want = ((2u64 << 30) as f64 * headroom(10.0)) as u64;
+        assert_eq!(m, want, "MemFit.at(1) × headroom(n_eff), not probe_mem");
         assert_eq!(d, 10 << 30, "fit.disk_p90, not default_disk");
         // No fit → probe defaults.
         let (c, m, d) = intent(None, &hints);
         assert_eq!((c, m, d), (1, 8 << 30, ceil().default_disk));
+    }
+    // r[verify sched.sla.headroom-confidence-scaled]
+    #[test]
+    fn intent_for_serial_applies_headroom_on_coupled_fit() {
+        // MemFit::Coupled.at() is the regression line (~p50), NOT a
+        // quantile. The serial early-return must scale by
+        // headroom(n_eff) just like solve_mvp does. Regression: it
+        // returned the raw fit → under-provision → OOM.
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.mem = MemFit::Coupled {
+            a: 21.5,
+            b: 0.3,
+            r1: 0.9,
+        };
+        fit.n_eff = 3.0;
+        let hints = DrvHints {
+            enable_parallel_building: Some(false),
+            ..Default::default()
+        };
+        let (_, m, _) = intent(Some(&fit), &hints);
+        let raw = 21.5f64.exp() as u64;
+        let want = (raw as f64 * headroom(3.0)) as u64;
+        assert_eq!(m, want);
+        assert!(m > raw * 3 / 2, "headroom(3.0)≈1.65 must inflate raw");
+    }
+    #[test]
+    fn intent_for_forced_cores_applies_headroom() {
+        let mut fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        fit.mem = MemFit::Coupled {
+            a: 21.5,
+            b: 0.3,
+            r1: 0.9,
+        };
+        let o = ResolvedTarget {
+            forced_cores: Some(12.0),
+            ..Default::default()
+        };
+        let (c, m, _) = intent_for(
+            Some(&fit),
+            &DrvHints::default(),
+            Some(&o),
+            &cfg(),
+            &[],
+            &ceil(),
+        );
+        assert_eq!(c, 12);
+        let raw = fit.mem.at(RawCores(12.0)).0;
+        assert_eq!(m, (raw as f64 * headroom(10.0)) as u64);
+        assert!(m > raw, "must include headroom factor");
+    }
+    #[test]
+    fn intent_for_probe_mem_honors_feature_probes() {
+        // `kvm` builds want a high mem floor regardless of core count
+        // (config.rs:28-30). The serial / forced_cores cold-start
+        // branches must consult `feature_probes`, not `cfg.probe`.
+        let mut cfg = cfg();
+        cfg.feature_probes.insert(
+            "kvm".into(),
+            super::super::config::ProbeShape {
+                cpu: 4.0,
+                mem_per_core: 2 << 30,
+                mem_base: 16 << 30,
+                deadline_secs: 7200,
+            },
+        );
+        let hints = DrvHints {
+            enable_parallel_building: Some(false),
+            required_features: vec!["kvm".into()],
+            ..Default::default()
+        };
+        let (c, m, _) = intent_for(None, &hints, None, &cfg, &[], &ceil());
+        assert_eq!(c, 1);
+        // 4×2Gi + 16Gi = 24Gi (kvm probe), NOT 4×1Gi + 4Gi = 8Gi (default).
+        assert_eq!(m, 24 << 30, "feature_probes[kvm], not cfg.probe");
     }
     #[test]
     fn serial_honors_forced_mem() {
@@ -1132,6 +1238,150 @@ mod tests {
         let (h, f) = hw.h_dagger("foo", Band::Hi, &no_bias);
         assert_eq!(h, "");
         assert!((f - 1.0).abs() < 1e-9);
+    }
+
+    /// Regression: `h_dagger` returned `f / bias` unclamped; with a
+    /// pathological factor row OR a large `hw_bias` denominator the
+    /// effective factor went ≪ 0.25 → `t = T(c)/factor` blew up →
+    /// `feasible(cap_c) = false` → entire band dropped out for both
+    /// Spot and OnDemand.
+    #[test]
+    fn h_dagger_floors_after_bias_division() {
+        use super::super::hw::HW_FACTOR_SANITY_FLOOR;
+        let mut m = HashMap::new();
+        m.insert("aws-7-ebs-mid".into(), 0.3);
+        let hw = HwTable::from_map(m);
+        let mut bias = HashMap::new();
+        bias.insert("aws-7-ebs-mid".into(), 3.0);
+        // Raw 0.3/3.0 = 0.1; must floor to 0.25.
+        let (_, f) = hw.h_dagger("foo", Band::Mid, &bias);
+        assert_eq!(f, HW_FACTOR_SANITY_FLOOR);
+    }
+
+    #[test]
+    fn solve_full_survives_pathological_hw_factor() {
+        // T(cap_c)=30+2000/64≈61s, tier p90=600. With factor=0.01,
+        // t=6100 → infeasible → mid drops out. With FLOOR=0.25, t=244
+        // → feasible. Hi/Lo bands have no hw_classes → factor=1.0 →
+        // would survive anyway, so check Mid specifically.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let mut m = HashMap::new();
+        m.insert("aws-7-ebs-mid".into(), 0.01);
+        let hw = HwTable::from_map(m);
+        let mut bias = HashMap::new();
+        // Further: bias-divides 0.01 / 10 = 0.001. Floor must catch.
+        bias.insert("aws-7-ebs-mid".into(), 10.0);
+        let mut fit_b = fit.clone();
+        fit_b.hw_bias = bias;
+        let ice = IceBackoff::default();
+        // Mark all non-Mid cells so the solve must pick Mid or fail.
+        for c in Cap::ALL {
+            ice.mark(Band::Hi, c);
+            ice.mark(Band::Lo, c);
+        }
+        let mut rng = StdRng::seed_from_u64(0);
+        let r = solve_full(
+            &fit_b,
+            &[t("normal", 600.0)],
+            &hw,
+            &CostTable::default(),
+            &ceil(),
+            &ice,
+            0.0,
+            &mut rng,
+        );
+        assert!(
+            matches!(r, SolveResult::Feasible { .. }),
+            "pathological factor must not drop band: {r:?}"
+        );
+    }
+
+    // ─── infeasible_total emission ──────────────────────────────────
+
+    fn infeasible_count(snap: &metrics_util::debugging::Snapshotter, reason: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                (k.name() == "rio_scheduler_sla_infeasible_total"
+                    && k.labels()
+                        .any(|l| l.key() == "reason" && l.value() == reason))
+                .then_some(match v {
+                    DebugValue::Counter(c) => c,
+                    _ => 0,
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// Regression: `rio_scheduler_sla_infeasible_total` was registered +
+    /// documented but `capacity_exhausted()` had ZERO non-test callers.
+    /// observability.md:147 documented an alerting hook that could not
+    /// fire.
+    #[test]
+    fn solve_full_emits_capacity_exhausted_when_ice_exhausted() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+            let ice = IceBackoff::default();
+            for b in Band::ALL {
+                for c in Cap::ALL {
+                    ice.mark(b, c);
+                }
+            }
+            let mut rng = StdRng::seed_from_u64(0);
+            let r = solve_full(
+                &fit,
+                &[t("normal", 1200.0)],
+                &hw_mid_only(),
+                &CostTable::default(),
+                &ceil(),
+                &ice,
+                0.0,
+                &mut rng,
+            );
+            assert!(matches!(r, SolveResult::BestEffort { .. }));
+        });
+        assert_eq!(infeasible_count(&snapshotter, "capacity_exhausted"), 1);
+    }
+
+    #[test]
+    fn solve_mvp_emits_ceiling_exhausted_on_all_bounded_infeasible() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            // T(c) ≫ 10 for all c ≤ 64: S=1e6.
+            let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+            let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
+            assert!(matches!(r, SolveResult::BestEffort { .. }));
+        });
+        assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 1);
+    }
+
+    #[test]
+    fn solve_mvp_no_emit_on_best_effort_tier() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+            let unbounded = Tier {
+                name: "be".into(),
+                p50: None,
+                p90: None,
+                p99: None,
+            };
+            // Unbounded tier returns Feasible at cap_c (solve_envelope's
+            // no-bounds arm), so no BestEffort fallthrough.
+            solve_mvp(&fit, &[unbounded], &ceil());
+            // Empty ladder (unknown pinned-tier) → BestEffort but NOT
+            // an exhaust event.
+            solve_mvp(&fit, &[], &ceil());
+        });
+        assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 0);
+        assert_eq!(infeasible_count(&snapshotter, "capacity_exhausted"), 0);
     }
 
     #[test]

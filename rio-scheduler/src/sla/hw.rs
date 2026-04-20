@@ -21,7 +21,7 @@ use crate::db::SchedulerDb;
 /// min_factor()` would then blow the deadline up ~×100 (capped at 24h,
 /// but wasteful). Clamp at 0.25 — i.e., assume no admitted hw_class is
 /// more than 4× slower than the reference.
-const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
+pub(crate) const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
 
 /// Sanity ceiling, mirror of [`HW_FACTOR_SANITY_FLOOR`]: assume no
 /// admitted hw_class is more than 4× FASTER than the reference.
@@ -30,7 +30,7 @@ const HW_FACTOR_SANITY_FLOOR: f64 = 0.25;
 /// compromised builder holding one valid token can write its one row
 /// at an absurd `factor`; the clamp bounds the blast radius of that
 /// one rank.
-const HW_FACTOR_SANITY_CEIL: f64 = 4.0;
+pub(crate) const HW_FACTOR_SANITY_CEIL: f64 = 4.0;
 
 /// Per-hw_class median microbench factor. Built from the
 /// `hw_perf_factors` view each [`super::SlaEstimator::refresh`] tick.
@@ -108,7 +108,13 @@ impl HwTable {
             sqlx::query_as("SELECT hw_class, factor FROM hw_perf_factors")
                 .fetch_all(db.pool())
                 .await?;
-        let factors: HashMap<String, f64> = rows.into_iter().collect();
+        // Clamp at the chokepoint so EVERY consumer (`iter`, `factor`,
+        // `normalize`, `min_factor`) sees `[FLOOR, CEIL]` values. The
+        // per-consumer clamps stay (defense-in-depth, documented).
+        let factors: HashMap<String, f64> = rows
+            .into_iter()
+            .map(|(h, f)| (h, f.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)))
+            .collect();
         // reference = class whose factor is closest to 1.0 (the
         // calibration target). Ties → lexicographic for determinism.
         let reference = factors
@@ -125,7 +131,9 @@ impl HwTable {
         Ok(Self { factors, reference })
     }
 
-    /// Test constructor: bypass PG.
+    /// Test constructor: bypass PG. Values pass through UNCLAMPED so
+    /// tests can probe the per-consumer `[FLOOR, CEIL]` clamps; for
+    /// load-chokepoint testing use [`Self::from_raw`].
     #[cfg(test)]
     pub fn from_map(factors: HashMap<String, f64>) -> Self {
         let reference = factors
@@ -139,6 +147,18 @@ impl HwTable {
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
         Self { factors, reference }
+    }
+
+    /// Test constructor: bypass PG, mirroring `load`'s chokepoint
+    /// clamp. Use to verify that pathological raw values are bounded
+    /// before any consumer (including [`Self::iter`]) sees them.
+    #[cfg(test)]
+    pub fn from_raw(raw: HashMap<String, f64>) -> Self {
+        Self::from_map(
+            raw.into_iter()
+                .map(|(h, f)| (h, f.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)))
+                .collect(),
+        )
     }
 }
 
@@ -199,5 +219,21 @@ mod tests {
         assert_eq!(t.factor("slow"), HW_FACTOR_SANITY_FLOOR);
         // Unknown still passes through at 1.0 (within band).
         assert_eq!(t.normalize(10.0, Some("unknown")), 10.0);
+    }
+
+    /// Regression: `load` clamps at the chokepoint so `iter()` (the
+    /// source for `h_dagger`) returns `[FLOOR, CEIL]` values. Before,
+    /// `normalize`/`factor`/`min_factor` clamped per-consumer but
+    /// `iter()` returned raw — a pathological row dropped an entire
+    /// band out of `solve_full` for both Spot and OnDemand.
+    #[test]
+    fn load_clamps_pathological_factor() {
+        let mut m = HashMap::new();
+        m.insert("slow".into(), 0.01);
+        m.insert("fast".into(), 50.0);
+        let t = HwTable::from_raw(m);
+        let by_name: HashMap<_, _> = t.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert_eq!(by_name["slow"], HW_FACTOR_SANITY_FLOOR);
+        assert_eq!(by_name["fast"], HW_FACTOR_SANITY_CEIL);
     }
 }

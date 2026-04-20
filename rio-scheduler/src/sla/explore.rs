@@ -8,6 +8,7 @@
 //! ladder freezes and `intent_for` switches to the solve path.
 
 use super::config::SlaConfig;
+use super::fit::headroom;
 use super::metrics;
 use super::solve::DrvHints;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
@@ -42,9 +43,19 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     // `resource_floor` is per-drv_hash so a fresh version would
     // otherwise re-climb OOM/DiskPressure from probe defaults. Disk is
     // a core-independent scalar (r[sched.sla.disk-scalar]); mem
-    // evaluates `MemFit::at(c)` at the explore-chosen c. `.max(probe
-    // shape)` guards the Independent{p90:0} sentinel (no prior sample).
-    let mem_for = move |c: f64| MemBytes(mem_for(c).0.max(f.mem.at(RawCores(c)).0));
+    // evaluates `MemFit::at(c)` at the explore-chosen c, scaled by
+    // `headroom(n_eff)` (r[sched.sla.headroom-confidence-scaled]) —
+    // `MemFit::Coupled.at()` is the regression line (~p50), not a
+    // quantile. `.max(probe shape)` guards the Independent{p90:0}
+    // sentinel (no prior sample).
+    let h = headroom(f.n_eff);
+    let mem_for = move |c: f64| {
+        MemBytes(
+            mem_for(c)
+                .0
+                .max((f.mem.at(RawCores(c)).0 as f64 * h) as u64),
+        )
+    };
     let disk = DiskBytes(f.disk_p90.map(|d| d.0).unwrap_or(cfg.default_disk));
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
@@ -251,15 +262,17 @@ mod tests {
     #[test]
     fn mem_uses_fit_when_above_probe_shape() {
         // ÷2 path: c=32 unsaturated → c_down=16. Probe shape at 16 =
-        // 16·2Gi + 4Gi = 36Gi. Observed Independent{p90:80Gi} must win
-        // (a fresh drv_hash would otherwise OOM and re-climb floor.mem).
+        // 16·2Gi + 4Gi = 36Gi. Observed Independent{p90:80Gi} ×
+        // headroom(n_eff) must win (a fresh drv_hash would otherwise
+        // OOM and re-climb floor.mem).
         let mut f = fit(st(32.0, 32.0, 1, false, 200.0));
         f.mem = MemFit::Independent {
             p90: MemBytes(80 << 30),
         };
         let d = next(Some(&f), &cfg(), &DrvHints::default());
         assert_eq!(d.c.0, 16.0);
-        assert_eq!(d.mem.0, 80 << 30, "fit mem, not probe shape");
+        let want = ((80u64 << 30) as f64 * headroom(f.n_eff)) as u64;
+        assert_eq!(d.mem.0, want, "fit mem × headroom, not probe shape");
         // Independent{p90:0} sentinel → probe shape wins via .max().
         let f = fit(st(32.0, 32.0, 1, false, 200.0));
         let d = next(Some(&f), &cfg(), &DrvHints::default());

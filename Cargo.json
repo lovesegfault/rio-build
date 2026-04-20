@@ -6696,6 +6696,21 @@
         "Henri Sivonen <hsivonen@hsivonen.fi>"
       ]
     },
+    "endian-type": {
+      "crateName": "endian-type",
+      "version": "0.1.2",
+      "edition": "2015",
+      "sha256": "0bbh88zaig1jfqrm7w3gx0pz81kw2jakk3055vbgapw3dmk08ky3",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Lolirofle <lolipopple@hotmail.com>"
+      ]
+    },
     "enum-ordinalize": {
       "crateName": "enum-ordinalize",
       "version": "4.3.2",
@@ -14986,6 +15001,10 @@
       },
       "dependencies": [
         {
+          "name": "aho-corasick",
+          "packageId": "aho-corasick"
+        },
+        {
           "name": "crossbeam-epoch",
           "packageId": "crossbeam-epoch"
         },
@@ -14998,12 +15017,24 @@
           "packageId": "hashbrown 0.16.1"
         },
         {
+          "name": "indexmap",
+          "packageId": "indexmap"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
         {
+          "name": "ordered-float",
+          "packageId": "ordered-float 5.3.0"
+        },
+        {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "radix_trie",
+          "packageId": "radix_trie"
         },
         {
           "name": "rand",
@@ -15019,10 +15050,19 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "aho-corasick",
         "crossbeam-epoch",
         "crossbeam-utils",
+        "debugging",
+        "default",
         "hashbrown",
+        "indexmap",
+        "layer-filter",
+        "layer-router",
+        "layers",
+        "ordered-float",
         "quanta",
+        "radix_trie",
         "rand",
         "rand_xoshiro",
         "recency",
@@ -15347,6 +15387,27 @@
       ],
       "authors": [
         "Sébastien Crozet <developer@crozet.re>"
+      ]
+    },
+    "nibble_vec": {
+      "crateName": "nibble_vec",
+      "version": "0.1.0",
+      "edition": "2018",
+      "sha256": "0hsdp3s724s30hkqz74ky6sqnadhp2xwcj1n1hzy4vzkz4yxi9bp",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michael Sproul <micsproul@gmail.com>"
       ]
     },
     "nix 0.30.1": {
@@ -18758,6 +18819,31 @@
         "lib"
       ]
     },
+    "radix_trie": {
+      "crateName": "radix_trie",
+      "version": "0.2.1",
+      "edition": "2018",
+      "sha256": "1zaq3im5ss03w91ij11cj97vvzc5y1f3064d9pi2ysnwziww2sf0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "endian-type",
+          "packageId": "endian-type"
+        },
+        {
+          "name": "nibble_vec",
+          "packageId": "nibble_vec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michael Sproul <micsproul@gmail.com>"
+      ]
+    },
     "rand 0.10.0": {
       "crateName": "rand",
       "version": "0.10.0",
@@ -21049,6 +21135,10 @@
         {
           "name": "http",
           "packageId": "http 1.4.0"
+        },
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
         },
         {
           "name": "opentelemetry",
@@ -30358,6 +30448,10 @@
           "packageId": "memchr"
         },
         {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
           "name": "miniz_oxide",
           "packageId": "miniz_oxide",
           "target": "aarch64-unknown-linux-gnu"
@@ -30396,6 +30490,10 @@
         {
           "name": "once_cell",
           "packageId": "once_cell"
+        },
+        {
+          "name": "ordered-float",
+          "packageId": "ordered-float 5.3.0"
         },
         {
           "name": "pem-rfc7468",

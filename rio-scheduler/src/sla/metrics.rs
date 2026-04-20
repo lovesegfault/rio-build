@@ -25,8 +25,11 @@ pub fn describe_all() {
     );
     describe_counter!(
         "rio_scheduler_sla_infeasible_total",
-        "infeasible-at-any-tier count: solve_mvp returned BestEffort \
-         because c* exceeded ceilings on every bounded tier"
+        "infeasible-at-any-tier count, labeled `reason`: \
+         `ceiling_exhausted` (solve returned BestEffort because c* \
+         exceeded ceilings on every bounded tier) | \
+         `capacity_exhausted` (the ICE-backoff ladder exhausted all 6 \
+         (band, cap) cells at the terminal tier)"
     );
     describe_counter!(
         "rio_scheduler_sla_resize_retry_total",

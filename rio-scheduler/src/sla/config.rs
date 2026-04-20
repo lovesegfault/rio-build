@@ -94,6 +94,7 @@ fn default_halflife() -> f64 {
 
 /// Cold-start probe shape: `mem = mem_base + cpu × mem_per_core`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeShape {
     pub cpu: f64,
     pub mem_per_core: u64,
@@ -107,6 +108,37 @@ pub struct ProbeShape {
 
 pub(crate) fn default_probe_deadline_secs() -> u32 {
     3600
+}
+
+impl ProbeShape {
+    /// Bounds-check this shape under `[sla].max_cores = max_cores`.
+    /// `label` names the config path (`"sla.probe"` /
+    /// `"sla.feature_probes[kvm]"`) so the error message points the
+    /// operator at the field. Validating here (not inline in
+    /// [`SlaConfig::validate`]) means a future ProbeShape field can't
+    /// be half-validated — there is one method, called from every
+    /// `[sla]` site that holds a `ProbeShape`.
+    pub fn validate(&self, label: &str, max_cores: f64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.cpu >= 1.0 && self.cpu <= max_cores,
+            "{label}.cpu must be in [1, max_cores={max_cores}]; got {}",
+            self.cpu
+        );
+        // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
+        // probe value; the controller takes it verbatim as
+        // `activeDeadlineSeconds` and derives the worker's
+        // `daemon_timeout = deadline − 90s`. At the old 60s floor both
+        // timers tied (the worker `.max(60)` clamp masked the negative
+        // slack) so K8s SIGKILL raced `CompletionReport{TimedOut}`.
+        // 180s leaves the 90s slack + ~30s cold-start + a meaningful
+        // build window.
+        anyhow::ensure!(
+            self.deadline_secs >= 180,
+            "{label}.deadline_secs must be >= 180, got {}",
+            self.deadline_secs
+        );
+        Ok(())
+    }
 }
 
 impl SlaConfig {
@@ -158,11 +190,6 @@ impl SlaConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let hi = self.max_cores;
         anyhow::ensure!(
-            self.probe.cpu >= 1.0 && self.probe.cpu <= hi,
-            "sla.probe.cpu must be in [1, max_cores={hi}]; got {}",
-            self.probe.cpu
-        );
-        anyhow::ensure!(
             self.tiers.iter().any(|t| t.name == self.default_tier),
             "sla.default_tier {:?} not in sla.tiers (known: {:?})",
             self.default_tier,
@@ -178,25 +205,21 @@ impl SlaConfig {
             "sla.halflife_secs must be finite and positive, got {}",
             self.halflife_secs
         );
-        // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
-        // probe value; the controller takes it verbatim as
-        // `activeDeadlineSeconds` and derives the worker's
-        // `daemon_timeout = deadline − 90s`. At the old 60s floor both
-        // timers tied (the worker `.max(60)` clamp masked the negative
-        // slack) so K8s SIGKILL raced `CompletionReport{TimedOut}`.
-        // 180s leaves the 90s slack + ~30s cold-start + a meaningful
-        // build window.
         anyhow::ensure!(
-            self.probe.deadline_secs >= 180,
-            "sla.probe.deadline_secs must be >= 180, got {}",
-            self.probe.deadline_secs
+            self.hw_fallback_after_secs.is_finite() && self.hw_fallback_after_secs > 0.0,
+            "sla.hw_fallback_after_secs must be finite and positive, got {}",
+            self.hw_fallback_after_secs
         );
+        // Tests deliberately set `0.0` (greedy argmin) so `>=`, not `>`.
+        // Negative/NaN would NaN the softmax weights.
+        anyhow::ensure!(
+            self.hw_softmax_temp.is_finite() && self.hw_softmax_temp >= 0.0,
+            "sla.hw_softmax_temp must be finite and non-negative, got {}",
+            self.hw_softmax_temp
+        );
+        self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
-            anyhow::ensure!(
-                p.deadline_secs >= 180,
-                "sla.feature_probes[{feat}].deadline_secs must be >= 180, got {}",
-                p.deadline_secs
-            );
+            p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
         }
         Ok(())
     }
@@ -298,7 +321,10 @@ mod tests {
         let mut cfg = base();
         cfg.probe.deadline_secs = 60;
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("probe.deadline_secs must be >= 180"), "{err}");
+        assert!(
+            err.contains("sla.probe.deadline_secs must be >= 180"),
+            "{err}"
+        );
         cfg.probe.deadline_secs = 180;
         cfg.validate().unwrap();
 
@@ -322,6 +348,69 @@ mod tests {
         let mut cfg = base();
         cfg.max_cores = 8.0;
         cfg.probe.cpu = 2.0;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_probe_field() {
+        // `deadline_sec` (no trailing s) — typo'd key under a nested
+        // struct must fail loud at deserialize, not silently default.
+        let r: Result<ProbeShape, _> = serde_json::from_str(
+            r#"{"cpu":4.0,"mem_per_core":1,"mem_base":1,"deadline_sec":7200}"#,
+        );
+        assert!(
+            r.unwrap_err().to_string().contains("unknown field"),
+            "ProbeShape must deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tier_field() {
+        // `p9O` (letter O, not zero).
+        let r: Result<Tier, _> = serde_json::from_str(r#"{"name":"x","p9O":300}"#);
+        assert!(
+            r.unwrap_err().to_string().contains("unknown field"),
+            "Tier must deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn rejects_feature_probe_cpu_gt_maxcores() {
+        let mut cfg = base();
+        cfg.feature_probes.insert(
+            "kvm".into(),
+            ProbeShape {
+                cpu: 96.0, // > max_cores=64
+                mem_per_core: 0,
+                mem_base: 0,
+                deadline_secs: 3600,
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("feature_probes[kvm]"), "{err}");
+        assert!(err.contains("[1, max_cores=64]"), "{err}");
+    }
+
+    #[test]
+    fn rejects_hw_fallback_after_secs_nonpositive() {
+        for bad in [0.0, -1.0, f64::NAN] {
+            let mut cfg = base();
+            cfg.hw_fallback_after_secs = bad;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("hw_fallback_after_secs"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_hw_softmax_temp_negative_or_nan() {
+        for bad in [-0.1, f64::NAN] {
+            let mut cfg = base();
+            cfg.hw_softmax_temp = bad;
+            assert!(cfg.validate().is_err(), "{bad} should be rejected");
+        }
+        // 0.0 is the greedy-argmin sentinel — must be accepted.
+        let mut cfg = base();
+        cfg.hw_softmax_temp = 0.0;
         cfg.validate().unwrap();
     }
 

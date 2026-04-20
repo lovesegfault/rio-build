@@ -116,6 +116,11 @@ rstest = { workspace = true }
 # (tests/sla_fit_props.rs).
 proptest = { workspace = true }
 aws-smithy-mocks = { workspace = true }
+# sla/solve.rs + cost.rs: assert that documented-but-unwired metrics are
+# actually emitted. Already transitive via metrics-exporter-prometheus
+# (zero lockfile churn); promoted to direct dev-dep for the
+# `debugging::DebuggingRecorder` snapshotter.
+metrics-util = { version = "0.20", features = ["debugging"] }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-sdk-ec2 = { workspace = true, features = ["test-util"] }
 # grpc/tests.rs trace_id header test: needs the tracing→OTel bridge so

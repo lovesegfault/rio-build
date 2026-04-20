@@ -164,17 +164,27 @@ const LAMBDA_DECAY_TO_SEED_AFTER_SECS: f64 = 48.0 * 3600.0;
 /// Short — capacity recovers in minutes; the ladder re-probes.
 const ICE_TTL: Duration = Duration::from_secs(60);
 
+/// EMA-smoothed `$/vCPU·hr` with its own last-update timestamp.
+/// Per-key timestamp (mirroring [`RatioEma`]) so a `(band, cap)` absent
+/// from a partial `poll_spot_once` observation keeps its OWN decay
+/// reference — a single global timestamp under-decays absent keys when
+/// the global stamp moves forward.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceEma {
+    pub value: f64,
+    /// Unix-epoch seconds of last update. `0.0` ⇒ seed (first fold gets
+    /// `decay = 0.0`).
+    pub updated_at: f64,
+}
+
 /// Per-`(band, cap)` `$/vCPU·hr` + per-band λ. Cheap to clone (two
 /// small maps); the solve takes a snapshot by value.
 #[derive(Debug, Clone)]
 pub struct CostTable {
     /// EMA-smoothed `$/vCPU·hr`. Missing key → seed.
-    price: HashMap<(Band, Cap), f64>,
+    price: HashMap<(Band, Cap), PriceEma>,
     /// Per-band interrupt-rate EMA.
     lambda: HashMap<Band, RatioEma>,
-    /// Unix-epoch seconds of the last successful price refresh. Feeds
-    /// `rio_scheduler_sla_hw_cost_stale_seconds`.
-    pub price_updated_at: f64,
     /// `sla_ema_state.cluster` / `interrupt_samples.cluster` scope
     /// (ADR-023 §2.13). Set by [`CostTable::load`]; empty for the
     /// single-cluster default. Carried on the struct so
@@ -188,13 +198,24 @@ impl Default for CostTable {
     fn default() -> Self {
         let mut price = HashMap::new();
         for &(b, od) in &ON_DEMAND_SEED {
-            price.insert((b, Cap::OnDemand), od);
-            price.insert((b, Cap::Spot), od * SPOT_SEED_DISCOUNT);
+            price.insert(
+                (b, Cap::OnDemand),
+                PriceEma {
+                    value: od,
+                    updated_at: 0.0,
+                },
+            );
+            price.insert(
+                (b, Cap::Spot),
+                PriceEma {
+                    value: od * SPOT_SEED_DISCOUNT,
+                    updated_at: 0.0,
+                },
+            );
         }
         Self {
             price,
             lambda: HashMap::new(),
-            price_updated_at: 0.0,
             cluster: String::new(),
         }
     }
@@ -203,17 +224,20 @@ impl Default for CostTable {
 impl CostTable {
     /// `$/vCPU·hr` for `(band, cap)`. Seed-backed — never `None`.
     pub fn price(&self, band: Band, cap: Cap) -> f64 {
-        self.price.get(&(band, cap)).copied().unwrap_or_else(|| {
-            let od = ON_DEMAND_SEED
-                .iter()
-                .find(|(b, _)| *b == band)
-                .map(|(_, p)| *p)
-                .unwrap_or(0.043);
-            match cap {
-                Cap::OnDemand => od,
-                Cap::Spot => od * SPOT_SEED_DISCOUNT,
-            }
-        })
+        self.price
+            .get(&(band, cap))
+            .map(|p| p.value)
+            .unwrap_or_else(|| {
+                let od = ON_DEMAND_SEED
+                    .iter()
+                    .find(|(b, _)| *b == band)
+                    .map(|(_, p)| *p)
+                    .unwrap_or(0.043);
+                match cap {
+                    Cap::OnDemand => od,
+                    Cap::Spot => od * SPOT_SEED_DISCOUNT,
+                }
+            })
     }
 
     /// Per-band Poisson interrupt rate (events/sec). Decays toward
@@ -269,6 +293,23 @@ impl CostTable {
         }
     }
 
+    /// Unix-epoch seconds of the most-recently-updated price key. Feeds
+    /// `rio_scheduler_sla_hw_cost_stale_seconds`. Derived (not stored)
+    /// so it can never drift from the per-key timestamps.
+    pub fn price_updated_at(&self) -> f64 {
+        self.price
+            .values()
+            .map(|p| p.updated_at)
+            .fold(0.0, f64::max)
+    }
+
+    /// `sla_ema_state.cluster` scope. Exposed so the poller's
+    /// leader-edge reload can re-`load()` from the in-mem snapshot's
+    /// own scope.
+    pub fn cluster(&self) -> &str {
+        &self.cluster
+    }
+
     /// Load persisted EMAs from `sla_ema_state`. Called once at
     /// startup so a scheduler restart doesn't re-warm. `cluster`
     /// scopes the rows (ADR-023 §2.13 global-DB safety).
@@ -286,8 +327,13 @@ impl CostTable {
             if let Some(rest) = key.strip_prefix("price:")
                 && let Some((b, c)) = parse_band_cap(rest)
             {
-                t.price.insert((b, c), value);
-                t.price_updated_at = t.price_updated_at.max(at);
+                t.price.insert(
+                    (b, c),
+                    PriceEma {
+                        value,
+                        updated_at: at,
+                    },
+                );
             } else if let Some(rest) = key.strip_prefix("lambda:")
                 && let Some(b) = parse_band(rest)
             {
@@ -307,15 +353,20 @@ impl CostTable {
     /// Persist all EMAs to `sla_ema_state` (upsert). One row per
     /// `(cluster, key)`; small (≤9 rows), so no batching.
     pub async fn persist(&self, db: &SchedulerDb) -> anyhow::Result<()> {
-        for (&(b, c), &v) in &self.price {
+        for (&(b, c), p) in &self.price {
+            // `to_timestamp($4)` (data-time), NOT `now()`: a tick where
+            // `poll_spot_once` failed must not advance the persisted
+            // timestamp, or on reload staleness is lost and the next
+            // `fold_prices` decay `dt` is wrong.
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
-                 VALUES ($1, $2, $3, now()) \
-                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = now()",
+                 VALUES ($1, $2, $3, to_timestamp($4)) \
+                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
             )
             .bind(&self.cluster)
             .bind(format!("price:{}:{}", b.label(), c.label()))
-            .bind(v)
+            .bind(p.value)
+            .bind(p.updated_at)
             .execute(db.pool())
             .await?;
         }
@@ -395,30 +446,59 @@ impl CostTable {
 
     /// Fold one round of spot-price observations into the price EMA.
     /// `obs` is `$/vCPU·hr` keyed by `(band, cap)` — already
-    /// vCPU-normalized by the caller.
+    /// vCPU-normalized by the caller. Per-key `dt`: a key absent from
+    /// `obs` keeps its OWN `updated_at`, so when it next appears its
+    /// decay reflects the full elapsed interval, not just the gap since
+    /// the last (partial) fold.
     pub fn fold_prices(&mut self, obs: &HashMap<(Band, Cap), f64>, now: f64) {
         for (&k, &v) in obs {
-            let prev = self.price.get(&k).copied().unwrap_or(v);
-            let dt = (now - self.price_updated_at).max(0.0);
-            let decay = if self.price_updated_at == 0.0 {
+            let prev = self.price.get(&k).copied().unwrap_or(PriceEma {
+                value: v,
+                updated_at: 0.0,
+            });
+            let dt = (now - prev.updated_at).max(0.0);
+            let decay = if prev.updated_at == 0.0 {
                 0.0
             } else {
                 0.5f64.powf(dt / SPOT_HALFLIFE_SECS)
             };
-            self.price.insert(k, prev * decay + v * (1.0 - decay));
+            self.price.insert(
+                k,
+                PriceEma {
+                    value: prev.value * decay + v * (1.0 - decay),
+                    updated_at: now,
+                },
+            );
         }
-        self.price_updated_at = now;
     }
 
     /// Test constructor.
     #[cfg(test)]
     pub fn from_parts(price: HashMap<(Band, Cap), f64>, lambda: HashMap<Band, RatioEma>) -> Self {
+        let now = now_epoch();
         Self {
-            price,
+            price: price
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        PriceEma {
+                            value: v,
+                            updated_at: now,
+                        },
+                    )
+                })
+                .collect(),
             lambda,
-            price_updated_at: now_epoch(),
             cluster: String::new(),
         }
+    }
+
+    /// Test setter: insert a price with an explicit `updated_at`.
+    #[cfg(test)]
+    pub fn set_price(&mut self, band: Band, cap: Cap, value: f64, updated_at: f64) {
+        self.price
+            .insert((band, cap), PriceEma { value, updated_at });
     }
 }
 
@@ -579,15 +659,30 @@ pub fn capacity_exhausted() {
     .increment(1);
 }
 
+/// Emit `infeasible_total{reason=ceiling_exhausted}`. Called when
+/// [`super::solve::solve_mvp`] falls through to `BestEffort` because
+/// `c*` exceeded ceilings on every bounded tier.
+pub fn ceiling_exhausted() {
+    metrics::counter!(
+        "rio_scheduler_sla_infeasible_total",
+        "reason" => "ceiling_exhausted"
+    )
+    .increment(1);
+}
+
 /// Lease-gated spot-price poller: every 10min, the leader pulls
 /// `DescribeSpotPriceHistory` for each band's representative instance
 /// type, EMA-smooths into `cost`, refreshes λ from `interrupt_samples`,
 /// persists to PG, and exports the staleness gauge.
 ///
 /// `source = None | Some(Static)` → AWS calls skipped; only the λ
-/// refresh + gauge run. Standby replicas skip the tick body entirely
-/// (price/λ are PG-backed; the next leader picks up where the last
-/// left off).
+/// refresh + gauge run. Standby replicas emit the staleness gauge
+/// (per-replica, observability.md says it "climbs when … this replica is
+/// standby") but skip the AWS/PG body. On a false→true leader edge the
+/// in-mem table is reloaded from PG so the next leader picks up where
+/// the last left off — without this, the standby's startup snapshot
+/// (loaded once at main.rs) would be `persist()`ed on the first leader
+/// tick, overwriting the previous leader's evolved EMA.
 pub async fn spot_price_poller(
     db: SchedulerDb,
     leader: LeaderState,
@@ -608,13 +703,14 @@ pub async fn spot_price_poller(
     };
     let mut tick = tokio::time::interval(Duration::from_secs(600));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_leader = false;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
         }
-        if !leader.is_leader() {
+        if !poller_tick_prelude(&mut was_leader, leader.is_leader(), &cost, &db).await {
             continue;
         }
         // Snapshot → mutate → swap: parking_lot guards aren't Send, so
@@ -637,9 +733,10 @@ pub async fn spot_price_poller(
         if let Err(e) = snap.persist(&db).await {
             tracing::warn!(error = %e, "cost-table persist failed");
         }
-        let stale = now_epoch() - snap.price_updated_at;
         *cost.write() = snap;
-        metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(stale);
+        // Re-emit post-swap so the leader's gauge doesn't lag one tick.
+        metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+            .set(now_epoch() - cost.read().price_updated_at());
     }
 }
 
@@ -660,6 +757,43 @@ pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> 
     .execute(db.pool())
     .await?;
     Ok(r.rows_affected())
+}
+
+/// Per-tick gauge-emit + leader-edge-reload, factored out of
+/// [`spot_price_poller`] for unit-testability (the poller body needs a
+/// live EC2 client). Returns `true` if the caller should proceed with
+/// the AWS/PG tick body.
+///
+/// - Emits `rio_scheduler_sla_hw_cost_stale_seconds` BEFORE the leader
+///   gate (per-replica metric — observability.md says it "climbs when …
+///   this replica is standby"; `r[obs.metric.scheduler-leader-gate]`
+///   does NOT list it).
+/// - On a false→true leader edge, reloads from PG so the new leader
+///   resumes from the previous leader's persisted state, not its own
+///   startup snapshot.
+pub(crate) async fn poller_tick_prelude(
+    was_leader: &mut bool,
+    is_leader: bool,
+    cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
+    db: &SchedulerDb,
+) -> bool {
+    metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+        .set(now_epoch() - cost.read().price_updated_at());
+    if !is_leader {
+        *was_leader = false;
+        return false;
+    }
+    if !*was_leader {
+        let cluster = cost.read().cluster().to_owned();
+        match CostTable::load(db, &cluster).await {
+            Ok(fresh) => *cost.write() = fresh,
+            Err(e) => {
+                tracing::warn!(error = %e, "cost reload on leader-acquire failed; using in-mem")
+            }
+        }
+        *was_leader = true;
+    }
+    true
 }
 
 /// Representative instance types per band for the spot-price poll. The
@@ -799,6 +933,13 @@ impl HwTable {
                 (h.clone(), f / bias)
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            // `f / bias` can push below [`HW_FACTOR_SANITY_FLOOR`] even
+            // with clamped inputs (e.g. 0.25/2.0). The result is divided
+            // into `T(c)` at solve_full's `feasible` gate; an unclamped
+            // tiny factor blows `t = T(c)/factor` up → `feasible(cap_c)
+            // = false` → entire band drops out for both Spot AND
+            // OnDemand.
+            .map(|(h, f)| (h, f.max(super::hw::HW_FACTOR_SANITY_FLOOR)))
             .unwrap_or_else(|| (String::new(), 1.0))
     }
 }
@@ -930,7 +1071,7 @@ mod tests {
         // Cluster A writes price=0.5 for (Hi, Spot) and a Hi-band
         // interrupt row.
         let mut a = CostTable::seeded("us-east-1");
-        a.price.insert((Band::Hi, Cap::Spot), 0.5);
+        a.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
         a.persist(&sdb).await.unwrap();
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
@@ -961,10 +1102,122 @@ mod tests {
 
         // B persists then A reloads: A's price unchanged (PK is
         // (cluster, key) — no overwrite).
-        b.price.insert((Band::Hi, Cap::Spot), 0.01);
+        b.set_price(Band::Hi, Cap::Spot, 0.01, 2000.0);
         b.persist(&sdb).await.unwrap();
         let a4 = CostTable::load(&sdb, "us-east-1").await.unwrap();
         assert!((a4.price(Band::Hi, Cap::Spot) - 0.5).abs() < 1e-9);
+    }
+
+    /// Regression: `persist()` wrote `updated_at = now()` instead of
+    /// the per-key data-time, so a tick where `poll_spot_once` failed
+    /// still advanced the persisted timestamp → on reload staleness was
+    /// lost and the next `fold_prices` `dt` was wrong.
+    #[tokio::test]
+    async fn persist_preserves_price_updated_at() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let mut t = CostTable::seeded("c");
+        t.set_price(Band::Hi, Cap::Spot, 0.5, 1000.0);
+        t.persist(&sdb).await.unwrap();
+        let r = CostTable::load(&sdb, "c").await.unwrap();
+        let at = r.price.get(&(Band::Hi, Cap::Spot)).unwrap().updated_at;
+        assert!(
+            (at - 1000.0).abs() < 1.0,
+            "reloaded updated_at must be data-time 1000, not now(); got {at}"
+        );
+    }
+
+    /// Regression: a single global `price_updated_at` advanced after
+    /// folding only keys present in `obs`; a band absent from a partial
+    /// obs kept its stale value but its decay reference moved forward
+    /// → under-decayed on next fold. With per-key timestamps each
+    /// value's decay `dt = now − that value's last-update`.
+    #[test]
+    fn fold_prices_partial_obs_decays_per_key() {
+        let mut t = CostTable {
+            price: HashMap::new(),
+            lambda: HashMap::new(),
+            cluster: String::new(),
+        };
+        let mut obs = HashMap::new();
+        obs.insert((Band::Hi, Cap::Spot), 0.02);
+        obs.insert((Band::Mid, Cap::Spot), 0.01);
+        t.fold_prices(&obs, 1000.0);
+        // t=1600: Mid only (Hi absent).
+        let mut obs2 = HashMap::new();
+        obs2.insert((Band::Mid, Cap::Spot), 0.015);
+        t.fold_prices(&obs2, 1600.0);
+        // Hi's updated_at must NOT have moved.
+        assert_eq!(t.price[&(Band::Hi, Cap::Spot)].updated_at, 1000.0);
+        // t=2200: Hi reappears. dt=1200 (vs old global-stamp dt=600).
+        let mut obs3 = HashMap::new();
+        obs3.insert((Band::Hi, Cap::Spot), 0.03);
+        t.fold_prices(&obs3, 2200.0);
+        // decay = 0.5^(1200/SPOT_HALFLIFE_SECS); SPOT_HALFLIFE_SECS=3h.
+        let decay = 0.5f64.powf(1200.0 / SPOT_HALFLIFE_SECS);
+        let want = 0.02 * decay + 0.03 * (1.0 - decay);
+        assert!(
+            (t.price(Band::Hi, Cap::Spot) - want).abs() < 1e-9,
+            "want {want}, got {}",
+            t.price(Band::Hi, Cap::Spot)
+        );
+    }
+
+    /// Regression (a): standby replicas `continue`d before the gauge
+    /// `.set()` so `hw_cost_stale_seconds` was frozen on standby.
+    /// Regression (b): on false→true leader edge the in-mem startup
+    /// snapshot was `persist()`ed, overwriting the previous leader's
+    /// evolved EMA.
+    #[tokio::test]
+    async fn poller_prelude_standby_emits_gauge_and_edge_reloads() {
+        use std::sync::Arc;
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+
+        // Seed PG with the previous leader's evolved state.
+        let mut prev = CostTable::seeded("c");
+        prev.set_price(Band::Hi, Cap::Spot, 0.08, 5000.0);
+        prev.persist(&sdb).await.unwrap();
+
+        // This replica's stale in-mem startup snapshot.
+        let mut mine = CostTable::seeded("c");
+        mine.set_price(Band::Hi, Cap::Spot, 0.02, 100.0);
+        let cost = Arc::new(parking_lot::RwLock::new(mine));
+
+        // (a) standby: emits gauge, returns false. Captured via local
+        // recorder so parallel tests can't interfere.
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        let mut was_leader = false;
+        let proceed = {
+            let _g = metrics::set_default_local_recorder(&rec);
+            poller_tick_prelude(&mut was_leader, false, &cost, &sdb).await
+        };
+        assert!(!proceed);
+        let saw_gauge = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(ck, _, _, _)| ck.key().name() == "rio_scheduler_sla_hw_cost_stale_seconds");
+        assert!(saw_gauge, "standby must emit the staleness gauge");
+        // Standby did NOT reload (still 0.02).
+        assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.02).abs() < 1e-9);
+
+        // (b) false→true edge: reloads from PG, returns true.
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        assert!(proceed);
+        assert!(was_leader);
+        assert!(
+            (cost.read().price(Band::Hi, Cap::Spot) - 0.08).abs() < 1e-9,
+            "leader-edge must reload PG state, not keep startup snapshot"
+        );
+
+        // Subsequent leader tick: no reload (would clobber in-flight
+        // mutation if it did).
+        cost.write().set_price(Band::Hi, Cap::Spot, 0.09, 6000.0);
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        assert!(proceed);
+        assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.09).abs() < 1e-9);
     }
 
     /// `refresh_lambda` advances `updated_at` to the rows' `MAX(at)`,

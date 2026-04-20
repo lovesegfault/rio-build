@@ -34,6 +34,16 @@ pub fn compute_vdists(versions: &[Option<String>], current: Option<&str>) -> Vec
     out
 }
 
+/// Lawson-Hanson tolerance. Shared between the KKT gradient gate, the
+/// SVD-solve tolerance, the inner accept-gate, and the inner
+/// alpha-filter so the four can never drift: the algorithm's
+/// termination invariant is **accept-gate fails ⇒ alpha-filter
+/// nonempty** (≥1 column drops per inner iteration); a `z_p[k] ∈
+/// (0, NNLS_TOL]` that fails the accept-gate but is excluded from alpha
+/// would yield `alpha = ∞` → `x` becomes ∞/NaN → inner loop spins
+/// forever inside `DagActor::handle_tick`.
+const NNLS_TOL: f64 = 1e-10;
+
 /// Lawson-Hanson active-set NNLS: min ||Ax - b||² s.t. x ≥ 0.
 fn nnls(a: &DMatrix<f64>, b: &DVector<f64>) -> DVector<f64> {
     let (_, m) = a.shape();
@@ -50,19 +60,22 @@ fn nnls(a: &DMatrix<f64>, b: &DVector<f64>) -> DVector<f64> {
         else {
             break;
         };
-        if wj <= 1e-10 {
+        if wj <= NNLS_TOL {
             break;
         }
         passive[j] = true;
-        loop {
+        // Hard bound: each inner iteration drops ≥1 passive column, so
+        // `m` is the worst case. Defense-in-depth — even if a future
+        // edit reintroduces a tolerance gap, the actor cannot hang.
+        for _ in 0..m {
             let cols: Vec<usize> = (0..m).filter(|i| passive[*i]).collect();
             let ap = a.select_columns(&cols);
             let z_p = ap
                 .clone()
                 .svd(true, true)
-                .solve(b, 1e-10)
+                .solve(b, NNLS_TOL)
                 .expect("svd solve");
-            if z_p.iter().all(|&v| v > 1e-10) {
+            if z_p.iter().all(|&v| v > NNLS_TOL) {
                 for (k, &ci) in cols.iter().enumerate() {
                     x[ci] = z_p[k];
                 }
@@ -71,12 +84,12 @@ fn nnls(a: &DMatrix<f64>, b: &DVector<f64>) -> DVector<f64> {
             let alpha = cols
                 .iter()
                 .enumerate()
-                .filter(|(k, _)| z_p[*k] <= 0.0)
+                .filter(|(k, _)| z_p[*k] <= NNLS_TOL)
                 .map(|(k, &ci)| x[ci] / (x[ci] - z_p[k]))
                 .fold(f64::INFINITY, f64::min);
             for (k, &ci) in cols.iter().enumerate() {
                 x[ci] += alpha * (z_p[k] - x[ci]);
-                if x[ci] <= 1e-10 {
+                if x[ci] <= NNLS_TOL {
                     passive[ci] = false;
                     x[ci] = 0.0;
                 }
@@ -318,8 +331,16 @@ fn irls_quantile(x: &[f64], y: &[f64], w: &[f64], tau: f64) -> (f64, f64, f64) {
 /// as a small-n sentinel (caller applies a Student-t PI factor). Degenerate design
 /// (constant c → undefined slope) falls through to an independent weighted p90.
 pub fn fit_memory(cs: &[f64], ms: &[u64], w: &[f64], n_eff: f64) -> MemFit {
-    let lc: Vec<f64> = cs.iter().map(|c| c.ln()).collect();
-    let lm: Vec<f64> = ms.iter().map(|m| (*m as f64).ln()).collect();
+    // `.max(1.0)` floors before `.ln()`: completion.rs persists
+    // `peak_memory_bytes = 0` as a legitimate sample point, but
+    // `ln(0) = -∞` and `wls_loglinear` has no NaN handling — `-∞ - (-∞)
+    // = NaN` collapses an entire key from `Coupled` to `Independent`.
+    // `ln(1) = 0` is a benign low outlier IRLS down-weights; the
+    // `Independent` p90 path below still uses raw `ms` so the
+    // percentile-doesn't-drag rationale survives. `cs` is floored
+    // symmetrically (`cpu_limit_cores` is `>= 1` in practice).
+    let lc: Vec<f64> = cs.iter().map(|c| c.max(1.0).ln()).collect();
+    let lm: Vec<f64> = ms.iter().map(|m| (*m as f64).max(1.0).ln()).collect();
     if n_eff >= 10.0 {
         let (a, b, r1) = irls_quantile(&lc, &lm, w, 0.9);
         if r1 >= 0.7 && a.is_finite() && b.is_finite() {
@@ -577,6 +598,51 @@ mod tests {
             panic!("expected Coupled")
         };
         assert_eq!(r1, 0.0); // small-n sentinel
+    }
+
+    /// Regression: accept-gate at `> NNLS_TOL`, alpha-filter at `<= 0.0`
+    /// → a `z_p[k] ∈ (0, NNLS_TOL]` failed accept yet was excluded from
+    /// alpha → `fold(∞, min) = ∞` → inner `loop {}` never broke. Ran
+    /// sync inside `DagActor::handle_tick` so the scheduler froze.
+    #[test]
+    fn nnls_tiny_positive_zp_terminates() {
+        // 1-col design where aᵀb / aᵀa ∈ (0, NNLS_TOL]: a=[[1e6]],
+        // b=[1e-5] → z_p = 1e-11. Under the old `<= 0.0` filter this
+        // hangs forever; with the unified threshold it terminates.
+        let a = DMatrix::from_row_slice(1, 1, &[1e6]);
+        let b = DVector::from_vec(vec![1e-5]);
+        let start = std::time::Instant::now();
+        let x = nnls(&a, &b);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "nnls must terminate (was: hang)"
+        );
+        assert!(x[0].is_finite());
+    }
+
+    /// Regression: `peak_memory_bytes = 0` (deliberately persisted by
+    /// completion.rs) yields `ln(0) = -∞`; `wls_loglinear` then NaNs and
+    /// the whole key collapsed from `Coupled` to `Independent`.
+    #[test]
+    fn fit_memory_tolerates_zero_sample() {
+        // 10 log-linear points + one zero. The zero must not poison the
+        // fit — it gets floored to `ln(1)=0` and IRLS down-weights it.
+        let cs: Vec<f64> = [1.0, 2.0, 4.0, 8.0, 16.0]
+            .into_iter()
+            .cycle()
+            .take(10)
+            .chain([4.0])
+            .collect();
+        let ms: Vec<u64> = cs[..10]
+            .iter()
+            .map(|c| ((20.0 + 0.5 * c.ln()).exp()) as u64)
+            .chain([0u64])
+            .collect();
+        let w = vec![1.0; 11];
+        let MemFit::Coupled { a, b, .. } = fit_memory(&cs, &ms, &w, 11.0) else {
+            panic!("zero sample must not collapse Coupled → Independent");
+        };
+        assert!(a.is_finite() && b.is_finite(), "a={a} b={b}");
     }
 
     #[test]
