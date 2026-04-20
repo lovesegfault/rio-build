@@ -108,7 +108,21 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     if is_permanent_auth_error(&e) {
-        anyhow::Error::new(BackendAuthError).context(msg)
+        // Render e's full source chain into the context string:
+        // SdkError's own Display is a fixed variant label ("dispatch
+        // failure"); the STS/IAM detail is in .source(). The walk
+        // mirrors `is_permanent_auth_error` above. BackendAuthError
+        // must stay the chain ROOT (grpc::storage_error / gc::drain
+        // downcast it as the innermost source), so `e` cannot be
+        // inserted into the chain — it's rendered into the context.
+        let mut detail = e.to_string();
+        let mut cur = e.source();
+        while let Some(s) = cur {
+            use std::fmt::Write as _;
+            let _ = write!(detail, ": {s}");
+            cur = s.source();
+        }
+        anyhow::Error::new(BackendAuthError).context(format!("{msg}: {detail}"))
     } else {
         anyhow::Error::new(e).context(msg)
     }
@@ -673,9 +687,67 @@ mod tests {
             "must walk source() chain to find credential-provider message"
         );
 
-        // classify_s3_error roots the anyhow chain at BackendAuthError.
+        // classify_s3_error roots the anyhow chain at BackendAuthError
+        // AND surfaces the source-chain detail in the context string —
+        // the `BackendAuthError` doc promises "the detailed message
+        // lives in the anyhow `.context(...)` layer above this marker".
         let any = classify_s3_error(outer(), "ctx".into());
         assert!(any.downcast_ref::<BackendAuthError>().is_some());
+        let rendered = format!("{any}");
+        assert!(
+            rendered.contains("credentials"),
+            "auth-branch context must include source-chain detail \
+             (Inner's message), got: {rendered}"
+        );
+        assert!(rendered.starts_with("ctx: "), "caller msg preserved");
+    }
+
+    /// Service-level auth (`code()=Some("AccessDenied")`): the IAM
+    /// action/principal/resource detail is in `e`'s top-level Display
+    /// and must reach the operator-visible context. Pre-fix the chain
+    /// was `["ctx", BackendAuthError]` only — the AWS detail was
+    /// dropped on the floor.
+    #[test]
+    fn classify_s3_error_auth_preserves_service_detail() {
+        #[derive(Debug)]
+        struct Svc {
+            meta: aws_sdk_s3::error::ErrorMetadata,
+        }
+        impl std::fmt::Display for Svc {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "AccessDenied: User arn:aws:iam::123:role/rio-store is not \
+                     authorized to perform s3:DeleteObject on resource \
+                     arn:aws:s3:::rio-chunks/chunks/ab/cd",
+                )
+            }
+        }
+        impl std::error::Error for Svc {}
+        impl ProvideErrorMetadata for Svc {
+            fn meta(&self) -> &aws_sdk_s3::error::ErrorMetadata {
+                &self.meta
+            }
+        }
+        let e = Svc {
+            meta: aws_sdk_s3::error::ErrorMetadata::builder()
+                .code("AccessDenied")
+                .build(),
+        };
+        assert!(is_permanent_auth_error(&e));
+
+        let any = classify_s3_error(e, "S3 DeleteObject failed for chunks/ab/cd".into());
+        // Marker still at root for downcast.
+        assert!(any.downcast_ref::<BackendAuthError>().is_some());
+        // anyhow Display = outermost context = what `error = %e` logs.
+        let rendered = format!("{any}");
+        assert!(
+            rendered.contains("s3:DeleteObject"),
+            "IAM action must reach operator-visible context, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("arn:aws:iam::123:role/rio-store"),
+            "principal ARN must reach operator-visible context, got: {rendered}"
+        );
     }
 
     #[test]
