@@ -6,6 +6,7 @@
 //! schedule independent of the client-facing SchedulerService RPCs.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,6 +18,16 @@ use rio_proto::ExecutorService;
 use crate::actor::{ActorCommand, HeartbeatPayload};
 
 use super::SchedulerGrpc;
+
+/// Monotonic per-stream epoch source. Each `BuildExecution` stream gets
+/// a fresh epoch on open; the reader task echoes it on
+/// `ExecutorDisconnected`. The actor compares against
+/// `ExecutorState::stream_epoch` to drop a stale disconnect from a
+/// prior stream (I-056a's late-disconnect half — connect-before-
+/// disconnect ordering observed live during deploy churn). Process-
+/// global (not per-`SchedulerGrpc`) since `SchedulerGrpc` is `Clone`d
+/// per-connection and all clones must share the sequence.
+static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -63,11 +74,17 @@ impl ExecutorService for SchedulerGrpc {
         let (output_tx, output_rx) =
             mpsc::channel::<Result<rio_proto::types::SchedulerMessage, Status>>(256);
 
+        // Per-stream epoch: starts at 1 (0 = "no stream yet" in
+        // ExecutorState::new). Captured into the reader closure below
+        // and echoed on ExecutorDisconnected.
+        let stream_epoch = STREAM_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+
         // Register the worker stream with the actor (blocking send — must not drop).
         self.actor
             .send_unchecked(ActorCommand::ExecutorConnected {
                 executor_id: executor_id.as_str().into(),
                 stream_tx: actor_tx,
+                stream_epoch,
             })
             .await
             .map_err(Self::actor_error_to_status)?;
@@ -242,6 +259,7 @@ impl ExecutorService for SchedulerGrpc {
             if actor_for_recv
                 .send_unchecked(ActorCommand::ExecutorDisconnected {
                     executor_id: executor_id_for_recv.into(),
+                    stream_epoch,
                 })
                 .await
                 .is_err()

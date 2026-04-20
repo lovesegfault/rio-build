@@ -56,6 +56,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "drain-auth".into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for("drain-auth"),
         })
         .await?;
 
@@ -151,6 +152,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "i066-a".into(),
             stream_tx: stream_tx_a,
+            stream_epoch: next_stream_epoch_for("i066-a"),
         })
         .await?;
     send_heartbeat_with(&handle, "i066-a", "x86_64-linux", |hb| {
@@ -374,10 +376,13 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
 /// post-send, I-032 pre-d11245b4). Before this fix the slot stayed dead
 /// forever: `has_capacity()` saw 1/1 and the derivation sat Assigned with
 /// no path to Ready short of executor disconnect.
-// r[verify sched.heartbeat.phantom-drain]
+// r[verify sched.heartbeat.phantom-drain+2]
 #[tokio::test]
 async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task, mut stream_rx) =
         setup_with_worker("phantom-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
@@ -386,7 +391,11 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Precondition: dispatch assigned the drv (single candidate).
-    // Worker's running_build has it; DAG is Assigned.
+    // Worker's running_build has it; DAG is Assigned. Consume the
+    // initial assignment from the stream so the SECOND assignment
+    // (post-drain re-dispatch) is the discriminating observable.
+    let first = recv_assignment(&mut stream_rx).await;
+    assert!(first.drv_path.contains(drv_hash));
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Assigned);
     let w = expect_worker(&handle, "phantom-worker").await;
@@ -408,10 +417,31 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
         DerivationStatus::Assigned,
         "first miss leaves DAG state alone"
     );
+    assert_eq!(
+        recorder.get("rio_scheduler_phantom_assignments_drained_total{}"),
+        0,
+        "first miss must not increment the drain counter"
+    );
 
     // Second miss: phantom confirmed. Drain → reset_to_ready →
     // dispatch_ready re-assigns to the (now-free) same worker.
     send_heartbeat(&handle, "phantom-worker", "x86_64-linux").await?;
+    barrier(&handle).await;
+    // Discriminator: a SECOND WorkAssignment arrives. With drain
+    // disabled the drv simply stays Assigned and no second assignment
+    // is sent — recv_assignment would time out. This proves the full
+    // drain → Ready → re-dispatch chain, not just end-state equality.
+    let second = recv_assignment(&mut stream_rx).await;
+    assert!(
+        second.drv_path.contains(drv_hash),
+        "drain → Ready → re-dispatched same drv; got {}",
+        second.drv_path
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_phantom_assignments_drained_total{}"),
+        1,
+        "second miss must increment the drain counter exactly once"
+    );
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
@@ -419,13 +449,9 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
         "second miss drained → Ready → dispatch_ready re-assigned \
          (only worker, only drv, deterministic)"
     );
-    // The re-assignment proves the drain happened: without it, the
-    // slot would still be 1/1 (phantom holds it) and dispatch would
-    // skip. The drain WARNs + resets to Ready; the same heartbeat's
-    // dispatch_ready sees 0/1 + Ready in queue → assigns again.
-    // Distinguish from "nothing happened": failed_builders must be
-    // empty. The drain path explicitly does NOT penalize the worker
-    // (a phantom is not a worker failure).
+    // The drain path explicitly does NOT penalize the worker (a
+    // phantom is not a worker failure). Pins drain ≠ reassign_
+    // derivations — the latter would add to failed_builders.
     assert!(
         info.retry.failed_builders.is_empty(),
         "phantom drain must NOT add to failed_builders — \
@@ -571,13 +597,22 @@ async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestRe
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Poisoned);
 
-    // Re-seed the leak: force_assign on a Poisoned drv fails the
-    // status transition (Poisoned → Assigned is invalid) so it
-    // returns false WITHOUT inserting into running_build. We need
-    // a different re-seed: the test below covers this scenario via
-    // the two-worker race; here we just assert the reconcile filter
-    // logic by checking the slot stays clear after a heartbeat (it
-    // was already clear from the completion-side fix).
+    // Re-seed the leak directly: debug_set_running_build bypasses the
+    // DAG-status guard (force_assign would refuse the Poisoned→Assigned
+    // transition). This puts the drv back into running_build so the
+    // heartbeat reconcile's `prev_kept` filter is what's under test —
+    // not the completion-side clear above.
+    let ok = handle
+        .debug_set_running_build("i042-hb-w", drv_hash)
+        .await?;
+    assert!(ok);
+    let w = expect_worker(&handle, "i042-hb-w").await;
+    assert_eq!(
+        w.running_build,
+        Some(drv_hash.to_string()),
+        "precondition: re-seeded leak"
+    );
+
     send_heartbeat(&handle, "i042-hb-w", "x86_64-linux").await?;
     let w = expect_worker(&handle, "i042-hb-w").await;
     assert!(
@@ -1856,10 +1891,13 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
 async fn test_worker_disconnect_unknown_noop() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    // Disconnect a worker that was never connected.
+    // Disconnect a worker that was never connected. Epoch 0: there is
+    // no recorded epoch (no prior connect); the unknown-worker early-
+    // return fires before the epoch check anyway.
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "ghost".into(),
+            stream_epoch: 0,
         })
         .await?;
 
@@ -1904,6 +1942,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "hb-worker".into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for("hb-worker"),
         })
         .await?;
 
@@ -2464,7 +2503,7 @@ async fn test_orphan_watcher_reattach_resets_timer() -> TestResult {
             reply: reply_tx,
         })
         .await?;
-    let (_rx2, _seq) = reply_rx.await??;
+    let (rx2, _seq) = reply_rx.await??;
 
     // Second tick: receiver_count > 0 → orphaned_since reset, no cancel.
     handle.send_unchecked(ActorCommand::Tick).await?;
@@ -2475,6 +2514,30 @@ async fn test_orphan_watcher_reattach_resets_timer() -> TestResult {
         status.state,
         rio_proto::types::BuildState::Active as i32,
         "reattached build must stay Active"
+    );
+
+    // Now drop the reattached watcher and observe the next two ticks.
+    // The reset's only observable effect is that this re-drop gets a
+    // FRESH grace window: first post-re-drop tick stamps fresh →
+    // Active. Without the reset (housekeeping.rs `orphaned_since =
+    // None` deleted), `orphaned_since` is still Some(t1) from the
+    // initial drop, grace=ZERO has elapsed, and this tick cancels.
+    drop(rx2);
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "first tick after re-drop must only stamp, not cancel — \
+         proves orphaned_since was reset on reattach"
+    );
+    // Second post-re-drop tick: grace=ZERO elapsed → cancel.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Cancelled as i32,
+        "second tick after re-drop should cancel (grace=ZERO elapsed)"
     );
 
     Ok(())
@@ -2782,6 +2845,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "fail-worker".into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for("fail-worker"),
         })
         .await?;
     send_heartbeat_with(&handle, "fail-worker", "x86_64-linux", |_| {}).await?;
@@ -3140,6 +3204,7 @@ async fn test_prefetch_complete_burst_capped() -> TestResult {
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "pfc-boot".into(),
+            stream_epoch: stream_epoch_for("pfc-boot"),
         })
         .await?;
     drop(boot_rx);
@@ -3196,6 +3261,315 @@ async fn test_prefetch_complete_burst_capped() -> TestResult {
         count_assignments(&mut rx_last),
         1,
         "deferred PrefetchComplete dispatch should land after one Tick"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Adopt-conflict / phantom-drain ownership (bug_263 / bug_182)
+// ---------------------------------------------------------------------
+
+/// Adopt-conflict: W1 reports D while D is Assigned→W2. After W1's
+/// local build exits and it sends two empty heartbeats, the phantom
+/// path must NOT reset D — `prev_kept` requires `assigned_executor ==
+/// W1`, which fails, so D drops out of W1's tracking instead of
+/// becoming a confirmed phantom. Before the fix, `drain_phantoms`
+/// reset D to Ready while W2 was mid-build → W2's completion dropped
+/// on the floor and D re-dispatched to a third worker.
+// r[verify sched.heartbeat.phantom-drain+2]
+#[tokio::test]
+async fn test_adopt_conflict_assigned_elsewhere_not_phantom_drained() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task, mut rx1) = setup_with_worker("adopt-w1", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "adopt-x";
+    let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx1).await;
+    let w1 = expect_worker(&handle, "adopt-w1").await;
+    assert_eq!(w1.running_build, Some(drv_hash.to_string()));
+
+    // W2 connects and steals the DAG assignment via debug_force_assign
+    // (resets X→Ready→Assigned-W2, leaves W1.running_build untouched).
+    // This is the adopt-conflict state: W1.running_build=X,
+    // DAG[X].assigned_executor=W2.
+    let _rx2 = connect_executor(&handle, "adopt-w2", "x86_64-linux").await?;
+    let ok = handle.debug_force_assign(drv_hash, "adopt-w2").await?;
+    assert!(ok);
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(info.assigned_executor.as_deref(), Some("adopt-w2"));
+    let w1 = expect_worker(&handle, "adopt-w1").await;
+    assert_eq!(
+        w1.running_build,
+        Some(drv_hash.to_string()),
+        "precondition: W1's running_build still points at X"
+    );
+    let drained_before = recorder.get("rio_scheduler_phantom_assignments_drained_total{}");
+
+    // Two empty W1 heartbeats. Pre-fix: prev_kept=Some(X) (Assigned
+    // matches, no ownership check) → phantom suspect → confirmed →
+    // drain_phantoms resets X to Ready while W2 is mid-build.
+    send_heartbeat(&handle, "adopt-w1", "x86_64-linux").await?;
+    send_heartbeat(&handle, "adopt-w1", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "X must stay Assigned (W2 mid-build), not reset to Ready"
+    );
+    assert_eq!(
+        info.assigned_executor.as_deref(),
+        Some("adopt-w2"),
+        "X must stay assigned to W2"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_phantom_assignments_drained_total{}"),
+        drained_before,
+        "phantom-drain counter must NOT increment for an assigned-elsewhere drv"
+    );
+    let w1 = expect_worker(&handle, "adopt-w1").await;
+    assert!(
+        w1.running_build.is_none(),
+        "W1's stale running_build entry should drop on first empty heartbeat \
+         (prev_kept ownership check failed)"
+    );
+    Ok(())
+}
+
+/// Adopt-conflict with terminal DAG state: W1 keeps reporting D while
+/// DAG[D]=Completed (W2 finished first). `running_build` must stay
+/// `Some(D)` across every heartbeat — matching the worker's
+/// authoritative claim of being busy — and clear only when W1's
+/// heartbeat omits D. Before the fix, the (None, Some(hb)) match arm's
+/// guard caused None↔Some(D) oscillation every heartbeat, firing
+/// spurious `became_idle=true` and inline dispatch to a busy worker.
+// r[verify sched.heartbeat.adopt]
+#[tokio::test]
+async fn test_adopt_conflict_terminal_stays_busy_no_oscillation() -> TestResult {
+    let (_db, handle, _task, mut rx1) = setup_with_worker("osc-w1", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "osc-d";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx1).await;
+
+    // W2 connects, steals the DAG assignment, completes D.
+    let _rx2 = connect_executor(&handle, "osc-w2", "x86_64-linux").await?;
+    let ok = handle.debug_force_assign(drv_hash, "osc-w2").await?;
+    assert!(ok);
+    complete_success_empty(&handle, "osc-w2", &drv_path).await?;
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(info.status, DerivationStatus::Completed);
+
+    // W1 still has D running locally and keeps reporting it. After
+    // EVERY heartbeat, W1.running_build must be Some(D) — no
+    // oscillation to None.
+    for i in 0..4 {
+        send_heartbeat_with(&handle, "osc-w1", "x86_64-linux", |hb| {
+            hb.running_build = Some(drv_path.clone());
+        })
+        .await?;
+        barrier(&handle).await;
+        let w1 = expect_worker(&handle, "osc-w1").await;
+        assert_eq!(
+            w1.running_build,
+            Some(drv_hash.to_string()),
+            "heartbeat #{i}: running_build must stay Some(D), not oscillate to None"
+        );
+    }
+
+    // W1's local build exits → heartbeat omits D → cleared (the
+    // intended behavior per the adopt-conflict comment).
+    send_heartbeat_with(&handle, "osc-w1", "x86_64-linux", |_| {}).await?;
+    barrier(&handle).await;
+    let w1 = expect_worker(&handle, "osc-w1").await;
+    assert!(
+        w1.running_build.is_none(),
+        "cleared once W1's heartbeat omits D"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// emit_progress chokepoint (bug_101 / bug_440)
+// ---------------------------------------------------------------------
+
+/// Drain a watcher's BuildEvent receiver and count Progress events.
+fn drain_progress_count(ev: &mut broadcast::Receiver<rio_proto::types::BuildEvent>) -> usize {
+    use rio_proto::types::build_event::Event;
+    let mut n = 0;
+    while let Ok(e) = ev.try_recv() {
+        if matches!(e.event, Some(Event::Progress(_))) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Force-drain (preemption hook) must emit BuildProgress for the
+/// affected build. Before the fix, `handle_drain_executor(force=true)`
+/// called `reassign_derivations` but never `emit_progress`, so a quiet
+/// build's dashboard showed the drv as still Running on the drained
+/// worker until the next unrelated event.
+#[tokio::test]
+async fn test_force_drain_emits_progress() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("emit-drain-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_single_node(
+        &handle,
+        build_id,
+        "emit-drain-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx).await;
+    barrier(&handle).await;
+    // Drain the merge/dispatch events so post-drain Progress is what
+    // we count, then wait out the I-140 250ms debounce window so the
+    // reassign emit isn't suppressed by the dispatch emit just above.
+    let _ = drain_progress_count(&mut ev);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "emit-drain-w".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    let _ = reply_rx.await?;
+    barrier(&handle).await;
+
+    assert!(
+        drain_progress_count(&mut ev) >= 1,
+        "force-drain must emit BuildProgress for the affected build"
+    );
+    Ok(())
+}
+
+/// `drain_phantoms` must emit BuildProgress for the affected build.
+/// Before the fix, the drv was reset to Ready but no Progress event
+/// was published; the dashboard kept showing it as Running until the
+/// next unrelated dispatch/completion (which on a quiet build might
+/// not arrive for minutes).
+#[tokio::test]
+async fn test_phantom_drain_emits_progress() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("emit-phantom-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_single_node(
+        &handle,
+        build_id,
+        "emit-phantom-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx).await;
+    barrier(&handle).await;
+
+    // First miss: TOCTOU keep. Drain pre-miss events, then wait out
+    // the I-140 250ms debounce window so the drain emit isn't
+    // suppressed by the dispatch emit above.
+    send_heartbeat(&handle, "emit-phantom-w", "x86_64-linux").await?;
+    barrier(&handle).await;
+    let _ = drain_progress_count(&mut ev);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second miss: phantom confirmed → drain_phantoms.
+    send_heartbeat(&handle, "emit-phantom-w", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    assert!(
+        drain_progress_count(&mut ev) >= 1,
+        "phantom drain must emit BuildProgress for the affected build"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// stream_epoch (bug_229)
+// ---------------------------------------------------------------------
+
+/// I-056a late-disconnect half: a stale `ExecutorDisconnected` from a
+/// prior stream (carrying the old epoch) must be ignored once a
+/// reconnect overwrote `stream_epoch`. Before the fix, the late
+/// disconnect removed the freshly-reconnected entry, dropped the new
+/// stream's tx (worker churns through another reconnect), spuriously
+/// reassigned `running_build`, and over-counted the disconnect metric.
+#[tokio::test]
+async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task) = setup().await;
+
+    let mut rx1 = connect_executor(&handle, "epoch-w", "x86_64-linux").await?;
+    let epoch1 = stream_epoch_for("epoch-w");
+    let build_id = Uuid::new_v4();
+    let drv_hash = "epoch-drv";
+    let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx1).await;
+
+    // Reconnect WITHOUT sending the disconnect first (entry persists,
+    // epoch overwritten). This is the connect-before-disconnect
+    // ordering observed live.
+    let _rx2 = connect_executor(&handle, "epoch-w", "x86_64-linux").await?;
+    let epoch2 = stream_epoch_for("epoch-w");
+    assert_ne!(epoch1, epoch2);
+    let disconnects_before = recorder.get("rio_scheduler_worker_disconnects_total{}");
+
+    // Late disconnect from the OLD reader task arrives.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "epoch-w".into(),
+            stream_epoch: epoch1,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Entry still present; running_build NOT spuriously reassigned;
+    // metric NOT incremented.
+    let w = expect_worker(&handle, "epoch-w").await;
+    assert_eq!(
+        w.running_build,
+        Some(drv_hash.to_string()),
+        "stale disconnect must not reassign running_build"
+    );
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "drv must stay Assigned, not reset to Ready"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_worker_disconnects_total{}"),
+        disconnects_before,
+        "stale disconnect must not increment the disconnect counter"
+    );
+
+    // Current-epoch disconnect → entry removed, drv reassigned.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "epoch-w".into(),
+            stream_epoch: epoch2,
+        })
+        .await?;
+    barrier(&handle).await;
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        workers.iter().all(|w| w.executor_id != "epoch-w"),
+        "current-epoch disconnect should remove the entry"
+    );
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(info.status, DerivationStatus::Ready);
+    assert_eq!(
+        recorder.get("rio_scheduler_worker_disconnects_total{}"),
+        disconnects_before + 1
     );
     Ok(())
 }

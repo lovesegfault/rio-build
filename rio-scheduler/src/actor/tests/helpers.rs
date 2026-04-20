@@ -3,6 +3,39 @@
 use super::*;
 use tokio::sync::mpsc;
 
+/// Per-stream-epoch source for tests. Mirrors the production
+/// `STREAM_EPOCH_SEQ` in `grpc/executor_service.rs`. Process-global so
+/// every `connect_executor*` (and inline `ExecutorConnected{..}`
+/// construction) draws from the same monotonic sequence regardless of
+/// which test or helper allocated it.
+static STREAM_EPOCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Last epoch allocated per executor_id. `disconnect()` and inline
+/// `ExecutorDisconnected{..}` sites read this so the epoch matches the
+/// connect's. Tests run in parallel but use distinct executor names,
+/// so per-key races are not a concern.
+static STREAM_EPOCHS: std::sync::LazyLock<dashmap::DashMap<String, u64>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Allocate a fresh stream epoch for `executor_id` and record it.
+/// Call at every `ExecutorConnected{..}` construction site (helper or
+/// inline).
+pub(crate) fn next_stream_epoch_for(executor_id: &str) -> u64 {
+    let epoch = STREAM_EPOCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    STREAM_EPOCHS.insert(executor_id.to_string(), epoch);
+    epoch
+}
+
+/// Current recorded epoch for `executor_id`. Call at every
+/// `ExecutorDisconnected{..}` construction site. Panics if no connect
+/// preceded — that's a test bug (production never sends disconnect
+/// without a prior connect from the same reader task).
+pub(crate) fn stream_epoch_for(executor_id: &str) -> u64 {
+    STREAM_EPOCHS
+        .get(executor_id)
+        .map(|e| *e)
+        .unwrap_or_else(|| panic!("stream_epoch_for({executor_id:?}): no prior connect recorded"))
+}
+
 // Re-exports: fixtures imported once here, used by sibling test modules
 // via `use super::*` and by grpc/tests.rs via `crate::actor::tests::*`.
 // `pub(crate)` (not `pub(super)`) so grpc/tests.rs can reach them through
@@ -354,6 +387,7 @@ pub(crate) async fn connect_executor_with(
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: executor_id.into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for(executor_id),
         })
         .await?;
     send_heartbeat_with(handle, executor_id, system, f).await?;
@@ -745,6 +779,7 @@ pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: id.into(),
+            stream_epoch: stream_epoch_for(id),
         })
         .await?;
     barrier(handle).await;

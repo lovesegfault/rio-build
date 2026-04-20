@@ -180,8 +180,8 @@ On dispatch, the scheduler writes the assigned derivation's input-closure paths 
 r[sched.heartbeat.adopt]
 A heartbeat-reported running build the scheduler doesn't have on record for that executor is adopted into BOTH `executor.running_build` (so dispatch sees at-capacity) AND the DAG node (so dispatch_ready won't re-pop it). Expected after scheduler restart: recovery's reconcile may have reset the assignment to Ready while the executor still has it in-flight.
 
-r[sched.heartbeat.phantom-drain]
-If the scheduler-kept running build is missing from the executor's heartbeat report across two consecutive heartbeats (past the ~10s race window), the scheduler drains the phantom assignment: the derivation is reset to Ready and re-queued.
+r[sched.heartbeat.phantom-drain+2]
+If the scheduler-kept running build assigned to that executor is missing from the executor's heartbeat report across two consecutive heartbeats (past the ~10s race window), the scheduler drains the phantom assignment: the derivation is reset to Ready and re-queued. A derivation assigned to a different executor is never drained from this executor's heartbeat.
 
 r[sched.breaker.cache-check+2]
 The merge-time `FindMissingPaths` cache check goes through a circuit breaker that opens after 5 consecutive store-side failures and auto-closes after 30 s. While open, each `SubmitBuild` still attempts the cache check as a half-open probe; on probe failure the scheduler **rejects `SubmitBuild` with `UNAVAILABLE`** rather than queueing a 100%-miss DAG. A successful probe closes the breaker immediately and uses the result. Under threshold (failures 1–4): proceed as if the cache check missed. This fail-**closed** policy applies only to new submissions at merge time; the in-flight stale-completed re-verify path (`r[sched.merge.stale-completed-verify]`) remains fail-**open** so an already-admitted DAG is never retroactively rejected by a transient store outage.

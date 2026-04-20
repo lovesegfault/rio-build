@@ -33,6 +33,7 @@ async fn test_stale_completion_dropped() -> TestResult {
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "stale-a".into(),
+            stream_epoch: stream_epoch_for("stale-a"),
         })
         .await?;
     drop(rx_a);

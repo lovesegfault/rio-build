@@ -110,12 +110,14 @@ impl DagActor {
         &mut self,
         executor_id: &ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
+        stream_epoch: u64,
     ) {
-        info!(executor_id = %executor_id, "worker stream connected");
+        info!(executor_id = %executor_id, stream_epoch, "worker stream connected");
 
         let entry = self.executors.entry(executor_id.clone());
         let is_reconnect = matches!(entry, std::collections::hash_map::Entry::Occupied(_));
         let worker = entry.or_insert_with(|| ExecutorState::new(executor_id.clone()));
+        worker.stream_epoch = stream_epoch;
 
         // I-056a: clear scheduler-side `draining` and `store_degraded`
         // on reconnect. We're here because the disconnect signal
@@ -123,7 +125,10 @@ impl DagActor {
         // handshake when the new stream's connect arrived). Both flags
         // reflect prior-session state — stale. Live: fetchers stuck
         // 22 min after deploy churn drained them; only restart
-        // cleared it.
+        // cleared it. The late-disconnect half of that race is the
+        // `stream_epoch` check in `handle_executor_disconnected`: the
+        // old reader's `ExecutorDisconnected` carries the prior epoch
+        // and is ignored once this assignment overwrote it.
         //
         // NOT `draining_hb`: I-063 split the worker's OWN drain state
         // (SIGTERM received) into a separate heartbeat-authoritative
@@ -255,12 +260,37 @@ impl DagActor {
         }
     }
 
-    pub(super) async fn handle_executor_disconnected(&mut self, executor_id: &ExecutorId) {
-        info!(executor_id = %executor_id, "worker disconnected");
-
-        let Some(worker) = self.executors.remove(executor_id) else {
+    pub(super) async fn handle_executor_disconnected(
+        &mut self,
+        executor_id: &ExecutorId,
+        stream_epoch: u64,
+    ) {
+        let Some(worker) = self.executors.get(executor_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
         };
+        // I-056a late-disconnect half: connect-before-disconnect
+        // ordering happens in production (old reader task still in
+        // TCP/h2 close handshake when the new stream's connect
+        // arrived). Without this guard the late `ExecutorDisconnected`
+        // from the OLD reader removes the freshly-reconnected entry —
+        // `tx_NEW` is dropped (worker churns through another
+        // reconnect), `running_build` is spuriously reassigned, and
+        // `rio_scheduler_worker_disconnects_total` over-counts.
+        if worker.stream_epoch != stream_epoch {
+            debug!(
+                executor_id = %executor_id,
+                stale = stream_epoch,
+                current = worker.stream_epoch,
+                "stale ExecutorDisconnected from prior stream — ignoring (I-056a late-half)"
+            );
+            return;
+        }
+        info!(executor_id = %executor_id, stream_epoch, "worker disconnected");
+
+        let worker = self
+            .executors
+            .remove(executor_id)
+            .expect("checked get() above");
 
         // Only decrement if worker was fully registered (stream + heartbeat).
         // Otherwise the gauge goes negative for workers that connected a stream
@@ -296,17 +326,6 @@ impl DagActor {
         }
         self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
-
-        // Dashboard: running count dropped; assigned_executors lost
-        // this worker. Without emit_progress here, a quiet build shows
-        // stale state until the next unrelated dispatch/completion.
-        let affected: std::collections::HashSet<Uuid> = to_reassign
-            .iter()
-            .flat_map(|h| self.get_interested_builds(h))
-            .collect();
-        for build_id in affected {
-            self.emit_progress(build_id);
-        }
 
         if was_registered {
             metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
@@ -353,6 +372,7 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
     ) {
+        let mut affected: std::collections::HashSet<Uuid> = Default::default();
         for drv_hash in drv_hashes {
             // Re-read existing poison state so 3 prior REAL failures
             // (recorded by handle_transient_failure) + this disconnect
@@ -383,8 +403,20 @@ impl DagActor {
                 }
                 self.persist_status(drv_hash, DerivationStatus::Ready, None)
                     .await;
+                affected.extend(self.get_interested_builds(drv_hash));
                 self.push_ready(drv_hash.clone());
             }
+        }
+        // Dashboard: running count dropped; assigned_executors lost
+        // this worker. Without emit_progress here, a quiet build shows
+        // stale state until the next unrelated dispatch/completion.
+        // Done at the chokepoint so every caller (disconnect, force-
+        // drain, backstop-timeout) gets it for free and future callers
+        // can't repeat the omission. `poison_and_cascade` emits its
+        // own events; only the reset-to-Ready arm needs the explicit
+        // emit.
+        for build_id in affected {
+            self.emit_progress(build_id);
         }
     }
 
@@ -933,7 +965,7 @@ impl DagActor {
     /// Returns `(reconciled_running_build, suspect_for_next_hb,
     /// confirmed_phantoms_to_drain)`.
     // r[impl sched.heartbeat.adopt]
-    // r[impl sched.heartbeat.phantom-drain]
+    // r[impl sched.heartbeat.phantom-drain+2]
     fn reconcile_running_build(
         &mut self,
         executor_id: &ExecutorId,
@@ -951,7 +983,13 @@ impl DagActor {
             .get(executor_id.as_str())
             .and_then(|w| w.running_build.clone());
 
-        // Keep the scheduler-assigned build if still in-flight.
+        // Keep the scheduler-assigned build if still in-flight ON THIS
+        // EXECUTOR. The ownership check matters for the adopt-conflict
+        // path (W1 reports D, DAG has D Assigned→W2): without it, W1's
+        // `running_build=D` survives as `prev_kept=Some(D)`, two empty
+        // W1 heartbeats turn D into a confirmed phantom, and
+        // `drain_phantoms` resets D to Ready while W2 is mid-build —
+        // W2's eventual completion is then dropped on the floor.
         let prev_kept: Option<DrvHash> = prev_running.as_ref().and_then(|h| {
             self.dag
                 .node(h)
@@ -959,7 +997,7 @@ impl DagActor {
                     matches!(
                         s.status(),
                         DerivationStatus::Assigned | DerivationStatus::Running
-                    )
+                    ) && s.assigned_executor.as_ref() == Some(executor_id)
                 })
                 .then(|| h.clone())
         });
@@ -975,9 +1013,23 @@ impl DagActor {
         // the DAG-side adoption, openssl was re-dispatched while two
         // draining workers were already running it → both ended up in
         // failed_builders → I-065 poisoned a passing build.
+        //
+        // Whenever the worker reports `Some(hb)` and we have nothing
+        // else for it, `running_build = Some(hb)` — matching the
+        // worker's authoritative claim of being busy. The
+        // `adopt_heartbeat_build` SIDE-EFFECT (DAG adoption + log/
+        // metric) is gated separately on `prev_running != Some(hb)` so
+        // it fires once on the first transition, not every heartbeat.
+        // Without the split, an adopt-conflict worker whose DAG[D] is
+        // terminal (W2 completed first) would oscillate None↔Some(D)
+        // every heartbeat: prev_kept=None, guard false → fall through
+        // to kept.clone()=None → spurious became_idle → inline
+        // dispatch_ready to a worker that's actually busy.
         let mut reconciled: Option<DrvHash> = match (&prev_kept, &heartbeat_hash) {
-            (None, Some(hb)) if prev_running.as_ref() != Some(hb) => {
-                self.adopt_heartbeat_build(executor_id, hb);
+            (None, Some(hb)) => {
+                if prev_running.as_ref() != Some(hb) {
+                    self.adopt_heartbeat_build(executor_id, hb);
+                }
                 Some(hb.clone())
             }
             (kept, _) => kept.clone(),
@@ -1022,11 +1074,37 @@ impl DagActor {
     /// never heard about it (I-032). Penalizing the executor_id would
     /// recreate the very dead-capacity problem this drain exists to
     /// fix.
-    pub(super) async fn drain_phantoms(&mut self, phantoms: Vec<DrvHash>) {
+    ///
+    /// `executor_id`: the heartbeating worker. Guarded so a phantom
+    /// assigned to a DIFFERENT worker is never reset — defense-in-
+    /// depth for the adopt-conflict case (`prev_kept`'s ownership
+    /// check is the primary guard; this makes the clobber impossible
+    /// even if that regresses).
+    pub(super) async fn drain_phantoms(
+        &mut self,
+        executor_id: &ExecutorId,
+        phantoms: Vec<DrvHash>,
+    ) {
+        let mut affected: std::collections::HashSet<Uuid> = Default::default();
         for phantom in phantoms {
             let Some(state) = self.dag.node_mut(&phantom) else {
                 continue;
             };
+            if state
+                .assigned_executor
+                .as_ref()
+                .is_some_and(|a| a != executor_id)
+            {
+                // Adopt-conflict residue: W1's stale running_build
+                // entry pointed at a drv now owned by W2. prev_kept's
+                // ownership check should have dropped it before it
+                // became a phantom; if it didn't, refuse the reset
+                // here so W2's in-flight build isn't yanked.
+                debug!(drv_hash = %phantom, owner = ?state.assigned_executor,
+                       reporter = %executor_id,
+                       "phantom drain: assigned to a different executor; skipping");
+                continue;
+            }
             if let Err(e) = state.reset_to_ready() {
                 // State changed under us (completion arrived between
                 // heartbeat and here, or another build cancelled it).
@@ -1037,7 +1115,15 @@ impl DagActor {
             }
             self.persist_status(&phantom, DerivationStatus::Ready, None)
                 .await;
+            affected.extend(self.get_interested_builds(&phantom));
             self.push_ready(phantom);
+        }
+        // Dashboard: running count dropped; assigned_executors lost
+        // this worker. Emit so a quiet build doesn't show stale
+        // Running until the next unrelated dispatch/completion. Same
+        // chokepoint rationale as `reassign_derivations`.
+        for build_id in affected {
+            self.emit_progress(build_id);
         }
     }
 

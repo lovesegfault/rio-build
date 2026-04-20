@@ -1704,6 +1704,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
         handle
             .send_unchecked(ActorCommand::ExecutorDisconnected {
                 executor_id: format!("w{w}").into(),
+                stream_epoch: stream_epoch_for(&format!("w{w}")),
             })
             .await?;
     }

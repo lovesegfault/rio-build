@@ -300,6 +300,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "tight-worker".into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for("tight-worker"),
         })
         .await?;
     send_heartbeat(&handle, "tight-worker", "x86_64-linux").await?;
@@ -332,6 +333,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "tight-worker".into(),
+            stream_epoch: stream_epoch_for("tight-worker"),
         })
         .await?;
 

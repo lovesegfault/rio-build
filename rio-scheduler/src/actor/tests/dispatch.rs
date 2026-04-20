@@ -1462,7 +1462,7 @@ async fn pending_intent_timeout_marks_ice() {
     // Heartbeat with intent_id="fresh" clears it (pod made it past
     // Pending). handle_heartbeat requires a stream entry first.
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    actor.handle_worker_connected(&"w0".into(), tx);
+    actor.handle_worker_connected(&"w0".into(), tx, next_stream_epoch_for("w0"));
     actor.handle_heartbeat(HeartbeatPayload {
         executor_id: "w0".into(),
         systems: vec!["x86_64-linux".into()],
@@ -1996,7 +1996,7 @@ fn bare_connect_builder(
     id: &str,
 ) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
     let (tx, rx) = mpsc::channel(8);
-    actor.handle_worker_connected(&id.into(), tx);
+    actor.handle_worker_connected(&id.into(), tx, next_stream_epoch_for(id));
     actor.handle_heartbeat(HeartbeatPayload {
         executor_id: id.into(),
         systems: vec!["x86_64-linux".into()],
@@ -2067,6 +2067,7 @@ async fn connect_executor_with_intent(
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: executor_id.into(),
             stream_tx: tx,
+            stream_epoch: next_stream_epoch_for(executor_id),
         })
         .await?;
     send_heartbeat_with(handle, executor_id, "x86_64-linux", |hb| {

@@ -235,6 +235,25 @@ impl ActorHandle {
         .await
     }
 
+    /// Set `worker.running_build` directly, bypassing DAG-status guards.
+    /// For the heartbeat-reconcile safety-net test where the drv is
+    /// terminal (Poisoned). Returns `false` if the executor isn't
+    /// registered.
+    pub async fn debug_set_running_build(
+        &self,
+        executor_id: &str,
+        drv_hash: &str,
+    ) -> Result<bool, ActorError> {
+        let executor_id = executor_id.into();
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SetRunningBuild {
+            executor_id,
+            drv_hash,
+            reply,
+        })
+        .await
+    }
+
     /// Backdate `running_since` and force Running status. For
     /// backstop-timeout tests. Returns `false` if not found or not in
     /// Assigned/Running.

@@ -247,12 +247,15 @@ impl DagActor {
             .executors
             .iter()
             .filter(|(_, w)| now.duration_since(w.last_heartbeat) > timeout)
-            .map(|(id, _)| id.clone())
+            .map(|(id, w)| (id.clone(), w.stream_epoch))
             .collect();
-        for executor_id in timed_out {
+        for (executor_id, stream_epoch) in timed_out {
             warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
                   "worker heartbeat timeout; disconnecting");
-            self.handle_executor_disconnected(&executor_id).await;
+            // Current epoch — this is the actor itself deciding the
+            // worker is dead, not a late reader-task signal.
+            self.handle_executor_disconnected(&executor_id, stream_epoch)
+                .await;
         }
     }
 

@@ -282,6 +282,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "stream-only".into(),
             stream_tx,
+            stream_epoch: crate::actor::tests::next_stream_epoch_for("stream-only"),
         })
         .await?;
 

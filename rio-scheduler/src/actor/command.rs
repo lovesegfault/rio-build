@@ -154,10 +154,22 @@ pub enum ActorCommand {
     ExecutorConnected {
         executor_id: ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
+        /// Per-stream epoch (monotonic across the process). The reader
+        /// task echoes this on `ExecutorDisconnected`; a stale
+        /// disconnect from a prior stream (I-056a connect-before-
+        /// disconnect ordering) is ignored when the epoch doesn't
+        /// match the entry's current `stream_epoch`.
+        stream_epoch: u64,
     },
 
     /// A worker's BuildExecution stream closed.
-    ExecutorDisconnected { executor_id: ExecutorId },
+    ExecutorDisconnected {
+        executor_id: ExecutorId,
+        /// Epoch of the stream that closed. Compared against
+        /// `ExecutorState::stream_epoch`; mismatch → stale disconnect
+        /// from a prior stream → no-op.
+        stream_epoch: u64,
+    },
 
     /// Controller observed a builder/fetcher Pod's container terminate
     /// and reports the k8s reason (OOMKilled / Evicted-DiskPressure /
@@ -434,6 +446,16 @@ pub enum DebugCmd {
     ForceAssign {
         drv_hash: String,
         executor_id: ExecutorId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Set `worker.running_build = Some(drv_hash)` directly, bypassing
+    /// the DAG-status guard. For heartbeat-reconcile safety-net tests
+    /// that need a `running_build` entry pointing at a terminal-status
+    /// drv (where `ForceAssign` would refuse the Poisoned→Assigned
+    /// transition).
+    SetRunningBuild {
+        executor_id: ExecutorId,
+        drv_hash: String,
         reply: oneshot::Sender<bool>,
     },
     /// Backdate a derivation's `running_since` and force it into

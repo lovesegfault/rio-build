@@ -592,11 +592,16 @@ impl DagActor {
                 ActorCommand::ExecutorConnected {
                     executor_id,
                     stream_tx,
+                    stream_epoch,
                 } => {
-                    self.handle_worker_connected(&executor_id, stream_tx);
+                    self.handle_worker_connected(&executor_id, stream_tx, stream_epoch);
                 }
-                ActorCommand::ExecutorDisconnected { executor_id } => {
-                    self.handle_executor_disconnected(&executor_id).await;
+                ActorCommand::ExecutorDisconnected {
+                    executor_id,
+                    stream_epoch,
+                } => {
+                    self.handle_executor_disconnected(&executor_id, stream_epoch)
+                        .await;
                 }
                 ActorCommand::ReportExecutorTermination {
                     executor_id,
@@ -633,12 +638,13 @@ impl DagActor {
                     }
                 }
                 ActorCommand::Heartbeat(hb) => {
+                    let executor_id = hb.executor_id.clone();
                     let (phantoms, became_idle) = self.handle_heartbeat(hb);
                     // I-035: drain phantom assignments BEFORE the next
                     // dispatch so the freed slot + re-queued derivation
                     // are both visible to it.
                     if !phantoms.is_empty() {
-                        self.drain_phantoms(phantoms).await;
+                        self.drain_phantoms(&executor_id, phantoms).await;
                     }
                     // I-163: mark dirty instead of dispatching inline.
                     // 290 workers × 10s heartbeat × 169ms dispatch_ready

@@ -165,6 +165,15 @@ pub struct ExecutorState {
     /// Dispatch (Phase-2) prefers the pre-computed assignment for
     /// this intent; falls through to pick-from-queue if no match.
     pub intent_id: Option<String>,
+    /// Per-stream epoch tying `ExecutorDisconnected` to the specific
+    /// `BuildExecution` stream that closed. Allocated by the gRPC
+    /// handler on stream open (monotonic across the process) and
+    /// carried on both `ExecutorConnected` and `ExecutorDisconnected`.
+    /// `handle_executor_disconnected` ignores a disconnect whose epoch
+    /// ≠ this — the late-disconnect half of I-056a (connect-before-
+    /// disconnect ordering observed live during deploy churn). `0` =
+    /// no stream connected yet.
+    pub stream_epoch: u64,
 }
 
 impl ExecutorState {
@@ -195,6 +204,7 @@ impl ExecutorState {
             warm: false,
             phantom_suspect: None,
             intent_id: None,
+            stream_epoch: 0,
         }
     }
 

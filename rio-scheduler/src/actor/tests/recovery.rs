@@ -750,6 +750,7 @@ async fn test_reconcile_defers_stream_connected_unregistered_worker() -> TestRes
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "defer-w1".into(),
             stream_tx,
+            stream_epoch: next_stream_epoch_for("defer-w1"),
         })
         .await?;
     barrier(&handle).await;

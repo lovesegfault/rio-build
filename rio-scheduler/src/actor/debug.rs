@@ -37,6 +37,13 @@ impl DagActor {
             } => {
                 let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &executor_id));
             }
+            DebugCmd::SetRunningBuild {
+                executor_id,
+                drv_hash,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_debug_set_running_build(&executor_id, &drv_hash));
+            }
             DebugCmd::BackdateRunning {
                 drv_hash,
                 secs_ago,
@@ -164,6 +171,23 @@ impl DagActor {
             w.running_build = Some(drv_hash.into());
         }
         assigned
+    }
+
+    /// Set `worker.running_build = Some(drv_hash)` without any DAG-side
+    /// transition. Unlike [`handle_debug_force_assign`], this does NOT
+    /// require the drv to be in a transitionable state — for the
+    /// heartbeat-reconcile safety-net test which needs a terminal
+    /// (Poisoned) drv leaked into `running_build`.
+    pub(super) fn handle_debug_set_running_build(
+        &mut self,
+        executor_id: &ExecutorId,
+        drv_hash: &str,
+    ) -> bool {
+        let Some(w) = self.executors.get_mut(executor_id) else {
+            return false;
+        };
+        w.running_build = Some(drv_hash.into());
+        true
     }
 
     /// Force to Running with `running_since` backdated. Used by

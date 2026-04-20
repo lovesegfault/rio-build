@@ -1084,6 +1084,7 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "w-idiag".into(),
+            stream_epoch: stream_epoch_for("w-idiag"),
         })
         .await?;
     let (_, live_after) = handle
@@ -1278,6 +1279,7 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "w0".into(),
             stream_tx: tx,
+            stream_epoch: next_stream_epoch_for("w0"),
         })
         .await?;
     send_heartbeat_with(&handle, "w0", "x86_64-linux", |_| {}).await?;
