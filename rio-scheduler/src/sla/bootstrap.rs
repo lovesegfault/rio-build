@@ -69,7 +69,14 @@ pub fn t_min_ci(
         let ts: Vec<f64> = idx.iter().map(|&i| samples[i].t).collect();
         let fit = fit_duration(&cs, &ts, &unit_w, unfreeze_q, p_bar);
         let c_eval = p_bar.min(fit.c_opt().0);
-        tmins.push(fit.t_at(RawCores(c_eval)).0);
+        let tmin = fit.t_at(RawCores(c_eval)).0;
+        // Defense-in-depth: a non-finite replicate (any future fit
+        // variant that produces NaN/∞) must not enter the percentile
+        // sort. The `< 100` gate below then treats it as a degenerate
+        // resample, same as rank-deficient.
+        if tmin.is_finite() {
+            tmins.push(tmin);
+        }
     }
 
     if tmins.len() < 100 {
@@ -135,6 +142,30 @@ mod tests {
     #[test]
     fn empty_input_returns_none() {
         assert!(t_min_ci(&[], 500, f64::INFINITY, false).is_none());
+    }
+
+    // r[verify sched.sla.reassign-schmitt]
+    #[test]
+    fn ci_finite_when_replicates_clamp_q() {
+        // Data is ~1000/c with no upturn → many resamples over-draw
+        // low-c and the un-ridged NNLS clamps q=0. With p_bar=∞ and
+        // unfreeze_q, c_eval=∞ → the q=0 chokepoint in t_at must hold
+        // (else NaN poisons hi). The is_finite filter is defense-in-
+        // depth; the assertion is that the CI is Some and both bounds
+        // are finite.
+        let samples: Vec<_> = [(4.0, 500.0), (8.0, 250.0), (16.0, 130.0), (64.0, 80.0)]
+            .iter()
+            .map(|&(c, t)| WeightedSample { c, t, w: 1.0 })
+            .collect();
+        let (lo, hi) = t_min_ci(&samples, 500, f64::INFINITY, true)
+            .expect("≥100 valid replicates after non-finite filter");
+        assert!(lo.0.is_finite(), "lo finite, got {}", lo.0);
+        assert!(
+            hi.0.is_finite(),
+            "hi finite (was NaN pre-fix), got {}",
+            hi.0
+        );
+        assert!(lo.0 <= hi.0);
     }
 
     #[test]

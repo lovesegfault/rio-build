@@ -43,7 +43,15 @@ impl DurationFit {
             Self::Probe => RefSeconds(f64::INFINITY),
             Self::Amdahl { s, p } => RefSeconds(s.0 + p.0 / c.0),
             Self::Capped { s, p, p_bar } => RefSeconds(s.0 + p.0 / c.0.min(p_bar.0)),
-            Self::Usl { s, p, q, p_bar } => RefSeconds(s.0 + p.0 / c.0.min(p_bar.0) + q * c.0),
+            Self::Usl { s, p, q, p_bar } => {
+                // q=0 ⇒ contention term is 0 regardless of c. Evaluating
+                // `0.0 * ∞` (reachable: `c_opt()=∞` when q=0, `p_bar=∞`
+                // from `observed_p_bar` when no sample is unsaturated)
+                // is IEEE-754 NaN, which propagates through `t_min_ci`
+                // → `reassign_tier` and silently breaks the Schmitt walk.
+                let qc = if *q == 0.0 { 0.0 } else { q * c.0 };
+                RefSeconds(s.0 + p.0 / c.0.min(p_bar.0) + qc)
+            }
         }
     }
     pub fn c_opt(&self) -> RawCores {
@@ -158,6 +166,30 @@ mod tests {
             p: RefSeconds(2000.0),
         };
         assert!((f.t_at(RawCores(10.0)).0 - 230.0).abs() < 1e-6);
+    }
+    // r[verify sched.sla.reassign-schmitt]
+    #[test]
+    fn usl_t_at_q_zero_c_infinity_is_finite() {
+        // q=0, p_bar=∞ → c_opt()=∞ → t_min() evaluates t_at(∞). The
+        // contention term must be 0, not 0·∞=NaN.
+        let f = DurationFit::Usl {
+            s: RefSeconds(10.0),
+            p: RefSeconds(100.0),
+            q: 0.0,
+            p_bar: RawCores(f64::INFINITY),
+        };
+        let t = f.t_at(RawCores(f64::INFINITY));
+        assert!(t.0.is_finite(), "t_at(∞) with q=0 must be finite, got {t}");
+        assert_eq!(t.0, 10.0, "S + P/∞ + 0 = S");
+        assert!(f.t_min().0.is_finite(), "t_min() must be finite");
+        // Control: q>0 at finite c is unchanged.
+        let g = DurationFit::Usl {
+            s: RefSeconds(10.0),
+            p: RefSeconds(100.0),
+            q: 0.5,
+            p_bar: RawCores(f64::INFINITY),
+        };
+        assert!((g.t_at(RawCores(4.0)).0 - 37.0).abs() < 1e-9);
     }
     #[test]
     fn t_at_c_capped_clamps_at_pbar() {
