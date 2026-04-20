@@ -137,6 +137,16 @@ async fn main() -> anyhow::Result<()> {
     if service_signer.is_some() {
         info!("service-token signing enabled (dispatch-time substitution probe)");
     }
+    // Same key, verifier role: AdminService gates controller-only
+    // mutating RPCs (AppendInterruptSample, DrainExecutor) on
+    // x-rio-service-token. HmacSigner == HmacVerifier (type alias);
+    // re-load to get an independently-owned Arc for AdminServiceImpl.
+    let service_verifier = rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?
+        .map(std::sync::Arc::new);
+    if service_verifier.is_some() {
+        info!("service-token verification enabled (controller-only AdminService RPCs)");
+    }
 
     // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)
     // so a restart doesn't re-warm; lease-gated poller below keeps it
@@ -327,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         is_leader_for_grpc,
         shutdown.clone(),
         sla_cluster,
+        service_verifier,
     );
 
     // Start periodic tick task. Actor-dead handling: try_send fails

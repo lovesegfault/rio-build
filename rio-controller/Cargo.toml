@@ -19,6 +19,7 @@ path = "src/bin/crdgen.rs"
 # Separate binary so the YAML dep doesn't leak into the controller itself.
 
 [dependencies]
+rio-auth = { workspace = true }
 rio-common = { workspace = true }
 rio-crds = { workspace = true }
 rio-proto = { workspace = true }

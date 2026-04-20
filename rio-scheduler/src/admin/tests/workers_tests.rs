@@ -67,3 +67,47 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Regression: `status_filter="degraded"` previously fell through to the
+/// lenient `_ => true` arm (the match enumerated three of four producer
+/// values) and returned ALL executors — broken precisely when the filter
+/// is needed (store incident, I-056b). Now `KNOWN_STATUSES` couples
+/// producer and consumer.
+#[tokio::test]
+async fn test_list_workers_degraded_filter() -> anyhow::Result<()> {
+    use crate::actor::tests::{connect_executor, connect_executor_with};
+
+    let (svc, actor, _task, _db) = setup_svc_default().await;
+
+    // Two fully-registered workers; one reports a sick store.
+    let _rx1 = connect_executor(&actor, "healthy", "x86_64-linux").await?;
+    let _rx2 = connect_executor_with(&actor, "sick-store", "x86_64-linux", true, |hb| {
+        hb.store_degraded = true;
+    })
+    .await?;
+
+    let resp = svc
+        .list_executors(Request::new(ListExecutorsRequest {
+            status_filter: "degraded".into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.executors.len(),
+        1,
+        "degraded filter must match exactly, not fall through to all"
+    );
+    assert_eq!(resp.executors[0].executor_id, "sick-store");
+    assert_eq!(resp.executors[0].status, "degraded");
+
+    // Unknown filter still lenient (operator typos shouldn't hide executors).
+    let resp = svc
+        .list_executors(Request::new(ListExecutorsRequest {
+            status_filter: "garbage".into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.executors.len(), 2, "unknown filter → all (lenient)");
+
+    Ok(())
+}

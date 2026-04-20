@@ -6,10 +6,9 @@
 //! printed line-by-line so the operator sees activity during long
 //! sweeps (mark phase on a large store can take minutes).
 
+use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::AdminServiceClient;
 use rio_proto::types::{GcProgress, GcRequest};
-use tonic::transport::Channel;
 
 use crate::RPC_TIMEOUT;
 
@@ -30,7 +29,7 @@ pub(crate) struct Args {
 /// `as_json` is NOT threaded here — gc progress is line-oriented
 /// (operator wants to watch it scroll, not parse one big document
 /// at the end). The global `--json` flag is ignored, same as `logs`.
-pub(crate) async fn run(client: &mut AdminServiceClient<Channel>, a: Args) -> anyhow::Result<()> {
+pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()> {
     // STREAMING — same open-timeout-only shape as `logs`. A store
     // sweep can legitimately go silent for minutes between
     // progress messages (mark phase on a large store).

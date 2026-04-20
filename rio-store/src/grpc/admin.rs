@@ -91,8 +91,16 @@ impl StoreAdminServiceImpl {
 /// Cap on `TriggerGc.extra_roots`. Separate from
 /// [`crate::grpc::DEFAULT_MAX_BATCH_PATHS`] (1M, sized for client closure
 /// queries) — GC mark runs under an exclusive lock that blocks PutPath, so
-/// the unnest() must stay bounded; the GcRoots actor sends ~tens.
-const MAX_GC_EXTRA_ROOTS: usize = 100_000;
+/// the unnest() must stay bounded.
+///
+/// The actual producer is the scheduler's `handle_gc_roots`
+/// (`rio-scheduler/src/actor/snapshot.rs`) which emits every
+/// non-terminal node's expected outputs — bounded by
+/// [`rio_common::limits::MAX_DAG_NODES`] (1M) × ~3 outputs/node, NOT
+/// "~tens". The mark CTE deduplicates; ~4M strings ≈ ~250 MB request,
+/// acceptable for an operator-initiated rare RPC. Bound kept as a DoS
+/// guard, sized to the real producer.
+const MAX_GC_EXTRA_ROOTS: usize = rio_common::limits::MAX_DAG_NODES * 4;
 
 type TriggerGcStream = ReceiverStream<Result<GcProgress, Status>>;
 type VerifyChunksStream = ReceiverStream<Result<VerifyChunksProgress, Status>>;

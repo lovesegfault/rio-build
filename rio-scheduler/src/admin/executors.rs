@@ -7,6 +7,12 @@ use tonic::Status;
 
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery, ExecutorSnapshot};
 
+/// Exhaustive list of values [`executor_status`] can return. The filter
+/// match below references this directly so the producer and consumer
+/// can't drift — adding a fifth status to `executor_status` without
+/// updating this array trips the `debug_assert!` in `list_executors`.
+const KNOWN_STATUSES: [&str; 4] = ["alive", "draining", "degraded", "connecting"];
+
 /// 3-bool → 4-state. `systems.is_empty()` = no heartbeat yet = not
 /// fully registered (stream-only or heartbeat-only) → "connecting".
 /// Draining wins over degraded: an operator who drained doesn't care
@@ -38,10 +44,21 @@ pub(super) async fn list_executors(
         .into_iter()
         // Empty filter = all. Known status = exact match. Unknown filter
         // = all (lenient — operator typos shouldn't hide executors).
+        // The KNOWN_STATUSES indirection makes producer/consumer drift
+        // unrepresentable: previously "degraded" hit the lenient `_` arm
+        // and returned ALL executors precisely when the filter was needed
+        // (store incident, I-056b).
         .filter(|w| match status_filter {
             "" => true,
-            "alive" | "draining" | "connecting" => executor_status(w) == status_filter,
+            s if KNOWN_STATUSES.contains(&s) => executor_status(w) == s,
             _ => true,
+        })
+        .inspect(|w| {
+            debug_assert!(
+                KNOWN_STATUSES.contains(&executor_status(w)),
+                "executor_status() returned {:?} not in KNOWN_STATUSES — update the array",
+                executor_status(w)
+            );
         })
         .map(snapshot_to_proto)
         .collect();

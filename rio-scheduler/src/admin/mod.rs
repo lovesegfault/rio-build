@@ -120,6 +120,14 @@ pub struct AdminServiceImpl {
     /// Empty for the single-cluster default (matches the `DEFAULT ''`
     /// migration-043 column).
     cluster: String,
+    /// Verifies `x-rio-service-token` for controller-only mutating RPCs
+    /// (`AppendInterruptSample`, `DrainExecutor`). `None` = dev mode
+    /// (accept all) — same pass-through pattern as the store's
+    /// assignment-token verifier. The threat: builders share port 9001
+    /// with this service (CCNP allows scheduler:9001 at L4 only), and a
+    /// compromised builder could forge `interrupt_samples` to bias
+    /// λ\[h\] or drain arbitrary executors. See `r[sec.authz.service-token]`.
+    service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
 }
 
 impl AdminServiceImpl {
@@ -134,6 +142,7 @@ impl AdminServiceImpl {
         is_leader: Arc<AtomicBool>,
         shutdown: rio_common::signal::Token,
         cluster: String,
+        service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     ) -> Self {
         Self {
             log_buffers,
@@ -146,6 +155,7 @@ impl AdminServiceImpl {
             is_leader,
             shutdown,
             cluster,
+            service_verifier,
         }
     }
 
@@ -163,6 +173,56 @@ impl AdminServiceImpl {
     /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
     fn ensure_leader(&self) -> Result<(), Status> {
         crate::grpc::actor_guards::ensure_leader(&self.is_leader)
+    }
+
+    /// Flip to standby. For tests exercising the in-stream-err leader
+    /// guard on `TriggerGC` (the field's name collides with a private
+    /// `lease::*::is_leader()` method during resolution from grandchild
+    /// modules, so a method is the cleanest accessor).
+    #[cfg(test)]
+    pub(super) fn force_standby(&self) {
+        self.is_leader
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Gate for controller-only mutating RPCs. Verifies
+    /// `x-rio-service-token` (HMAC-signed [`ServiceClaims`]) and checks
+    /// `claims.caller ∈ allowed`. `service_verifier == None` → dev-mode
+    /// pass-through (parity with the store's assignment-token verifier).
+    ///
+    /// Builders share port 9001 with this service; without this gate a
+    /// compromised builder could write straight into `interrupt_samples`
+    /// (poisoning λ\[h\]) or drain arbitrary executors.
+    ///
+    /// [`ServiceClaims`]: rio_auth::hmac::ServiceClaims
+    // r[impl sec.authz.service-token]
+    fn ensure_service_caller(
+        &self,
+        md: &tonic::metadata::MetadataMap,
+        allowed: &[&str],
+    ) -> Result<(), Status> {
+        let Some(verifier) = &self.service_verifier else {
+            return Ok(());
+        };
+        let tok = md
+            .get(rio_proto::SERVICE_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                Status::permission_denied(format!(
+                    "{} header required for this RPC",
+                    rio_proto::SERVICE_TOKEN_HEADER
+                ))
+            })?;
+        let claims = verifier
+            .verify::<rio_auth::hmac::ServiceClaims>(tok)
+            .map_err(|e| Status::permission_denied(format!("service token: {e}")))?;
+        if !allowed.contains(&claims.caller.as_str()) {
+            return Err(Status::permission_denied(format!(
+                "service-token caller {:?} not in allowlist {allowed:?}",
+                claims.caller
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -295,11 +355,18 @@ impl AdminService for AdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        self.ensure_leader()?;
-        self.check_actor_alive()?;
+        // grpc-web compatibility: same Trailers-Only constraint as
+        // get_build_logs above. ALL error paths return Ok(stream-
+        // yielding-Err); the handler never returns Err.
+        if let Err(status) = self.ensure_leader().and_then(|_| self.check_actor_alive()) {
+            return Ok(Response::new(logs::err_stream(status)));
+        }
         let req = request.into_inner();
         let stream =
-            gc::trigger_gc(&self.actor, &self.store_addr, self.shutdown.clone(), req).await?;
+            match gc::trigger_gc(&self.actor, &self.store_addr, self.shutdown.clone(), req).await {
+                Ok(s) => s,
+                Err(s) => logs::err_stream(s),
+            };
         Ok(Response::new(stream))
     }
 
@@ -325,6 +392,11 @@ impl AdminService for AdminServiceImpl {
         request: Request<DrainExecutorRequest>,
     ) -> Result<Response<DrainExecutorResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: builders share this port; a compromised
+        // builder draining arbitrary executors is a DoS. rio-cli runs
+        // from operator workstations (outside builder netns) but uses
+        // the same shared key — both legitimate callers allowlisted.
+        self.ensure_service_caller(request.metadata(), &["rio-controller", "rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -366,6 +438,12 @@ impl AdminService for AdminServiceImpl {
         request: Request<ReportExecutorTerminationRequest>,
     ) -> Result<Response<ReportExecutorTerminationResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: a forged
+        // `{reason: OOMKilled, executor_id: <any>}` from a compromised
+        // builder would promote `resource_floor` for arbitrary
+        // derivations → fleet-wide over-allocation. Same threat surface
+        // as `append_interrupt_sample`.
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -510,6 +588,10 @@ impl AdminService for AdminServiceImpl {
         request: Request<AckSpawnedIntentsRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: a forged ack from a compromised builder
+        // arms the ICE-backoff timer for arbitrary intent_ids → false
+        // ICE marks bias hw-band selection.
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -823,7 +905,33 @@ impl AdminService for AdminServiceImpl {
         request: Request<AppendInterruptSampleRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Service-token gate: a single forged
+        // `{hw_class:"x-x-x-hi", kind:"exposure", value:1e12}` from a
+        // compromised builder drives λ[Hi]≈0 → fleet-wide solver bias.
+        // Per the threat model "the worker is NOT trusted".
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         let r = request.into_inner();
+        // Defense-in-depth input validation: lands regardless of the
+        // token gate. `band_of_hw_class` parses the 4-segment shape so
+        // garbage hw_class can't pollute the table even in dev mode.
+        if !matches!(r.kind.as_str(), "interrupt" | "exposure") {
+            return Err(Status::invalid_argument(format!(
+                "kind must be 'interrupt' or 'exposure', got {:?}",
+                r.kind
+            )));
+        }
+        if !r.value.is_finite() || r.value < 0.0 {
+            return Err(Status::invalid_argument(format!(
+                "value must be finite and non-negative, got {}",
+                r.value
+            )));
+        }
+        if crate::sla::cost::band_of_hw_class(&r.hw_class).is_none() {
+            return Err(Status::invalid_argument(format!(
+                "hw_class {:?} does not parse to a known band",
+                r.hw_class
+            )));
+        }
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, event_uid) \
              VALUES ($1, $2, $3, $4, $5) \

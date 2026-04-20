@@ -17,12 +17,11 @@
 
 use std::collections::BTreeSet;
 
-use rio_proto::AdminServiceClient;
+use crate::AdminClient;
 use rio_proto::types::{
     DebugExecutorState, DrainExecutorRequest, ExecutorInfo, ExecutorKind, ListExecutorsRequest,
 };
 use serde::Serialize;
-use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
@@ -58,11 +57,7 @@ pub(crate) struct DrainArgs {
     force: bool,
 }
 
-pub(crate) async fn run(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-    a: Args,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(as_json: bool, client: &mut AdminClient, a: Args) -> anyhow::Result<()> {
     if a.actor {
         run_actor(as_json, client).await
     } else if a.diff {
@@ -72,10 +67,7 @@ pub(crate) async fn run(
     }
 }
 
-pub(crate) async fn run_actor(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_actor(as_json: bool, client: &mut AdminClient) -> anyhow::Result<()> {
     let resp = rpc("DebugListExecutors", async || {
         client.debug_list_executors(()).await
     })
@@ -94,10 +86,7 @@ pub(crate) async fn run_actor(
 }
 
 /// `--diff` path: PG ∪ actor, diverge markers per row.
-pub(crate) async fn run_diff(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_diff(as_json: bool, client: &mut AdminClient) -> anyhow::Result<()> {
     // Gather both views before printing — same all-or-nothing
     // discipline as status::run.
     let pg = rpc("ListExecutors", async || {
@@ -359,7 +348,7 @@ fn yn(b: bool) -> &'static str {
 /// path — `--actor`/`--diff` use [`run_actor`]/[`run_diff`] instead.
 pub(crate) async fn run_pg(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     status: Option<String>,
 ) -> anyhow::Result<()> {
     let req = ListExecutorsRequest {
@@ -386,7 +375,7 @@ pub(crate) async fn run_pg(
 /// lever for the same path.
 pub(crate) async fn run_drain(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     a: DrainArgs,
 ) -> anyhow::Result<()> {
     let DrainArgs { executor_id, force } = a;

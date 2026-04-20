@@ -31,6 +31,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
         String::new(),
+        None,
     );
 
     let mut fod = make_node("fod-a");

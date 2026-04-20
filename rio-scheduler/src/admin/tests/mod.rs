@@ -57,6 +57,9 @@ pub(super) async fn setup_svc(
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
         String::new(),
+        // service_verifier=None → dev-mode pass-through. Tests that
+        // exercise the gate construct svc with Some(verifier) below.
+        None,
     );
     (svc, actor, task, db)
 }
@@ -138,6 +141,219 @@ async fn append_interrupt_sample_idempotent_on_event_uid() {
     assert_eq!(total, 4, "ev-abc(1) + ev-def(1) + 2×NULL exposure = 4 rows");
 }
 
+/// Defense-in-depth input validation: lands regardless of the
+/// service-token gate (dev-mode pass-through here).
+#[tokio::test]
+async fn append_interrupt_sample_rejects_invalid_inputs() {
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
+
+    let base = AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "interrupt".into(),
+        value: 1.0,
+        event_uid: None,
+    };
+
+    let bad_kind = AppendInterruptSampleRequest {
+        kind: "garbage".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        svc.append_interrupt_sample(Request::new(bad_kind))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let bad_value = AppendInterruptSampleRequest {
+        value: f64::NAN,
+        ..base.clone()
+    };
+    assert_eq!(
+        svc.append_interrupt_sample(Request::new(bad_value))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let neg_value = AppendInterruptSampleRequest {
+        value: -1.0,
+        ..base.clone()
+    };
+    assert_eq!(
+        svc.append_interrupt_sample(Request::new(neg_value))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let bad_hw = AppendInterruptSampleRequest {
+        hw_class: "no-band".into(),
+        ..base
+    };
+    assert_eq!(
+        svc.append_interrupt_sample(Request::new(bad_hw))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+}
+
+/// Construct svc with a real `service_verifier`. Other defaults match
+/// [`setup_svc`]. Returns the signer so tests can mint valid tokens.
+async fn setup_svc_with_service_verifier() -> (
+    AdminServiceImpl,
+    rio_auth::hmac::HmacSigner,
+    tokio::task::JoinHandle<()>,
+    TestDb,
+) {
+    let key = b"test-service-hmac-key-32-bytes!!".to_vec();
+    let signer = rio_auth::hmac::HmacSigner::from_key(key.clone());
+    let verifier = Arc::new(rio_auth::hmac::HmacVerifier::from_key(key));
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let (actor, task) = setup_actor(db.pool.clone());
+    let svc = AdminServiceImpl::new(
+        Arc::new(LogBuffers::new()),
+        None,
+        db.pool.clone(),
+        actor,
+        "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        rio_common::signal::Token::new(),
+        String::new(),
+        Some(verifier),
+    );
+    (svc, signer, task, db)
+}
+
+fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T) -> Request<T> {
+    let claims = rio_auth::hmac::ServiceClaims {
+        caller: caller.into(),
+        expiry_unix: rio_auth::now_unix().unwrap() + 60,
+    };
+    let mut req = Request::new(body);
+    req.metadata_mut().insert(
+        rio_proto::SERVICE_TOKEN_HEADER,
+        signer.sign(&claims).parse().unwrap(),
+    );
+    req
+}
+
+/// Regression: with `service_verifier` configured, a request without
+/// `x-rio-service-token` is rejected. Builders share port 9001 with
+/// AdminService; without this gate a compromised builder could forge
+/// `interrupt_samples` to bias λ\[h\] fleet-wide.
+// r[verify sec.authz.service-token]
+#[tokio::test]
+async fn append_interrupt_sample_without_service_token_rejected() {
+    let (svc, _signer, _task, _db) = setup_svc_with_service_verifier().await;
+    let r = AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "interrupt".into(),
+        value: 1.0,
+        event_uid: None,
+    };
+    let err = svc
+        .append_interrupt_sample(Request::new(r))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains(rio_proto::SERVICE_TOKEN_HEADER));
+}
+
+#[tokio::test]
+async fn append_interrupt_sample_with_valid_token_ok() {
+    let (svc, signer, _task, db) = setup_svc_with_service_verifier().await;
+    let r = AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "interrupt".into(),
+        value: 1.0,
+        event_uid: None,
+    };
+    svc.append_interrupt_sample(req_with_token(&signer, "rio-controller", r.clone()))
+        .await
+        .expect("valid rio-controller token → Ok");
+
+    // Wrong caller in allowlist → rejected.
+    let err = svc
+        .append_interrupt_sample(req_with_token(&signer, "rio-gateway", r))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("allowlist"));
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM interrupt_samples")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "exactly one accepted insert");
+}
+
+/// All controller-only mutating RPCs are gated. A compromised builder
+/// sharing port 9001 must not reach any of them.
+#[tokio::test]
+async fn controller_only_rpcs_without_service_token_rejected() {
+    let (svc, signer, _task, _db) = setup_svc_with_service_verifier().await;
+
+    // ReportExecutorTermination: forged OOMKilled → resource_floor poisoning.
+    let term = ReportExecutorTerminationRequest {
+        executor_id: "victim".into(),
+        reason: TerminationReason::OomKilled as i32,
+    };
+    assert_eq!(
+        svc.report_executor_termination(Request::new(term.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    svc.report_executor_termination(req_with_token(&signer, "rio-controller", term))
+        .await
+        .expect("rio-controller allowed");
+
+    // AckSpawnedIntents: forged ack → false ICE arm.
+    let ack = AckSpawnedIntentsRequest { spawned: vec![] };
+    assert_eq!(
+        svc.ack_spawned_intents(Request::new(ack.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    svc.ack_spawned_intents(req_with_token(&signer, "rio-controller", ack))
+        .await
+        .expect("rio-controller allowed");
+}
+
+/// Sibling: `DrainExecutor` is also gated. A builder draining arbitrary
+/// executors is a DoS.
+#[tokio::test]
+async fn drain_executor_without_service_token_rejected() {
+    let (svc, signer, _task, _db) = setup_svc_with_service_verifier().await;
+    let r = DrainExecutorRequest {
+        executor_id: "victim".into(),
+        force: true,
+    };
+    let err = svc
+        .drain_executor(Request::new(r.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // rio-controller and rio-cli are both allowlisted callers.
+    svc.drain_executor(req_with_token(&signer, "rio-controller", r.clone()))
+        .await
+        .expect("rio-controller allowed");
+    svc.drain_executor(req_with_token(&signer, "rio-cli", r))
+        .await
+        .expect("rio-cli allowed");
+}
+
 /// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
 ///
 /// `get_build_logs` returns errors as stream items (not handler-level
@@ -185,13 +401,15 @@ async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
         .into_inner();
     assert!(lb.builds.is_empty(), "no builds → empty list");
     assert_eq!(lb.total_count, 0);
-    // TriggerGC: now implemented (proxy to store). Test separately.
-    // With the test store_addr (127.0.0.1:1), proxy connect fails
-    // with Unavailable (not Unimplemented) — proves it's wired.
-    let gc_err = svc
+    // TriggerGC: now implemented (proxy to store). With the test
+    // store_addr (127.0.0.1:1), proxy connect fails with Unavailable
+    // (not Unimplemented) — proves it's wired. Error arrives IN-STREAM
+    // (grpc-web Trailers-Only constraint).
+    let mut gc_stream = svc
         .trigger_gc(Request::new(GcRequest::default()))
-        .await
-        .unwrap_err();
+        .await?
+        .into_inner();
+    let gc_err = gc_stream.next().await.unwrap().unwrap_err();
     assert_eq!(
         gc_err.code(),
         tonic::Code::Unavailable,

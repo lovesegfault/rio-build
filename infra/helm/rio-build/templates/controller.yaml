@@ -41,7 +41,7 @@ spec:
               containerPort: 9194
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "serviceHmac")) | nindent 12 }}
             - name: RIO_SCHEDULER__ADDR
               value: {{ $c.schedulerAddr | quote }}
             - name: RIO_STORE__ADDR
@@ -75,7 +75,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "serviceHmac")) | nindent 12 }}
           # /healthz: unconditional 200 (process alive + tokio
           # responsive) — bound BEFORE connect_forever so liveness
           # passes during scheduler cold-start. /readyz: 503 until
@@ -91,5 +91,5 @@ spec:
           resources:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "serviceHmac")) | nindent 8 }}
 {{- end }}

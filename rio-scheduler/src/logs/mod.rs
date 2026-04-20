@@ -180,19 +180,22 @@ impl LogBuffers {
     /// For `AdminService.GetBuildLogs` — lets a late-joining dashboard
     /// client catch up from the ring buffer without blocking on S3.
     ///
-    /// Returns `(line_number, line_bytes)` pairs. Empty vec if the buffer
-    /// doesn't exist or has no lines ≥ `since` (after eviction, early
-    /// line numbers may be gone — that's expected).
-    pub fn read_since(&self, drv_path: &str, since: u64) -> Vec<Line> {
-        let Some(buf) = self.buffers.get(drv_path) else {
-            return Vec::new();
-        };
+    /// Returns `None` if no buffer exists for `drv_path` (derivation not
+    /// active / already drained → caller falls through to S3). Returns
+    /// `Some(vec)` if the buffer exists — `vec` MAY be empty when the
+    /// caller is caught up (`since` ≥ newest line). The distinction
+    /// matters: empty-because-absent → try S3; empty-because-caught-up
+    /// → tell the client to re-poll. Conflating the two (the old `Vec`
+    /// signature) made `try_ring_buffer` map "caught up on an active
+    /// build" → S3 → `NotFound`.
+    pub fn read_since(&self, drv_path: &str, since: u64) -> Option<Vec<Line>> {
+        let buf = self.buffers.get(drv_path)?;
         // Could binary-search for `since` since line numbers are monotone,
         // but `read_since` is called by dashboard polls (infrequent) on a
         // buffer that's already in-memory. Linear scan is fine until
         // profiling says otherwise; premature optimization would just
         // obscure the invariant that makes bisection valid.
-        buf.iter().filter(|(n, _)| *n >= since).cloned().collect()
+        Some(buf.iter().filter(|(n, _)| *n >= since).cloned().collect())
     }
 
     /// Discard a buffer without returning its contents. Also un-seals.
@@ -310,7 +313,7 @@ mod tests {
         let bufs = LogBuffers::new();
         bufs.push(&mk_batch("drv-a", 0, &[b"line0", b"line1", b"line2"]));
 
-        let lines = bufs.read_since("drv-a", 0);
+        let lines = bufs.read_since("drv-a", 0).unwrap();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], (0, b"line0".to_vec()));
         assert_eq!(lines[1], (1, b"line1".to_vec()));
@@ -322,23 +325,38 @@ mod tests {
         let bufs = LogBuffers::new();
         bufs.push(&mk_batch("drv-a", 0, &[b"l0"]));
         bufs.push(&mk_batch("drv-a", 1, &[b"l1"]));
-        assert_eq!(bufs.read_since("drv-a", 0).len(), 2);
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 2);
     }
 
     #[test]
     fn read_since_filters_by_line_number() {
         let bufs = LogBuffers::new();
         bufs.push(&mk_batch("drv-a", 0, &[b"l0", b"l1", b"l2", b"l3", b"l4"]));
-        let lines = bufs.read_since("drv-a", 3);
+        let lines = bufs.read_since("drv-a", 3).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].0, 3);
         assert_eq!(lines[1].0, 4);
     }
 
     #[test]
-    fn read_since_nonexistent_buffer_empty() {
+    fn read_since_nonexistent_buffer_is_none() {
         let bufs = LogBuffers::new();
-        assert!(bufs.read_since("not-there", 0).is_empty());
+        assert!(
+            bufs.read_since("not-there", 0).is_none(),
+            "absent buffer → None (not Some(empty)) so callers can \
+             distinguish 'try S3' from 'caught up, re-poll'"
+        );
+    }
+
+    #[test]
+    fn read_since_caught_up_is_some_empty() {
+        let bufs = LogBuffers::new();
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0", b"l1", b"l2"]));
+        let lines = bufs.read_since("drv-a", 3).unwrap();
+        assert!(
+            lines.is_empty(),
+            "buffer present, since ≥ newest → Some(empty) (caller re-polls)"
+        );
     }
 
     #[test]
@@ -348,14 +366,14 @@ mod tests {
         let lines: Vec<Vec<u8>> = (0..RING_CAPACITY).map(|i| format!("l{i}").into()).collect();
         let line_refs: Vec<&[u8]> = lines.iter().map(|v| v.as_slice()).collect();
         bufs.push(&mk_batch("drv-a", 0, &line_refs));
-        assert_eq!(bufs.read_since("drv-a", 0).len(), RING_CAPACITY);
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), RING_CAPACITY);
 
         // Push 100 more → oldest 100 evicted.
         let extra: Vec<Vec<u8>> = (0..100).map(|i| format!("x{i}").into()).collect();
         let extra_refs: Vec<&[u8]> = extra.iter().map(|v| v.as_slice()).collect();
         bufs.push(&mk_batch("drv-a", RING_CAPACITY as u64, &extra_refs));
 
-        let all = bufs.read_since("drv-a", 0);
+        let all = bufs.read_since("drv-a", 0).unwrap();
         assert_eq!(all.len(), RING_CAPACITY, "still at capacity after eviction");
         // The FIRST line number present should be 100 (lines 0-99 evicted).
         assert_eq!(all[0].0, 100, "oldest 100 should be evicted");
@@ -373,7 +391,7 @@ mod tests {
         let line_refs: Vec<&[u8]> = lines.iter().map(|v| v.as_slice()).collect();
         bufs.push(&mk_batch("drv-a", 0, &line_refs));
 
-        let all = bufs.read_since("drv-a", 0);
+        let all = bufs.read_since("drv-a", 0).unwrap();
         assert_eq!(all.len(), RING_CAPACITY);
         assert_eq!(all[0].0, 50, "first 50 evicted, kept tail");
         assert_eq!(all.last().unwrap().0, big as u64 - 1);
@@ -405,7 +423,7 @@ mod tests {
         bufs.push(&mk_batch("drv-a", 0, &[b"line"]));
         bufs.discard("drv-a");
         assert_eq!(bufs.active_count(), 0);
-        assert!(bufs.read_since("drv-a", 0).is_empty());
+        assert!(bufs.read_since("drv-a", 0).is_none());
     }
 
     #[test]
@@ -414,11 +432,11 @@ mod tests {
         bufs.push(&mk_batch("drv-a", 0, &[b"a0"]));
         bufs.push(&mk_batch("drv-b", 0, &[b"b0", b"b1"]));
 
-        assert_eq!(bufs.read_since("drv-a", 0).len(), 1);
-        assert_eq!(bufs.read_since("drv-b", 0).len(), 2);
+        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 1);
+        assert_eq!(bufs.read_since("drv-b", 0).unwrap().len(), 2);
 
         bufs.drain("drv-a");
-        assert_eq!(bufs.read_since("drv-b", 0).len(), 2, "b untouched");
+        assert_eq!(bufs.read_since("drv-b", 0).unwrap().len(), 2, "b untouched");
     }
 
     /// DashMap's sharded locking should handle concurrent push from
@@ -444,7 +462,7 @@ mod tests {
         assert_eq!(bufs.active_count(), 16);
         for i in 0..16 {
             assert_eq!(
-                bufs.read_since(&format!("drv-{i}"), 0).len(),
+                bufs.read_since(&format!("drv-{i}"), 0).unwrap().len(),
                 50,
                 "drv-{i} should have all 50 lines"
             );

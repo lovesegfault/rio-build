@@ -38,12 +38,10 @@ use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
-use rio_proto::AdminServiceClient;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use super::POOL_LABEL;
-use crate::reconcilers::admin_call;
+use crate::reconcilers::{admin_call, AdminClient};
 
 /// Run the watcher. Returns on `shutdown.cancelled()` or if the
 /// watch stream ends (never — `default_backoff()` retries
@@ -54,11 +52,7 @@ use crate::reconcilers::admin_call;
 /// Panics are logged; the controller keeps reconciling (workers
 /// just lose the fast-preemption path — SIGTERM self-drain is the
 /// fallback).
-pub async fn run(
-    client: Client,
-    mut admin: AdminServiceClient<Channel>,
-    shutdown: rio_common::signal::Token,
-) {
+pub async fn run(client: Client, mut admin: AdminClient, shutdown: rio_common::signal::Token) {
     // All-namespaces: Pool is namespaced, so pods can be in
     // any ns. Label selector filters to OUR pods at the apiserver
     // (not client-side) — cheap.

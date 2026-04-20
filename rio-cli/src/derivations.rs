@@ -5,11 +5,10 @@
 //! I-025 diagnostic: if a derivation is `Assigned` to an executor whose
 //! stream is dead (`⚠ no-stream`), dispatch is stuck forever.
 
+use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::AdminServiceClient;
 use rio_proto::types::{InspectBuildDagRequest, ListBuildsRequest};
 use serde::Serialize;
-use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
@@ -33,11 +32,7 @@ pub(crate) struct Args {
     stuck: bool,
 }
 
-pub(crate) async fn run(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-    a: Args,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(as_json: bool, client: &mut AdminClient, a: Args) -> anyhow::Result<()> {
     let Args {
         build_id,
         all_active,

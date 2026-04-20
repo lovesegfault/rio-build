@@ -13,6 +13,7 @@ name = "rio-cli"
 path = "src/main.rs"
 
 [dependencies]
+rio-auth = { workspace = true }
 rio-common = { workspace = true }
 rio-proto = { workspace = true }
 # CRD types only (Pool, ComponentScaler) — NOT rio-controller.

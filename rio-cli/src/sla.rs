@@ -10,9 +10,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use clap::Subcommand;
-use tonic::transport::Channel;
 
-use rio_proto::AdminServiceClient;
+use crate::AdminClient;
 use rio_proto::types::{
     ExportSlaCorpusRequest, ImportSlaCorpusRequest, ListSlaOverridesRequest, ResetSlaModelRequest,
     SetSlaOverrideRequest, SlaExplainRequest, SlaOverride, SlaStatusRequest,
@@ -100,7 +99,7 @@ pub enum SlaCmd {
 // r[impl cli.cmd.sla]
 pub(crate) async fn run(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     cmd: SlaCmd,
 ) -> anyhow::Result<()> {
     match cmd {

@@ -74,6 +74,23 @@ pub fn require_namespace<K: kube::Resource<DynamicType = ()>>(obj: &K) -> Result
         .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))
 }
 
+/// Shared `AdminServiceClient` shape: balanced channel +
+/// [`ServiceTokenInterceptor`](rio_auth::hmac::ServiceTokenInterceptor)
+/// (`caller="rio-controller"`). The scheduler gates controller-only
+/// mutating RPCs (`AppendInterruptSample`, `DrainExecutor`,
+/// `ReportExecutorTermination`, `AckSpawnedIntents`) on
+/// `x-rio-service-token` — builders share the scheduler's port 9001 at L4
+/// (CCNP), so without the gate a compromised builder could poison λ\[h\],
+/// drain executors, or arm false ICE marks. All controller→scheduler
+/// callsites (`Ctx.admin`, `disruption::run`, `node_informer::*`) use
+/// this alias so a single interceptor covers every RPC.
+pub type AdminClient = rio_proto::AdminServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        rio_auth::hmac::ServiceTokenInterceptor,
+    >,
+>;
+
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
 ///
@@ -89,9 +106,10 @@ pub struct Ctx {
     /// K8s client. Shared (clone per `Api<T>` call --- cheap, it's
     /// an Arc internally).
     pub client: Client,
-    /// Balanced AdminServiceClient (DrainExecutor in pool
-    /// finalizer).
-    pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
+    /// Balanced AdminServiceClient with service-token interceptor
+    /// (DrainExecutor in pool finalizer, AppendInterruptSample,
+    /// ClusterStatus).
+    pub admin: AdminClient,
     /// rio-scheduler addresses. For builder pod env injection ONLY
     /// (reconcilers use `admin` above). `balance_host = None` → env
     /// var NOT injected → builders fall back to single-channel.

@@ -1,9 +1,8 @@
 //! `rio-cli poison-clear|poison-list` — poisoned-derivation inspection.
 
-use rio_proto::AdminServiceClient;
+use crate::AdminClient;
 use rio_proto::types::ClearPoisonRequest;
 use serde::Serialize;
-use tonic::transport::Channel;
 
 use crate::{fmt_secs_ago, json, rpc};
 
@@ -17,7 +16,7 @@ pub(crate) struct ClearArgs {
 
 pub(crate) async fn run_clear(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     a: ClearArgs,
 ) -> anyhow::Result<()> {
     // Validate BEFORE the RPC. The scheduler's DAG is keyed on
@@ -49,10 +48,7 @@ pub(crate) async fn run_clear(
     Ok(())
 }
 
-pub(crate) async fn run_list(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_list(as_json: bool, client: &mut AdminClient) -> anyhow::Result<()> {
     let resp = rpc("ListPoisoned", async || client.list_poisoned(()).await).await?;
     if as_json {
         // `PoisonedDerivation` is NOT in rio-proto's Serialize allowlist

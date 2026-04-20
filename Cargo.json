@@ -20194,6 +20194,10 @@
           "packageId": "kube"
         },
         {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -20453,6 +20457,10 @@
         {
           "name": "rand",
           "packageId": "rand 0.10.0"
+        },
+        {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
         },
         {
           "name": "rio-common",

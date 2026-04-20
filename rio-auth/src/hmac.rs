@@ -154,6 +154,48 @@ impl HmacClaims for ExecutorClaims {
     }
 }
 
+/// tonic client interceptor that mints `x-rio-service-token` (HMAC-signed
+/// [`ServiceClaims`]) on every outgoing request.
+///
+/// Shared by every control-plane caller of a service-token-gated RPC:
+/// rio-controller (`caller="rio-controller"`) and rio-cli
+/// (`caller="rio-cli"`). The verifier side checks `claims.caller` against
+/// a per-RPC allowlist. `signer = None` → no-op (dev-mode pass-through;
+/// the verifier is also `None` in that mode). See
+/// `r[sec.authz.service-token]`.
+#[derive(Clone)]
+pub struct ServiceTokenInterceptor {
+    signer: Option<std::sync::Arc<HmacSigner>>,
+    caller: &'static str,
+}
+
+impl ServiceTokenInterceptor {
+    pub fn new(signer: Option<std::sync::Arc<HmacSigner>>, caller: &'static str) -> Self {
+        Self { signer, caller }
+    }
+}
+
+impl tonic::service::Interceptor for ServiceTokenInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(signer) = &self.signer {
+            let claims = ServiceClaims {
+                caller: self.caller.to_string(),
+                // 60s: sub-µs to sign, no caching. Same window as the
+                // gateway's PutPath token.
+                expiry_unix: crate::now_unix()
+                    .map_err(|e| tonic::Status::internal(e.to_string()))?
+                    + 60,
+            };
+            // sign() output is base64url + '.' — always ASCII.
+            if let Ok(v) = signer.sign(&claims).parse() {
+                req.metadata_mut()
+                    .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, v);
+            }
+        }
+        Ok(req)
+    }
+}
+
 /// Shared HMAC key. The scheduler signs, the store verifies — same key
 /// file, same field, and a process is one role or the other (never
 /// both), so a single struct with both methods is sufficient. The
@@ -451,6 +493,33 @@ mod tests {
             verifier.verify::<AssignmentClaims>("!!!.!!!"),
             Err(HmacError::Base64(_))
         ));
+    }
+
+    #[test]
+    fn service_token_interceptor_mints_header_and_noop_when_unsigned() {
+        use tonic::service::Interceptor;
+        // signer present → header attached, verifies, caller matches.
+        let signer = std::sync::Arc::new(HmacSigner::from_key(TEST_KEY.to_vec()));
+        let mut int = ServiceTokenInterceptor::new(Some(signer), "rio-cli");
+        let req = int.call(tonic::Request::new(())).unwrap();
+        let tok = req
+            .metadata()
+            .get(rio_common::grpc::SERVICE_TOKEN_HEADER)
+            .expect("interceptor should attach header")
+            .to_str()
+            .unwrap();
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let claims = verifier.verify::<ServiceClaims>(tok).expect("verifies");
+        assert_eq!(claims.caller, "rio-cli");
+
+        // signer=None → no header (dev-mode pass-through).
+        let mut noop = ServiceTokenInterceptor::new(None, "rio-cli");
+        let req = noop.call(tonic::Request::new(())).unwrap();
+        assert!(
+            req.metadata()
+                .get(rio_common::grpc::SERVICE_TOKEN_HEADER)
+                .is_none()
+        );
     }
 
     #[test]

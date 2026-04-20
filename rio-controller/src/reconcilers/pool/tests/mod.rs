@@ -44,7 +44,10 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     );
     Arc::new(Ctx {
         client,
-        admin: rio_proto::AdminServiceClient::new(rio_test_support::grpc::dead_channel()),
+        admin: rio_proto::AdminServiceClient::with_interceptor(
+            rio_test_support::grpc::dead_channel(),
+            rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+        ),
         scheduler: rio_common::config::UpstreamAddrs {
             addr: "http://127.0.0.1:1".into(),
             ..rio_common::config::UpstreamAddrs::with_port(9001)

@@ -23,7 +23,9 @@ use tracing::{info, warn};
 
 use rio_controller::reconcilers::node_informer::NodeLabelCache;
 use rio_controller::reconcilers::nodepoolbudget::NodePoolBudgetConfig;
-use rio_controller::reconcilers::{Ctx, componentscaler, node_informer, nodepoolbudget, pool};
+use rio_controller::reconcilers::{
+    AdminClient, Ctx, componentscaler, node_informer, nodepoolbudget, pool,
+};
 use rio_controller::spawn_controller;
 use rio_crds::componentscaler::ComponentScaler;
 use rio_crds::pool::Pool;
@@ -60,6 +62,13 @@ struct Config {
     /// reconciler not spawned. Env: `RIO_NODEPOOL_BUDGET__CPU_MILLICORES`
     /// / `__SELECTOR`.
     nodepool_budget: NodePoolBudgetConfig,
+    /// HMAC key for minting `x-rio-service-token` on AdminService
+    /// calls. SAME file as the gateway/scheduler/store
+    /// `service_hmac_key_path` (one shared `rio-service-hmac` Secret).
+    /// `None` = dev mode (no header attached; scheduler's verifier is
+    /// also `None` and passes through). Env:
+    /// `RIO_SERVICE_HMAC_KEY_PATH`. See `r[sec.authz.service-token]`.
+    service_hmac_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -76,6 +85,7 @@ impl Default for Config {
             // thousand paths. Lower values are fine for VM tests.
             gc_interval_hours: 24,
             nodepool_budget: NodePoolBudgetConfig::default(),
+            service_hmac_key_path: None,
         }
     }
 }
@@ -177,13 +187,30 @@ async fn main() -> anyhow::Result<()> {
     // ticks; balanced channel health-probes pod IPs and routes only
     // to the leader. Guard held in _balance_guard (dropping it stops
     // the probe loop). Single-channel mode: dev/test only.
-    let Some((admin, _balance_guard)) = rio_proto::client::connect_forever(&shutdown, || {
-        rio_proto::client::connect::<rio_proto::AdminServiceClient<_>>(&cfg.scheduler)
+    let Some((admin_ch, _balance_guard)) = rio_proto::client::connect_forever(&shutdown, || {
+        rio_proto::client::connect_raw::<rio_proto::AdminServiceClient<_>>(&cfg.scheduler)
     })
     .await
     else {
         return Ok(());
     };
+    // Wrap the balanced channel with a service-token interceptor: every
+    // AdminService RPC carries `x-rio-service-token` so the scheduler's
+    // controller-only gates (AppendInterruptSample, DrainExecutor) pass.
+    // r[impl sec.authz.service-token]
+    let service_signer = rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?
+        .map(std::sync::Arc::new);
+    if service_signer.is_some() {
+        info!("x-rio-service-token minting enabled on AdminService RPCs");
+    }
+    let admin: AdminClient = rio_proto::AdminServiceClient::with_interceptor(
+        admin_ch,
+        rio_auth::hmac::ServiceTokenInterceptor::new(service_signer, "rio-controller"),
+    )
+    .max_decoding_message_size(rio_common::grpc::max_message_size())
+    .max_encoding_message_size(rio_common::grpc::max_message_size());
+
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // ---- Events Recorder ----

@@ -7,7 +7,7 @@ use rio_proto::types::{SlaCandidateRow, SlaExplainResponse, SlaOverride, SlaStat
 
 use crate::db::SlaOverrideRow;
 use crate::sla::explain::ExplainResult;
-use crate::sla::types::{DurationFit, FittedParams, MemFit};
+use crate::sla::types::{DurationFit, FittedParams, MemFit, RawCores};
 
 /// proto → row. `id`/`created_at` are server-assigned; ignore the
 /// request's values.
@@ -69,8 +69,19 @@ pub(super) fn status_from_fit(
         DurationFit::Usl { p_bar, .. } => ("Usl", p_bar.0),
     };
     let (s, p, q) = f.fit.spq();
+    // `MemFit::Coupled` evaluated at p̄=∞ (Probe/Amdahl) is
+    // `(a + b·∞.ln()).exp() as u64` → saturates to u64::MAX (18 EB).
+    // Amdahl+Coupled is the test-fixture default; the export-corpus path
+    // already guards with a 0.0 sentinel — match that convention here.
     let (mem_kind, mem_p90) = match &f.mem {
-        MemFit::Coupled { .. } => ("Coupled", f.mem.at(f.fit.p_bar()).0),
+        MemFit::Coupled { .. } => (
+            "Coupled",
+            if p_bar.is_finite() {
+                f.mem.at(RawCores(p_bar)).0
+            } else {
+                0
+            },
+        ),
         MemFit::Independent { p90 } => ("Independent", p90.0),
     };
     SlaStatusResponse {
@@ -79,7 +90,9 @@ pub(super) fn status_from_fit(
         s,
         p,
         q,
-        p_bar,
+        // Same sentinel for the proto field: protojson serializes
+        // f64::INFINITY as the non-standard string "Infinity".
+        p_bar: if p_bar.is_finite() { p_bar } else { 0.0 },
         mem_kind: mem_kind.into(),
         mem_p90_bytes: mem_p90,
         disk_p90_bytes: f.disk_p90.map(|d| d.0),
@@ -113,5 +126,82 @@ pub(super) fn explain_to_proto(r: &ExplainResult) -> SlaExplainResponse {
                 feasible: c.feasible,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sla::types::{ExploreState, ModelKey, RefSeconds, WallSeconds};
+
+    fn amdahl_coupled() -> FittedParams {
+        FittedParams {
+            key: ModelKey {
+                pname: "x".into(),
+                system: "x86_64-linux".into(),
+                tenant: "t".into(),
+            },
+            fit: DurationFit::Amdahl {
+                s: RefSeconds(10.0),
+                p: RefSeconds(400.0),
+            },
+            mem: MemFit::Coupled {
+                a: 22.0,
+                b: 0.5,
+                r1: 0.9,
+            },
+            disk_p90: None,
+            sigma_resid: 0.1,
+            log_residuals: vec![],
+            n_eff: 8.0,
+            span: 8.0,
+            explore: ExploreState {
+                distinct_c: 3,
+                min_c: RawCores(2.0),
+                max_c: RawCores(16.0),
+                saturated: true,
+                last_wall: WallSeconds(100.0),
+            },
+            t_min_ci: None,
+            ci_computed_at: None,
+            tier: None,
+            hw_bias: Default::default(),
+            prior_source: None,
+        }
+    }
+
+    /// Regression: Amdahl/Probe → p̄=∞; `MemFit::Coupled` evaluated at ∞
+    /// is `(a + b·∞.ln()).exp() as u64` → saturates to u64::MAX (18 EB).
+    /// Amdahl+Coupled is the test-fixture default — operator-facing
+    /// garbage for a common shape. Now matches the export-corpus path's
+    /// 0-sentinel guard.
+    #[test]
+    fn status_from_fit_amdahl_coupled_finite_mem() {
+        let r = status_from_fit(Some(&amdahl_coupled()), None);
+        assert_eq!(
+            r.mem_p90_bytes, 0,
+            "p̄=∞ + Coupled → 0 sentinel, not u64::MAX"
+        );
+        assert_eq!(
+            r.p_bar, 0.0,
+            "p̄=∞ → 0.0 sentinel (protojson can't encode ∞)"
+        );
+        assert_eq!(r.mem_kind, "Coupled");
+        assert_eq!(r.fit_kind, "Amdahl");
+    }
+
+    /// Finite p̄ (Capped) + Coupled → mem evaluated at p̄, not sentineled.
+    #[test]
+    fn status_from_fit_capped_coupled_evaluates_at_p_bar() {
+        let mut f = amdahl_coupled();
+        f.fit = DurationFit::Capped {
+            s: RefSeconds(10.0),
+            p: RefSeconds(400.0),
+            p_bar: RawCores(8.0),
+        };
+        let r = status_from_fit(Some(&f), None);
+        // (22.0 + 0.5·ln(8)).exp() ≈ e^23.04 ≈ 1.0e10 — finite, non-zero.
+        assert!(r.mem_p90_bytes > 0 && r.mem_p90_bytes < u64::MAX);
+        assert_eq!(r.p_bar, 8.0);
     }
 }

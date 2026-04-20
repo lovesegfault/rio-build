@@ -1,9 +1,8 @@
 //! `rio-cli builds|cancel-build` — build listing + cancellation.
 
+use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::AdminServiceClient;
 use rio_proto::types::{BuildInfo, CancelBuildRequest, ListBuildsRequest};
-use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
@@ -34,7 +33,7 @@ pub(crate) struct CancelArgs {
 
 pub(crate) async fn run_list(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     a: ListArgs,
 ) -> anyhow::Result<()> {
     let req = ListBuildsRequest {

@@ -35,7 +35,7 @@ message ClusterStatusResponse {
 }
 
 message ListExecutorsRequest {
-  string status_filter = 1;              // Optional: "alive", "draining", "dead"
+  string status_filter = 1;              // Optional: "alive", "draining", "degraded", "connecting"
 }
 
 message ListExecutorsResponse {
@@ -49,7 +49,7 @@ message ExecutorInfo {
   repeated string supported_features = 3;
   reserved 4;                            // was max_builds (P0537: always 1)
   reserved 5;                            // was uint32 running_builds (P0537: → bool busy)
-  string status = 6;                     // "alive", "draining", "dead"
+  string status = 6;                     // "alive", "draining", "degraded", "connecting"
   ResourceUsage resources = 7;           // (types.proto)
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;

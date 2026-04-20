@@ -114,16 +114,30 @@ pub(super) async fn get_build_logs(
 /// 256 lines/chunk balances message count vs. per-message size.
 const CHUNK_LINES: usize = 256;
 
-/// Try the ring buffer. Returns `Some` if the derivation has any lines
-/// buffered (i.e., it's active or just-completed-not-yet-drained).
-fn try_ring_buffer(
+/// Try the ring buffer. `None` ⇔ no buffer exists for `drv_path`
+/// (derivation not active / already drained → caller falls through to
+/// S3). `Some(chunks)` ⇔ buffer exists; when the caller is caught up
+/// (`since` ≥ newest line) `chunks` is a single empty
+/// `is_complete=false` chunk telling the client to re-poll.
+///
+/// The previous `lines.is_empty() → None` conflated "no buffer" with
+/// "caught up" — a fast-polling dashboard on an active build fell
+/// through to S3 and got `NotFound`.
+pub(super) fn try_ring_buffer(
     log_buffers: &LogBuffers,
     drv_path: &str,
     since: u64,
 ) -> Option<Vec<BuildLogChunk>> {
-    let lines = log_buffers.read_since(drv_path, since);
+    let lines = log_buffers.read_since(drv_path, since)?;
     if lines.is_empty() {
-        return None;
+        // Buffer present but caller already has everything. Per the
+        // proto contract: empty + is_complete=false → re-poll.
+        return Some(vec![BuildLogChunk {
+            derivation_path: drv_path.to_string(),
+            lines: vec![],
+            first_line_number: since,
+            is_complete: false,
+        }]);
     }
     // Group into CHUNK_LINES-sized chunks. Each chunk carries the
     // first_line_number of its first line for client-side ordering.
@@ -171,9 +185,24 @@ async fn try_s3(
     .await
     .status_internal("PG query failed")?;
 
-    let Some((s3_key, _line_count)) = row else {
+    let Some((s3_key, line_count)) = row else {
         return Ok(None); // not in S3 either → truly not found
     };
+
+    // Short-circuit: client already has every line. Don't fetch +
+    // zstd-decode a (potentially 10 MiB) blob just to produce zero
+    // chunks — and `decompress_and_chunk` returning `vec![]` means
+    // `chunks.last_mut()` is None, so no `is_complete=true` would ship
+    // (client never learns the build finished). One empty terminal
+    // chunk satisfies the proto contract.
+    if since >= line_count as u64 {
+        return Ok(Some(vec![BuildLogChunk {
+            derivation_path: drv_hash.to_string(),
+            lines: vec![],
+            first_line_number: since,
+            is_complete: true,
+        }]));
+    }
 
     debug!(s3_key = %s3_key, "serving build log from S3");
 
@@ -216,31 +245,33 @@ pub(super) fn decompress_and_chunk(
     drv_label: &str,
     since: u64,
 ) -> std::io::Result<Vec<BuildLogChunk>> {
-    let raw = zstd::decode_all(compressed)?;
+    let decoded = zstd::decode_all(compressed)?;
+    // The flusher writes `line\nline\nline\n` — strip the trailing
+    // delimiter BEFORE splitting so `split('\n')` yields exactly the
+    // lines (no trailing `""`). Stripping post-hoc from `buf` is wrong
+    // when `(M-since) % CHUNK_LINES == CHUNK_LINES-1`: the `""` is the
+    // element that fills `buf` to CHUNK_LINES and gets `mem::take`n
+    // into `chunks` first. Stripping at source eliminates the boundary
+    // case structurally.
+    let raw: &[u8] = decoded.strip_suffix(b"\n").unwrap_or(&decoded);
 
-    // Split on \n. The flusher joins with \n so every line gets a trailing
-    // \n — split() gives an empty last element, which we skip.
     // Line numbers are the index into this split, starting from 0 (the
     // flusher writes them in buffer order, which IS line-number order).
     let mut chunks = Vec::new();
     let mut buf: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_LINES);
     let mut chunk_first_line = since;
 
+    #[allow(
+        clippy::sliced_string_as_bytes,
+        reason = "raw is a zstd-decoded byte slice, not UTF-8; the flusher \
+                  writes raw bytes joined by 0x0A — splitting on 0x0A is the \
+                  inverse, no Unicode line-break handling wanted"
+    )]
     for (n, line) in raw.split(|b| *b == b'\n').enumerate() {
         let n = n as u64;
         if n < since {
             continue; // client already has this line
         }
-        // Skip the trailing empty element from the final \n. (An ACTUAL
-        // empty log line is uncommon but valid — we keep those. The
-        // distinguisher is whether it's the very last element.)
-        // We don't know we're at the last element until the iterator ends,
-        // so: collect all, then strip a trailing empty. Simpler: check if
-        // this is the last byte position. But `split()` doesn't give us
-        // that. Simplest: if line is empty AND it's past line_count, skip.
-        // Actually: the flusher writes `line\nline\nline\n` — split gives
-        // [line, line, line, ""]. The "" is always the last element.
-        // We handle it after the loop.
         buf.push(line.to_vec());
         if buf.len() >= CHUNK_LINES {
             chunks.push(BuildLogChunk {
@@ -251,10 +282,6 @@ pub(super) fn decompress_and_chunk(
             });
             chunk_first_line = n + 1;
         }
-    }
-    // Strip the trailing empty from the final-\n split artifact.
-    if buf.last().is_some_and(|l| l.is_empty()) {
-        buf.pop();
     }
     if !buf.is_empty() {
         chunks.push(BuildLogChunk {

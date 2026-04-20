@@ -20,6 +20,19 @@ use rio_common::signal::Token;
 use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
 use tonic::transport::Channel;
 
+/// `AdminServiceClient` shape for all rio-cli→scheduler calls: a
+/// [`ServiceTokenInterceptor`](rio_auth::hmac::ServiceTokenInterceptor)
+/// (`caller="rio-cli"`) mints `x-rio-service-token` per request so the
+/// scheduler's controller-only-RPC gates (`DrainExecutor` allowlists
+/// `["rio-controller", "rio-cli"]`) pass. Signer absent → no header
+/// (dev-mode pass-through).
+pub(crate) type AdminClient = AdminServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        Channel,
+        rio_auth::hmac::ServiceTokenInterceptor,
+    >,
+>;
+
 // Subcommand handlers. Each module owns its `#[derive(Args)]` struct
 // and `run*` fn so `main.rs` deltas for a new subcommand stay at enum
 // variant + match arm + mod decl.
@@ -126,6 +139,13 @@ struct Config {
     /// (scheduler pod is in rio-system; store pod is in rio-store
     /// namespace since P0454's four-namespace split).
     store_addr: String,
+    /// HMAC key for minting `x-rio-service-token`. Same file as
+    /// gateway/scheduler/store/controller (one shared `rio-service-hmac`
+    /// Secret). xtask's port-forward wrapper fetches it alongside the
+    /// mTLS cert; in-pod exec inside the scheduler pod has it mounted.
+    /// `None` → no header (dev-mode; scheduler's verifier is also
+    /// `None` and passes through). Env: `RIO_SERVICE_HMAC_KEY_PATH`.
+    service_hmac_key_path: Option<std::path::PathBuf>,
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -145,6 +165,7 @@ impl Default for Config {
             // Service FQDN. Override via `RIO_STORE_ADDR` for
             // port-forward / standalone use.
             store_addr: "rio-store.rio-store:9002".into(),
+            service_hmac_key_path: None,
         }
     }
 }
@@ -155,10 +176,19 @@ impl Config {
     /// store / SchedulerService) are matched first so they never `?`
     /// on an unreachable scheduler — `rio-cli bps describe` must work
     /// when the scheduler is down (e.g., to diagnose why).
-    async fn connect_admin(&self) -> anyhow::Result<AdminServiceClient<Channel>> {
-        rio_proto::client::connect_single(&self.scheduler_addr)
+    async fn connect_admin(&self) -> anyhow::Result<AdminClient> {
+        let ch = rio_proto::client::connect_channel(&self.scheduler_addr)
             .await
-            .map_err(|e| anyhow!("connect to scheduler at {}: {e}", self.scheduler_addr))
+            .map_err(|e| anyhow!("connect to scheduler at {}: {e}", self.scheduler_addr))?;
+        let signer = rio_auth::hmac::HmacSigner::load(self.service_hmac_key_path.as_deref())
+            .map_err(|e| anyhow!("service HMAC key load: {e}"))?
+            .map(std::sync::Arc::new);
+        Ok(AdminServiceClient::with_interceptor(
+            ch,
+            rio_auth::hmac::ServiceTokenInterceptor::new(signer, "rio-cli"),
+        )
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size()))
     }
 
     /// Connect to the store's `StoreAdminService`. Only `upstream` /

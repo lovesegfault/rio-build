@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use futures_util::Stream;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
@@ -104,10 +106,14 @@ pub(super) async fn trigger_gc(
     // so the store's link_parent can stitch the trace chain.
     let mut tonic_req = tonic::Request::new(req);
     rio_proto::interceptor::inject_current(tonic_req.metadata_mut());
+    // Preserve upstream code+message verbatim with a context prefix —
+    // `.status_internal(..)` here squashed the store's
+    // `InvalidArgument: too many extra_roots: N (max …)` into an
+    // opaque INTERNAL.
     let store_stream = store_admin
         .trigger_gc(tonic_req)
         .await
-        .status_internal("store TriggerGC failed")?
+        .map_err(|s| Status::new(s.code(), format!("store TriggerGC: {}", s.message())))?
         .into_inner();
 
     // Forward store's progress stream to the client. A small
@@ -115,44 +121,60 @@ pub(super) async fn trigger_gc(
     // directly compatible with our TriggerGCStream type (we
     // declare it as ReceiverStream).
     let (tx, rx) = mpsc::channel::<Result<GcProgress, Status>>(8);
-    tokio::spawn(async move {
-        let mut store_stream = store_stream;
-        loop {
-            // biased: check shutdown first. A store-side sweep
-            // can go minutes between progress messages; without
-            // this arm the task holds the store channel alive
-            // past main()'s lease_loop.await.
-            let msg = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("TriggerGC forward: shutdown, dropping store stream");
-                    break;
-                }
-                m = store_stream.message() => m,
-            };
-            match msg {
-                Ok(Some(progress)) => {
-                    if tx.send(Ok(progress)).await.is_err() {
-                        // Client disconnected. Let the store-
-                        // side GC finish (it's already running);
-                        // just stop forwarding.
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // Store stream EOF (GC complete). Drop tx
-                    // → client sees stream end.
-                    break;
-                }
-                Err(e) => {
-                    // Store error mid-stream. Forward the error;
-                    // client decides whether to retry.
-                    let _ = tx.send(Err(e)).await;
+    tokio::spawn(forward_gc_progress(store_stream, tx, shutdown));
+
+    Ok(ReceiverStream::new(rx))
+}
+
+/// Forward `GcProgress` items from `store_stream` to `tx`, exiting
+/// promptly on `shutdown`. Extracted from the `tokio::spawn` body so the
+/// shutdown-exit regression test
+/// ([`tests::gc_tests::trigger_gc_forward_exits_on_shutdown`]) calls
+/// PRODUCTION code — previously the test inlined a hand-copy and a
+/// refactor that dropped the `shutdown.cancelled()` arm passed it.
+///
+/// Generic over the stream type: production wraps `tonic::Streaming`;
+/// tests pass a `ReceiverStream`.
+pub(super) async fn forward_gc_progress<S>(
+    mut store_stream: S,
+    tx: mpsc::Sender<Result<GcProgress, Status>>,
+    shutdown: rio_common::signal::Token,
+) where
+    S: Stream<Item = Result<GcProgress, Status>> + Unpin,
+{
+    loop {
+        // biased: check shutdown first. A store-side sweep can go
+        // minutes between progress messages; without this arm the
+        // task holds the store channel alive past main()'s
+        // lease_loop.await.
+        let msg = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::debug!("TriggerGC forward: shutdown, dropping store stream");
+                break;
+            }
+            m = store_stream.next() => m,
+        };
+        match msg {
+            Some(Ok(progress)) => {
+                if tx.send(Ok(progress)).await.is_err() {
+                    // Client disconnected. Let the store-side GC
+                    // finish (it's already running); just stop
+                    // forwarding.
                     break;
                 }
             }
+            None => {
+                // Store stream EOF (GC complete). Drop tx → client
+                // sees stream end.
+                break;
+            }
+            Some(Err(e)) => {
+                // Store error mid-stream. Forward the error; client
+                // decides whether to retry.
+                let _ = tx.send(Err(e)).await;
+                break;
+            }
         }
-    });
-
-    Ok(ReceiverStream::new(rx))
+    }
 }

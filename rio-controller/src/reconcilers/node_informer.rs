@@ -34,11 +34,9 @@ use kube::api::{Patch, PatchParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use parking_lot::RwLock;
-use rio_proto::AdminServiceClient;
-use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
-use crate::reconcilers::admin_call;
+use crate::reconcilers::{admin_call, AdminClient};
 
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
 /// node's [`HwClass::as_string`]. Builder reads it via downward-API
@@ -262,7 +260,7 @@ impl NodeLabelCache {
 pub async fn run(
     client: Client,
     cache: NodeLabelCache,
-    mut admin: AdminServiceClient<Channel>,
+    mut admin: AdminClient,
     shutdown: rio_common::signal::Token,
 ) {
     let nodes: Api<Node> = Api::all(client);
@@ -473,7 +471,7 @@ pub async fn run_pod_annotator(
 pub async fn run_spot_interrupt_watcher(
     client: Client,
     cache: NodeLabelCache,
-    mut admin: AdminServiceClient<Channel>,
+    mut admin: AdminClient,
     shutdown: rio_common::signal::Token,
 ) {
     let events: Api<Event> = Api::all(client);
@@ -530,7 +528,7 @@ pub async fn run_spot_interrupt_watcher(
 /// (λ reads slightly high until the next flush lands). Bounded by
 /// [`admin_call`]'s timeout so a hung scheduler can't wedge the Node-
 /// informer's watch loop (every caller is inside that loop).
-async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: String, secs: f64) {
+async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
     if let Err(e) = admin_call(admin.append_interrupt_sample(
         rio_proto::types::AppendInterruptSampleRequest {
             hw_class,

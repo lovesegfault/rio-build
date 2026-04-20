@@ -65,7 +65,8 @@ Families:
              (private ed25519 seed). Same RIO_JWT__KEY_PATH env var as
              jwtVerify — JwtConfig is a shared type; gateway loads it
              as SigningKey seed, scheduler/store as VerifyingKey.
-  serviceHmac  always-on. GATEWAY+SCHEDULER (signers) + STORE (verifier).
+  serviceHmac  always-on. GATEWAY+SCHEDULER+CONTROLLER (signers) +
+             STORE+SCHEDULER (verifiers).
              Secret rio-service-hmac → /etc/rio/hmac/service-hmac.key,
              env RIO_SERVICE_HMAC_KEY_PATH. Service-identity HMAC
              replaced mTLS CN-allowlisting when transport encryption

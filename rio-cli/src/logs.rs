@@ -8,10 +8,9 @@
 
 use std::io::Write;
 
+use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::AdminServiceClient;
 use rio_proto::types::GetBuildLogsRequest;
-use tonic::transport::Channel;
 
 use crate::RPC_TIMEOUT;
 
@@ -31,7 +30,7 @@ pub(crate) struct Args {
 /// non-UTF-8 build output), and there's no structured JSON shape for
 /// an arbitrary byte stream. The global `--json` flag is ignored,
 /// same as `gc`.
-pub(crate) async fn run(client: &mut AdminServiceClient<Channel>, a: Args) -> anyhow::Result<()> {
+pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()> {
     // STREAMING — NOT via rpc() helper. The helper's 30s whole-
     // call deadline is wrong for log tails (a build can run for
     // an hour). Wrap just the initial call in the timeout —

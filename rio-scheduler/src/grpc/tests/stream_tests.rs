@@ -269,11 +269,13 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     // would be empty. new_for_tests() makes a fresh DashMap but we
     // grabbed a handle to it via log_buffers() above, so we're
     // asserting against the same one the recv task writes to.
-    let buffered = log_buffers.read_since(&work.drv_path, 0);
+    let buffered = log_buffers
+        .read_since(&work.drv_path, 0)
+        .expect("ring buffer should have been written by the recv task");
     assert_eq!(
         buffered.len(),
         2,
-        "ring buffer should have been written by the recv task; \
+        "ring buffer should hold both lines; \
          if empty, the Arc<LogBuffers> sharing is broken"
     );
     assert_eq!(buffered[0].1, b"wire-line-0");

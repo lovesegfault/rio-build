@@ -24,12 +24,13 @@ pub struct ClockBeforeEpoch(pub std::time::Duration);
 /// Current Unix time in seconds, or [`ClockBeforeEpoch`] if the
 /// system clock predates 1970.
 ///
-/// Shared by [`hmac::HmacVerifier::verify`] (expiry check) and the JWT
-/// test scaffolding so both modules agree on pre-epoch handling.
-/// `jsonwebtoken`'s own `exp` validation reads the clock internally;
-/// it errors (not panics) on pre-epoch, so JWT verify already matches
-/// this contract.
-pub(crate) fn now_unix() -> Result<u64, ClockBeforeEpoch> {
+/// Shared by [`hmac::HmacVerifier::verify`] (expiry check), the JWT
+/// test scaffolding, and out-of-crate token MINTERS (controller's
+/// `ServiceTokenInterceptor`, scheduler's admin tests) so all callers
+/// agree on pre-epoch handling. `jsonwebtoken`'s own `exp` validation
+/// reads the clock internally; it errors (not panics) on pre-epoch, so
+/// JWT verify already matches this contract.
+pub fn now_unix() -> Result<u64, ClockBeforeEpoch> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

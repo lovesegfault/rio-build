@@ -5,20 +5,16 @@
 //! recent-build rollup. The flattened-JSON shape is what cli.nix
 //! asserts against (`jq -e '.total_executors'`).
 
-use rio_proto::AdminServiceClient;
+use crate::AdminClient;
 use rio_proto::types::{
     BuildInfo, ClusterStatusResponse, ExecutorInfo, ListBuildsRequest, ListExecutorsRequest,
 };
 use serde::Serialize;
-use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
 /// Run the `status` subcommand.
-pub(crate) async fn run(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(as_json: bool, client: &mut AdminClient) -> anyhow::Result<()> {
     // Three sequential RPCs. Gather ALL results before printing
     // anything — if `list_executors` or `list_builds` fails after
     // `cluster_status` succeeds, we'd otherwise print the summary

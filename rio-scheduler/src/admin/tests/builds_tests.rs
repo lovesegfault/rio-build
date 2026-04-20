@@ -235,9 +235,16 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_list_builds_cursor_pagination_walks_full_set() -> anyhow::Result<()> {
     const TOTAL: usize = 250;
-    const PAGE: u32 = 100;
+    // PAGE coprime with `per_bucket` (=TOTAL/BUCKETS=5): page boundaries
+    // MUST split a same-timestamp bucket so the `(submitted_at, build_id)`
+    // row-value comparison is decided by `build_id`. With PAGE=100 (a
+    // multiple of 5) every boundary lands BETWEEN buckets and a
+    // timestamp-only cursor would pass — the tiebreaker was structurally
+    // untested. PAGE=97 → page 1 ends 2 rows into bucket 19; page 2 must
+    // include the remaining 3 same-timestamp rows via `build_id <`.
+    const PAGE: u32 = 97;
     const BUCKETS: usize = 50;
-    // Expect ceil(250/100) = 3 pages: 100 + 100 + 50.
+    // Expect ceil(250/97) = 3 pages: 97 + 97 + 56.
     const EXPECTED_PAGES: usize = TOTAL.div_ceil(PAGE as usize);
 
     let (svc, _actor, _task, db) = setup_svc_default().await;

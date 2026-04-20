@@ -609,7 +609,13 @@ mod tests {
             1,
             "periodic flush must snapshot, not drain"
         );
-        assert_eq!(buffers.read_since("/nix/store/aaaa-test.drv", 0).len(), 2);
+        assert_eq!(
+            buffers
+                .read_since("/nix/store/aaaa-test.drv", 0)
+                .unwrap()
+                .len(),
+            2
+        );
 
         // S3 PUT happened under periodic/ key, NO PG row.
         let puts: Vec<CapturedPut> = captured.lock().unwrap().clone();

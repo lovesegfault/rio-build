@@ -1,9 +1,8 @@
 //! `rio-cli create-tenant|list-tenants` — tenant CRUD via AdminService.
 
+use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::AdminServiceClient;
 use rio_proto::types::{CreateTenantRequest, TenantInfo};
-use tonic::transport::Channel;
 
 use crate::{emit, json, rpc};
 
@@ -27,7 +26,7 @@ pub(crate) struct CreateArgs {
 
 pub(crate) async fn run_create(
     as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
     a: CreateArgs,
 ) -> anyhow::Result<()> {
     let req = CreateTenantRequest {
@@ -50,10 +49,7 @@ pub(crate) async fn run_create(
     Ok(())
 }
 
-pub(crate) async fn run_list(
-    as_json: bool,
-    client: &mut AdminServiceClient<Channel>,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_list(as_json: bool, client: &mut AdminClient) -> anyhow::Result<()> {
     let resp = rpc("ListTenants", async || client.list_tenants(()).await).await?;
     emit(as_json, &resp.tenants, "(no tenants)", print_tenant)
 }
@@ -63,7 +59,7 @@ pub(crate) async fn run_list(
 /// failure so callers fall back to printing the raw UUID rather than
 /// failing the whole command on a display-only concern.
 pub(crate) async fn name_map(
-    client: &mut AdminServiceClient<Channel>,
+    client: &mut AdminClient,
 ) -> std::collections::HashMap<String, String> {
     match rpc("ListTenants", async || client.list_tenants(()).await).await {
         Ok(r) => r
