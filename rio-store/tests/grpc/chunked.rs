@@ -329,11 +329,10 @@ async fn gt13_batch_rpc_atomic() -> TestResult {
          (contrast gt13_multi_output_not_atomic where output-0 survives)"
     );
 
-    // Placeholders cleaned up too (abort_batch). No stale 'uploading' rows
-    // blocking the retry.
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests")
-        .fetch_one(&s.db.pool)
-        .await?;
+    // Placeholders cleaned up too. PlaceholderGuard's drop-spawn is
+    // async — poll until the reap lands so the retry below doesn't
+    // hit Concurrent.
+    let total = poll_scalar_until(&s.db.pool, "SELECT COUNT(*) FROM manifests", 0i64).await;
     assert_eq!(total, 0, "placeholders must be cleaned up (clean retry)");
 
     // --- Attempt 2: both valid → both commit (clean retry) ---
@@ -714,27 +713,36 @@ async fn gt13_batch_chunked_abort_decrements_refcounts() -> TestResult {
             .await?;
     assert_eq!(complete, 0, "no output committed");
 
-    // No 'uploading' rows (abort_batch's reap_one deleted output-0's
-    // placeholder; output-1 never claimed one — hash check is BEFORE
-    // claim_placeholder).
-    let uploading: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
-            .fetch_one(&s.db.pool)
-            .await?;
+    // No 'uploading' rows (PlaceholderGuard's drop-spawn reaped
+    // output-0's placeholder; output-1 never claimed one — hash check
+    // is BEFORE claim_placeholder). The guard's reap is spawned async
+    // on Drop — poll until it lands.
+    let uploading = poll_scalar_until(
+        &s.db.pool,
+        "SELECT COUNT(*) FROM manifests WHERE status = 'uploading'",
+        0i64,
+    )
+    .await;
     assert_eq!(
         uploading, 0,
-        "abort_batch reaped output-0's staged placeholder"
+        "PlaceholderGuard drop reaped output-0's staged placeholder"
     );
 
     // THE REFCOUNT ASSERTION: output-0's chunks were staged at
     // refcount=1; reap_one decremented them back to 0 (GC-eligible).
-    // Without this, every failed batch leaks refcounted chunks forever.
-    let live_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE refcount > 0")
-        .fetch_one(&s.db.pool)
-        .await?;
+    // Without this, every failed batch leaks refcounted chunks
+    // forever. The same `reap_one` tx commits both placeholder DELETE
+    // and refcount decrement, so once `uploading == 0` above this is
+    // settled — but poll for symmetry.
+    let live_chunks = poll_scalar_until(
+        &s.db.pool,
+        "SELECT COUNT(*) FROM chunks WHERE refcount > 0",
+        0i64,
+    )
+    .await;
     assert_eq!(
         live_chunks, 0,
-        "abort_batch's reap_one must decrement staged chunk refcounts to zero"
+        "PlaceholderGuard drop's reap_one must decrement staged chunk refcounts to zero"
     );
 
     // Blob-store writes are NOT rolled back — output-0's chunks orphan
@@ -995,19 +1003,13 @@ async fn batch_guard_drop_reaps_placeholders() -> TestResult {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(status.message().contains("hash mismatch"));
 
-    // Guard's drop-spawn is async — give it a moment to land.
-    let mut tries = 0;
-    let uploading = loop {
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
-                .fetch_one(&s.db.pool)
-                .await?;
-        if n == 0 || tries >= 50 {
-            break n;
-        }
-        tries += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
+    // Guard's drop-spawn is async — poll until it lands.
+    let uploading = poll_scalar_until(
+        &s.db.pool,
+        "SELECT COUNT(*) FROM manifests WHERE status = 'uploading'",
+        0i64,
+    )
+    .await;
     assert_eq!(
         uploading, 0,
         "PlaceholderGuard drop must reap output-0's placeholder \

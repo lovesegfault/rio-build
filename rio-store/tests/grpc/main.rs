@@ -32,6 +32,33 @@ use rio_test_support::{TestDb, TestResult};
 
 use std::sync::Arc;
 
+/// Poll a scalar query until it returns `target` or 50×20ms elapses.
+/// Returns the final observed value (== `target` on success).
+///
+/// Use for any assertion that races `PlaceholderGuard::Drop`'s
+/// `spawn_monitored(reap_one)` — the guard's reap is spawned async on
+/// Drop, so a single-shot `query_scalar` immediately after the
+/// handler's `Err` return can observe pre-reap state under nextest
+/// parallelism / builder load.
+pub async fn poll_scalar_until<T>(pool: &sqlx::PgPool, sql: &str, target: T) -> T
+where
+    T: PartialEq
+        + for<'r> sqlx::Decode<'r, sqlx::Postgres>
+        + sqlx::Type<sqlx::Postgres>
+        + Unpin
+        + Send,
+{
+    let mut tries = 0;
+    loop {
+        let n: T = sqlx::query_scalar(sql).fetch_one(pool).await.unwrap();
+        if n == target || tries >= 50 {
+            break n;
+        }
+        tries += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Test harness bundling the three things every gRPC integration test
 /// needs: an ephemeral PG, a connected client, and a server handle.
 ///
