@@ -54,27 +54,59 @@ fn assert_rejected(args: &[&str]) {
 // --help round-trips: clap derives are internally consistent
 // ---------------------------------------------------------------------------
 
+/// Every Cmd variant's kebab-case name. The count assertion in
+/// `top_level_help_lists_all_subcommands` ties this to the actual clap
+/// command set, so adding a `Cmd` variant without updating this list
+/// fails CI instead of silently losing coverage.
+const ALL_SUBCOMMANDS: &[&str] = &[
+    "create-tenant",
+    "list-tenants",
+    "status",
+    "workers",
+    "builds",
+    "derivations",
+    "logs",
+    "gc",
+    "poison-clear",
+    "poison-list",
+    "cancel-build",
+    "drain-executor",
+    "pool",
+    "sla",
+    "verify-chunks",
+    "upstream",
+];
+
 #[test]
 fn top_level_help_lists_all_subcommands() {
     let out = run_cli(&["--help"]);
     assert!(out.status.success());
     let help = String::from_utf8(out.stdout).expect("rio-cli stdout is utf8");
+    // Count guard: clap's subcommand set must match ALL_SUBCOMMANDS
+    // exactly. `Commands:` block runs from the heading to the next
+    // blank line; each entry's first word is the kebab name. `help`
+    // is clap's built-in (not a Cmd variant).
+    let clap_count = help
+        .lines()
+        .skip_while(|l| *l != "Commands:")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .filter(|l| {
+            l.split_whitespace().next().is_some_and(|w| {
+                w != "help"
+                    && !w.starts_with('-')
+                    && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            })
+        })
+        .count();
+    assert_eq!(
+        clap_count,
+        ALL_SUBCOMMANDS.len(),
+        "Cmd enum drifted — update ALL_SUBCOMMANDS:\n{help}"
+    );
     // Every Cmd variant's kebab-case name. If one is missing, the
     // #[derive(Subcommand)] dropped a variant somewhere.
-    for sub in [
-        "create-tenant",
-        "list-tenants",
-        "status",
-        "workers",
-        "builds",
-        "logs",
-        "gc",
-        "poison-clear",
-        "cancel-build",
-        "drain-executor",
-        "pool",
-        "upstream",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         assert!(help.contains(sub), "--help missing {sub}:\n{help}");
     }
 }
@@ -83,18 +115,7 @@ fn top_level_help_lists_all_subcommands() {
 fn per_subcommand_help_renders() {
     // clap --help exit 0 means the Args/Subcommand derives compiled
     // cleanly AND the help template rendered without a format panic.
-    for sub in [
-        "create-tenant",
-        "list-tenants",
-        "status",
-        "workers",
-        "builds",
-        "logs",
-        "gc",
-        "poison-clear",
-        "cancel-build",
-        "drain-executor",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         let out = run_cli(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help: {:?}", out.status);
     }

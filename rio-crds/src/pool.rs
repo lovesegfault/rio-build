@@ -376,7 +376,7 @@ mod tests {
         // D3: fetcher hardening rules. Admission-time rejection of
         // spec fields ADR-019 forces — the reconciler's belt-and-
         // suspenders override is `pool/pod.rs` fetcher hardening.
-        for (rule, msg) in [
+        let fetcher_rules = [
             (
                 "self.kind != 'Fetcher' || (!has(self.privileged) || !self.privileged)",
                 "kind=Fetcher forbids privileged:true",
@@ -390,7 +390,20 @@ mod tests {
                 "self.kind != 'Fetcher' || !has(self.seccompProfile)",
                 "kind=Fetcher forbids seccompProfile",
             ),
-        ] {
+            (
+                "self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))",
+                "kind=Fetcher forbids FUSE tuning knobs",
+            ),
+        ];
+        // Count guard: ties the assertion list to the actual rendered
+        // schema so adding a Fetcher CEL rule without updating this
+        // test fails CI instead of silently losing coverage.
+        assert_eq!(
+            json.matches("self.kind != 'Fetcher'").count(),
+            fetcher_rules.len(),
+            "Fetcher CEL rule count drifted"
+        );
+        for (rule, msg) in fetcher_rules {
             assert!(json.contains(rule), "fetcher CEL rule missing: {rule}");
             assert!(json.contains(msg), "fetcher CEL rule has no message: {msg}");
         }
