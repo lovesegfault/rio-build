@@ -229,9 +229,9 @@ pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
 
 /// Load configuration for `component` with the full precedence chain.
 ///
-/// Search paths for TOML (first found wins; missing = skipped, not error):
+/// TOML search paths (later overrides earlier; missing = skipped, not error):
 /// 1. `/etc/rio/{component}.toml` (system-wide, typically from NixOS module)
-/// 2. `./{component}.toml` (cwd, for local dev)
+/// 2. `./{component}.toml` (cwd, for local dev) — overrides `/etc/rio/`
 ///
 /// `cli_overlay` is the clap-parsed `CliArgs` struct. Its `None` fields
 /// are skipped during serialization (see module docs), so only explicitly
@@ -409,14 +409,20 @@ where
                 .collect())
         }
 
-        // TOML provider path: ["x86_64-linux", "aarch64-linux"]
+        // TOML provider path: ["x86_64-linux", "aarch64-linux"]. Same
+        // trim+empty-filter as visit_str so env and TOML are peers — a
+        // leading-space system name has no valid use and otherwise
+        // silently never matches hard_filter().
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
             self,
             mut seq: A,
         ) -> Result<Self::Value, A::Error> {
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
             while let Some(s) = seq.next_element::<String>()? {
-                out.push(s);
+                let t = s.trim();
+                if !t.is_empty() {
+                    out.push(t.to_owned());
+                }
             }
             Ok(out)
         }
@@ -441,31 +447,63 @@ pub fn redact_db_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return "<redacted>".to_string();
     };
-    let after_scheme = &url[scheme_end + 3..];
+
+    // Split off the query string FIRST. libpq/sqlx accept `?password=` /
+    // `?sslpassword=` as an alternative to userinfo, so we must scrub
+    // both shapes. Splitting first also keeps `rfind('@')` from matching
+    // an `@` inside a query value.
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    let after_scheme = &base[scheme_end + 3..];
 
     // Find the userinfo@host boundary. RFC 3986: the userinfo delimiter
     // is the *last* '@' before the host — passwords may contain literal
     // '@' (percent-encoding is "should", not "must"). Using find('@')
     // here would truncate at the first '@' and leak the password tail.
-    // If no '@', there's no userinfo component → no password → safe as-is.
-    let Some(at_idx) = after_scheme.rfind('@') else {
-        return url.to_string();
-    };
-
-    // Userinfo is everything before '@'. If it contains ':', the
-    // part after ':' is the password.
-    let userinfo = &after_scheme[..at_idx];
-    let Some(colon_idx) = userinfo.find(':') else {
-        // user@host (no password) → safe as-is.
-        return url.to_string();
-    };
-
-    // Rebuild: scheme:// + user + :*** + @host...
     let mut out = String::with_capacity(url.len());
-    out.push_str(&url[..scheme_end + 3]); // scheme://
-    out.push_str(&userinfo[..colon_idx]); // user
-    out.push_str(":***");
-    out.push_str(&after_scheme[at_idx..]); // @host:port/db?...
+    match after_scheme.rfind('@') {
+        None => out.push_str(base),
+        Some(at_idx) => {
+            let userinfo = &after_scheme[..at_idx];
+            match userinfo.find(':') {
+                // user@host (no password) → safe as-is.
+                None => out.push_str(base),
+                Some(colon_idx) => {
+                    out.push_str(&base[..scheme_end + 3]); // scheme://
+                    out.push_str(&userinfo[..colon_idx]); // user
+                    out.push_str(":***");
+                    out.push_str(&after_scheme[at_idx..]); // @host:port/db
+                }
+            }
+        }
+    }
+
+    // Rewrite query params: redact `password` / `sslpassword` values,
+    // preserve everything else (sslmode, connect_timeout, …) for
+    // diagnostic value.
+    if let Some(q) = query {
+        out.push('?');
+        let mut first = true;
+        for pair in q.split('&') {
+            if !first {
+                out.push('&');
+            }
+            first = false;
+            match pair.split_once('=') {
+                Some((k, _))
+                    if k.eq_ignore_ascii_case("password")
+                        || k.eq_ignore_ascii_case("sslpassword") =>
+                {
+                    out.push_str(k);
+                    out.push_str("=***");
+                }
+                _ => out.push_str(pair),
+            }
+        }
+    }
+
     out
 }
 
@@ -801,6 +839,24 @@ mod tests {
     }
 
     #[test]
+    fn comma_vec_toml_seq_trims_and_filters() {
+        // TOML path must apply the same trim+empty-filter as the env
+        // path. Before the fix, visit_seq pushed raw → " x86_64-linux"
+        // never matched hard_filter() and the builder silently took
+        // no work.
+        figment::Jail::expect_with(|_jail| {
+            let f = write_toml(r#"systems = [" x86_64-linux", "", "kvm "]"#);
+            let cfg: VecConfig = load_from_path(f.path(), NoCli::default()).unwrap();
+            assert_eq!(
+                cfg.systems,
+                vec!["x86_64-linux", "kvm"],
+                "TOML seq trimmed + empty dropped"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
     fn comma_vec_empty_and_whitespace_filtered() {
         figment::Jail::expect_with(|jail| {
             // Trailing comma + internal empty + whitespace — should all
@@ -935,6 +991,37 @@ mod tests {
         assert_eq!(
             redact_db_url("postgres://admin:a@b@c@db.example.com:5432/rio"),
             "postgres://admin:***@db.example.com:5432/rio"
+        );
+    }
+
+    #[test]
+    fn redact_db_url_query_param_password() {
+        // libpq/sqlx accept ?password= as an alternative to userinfo.
+        // Before the fix, this passed through verbatim and was logged
+        // at INFO by rio-store.
+        assert_eq!(
+            redact_db_url("postgres://rio@pg/db?password=hunter2&sslmode=require"),
+            "postgres://rio@pg/db?password=***&sslmode=require"
+        );
+        // Password not first.
+        assert_eq!(
+            redact_db_url("postgres://pg:5432/db?sslmode=require&password=hunter2"),
+            "postgres://pg:5432/db?sslmode=require&password=***"
+        );
+        // sslpassword (TLS client-key passphrase).
+        assert_eq!(
+            redact_db_url("postgres://pg/db?sslpassword=keypw"),
+            "postgres://pg/db?sslpassword=***"
+        );
+        // Both userinfo AND query-param redacted.
+        assert_eq!(
+            redact_db_url("postgres://u:pw@h/d?password=x"),
+            "postgres://u:***@h/d?password=***"
+        );
+        // Case-insensitive key match (libpq lowercases).
+        assert_eq!(
+            redact_db_url("postgres://h/d?Password=x"),
+            "postgres://h/d?Password=***"
         );
     }
 
