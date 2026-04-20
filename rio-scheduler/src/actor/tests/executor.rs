@@ -1509,6 +1509,70 @@ async fn test_disconnect_no_promote_oom_report_promotes(
     Ok(())
 }
 
+// r[verify sched.termination.deadline-exceeded+2]
+/// Non-promoting report (`Error`/`Completed`/`EvictedOther`) MUST NOT
+/// consume the `recently_disconnected` entry. Before the
+/// `reason_label` gate was hoisted above `remove()`, an `Error` report
+/// (the controller's `report_terminated_pods` sees a deadline-SIGKILL'd
+/// pod with `terminated.reason="Error"` for the full TGPS=7200 grace
+/// window) consumed the entry then no-op'd — the same-tick
+/// `report_deadline_exceeded_jobs` prefix-match found nothing, so the
+/// `r[ctrl.terminated.deadline-exceeded]` backstop was structurally
+/// defeated and a deterministically-wedging drv looped at
+/// `activeDeadlineSeconds`.
+#[tokio::test]
+async fn test_non_promoting_report_preserves_recently_disconnected() -> TestResult {
+    use rio_proto::types::TerminationReason;
+    let (_db, handle, _task) = setup_with_big_ceilings().await;
+
+    let mut rx = connect_executor_kind(
+        &handle,
+        "rio-builder-p-abc-x1y2z",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Builder,
+    )
+    .await?;
+    let mut node = make_node("wedger");
+    node.is_fixed_output = false;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("wedger"));
+
+    // Seed est_deadline_secs so DeadlineExceeded has a base to double.
+    handle
+        .debug_seed_sched_hint("wedger", None, None, Some(600), None)
+        .await?;
+
+    disconnect(&handle, "rio-builder-p-abc-x1y2z").await?;
+    drop(rx);
+
+    // Controller's report_terminated_pods sends Error for the
+    // deadline-SIGKILL'd pod. MUST NOT consume the entry.
+    let promoted =
+        report_termination(&handle, "rio-builder-p-abc-x1y2z", TerminationReason::Error).await?;
+    assert!(!promoted, "Error never promotes");
+
+    // Same tick: report_deadline_exceeded_jobs sends DeadlineExceeded
+    // by JOB name (prefix). Entry MUST still be present → bump.
+    let promoted = report_termination(
+        &handle,
+        "rio-builder-p-abc",
+        TerminationReason::DeadlineExceeded,
+    )
+    .await?;
+    assert!(
+        promoted,
+        "DeadlineExceeded by job-name prefix must find the entry the \
+         non-promoting Error report did NOT consume"
+    );
+    let info = expect_drv(&handle, "wedger").await;
+    assert_eq!(
+        info.sched.resource_floor.deadline_secs, 1200,
+        "deadline floor doubled from 600"
+    );
+    Ok(())
+}
+
 // r[verify sched.sla.reactive-floor]
 /// Race-ahead order: `ReportExecutorTermination` lands BEFORE
 /// `ExecutorDisconnected` (controller observed Pod-status before the

@@ -87,10 +87,10 @@ excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`) and the
 orphan-Running reap. `ttlSecondsAfterFinished` reaps Completed/Failed
 Jobs; ownerRef GC handles pool-delete cleanup.
 
-r[ctrl.ephemeral.reap-excess-pending]
+r[ctrl.ephemeral.reap-excess-pending+2]
 When the per-class queued count drops below the count of Pending-phase
 Jobs for that class, the controller MUST delete the excess Pending Jobs
-(oldest first). Running Jobs are not touched — those have or may
+(orphan-by-intent first; residual excess oldest-first). Running Jobs are not touched — those have or may
 receive assignments; the scheduler handles them via
 cancel-on-disconnect. "Pending" is `JobStatus.ready == 0` with
 `parallelism: 1` and no readiness probe: the pod has not been
@@ -106,7 +106,7 @@ Without this reap, a cancelled build leaves already-spawned Pending
 Jobs sitting until `activeDeadlineSeconds` (default 1h), and Karpenter
 keeps provisioning nodes for them.
 
-r[ctrl.ephemeral.reap-orphan-running]
+r[ctrl.ephemeral.reap-orphan-running+2]
 When a Running Job (`JobStatus.ready > 0`) is older than the orphan
 grace (default 5min) AND the scheduler does not consider its executor
 busy --- either the pod's `executor_id` is absent from `ListExecutors`,
@@ -120,9 +120,9 @@ process-level exit is given first chance; the controller reap fires only
 when the process cannot act on its own. A Job whose executor reports
 `busy == true` is NOT reaped --- the scheduler believes a build is
 in progress; `activeDeadlineSeconds` is the backstop for stuck-mid-build.
-The reap is **skipped entirely** when `ListExecutors` fails (scheduler
-unreachable) --- fail-closed, same posture as
-`r[ctrl.ephemeral.reap-excess-pending]`.
+The reap is **skipped entirely** when `ListExecutors` fails or returns
+empty (scheduler unreachable, or new-leader pre-reconnect window) ---
+fail-closed, same posture as `r[ctrl.ephemeral.reap-excess-pending]`.
 
 **Cleanup:** the finalizer's `cleanup()` returns immediately. In-flight
 Jobs finish their one build naturally; ownerRef GC removes them after
@@ -145,14 +145,15 @@ purpose: a wrong-pool spawn (executor heartbeats in, never matches
 dispatch) would hang indefinitely without it; K8s kills at deadline,
 `backoffLimit: 0` marks Failed, `ttlSecondsAfterFinished` reaps.
 
-r[ctrl.terminated.deadline-exceeded]
+r[ctrl.terminated.deadline-exceeded+2]
 The Job-mode reconciler MUST report each Job with `status.conditions`
 containing `type=Failed, reason=DeadlineExceeded` to the scheduler via
 `AdminService.ReportExecutorTermination{executor_id = job.metadata.name,
-reason = DeadlineExceeded}`. The Job controller deletes the Pod when
-`activeDeadlineSeconds` fires, so the `report_terminated_pods` Pod-
-status scan never sees a terminated container; the Job condition is
-observable for `JOB_TTL_SECS=600` (~60 reconcile ticks). The scheduler
+reason = DeadlineExceeded}`. With `restartPolicy:Never` +
+`backoffLimit:0` + the `job-tracking` finalizer the SIGKILL'd Pod IS
+listable with `terminated.reason="Error"` for the grace window, but
+`Error` is non-promoting so `report_terminated_pods` skips it; the Job
+condition is observable for `JOB_TTL_SECS=600` (~60 reconcile ticks). The scheduler
 prefix-matches the Job name against its `recently_disconnected` map
 (`r[sched.termination.deadline-exceeded]`). Iterates the already-listed
 `jobs.items` --- no extra apiserver call. Best-effort (RPC error
@@ -245,6 +246,27 @@ in-cluster, and the controller already has the demand signal
 `r[ctrl.scaler.ratio-learn]` for reconciler behavior.
 
 ## Reconciliation Loops
+
+r[ctrl.admin.rpc-timeout]
+Every `AdminServiceClient` RPC issued from a controller reconcile or
+watcher loop MUST be bounded by a 5-second timeout. `build_endpoint`
+sets `.connect_timeout()` only; h2 keepalive detects dead transport
+(~40s) but not a live-but-stalled scheduler (actor mailbox backlog,
+slow PG). A hung await would block the watcher loop indefinitely
+(missed `DisruptionTarget` fast-preemption) or block the kube-runtime
+reconciler with no requeue. On timeout the call site treats it as the
+RPC's existing `Err` arm (best-effort: log + continue / requeue). The
+bound is NOT applied at the channel level — builder/gateway data-plane
+RPCs (long-poll, streaming) legitimately exceed 5s.
+
+r[ctrl.pool.hw-class-annotation]
+The `rio.build/hw-class` pod annotation MUST be exposed to the builder
+via a downward-API **volume** (`/etc/rio/downward/hw-class`), not an
+env var. The annotation is stamped reactively by `run_pod_annotator`
+after `spec.nodeName` binds; the env-var form resolves once at
+container-create and races the annotator permanently. The builder
+reads the file with a bounded 30s poll (`hw_class::resolve`) so a
+late stamp still reaches a running pod.
 
 r[ctrl.reconcile.owner-refs]
 - **Pool reconciler**: spawn/reap one-shot Jobs (builder or fetcher per `spec.kind`) based on scheduler `SpawnIntent`s. All Jobs carry `ownerReferences` to the Pool CRD with `controller: true`, ensuring garbage collection on Pool deletion.

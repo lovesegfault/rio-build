@@ -123,11 +123,13 @@ pub struct Config {
     /// resolves instance type from the Node object). Empty outside k8s.
     pub node_name: String,
     /// ADR-023 phase-10: `rio.build/hw-class` pod annotation
-    /// (controller-stamped from the Node informer; downward-API →
-    /// `RIO_HW_CLASS`). Feeds [`crate::hw_bench::spawn_measure`] /
-    /// [`crate::hw_bench::send`]'s `hw_perf_samples` insert. Empty →
-    /// bench skipped (no hw_class to key the sample on; controller
-    /// hasn't stamped yet, or non-k8s).
+    /// (controller-stamped from the Node informer). Resolved at
+    /// runtime via the downward-API VOLUME (`/etc/rio/downward/
+    /// hw-class`, see [`crate::hw_class::resolve`]) — NOT an env var,
+    /// because the env-var form resolves once at container-create and
+    /// races `run_pod_annotator` permanently. This config field is
+    /// kept for non-k8s test injection (`RIO_HW_CLASS`); when empty,
+    /// the volume resolver runs.
     pub hw_class: String,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward API → `RIO_INTENT_ID`). Sent

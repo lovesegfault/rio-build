@@ -91,14 +91,14 @@ pub fn run() -> f64 {
 /// (~30s); the result is awaited later by [`send`] once the first
 /// `WorkAssignment` (and its assignment token) is in hand.
 ///
-/// `hw_class` is the `rio.build/hw-class` pod annotation (controller-
-/// stamped from the Node informer; downward-API → `RIO_HW_CLASS`).
-/// Empty → `None`: the controller hasn't stamped this pod yet (race
-/// at pod-start), or the deployment isn't k8s. Either way, no
-/// hw_class means the row would be useless.
+/// `hw_class` is the `rio.build/hw-class` pod annotation, resolved
+/// via [`crate::hw_class::resolve`] (downward-API volume + bounded
+/// poll). Empty → `None`: the resolver expired (annotator dead) or
+/// the deployment isn't k8s. Either way, no hw_class means the row
+/// would be useless.
 pub fn spawn_measure(hw_class: &str) -> Option<tokio::task::JoinHandle<f64>> {
     if hw_class.is_empty() {
-        tracing::debug!("hw_bench: no hw_class (RIO_HW_CLASS unset); skipping");
+        tracing::debug!("hw_bench: no hw_class (downward volume empty); skipping");
         return None;
     }
     // spawn_blocking: ~5s of pure CPU. Running it inline on the

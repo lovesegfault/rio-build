@@ -519,6 +519,53 @@ fn job_pod_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
+// r[verify ctrl.pool.hw-class-annotation]
+/// `rio.build/hw-class` is exposed via a downward-API VOLUME (kubelet
+/// refreshes file contents on annotation change), NOT an env var
+/// (resolved once at container-create — races `run_pod_annotator`
+/// permanently on warm nodes). Regression: `RIO_HW_CLASS` env var
+/// must NOT be present; the `downward` volume + mount MUST be.
+#[test]
+fn executor_pod_has_downward_hwclass_volume() {
+    let wp = test_wp();
+    let pod = test_pod_spec(&wp);
+
+    let vol = pod
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.name == "downward")
+        .expect("downward volume must exist");
+    let item = &vol.downward_api.as_ref().unwrap().items.as_ref().unwrap()[0];
+    assert_eq!(item.path, "hw-class");
+    assert_eq!(
+        item.field_ref.as_ref().unwrap().field_path,
+        "metadata.annotations['rio.build/hw-class']"
+    );
+
+    let mount = pod.containers[0]
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|m| m.name == "downward")
+        .expect("downward volumeMount");
+    assert_eq!(mount.mount_path, "/etc/rio/downward");
+    assert_eq!(mount.read_only, Some(true));
+
+    assert!(
+        !pod.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "RIO_HW_CLASS"),
+        "RIO_HW_CLASS env var races run_pod_annotator (resolved once at \
+         container-create); the downward volume is the mechanism"
+    );
+}
+
 // r[verify ctrl.drain.disruption-target]
 /// DisruptionTarget filter: Pod with `conditions[DisruptionTarget]=
 /// True` → `Some(name)`. Anything else → `None`.

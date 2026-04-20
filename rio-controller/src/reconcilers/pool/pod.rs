@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, DownwardAPIVolumeFile,
+    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource,
+    ObjectFieldSelector, PodSecurityContext, PodSpec, SeccompProfile, SecurityContext, Toleration,
+    Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
@@ -28,7 +29,7 @@ use rio_crds::pool::{ExecutorKind, Pool, SeccompProfileKind};
 /// `base_runtime_spec` on every node (`nix/base-runtime-spec.nix`);
 /// it ENXIOs on open() on non-`.metal` hosts, so the nodeSelector is
 /// what makes kvm builds work, not the device node's presence.
-const KVM_FEATURE: &str = "kvm";
+pub(super) const KVM_FEATURE: &str = "kvm";
 
 /// Node label set on the metal NodePool (values.yaml `karpenter.
 /// nodePools[rio-builder-metal].labels`). Pairs with the same-key
@@ -384,6 +385,33 @@ pub fn build_executor_pod_spec(
                     empty_dir: Some(EmptyDirVolumeSource::default()),
                     ..Default::default()
                 },
+                // r[impl ctrl.pool.hw-class-annotation]
+                // Downward-API VOLUME (not env var): kubelet refreshes
+                // file contents on annotation change. The annotation is
+                // stamped reactively by `run_pod_annotator` AFTER
+                // `spec.nodeName` binds — the same event that triggers
+                // kubelet to create the container. With the env-var
+                // form kubelet resolves once at container-create and
+                // never updates; on warm nodes (~100-300ms to create)
+                // or under SpawnIntent burst the annotator loses and
+                // `RIO_HW_CLASS=""` permanently. The volume + bounded
+                // poll in `rio_builder::hw_class::resolve` makes the
+                // race per-pod transient instead of permanent.
+                Volume {
+                    name: "downward".into(),
+                    downward_api: Some(DownwardAPIVolumeSource {
+                        items: Some(vec![DownwardAPIVolumeFile {
+                            path: "hw-class".into(),
+                            field_ref: Some(ObjectFieldSelector {
+                                field_path: "metadata.annotations['rio.build/hw-class']".into(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
             ];
             if read_only_root_fs {
                 for (name, _, medium, size_limit) in READ_ONLY_ROOT_MOUNTS {
@@ -556,12 +584,12 @@ fn build_executor_container(
                     "RIO_INTENT_ID",
                     "metadata.annotations['rio.build/intent-id']",
                 ),
-                // ADR-023 phase-10 hw self-calibration. Controller's
-                // node_informer pod-watcher stamps `rio.build/hw-class`
-                // once `spec.nodeName` is set; builder reads it via
-                // downward-API to key the hw_perf_samples insert.
-                // Unset → kubelet resolves to "" → bench skipped.
-                env_from_field("RIO_HW_CLASS", "metadata.annotations['rio.build/hw-class']"),
+                // ADR-023 phase-10 hw self-calibration: `rio.build/
+                // hw-class` is exposed via the `downward` VOLUME (see
+                // r[ctrl.pool.hw-class-annotation]), not an env var —
+                // env-var form resolves once at container-create and
+                // races `run_pod_annotator`. Builder reads
+                // `/etc/rio/downward/hw-class` with a bounded poll.
                 // Role discriminator. rio-builder's `RIO_EXECUTOR_
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
                 // §Executor enforcement — a builder receiving a FOD
@@ -618,6 +646,12 @@ fn build_executor_container(
                 VolumeMount {
                     name: "overlays".into(),
                     mount_path: "/var/rio/overlays".into(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: "downward".into(),
+                    mount_path: "/etc/rio/downward".into(),
+                    read_only: Some(true),
                     ..Default::default()
                 },
             ];

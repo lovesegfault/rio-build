@@ -76,16 +76,23 @@ pub async fn setup(
         "connected to gRPC services"
     );
 
-    // ADR-023 phase-10 hw self-calibration. Best-effort: a ~5s
-    // CPU-bound microbench in a blocking thread, started here so it
-    // runs concurrently with FUSE mount + first heartbeat below. The
-    // RPC itself is DEFERRED until the first WorkAssignment arrives
+    // ADR-023 phase-10 hw self-calibration. Resolve `hw_class` from
+    // the downward-API volume (bounded poll — the controller stamps
+    // the annotation reactively after `spec.nodeName` binds, so the
+    // file may be empty for the first ~1s). `cfg.hw_class` (env var)
+    // is the test-injection override. The bench itself is a ~5s
+    // CPU-bound microbench in a blocking thread; `resolve()` + bench
+    // run concurrently with FUSE mount + first heartbeat below. The
+    // RPC is DEFERRED until the first WorkAssignment arrives
     // (`spawn_build_task` consumes `BuildSpawnContext::hw_bench`) —
-    // the store now gates `AppendHwPerfSample` on the assignment
-    // token (`r[sec.boundary.grpc-hmac]`), and there is no token
-    // until the scheduler dispatches. Empty hw_class → None
-    // (controller hasn't stamped the annotation yet, or non-k8s).
-    let hw_bench = crate::hw_bench::spawn_measure(&cfg.hw_class);
+    // the store gates `AppendHwPerfSample` on the assignment token
+    // (`r[sec.boundary.grpc-hmac]`).
+    let hw_class = if cfg.hw_class.is_empty() {
+        crate::hw_class::resolve().await.unwrap_or_default()
+    } else {
+        cfg.hw_class.clone()
+    };
+    let hw_bench = crate::hw_bench::spawn_measure(&hw_class);
 
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
@@ -292,7 +299,7 @@ pub async fn setup(
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
-        hw_class: (!cfg.hw_class.is_empty()).then(|| cfg.hw_class.clone()),
+        hw_class: (!hw_class.is_empty()).then(|| hw_class.clone()),
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,

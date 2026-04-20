@@ -454,6 +454,24 @@ impl DagActor {
             return self.handle_deadline_exceeded(executor_id).await;
         }
 
+        // Non-promoting reason → return BEFORE touching
+        // `recently_disconnected` or the race-ahead `executors`
+        // lookup. Without this gate a `Completed`/`Error`/
+        // `EvictedOther` report consumes the dedup entry then no-ops
+        // — the same-tick `report_deadline_exceeded_jobs` prefix-match
+        // (or a later promoting report) finds nothing, so the
+        // `r[ctrl.terminated.deadline-exceeded]` backstop is
+        // structurally defeated and a deterministically-wedging drv
+        // loops at `activeDeadlineSeconds` instead of climbing the
+        // floor ladder. Same hazard for the race-ahead arm: a non-
+        // promoting report would set `last_completed` and suppress
+        // the imminent disconnect's `recently_disconnected` insert.
+        let Some(label) = super::floor::reason_label(reason) else {
+            debug!(executor_id = %executor_id, ?reason,
+                   "termination report: non-resource reason, no promotion");
+            return false;
+        };
+
         // Resolve drv. remove() = first-report-wins dedup.
         let drv_hash = match self.recently_disconnected.remove(executor_id) {
             Some((drv, _)) => drv,
@@ -485,12 +503,6 @@ impl DagActor {
                     return false;
                 }
             },
-        };
-
-        let Some(label) = super::floor::reason_label(reason) else {
-            debug!(executor_id = %executor_id, drv_hash = %drv_hash, ?reason,
-                   "termination report: non-resource reason, no promotion");
-            return false;
         };
 
         let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
