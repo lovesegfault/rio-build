@@ -18,7 +18,8 @@ use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
-    SpawnOutcome, is_active_job, reap_excess_pending, spawn_for_each, try_spawn_job,
+    JobCensus, SpawnOutcome, is_active_job, job_census, orphan_reap_gate, reap_excess_pending,
+    spawn_for_each, try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
 use rio_crds::pool::ExecutorKind;
@@ -180,7 +181,7 @@ fn pending_job(name: &str, ready: i32, age_s: i64) -> Job {
     }
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending]
+// r[verify ctrl.ephemeral.reap-excess-pending+2]
 /// I-183: `reap_excess_pending` issues DELETE for the oldest excess
 /// Pending Jobs, increments the metric, and warn+continues on a 404
 /// (already gone — concurrent reconcile or TTL).
@@ -431,8 +432,8 @@ async fn reap_stale_at_ceiling_saturation() {
     ]);
 
     // ceiling=2, active=2 → pre-reap headroom=0.
-    let headroom = 2usize.saturating_sub(existing.iter().filter(|j| is_active_job(j)).count());
-    assert_eq!(headroom, 0);
+    let census = job_census(&existing);
+    assert_eq!(census.headroom(Some(2), 0), 0);
     // Reap over the FULL intent set (NOT a headroom-truncated slice).
     let reaped =
         reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
@@ -447,8 +448,8 @@ async fn reap_stale_at_ceiling_saturation() {
                     .as_deref()
                     .is_some_and(|n| reaped.contains(n))
         })
-        .count();
-    let headroom = headroom + freed;
+        .count() as i32;
+    let headroom = census.headroom(Some(2), freed);
 
     // Skip-set = existing names minus reaped → empty → spawn fires
     // for both intents this tick.
@@ -593,7 +594,7 @@ async fn spawn_for_each_omits_failed_from_ack_set() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-excess-pending]
+// r[verify ctrl.ephemeral.reap-excess-pending+2]
 /// `pending <= queued` → no DELETE calls; `queued = None` (scheduler
 /// unreachable) → no DELETE calls. The verifier's empty scenario list
 /// asserts zero apiserver requests in both cases.
@@ -615,4 +616,144 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     // on a scheduler restart).
     assert_eq!(reap_excess_pending(&jobs_api, &jobs, None, "p").await, 0);
     guard.verified().await;
+}
+
+// r[verify ctrl.pool.reconcile]
+/// `job_census` excludes terminating Jobs from `active` (a Job
+/// foreground-deleted on a prior tick doesn't burn a headroom slot for
+/// up to TGPS=7200s) and computes `ready` distinctly from `active`
+/// (`PoolStatus.ready_replicas` = "passed readinessProbe", NOT "all
+/// non-terminal"). Before JobCensus, `is_active_job` (no
+/// `deletion_timestamp` filter) was used for both.
+#[test]
+fn job_census_excludes_terminating_and_distinguishes_ready() {
+    use k8s_openapi::jiff::Timestamp;
+    let mut terminating = pending_job("terminating", 1, 60);
+    terminating.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
+    let mut complete = pending_job("complete", 0, 60);
+    complete.status.as_mut().unwrap().succeeded = Some(1);
+    let jobs = vec![
+        pending_job("pending", 0, 30),
+        pending_job("running", 1, 60),
+        terminating,
+        complete,
+    ];
+    let c = job_census(&jobs);
+    assert_eq!(
+        c.active, 2,
+        "terminating + complete excluded from active (was 3 with bare is_active_job)"
+    );
+    assert_eq!(
+        c.ready, 1,
+        "ready counts only is_running_job (was passed as `active` before)"
+    );
+}
+
+/// `JobCensus::headroom` recomputes from `(active − freed)` BEFORE
+/// the 0-clamp. The pre-JobCensus `clamp(ceiling − active) + freed`
+/// form lost the negative magnitude clamped away: ceiling=10 with
+/// active=12 (operator lowered `maxConcurrent` while Jobs live) and
+/// freed=12 (selector-drift reaps all) computed `0 + 12 = 12` —
+/// overshoots the cap. The single-subtraction form computes `10 −
+/// (12 − 12) = 10`.
+#[test]
+fn headroom_recompute_never_exceeds_ceiling() {
+    let c = JobCensus {
+        active: 12,
+        ready: 0,
+    };
+    assert_eq!(
+        c.headroom(Some(10), 12),
+        10,
+        "over-committed pool freed=12 must not overshoot ceiling=10"
+    );
+    assert_eq!(c.headroom(Some(10), 0), 0, "no freed → headroom stays 0");
+    assert_eq!(c.headroom(Some(10), 3), 1, "partial free → ceiling − 9 = 1");
+    assert_eq!(c.headroom(None, 0), usize::MAX, "uncapped");
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending+2]
+/// `reap_stale_for_intents` reaps Pending Jobs whose intent left the
+/// set (orphan-by-intent). Before, only `select_excess_pending`'s
+/// oldest-first reap caught these, so [A,B,C,D]→[A,B] reaped jA,jB
+/// (oldest, still-live, losing in-flight Karpenter provisioning) while
+/// orphans jC,jD survived ≥1 extra tick. Running orphans are NOT
+/// reaped (`reap_orphan_running` owns them). `intents=[]` is the
+/// fail-closed gate via `want.is_empty()`.
+#[tokio::test]
+async fn reap_stale_for_intents_reaps_orphan_pending() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let intent = |id: &str| SpawnIntent {
+        intent_id: id.into(),
+        ..Default::default()
+    };
+    // jA,jB Pending old (live, matching selector ""); jC Pending old
+    // (orphan); jD Running (orphan, NOT reaped here).
+    let job = |name: &str, ready: i32| {
+        let mut j = pending_job(name, ready, 30);
+        j.metadata.annotations = Some(BTreeMap::from([(
+            INTENT_SELECTOR_ANNOTATION.into(),
+            "".into(),
+        )]));
+        j
+    };
+    let existing = vec![
+        job("rio-builder-p-aaa", 0),
+        job("rio-builder-p-bbb", 0),
+        job("rio-builder-p-ccc", 0),
+        job("rio-builder-p-ddd", 1),
+    ];
+    let intents = vec![intent("aaa"), intent("bbb")];
+
+    // Only jC reaped: jA/jB in `want` with matching (default→None)
+    // selector → continue; jD Running → `is_pending_job` false.
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-ccc",
+        body_contains: Some(r#""propagationPolicy":"Foreground""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    let reaped =
+        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    assert_eq!(reaped, HashSet::from(["rio-builder-p-ccc".into()]));
+    guard.verified().await;
+
+    // Fail-closed: intents=[] → want.is_empty() early-return → no
+    // reap (scheduler error must not nuke every Pending Job).
+    let (client2, verifier2) = ApiServerVerifier::new();
+    let jobs_api2: Api<Job> = Api::namespaced(client2, "rio");
+    let guard = verifier2.run(vec![]);
+    let reaped =
+        reap_stale_for_intents(&jobs_api2, &existing, &[], "p", ExecutorKind::Builder).await;
+    assert!(reaped.is_empty(), "scheduler error → no orphan-reap");
+    guard.verified().await;
+}
+
+// r[verify ctrl.ephemeral.reap-orphan-running+2]
+/// `orphan_reap_gate` returns `None` (skip reap) for both `Err` AND
+/// `Ok(empty)`. On 2-replica scheduler failover the new leader returns
+/// `Ok([])` until workers reconnect; `select_orphan_running`'s
+/// `None => true` arm would foreground-delete every Running Job past
+/// the 5-min grace.
+#[test]
+fn orphan_reap_gate_failclosed_on_empty_and_err() {
+    assert!(
+        orphan_reap_gate(Ok(vec![]), "p").is_none(),
+        "Ok(empty) → None (new-leader pre-reconnect)"
+    );
+    assert!(
+        orphan_reap_gate(Err(tonic::Status::unavailable("standby")), "p").is_none(),
+        "Err → None (unreachable)"
+    );
+    let exec = rio_proto::types::ExecutorInfo {
+        executor_id: "x".into(),
+        ..Default::default()
+    };
+    assert!(
+        orphan_reap_gate(Ok(vec![exec]), "p").is_some(),
+        "Ok(nonempty) → Some"
+    );
 }

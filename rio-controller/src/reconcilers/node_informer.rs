@@ -38,6 +38,8 @@ use rio_proto::AdminServiceClient;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
+use crate::reconcilers::admin_call;
+
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
 /// node's [`HwClass::as_string`]. Builder reads it via downward-API
 /// (`RIO_HW_CLASS`) to key its `hw_perf_samples` insert.
@@ -362,17 +364,6 @@ pub async fn run(
 /// [`NodeLabelCache::drain_live_spot_exposure`].
 const EXPOSURE_FLUSH_SECS: u64 = 60;
 
-/// Per-RPC bound on `AppendInterruptSample`. The balanced channel sets
-/// only `connect_timeout`; h2 keepalive (~40s) detects a dead
-/// transport but not a stalled handler. Without this a hung scheduler
-/// actor wedges the Node-informer/spot-interrupt watch loops — every
-/// subsequent `flush.tick()` and watch event is blocked behind the
-/// await, so λ's denominator stops accruing AND `prune_absent` never
-/// runs (phantom node-seconds leak). Best-effort RPCs: timed-out
-/// samples are dropped (λ reads slightly high until the next flush
-/// lands), same as the existing `Err` path.
-const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -397,8 +388,10 @@ const POOL_LABEL: &str = "rio.build/pool";
 ///
 /// `spawn_monitored("hw-class-annotator", run_pod_annotator(...))`
 /// from main.rs. Same degraded-not-broken contract as [`run`]: if the
-/// watcher dies, builders skip the bench (`RIO_HW_CLASS` empty) and
-/// the hw_class stays at `factor=1.0` until ≥3 pods report.
+/// watcher dies, builders' downward-API volume stays empty,
+/// `hw_class::resolve` returns `None` after its 30s bound, and the
+/// hw_class stays at `factor=1.0` until ≥3 pods report. The volume
+/// (NOT env-var) form means a late stamp still reaches a running pod.
 ///
 /// TODO: gate the stamp on `EXISTS(SELECT 1 FROM hw_perf_factors WHERE
 /// hw_class=$1)` so well-sampled classes skip the ~5s bench. Deferred:
@@ -516,20 +509,18 @@ pub async fn run_spot_interrupt_watcher(
         // restart, apiserver restart, watch reconnect). Without dedup
         // each relist double-counts into λ's numerator → `solve_full`
         // biases away from spot.
-        let r = tokio::time::timeout(
-            ADMIN_RPC_TIMEOUT,
-            admin.append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+        let r = admin_call(admin.append_interrupt_sample(
+            rio_proto::types::AppendInterruptSampleRequest {
                 hw_class: hw_class.clone(),
                 kind: "interrupt".into(),
                 value: 1.0,
                 event_uid: ev.metadata.uid.clone(),
-            }),
-        )
+            },
+        ))
         .await;
         match r {
-            Ok(Ok(_)) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
-            Ok(Err(e)) => warn!(%node, error = %e, "spot-interrupt: append failed"),
-            Err(_) => warn!(%node, "spot-interrupt: append timed out"),
+            Ok(_) => debug!(%node, %hw_class, "spot-interrupt: sample appended"),
+            Err(e) => warn!(%node, error = %e, "spot-interrupt: append failed"),
         }
     }
 }
@@ -537,25 +528,22 @@ pub async fn run_spot_interrupt_watcher(
 /// Append `kind='exposure'` node-seconds for one `hw_class`.
 /// Best-effort: a failed/timed-out RPC drops one denominator sample
 /// (λ reads slightly high until the next flush lands). Bounded by
-/// [`ADMIN_RPC_TIMEOUT`] so a hung scheduler can't wedge the Node-
+/// [`admin_call`]'s timeout so a hung scheduler can't wedge the Node-
 /// informer's watch loop (every caller is inside that loop).
 async fn report_exposure(admin: &mut AdminServiceClient<Channel>, hw_class: String, secs: f64) {
-    let r = tokio::time::timeout(
-        ADMIN_RPC_TIMEOUT,
-        admin.append_interrupt_sample(rio_proto::types::AppendInterruptSampleRequest {
+    if let Err(e) = admin_call(admin.append_interrupt_sample(
+        rio_proto::types::AppendInterruptSampleRequest {
             hw_class,
             kind: "exposure".into(),
             value: secs,
             // Timer-driven, no K8s Event → NULL uid (unconstrained by
             // the M_047 partial unique index).
             event_uid: None,
-        }),
-    )
-    .await;
-    match r {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => warn!(error = %e, "spot-exposure: append failed"),
-        Err(_) => warn!("spot-exposure: append timed out"),
+        },
+    ))
+    .await
+    {
+        warn!(error = %e, "spot-exposure: append failed");
     }
 }
 

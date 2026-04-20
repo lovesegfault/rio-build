@@ -34,6 +34,35 @@ use crate::error::{Error, Result, error_kind};
 /// KubeErrorExt` without naming rio-crds directly.
 pub use rio_crds::{KubeErrorExt, KubeResultExt};
 
+/// Upper bound on every `AdminServiceClient` RPC issued from a
+/// reconcile/watcher loop. `build_endpoint` sets `.connect_timeout()`
+/// only; h2 keepalive detects dead transport (~40s) but not a
+/// live-but-stalled scheduler (actor mailbox backlog, slow PG). A
+/// hung await blocks the watcher loop indefinitely → subsequent
+/// `DisruptionTarget` pods miss fast-preemption; a hung await inside
+/// kube-runtime's reconciler blocks the entire `pool` reconciler with
+/// no requeue. 5s: short enough to keep best-effort watchers
+/// responsive, long enough that p99 admin RPCs (PG round-trip) clear.
+pub(crate) const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound an `AdminServiceClient` RPC by [`ADMIN_RPC_TIMEOUT`],
+/// mapping `Elapsed` → `Status::deadline_exceeded` so existing `Err`
+/// arms handle it uniformly. ALL controller-side admin RPCs go
+/// through this — the chokepoint makes "live-but-stalled scheduler
+/// hangs the watcher/reconciler" unrepresentable. Data-plane RPCs
+/// (long-poll, streaming) MUST NOT use this.
+// r[impl ctrl.admin.rpc-timeout]
+pub(crate) async fn admin_call<T>(
+    fut: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+) -> std::result::Result<tonic::Response<T>, tonic::Status> {
+    match tokio::time::timeout(ADMIN_RPC_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_elapsed) => Err(tonic::Status::deadline_exceeded(
+            "admin rpc timeout (live-but-stalled scheduler?)",
+        )),
+    }
+}
+
 /// `obj.namespace()` or `InvalidSpec("{Kind} has no namespace")`.
 /// All rio-controller CRDs are `Namespaced`-scope; a missing
 /// namespace is an apply-time error, not a transient. Replaces five
@@ -378,5 +407,28 @@ mod tests {
         assert_eq!(transient_backoff(100), Duration::from_secs(300));
         // n=0 defensive: treat as first attempt.
         assert_eq!(transient_backoff(0), Duration::from_secs(5));
+    }
+
+    /// `admin_call` bounds a hung future by `ADMIN_RPC_TIMEOUT` and
+    /// maps `Elapsed` → `Status::deadline_exceeded`. Every controller-
+    /// side admin RPC goes through this chokepoint, so the live-but-
+    /// stalled-scheduler hang is unrepresentable by construction.
+    // r[verify ctrl.admin.rpc-timeout]
+    #[tokio::test(start_paused = true)]
+    async fn admin_call_times_out_on_stalled_scheduler() {
+        let pending = std::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
+        let r = admin_call(pending).await;
+        assert_eq!(
+            r.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded,
+            "hung admin RPC → DeadlineExceeded after {ADMIN_RPC_TIMEOUT:?}"
+        );
+        // Passthrough: completed Ok/Err are not touched.
+        let ok = admin_call(async { Ok(tonic::Response::new(())) }).await;
+        assert!(ok.is_ok());
+        let err =
+            admin_call(async { Err::<tonic::Response<()>, _>(tonic::Status::unavailable("x")) })
+                .await;
+        assert_eq!(err.unwrap_err().code(), tonic::Code::Unavailable);
     }
 }

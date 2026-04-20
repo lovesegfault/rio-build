@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use rio_proto::types::{ReportExecutorTerminationRequest, SpawnIntent, TerminationReason};
 
 use crate::error::Result;
-use crate::reconcilers::{Ctx, KubeErrorExt};
+use crate::reconcilers::{Ctx, KubeErrorExt, admin_call};
 use rio_crds::pool::{Pool, PoolStatus};
 
 use super::pod::POOL_LABEL;
@@ -151,6 +151,56 @@ pub(super) fn is_active_job(j: &Job) -> bool {
     s.and_then(|st| st.succeeded).unwrap_or(0) == 0 && s.and_then(|st| st.failed).unwrap_or(0) == 0
 }
 
+/// Per-tick Job inventory: `active` (consumes a `maxConcurrent` slot)
+/// and `ready` (container started — heartbeating). Computed once at
+/// the top of `jobs::reconcile` so the headroom math, status patch,
+/// and reap passes see ONE consistent view.
+///
+/// `active` excludes `deletion_timestamp` (terminating Jobs do not
+/// consume headroom — they were foreground-deleted on a prior tick and
+/// their slot is free for spawn). `ready` is the [`is_running_job`]
+/// subset, which already excludes terminating; this is what
+/// `PoolStatus.ready_replicas` documents as "passed readinessProbe".
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct JobCensus {
+    pub active: i32,
+    pub ready: i32,
+}
+
+impl JobCensus {
+    /// Single-subtraction headroom: `ceiling - effective_active`,
+    /// floored at 0. `freed` (active Jobs reaped THIS tick) is
+    /// subtracted from `active` BEFORE the clamp, so an
+    /// over-committed pool (`active > ceiling`, e.g. operator
+    /// lowered `maxConcurrent` while Jobs are live) computes
+    /// `ceiling − (active − freed)` instead of `0 + freed`. The
+    /// add-after-clamp form (`clamp(ceiling − active) + freed`)
+    /// overshoots `ceiling` in that case. `ceiling = None` →
+    /// uncapped.
+    pub fn headroom(self, ceiling: Option<i32>, freed: i32) -> usize {
+        ceiling.map_or(usize::MAX, |c| {
+            c.saturating_sub(self.active.saturating_sub(freed)).max(0) as usize
+        })
+    }
+}
+
+/// Compute the per-tick [`JobCensus`] from a Job list.
+pub(super) fn job_census(jobs: &[Job]) -> JobCensus {
+    let active = jobs
+        .iter()
+        .filter(|j| is_active_job(j) && j.metadata.deletion_timestamp.is_none())
+        .count()
+        .try_into()
+        .unwrap_or(i32::MAX);
+    let ready = jobs
+        .iter()
+        .filter(|j| is_running_job(j))
+        .count()
+        .try_into()
+        .unwrap_or(i32::MAX);
+    JobCensus { active, ready }
+}
+
 /// Active AND `status.ready == 0` — the Job's pod is in `Pending`
 /// phase (unscheduled or `ContainerCreating`).
 ///
@@ -160,7 +210,7 @@ pub(super) fn is_active_job(j: &Job) -> bool {
 /// scheduler and may receive an assignment any millisecond. `ready ==
 /// 0` means the container has NOT started: never heartbeated, never
 /// dispatched, deleting it loses nothing. This is the reap-safety
-/// boundary for `r[ctrl.ephemeral.reap-excess-pending]`.
+/// boundary for `r[ctrl.ephemeral.reap-excess-pending+2]`.
 ///
 /// `None` status (Job controller hasn't reconciled yet → pod not
 /// created) is treated as Pending. That's the safe direction: a Job
@@ -179,7 +229,7 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 /// Active AND `status.ready > 0` — the Job's pod container has
 /// started. Complement of [`is_pending_job`] within the active set
 /// (both predicates exclude terminating Jobs). The orphan-reap
-/// boundary for `r[ctrl.ephemeral.reap-orphan-running]`: only Running
+/// boundary for `r[ctrl.ephemeral.reap-orphan-running+2]`: only Running
 /// Jobs are candidates (Pending is handled by `reap_excess_pending`;
 /// Complete/Failed by TTL).
 ///
@@ -215,17 +265,19 @@ pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 /// for an HOUR; 10s grace is noise).
 pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
-/// Pending Jobs in excess of `queued`, oldest-first — the reap set
-/// for `r[ctrl.ephemeral.reap-excess-pending]`.
+/// Pending Jobs in excess of `queued`, oldest-first — RESIDUAL
+/// fallback for `r[ctrl.ephemeral.reap-excess-pending+2]` after
+/// `reap_stale_for_intents`' orphan-pending arm has already reaped by
+/// intent-membership.
 ///
-/// `pending.len() <= queued` → empty (every Pending Job is plausibly
-/// claimed by a queued derivation). `pending.len() > queued` → the
-/// `pending - queued` oldest are surplus: even if every queued
-/// derivation lands on a Pending pod, these will never get one. The
-/// spawn loop's NameCollision dedupe means we never spawn more than
-/// one Job per intent, so this only fires when `queued` DROPS after
-/// spawn (user cancel, build completes elsewhere, gateway disconnect)
-/// or when overlapping pools double-spawned for the same intent.
+/// `pending.len() <= queued` → empty. `pending.len() > queued` → the
+/// `pending - queued` oldest are surplus. The spawn loop's
+/// NameCollision dedupe means we never spawn more than one Job per
+/// intent IN ONE POOL, so after the orphan-pending arm this only
+/// fires for the overlapping-pool double-spawn case (two Pools with
+/// intersecting `{systems, features}` both spawn for the same intent
+/// under different names — neither is "orphan" by name-membership but
+/// `pending > queued`).
 ///
 /// `min_age`: Jobs younger than this are excluded — see
 /// [`REAP_PENDING_GRACE`]. Passing `Duration::ZERO` disables the
@@ -256,7 +308,7 @@ pub(super) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration
     pending
 }
 
-// r[impl ctrl.ephemeral.reap-excess-pending]
+// r[impl ctrl.ephemeral.reap-excess-pending+2]
 /// Delete Pending Jobs in excess of `queued`. Shared by the
 /// builder and fetcher pool reconcilers (both had the spawn-only
 /// pattern before I-183; both now reap).
@@ -334,7 +386,7 @@ pub(super) async fn reap_excess_pending(
 /// `creation_timestamp` strictly before `now - min_age`. `None` →
 /// not-old-enough (conservative; same posture as
 /// [`select_excess_pending`]).
-fn job_older_than(j: &Job, min_age: Duration) -> bool {
+pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     let cutoff = Time(
         k8s_openapi::jiff::Timestamp::now()
@@ -349,7 +401,7 @@ fn job_older_than(j: &Job, min_age: Duration) -> bool {
 
 /// Running Jobs older than `min_age` whose executor is NOT busy in
 /// the scheduler's view — the reap set for
-/// `r[ctrl.ephemeral.reap-orphan-running]`.
+/// `r[ctrl.ephemeral.reap-orphan-running+2]`.
 ///
 /// "Not busy" = no `ExecutorInfo` whose `executor_id` starts with
 /// `{job_name}-` (pod never registered / already disconnected), OR
@@ -399,7 +451,43 @@ pub(super) fn select_orphan_running<'a>(
         .collect()
 }
 
-// r[impl ctrl.ephemeral.reap-orphan-running]
+/// Fail-closed gate for [`reap_orphan_running`]: `None` (skip the
+/// reap) for both `Err` AND `Ok(empty)`. On 2-replica scheduler
+/// failover the new leader returns `Ok([])` — `self.executors` is
+/// empty until workers reconnect, but `ListExecutors` passes
+/// `ensure_leader()`. `select_orphan_running`'s `None => true` arm
+/// would mark every Running Job past the 5-min grace as orphan and
+/// foreground-delete it. In the genuine zero-executors steady state
+/// there are no Running Jobs to reap anyway (workers register before
+/// `ready>0`), so the empty-check costs nothing.
+///
+/// A server-side `recovery_complete` gate on `ListExecutors` is the
+/// cleaner long-term fix but touches `rio-scheduler` + `rio-proto`.
+pub(super) fn orphan_reap_gate(
+    result: std::result::Result<Vec<rio_proto::types::ExecutorInfo>, tonic::Status>,
+    pool: &str,
+) -> Option<Vec<rio_proto::types::ExecutorInfo>> {
+    match result {
+        Ok(execs) if execs.is_empty() => {
+            warn!(
+                pool,
+                "ListExecutors returned empty; skipping orphan-reap \
+                 (fail-closed: scheduler may be mid-failover)"
+            );
+            None
+        }
+        Ok(execs) => Some(execs),
+        Err(e) => {
+            warn!(
+                pool, error = %e,
+                "ListExecutors failed; skipping orphan-reap this tick (fail-closed)"
+            );
+            None
+        }
+    }
+}
+
+// r[impl ctrl.ephemeral.reap-orphan-running+2]
 /// Delete Running ephemeral Jobs the scheduler doesn't consider busy
 /// after [`ORPHAN_REAP_GRACE`]. Same I-165 stuck-process failure
 /// mode applies to both builder and fetcher pools.
@@ -428,22 +516,15 @@ pub(super) async fn reap_orphan_running(
     {
         return 0;
     }
-    let executors = match ctx
-        .admin
-        .clone()
-        .list_executors(rio_proto::types::ListExecutorsRequest {
+    let result = admin_call(ctx.admin.clone().list_executors(
+        rio_proto::types::ListExecutorsRequest {
             status_filter: String::new(),
-        })
-        .await
-    {
-        Ok(resp) => resp.into_inner().executors,
-        Err(e) => {
-            warn!(
-                pool, error = %e,
-                "ListExecutors failed; skipping orphan-reap this tick (fail-closed)"
-            );
-            return 0;
-        }
+        },
+    ))
+    .await
+    .map(|r| r.into_inner().executors);
+    let Some(executors) = orphan_reap_gate(result, pool) else {
+        return 0;
     };
     let orphans = select_orphan_running(jobs, &executors, ORPHAN_REAP_GRACE);
     if orphans.is_empty() {
@@ -807,18 +888,33 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     let mut admin = ctx.admin.clone();
     for pod in &list.items {
         let reason = pod_termination_reason(pod);
-        if reason == TerminationReason::Unknown {
+        // Only the promoting reasons go over the wire. `Completed`/
+        // `Error`/`EvictedOther` are sent every tick for every TTL-
+        // window Job today; the scheduler's `reason_label` gate
+        // no-ops them anyway. `Error` IS observable for a deadline-
+        // SIGKILL'd pod (restartPolicy:Never + backoffLimit:0 +
+        // TGPS=7200 + job-tracking finalizer keep it listable for
+        // the full grace window) — sending it would consume the
+        // `recently_disconnected` entry the same-tick
+        // `report_deadline_exceeded_jobs` needs. The scheduler-side
+        // gate makes consume-then-noop unrepresentable; this filter
+        // eliminates the wasted RPCs.
+        if !matches!(
+            reason,
+            TerminationReason::OomKilled | TerminationReason::EvictedDiskPressure
+        ) {
             continue;
         }
         let Some(name) = pod.metadata.name.as_deref() else {
             continue;
         };
-        match admin
-            .report_executor_termination(ReportExecutorTerminationRequest {
+        match admin_call(
+            admin.report_executor_termination(ReportExecutorTerminationRequest {
                 executor_id: name.to_owned(),
                 reason: reason.into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             Ok(resp) => {
                 if resp.into_inner().promoted {
@@ -842,9 +938,13 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
 }
 
 /// Job has a `Failed` condition with `reason=DeadlineExceeded` —
-/// `activeDeadlineSeconds` fired. The Job controller deletes the Pod
-/// immediately, so [`report_terminated_pods`] never observes a
-/// terminated container; this reads the Job condition instead.
+/// `activeDeadlineSeconds` fired. With `restartPolicy:Never` +
+/// `backoffLimit:0` + TGPS=7200 + the `job-tracking` finalizer, the
+/// SIGKILL'd pod IS listable (`deletionTimestamp` set,
+/// `containerStatuses[].state.terminated.reason="Error"`) for the
+/// full grace window — but `Error` is non-promoting, so
+/// [`report_terminated_pods`] skips it; this reads the Job condition
+/// instead.
 pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
     job.status
         .as_ref()
@@ -857,7 +957,7 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 /// Report each `DeadlineExceeded` Job to the scheduler so the
 /// `activeDeadlineSeconds` backstop still climbs the resource_floor
 /// ladder when the worker is too wedged to fire its own `daemon_timeout`
-/// (`r[ctrl.terminated.deadline-exceeded]`). Defense-in-depth behind
+/// (`r[ctrl.terminated.deadline-exceeded+2]`). Defense-in-depth behind
 /// the worker-side `BuildResultStatus::TimedOut` primary path.
 ///
 /// Iterates the already-listed `jobs` (no extra apiserver call). For
@@ -870,7 +970,7 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 /// Idempotent per the same dedup as [`report_terminated_pods`]. Best-
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
-// r[impl ctrl.terminated.deadline-exceeded]
+// r[impl ctrl.terminated.deadline-exceeded+2]
 pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
@@ -880,12 +980,13 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         let Some(name) = job.metadata.name.as_deref() else {
             continue;
         };
-        match admin
-            .report_executor_termination(ReportExecutorTerminationRequest {
+        match admin_call(
+            admin.report_executor_termination(ReportExecutorTerminationRequest {
                 executor_id: name.to_owned(),
                 reason: TerminationReason::DeadlineExceeded.into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             Ok(resp) => {
                 if resp.into_inner().promoted {
@@ -938,6 +1039,27 @@ mod tests {
         assert_eq!(c["type"], "SchedulerUnreachable");
         assert_eq!(c["status"], "False");
         assert_eq!(c["reason"], "ClusterStatusOK");
+
+        // ── lastTransitionTime preservation (the let-chain at :706) ──
+        // Same-status write (True→True): timestamp PRESERVED. Without
+        // this the 10s tick stamps "now" every write and "when did the
+        // scheduler become unreachable" reads ~10s ago regardless.
+        let prev = serde_json::json!({
+            "type": "SchedulerUnreachable",
+            "status": "True",
+            "lastTransitionTime": "2020-01-01T00:00:00Z",
+        });
+        let c = scheduler_unreachable_condition(Some("still refused"), Some(&prev));
+        assert_eq!(
+            c["lastTransitionTime"], "2020-01-01T00:00:00Z",
+            "same-status write must preserve lastTransitionTime"
+        );
+        // Transition (True→False): fresh stamp.
+        let c = scheduler_unreachable_condition(None, Some(&prev));
+        assert_ne!(
+            c["lastTransitionTime"], "2020-01-01T00:00:00Z",
+            "True→False transition must stamp fresh lastTransitionTime"
+        );
     }
 
     /// `pod_termination_reason` classification. Mirrors what k8s
@@ -1042,7 +1164,7 @@ mod tests {
     /// `activeDeadlineSeconds` fires (live: `kubectl get job -o
     /// jsonpath` showed `cond=FailureTarget Failed/DeadlineExceeded
     /// DeadlineExceeded`).
-    // r[verify ctrl.terminated.deadline-exceeded]
+    // r[verify ctrl.terminated.deadline-exceeded+2]
     #[test]
     fn job_deadline_exceeded_condition() {
         use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
@@ -1163,7 +1285,7 @@ mod tests {
 
     const NO_GRACE: Duration = Duration::ZERO;
 
-    // r[verify ctrl.ephemeral.reap-excess-pending]
+    // r[verify ctrl.ephemeral.reap-excess-pending+2]
     /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →
     /// reap the 2 oldest, keep the 1 newest. The newest is closest to
     /// scheduling; the oldest has waited longest for a node Karpenter
@@ -1189,7 +1311,7 @@ mod tests {
         assert_eq!(select_excess_pending(&jobs, 0, NO_GRACE).len(), 3);
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending]
+    // r[verify ctrl.ephemeral.reap-excess-pending+2]
     /// I-183 scenario B: 1 Pending + 2 Running, queued=0 → reap the
     /// 1 Pending only. Running Jobs are NOT touched — they may hold
     /// assignments; scheduler's cancel-on-disconnect handles those.
@@ -1210,7 +1332,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-excess-pending]
+    // r[verify ctrl.ephemeral.reap-excess-pending+2]
     /// Grace window: a Job younger than `min_age` is excluded even if
     /// `ready=0`. `JobStatus.ready` is set asynchronously by the K8s
     /// Job controller; a freshly-started container may already hold an
@@ -1273,7 +1395,7 @@ mod tests {
         }
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running]
+    // r[verify ctrl.ephemeral.reap-orphan-running+2]
     /// I-165: Running Jobs older than grace, scheduler has no live
     /// assignment for them → reap. Jobs whose executor reports
     /// `busy` are skipped (build in progress per scheduler;
@@ -1304,7 +1426,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running]
+    // r[verify ctrl.ephemeral.reap-orphan-running+2]
     /// Grace + phase filtering: Jobs younger than grace are excluded
     /// (process-level idle-exit gets first chance); Pending and
     /// Completed Jobs are excluded (other reapers' territory).
@@ -1345,7 +1467,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running]
+    // r[verify ctrl.ephemeral.reap-orphan-running+2]
     /// `{job_name}-` prefix match: trailing dash prevents Job
     /// "pool-abc" from matching executor of Job "pool-abcdef".
     #[test]

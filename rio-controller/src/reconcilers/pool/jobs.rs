@@ -43,12 +43,13 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 use super::job::JOB_TTL_SECS;
 use super::job::{
-    JOB_REQUEUE, ephemeral_job, is_active_job, is_pending_job, patch_job_pool_status,
-    reap_excess_pending, reap_orphan_running, report_deadline_exceeded_jobs,
-    report_terminated_pods, spawn_for_each,
+    JOB_REQUEUE, REAP_PENDING_GRACE, ephemeral_job, is_active_job, is_pending_job, job_census,
+    job_older_than, patch_job_pool_status, reap_excess_pending, reap_orphan_running,
+    report_deadline_exceeded_jobs, report_terminated_pods, spawn_for_each,
 };
 use super::pod::{self, UpstreamAddrs};
 use crate::error::{Error, Result};
+use crate::reconcilers::admin_call;
 use crate::reconcilers::{Ctx, KubeErrorExt, require_namespace};
 use rio_crds::pool::{ExecutorKind, Pool};
 use rio_proto::types::SpawnIntent;
@@ -139,22 +140,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     let jobs = jobs_api
         .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
         .await?;
-    let active: i32 = jobs
-        .items
-        .iter()
-        .filter(|j| is_active_job(j))
-        .count()
-        .try_into()
-        .unwrap_or(i32::MAX);
-
-    // ---- Spawn decision ----
-    // We do NOT subtract `active`: `queued` counts only Ready intents
-    // but `active` counts ALL non-terminal Jobs (incl. Running, whose
-    // drvs have left the Ready set). Under per-size-class pools that
-    // mismatch was bounded by class cutoff (~30s); under one Pool it's
-    // bounded by the slowest build, so `queued.sub(active)` starved
-    // new Ready drvs for hours (bug_045). `ceiling = None` → uncapped.
-    let headroom = ceiling.map_or(usize::MAX, |c| c.saturating_sub(active).max(0) as usize);
+    let census = job_census(&jobs.items);
 
     // ---- Reap stale Jobs blocking respawn ----
     // (a) Terminal: a drv that re-enters Ready after its prior Job
@@ -172,22 +158,36 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // consume headroom, so the cap doesn't apply.
     let reaped =
         reap_stale_for_intents(&jobs_api, &jobs.items, &intents, &name, pool.spec.kind).await;
-    // Reaped active Jobs (selector-drifted Pending) free slots THIS
-    // tick; terminal reaped Jobs weren't counted in `active` so don't
-    // double-count. Without this `+ freed`, ceiling-saturation reap
-    // still spawns 0 (`.take(0)`) and respawn waits one extra tick.
-    let freed = jobs
+    // Reaped active Jobs (selector-drifted / orphan Pending) free
+    // slots THIS tick; terminal reaped Jobs weren't counted in
+    // `census.active` so don't double-count.
+    let freed: i32 = jobs
         .items
         .iter()
         .filter(|j| {
             is_active_job(j)
+                && j.metadata.deletion_timestamp.is_none()
                 && j.metadata
                     .name
                     .as_deref()
                     .is_some_and(|n| reaped.contains(n))
         })
-        .count();
-    let headroom = headroom.saturating_add(freed);
+        .count()
+        .try_into()
+        .unwrap_or(i32::MAX);
+    // ---- Spawn decision ----
+    // We do NOT subtract `active`: `queued` counts only Ready intents
+    // but `active` counts ALL non-terminal Jobs (incl. Running, whose
+    // drvs have left the Ready set). Under per-size-class pools that
+    // mismatch was bounded by class cutoff (~30s); under one Pool it's
+    // bounded by the slowest build, so `queued.sub(active)` starved
+    // new Ready drvs for hours (bug_045). `ceiling = None` → uncapped.
+    //
+    // `census.headroom` recomputes from `(active − freed)` BEFORE the
+    // 0-clamp so an over-committed pool (operator lowered
+    // `maxConcurrent` while Jobs live) can't overshoot `ceiling`; the
+    // pre-JobCensus `clamp(ceiling − active) + freed` form did.
+    let headroom = census.headroom(ceiling, freed);
 
     // Names already present (minus what we just reaped) are skipped
     // in the spawn pass to avoid a create()→409 per still-Ready
@@ -266,12 +266,12 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .chain(spawned)
         .collect();
     if to_ack.is_empty() {
-        debug!(pool = %name, queued, active, ?ceiling, "no Pending intents to ack");
+        debug!(pool = %name, queued, active = census.active, ?ceiling, "no Pending intents to ack");
     } else {
-        if let Err(e) = ctx
-            .admin
-            .clone()
-            .ack_spawned_intents(rio_proto::types::AckSpawnedIntentsRequest { spawned: to_ack })
+        if let Err(e) =
+            admin_call(ctx.admin.clone().ack_spawned_intents(
+                rio_proto::types::AckSpawnedIntentsRequest { spawned: to_ack },
+            ))
             .await
         {
             warn!(pool = %name, error = %e, "ack_spawned_intents failed; ICE-timer not armed this tick");
@@ -301,8 +301,8 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         pool.status.as_ref(),
         &ns,
         &name,
-        active,
-        active,
+        census.active,
+        census.ready,
         ceiling.unwrap_or(queued as i32),
         scheduler_err.as_deref(),
     )
@@ -326,17 +326,16 @@ async fn queued_for_pool(
     // I-176: `filter_features=true` even when `features` is empty: a
     // featureless pool then sees only featureless work. Fetcher pools
     // have `features=[]` always (FODs route by is_fixed_output alone).
-    let resp = ctx
-        .admin
-        .clone()
-        .get_spawn_intents(rio_proto::types::GetSpawnIntentsRequest {
+    let resp = admin_call(ctx.admin.clone().get_spawn_intents(
+        rio_proto::types::GetSpawnIntentsRequest {
             kind: Some(super::executor_kind_to_proto(pool.spec.kind).into()),
             systems: pool.spec.systems.clone(),
             features: pool.spec.features.clone(),
             filter_features: true,
-        })
-        .await?
-        .into_inner();
+        },
+    ))
+    .await?
+    .into_inner();
     Ok(resp.intents)
 }
 
@@ -420,22 +419,35 @@ pub(super) async fn reap_stale_for_intents(
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
         };
-        let Some(want_sel) = want.get(jn) else {
-            continue;
-        };
-        let (params, why) = if !is_active_job(j) {
-            (DeleteParams::background(), "terminal")
-        } else if is_pending_job(j)
-            && j.metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
-                .map(String::as_str)
-                != Some(want_sel.as_str())
-        {
-            (DeleteParams::foreground(), "selector-drift")
-        } else {
-            continue;
+        let (params, why) = match want.get(jn) {
+            // Not in the current intent set. Pending → orphan: the
+            // intent left (cancel / completes-elsewhere / disconnect)
+            // and this Job will never receive an assignment. Reap by
+            // intent-membership HERE so the surplus is the orphan set,
+            // not an arbitrary age-prefix — `select_excess_pending`'s
+            // oldest-first reap would otherwise delete still-live Jobs
+            // (losing in-flight Karpenter provisioning) while orphans
+            // survive ≥1 extra tick. Running → leave alone (may hold
+            // assignment; `reap_orphan_running` owns it). The
+            // `want.is_empty()` early-return above is the fail-closed
+            // gate (scheduler error → no orphan-reap).
+            None if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) => {
+                (DeleteParams::foreground(), "orphan-pending")
+            }
+            None => continue,
+            Some(_) if !is_active_job(j) => (DeleteParams::background(), "terminal"),
+            Some(want_sel)
+                if is_pending_job(j)
+                    && j.metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
+                        .map(String::as_str)
+                        != Some(want_sel.as_str()) =>
+            {
+                (DeleteParams::foreground(), "selector-drift")
+            }
+            Some(_) => continue,
         };
         match jobs_api.delete(jn, &params).await {
             Ok(_) => {

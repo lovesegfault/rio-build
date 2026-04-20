@@ -43,6 +43,7 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use super::POOL_LABEL;
+use crate::reconcilers::admin_call;
 
 /// Run the watcher. Returns on `shutdown.cancelled()` or if the
 /// watch stream ends (never — `default_backoff()` retries
@@ -126,12 +127,13 @@ pub async fn run(
         //     to the leader. Standby reject is transient.
         //   - Unknown executor_id → accepted=false. Pod hasn't
         //     heartbeated yet, or already disconnected. No-op.
-        match admin
-            .drain_executor(rio_proto::types::DrainExecutorRequest {
+        match admin_call(
+            admin.drain_executor(rio_proto::types::DrainExecutorRequest {
                 executor_id: executor_id.to_string(),
                 force: true,
-            })
-            .await
+            }),
+        )
+        .await
         {
             Ok(resp) => {
                 let r = resp.into_inner();
@@ -148,9 +150,14 @@ pub async fn run(
                 );
             }
             Err(e) => {
+                let result = if e.code() == tonic::Code::DeadlineExceeded {
+                    "timeout"
+                } else {
+                    "rpc_error"
+                };
                 metrics::counter!(
                     "rio_controller_disruption_drains_total",
-                    "result" => "rpc_error"
+                    "result" => result
                 )
                 .increment(1);
                 warn!(
