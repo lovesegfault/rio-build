@@ -86,10 +86,11 @@ pub fn run() -> f64 {
     REF_TIME_SECS / start.elapsed().as_secs_f64()
 }
 
-/// Spawn the ~5s CPU-bound microbench on a blocking thread. Called at
-/// init so the bench runs concurrently with FUSE mount + cold-start
-/// (~30s); the result is awaited later by [`send`] once the first
-/// `WorkAssignment` (and its assignment token) is in hand.
+/// Spawn the ~5s CPU-bound microbench on a blocking thread. Called
+/// from the resolve→bench task spawned at init (`runtime/setup.rs`),
+/// which itself runs concurrently with FUSE mount + cold-start (~30s);
+/// the result is consumed once the first `WorkAssignment` (and its
+/// assignment token) is in hand.
 ///
 /// `hw_class` is the `rio.build/hw-class` pod annotation, resolved
 /// via [`crate::hw_class::resolve`] (downward-API volume + bounded
@@ -107,10 +108,13 @@ pub fn spawn_measure(hw_class: &str) -> Option<tokio::task::JoinHandle<f64>> {
     Some(tokio::task::spawn_blocking(run))
 }
 
-/// Best-effort: await the bench handle from [`spawn_measure`] and
-/// append the sample. Logs and returns on any failure — a missed
-/// sample degrades normalization (hw_class stays at `factor=1.0`
-/// until ≥3 distinct pods report), not the build itself.
+/// Best-effort: append the bench sample. Logs and returns on any
+/// failure — a missed sample degrades normalization (hw_class stays at
+/// `factor=1.0` until ≥3 distinct pods report), not the build itself.
+///
+/// `factor` is the already-awaited result of [`spawn_measure`]; the
+/// caller (`spawn_build_task`) awaits the spawned resolve→bench task
+/// and passes the `f64` here.
 ///
 /// **Why deferred until an assignment token is in hand:** the store
 /// gates `AppendHwPerfSample` on `x-rio-assignment-token` and derives
@@ -121,16 +125,9 @@ pub async fn send(
     store: &mut rio_proto::StoreServiceClient<tonic::transport::Channel>,
     hw_class: &str,
     pod_id: &str,
-    bench: tokio::task::JoinHandle<f64>,
+    factor: f64,
     assignment_token: &str,
 ) {
-    let factor = match bench.await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "hw_bench: spawn_blocking panicked");
-            return;
-        }
-    };
     tracing::info!(%hw_class, %pod_id, factor, "hw_bench: measured");
     let mut req = tonic::Request::new(rio_proto::types::AppendHwPerfSampleRequest {
         hw_class: hw_class.to_owned(),

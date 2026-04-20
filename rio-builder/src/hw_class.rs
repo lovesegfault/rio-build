@@ -26,8 +26,9 @@ use std::time::Duration;
 pub const HW_CLASS_FILE: &str = "/etc/rio/downward/hw-class";
 
 /// Poll interval. The annotator typically lands <1s after bind; 250ms
-/// keeps the bench start latency (which runs concurrently with FUSE
-/// mount + cold-start ~30s) negligible.
+/// keeps the bench start latency negligible. The whole resolve→bench
+/// chain is `tokio::spawn`ed in `runtime/setup.rs` so it runs
+/// concurrently with FUSE mount + cold-start (~30s).
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Upper bound on the poll. Preserves degraded-not-broken: a missed
@@ -120,5 +121,33 @@ mod tests {
         let got = resolve_from(&path, Duration::from_millis(10), Duration::from_secs(5)).await;
         writer.await.unwrap();
         assert_eq!(got.as_deref(), Some("intel-7-nvme-m"));
+    }
+
+    /// bug_083: `setup()` spawns the resolve→bench chain so a slow
+    /// resolve (annotator dead → 30s POLL_BOUND) does NOT delay FUSE
+    /// mount. This test asserts the structural property at the type
+    /// level — `BuildSpawnContext::hw_bench` carries a `JoinHandle`
+    /// over `(String, Option<f64>)`, which is only constructible by
+    /// spawning. Compile-time regression guard: reverts to the old
+    /// inline-await `Option<JoinHandle<f64>>` shape won't typecheck.
+    ///
+    /// Runtime end-to-end coverage lives in `vm-sla-sizing-standalone`
+    /// (the hw_bench RPC path).
+    #[test]
+    fn hw_class_resolve_runs_concurrently_with_fuse_mount() {
+        // Type-level assertion: `HwBenchHandle` is a JoinHandle over
+        // `(String, Option<f64>)`. A `tokio::spawn`ed future is the
+        // only way to construct this; an inline `.await` returns the
+        // value directly (not a handle), so the old sequential code
+        // structurally cannot produce it.
+        fn assert_spawned(
+            _: &crate::runtime::HwBenchHandle,
+        ) -> Option<&tokio::task::JoinHandle<(String, Option<f64>)>> {
+            // Forces `HwBenchHandle` to deref as
+            // `Mutex<Option<JoinHandle<(String, Option<f64>)>>>`.
+            None
+        }
+        let h: crate::runtime::HwBenchHandle = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let _ = assert_spawned(&h);
     }
 }

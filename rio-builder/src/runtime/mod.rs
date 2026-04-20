@@ -65,6 +65,13 @@ pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
     assignment_gen < latest_observed
 }
 
+/// `BuildSpawnContext::hw_bench` payload: the spawned resolve→bench
+/// task's handle. Yields `(hw_class, factor)` — `hw_class` is empty if
+/// the resolver expired (annotator dead / non-k8s); `factor` is `None`
+/// if `hw_class` was empty (bench skipped) or the bench panicked.
+pub type HwBenchHandle =
+    Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<(String, Option<f64>)>>>>;
+
 /// Shared context for spawning build tasks.
 ///
 /// Constructed once before the event loop to reduce per-assignment clone
@@ -126,22 +133,28 @@ pub struct BuildSpawnContext {
     /// API). Attached to every `CompletionReport` so the scheduler can
     /// write `build_samples.hw_class` directly — the scheduler has no
     /// Node informer, so this is the only path. `None` outside k8s /
-    /// before the annotator stamps.
-    pub hw_class: Option<String>,
+    /// before the annotator stamps. Lazily populated from `hw_bench`
+    /// on first assignment (the resolve runs concurrently with FUSE
+    /// mount; see `setup.rs`). `Arc<Mutex<..>>` so the struct stays
+    /// `Clone` and the panic handler can read whatever the consumer
+    /// wrote.
+    pub hw_class: Arc<std::sync::Mutex<Option<String>>>,
     /// Shared handle to the cgroup-poll `ResourceUsage` snapshot
     /// (same `Arc` as the heartbeat loop). Read once at completion
     /// time to populate `CompletionReport.final_resources` — the
     /// only telemetry channel for the scheduler's `build_samples`
     /// writer (ADR-023).
     pub resources: ResourceSnapshotHandle,
-    /// ADR-023 phase-10 microbench handle, spawned at init. `take()`n
-    /// by [`spawn_build_task`] on the FIRST assignment so the
-    /// `AppendHwPerfSample` RPC can carry that assignment's token
-    /// (`r[sec.boundary.grpc-hmac]` — the store derives `pod_id` from
-    /// claims, not the request body). `Arc<Mutex<Option<..>>>` so the
-    /// struct stays `Clone` (shared slot; second `take()` on any
-    /// clone sees `None`).
-    pub hw_bench: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<f64>>>>,
+    /// ADR-023 phase-10 resolve+microbench handle, spawned at init so
+    /// the resolve poll (≤30s) overlaps FUSE mount. `take()`n by
+    /// [`spawn_build_task`] on the FIRST assignment: the resolved
+    /// `hw_class` is written to [`Self::hw_class`] and the bench
+    /// `factor` (if any) is sent via `AppendHwPerfSample` carrying
+    /// that assignment's token (`r[sec.boundary.grpc-hmac]` — the
+    /// store derives `pod_id` from claims, not the request body).
+    /// `Arc<Mutex<Option<..>>>` so the struct stays `Clone` (shared
+    /// slot; second `take()` on any clone sees `None`).
+    pub hw_bench: HwBenchHandle,
     /// "A `Msg::Completion` is in `sink_rx` or `relay_loop.buffered`
     /// and has not yet been `grpc_tx.send()`-Ok'd into a confirmed-
     /// open stream." Set by `send_completion`; cleared by
@@ -171,7 +184,11 @@ impl BuildSpawnContext {
         let prev = *self.resources.read().unwrap_or_else(|e| e.into_inner());
         result::CompletionStamp {
             node_name: self.node_name.clone(),
-            hw_class: self.hw_class.clone(),
+            hw_class: self
+                .hw_class
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             final_resources: Some(crate::cgroup::final_sample(
                 &self.cgroup_parent,
                 peak_disk_bytes,
@@ -241,18 +258,33 @@ pub async fn spawn_build_task(
         return; // Guard drops, no build spawned.
     }
 
-    // ADR-023 phase-10: now that we have an assignment token, fire the
-    // hw-bench RPC. The bench itself was spawned at init (~5s CPU,
-    // long since done by the time the first assignment arrives);
-    // `take()` so this is one-shot. Best-effort fire-and-forget — the
-    // build does not block on it.
+    // ADR-023 phase-10: now that we have an assignment token, await the
+    // resolve→bench task (spawned at init, runs concurrently with FUSE
+    // mount; ≤30s resolve poll + ~5s CPU bench, long since done by the
+    // time the first assignment arrives). Populate `ctx.hw_class` for
+    // every later `CompletionReport` and fire the `AppendHwPerfSample`
+    // RPC. `take()` so this is one-shot. Best-effort fire-and-forget —
+    // the build does not block on it.
     if let Some(bench) = ctx.hw_bench.lock().unwrap().take() {
         let mut store = ctx.store_clients.store.clone();
-        let hw_class = ctx.hw_class.clone().unwrap_or_default();
+        let hw_class_cell = Arc::clone(&ctx.hw_class);
         let pod_id = ctx.executor_id.clone();
         let token = assignment_token.clone();
         rio_common::task::spawn_monitored("hw-bench-send", async move {
-            crate::hw_bench::send(&mut store, &hw_class, &pod_id, bench, &token).await;
+            let (hw_class, factor) = match bench.await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "hw_bench: resolve+bench task panicked");
+                    return;
+                }
+            };
+            // Publish hw_class for completion_stamp / panic handler.
+            // Empty → None (proto3 optional semantics: "unknown hw").
+            *hw_class_cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                (!hw_class.is_empty()).then(|| hw_class.clone());
+            if let Some(factor) = factor {
+                crate::hw_bench::send(&mut store, &hw_class, &pod_id, factor, &token).await;
+            }
         });
     }
 
@@ -277,7 +309,7 @@ pub async fn spawn_build_task(
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
     let panic_node_name = ctx.node_name.clone();
-    let panic_hw_class = ctx.hw_class.clone();
+    let panic_hw_class = Arc::clone(&ctx.hw_class);
     let panic_resources = Arc::clone(&ctx.resources);
     let panic_completion_pending = Arc::clone(&ctx.completion_pending);
 
@@ -388,8 +420,12 @@ pub async fn spawn_build_task(
                 drv_path = %panic_drv_path,
                 "build task panicked; sending InfrastructureFailure to scheduler"
             );
-            // Read out before the .await — RwLockReadGuard isn't Send.
+            // Read out before the .await — Mutex/RwLock guards aren't Send.
             let final_resources = Some(*panic_resources.read().unwrap_or_else(|e| e.into_inner()));
+            let hw_class = panic_hw_class
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             send_completion(
                 &panic_tx,
                 &panic_completion_pending,
@@ -398,7 +434,7 @@ pub async fn spawn_build_task(
                     panic_token,
                     result::CompletionStamp {
                         node_name: panic_node_name,
-                        hw_class: panic_hw_class,
+                        hw_class,
                         final_resources,
                     },
                 ),

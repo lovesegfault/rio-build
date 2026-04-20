@@ -81,18 +81,30 @@ pub async fn setup(
     // the annotation reactively after `spec.nodeName` binds, so the
     // file may be empty for the first ~1s). `cfg.hw_class` (env var)
     // is the test-injection override. The bench itself is a ~5s
-    // CPU-bound microbench in a blocking thread; `resolve()` + bench
-    // run concurrently with FUSE mount + first heartbeat below. The
-    // RPC is DEFERRED until the first WorkAssignment arrives
-    // (`spawn_build_task` consumes `BuildSpawnContext::hw_bench`) —
-    // the store gates `AppendHwPerfSample` on the assignment token
-    // (`r[sec.boundary.grpc-hmac]`).
-    let hw_class = if cfg.hw_class.is_empty() {
-        crate::hw_class::resolve().await.unwrap_or_default()
-    } else {
-        cfg.hw_class.clone()
-    };
-    let hw_bench = crate::hw_bench::spawn_measure(&hw_class);
+    // CPU-bound microbench in a blocking thread.
+    //
+    // The whole resolve→bench chain is SPAWNED so it runs concurrently
+    // with FUSE mount + first heartbeat below — `POLL_BOUND=30s` was
+    // sized assuming overlap with the ~30s FUSE cold-start, so an
+    // annotator outage adds 0s (not 30s) to startup. Both products
+    // (`hw_class` string + bench `factor`) are consumed only at first
+    // WorkAssignment (`spawn_build_task` takes `BuildSpawnContext::
+    // hw_bench`); the store gates `AppendHwPerfSample` on the
+    // assignment token (`r[sec.boundary.grpc-hmac]`).
+    let hw_class_override = (!cfg.hw_class.is_empty()).then(|| cfg.hw_class.clone());
+    let hw_bench = tokio::spawn(async move {
+        let hw_class = match hw_class_override {
+            Some(c) => c,
+            None => crate::hw_class::resolve().await.unwrap_or_default(),
+        };
+        // Flatten: await the spawn_blocking handle inside this task so
+        // the consumer sees one JoinHandle<(String, Option<f64>)>.
+        let factor = match crate::hw_bench::spawn_measure(&hw_class) {
+            Some(h) => h.await.ok(),
+            None => None,
+        };
+        (hw_class, factor)
+    });
 
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
@@ -300,11 +312,14 @@ pub async fn setup(
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
-        hw_class: (!hw_class.is_empty()).then(|| hw_class.clone()),
+        // Populated lazily by `spawn_build_task` when it awaits
+        // `hw_bench` on the first assignment. Before then, `None` —
+        // the documented "unknown hw" semantics.
+        hw_class: Arc::new(std::sync::Mutex::new(None)),
         // Same Arc as the heartbeat loop (above) — completion reads
         // the snapshot the cgroup poller has been maintaining.
         resources: resource_snapshot,
-        hw_bench: Arc::new(std::sync::Mutex::new(hw_bench)),
+        hw_bench: Arc::new(std::sync::Mutex::new(Some(hw_bench))),
         completion_pending: Arc::clone(&completion_pending),
     };
 
