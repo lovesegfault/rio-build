@@ -439,6 +439,12 @@ impl Substituter {
                 Ok(UpstreamOutcome::Miss) => {
                     // This upstream doesn't have it. Try the next.
                     debug!(upstream = %upstream.url, "upstream miss, trying next");
+                    metrics::counter!(
+                        "rio_store_substitute_total",
+                        "result" => "miss",
+                        "upstream" => upstream.url.clone()
+                    )
+                    .increment(1);
                 }
                 Ok(UpstreamOutcome::Raced) => {
                     // Another uploader holds the placeholder. STOP —
@@ -463,11 +469,16 @@ impl Substituter {
                         .increment(1);
                     }
                     warn!(upstream = %upstream.url, error = %e, "upstream fetch failed, trying next");
+                    metrics::counter!(
+                        "rio_store_substitute_total",
+                        "result" => "error",
+                        "upstream" => upstream.url.clone()
+                    )
+                    .increment(1);
                 }
             }
         }
 
-        metrics::counter!("rio_store_substitute_total", "result" => "miss").increment(1);
         Ok(None)
     }
 
@@ -1313,6 +1324,90 @@ mod tests {
             "add: both sigs, got {:?}",
             got.signatures
         );
+    }
+
+    /// Per-upstream miss/error labeling: an upstream that 404s emits
+    /// `{result=miss,upstream=URL}`; one that fails fetch/verify emits
+    /// `{result=error,upstream=URL}`. Prior code emitted ONE unlabeled
+    /// `{result=miss}` after the loop and NO metric on Err — a 503ing
+    /// upstream was invisible in metrics and indistinguishable from
+    /// cache-miss.
+    #[tokio::test]
+    async fn substitute_per_upstream_miss_and_error_labeled() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-metrics").await;
+        let (have_path, nar) = make_path();
+        // Upstream A serves `have_path` only → request a DIFFERENT
+        // path → 404 (axum default) → Ok(None) miss.
+        let a = spawn_fake_upstream(&have_path, nar, "cache.metrics-a").await;
+        // Upstream B: every .narinfo returns 500 → Err.
+        let b = spawn_500_upstream().await;
+
+        for url in [&a.url, &b.url] {
+            metadata::upstreams::insert(
+                &db.pool,
+                tid,
+                url,
+                50,
+                std::slice::from_ref(&a.trusted_key),
+                SigMode::Keep,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Distinct hash_part: test_store_path() uses a fixed TEST_HASH
+        // for all names, so requesting it would HIT upstream A's
+        // narinfo route. A different hash_part guarantees A 404s.
+        let other = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-not-on-any-upstream".to_string();
+        let sub = test_substituter(db.pool.clone());
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &other).await.unwrap();
+        assert!(got.is_none());
+
+        let miss_a = format!(
+            "rio_store_substitute_total{{result=miss,upstream={}}}",
+            a.url
+        );
+        let err_b = format!(
+            "rio_store_substitute_total{{result=error,upstream={}}}",
+            b.url
+        );
+        assert_eq!(
+            rec.get(&miss_a),
+            1,
+            "per-upstream miss; keys={:?}",
+            rec.all_keys()
+        );
+        assert_eq!(
+            rec.get(&err_b),
+            1,
+            "per-upstream error; keys={:?}",
+            rec.all_keys()
+        );
+        // No unlabeled post-loop miss any more.
+        assert_eq!(rec.get("rio_store_substitute_total{result=miss}"), 0);
+    }
+
+    /// Axum server that 500s on every request — for the per-upstream
+    /// error-metric test.
+    async fn spawn_500_upstream() -> FakeUpstream {
+        use axum::{Router, http::StatusCode, routing::get};
+        let app = Router::new().fallback(get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FakeUpstream {
+            url: format!("http://{addr}"),
+            trusted_key: String::new(),
+            _task: task,
+        }
     }
 
     #[tokio::test]

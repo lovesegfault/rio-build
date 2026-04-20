@@ -212,14 +212,14 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 
 ### Key Rotation
 
-1. Generate a new ed25519 signing key
+1. Generate a new ed25519 signing key with a NEW key name (e.g., `rio-prod-2` if the prior was `rio-prod-1`)
 2. Add the new public key to all clients' `trusted-public-keys` configuration
 3. New paths are signed with the new key immediately
 4. Prior cluster public keys stay in the trusted set via `cluster_key_history`; no re-sign needed while the history row exists (see `r[store.key.rotation-cluster-history]`)
 5. After a grace period (default: 30 days), remove the old key from `trusted-public-keys` and delete its `cluster_key_history` row
 
 r[store.key.rotation-cluster-history]
-The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`.
+The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`. Load-time validation also warns if a prior key's name collides with the current cluster key name; verification tries all matching-name keys regardless, so a name collision does not break visibility, but the warning surfaces a runbook violation.
 
 > **Future work:** cluster key rotation history and per-tenant signing keys are intended to be manageable via a `rio-cli keys` subcommand (validating `name:base64(32-byte-ed25519-pubkey)` format before INSERT; retirement sets `retired_at` to preserve the audit trail). Until that lands, manual `psql` is the workflow — load-time checks (`r[store.key.rotation-cluster-history]`) catch malformed rows regardless. See `// TODO:` in `rio-store/src/grpc/admin.rs`.
 

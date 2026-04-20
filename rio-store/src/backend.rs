@@ -52,17 +52,20 @@ pub struct BackendAuthError;
 /// 2. **Credential-provider auth** — request never left: STS
 ///    AssumeRoleWithWebIdentity denied, IMDS unreachable, expired
 ///    token, etc. Surfaces as `DispatchFailure` with `.code() == None`
-///    and the denial buried in the source chain. The Display impl
-///    flattens the chain — string-matching is imprecise but the
-///    alternative is exhaustively matching aws-smithy internal types.
+///    and the denial buried in the *source chain* — `SdkError`'s own
+///    `Display` is a fixed variant label (`"dispatch failure"`),
+///    NOT a flattened chain, so we walk `Error::source()` ourselves.
 ///
 /// False negative (auth error classified as transient) → client retries
 /// a few times then gives up; annoying but safe. False positive
 /// (transient classified as auth) → client gives up on a recoverable
 /// error; bad. The code-list is conservative (well-known AWS auth
-/// codes only) and the string match is narrowed to the flattened
-/// Display specifically to bias toward false negatives.
-fn is_permanent_auth_error<E: ProvideErrorMetadata + std::fmt::Display>(e: &E) -> bool {
+/// codes only) and the string match is narrowed to source-chain Display
+/// specifically to bias toward false negatives.
+fn is_permanent_auth_error<E>(e: &E) -> bool
+where
+    E: ProvideErrorMetadata + std::error::Error + 'static,
+{
     // Service-level: explicit S3/IAM error codes.
     if let Some(code) = e.code()
         && matches!(
@@ -78,12 +81,37 @@ fn is_permanent_auth_error<E: ProvideErrorMetadata + std::fmt::Display>(e: &E) -
         return true;
     }
     // Credential-provider level: STS denial or credential-chain
-    // exhaustion buried in DispatchFailure. Display flattens the
-    // source chain. "AccessDenied" catches the STS response body;
-    // "credentials" (lowercase) catches the sdk's own "failed to
-    // load credentials" wrapper.
-    let display = format!("{e}");
-    display.contains("AccessDenied") || display.contains("credentials")
+    // exhaustion buried in DispatchFailure. Walk Error::source()
+    // (SdkError::Display alone is a fixed variant label). "AccessDenied"
+    // catches the STS response body; "credentials" (lowercase) catches
+    // the sdk's own "failed to load credentials" / "an error occurred
+    // while loading credentials" wrappers.
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        let s = err.to_string();
+        if s.contains("AccessDenied") || s.contains("credentials") {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Chokepoint: convert an aws-sdk error to anyhow, rooting at
+/// [`BackendAuthError`] when [`is_permanent_auth_error`] matches so
+/// `grpc::storage_error` / `gc::drain` can downcast it. Generic over
+/// `SdkError<Op>` and the `Op::Error` service-error types alike (both
+/// satisfy the bound), so call this from before *or* after
+/// `.into_service_error()`.
+fn classify_s3_error<E>(e: E, msg: String) -> anyhow::Error
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    if is_permanent_auth_error(&e) {
+        anyhow::Error::new(BackendAuthError).context(msg)
+    } else {
+        anyhow::Error::new(e).context(msg)
+    }
 }
 
 /// Trait for chunk storage backends.
@@ -448,18 +476,7 @@ impl ChunkBackend for S3ChunkBackend {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| {
-                let msg = format!("S3 PutObject failed for {key}: {e}");
-                if is_permanent_auth_error(&e) {
-                    // Root the anyhow chain at BackendAuthError so the
-                    // grpc layer's storage_error() can downcast_ref it.
-                    // The detailed message is .context() on top — logs
-                    // see the full chain, client sees only the category.
-                    anyhow::Error::new(BackendAuthError).context(msg)
-                } else {
-                    anyhow::anyhow!(msg)
-                }
-            })?;
+            .map_err(|e| classify_s3_error(e, format!("S3 PutObject failed for {key}")))?;
 
         Ok(())
     }
@@ -496,11 +513,14 @@ impl ChunkBackend for S3ChunkBackend {
                 if service_err.is_no_such_key() {
                     Ok(None)
                 } else {
-                    // Transient error — propagate. Conflating this with
-                    // Ok(None) makes every S3 blip look like data loss,
-                    // which is the opposite problem.
-                    Err(anyhow::anyhow!(
-                        "S3 GetObject failed for {key}: {service_err}"
+                    // Propagate via classify_s3_error so AccessDenied
+                    // surfaces as BackendAuthError (FailedPrecondition,
+                    // non-retriable). Conflating with Ok(None) makes
+                    // every S3 blip look like data loss; conflating
+                    // auth with transient retries forever.
+                    Err(classify_s3_error(
+                        service_err,
+                        format!("S3 GetObject failed for {key}"),
                     ))
                 }
             }
@@ -542,8 +562,9 @@ impl ChunkBackend for S3ChunkBackend {
                                 if service_err.is_not_found() {
                                     Ok(false)
                                 } else {
-                                    Err(anyhow::anyhow!(
-                                        "S3 HeadObject failed for {key}: {service_err}"
+                                    Err(classify_s3_error(
+                                        service_err,
+                                        format!("S3 HeadObject failed for {key}"),
                                     ))
                                 }
                             }
@@ -584,7 +605,7 @@ impl ChunkBackend for S3ChunkBackend {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("S3 DeleteObject failed for {key}: {e}"))?;
+            .map_err(|e| classify_s3_error(e, format!("S3 DeleteObject failed for {key}")))?;
         Ok(())
     }
 }
@@ -598,6 +619,64 @@ mod tests {
     const HASH_A: [u8; 32] = [0x00; 32];
     const HASH_B: [u8; 32] = [0xFF; 32];
     const HASH_C: [u8; 32] = [0xAB; 32];
+
+    /// `is_permanent_auth_error` branch 2 (credential-provider) walks
+    /// `Error::source()` — the prior `format!("{e}")` only saw the
+    /// outer Display (`"dispatch failure"`), never the buried
+    /// credential-chain message, so STS denial classified as transient
+    /// and the builder retried forever.
+    ///
+    /// Builds: outer (no auth marker) → inner ("...credentials...").
+    #[test]
+    fn is_permanent_auth_error_walks_source_chain() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an error occurred while loading credentials")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer {
+            inner: Inner,
+            meta: aws_sdk_s3::error::ErrorMetadata,
+        }
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                // Mimics SdkError::DispatchFailure's Display: a fixed
+                // variant label, NOT a flattened chain.
+                f.write_str("dispatch failure")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.inner)
+            }
+        }
+        impl ProvideErrorMetadata for Outer {
+            fn meta(&self) -> &aws_sdk_s3::error::ErrorMetadata {
+                &self.meta
+            }
+        }
+        let outer = || Outer {
+            inner: Inner,
+            meta: aws_sdk_s3::error::ErrorMetadata::builder().build(),
+        };
+
+        let e = outer();
+        // Outer Display alone has no auth marker; the walk must reach Inner.
+        assert!(!e.to_string().contains("credentials"));
+        assert!(
+            is_permanent_auth_error(&e),
+            "must walk source() chain to find credential-provider message"
+        );
+
+        // classify_s3_error roots the anyhow chain at BackendAuthError.
+        let any = classify_s3_error(outer(), "ctx".into());
+        assert!(any.downcast_ref::<BackendAuthError>().is_some());
+    }
 
     #[test]
     fn chunk_key_format() {

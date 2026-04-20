@@ -332,16 +332,27 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 let exists = match backend.exists_batch(&hashes).await {
                     Ok(e) => e,
                     Err(e) => {
-                        // Transient S3 failure surfaces a partial
-                        // result. Stream the error so the operator
-                        // sees the boundary (last scanned was N) and
-                        // can resume. No partial done=true.
-                        let _ = tx
-                            .send(Err(Status::unavailable(format!(
+                        // Permanent auth (IRSA misconfigured, IAM
+                        // missing s3:HeadObject) → FailedPrecondition
+                        // so the operator sees a fix-the-config
+                        // signal instead of retrying. Everything else
+                        // → Unavailable (transient, stream the boundary
+                        // so the operator can resume from N).
+                        let status = if e
+                            .downcast_ref::<crate::backend::BackendAuthError>()
+                            .is_some()
+                        {
+                            Status::failed_precondition(
+                                "VerifyChunks: storage backend authentication failed; \
+                                 check S3 credentials/IAM permissions",
+                            )
+                        } else {
+                            Status::unavailable(format!(
                                 "VerifyChunks: backend exists_batch failed at \
                                  scanned={scanned}: {e}"
-                            ))))
-                            .await;
+                            ))
+                        };
+                        let _ = tx.send(Err(status)).await;
                         return;
                     }
                 };

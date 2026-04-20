@@ -135,6 +135,21 @@ pub async fn drain_once(
                 deleted += 1;
             }
             Err(e) => {
+                // Permanent auth (IRSA misconfigured, IAM missing
+                // s3:DeleteObject): bumping attempts on every row
+                // chews through the retry budget at debug! level
+                // with no operator signal. Stop this iteration,
+                // emit error! (alert-worthy), DON'T burn attempts.
+                if e.downcast_ref::<crate::backend::BackendAuthError>()
+                    .is_some()
+                {
+                    tracing::error!(
+                        key = %key, error = %e,
+                        "drain: storage backend authentication failed; \
+                         check S3 credentials/IAM permissions"
+                    );
+                    break;
+                }
                 // Increment attempts + record error (same tx).
                 // Next iteration retries (if attempts < MAX).
                 sqlx::query(

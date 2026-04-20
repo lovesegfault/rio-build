@@ -121,7 +121,9 @@ mod tests {
         .await
         .unwrap();
 
-        let loaded = TenantSigner::load_prior_cluster(&db.pool).await.unwrap();
+        let loaded = TenantSigner::load_prior_cluster(&db.pool, "current-key")
+            .await
+            .unwrap();
 
         // Malformed entry skipped; both valid entries loaded.
         assert_eq!(loaded.len(), 2, "malformed entry skipped, 2 valid loaded");
@@ -169,12 +171,40 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = TenantSigner::load_prior_cluster(&db.pool).await.unwrap();
+        let loaded = TenantSigner::load_prior_cluster(&db.pool, "current-key")
+            .await
+            .unwrap();
 
         assert_eq!(loaded.len(), 1);
         assert!(
             !logs_contain("malformed"),
             "no malformed entries → no warn noise"
+        );
+    }
+
+    /// Prior key with same name as current → loud warn (runbook
+    /// violation). Loaded anyway — `any_sig_trusted` tries all
+    /// matching-name keys so verification stays robust.
+    #[tokio::test]
+    #[traced_test]
+    async fn load_prior_cluster_warns_on_name_collision() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let prior = Signer::from_seed("rio-prod", &[0xDD; 32]).trusted_key_entry();
+        sqlx::query("INSERT INTO cluster_key_history (pubkey) VALUES ($1)")
+            .bind(&prior)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let loaded = TenantSigner::load_prior_cluster(&db.pool, "rio-prod")
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1, "still loaded — verification is robust");
+        assert!(
+            logs_contain("shadows the current cluster key name"),
+            "warn fires on name collision"
         );
     }
 }

@@ -85,7 +85,7 @@ pub(crate) fn validate_store_path(s: &str) -> Result<(), Status> {
 /// intervention.
 ///
 /// Inspects the anyhow chain for [`BackendAuthError`] (set by
-/// `S3ChunkBackend::put` when the SDK error matches known auth
+/// `S3ChunkBackend` ops when the SDK error matches known auth
 /// signatures). If present → `FailedPrecondition` with a message that
 /// names the fix. Otherwise → same as [`rio_common::grpc::internal`].
 ///

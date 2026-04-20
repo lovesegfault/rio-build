@@ -101,20 +101,23 @@ pub fn any_sig_trusted(
         let Some((sig_name, sig_b64)) = sig.split_once(':') else {
             continue;
         };
-        let Some((_, vk)) = keys.iter().find(|(n, _)| *n == sig_name) else {
-            continue;
-        };
         let Ok(sig_bytes) = b64.decode(sig_b64) else {
             continue;
         };
         let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else {
             continue;
         };
-        if vk
-            .verify(fingerprint.as_bytes(), &Signature::from_bytes(&sig_arr))
-            .is_ok()
-        {
-            return Some(sig_name.to_string());
+        let signature = Signature::from_bytes(&sig_arr);
+        // Try EVERY key matching this name. cluster_key_history.pubkey
+        // is PK on full `name:b64`, so two rows with the same `name`
+        // are legal (rotation with reused name). `.find()` only tries
+        // the first → on verify-fail moves to the next *signature*,
+        // not the next *key*, leaving the second key unreachable and
+        // old-key paths silently dark.
+        for (_, vk) in keys.iter().filter(|(n, _)| *n == sig_name) {
+            if vk.verify(fingerprint.as_bytes(), &signature).is_ok() {
+                return Some(sig_name.to_string());
+            }
         }
     }
     None
@@ -333,7 +336,10 @@ impl TenantSigner {
     /// main.rs reaches the query through the public `signing` module.
     /// Same cycle-local pattern as [`Self::resolve_once`]'s
     /// `get_active_signer` call.
-    pub async fn load_prior_cluster(pool: &sqlx::PgPool) -> Result<Vec<String>, SignerError> {
+    pub async fn load_prior_cluster(
+        pool: &sqlx::PgPool,
+        current_key_name: &str,
+    ) -> Result<Vec<String>, SignerError> {
         let entries = crate::metadata::load_cluster_key_history(pool)
             .await
             .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?;
@@ -348,6 +354,18 @@ impl TenantSigner {
         for entry in entries {
             match parse_trusted_key_entry(&entry) {
                 Ok((name, _)) => {
+                    if name == current_key_name {
+                        // any_sig_trusted now tries all matching-name
+                        // keys so verification is robust regardless,
+                        // but the operator should know they violated
+                        // the rotation runbook.
+                        tracing::warn!(
+                            key_name = name,
+                            "prior cluster key shadows the current cluster key name; \
+                             old-key paths would go dark without all-match verification — \
+                             bump the key name (e.g. {name}-2) on rotation"
+                        );
+                    }
                     tracing::debug!(key_name = name, "prior cluster key loaded");
                     valid.push(entry);
                 }
@@ -865,6 +883,28 @@ mod tests {
         assert_eq!(
             any_sig_trusted(&[sig], &[trusted], fp).as_deref(),
             Some("key-a")
+        );
+    }
+
+    /// Two trusted keys with the SAME name (rotation with reused name —
+    /// `cluster_key_history.pubkey` PK is on full `name:b64`, so legal).
+    /// `.find()` only tried the first; sig from the second key returned
+    /// `None` and old-key paths went silently dark.
+    // r[verify store.key.rotation-cluster-history]
+    #[test]
+    fn any_sig_trusted_tries_all_keys_with_same_name() {
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        let k1 = Signer::from_seed("rio-prod", &[0x11u8; 32]);
+        let k2 = Signer::from_seed("rio-prod", &[0x22u8; 32]);
+        // Sig is from k2; trust set lists k1 FIRST (sig_visibility_gate
+        // pushes current before priors).
+        let sig = k2.sign(fp);
+        let trusted = vec![k1.trusted_key_entry(), k2.trusted_key_entry()];
+
+        assert_eq!(
+            any_sig_trusted(&[sig], &trusted, fp).as_deref(),
+            Some("rio-prod"),
+            "must try ALL keys matching the signature name, not just the first"
         );
     }
 

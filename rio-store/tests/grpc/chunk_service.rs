@@ -180,24 +180,28 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
 /// Prove StoreService and ChunkService ACTUALLY share one cache.
 ///
 /// If StoreService and ChunkService each had their own ChunkCache,
-/// the two would have DIFFERENT moka LRUs. That would pass incidentally: both
-/// miss → both hit the shared MemoryChunkBackend → same data. But
-/// "warmed by GetPath is hot for GetChunk" wasn't really tested.
+/// the two would have DIFFERENT moka LRUs. The prior version of this
+/// test warmed AND verified via `s.chunk` only — that proves
+/// "ChunkService has a cache", not "StoreService and ChunkService
+/// share one". With two private caches it still passed.
 ///
-/// This test proves sharing: GetChunk populates moka, then CORRUPT
-/// the backend, then GetChunk again. If the cache is real, the second
-/// read comes from moka (good bytes, BLAKE3 verify passes). If there's
-/// no cache sharing (or no cache at all), the second read goes to
-/// backend (corrupted bytes, verify fails).
+/// This test proves sharing: warm via **StoreService.GetPath** (which
+/// reads chunks through the cache), CORRUPT the backend, then read via
+/// **ChunkService.GetChunk**. If the cache is shared, ChunkService's
+/// read comes from moka (good bytes). If StoreService had a private
+/// cache, ChunkService misses → backend → corrupted bytes → BLAKE3
+/// verify fail → gRPC error.
 ///
 /// This mirrors what main.rs does: one Arc<ChunkCache> cloned into
 /// all consumers.
 #[tokio::test]
 async fn test_shared_cache_warms_across_services() -> TestResult {
+    use rio_proto::types::GetPathRequest;
     let mut s = ChunkSession::new().await?;
 
     // Upload something large enough to chunk.
     let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    let store_path = info.store_path.to_string();
     put_path(&mut s.store, info, nar).await?;
 
     // Grab one chunk's hash.
@@ -206,9 +210,18 @@ async fn test_shared_cache_warms_across_services() -> TestResult {
         .await?;
     let hash_arr: [u8; 32] = hash.as_slice().try_into().expect("32-byte hash");
 
-    // First GetChunk: cold → backend → moka insert.
-    let first = collect_get_chunk(&mut s.chunk, hash.clone()).await?;
-    assert!(!first.is_empty(), "chunk has content");
+    // Warm via StoreService.GetPath: reads every chunk through
+    // cache.get_verified() (get_path.rs PREFETCH_K loop), populating
+    // the SHARED moka. Drain the stream fully so all chunk reads run.
+    let mut stream = s
+        .store
+        .get_path(GetPathRequest {
+            store_path,
+            manifest_hint: None,
+        })
+        .await?
+        .into_inner();
+    while stream.message().await?.is_some() {}
 
     // Corrupt the backend. If the cache is shared and populated, the
     // next read should NOT hit this. If setup had two caches (the old
@@ -217,14 +230,14 @@ async fn test_shared_cache_warms_across_services() -> TestResult {
     s.backend
         .corrupt_for_test(&hash_arr, bytes::Bytes::from_static(b"garbage"));
 
-    // Second GetChunk: if cache is real, this is a moka hit (original
-    // good bytes). If not, it reads the corrupted backend → verify
-    // fail → gRPC Internal error.
-    let second = collect_get_chunk(&mut s.chunk, hash).await?;
-    assert_eq!(
-        second, first,
-        "second read came from SHARED moka cache (same bytes), not \
-         corrupted backend. If this fails: cache is NOT shared."
+    // Verify via ChunkService.GetChunk: if cache is SHARED, this is a
+    // moka hit (original good bytes). If StoreService had a private
+    // cache, this misses → corrupted backend → verify fail.
+    let got = collect_get_chunk(&mut s.chunk, hash).await?;
+    assert!(
+        !got.is_empty(),
+        "ChunkService read came from SHARED moka cache warmed by \
+         StoreService.GetPath. If this fails: cache is NOT shared."
     );
     Ok(())
 }

@@ -330,6 +330,11 @@ async fn test_trailer_duplicate_trailer_rejected() -> TestResult {
         .await
         .expect_err("duplicate trailer → reject");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("duplicate trailer"),
+        "pin to the duplicate-trailer guard, got: {}",
+        status.message()
+    );
 
     Ok(())
 }
@@ -357,6 +362,15 @@ async fn test_trailer_oversized_nar_size_rejected() -> TestResult {
     .await
     .expect_err("oversized nar_size → reject");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    // Pin to the MAX_NAR_SIZE guard specifically. Without this, deleting
+    // common.rs:175-180 still passes (verify_nar's size-mismatch fires
+    // with the same code). Sibling tests (lines 75/151/197/229/280) all
+    // pin via .message().contains() — this one was the odd one out.
+    assert!(
+        status.message().contains("exceeds maximum"),
+        "must be the MAX_NAR_SIZE guard, got: {}",
+        status.message()
+    );
 
     Ok(())
 }

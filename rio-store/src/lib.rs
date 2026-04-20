@@ -212,8 +212,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_total",
-        "Upstream substitution attempts (labeled by result: hit/miss/error, \
-         upstream: URL). Hit means ingested; miss means no upstream had it."
+        "Upstream substitution attempts, labeled by result (hit/miss/error) \
+         and upstream (URL; empty for pre-loop failures). Per-upstream: \
+         hit=ingested, miss=upstream returned 404, error=upstream \
+         fetch/verify failed."
     );
     describe_counter!(
         "rio_store_substitute_bytes_total",
