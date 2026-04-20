@@ -924,10 +924,20 @@ rec {
   # the Secret with a throwaway key so the pod starts cleanly during
   # waitReady; this patches in the real key + scale-bounces (0→1) to
   # force a fresh kubelet Secret LIST (see bounceGatewayForSecret).
-  sshKeySetup = ''
+  #
+  # `tenantComment` becomes the key's SSH comment field, which the
+  # gateway parses as tenant_name (r[gw.auth.tenant-from-key-comment]).
+  # When jwtEnabled, the gateway resolves this name → UUID → mints
+  # x-rio-tenant-token; the scheduler's require_tenant() rejects
+  # tokenless SubmitBuild in JWT mode, so an empty comment makes every
+  # ssh-ng build fail Unauthenticated. Non-JWT scenarios pass "" (the
+  # backward-compat sshKeySetup alias below) — gateway then sends
+  # tenant_name="" in the body and the scheduler treats it as
+  # single-tenant.
+  sshKeySetupFor = tenantComment: ''
     client.succeed(
         "mkdir -p /root/.ssh && "
-        "ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519"
+        "ssh-keygen -t ed25519 -N ''' -C '${tenantComment}' -f /root/.ssh/id_ed25519"
     )
     pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
     # Create-or-replace. --dry-run=client -o yaml | apply is idempotent.
@@ -975,6 +985,10 @@ rec {
         timeout=30,
     )
   '';
+  # Backward-compat alias: empty comment (single-tenant / non-JWT
+  # scenarios). leader-election + privileged-hardening-e2e + the
+  # common.nix mkFragmentTest fallback all use this.
+  sshKeySetup = sshKeySetupFor "";
 
   # For `${common.collectCoverage pyNodeVars}`. Client excluded (no
   # rio services → empty tarball noise).

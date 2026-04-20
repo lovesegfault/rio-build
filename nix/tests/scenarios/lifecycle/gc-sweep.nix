@@ -111,10 +111,11 @@ scope: with scope; ''
       # bytea). Same input bytes → same digest → same BYTEA. If
       # either side hex-encoded, this would be 0 forever.
       #
-      # The earlier builds (out_pin/out_victim) used the default
-      # key (empty comment → tenant_id=None → upsert skipped) —
-      # path_tenants is currently empty. We set up a tenant key
-      # now, bounce the gateway to load it, and do ONE build.
+      # The earlier builds (out_pin/out_victim) used the prelude's
+      # vm-lifecycle key, so path_tenants already has rows for them
+      # (tenant=vm-lifecycle, no retention configured → no GC effect).
+      # We set up a SECOND tenant key now, bounce the gateway to load
+      # it, and do ONE build under gc-tenant-test.
 
       # Tenant key with non-empty comment. Gateway's
       # load_authorized_keys parses the comment as tenant_name.
@@ -187,9 +188,10 @@ scope: with scope; ''
       # to /etc/ssh/ssh_config (system); per-user config wins.
       #
       # IdentitiesOnly yes: without it ssh offers ~/.ssh/id_ed25519
-      # (default key, empty comment) FIRST, gateway accepts THAT →
-      # tenant_id=None → upsert never fires. The build succeeds
-      # silently with the wrong identity.
+      # (prelude's vm-lifecycle key) FIRST, gateway accepts THAT →
+      # tenant_id=vm-lifecycle → the path_tenants assertion below
+      # (scoped to gc-tenant-test's UUID) finds 0 rows. The build
+      # succeeds silently with the wrong identity.
       client.succeed(
           "cat >> /root/.ssh/config << 'EOF'\n"
           "Host k3s-server-tenant\n"

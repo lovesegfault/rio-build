@@ -179,12 +179,13 @@ let
   #
   # jwtEnabled: mounts the rio-jwt-pubkey ConfigMap into scheduler+store
   # and the rio-jwt-signing Secret into gateway (lib/jwt-keys.nix fixed
-  # test keypair). The interceptor is DUAL-MODE (header-absent → pass-
-  # through), so enabling it doesn't break existing lifecycle subtests
-  # that call gRPC without the x-rio-tenant-token header. Turned on here
-  # for jwt-mount-present; the other splits don't need it but the shared
-  # module means they get it too (harmless — just an extra ConfigMap
-  # mount).
+  # test keypair). SchedulerGrpc.require_tenant() rejects tokenless
+  # SchedulerService calls in JWT mode, so lifecycle.nix's
+  # prelude creates a vm-lifecycle tenant, mints a matching JWT for
+  # grpcurl-direct calls, and gives the SSH key that tenant's name as
+  # its comment so the gateway mints a JWT for ssh-ng builds. Turned on
+  # here for jwt-mount-present; the other splits inherit it via the
+  # shared module and exercise the full tenant-authz path as a bonus.
   lifecycleMod = lifecycle {
     inherit pkgs common;
     fixture = k3sFull { jwtEnabled = true; };

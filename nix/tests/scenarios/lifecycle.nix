@@ -96,10 +96,36 @@ let
     ;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
+  jwtKeys = import ../lib/jwt-keys.nix;
 
   # grpcurl not in k3sBase systemPackages (only curl+kubectl). Use the
   # store path directly — it's pulled into the VM closure by interpolation.
   grpcurl = "${pkgs.grpcurl}/bin/grpcurl";
+
+  # Mint a tenant JWT signed with the lib/jwt-keys.nix test seed (same
+  # seed the k3s-full fixture passes to the chart via jwt.signingSeed).
+  # Prelude calls this once after creating the vm-lifecycle tenant; the
+  # resulting token is attached to every grpcurl-direct SchedulerService
+  # call so require_tenant() (r[sched.tenant.authz]) accepts it. When
+  # the fixture has jwtEnabled=false (prod-parity), the scheduler's
+  # interceptor is inert and the header is ignored — harmless.
+  pyWithJwt = pkgs.python3.withPackages (
+    ps: with ps; [
+      pyjwt
+      cryptography
+    ]
+  );
+  signJwt = pkgs.writeScript "sign-jwt-lifecycle" ''
+    #!${pyWithJwt}/bin/python3
+    import sys, time, base64, jwt
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    seed = base64.b64decode("${jwtKeys.seedB64}")
+    sk = Ed25519PrivateKey.from_private_bytes(seed)
+    now = int(time.time())
+    claims = {"sub": sys.argv[1], "iat": now, "exp": now + 3600,
+              "jti": "vm-lifecycle"}
+    print(jwt.encode(claims, sk, algorithm="EdDSA"))
+  '';
 
   # rio-* gRPC is plaintext-on-WireGuard; grpcurl needs -plaintext.
   grpcurlTls = "-plaintext";
@@ -416,9 +442,12 @@ let
     # is a raw TCP tunnel through the apiserver. `-max-time` bounds the
     # RPC itself; port-forward is killed by trap even if grpcurl hangs.
     def sched_grpc(payload, method):
-        """TriggerGC etc. on the scheduler leader. Returns stdout+stderr."""
+        """TriggerGC etc. on the scheduler leader. Returns stdout+stderr.
+        Carries x-rio-tenant-token (require_tenant gate); AdminService
+        ignores it, SchedulerService requires it when jwtEnabled."""
         return pf_exec(leader_pod(), 9001,
             f"${grpcurl} ${grpcurlTls} -max-time 30 "
+            f"-H 'x-rio-tenant-token: {tenant_jwt}' "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{payload}' localhost:__PORT__ {method}")
 
@@ -453,6 +482,7 @@ let
         stack within one subtest, e.g. build-timeout submit→retry)."""
         out = pf_exec(leader_pod(), 9001,
             f"${grpcurl} ${grpcurlTls} -max-time {max_time} "
+            f"-H 'x-rio-tenant-token: {tenant_jwt}' "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{json.dumps(payload)}' "
             f"localhost:__PORT__ rio.scheduler.SchedulerService/SubmitBuild",
@@ -475,12 +505,42 @@ let
             idx = out.find("{", idx)
         return objs
 
+    # ── Tenant + JWT for grpcurl-direct + ssh-ng ──────────────────────
+    # require_tenant() (r[sched.tenant.authz]) rejects tokenless
+    # SchedulerService calls when jwtEnabled. Two callers reach the
+    # scheduler from this prelude:
+    #   - ssh-ng (build()): gateway parses the SSH key comment as
+    #     tenant_name, resolves → UUID, mints x-rio-tenant-token. Empty
+    #     comment → no JWT → Unauthenticated. So sshKeySetupFor below
+    #     gives the key a non-empty comment naming THIS tenant.
+    #   - grpcurl-direct (submit_build_grpc/sched_grpc): we mint the
+    #     token here with the same lib/jwt-keys.nix seed the chart
+    #     loads. Same tenant UUID so cancel-cgroup-kill's CancelBuild
+    #     authorizes against the SubmitBuild it follows.
+    # When jwtEnabled=false (prod-parity fixture), the scheduler
+    # interceptor is inert (header ignored) and require_tenant returns
+    # Ok(None) → tenant_name body fallback resolves the same row.
+    #
+    # gc_retention_hours=0: gc-sweep + refs-end-to-end backdate narinfo
+    # rows past grace and assert exact pathsCollected counts. The
+    # default 168h retention would make seed-f (path_tenants) protect
+    # those paths (first_referenced_at is recent) → pathsCollected
+    # would be 0. With 0h, `first_referenced_at > now()` is always
+    # false → seed-f yields nothing for this tenant → GC assertions
+    # see the same counts they did pre-tenant-authz.
+    tenant_id = psql_k8s(k3s_server,
+        "INSERT INTO tenants (tenant_name, gc_retention_hours) "
+        "VALUES ('vm-lifecycle', 0) RETURNING tenant_id"
+    )
+    tenant_jwt = k3s_server.succeed(f"${signJwt} {tenant_id}").strip()
+    print(f"lifecycle: tenant vm-lifecycle={tenant_id}")
+
     # ── SSH + seed ────────────────────────────────────────────────────
-    # fixture.sshKeySetup (NOT common.sshKeySetup): patches the
+    # fixture.sshKeySetupFor (NOT common.sshKeySetup): patches the
     # rio-gateway-ssh Secret + rollout-restarts the gateway Deployment.
     # The common.nix version writes /var/lib/rio/gateway/authorized_keys
     # on a systemd host — wrong for a pod.
-    ${fixture.sshKeySetup}
+    ${fixture.sshKeySetupFor "vm-lifecycle"}
     ${common.seedBusybox "k3s-server"}
 
     # ── Build helper ──────────────────────────────────────────────────
