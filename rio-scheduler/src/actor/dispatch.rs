@@ -127,6 +127,10 @@ impl DagActor {
         // standby keeps the flag so the first post-recovery Tick
         // dispatches.
         self.dispatch_dirty = false;
+        #[cfg(test)]
+        self.test_counters
+            .dispatch_ready_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         // dispatch_ready is on the hot path (every heartbeat) so the
@@ -580,18 +584,26 @@ impl DagActor {
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let mut checked = HashSet::with_capacity(candidates.len());
+        // I-139: collect-then-batch. The locally-present branch awaited
+        // `complete_ready_from_store` per item (≥3 sequential PG RTTs
+        // each); on warm-restart of a large closure ~all 2048 candidates
+        // hit it → 12-30s actor stall → heartbeats missed → live workers
+        // reaped. The Substituting branch already batched.
+        let mut locally_present = Vec::new();
         let mut to_spawn = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
             if paths.iter().all(|p| !missing.contains(p)) {
-                self.complete_ready_from_store(&drv_hash).await;
-            } else if paths
-                .iter()
-                .all(|p| !missing.contains(p) || substitutable.contains(p))
+                locally_present.push(drv_hash);
+            } else if !self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried)
+                && paths
+                    .iter()
+                    .all(|p| !missing.contains(p) || substitutable.contains(p))
             {
                 to_spawn.push((drv_hash, paths));
             }
         }
+        self.complete_ready_from_store_batch(&locally_present).await;
         self.spawn_substitute_fetches(to_spawn, probe).await;
         checked
     }
@@ -816,6 +828,17 @@ impl DagActor {
                     self.events.emit(build_id, event.clone());
                 }
             }
+            // build_summary counts Substituting as running — emit a
+            // progress snapshot so the queued/running flip is visible
+            // (matches `emit_assignment_started`). Dedup builds across
+            // all spawned drvs; emit once per build.
+            let interested_builds: HashSet<Uuid> = spawned
+                .iter()
+                .flat_map(|s| s.interested.iter().copied())
+                .collect();
+            for build_id in interested_builds {
+                self.emit_progress(build_id);
+            }
         }
     }
 
@@ -827,6 +850,19 @@ impl DagActor {
     /// inputDrvs aren't yet Completed in the DAG. `ok=false` → revert
     /// to `Ready`/`Queued` for normal scheduling.
     pub(super) async fn handle_substitute_complete(&mut self, drv_hash: &DrvHash, ok: bool) {
+        // r[impl sched.substitute.leader-gate]
+        // `on_lose` only flips atomics; the detached `substitute-fetch`
+        // task survives lease loss and posts here on the standby. The
+        // ok=true branch writes PG (`persist_status(Completed)` /
+        // `complete_ready_from_store`) → split-brain on
+        // `derivations.status`. Same gate as `dispatch_ready` — the new
+        // leader's recovery owns this drv (resets Substituting via the
+        // dep-walk).
+        if !self.leader.is_leader() {
+            debug!(%drv_hash, ok,
+                   "SubstituteComplete on standby (lease lost mid-fetch); dropping");
+            return;
+        }
         let Some(state) = self.dag.node(drv_hash) else {
             return;
         };
@@ -855,6 +891,11 @@ impl DagActor {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
+        // One-shot fall-through: FMP said substitutable, QPI said no.
+        // Next dispatch pass skips substitution and routes to a worker
+        // — without this the partition re-includes it every Tick (~1/s
+        // livelock; never reaches `find_executor`).
+        state.substitute_tried = true;
         if let Err(e) = state.transition(to) {
             warn!(%drv_hash, %e, "SubstituteComplete fail: revert rejected");
             return;
@@ -863,6 +904,12 @@ impl DagActor {
         if to == DerivationStatus::Ready {
             self.push_ready(drv_hash.clone());
             self.dispatch_dirty = true;
+        }
+        // build_summary counts Substituting as running; revert flips
+        // running→queued. Mirror `rollback_assignment` /
+        // `emit_assignment_started` so the dashboard sees the demote.
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.emit_progress(build_id);
         }
     }
 
@@ -881,7 +928,7 @@ impl DagActor {
     /// (an earlier dispatch on another scheduler/build uploaded it).
     async fn ready_check_or_spawn(&mut self, drv_hash: &DrvHash) -> bool {
         let probe_gen = self.probe_generation;
-        let (paths, mut store) = {
+        let (paths, substitute_tried, mut store) = {
             let Some(state) = self.dag.node_mut(drv_hash) else {
                 return false;
             };
@@ -901,10 +948,15 @@ impl DagActor {
                 return false;
             }
             state.probed_generation = probe_gen;
+            let substitute_tried = state.substitute_tried;
             let Some(store) = &self.store_client else {
                 return false;
             };
-            (state.expected_output_paths.clone(), store.clone())
+            (
+                state.expected_output_paths.clone(),
+                substitute_tried,
+                store.clone(),
+            )
         };
         // r[impl sched.dispatch.fod-substitute] — same probe-tenant
         // wiring as batch_probe_cached_ready.
@@ -925,7 +977,7 @@ impl DagActor {
                 // r[impl sched.substitute.detached] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-                if resp.missing_paths.iter().all(|p| sub.contains(p)) {
+                if !substitute_tried && resp.missing_paths.iter().all(|p| sub.contains(p)) {
                     self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], probe)
                         .await;
                     return true;
@@ -957,40 +1009,105 @@ impl DagActor {
     /// metric, no CA realisation insert (input-addressed:
     /// `expected_output_paths` IS the realised path).
     async fn complete_ready_from_store(&mut self, drv_hash: &DrvHash) {
-        let (drv_path, output_paths, interested) = {
+        self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
+            .await;
+    }
+
+    /// Batched [`complete_ready_from_store`](Self::complete_ready_from_store):
+    /// transition + `output_paths` set in-mem first (no await), then one
+    /// `persist_status_batch(Completed)`, one `upsert_path_tenants_for_
+    /// batch`, one batched newly-ready promote, then per-BUILD (not
+    /// per-drv) summary/counts/completion-check. I-139: the per-item
+    /// variant in `batch_probe_cached_ready`'s locally-present branch
+    /// was 3 sequential PG awaits × ≤2048 candidates → 12-30s actor
+    /// stall on warm-restart of a large closure.
+    async fn complete_ready_from_store_batch(&mut self, hashes: &[DrvHash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        struct Done {
+            hash: DrvHash,
+            drv_path: String,
+            output_paths: Vec<String>,
+            interested: HashSet<Uuid>,
+        }
+        let mut ok: Vec<Done> = Vec::with_capacity(hashes.len());
+        for drv_hash in hashes {
             let Some(state) = self.dag.node_mut(drv_hash) else {
-                return;
+                continue;
             };
             if let Err(e) = state.transition(DerivationStatus::Completed) {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "store-hit Ready→Completed rejected; dispatching instead");
-                return;
+                continue;
             }
             state.output_paths = state.expected_output_paths.clone();
-            (
-                state.drv_path().to_string(),
-                state.output_paths.clone(),
-                state.interested_builds.clone(),
-            )
-        };
-
-        info!(drv_hash = %drv_hash, "output already in store; skipping dispatch");
-        metrics::counter!("rio_scheduler_cache_hits_total", "source" => "dispatch").increment(1);
-        self.persist_status(drv_hash, DerivationStatus::Completed, None)
-            .await;
-        self.upsert_path_tenants_for(drv_hash).await;
-        self.promote_newly_ready(drv_hash).await;
-
-        let event = rio_proto::types::build_event::Event::Derivation(
-            rio_proto::types::DerivationEvent::cached(drv_path, output_paths),
+            ok.push(Done {
+                hash: drv_hash.clone(),
+                drv_path: state.drv_path().to_string(),
+                output_paths: state.output_paths.clone(),
+                interested: state.interested_builds.clone(),
+            });
+        }
+        if ok.is_empty() {
+            return;
+        }
+        info!(
+            count = ok.len(),
+            "outputs already in store; skipping dispatch"
         );
-        for build_id in interested {
-            self.events.emit(build_id, event.clone());
-            // I-103: dispatch-time short-circuit is "completed without
-            // assignment" → counts as cached (matches the original
-            // LIST_BUILDS_SELECT NOT EXISTS heuristic).
+        metrics::counter!("rio_scheduler_cache_hits_total", "source" => "dispatch")
+            .increment(ok.len() as u64);
+
+        let ok_hashes: Vec<DrvHash> = ok.iter().map(|d| d.hash.clone()).collect();
+        let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
+        self.persist_status_batch(&ok_refs, DerivationStatus::Completed)
+            .await;
+        self.upsert_path_tenants_for_batch(&ok_hashes).await;
+
+        // Batched promote: dedup find_newly_ready across all completed
+        // hashes, transition + push_ready in-mem, then one
+        // persist_status_batch(Ready). Same shape as the
+        // ca_cutoff_cascade batched-promote.
+        let mut newly_ready: Vec<DrvHash> = Vec::new();
+        let mut seen_ready: HashSet<DrvHash> = HashSet::new();
+        for h in &ok_hashes {
+            for ready_hash in self.dag.find_newly_ready(h) {
+                if !seen_ready.insert(ready_hash.clone()) {
+                    continue;
+                }
+                if let Some(s) = self.dag.node_mut(&ready_hash)
+                    && s.transition(DerivationStatus::Ready).is_ok()
+                {
+                    newly_ready.push(ready_hash.clone());
+                    self.push_ready(ready_hash);
+                }
+            }
+        }
+        let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
+        self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
+            .await;
+
+        // Per-build (not per-drv): emit one cached event per (drv,
+        // interested-build), then a single summary scan + counts +
+        // completion-check per distinct build. I-103: dispatch-time
+        // short-circuit counts as cached.
+        let mut cached_per_build: HashMap<Uuid, u32> = HashMap::new();
+        for d in &ok {
+            let event = rio_proto::types::build_event::Event::Derivation(
+                rio_proto::types::DerivationEvent::cached(
+                    d.drv_path.clone(),
+                    d.output_paths.clone(),
+                ),
+            );
+            for &build_id in &d.interested {
+                self.events.emit(build_id, event.clone());
+                *cached_per_build.entry(build_id).or_default() += 1;
+            }
+        }
+        for (build_id, n) in cached_per_build {
             if let Some(b) = self.builds.get_mut(&build_id) {
-                b.cached_count += 1;
+                b.cached_count += n;
             }
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
@@ -1316,10 +1433,18 @@ impl DagActor {
                 .increment(1);
         }
         // PG cleanup (inverse of record_assignment):
+        //   - persist_status(Ready): record_assignment wrote
+        //     status=Assigned + assigned_executor; without this a
+        //     scheduler crash in the (potentially long) deferred window
+        //     reloads `Assigned` and `reset_orphan_to_ready` charges a
+        //     spurious retry/poison for an assignment that never
+        //     reached the worker.
         //   - unpin: pin_live_inputs wrote scheduler_live_pins rows;
         //     leak until terminal cleanup if not undone.
         //   - delete_latest_assignment: insert_assignment wrote a
         //     'pending' row; misleading on recovery.
+        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            .await;
         self.unpin_best_effort(drv_hash).await;
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id

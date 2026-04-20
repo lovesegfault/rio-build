@@ -557,6 +557,14 @@ pub struct DerivationState {
     /// inline `dispatch_ready` calls instead of re-probing the head.
     /// `probe_generation` advances once per `handle_tick` (1/s).
     pub probed_generation: u64,
+    /// One-shot suppression for the detached-substitute lane: set on
+    /// `SubstituteComplete{ok=false}` so subsequent dispatch passes
+    /// skip substitution and route to a worker. Without this, a
+    /// `FindMissingPaths` that says "substitutable" while
+    /// `QueryPathInfo` says "no" loops at ~1/s and the drv never
+    /// reaches `find_executor` (FMP HEAD probe vs. QPI GET drift).
+    /// In-mem only — recovery resets `Substituting` to dep-walk anyway.
+    pub substitute_tried: bool,
 }
 
 impl DerivationState {
@@ -612,6 +620,7 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
+            substitute_tried: false,
         })
     }
 
@@ -708,6 +717,7 @@ impl DerivationState {
             running_since: (status == DerivationStatus::Running).then_some(now),
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
+            substitute_tried: false,
         })
     }
 
@@ -770,6 +780,7 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
+            substitute_tried: false,
         })
     }
 

@@ -87,6 +87,9 @@ impl DagActor {
                     .seed_hw(crate::sla::hw::HwTable::from_map(factors));
                 let _ = reply.send(());
             }
+            DebugCmd::Counters { reply } => {
+                let _ = reply.send(self.test_counters.snapshot());
+            }
             DebugCmd::SeedSchedHint {
                 drv_hash,
                 est_memory_bytes,
@@ -134,6 +137,7 @@ impl DagActor {
             retry: s.retry.clone(),
             ca: s.ca.clone(),
             sched: s.sched.clone(),
+            substitute_tried: s.substitute_tried,
         })
     }
 

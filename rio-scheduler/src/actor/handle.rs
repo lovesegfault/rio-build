@@ -57,6 +57,7 @@ pub struct DebugDerivationInfo {
     pub retry: crate::state::RetryState,
     pub ca: crate::state::CaState,
     pub sched: crate::state::SchedHint,
+    pub substitute_tried: bool,
 }
 
 /// Handle for sending commands to the actor.
@@ -339,6 +340,10 @@ impl ActorHandle {
     /// `is_open()` after. For breaker-gate tests that need the breaker
     /// open WITHOUT driving N failing RPCs through the full
     /// merge/completion path.
+    pub async fn debug_counters(&self) -> Result<super::TestCountersSnapshot, ActorError> {
+        self.debug(|reply| DebugCmd::Counters { reply }).await
+    }
+
     pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
         self.debug(|reply| DebugCmd::TripBreaker { n, reply }).await
     }

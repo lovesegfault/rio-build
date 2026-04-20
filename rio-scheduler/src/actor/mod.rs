@@ -399,6 +399,50 @@ pub struct DagActor {
     /// simulating a lease flap mid-recovery without mocking PG.
     #[cfg(test)]
     recovery_toctou_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    /// Test-only structural counters. Asserting on these (rather than
+    /// wall-clock or absence-of-side-effect) makes the I-163 / I-139
+    /// regression tests fail under their target mutation.
+    #[cfg(test)]
+    pub(crate) test_counters: TestCounters,
+}
+
+/// Per-actor `#[cfg(test)]` call counters. Incremented at the top of
+/// the named method; read via [`DebugCmd::Counters`]. Atomics so
+/// `&self` callsites (e.g. `persist_status`) can increment without
+/// changing the borrow signature.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestCounters {
+    /// Incremented on every `dispatch_ready` entry (after the
+    /// leader/recovery gate). Asserts on the I-163 dispatch-decoupled
+    /// rule: a steady-state heartbeat must NOT bump this.
+    pub dispatch_ready_calls: std::sync::atomic::AtomicU64,
+    /// Incremented on every singular `persist_status` call (NOT the
+    /// batch variant). Asserts on the I-139 rule: a batched completion
+    /// path must NOT touch the per-row helper.
+    pub persist_status_calls: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl TestCounters {
+    pub(crate) fn snapshot(&self) -> TestCountersSnapshot {
+        use std::sync::atomic::Ordering::SeqCst;
+        TestCountersSnapshot {
+            dispatch_ready_calls: self.dispatch_ready_calls.load(SeqCst),
+            persist_status_calls: self.persist_status_calls.load(SeqCst),
+        }
+    }
+}
+
+/// Plain-data snapshot of [`TestCounters`] for the
+/// [`DebugCmd::Counters`] reply. `pub` (not `pub(crate)`) only because
+/// `DebugCmd` is `pub` and the private-interfaces lint denies the
+/// mismatch; `cfg(test)` keeps it out of real builds either way.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TestCountersSnapshot {
+    pub dispatch_ready_calls: u64,
+    pub persist_status_calls: u64,
 }
 
 impl DagActor {
@@ -454,6 +498,8 @@ impl DagActor {
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
+            #[cfg(test)]
+            test_counters: TestCounters::default(),
         }
     }
 

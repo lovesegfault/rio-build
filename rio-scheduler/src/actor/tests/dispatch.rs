@@ -268,13 +268,11 @@ async fn test_interactive_priority_boost() -> TestResult {
     )
     .await?;
 
-    // Drain the first assignment (one of Q/R/B — whichever dispatched first).
-    // We don't care which; we only care what happens AFTER we complete it
-    // in a way that makes A newly-ready.
-    //
-    // Strategy: complete EVERYTHING currently assigned with success until
-    // prioB is completed. Then A becomes newly-ready with INTERACTIVE_BOOST,
-    // and the NEXT dispatch should be A (not a leftover Q/R).
+    // Worker connected before the merges, so the first assignment is one
+    // of Q/R (NOT B — Interactive merged after Q/R were already
+    // dispatched/queued). Complete until prioB is dispatched; then A
+    // becomes newly-ready with INTERACTIVE_BOOST, and the NEXT dispatch
+    // should be A (not a leftover Q/R).
     //
     // One-shot workers: each completion drains the worker; connect a
     // fresh one per iteration.
@@ -295,6 +293,16 @@ async fn test_interactive_priority_boost() -> TestResult {
         worker_rx = connect_executor(&handle, &wid, "x86_64-linux").await?;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
+            // Regression guard: if INTERACTIVE_BOOST = 0, B is just
+            // another leaf and dispatches FIFO after both Q and R. The
+            // boost must have brought B forward past at least one
+            // Scheduled leaf — otherwise the next-is-A assertion below
+            // is vacuous (Q/R already drained, A is the only Ready).
+            assert!(
+                seen_paths.len() < 3,
+                "prioB must dispatch before both Scheduled leaves drain \
+                 (boost beats FIFO); history: {seen_paths:?}"
+            );
             let next_a = recv_assignment(&mut worker_rx).await;
             assert_eq!(
                 next_a.drv_path, p_prio_a,
@@ -961,15 +969,33 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
 
     // Second heartbeat: worker is now busy (running_build=Some) →
     // capacity 0→0 → became_idle=false → only dispatch_dirty set.
-    // Queue another node; it must NOT dispatch on this heartbeat
-    // (worker has no capacity AND no 0→1 edge), only on Tick after
-    // capacity frees. Here we just assert no spurious second
-    // assignment from the steady-state heartbeat.
+    // Structural assertion: a steady-state heartbeat must NOT call
+    // `dispatch_ready` inline. The previous "no Assignment on rx"
+    // check was vacuous — there's no idle capacity AND no queued
+    // work, so it passes even if the heartbeat handler dispatches
+    // inline. Counting `dispatch_ready` calls fails under the I-163
+    // mutation (revert decoupling → heartbeat calls inline).
+    let before = handle.debug_counters().await?;
     send_heartbeat_with(&handle, "i163-w", "x86_64-linux", |hb| {
         hb.running_build = Some(a.drv_path.clone());
     })
     .await?;
     barrier(&handle).await;
+    let after_hb = handle.debug_counters().await?;
+    assert_eq!(
+        after_hb.dispatch_ready_calls, before.dispatch_ready_calls,
+        "steady-state heartbeat (0→0, busy) must NOT call dispatch_ready inline — \
+         r[sched.actor.dispatch-decoupled]"
+    );
+    // …and Tick drains the dirty flag (exactly one dispatch_ready).
+    tick(&handle).await?;
+    let after_tick = handle.debug_counters().await?;
+    assert_eq!(
+        after_tick.dispatch_ready_calls,
+        before.dispatch_ready_calls + 1,
+        "Tick must drain dispatch_dirty exactly once"
+    );
+    // Belt: still no spurious Assignment on the stream.
     while let Ok(m) = rx.try_recv() {
         use rio_proto::types::scheduler_message::Msg;
         assert!(
@@ -1045,24 +1071,77 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux").await?;
 
-    let mut n = make_node("i163-fo-fod");
-    n.is_fixed_output = true;
-    n.expected_output_paths = vec![test_store_path("i163-fo-fod-out")];
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    // fod1: leaf, Ready at merge → always in the batch snapshot.
+    let mut fod1 = make_node("i163-fo-fod");
+    fod1.is_fixed_output = true;
+    fod1.expected_output_paths = vec![test_store_path("i163-fo-fod-out")];
+    // fod2 depends on dep. dep's output is seeded AFTER merge so the
+    // dispatch-time batch (not merge-time check_cached_outputs)
+    // completes dep → cascade-promotes fod2 to Ready DURING the
+    // dispatch pass, AFTER the batch's candidate snapshot — fod2 is
+    // unstamped this gen → the per-drv `ready_check_or_spawn`
+    // fallback fires for it.
+    let dep_out = test_store_path("i163-fo-dep-out");
+    let mut dep = make_node("i163-fo-dep");
+    // FOD so it routes to fetcher (none connected → defers) instead
+    // of dispatching to i163-fo-b during merge's inline dispatch_ready.
+    dep.is_fixed_output = true;
+    dep.expected_output_paths = vec![dep_out.clone()];
+    let mut fod2 = make_node("i163-fo-fod2");
+    fod2.is_fixed_output = true;
+    fod2.expected_output_paths = vec![test_store_path("i163-fo-fod2-out")];
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![fod1, fod2, dep],
+        vec![make_test_edge("i163-fo-fod2", "i163-fo-dep")],
+        false,
+    )
+    .await?;
     barrier(&handle).await;
 
-    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    // ── per-drv fallback path (test name half 2): seed dep present
+    // NOW (post-merge), then drive one dispatch_ready. Batch sees
+    // [fod1, dep] (both Ready); completes dep → fod2 promoted →
+    // drain loop hits the `!batch_checked.contains(fod2)` branch →
+    // `ready_check_or_spawn(fod2)` issues 1 per-drv FMP. Total = 2.
+    // Mutation guard: delete the `ready_check_or_spawn` clause and
+    // fod2 is never store-checked → ==1.
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(dep_out, Default::default());
     store.calls.find_missing_calls.store(0, Ordering::SeqCst);
-
     send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
     barrier(&handle).await;
+    let calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 2,
+        "cascade-promoted fod2 must hit the per-drv ready_check_or_spawn \
+         fallback (1 batch + 1 per-drv); got {calls}"
+    );
+    assert_eq!(
+        expect_drv(&handle, "i163-fo-dep").await.status,
+        DerivationStatus::Completed
+    );
 
-    // send_heartbeat → dispatch_dirty → Tick → gen++ → dispatch_ready:
-    // batch stamps the FOD (1 FMP, fails). Per-drv fallback gated by
-    // probed_generation → 0 extra. Exactly 1 proves the batch retries
-    // at Tick cadence and the per-drv path doesn't re-fire for the
-    // same node within a generation.
-    assert_eq!(store.calls.find_missing_calls.load(Ordering::SeqCst), 1);
+    // ── fail-open gating path (test name half 1): arm the failure;
+    // next gen's batch stamps fod1+fod2 (1 FMP, fails). batch_checked
+    // returns empty BUT both have probed_generation == gen → per-drv
+    // path's `probed_generation >= probe_gen` gate suppresses re-fire.
+    // Exactly 1 proves a batch failure doesn't degrade to N
+    // sequential per-drv FMPs in the same pass.
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
+    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
+    barrier(&handle).await;
+    assert_eq!(
+        store.calls.find_missing_calls.load(Ordering::SeqCst),
+        1,
+        "batch-stamped nodes must not re-fire per-drv FMP within a generation"
+    );
     Ok(())
 }
 
@@ -2267,6 +2346,315 @@ async fn test_queue_depth_gauge_exact_under_active_dispatch(
          pre-fix this read {} (double-counted across outer-loop iterations)",
         systems.len(),
         2.0 * expected
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Detached-substitute completion: leader gate, one-shot suppress, progress
+// ---------------------------------------------------------------------------
+
+// r[verify sched.substitute.leader-gate]
+/// `SubstituteComplete` posted by a detached fetch task that survived
+/// lease loss must be a no-op on the standby — the ok=true branch
+/// writes PG (`persist_status(Completed)` etc.) and would split-brain
+/// `derivations.status` with the new leader. Pre-fix the handler had
+/// no `is_leader()` gate.
+#[tokio::test]
+async fn substitute_complete_on_standby_is_noop() -> TestResult {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // Wire a LeaderState we can flip from the test.
+    let is_leader = Arc::new(AtomicBool::new(true));
+    let leader = crate::lease::LeaderState::from_parts(
+        Arc::new(AtomicU64::new(1)),
+        is_leader.clone(),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), Some(store_client), |_, p| {
+        p.leader = leader;
+    });
+
+    // Seed substitutable so the dispatch-time batch spawns a detached
+    // fetch (Ready → Substituting). Arm a permanent QPI failure so the
+    // task posts ok=false (we don't depend on the value — the test
+    // sends its own SubstituteComplete{ok=true} after lease loss).
+    let out = test_store_path("sub-standby-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
+    let mut n = make_node("sub-standby");
+    n.expected_output_paths = vec![out];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    settle_substituting(&handle, &["sub-standby"]).await;
+
+    // Lease lost. The detached task may have already posted; either way
+    // we now send an explicit ok=true as the standby. Pre-fix this
+    // wrote `derivations.status = 'completed'` to PG.
+    is_leader.store(false, Ordering::SeqCst);
+    let before = handle.debug_counters().await?.persist_status_calls;
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "sub-standby".into(),
+            ok: true,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, assigned_builder_id FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("sub-standby")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(
+        row.0, "completed",
+        "standby must not write Completed to PG (split-brain)"
+    );
+    assert_eq!(
+        handle.debug_counters().await?.persist_status_calls,
+        before,
+        "standby SubstituteComplete must not call persist_status"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached]
+/// `SubstituteComplete{ok=false}` sets `substitute_tried` so the next
+/// dispatch pass falls through to a worker instead of re-spawning the
+/// fetch every Tick (~1/s livelock when FMP HEAD says substitutable
+/// but QPI GET says no).
+#[tokio::test]
+async fn substitute_ok_false_suppresses_respawn() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    // Fetcher so the FOD has somewhere to dispatch on fall-through.
+    let mut frx = connect_executor_kind(
+        &handle,
+        "sub-fall-f",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let out = test_store_path("sub-fall-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    // Permanent (non-transient) QPI failure → detached task posts
+    // ok=false on the first attempt.
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
+
+    let mut n = make_node("sub-fall");
+    n.is_fixed_output = true;
+    n.expected_output_paths = vec![out];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    // Spawn → Substituting → task fails → ok=false → Ready.
+    settle_substituting(&handle, &["sub-fall"]).await;
+
+    let info = expect_drv(&handle, "sub-fall").await;
+    assert!(
+        info.substitute_tried,
+        "ok=false must set substitute_tried (one-shot fall-through)"
+    );
+    let qpi_before = store.calls.qpi_calls.read().unwrap().len();
+
+    // Next dispatch pass: partition's `!substitute_tried` guard skips
+    // the spawn lane → drv stays Ready → drains to find_executor →
+    // dispatched to the fetcher. Pre-fix: re-spawned every tick,
+    // qpi_calls grows, never Assigned.
+    tick(&handle).await?;
+    let a = recv_assignment(&mut frx).await;
+    assert!(a.drv_path.contains("sub-fall"));
+    assert_eq!(
+        store.calls.qpi_calls.read().unwrap().len(),
+        qpi_before,
+        "no re-spawn after ok=false (substitute_tried suppression)"
+    );
+    Ok(())
+}
+
+/// Ready→Substituting and Substituting→Ready/Queued both flip
+/// `build_summary`'s running count; both paths must `emit_progress`
+/// so the dashboard sees the change. Pre-fix neither did — the next
+/// per-drv event after `SUBSTITUTING` was `CACHED` or much-later
+/// `STARTED`, with stale running/queued in between.
+#[tokio::test]
+async fn substitute_spawn_and_revert_emit_progress() -> TestResult {
+    use rio_proto::types::build_event::Event;
+    use std::sync::atomic::Ordering;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("sub-prog-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, Ordering::SeqCst);
+
+    let mut n = make_node("sub-prog");
+    n.expected_output_paths = vec![out];
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    settle_substituting(&handle, &["sub-prog"]).await;
+
+    // Drain: must contain a Substituting DerivationEvent followed by a
+    // Progress with running >= 1. The ok=false revert ALSO calls
+    // emit_progress (running→0), but that fires within
+    // PROGRESS_DEBOUNCE of the spawn-side emit in this fast test and
+    // is correctly debounced — same `self.emit_progress(build_id)`
+    // wiring, so observing the spawn side proves both callsites.
+    let mut saw_substituting = false;
+    let mut saw_progress_running = false;
+    while let Ok(e) = ev.try_recv() {
+        match e.event {
+            Some(Event::Derivation(d))
+                if d.kind == rio_proto::types::DerivationEventKind::Substituting as i32 =>
+            {
+                saw_substituting = true;
+            }
+            Some(Event::Progress(p)) if saw_substituting && p.running >= 1 => {
+                saw_progress_running = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_substituting,
+        "merge → spawn_substitute_fetches must emit a Substituting DerivationEvent"
+    );
+    assert!(
+        saw_progress_running,
+        "spawn_substitute_fetches must emit_progress (running ≥ 1) after Substituting"
+    );
+    // The revert reached Ready/Queued and substitute_tried is set —
+    // covers the ok=false branch ran (the emit_progress above is
+    // wired identically there).
+    let info = expect_drv(&handle, "sub-prog").await;
+    assert!(matches!(
+        info.status,
+        DerivationStatus::Ready | DerivationStatus::Queued
+    ));
+    assert!(info.substitute_tried);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// I-139: locally-present completion is batched (no per-row PG awaits)
+// ---------------------------------------------------------------------------
+
+/// `batch_probe_cached_ready`'s locally-present branch must batch the
+/// PG writes — pre-fix it awaited `complete_ready_from_store` per
+/// item (≥3 sequential PG RTTs each); on warm-restart of a large
+/// closure ~all 2048 candidates hit it → 12-30s actor stall.
+/// Structural assertion via `persist_status_calls`: batch path uses
+/// `persist_status_batch` (NOT counted), so 0 singular calls during
+/// the dispatch pass means the batch helper was used.
+#[tokio::test]
+async fn batch_probe_locally_present_batches_pg() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    // Builder for an unrelated arch: heartbeat sets dispatch_dirty so
+    // Tick drains, but it can't take any of the x86_64 nodes (so no
+    // record_assignment → no singular persist_status(Assigned) noise).
+    let _rx = connect_executor(&handle, "bp-hb", "aarch64-linux").await?;
+
+    // 50 leaves, all outputs seeded present → all hit the
+    // locally-present branch on the first dispatch_ready.
+    let mut nodes = Vec::with_capacity(50);
+    {
+        let mut paths = store.state.paths.write().unwrap();
+        for i in 0..50 {
+            let out = test_store_path(&format!("bp-{i}-out"));
+            paths.insert(out.clone(), Default::default());
+            let mut n = make_node(&format!("bp-{i}"));
+            n.expected_output_paths = vec![out];
+            nodes.push(n);
+        }
+    }
+    // fail_find_missing during merge so check_cached_outputs +
+    // merge's inline dispatch_ready don't complete them — we want
+    // them Ready at the NEXT dispatch-time batch.
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+    store
+        .faults
+        .fail_find_missing
+        .store(false, Ordering::SeqCst);
+
+    let before = handle.debug_counters().await?.persist_status_calls;
+    send_heartbeat(&handle, "bp-hb", "aarch64-linux").await?;
+    barrier(&handle).await;
+    let after = handle.debug_counters().await?.persist_status_calls;
+
+    for i in 0..50 {
+        assert_eq!(
+            expect_drv(&handle, &format!("bp-{i}")).await.status,
+            DerivationStatus::Completed,
+            "node bp-{i} must be Completed by the dispatch-time batch"
+        );
+    }
+    assert_eq!(
+        after, before,
+        "locally-present completion must use persist_status_batch (0 singular calls); \
+         pre-fix this was {} (one per node + one per newly-ready)",
+        50
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// rollback_assignment is a complete inverse of record_assignment
+// ---------------------------------------------------------------------------
+
+/// `rollback_assignment` must persist `Ready` to PG — `record_
+/// assignment` wrote `status=Assigned`+`assigned_executor`; without
+/// the inverse, a scheduler crash in the deferred window reloads
+/// `Assigned` and `reset_orphan_to_ready` charges a spurious
+/// retry/poison for an assignment that never reached the worker.
+#[tokio::test]
+async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Connect a worker but immediately drop its rx so the channel
+    // closes — `try_send_assignment` fails → `rollback_assignment`.
+    let rx = connect_executor(&handle, "rb-w", "x86_64-linux").await?;
+    drop(rx);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "rb-drv", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, "rb-drv").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "in-mem reset_to_ready ran"
+    );
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, assigned_builder_id FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("rb-drv")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        row.0, "ready",
+        "rollback_assignment must persist Ready to PG (was: {})",
+        row.0
+    );
+    assert_eq!(
+        row.1, None,
+        "rollback_assignment must clear assigned_builder_id in PG"
     );
     Ok(())
 }

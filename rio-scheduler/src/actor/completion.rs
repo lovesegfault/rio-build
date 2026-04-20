@@ -65,6 +65,10 @@ impl DagActor {
         status: DerivationStatus,
         executor_id: Option<&ExecutorId>,
     ) {
+        #[cfg(test)]
+        self.test_counters
+            .persist_status_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = self
             .db
             .update_derivation_status(drv_hash, status, executor_id)

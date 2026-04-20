@@ -512,6 +512,12 @@ pub enum DebugCmd {
         factors: std::collections::HashMap<String, f64>,
         reply: oneshot::Sender<()>,
     },
+    /// Snapshot the actor's [`TestCounters`](super::TestCounters).
+    /// For structural assertions on call-count (vs. wall-clock or
+    /// absence-of-side-effect) — see I-163 / I-139 regression tests.
+    Counters {
+        reply: oneshot::Sender<super::TestCountersSnapshot>,
+    },
     /// Seed `state.sched.last_intent` and/or `resource_floor` for D4
     /// floor tests. Per-field `Option` (builder-style); any `Some`
     /// field materializes a `last_intent`.
