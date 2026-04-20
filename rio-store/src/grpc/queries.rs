@@ -304,12 +304,13 @@ impl StoreServiceImpl {
     }
 
     /// Append signatures to an existing store path.
-    // r[impl store.api.add-signatures]
+    // r[impl store.api.add-signatures+2]
     pub(super) async fn add_signatures_impl(
         &self,
         request: Request<AddSignaturesRequest>,
     ) -> Result<Response<AddSignaturesResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -321,6 +322,26 @@ impl StoreServiceImpl {
             req.signatures.len(),
             rio_common::limits::MAX_SIGNATURES,
         )?;
+
+        // r[impl store.tenant.narinfo-filter]
+        // Gate BEFORE the empty-list short-circuit so AddSignatures can't
+        // be used as an existence probe (Ok vs NotFound) for paths the
+        // sig-visibility gate hides, and BEFORE the write so a tenant
+        // can't fill another tenant's path with junk sigs and DoS its
+        // `nix store sign` via the MAX_SIGNATURES post-dedup cap. Same
+        // pattern as `query_path_info_impl`; on gate failure return
+        // NotFound (not PermissionDenied) — gate-hidden paths are
+        // indistinguishable from absent.
+        let info = metadata::query_path_info(&self.pool, &req.store_path)
+            .await
+            .map_err(|e| metadata_status("AddSignatures: query_path_info", e))?
+            .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
+        if !self.sig_visibility_gate(tenant_id, &info).await? {
+            return Err(Status::not_found(format!(
+                "path not found: {}",
+                req.store_path
+            )));
+        }
 
         // Empty sigs list: no-op. Don't hit PG for nothing. Not an error —
         // `nix store sign` with no configured keys can legitimately produce

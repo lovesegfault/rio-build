@@ -153,45 +153,44 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
+        // r[impl sec.authz.ca-path-derived+2]
+        // For is_ca tokens, validate_put_metadata skips the
+        // `store_path ∈ expected_outputs` membership check (the path is
+        // content-derived). The CA authorization gate —
+        // `verify_ca_store_path` inside `ingest_nar_stream` — needs the
+        // full NAR, so it runs AFTER stream drain. Claiming the
+        // placeholder BEFORE that gate would let an is_ca worker squat
+        // an `'uploading'` row for ANY syntactically-valid path
+        // (including other tenants' IA outputs), drip-feed chunks while
+        // `spawn_placeholder_guard` heartbeats it fresh, and force
+        // legitimate uploaders into `Aborted` until token expiry. So:
+        // IA → claim BEFORE ingest (path is HMAC-bound); CA → claim
+        // AFTER ingest (path is now content-bound). Matches
+        // PutPathBatch's verify-then-claim ordering.
+        let is_ca_caller = auth.hmac_claims.as_ref().is_some_and(|c| c.is_ca);
+
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        let claim = match self
-            .claim_placeholder(
-                &store_path_hash,
-                info.store_path.as_str(),
-                &refs_str,
-                "PutPath",
-            )
-            .await
-        {
-            Ok(PlaceholderClaim::Owned(claim)) => claim,
-            Ok(PlaceholderClaim::AlreadyComplete) => {
-                debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete");
-                drain_stream(&mut stream).await;
-                return Ok(Response::new(PutPathResponse { created: false }));
-            }
-            Ok(PlaceholderClaim::Concurrent) => {
-                drain_stream(&mut stream).await;
-                if let Ok(true) =
-                    metadata::check_manifest_complete(&self.pool, &store_path_hash).await
-                {
-                    debug!(store_path = %info.store_path, "PutPath: concurrent upload won the race");
-                    metrics::counter!("rio_store_put_path_total", "result" => "exists")
-                        .increment(1);
+        let (mut claim, mut placeholder_guard) = if is_ca_caller {
+            (None, None)
+        } else {
+            match self
+                .claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str)
+                .await
+            {
+                Ok(Some(c)) => {
+                    let g = self.spawn_placeholder_guard(store_path_hash.clone(), c);
+                    (Some(c), Some(g))
+                }
+                Ok(None) => {
+                    drain_stream(&mut stream).await;
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
-                debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
-                return Err(Status::aborted(format!(
-                    "{} for this path; retry",
-                    rio_proto::CONCURRENT_PUTPATH_MSG
-                )));
-            }
-            Err(e) => {
-                drain_stream(&mut stream).await;
-                return Err(putpath_metadata_status("PutPath: claim_placeholder", e));
+                Err(e) => {
+                    drain_stream(&mut stream).await;
+                    return Err(e);
+                }
             }
         };
-
-        let placeholder_guard = self.spawn_placeholder_guard(store_path_hash.clone(), claim);
 
         let (nar_data, _held_permits) = match self
             .ingest_nar_stream(&mut stream, &mut info, auth.hmac_claims.as_ref())
@@ -199,14 +198,82 @@ impl StoreServiceImpl {
         {
             Ok(x) => x,
             Err(e) => {
-                self.abort_upload(&store_path_hash, claim).await;
+                if let Some(c) = claim {
+                    self.abort_upload(&store_path_hash, c).await;
+                }
                 return Err(e);
             }
         };
 
+        // CA: NOW claim — verify_ca_store_path has bound store_path to
+        // server-hashed content. Stream is already drained, so no
+        // drain_stream in the non-Owned arms.
+        if claim.is_none() {
+            match self
+                .claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str)
+                .await?
+            {
+                Some(c) => {
+                    placeholder_guard =
+                        Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
+                    claim = Some(c);
+                }
+                None => return Ok(Response::new(PutPathResponse { created: false })),
+            }
+        }
+        let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
+
         self.finalize_single(info, claim, nar_data, auth.tenant_id)
             .await?;
-        placeholder_guard.defuse();
+        if let Some(g) = placeholder_guard {
+            g.defuse();
+        }
         Ok(Response::new(PutPathResponse { created: true }))
+    }
+
+    /// `claim_placeholder` + the AlreadyComplete/Concurrent fast-path
+    /// arms, factored so the IA (pre-ingest) and CA (post-ingest) call
+    /// sites share one match. Returns:
+    ///   - `Ok(Some(claim))` → we own the placeholder; proceed.
+    ///   - `Ok(None)` → path is already complete (or a concurrent
+    ///     uploader just won) → caller returns `created: false`.
+    ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder held by
+    ///     someone else; caller propagates so client retries.
+    ///
+    /// Does NOT drain the stream — IA caller drains on `Ok(None)`/`Err`
+    /// (stream not yet read); CA caller doesn't (stream already drained
+    /// by `ingest_nar_stream`).
+    async fn claim_or_return(
+        &self,
+        store_path_hash: &[u8],
+        store_path: &str,
+        refs: &[String],
+    ) -> Result<Option<uuid::Uuid>, Status> {
+        match self
+            .claim_placeholder(store_path_hash, store_path, refs, "PutPath")
+            .await
+        {
+            Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
+            Ok(PlaceholderClaim::AlreadyComplete) => {
+                debug!(%store_path, "PutPath: path already complete");
+                Ok(None)
+            }
+            Ok(PlaceholderClaim::Concurrent) => {
+                if let Ok(true) =
+                    metadata::check_manifest_complete(&self.pool, store_path_hash).await
+                {
+                    debug!(%store_path, "PutPath: concurrent upload won the race");
+                    metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                        .increment(1);
+                    return Ok(None);
+                }
+                debug!(%store_path, "PutPath: concurrent upload in progress, aborting");
+                Err(Status::aborted(format!(
+                    "{} for this path; retry",
+                    rio_proto::CONCURRENT_PUTPATH_MSG
+                )))
+            }
+            Err(e) => Err(putpath_metadata_status("PutPath: claim_placeholder", e)),
+        }
     }
 }

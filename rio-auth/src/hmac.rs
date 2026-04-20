@@ -74,10 +74,11 @@ pub struct AssignmentClaims {
     /// store skips the `store_path ∈ expected_outputs` check on
     /// PutPath and instead RECOMPUTES the CA store path server-side
     /// from the verified NAR hash (`r[sec.authz.ca-path-derived]`),
-    /// rejecting on mismatch. A worker holding an `is_ca=true` token
-    /// therefore cannot upload to a path that doesn't match the
-    /// content it actually sent — same blast radius as IA (one
-    /// content-determined path per NAR).
+    /// rejecting on mismatch. The `'uploading'` placeholder is NOT
+    /// claimed until that recompute passes, so a worker holding an
+    /// `is_ca=true` token cannot upload to (or squat the placeholder
+    /// for) a path that doesn't match the content it actually sent —
+    /// same blast radius as IA (one content-determined path per NAR).
     pub is_ca: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
     /// sets it to ~2× build_timeout; a worker legitimately uploading

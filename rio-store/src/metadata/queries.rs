@@ -423,7 +423,7 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
     // novel sigs, so an untrusted caller could bloat the row
     // indefinitely (`r[store.api.add-signatures]` says "bounded by
     // MAX_SIGNATURES" — a hard bound, not an alert threshold).
-    // r[impl store.api.add-signatures]
+    // r[impl store.api.add-signatures+2]
     let mut tx = pool.begin().await?;
     let row = sqlx::query!(
         r#"
@@ -818,7 +818,7 @@ mod tests {
             "expected ResourceExhausted, got {err:?}"
         );
 
-        // r[verify store.api.add-signatures]
+        // r[verify store.api.add-signatures+2]
         // Reject MUST roll back: stored cardinality stays at MAX, not
         // MAX+1. Previously the UPDATE auto-committed before the cap
         // check (this assertion was the fails-before/passes-after).

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tonic::transport::{Channel, Server};
 
 use rio_proto::types::{
-    AddUpstreamRequest, BatchGetManifestRequest, BatchQueryPathInfoRequest,
+    AddSignaturesRequest, AddUpstreamRequest, BatchGetManifestRequest, BatchQueryPathInfoRequest,
     FindMissingPathsRequest, GetPathRequest, QueryPathFromHashPartRequest, QueryPathInfoRequest,
 };
 use rio_proto::{
@@ -287,6 +287,44 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
         "BatchGetManifest: {err:?}"
     );
 
+    // r[verify store.api.add-signatures+2]
+    // r[verify store.tenant.narinfo-filter]
+    // AddSignatures: same gate. Gate-hidden → NotFound (NOT
+    // PermissionDenied — indistinguishable from absent), and the write
+    // does NOT happen. Pre-fix: C's call succeeded and appended,
+    // letting any tenant fill another's path with junk sigs (DoS via
+    // MAX_SIGNATURES post-dedup cap). Also: empty-list call must NOT
+    // short-circuit Ok before the gate (existence-probe leak).
+    let err = client
+        .add_signatures(AddSignaturesRequest {
+            store_path: path.clone(),
+            signatures: vec!["junk-C:aaaa".into()],
+        })
+        .await
+        .expect_err("AddSignatures: C doesn't trust K1 → NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound, "AddSignatures: {err:?}");
+    let err = client
+        .add_signatures(AddSignaturesRequest {
+            store_path: path.clone(),
+            signatures: vec![],
+        })
+        .await
+        .expect_err("AddSignatures(empty): C → NotFound (no existence-probe via no-op)");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "AddSignatures(empty): {err:?}"
+    );
+    let sigs: Vec<String> =
+        sqlx::query_scalar("SELECT signatures FROM narinfo WHERE store_path_hash = $1")
+            .bind(&path_hash[..])
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !sigs.iter().any(|s| s.starts_with("junk-C:")),
+        "gate-failed AddSignatures must not write; got {sigs:?}"
+    );
+
     // ── B trusts K1 → present via FindMissingPaths + HashPart ──────────
     // Positive control for the new gates (over-broad gate would block B).
     switch.set(Some(tid_b));
@@ -305,6 +343,23 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
         .await?
         .into_inner();
     assert_eq!(resp.store_path, path, "HashPart: B trusts K1 → visible");
+    // AddSignatures positive control: B trusts K1 → gate passes →
+    // appended. Proves the gate isn't over-broad (rejecting everyone).
+    client
+        .add_signatures(AddSignaturesRequest {
+            store_path: path.clone(),
+            signatures: vec!["new-B:bbbb".into()],
+        })
+        .await?;
+    let sigs: Vec<String> =
+        sqlx::query_scalar("SELECT signatures FROM narinfo WHERE store_path_hash = $1")
+            .bind(&path_hash[..])
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        sigs.iter().any(|s| s == "new-B:bbbb"),
+        "B's AddSignatures must append; got {sigs:?}"
+    );
 
     // ── Anonymous → batch RPCs pass through (builder, no token) ────────
     switch.set(None);

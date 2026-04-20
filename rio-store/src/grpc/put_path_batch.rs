@@ -142,7 +142,7 @@ impl StoreServiceImpl {
             if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
                 bail!(e);
             }
-            // r[impl sec.authz.ca-path-derived]
+            // r[impl sec.authz.ca-path-derived+2]
             if let Err(e) = verify_ca_store_path(info, auth.hmac_claims.as_ref(), &ctx) {
                 bail!(e);
             }
@@ -221,13 +221,17 @@ impl StoreServiceImpl {
         // need to fill it in order regardless of stream arrival order.
         let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
         let mut held_permits = Vec::new();
-        // Cumulative NAR bytes across ALL outputs. Per-output is capped
-        // at MAX_NAR_SIZE inside `accumulate_chunk`; without a
-        // cumulative cap, MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB
-        // could be demanded against a 32 GiB budget — `acquire_many`
-        // would block on permits THIS task holds (self-deadlock).
+        // Cumulative charged permits across ALL outputs (NOT raw bytes
+        // — `accumulate_chunk` floors each chunk at MIN_NAR_CHUNK_CHARGE,
+        // so tracking raw bytes undercounts up to 256× and a tiny-chunk
+        // stream exhausts the budget while `total_bytes` is still tiny).
+        // Per-output raw bytes are capped at MAX_NAR_SIZE inside
+        // `accumulate_chunk`; without a cumulative charged-permit cap,
+        // MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB could be demanded
+        // against a 32 GiB budget — `acquire_many` would block on permits
+        // THIS task holds (self-deadlock).
         // r[impl store.put.nar-bytes-budget+3]
-        let mut total_bytes: u64 = 0;
+        let mut total_charged: u64 = 0;
 
         while let Some(msg) = stream.message().await? {
             let idx = msg.output_index;
@@ -271,15 +275,16 @@ impl StoreServiceImpl {
                             "{ctx}: nar_chunk after trailer"
                         )));
                     }
-                    total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-                    if total_bytes >= MAX_NAR_SIZE {
+                    total_charged = total_charged
+                        .saturating_add(rio_common::limits::nar_chunk_charge(chunk.len()));
+                    if total_charged >= MAX_NAR_SIZE {
                         // FailedPrecondition (not InvalidArgument) so
                         // the builder's batch fallback at
                         // upload/mod.rs falls through to independent
                         // PutPath — each output then gets its own
                         // MAX_NAR_SIZE without a cumulative cap.
                         return Err(Status::failed_precondition(format!(
-                            "PutPathBatch: cumulative NAR bytes {total_bytes} exceed \
+                            "PutPathBatch: cumulative charged permits {total_charged} exceed \
                              MAX_NAR_SIZE {MAX_NAR_SIZE}; fall back to per-output PutPath"
                         )));
                     }

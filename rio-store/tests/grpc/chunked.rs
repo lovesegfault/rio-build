@@ -927,6 +927,15 @@ async fn send_batch_output(
 /// default budget) can never self-deadlock. Verified here with a 2 MiB
 /// budget and 3 × 600 KiB outputs (1.8 MiB cumulative — under both
 /// MAX_NAR_SIZE and the budget, so no rejection AND no deadlock).
+///
+/// bug_128: the cap previously counted RAW bytes while the semaphore
+/// charged `max(len, MIN_NAR_CHUNK_CHARGE)`; a 1-byte stream undercounted
+/// 256× and could exhaust the budget before the cap fired. The cap now
+/// tracks `nar_chunk_charge(len)` — same unit. End-to-end deadlock
+/// reproduction needs ~16M tiny chunks (MAX_NAR_SIZE / 256), so the unit
+/// alignment is verified at `rio_common::limits::nar_chunk_charge` and by
+/// the `total_charged` formula in `drain_batch_stream`; this test
+/// continues to cover the >256-byte chunk case.
 // r[verify store.put.nar-bytes-budget+3]
 #[tokio::test]
 async fn batch_no_self_deadlock_under_budget() -> TestResult {

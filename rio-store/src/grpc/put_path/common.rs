@@ -31,7 +31,7 @@ use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::grpc::StatusExt;
-use rio_common::limits::{MAX_NAR_SIZE, MIN_NAR_CHUNK_CHARGE};
+use rio_common::limits::{MAX_NAR_SIZE, nar_chunk_charge};
 
 use crate::cas;
 use crate::grpc::{StoreServiceImpl, putpath_metadata_status, storage_error};
@@ -142,10 +142,12 @@ pub(in crate::grpc) fn validate_put_metadata(
     // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
     // skip the membership check here: the output path is computed
     // post-build from the NAR hash, so expected_outputs is [""] at
-    // sign time. Authorization for the CA case is enforced AFTER the
-    // NAR is hashed by `verify_ca_store_path` (r[sec.authz.ca-path-
-    // derived]): the store recomputes the CA path from the
-    // server-verified `nar_hash` and rejects on mismatch.
+    // sign time. Authorization for the CA case is enforced by
+    // `verify_ca_store_path` (r[sec.authz.ca-path-derived]) which runs
+    // BEFORE `claim_placeholder` in both PutPath and PutPathBatch: the
+    // store recomputes the CA path from the server-verified `nar_hash`
+    // and rejects on mismatch, so an is_ca worker can never claim a
+    // placeholder for a path it hasn't content-proven.
     if let Some(claims) = hmac_claims
         && !claims.is_ca
     {
@@ -262,7 +264,7 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
-// r[impl sec.authz.ca-path-derived]
+// r[impl sec.authz.ca-path-derived+2]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This
@@ -385,13 +387,16 @@ impl StoreServiceImpl {
     /// them; an infinite empty-chunk stream would otherwise
     /// `acquire_many(0)` forever and grow `held_permits` unbounded by
     /// the byte budget). Tiny chunks are charged
-    /// [`MIN_NAR_CHUNK_CHARGE`] so per-permit tracking overhead is
-    /// itself bounded by the budget.
+    /// [`nar_chunk_charge`] (floored at `MIN_NAR_CHUNK_CHARGE`) so
+    /// per-permit tracking overhead is itself bounded by the budget;
+    /// callers track cumulative `nar_chunk_charge(len)` against
+    /// `MAX_NAR_SIZE` BEFORE calling so a single handler never
+    /// self-deadlocks on permits it holds.
     ///
     /// `>=` so a single chunk of exactly 2³² bytes is rejected before
     /// it reaches `acquire_many(0)` and silently bypasses the budget.
-    /// `chunk.len() as u32` never truncates: chunks are bounded by
-    /// `RIO_GRPC_MAX_MESSAGE_SIZE`.
+    /// `nar_chunk_charge(len) as u32` never truncates: chunks are
+    /// bounded by `RIO_GRPC_MAX_MESSAGE_SIZE`.
     pub(in crate::grpc) async fn accumulate_chunk<'a>(
         &'a self,
         nar_data: &mut Vec<u8>,
@@ -412,7 +417,7 @@ impl StoreServiceImpl {
         }
         let permit = self
             .nar_bytes_budget
-            .acquire_many((chunk.len() as u32).max(MIN_NAR_CHUNK_CHARGE))
+            .acquire_many(nar_chunk_charge(chunk.len()) as u32)
             .await
             .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
         nar_data.extend_from_slice(chunk);
@@ -455,6 +460,13 @@ impl StoreServiceImpl {
         let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
         let mut held_permits = Vec::new();
+        // Cumulative permits charged (NOT raw bytes — `accumulate_chunk`
+        // floors each chunk at MIN_NAR_CHUNK_CHARGE). Checked BEFORE
+        // `accumulate_chunk` so a tiny-chunk stream that would exhaust
+        // the global budget hits this cap instead of self-deadlocking on
+        // `acquire_many` for permits this task already holds.
+        // r[impl store.put.nar-bytes-budget+3]
+        let mut charged: u64 = 0;
         loop {
             let msg = match stream.message().await {
                 Ok(Some(m)) => m,
@@ -470,6 +482,13 @@ impl StoreServiceImpl {
                         return Err(Status::invalid_argument(
                             "PutPath: nar_chunk after trailer (trailer must be last)",
                         ));
+                    }
+                    charged = charged.saturating_add(nar_chunk_charge(chunk.len()));
+                    if charged >= MAX_NAR_SIZE {
+                        return Err(Status::invalid_argument(format!(
+                            "PutPath: cumulative charged permits {charged} exceed \
+                             MAX_NAR_SIZE {MAX_NAR_SIZE} (too many tiny chunks)"
+                        )));
                     }
                     let permit = self
                         .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "PutPath")
