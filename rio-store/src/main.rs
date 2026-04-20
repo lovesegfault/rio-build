@@ -33,12 +33,16 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
 
-    // grpc.health.v1.Health. Starts NOT_SERVING (the `set_serving::<>` call
-    // below flips it). K8s readiness probe hits this — NOT_SERVING until
-    // migrations complete means the Service doesn't route to a half-booted
-    // pod. The "" (empty-string) service name is the conventional "whole
-    // server" check; we don't bother with per-service granularity since
-    // every RPC here needs PG, which is the one thing we're checking.
+    // grpc.health.v1.Health. The NAMED `rio.store.StoreService` is unset
+    // (probe → NotFound, which kubelet treats as failure) until the
+    // `set_serving::<StoreServiceServer>` call below flips it. K8s
+    // readinessProbe (store.yaml `grpc:{service: rio.store.StoreService}`)
+    // hits the named service — readiness fails until migrations complete
+    // means the Service doesn't route to a half-booted pod. NOTE:
+    // tonic-health defaults the EMPTY-string service to SERVING; the
+    // store's probe doesn't check "" so that default is harmless here,
+    // but DON'T copy this pattern to a binary that probes "" (see
+    // `rio_common::server::health_reporter_not_serving`).
     //
     // Ordering: health_reporter() → build services → set_serving() →
     // serve(). The set_serving happens BEFORE serve() blocks, which means

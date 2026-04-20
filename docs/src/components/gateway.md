@@ -601,6 +601,15 @@ r[gw.conn.real-connection-marker]
 authentication layer (any `auth_*` callback). TCP probes that close
 before the SSH handshake are logged at `trace!` only.
 
+r[gw.health.readiness-gated]
+The gateway's gRPC health endpoint MUST report `NOT_SERVING` for the
+empty-string service from process start until `connect_forever` has
+established both store and scheduler channels, and MUST report `SERVING`
+thereafter (until drain). tonic-health's `health_reporter()` initializes
+`""` to SERVING — the gateway explicitly flips it to `NOT_SERVING`
+immediately after construction via
+`rio_common::server::health_reporter_not_serving`.
+
 r[gw.conn.session-drain]
 On SIGTERM, the gateway sets readiness `NOT_SERVING`, waits
 `drain_grace_secs` for the load balancer to deregister, stops accepting

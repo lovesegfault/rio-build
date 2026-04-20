@@ -105,7 +105,10 @@ spec:
               readOnly: true
             {{- end }}
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
-          # tonic-health server — SERVING after connect_forever succeeds.
+          # tonic-health server — NOT_SERVING until connect_forever
+          # succeeds (main.rs explicitly gates "" via
+          # health_reporter_not_serving; tonic-health's default is
+          # SERVING).
           readinessProbe:
             grpc: {port: 9190}
             periodSeconds: 5

@@ -29,6 +29,37 @@ use crate::observability::OtelGuard;
 use crate::signal::Token;
 use crate::task::spawn_monitored;
 
+/// `tonic_health::server::health_reporter()` with the empty-string
+/// service flipped to `NOT_SERVING` before return.
+///
+/// tonic-health initializes `""` to **SERVING** (tonic-health-0.14
+/// `server.rs:43`: `("".to_string(), watch::channel(ServingStatus::
+/// Serving))`). Kubelet's `grpc:` readinessProbe with no `service:`
+/// field sends `Check{service:""}` — so a bare `health_reporter()`
+/// makes the pod Ready the instant the health port binds, BEFORE the
+/// caller's own readiness gate (`connect_forever`, migrations, …).
+///
+/// This wrapper flips `""` to `NOT_SERVING` so readiness fails until
+/// the caller explicitly sets it back via `reporter.set_service_status
+/// ("", ServingStatus::Serving)`. Liveness (port-open / `tcpSocket`)
+/// is unaffected.
+///
+/// Named-service flows (store, scheduler — probe a specific
+/// `rio.{X}.{X}Service`) don't need this: an unset named service
+/// returns `NotFound` which kubelet treats as a probe failure. Use
+/// the bare `tonic_health::server::health_reporter()` there.
+// r[impl gw.health.readiness-gated]
+pub async fn health_reporter_not_serving() -> (
+    tonic_health::server::HealthReporter,
+    HealthServer<impl Health>,
+) {
+    let (reporter, service) = tonic_health::server::health_reporter();
+    reporter
+        .set_service_status("", tonic_health::ServingStatus::NotServing)
+        .await;
+    (reporter, service)
+}
+
 /// `tonic::transport::Server::builder()` with h2 flow-control window
 /// tuning applied. Use this for every component's main gRPC server
 /// instead of bare `Server::builder()`.
@@ -479,6 +510,89 @@ mod tests {
             serve_shutdown.is_cancelled(),
             "serve_shutdown must fire after grace elapses"
         );
+    }
+
+    // r[verify gw.health.readiness-gated]
+    /// `health_reporter_not_serving` gates the empty-string check.
+    ///
+    /// Proves both halves: (1) tonic-health's bare `health_reporter()`
+    /// defaults `""` to SERVING (the bug C5 fixes — gateway readiness
+    /// was never gated); (2) the wrapper flips it to NOT_SERVING, and
+    /// the caller's explicit `set_service_status("", Serving)` un-gates.
+    #[tokio::test]
+    async fn health_reporter_not_serving_gates_empty_string() -> anyhow::Result<()> {
+        use tonic_health::pb::health_check_response::ServingStatus;
+        use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
+
+        // (1) Bare health_reporter() → "" is SERVING. This is the
+        // upstream default the gateway's old comment claimed was
+        // NOT_SERVING — pin it so a tonic-health upgrade that changes
+        // the default doesn't silently invalidate the wrapper.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (_bare_reporter, bare_service) = tonic_health::server::health_reporter();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(bare_service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let chan = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(chan);
+        let resp = client
+            .check(HealthCheckRequest { service: "".into() })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status(),
+            ServingStatus::Serving,
+            "tonic-health default for \"\" is SERVING — if this fails, \
+             the upstream default changed and the wrapper may be redundant"
+        );
+
+        // (2) Wrapper → "" is NOT_SERVING until caller flips it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (reporter, service) = health_reporter_not_serving().await;
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let chan = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(chan);
+
+        let resp = client
+            .check(HealthCheckRequest { service: "".into() })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status(),
+            ServingStatus::NotServing,
+            "wrapper must flip \"\" to NOT_SERVING so kubelet readiness fails \
+             until the caller's gate (connect_forever) passes"
+        );
+
+        reporter
+            .set_service_status("", tonic_health::ServingStatus::Serving)
+            .await;
+        let resp = client
+            .check(HealthCheckRequest { service: "".into() })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status(),
+            ServingStatus::Serving,
+            "caller's explicit Serving must un-gate"
+        );
+        Ok(())
     }
 
     /// Zero grace: the `if !grace.is_zero()` skip. serve_shutdown

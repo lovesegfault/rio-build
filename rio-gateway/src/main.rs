@@ -34,18 +34,21 @@ async fn main() -> anyhow::Result<()> {
     //
     // Bound BEFORE `connect_forever` so kubelet's livenessProbe (port
     // 9190) sees an open socket while the retry loop runs. tonic-health
-    // defaults to NOT_SERVING, so readiness stays correctly gated until
-    // `set_serving` below — liveness="process responding",
-    // readiness="connected to upstreams". With the bind AFTER connect
-    // (the old ordering), a slow scheduler/store cold-start (>60s) let
-    // kubelet kill the pod via livenessProbe before the retry loop
-    // could finish — neutralizing `connect_forever`'s purpose.
+    // initializes "" to SERVING — `health_reporter_not_serving` flips
+    // it to NOT_SERVING immediately, so readiness stays gated until the
+    // explicit `set_service_status("", Serving)` below. Liveness="port
+    // responding", readiness="connected to upstreams". With the bind
+    // AFTER connect (the old ordering), a slow scheduler/store
+    // cold-start (>60s) let kubelet kill the pod via livenessProbe
+    // before the retry loop could finish — neutralizing
+    // `connect_forever`'s purpose.
     //
     // spawn_monitored: the SSH server's `.run().await` below blocks
     // forever. Health must run concurrently. If the health server dies
     // (port conflict, etc), spawn_monitored logs it — K8s readiness
     // probe starts failing, pod restarts. Self-healing.
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // r[impl gw.health.readiness-gated]
+    let (health_reporter, health_service) = rio_common::server::health_reporter_not_serving().await;
     rio_common::server::spawn_health_server(
         health_service,
         cfg.health_addr,
@@ -111,14 +114,14 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    // Generic param: we don't have a "GatewayService" proto. Use the
-    // tonic-health server's own type as a stand-in — the empty-string
-    // "whole server" health check (which K8s sends) doesn't care about
-    // the service name, it just wants ANY service marked SERVING.
+    // Upstreams reachable — flip "" to SERVING so kubelet readiness
+    // passes. Symmetric with the drain-phase set_service_status("",
+    // NotServing) above. Target the empty-string key directly:
+    // `set_serving::<S>()` writes `S::NAME` ("grpc.health.v1.Health"),
+    // NOT "" — kubelet's `grpc:{port:9190}` probe (no `service:` field)
+    // checks "", so a named-service flip is a no-op for the probe.
     health_reporter
-        .set_serving::<tonic_health::pb::health_server::HealthServer<
-            tonic_health::server::HealthService,
-        >>()
+        .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
 
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
