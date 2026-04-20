@@ -52,52 +52,14 @@ use crate::{tofu, ui};
 /// unreachable-apiserver are treated as success because we're destroying
 /// — the resource (or whole cluster) being gone is the goal.
 ///
-/// Captures stderr itself rather than going through `sh::run`: that
-/// helper's error is just `"{argv}: exit status N"` (stderr is printed
-/// but not in the chain), so the benign-match below would never fire.
+/// Uses [`sh::run_benign_if`] so stderr is captured for the benign
+/// match — `sh::run`'s error is `"{argv}: exit status N"` only.
 /// First exposed by destroying a cluster that never had the rio chart
 /// installed → no `pool` CRD → kubectl exits 1 with "the server doesn't
 /// have a resource type" on stderr → match missed → hard fail.
 async fn k(args: &[&str]) -> Result<()> {
-    use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let argv = format!("kubectl {}", args.join(" "));
-    let mut child = tokio::process::Command::new("kubectl")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {argv}"))?;
-
-    // Tee both streams: echo live (long waits like `delete --timeout=
-    // 600s` print incremental progress) AND accumulate so we can match
-    // benign failure text after exit.
-    async fn tee(r: impl tokio::io::AsyncRead + Unpin) -> String {
-        let mut lines = BufReader::new(r).lines();
-        let mut buf = String::new();
-        while let Ok(Some(line)) = lines.next_line().await {
-            info!("{line}");
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    }
-    let (stdout, stderr) = tokio::join!(
-        tee(child.stdout.take().expect("set via Stdio::piped() above")),
-        tee(child.stderr.take().expect("set via Stdio::piped() above")),
-    );
-    let status = child.wait().await?;
-
-    if status.success() {
-        return Ok(());
-    }
-    let combined = format!("{stdout}{stderr}");
-    if is_benign_destroy_failure(&combined) {
-        info!("(already gone) {argv}");
-        return Ok(());
-    }
-    anyhow::bail!("{argv}: {status}")
+    let sh = shell()?;
+    sh::run_benign_if(cmd!(sh, "kubectl {args...}"), is_benign_destroy_failure).await
 }
 
 /// kubectl failure text that means "the thing you're trying to destroy
@@ -187,21 +149,17 @@ pub async fn run() -> Result<()> {
     // NodeClaims. helm's --ignore-not-found makes this idempotent.
     ui::step("helm uninstall rio", || async {
         let sh = shell()?;
-        match sh::run(cmd!(
-            sh,
-            "helm uninstall rio -n {NS} --wait --timeout 10m --ignore-not-found"
-        ))
+        // Unreachable apiserver = cluster already gone. Tofu destroy
+        // will confirm. `sh::run`'s error chain doesn't carry stderr,
+        // so this MUST go through run_benign_if.
+        sh::run_benign_if(
+            cmd!(
+                sh,
+                "helm uninstall rio -n {NS} --wait --timeout 10m --ignore-not-found"
+            ),
+            |e| e.contains("Kubernetes cluster unreachable"),
+        )
         .await
-        {
-            Ok(()) => Ok(()),
-            // Unreachable apiserver = cluster already gone. Tofu
-            // destroy will confirm.
-            Err(e) if format!("{e:#}").contains("Kubernetes cluster unreachable") => {
-                info!("(cluster unreachable; skipping helm uninstall)");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     })
     .await?;
 

@@ -149,6 +149,64 @@ async fn run_inner(
     Ok(out_buf.trim_end().to_string())
 }
 
+/// Run `cmd`, capturing stdout+stderr. `Ok(())` on success OR if
+/// `benign(combined_output)` returns true. Otherwise dumps captured
+/// output and bails. For best-effort teardown commands where specific
+/// failure text means "already done" — e.g. `kubectl delete` →
+/// `NotFound`, `helm uninstall` → `cluster unreachable`.
+///
+/// [`run`]'s error chain is `"{argv}: exit status N"` only (stderr is
+/// printed to the terminal but not folded into the `anyhow::Error`), so
+/// matching stderr substrings against a [`run`] result is dead code.
+/// This helper captures stderr into the predicate's input. Output is
+/// teed (echoed live at `info!` AND accumulated) so long `--wait
+/// --timeout=...` commands still show progress.
+pub fn run_benign_if(
+    cmd: xshell::Cmd<'_>,
+    benign: fn(&str) -> bool,
+) -> impl Future<Output = Result<()>> + Send + use<> {
+    let argv = cmd.to_string();
+    let std_cmd: std::process::Command = cmd.quiet().into();
+    async move {
+        debug!("exec: {argv}");
+        let mut child = tokio::process::Command::from(std_cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn: {argv}"))?;
+        // Tee: echo live (long waits print incremental progress) AND
+        // accumulate for the benign-match.
+        async fn tee(r: impl tokio::io::AsyncRead + Unpin) -> String {
+            let mut lines = BufReader::new(r).lines();
+            let mut buf = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!("{line}");
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            buf
+        }
+        let (stdout, stderr) = tokio::join!(
+            tee(child.stdout.take().expect("set via Stdio::piped() above")),
+            tee(child.stderr.take().expect("set via Stdio::piped() above")),
+        );
+        let status = child.wait().await?;
+        if status.success() {
+            return Ok(());
+        }
+        let combined = format!("{stdout}{stderr}");
+        if benign(&combined) {
+            tracing::info!("(benign failure) {argv}");
+            return Ok(());
+        }
+        for line in combined.lines() {
+            ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
+        }
+        bail!("{argv}: {status}");
+    }
+}
+
 /// Run a command that must interact with a tty (prompts for input).
 /// Always inherits stdio, regardless of verbosity.
 pub fn run_interactive(cmd: xshell::Cmd<'_>) -> Result<()> {
@@ -277,4 +335,44 @@ pub unsafe fn init_env() {
 /// and kubectl read from here via the KUBECONFIG env var `init_env` sets.
 pub fn kubeconfig_path() -> PathBuf {
     repo_root().join(".kube/config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_benign_if_swallows_matching_stderr() {
+        let sh = Shell::new().unwrap();
+        let r = run_benign_if(
+            cmd!(
+                sh,
+                "sh -c 'echo Kubernetes cluster unreachable >&2; exit 1'"
+            ),
+            |e| e.contains("Kubernetes cluster unreachable"),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn run_benign_if_propagates_nonmatching() {
+        let sh = Shell::new().unwrap();
+        let r = run_benign_if(
+            cmd!(
+                sh,
+                "sh -c 'echo Kubernetes cluster unreachable >&2; exit 1'"
+            ),
+            |e| e.contains("zebra"),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_benign_if_ok_on_success() {
+        let sh = Shell::new().unwrap();
+        let r = run_benign_if(cmd!(sh, "true"), |_| false).await;
+        assert!(r.is_ok());
+    }
 }
