@@ -167,6 +167,9 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 - [External Secrets Operator](https://external-secrets.io/) syncing from AWS Secrets Manager, GCP Secret Manager, or HashiCorp Vault into Kubernetes Secrets. Secrets are managed externally and auto-rotated.
 - Mount secrets as files (not environment variables) to avoid `/proc` and `ps` leakage. All rio-build secret config parameters use file paths (`signing_key_path`, `host_key_path`, `hmac_key_path`).
 
+r[sec.host-key.file-mode]
+A gateway-generated SSH host private key MUST be written with mode `0600` (owner-only) at creation time. The standalone NixOS module relies on the auto-generate path and sets neither `UMask=` nor `StateDirectoryMode=`, so a plain `std::fs::write` would leave the key world-readable.
+
 **Production hardened:**
 - HashiCorp Vault with the Vault Agent Injector sidecar. The sidecar injects secrets into a shared `emptyDir` volume, and rio-build reads them from file paths. Vault handles rotation; the sidecar re-renders secrets on change.
 - For the `database_url` credential specifically: use Vault's database secrets engine to issue short-lived PostgreSQL credentials per pod, eliminating static database passwords entirely.

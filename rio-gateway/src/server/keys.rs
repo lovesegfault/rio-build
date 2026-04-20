@@ -39,7 +39,26 @@ pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
                 "failed to create directory for host key; key will be ephemeral"
             );
         }
-        if let Err(e) = std::fs::write(path, key.to_openssh(ssh_key::LineEnding::LF)?) {
+        // r[impl sec.host-key.file-mode]
+        // Private-key material must be owner-only. `std::fs::write` is
+        // `open(..., 0666) & !umask` → typically 0644. Set the mode at
+        // creation (no 0644 window) and `create_new` so a file that
+        // appeared between the `path.exists()` check above and here is
+        // never clobbered — fail-safe to ephemeral instead.
+        let persist = || -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let pem = key
+                .to_openssh(ssh_key::LineEnding::LF)
+                .map_err(std::io::Error::other)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?
+                .write_all(pem.as_bytes())
+        };
+        if let Err(e) = persist() {
             warn!(error = %e, "could not save generated host key (continuing with ephemeral key)");
         }
         Ok(key)
@@ -287,6 +306,12 @@ mod tests {
         // First call: generates and writes
         let k1 = load_or_generate_host_key(&key_path).expect("should generate");
         assert!(key_path.exists(), "key should be persisted");
+        // r[verify sec.host-key.file-mode]
+        // Generated private key must be owner-only. `std::fs::write`
+        // (the previous impl) lands at 0666 & !umask = 0644/0664 on
+        // typical systems; this assertion fails on that.
+        let mode = std::fs::metadata(&key_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "generated host private key must be 0600");
         let fp1 = k1.public_key().fingerprint(Default::default());
 
         // Second call: loads the same key
