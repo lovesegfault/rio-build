@@ -328,6 +328,38 @@ impl ActorHandle {
         .await
     }
 
+    /// Overwrite a derivation's `output_paths`. Returns `false` if not
+    /// found.
+    pub async fn debug_set_output_paths(
+        &self,
+        drv_hash: &str,
+        paths: Vec<String>,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SetOutputPaths {
+            drv_hash,
+            paths,
+            reply,
+        })
+        .await
+    }
+
+    /// Force a derivation into `status`, bypassing the transition
+    /// table. Returns `false` if not found.
+    pub async fn debug_force_status(
+        &self,
+        drv_hash: &str,
+        status: crate::state::DerivationStatus,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::ForceStatus {
+            drv_hash,
+            status,
+            reply,
+        })
+        .await
+    }
+
     /// Clear a derivation's `drv_content` to simulate post-recovery
     /// state. Returns `false` if not found.
     pub async fn debug_clear_drv_content(&self, drv_hash: &str) -> Result<bool, ActorError> {

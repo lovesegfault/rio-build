@@ -132,16 +132,32 @@ impl DerivationStatus {
             }
         }
 
-        // Terminal -> non-terminal is rejected, with two carve-outs:
+        // Terminal -> non-terminal is rejected, with carve-outs:
         if self.is_terminal() && !to.is_terminal() {
             if self == Self::Poisoned && to == Self::Created {
                 // 24h TTL expiry resets poisoned -> created
                 return Ok(());
             }
-            if self == Self::Completed && to == Self::Ready {
-                // Output GC'd from store between completion and a later
-                // build's merge. Re-dispatch the derivation; dependents
-                // stay Queued until it re-completes. See I-047.
+            if matches!(self, Self::Completed | Self::Skipped)
+                && matches!(to, Self::Ready | Self::Queued)
+            {
+                // I-047: output GC'd from store between completion and
+                // a later build's merge. Reset to Ready (deps
+                // available) or Queued (deps also reset). Skipped
+                // carries real output_paths and unlocks dependents the
+                // same as Completed, so a GC'd Skipped output needs
+                // the same reset.
+                return Ok(());
+            }
+            if matches!(self, Self::Poisoned | Self::DependencyFailed) && to == Self::Queued {
+                // I-094 deferred re-probe: output is locally present
+                // (cache-hit) but an inputDrv is in-flight, so the
+                // closure-invariant fixed-point deferred this hit.
+                // Prior failure history is moot; gate on the dep via
+                // Queued so find_newly_ready picks it up when the dep
+                // completes. Parallel to the →Substituting arm below.
+                // (Failed is non-terminal; its Queued arm is in the
+                // table below.)
                 return Ok(());
             }
             if matches!(self, Self::Poisoned | Self::DependencyFailed) && to == Self::Substituting {
@@ -190,6 +206,9 @@ impl DerivationStatus {
             (Self::Running, Self::Poisoned) => true, // failed on 3+ workers
             (Self::Ready, Self::Poisoned) => true, // failed_builders exhausts fleet (I-065)
             (Self::Failed, Self::Ready) => true,   // retry scheduled
+            // I-094 deferred re-probe: output present but inputDrv
+            // in-flight; failure history moot, gate on dep via Queued.
+            (Self::Failed, Self::Queued) => true,
             // Cancel: from any in-flight state. CancelBuild sends
             // CancelSignal to workers running sole-interest derivations;
             // DrainExecutor(force) cancels all a worker's in-flight.
@@ -1057,6 +1076,12 @@ mod tests {
             (Ready, Poisoned),           // failed_builders exhausts fleet (I-065)
             (Failed, Ready),             // retry scheduled
             (Completed, Ready),          // output GC'd; re-dispatch (I-047)
+            (Completed, Queued),         // output GC'd + dep also reset (I-047)
+            (Skipped, Ready),            // output GC'd; re-dispatch (I-047)
+            (Skipped, Queued),           // output GC'd + dep also reset (I-047)
+            (Poisoned, Queued),          // I-094 deferred re-probe (output present, dep in-flight)
+            (Failed, Queued),            // I-094 deferred re-probe
+            (DependencyFailed, Queued),  // I-094 deferred re-probe
             (Poisoned, Created),         // 24h TTL expiry
             (Queued, DependencyFailed),  // dep poisoned cascade
             (Ready, DependencyFailed),   // dep poisoned cascade
@@ -1125,9 +1150,12 @@ mod tests {
     fn test_skipped_is_terminal_never_from_running() {
         use DerivationStatus::*;
         assert!(Skipped.is_terminal());
-        // Terminal: no resurrect.
+        // Terminal: no resurrect to Created/Completed. Ready/Queued ARE
+        // valid (I-047 GC reset — Skipped carries output_paths and
+        // unlocks dependents same as Completed).
         assert!(Skipped.validate_transition(Created).is_err());
-        assert!(Skipped.validate_transition(Ready).is_err());
+        assert!(Skipped.validate_transition(Ready).is_ok());
+        assert!(Skipped.validate_transition(Queued).is_ok());
         assert!(Skipped.validate_transition(Completed).is_err());
         // r[sched.preempt.never-running]: in-flight states can NOT
         // transition to Skipped. CA cutoff only touches Queued/Ready.
@@ -1142,13 +1170,13 @@ mod tests {
     fn test_derivation_invalid_transitions() {
         use DerivationStatus::*;
 
-        // Terminal -> non-terminal (except poisoned -> created and
-        // completed -> ready, both carve-outs validated below)
+        // Terminal -> non-terminal (except the documented carve-outs
+        // validated below)
         assert!(Completed.validate_transition(Created).is_err());
         assert!(Completed.validate_transition(Running).is_err());
-        assert!(Completed.validate_transition(Queued).is_err());
-        // completed -> ready IS valid (output GC'd; I-047)
+        // completed -> ready/queued IS valid (output GC'd; I-047)
         assert!(Completed.validate_transition(Ready).is_ok());
+        assert!(Completed.validate_transition(Queued).is_ok());
 
         // Skip states
         assert!(Created.validate_transition(Running).is_err());
@@ -1165,19 +1193,23 @@ mod tests {
         assert!(Running.validate_transition(Queued).is_err());
         assert!(Running.validate_transition(Assigned).is_err());
 
-        // Failed can only go to Ready
+        // Failed can only go to Ready or Queued (I-094 deferred re-probe)
         assert!(Failed.validate_transition(Running).is_err());
         assert!(Failed.validate_transition(Completed).is_err());
-        assert!(Failed.validate_transition(Queued).is_err());
+        assert!(Failed.validate_transition(Queued).is_ok());
 
-        // Poisoned can only go to Created (TTL expiry) or stay Poisoned
+        // Poisoned can go to Created (TTL), Queued (I-094 deferred),
+        // Completed/Substituting (I-094 reprobe), or stay Poisoned.
+        // NOT Ready (must gate on dep), Running, Failed.
         assert!(Poisoned.validate_transition(Ready).is_err());
         assert!(Poisoned.validate_transition(Running).is_err());
         assert!(Poisoned.validate_transition(Failed).is_err());
+        assert!(Poisoned.validate_transition(Queued).is_ok());
 
-        // DependencyFailed is terminal: can't go anywhere except self
+        // DependencyFailed is terminal: can't go anywhere except
+        // self/Completed/Substituting/Queued (re-probe lanes).
         assert!(DependencyFailed.validate_transition(Ready).is_err());
-        assert!(DependencyFailed.validate_transition(Queued).is_err());
+        assert!(DependencyFailed.validate_transition(Queued).is_ok());
         assert!(DependencyFailed.validate_transition(Created).is_err());
         // Assigned/Running cannot cascade to DependencyFailed (already started)
         assert!(Assigned.validate_transition(DependencyFailed).is_err());
@@ -1330,6 +1362,13 @@ mod tests {
             (Poisoned, Created),
             // Output GC'd between completion and later merge (I-047)
             (Completed, Ready),
+            (Completed, Queued), // dep also reset
+            (Skipped, Ready),
+            (Skipped, Queued),
+            // I-094 deferred re-probe (output present, dep in-flight)
+            (Poisoned, Queued),
+            (Failed, Queued),
+            (DependencyFailed, Queued),
             // Cancel from in-flight
             (Assigned, Cancelled),
             (Running, Cancelled),

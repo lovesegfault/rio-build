@@ -483,6 +483,23 @@ pub enum DebugCmd {
         retry_count: u32,
         reply: oneshot::Sender<bool>,
     },
+    /// Force a derivation into an arbitrary status, bypassing the
+    /// transition table. For tests that need a precondition the state
+    /// machine has no path to (e.g. a `Skipped` node with output_paths
+    /// already set, for the I-047 stale-reset Skipped lane).
+    ForceStatus {
+        drv_hash: String,
+        status: crate::state::DerivationStatus,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Overwrite a derivation's `output_paths`. For tests staging a
+    /// pre-existing Completed/Skipped node without driving the full
+    /// worker→completion path (which is one-shot per worker).
+    SetOutputPaths {
+        drv_hash: String,
+        paths: Vec<String>,
+        reply: oneshot::Sender<bool>,
+    },
     /// Clear a derivation's `drv_content`. Simulates the post-recovery
     /// state for the `sched.ca.resolve` recovery-fetch test.
     ClearDrvContent {

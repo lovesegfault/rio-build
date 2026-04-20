@@ -56,6 +56,12 @@ pub(super) struct MergeReconcile {
     /// First Poisoned/DependencyFailed hash (newly-seeded OR
     /// pre-existing). Caller fires `handle_derivation_failure` on it.
     pub first_dep_failed: Option<DrvHash>,
+    /// Other builds (≠ this merge's build_id) interested in a node
+    /// that a re-probe transitioned →Completed. Caller fans out
+    /// `update_build_counts` + `check_build_completion` so a
+    /// shared-node completion doesn't leave the earlier build hung
+    /// Active. r[sched.merge.dedup]
+    pub other_builds: HashSet<Uuid>,
 }
 
 impl DagActor {
@@ -92,6 +98,7 @@ impl DagActor {
         let MergeReconcile {
             cached_count,
             first_dep_failed,
+            other_builds,
         } = self.reconcile_merged_state(&ingest).await;
 
         // Update build's cached count + persist initial denorm columns.
@@ -101,6 +108,14 @@ impl DagActor {
         // I-103: sets completed_count from DAG ground truth + persists
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
+        // r[impl sched.merge.dedup]
+        // Re-probe completed a node that other builds were waiting on:
+        // fan out the count-update + completion-check to them. Mirrors
+        // complete_ready_from_store / release_downstream.
+        for b in other_builds {
+            self.update_build_counts(b).await;
+            self.check_build_completion(b).await;
+        }
 
         // Send BuildStarted event
         self.events.emit(
@@ -140,9 +155,17 @@ impl DagActor {
             ),
         );
 
-        // Check if the build is already complete (all cache hits)
+        // Check if the build is already complete (all cache hits).
+        // Log-and-continue on DB error: build is Active+committed in PG;
+        // returning Err here would surface a failure for a build that
+        // already succeeded, with no BuildCompleted event and no
+        // schedule_terminal_cleanup. Mirrors check_build_completion at
+        // build.rs.
         if cached_count == total_derivations {
-            self.complete_build(build_id).await?;
+            if let Err(e) = self.complete_build(build_id).await {
+                error!(build_id = %build_id, error = %e,
+                       "failed to persist build completion (build is Active; continuing)");
+            }
         } else {
             // Dispatch ready derivations to workers
             self.dispatch_ready().await;
@@ -199,7 +222,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down root substitution check ===============
-        // r[impl sched.merge.substitute-topdown]
+        // r[impl sched.merge.substitute-topdown+2]
         // Before merging the full DAG, check if the ROOT derivations'
         // outputs are already available. If ALL roots are cached, the
         // deps are transitively unnecessary — prune the submission to
@@ -467,7 +490,8 @@ impl DagActor {
             };
         }
 
-        let (mut cached_count, deferred_hits) = self.apply_cached_hits(ingest, &node_index).await;
+        let (mut cached_count, deferred_hits, other_builds) =
+            self.apply_cached_hits(ingest, &node_index).await;
         phase!("6a-cached-hits-loop");
 
         // Compute critical-path priorities for newly-inserted nodes.
@@ -493,7 +517,7 @@ impl DagActor {
         // otherwise newly-inserted dependents would be unlocked against a
         // dep whose output is gone, and the worker fails on isValidPath.
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify]
+        // r[impl sched.merge.stale-completed-verify+2]
         let stale_reset = self
             .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
             .await;
@@ -562,6 +586,7 @@ impl DagActor {
         MergeReconcile {
             cached_count,
             first_dep_failed,
+            other_builds,
         }
     }
 
@@ -569,9 +594,12 @@ impl DagActor {
     /// to `Completed`, set `output_paths`, clear retry state for
     /// previously-failed re-probes, batch-persist `Completed`, advance
     /// pre-existing Queued dependents of re-probe hits, and emit
-    /// `DerivationCached` events. Returns `(cached_count, deferred_hits)`
-    /// — deferred_hits are cache-hits whose inputDrvs are incomplete
-    /// (closure invariant), so the caller seeds them as Queued instead.
+    /// `DerivationCached` events. Returns `(cached_count,
+    /// deferred_hits, other_builds)` — `deferred_hits` are cache-hits
+    /// whose inputDrvs are incomplete (closure invariant), so the
+    /// caller seeds them as Queued instead; `other_builds` are builds
+    /// other than `ingest.build_id` interested in a re-probe
+    /// completion (caller fans out count-update + completion-check).
     ///
     /// All I/O here is best-effort log-and-continue (build is Active).
     /// Kept as a `&mut self` method (not a free decision fn) because
@@ -582,7 +610,7 @@ impl DagActor {
         &mut self,
         ingest: &MergeIngest,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
-    ) -> (u32, HashSet<DrvHash>) {
+    ) -> (u32, HashSet<DrvHash>, HashSet<Uuid>) {
         let MergeIngest {
             build_id,
             existing_reprobe,
@@ -592,6 +620,15 @@ impl DagActor {
         let build_id = *build_id;
         let mut cached_count = 0u32;
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
+        // Re-probe completions that other builds were waiting on. The
+        // event emission below + caller's update_build_counts are
+        // scoped to ingest.build_id; without fanning out, an earlier
+        // build B1 with X sitting Ready never sees X complete via
+        // B2's re-probe — completed_count stays 0, dispatch_ready
+        // silently drops the now-Completed entry,
+        // check_build_completion(B1) never fires → B1 hangs Active.
+        // r[sched.merge.dedup]: "all interested builds are notified".
+        let mut reprobe_completed: Vec<DrvHash> = Vec::new();
         // I-139: collect for batched Completed-status + path_tenants
         // updates after the loop instead of N sequential round-trips.
         // clear_poison stays per-hit (Poisoned-only, rare).
@@ -606,10 +643,13 @@ impl DagActor {
         // building → git dispatches → rustc not in JIT allowlist).
         // Fixed-point: apply Completed only when all_deps_completed;
         // re-walk until no progress (handles chains of hits). Hits
-        // whose deps never complete here fall through to
-        // seed_initial_states as Queued and BUILD when deps complete
-        // — correctness over the cache-hit shortcut (wrapper drvs
-        // are cheap to rebuild).
+        // whose deps never complete here are returned in
+        // deferred_hits: newly-inserted ones fall through to
+        // seed_initial_states as Queued; pre-existing ones in a
+        // failed state are reset to Queued in the post-loop stanza
+        // below (I-094 deferred lane). Either way they BUILD when
+        // deps complete — correctness over the cache-hit shortcut
+        // (wrapper drvs are cheap to rebuild).
         let mut worklist: Vec<DrvHash> = cached_hits.keys().cloned().collect();
         let deferred_hits: HashSet<DrvHash> = loop {
             let before = worklist.len();
@@ -680,6 +720,7 @@ impl DagActor {
                     // compute_initial_states below; this catches the
                     // pre-existing ones.
                     reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
+                    reprobe_completed.push(drv_hash.clone());
                 }
 
                 self.events.emit(
@@ -710,6 +751,59 @@ impl DagActor {
             metrics::counter!("rio_scheduler_cache_hit_deferred_total")
                 .increment(deferred_hits.len() as u64);
         }
+        // I-094 deferred lane: a pre-existing Poisoned/Failed/
+        // DependencyFailed node whose output is now locally present
+        // but whose inputDrv is in-flight got deferred above (no
+        // transition). It is NOT newly_inserted (at-limit ⇒
+        // is_retriable_on_resubmit=false) so seed_initial_states
+        // skips it; reconcile_preexisting skips ALL cached_hits keys
+        // including deferred. When the dep later completes,
+        // find_newly_ready only walks Queued parents — so a Poisoned
+        // X stays Poisoned forever despite output present. Reset to
+        // Queued here (failure history is moot; we have the output);
+        // dispatch-time batch_probe_cached_ready re-finds the hit.
+        for h in &deferred_hits {
+            if !existing_reprobe.contains(h) {
+                continue;
+            }
+            let Some(state) = self.dag.node_mut(h) else {
+                continue;
+            };
+            let from = state.status();
+            if !matches!(
+                from,
+                DerivationStatus::Poisoned
+                    | DerivationStatus::Failed
+                    | DerivationStatus::DependencyFailed
+            ) {
+                continue;
+            }
+            if let Err(e) = state.transition(DerivationStatus::Queued) {
+                warn!(drv_hash = %h, error = %e,
+                      "deferred re-probe →Queued rejected; node stays {from:?}");
+                continue;
+            }
+            state.retry.clear();
+            info!(drv_hash = %h, ?from,
+                  "deferred re-probe: pre-existing failed node's output present \
+                   but inputDrv in-flight; reset to Queued (failure history moot)");
+            if matches!(
+                from,
+                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+            ) && let Err(e) = self.db.clear_poison(h).await
+            {
+                warn!(drv_hash = %h, error = %e,
+                      "failed to clear poison in PG after deferred re-probe reset");
+            }
+            if let Err(e) = self
+                .db
+                .update_derivation_status(h, DerivationStatus::Queued, None)
+                .await
+            {
+                warn!(drv_hash = %h, error = %e,
+                      "failed to persist deferred re-probe Queued reset");
+            }
+        }
         if !completed_batch.is_empty() {
             let hashes: Vec<&str> = completed_batch.iter().map(DrvHash::as_str).collect();
             if let Err(e) = self
@@ -725,8 +819,17 @@ impl DagActor {
         // I-099: advance pre-existing Queued dependents of re-probe
         // hits. Newly-inserted dependents are handled by
         // compute_initial_states; this is the pre-existing-DAG side.
+        // find_newly_ready captured these while they were Queued, but
+        // a later fixed-point pass may have transitioned a captured
+        // hash Queued→Completed (it was itself a cache-hit). Without
+        // the explicit Queued re-check, transition(Ready) on a
+        // Completed node SUCCEEDS via the I-047 carve-out and we
+        // push_ready a node we just marked Completed (cached_count
+        // over-counts; PG sees Completed then Ready). Re-check the
+        // find_newly_ready precondition at use-site.
         for ready_hash in reprobe_unlocked {
             if let Some(s) = self.dag.node_mut(&ready_hash)
+                && s.status() == DerivationStatus::Queued
                 && s.transition(DerivationStatus::Ready).is_ok()
             {
                 if let Err(e) = self
@@ -740,7 +843,32 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
-        (cached_count, deferred_hits)
+        // Fan-out: collect other builds interested in re-probe-
+        // completed nodes + emit DerivationCached to each. Caller
+        // does update_build_counts + check_build_completion per build.
+        let mut other_builds: HashSet<Uuid> = HashSet::new();
+        for h in &reprobe_completed {
+            let (drv_path, output_paths) = match self.dag.node(h) {
+                Some(s) => (s.drv_path().to_string(), s.output_paths.clone()),
+                None => continue,
+            };
+            for b in self.get_interested_builds(h) {
+                if b == build_id {
+                    continue;
+                }
+                self.events.emit(
+                    b,
+                    rio_proto::types::build_event::Event::Derivation(
+                        rio_proto::types::DerivationEvent::cached(
+                            drv_path.clone(),
+                            output_paths.clone(),
+                        ),
+                    ),
+                );
+                other_builds.insert(b);
+            }
+        }
+        (cached_count, deferred_hits, other_builds)
     }
 
     /// Step-6f body: walk pre-existing nodes (not newly-inserted, not
@@ -781,8 +909,9 @@ impl DagActor {
             if stale_reset.contains(node.drv_hash.as_str()) {
                 continue;
             }
-            // I-099: re-probe hits were already counted + emitted in
-            // apply_cached_hits. Don't double-count.
+            // I-099: re-probe hits were handled in apply_cached_hits
+            // (either counted + emitted, or deferred-and-reset to
+            // Queued). Don't double-count or fail-fast on them.
             if cached_hits.contains_key(node.drv_hash.as_str()) {
                 continue;
             }
@@ -948,9 +1077,13 @@ impl DagActor {
         jwt_token: Option<&str>,
     ) -> HashSet<String> {
         // Collect (drv_hash, output_paths) for pre-existing Completed
-        // nodes in this merge. Skip nodes with empty output_paths —
-        // nothing to verify (shouldn't happen for a real Completed
-        // node, but defensive against test fixtures).
+        // OR Skipped nodes in this merge. Skipped carries real
+        // output_paths (stamped at completion) and unlocks dependents
+        // via all_deps_completed; a GC'd Skipped output bypasses I-047
+        // and dispatches dependents against a missing path. Skip nodes
+        // with empty output_paths — nothing to verify (shouldn't
+        // happen for a real done node, but defensive against test
+        // fixtures).
         let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
@@ -964,7 +1097,10 @@ impl DagActor {
             let Some(state) = self.dag.node(&node.drv_hash) else {
                 continue;
             };
-            if state.status() != DerivationStatus::Completed {
+            if !matches!(
+                state.status(),
+                DerivationStatus::Completed | DerivationStatus::Skipped
+            ) {
                 continue;
             }
             if state.output_paths.is_empty() {
@@ -1040,10 +1176,24 @@ impl DagActor {
             return HashSet::new();
         }
 
-        // Reset each node that has ANY missing output. Partial-missing
-        // (multi-output drv with some outputs GC'd) is the same as
-        // all-missing from the dependent's perspective: the build
-        // needs to re-run to repopulate everything.
+        // Two-pass: when GC sweeps a chain {A→B}, both must reset; A
+        // gates on B, so A goes to Queued (not Ready) and is NOT
+        // pushed — find_newly_ready picks A up when B re-completes.
+        // Single-pass would push_ready A while B is still
+        // Ready/Substituting → worker ENOENT on B's output → burned
+        // retry, can cascade to Poisoned. "Ready ⟹ all deps' outputs
+        // available in store" is the invariant.
+        //
+        // Pass 1: collect reset_set (no mutation).
+        let reset_set: HashSet<DrvHash> = candidates
+            .iter()
+            .filter(|(_, paths)| paths.iter().any(|p| missing.contains(p.as_str())))
+            .map(|(h, _)| DrvHash::from(h.as_str()))
+            .collect();
+
+        // Pass 2: per-node, compute deps_ok against reset_set + DAG
+        // state, then transition to Ready (deps ok) or Queued (a dep
+        // also reset / not done).
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for (drv_hash, output_paths) in candidates {
@@ -1051,12 +1201,34 @@ impl DagActor {
                 continue;
             };
             let drv_hash_k: DrvHash = drv_hash.as_str().into();
+            // deps_ok: every child is Completed/Skipped AND not itself
+            // being reset. The substitutable→to_spawn lane is
+            // technically safe even when !deps_ok per
+            // r[sched.substitute.detached] (store-side closure walk
+            // fetched the full reference set), but gating it on
+            // deps_ok too is strictly safe and simpler — Queued falls
+            // through to normal dispatch which re-probes
+            // substitutability.
+            let deps_ok = self.dag.get_children(&drv_hash).into_iter().all(|d| {
+                !reset_set.contains(&d)
+                    && self.dag.node(&d).is_some_and(|s| {
+                        matches!(
+                            s.status(),
+                            DerivationStatus::Completed | DerivationStatus::Skipped
+                        )
+                    })
+            });
+            let target = if deps_ok {
+                DerivationStatus::Ready
+            } else {
+                DerivationStatus::Queued
+            };
             let Some(state) = self.dag.node_mut(&drv_hash_k) else {
                 continue;
             };
-            if let Err(e) = state.transition(DerivationStatus::Ready) {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "stale-completed verify: Completed→Ready rejected; skipping reset");
+            if let Err(e) = state.transition(target) {
+                warn!(drv_hash = %drv_hash, error = %e, ?target,
+                      "stale-completed verify: reset transition rejected; skipping");
                 continue;
             }
             state.output_paths.clear();
@@ -1064,19 +1236,26 @@ impl DagActor {
             warn!(
                 drv_hash = %drv_hash,
                 missing_path = %gone,
-                "pre-existing Completed node's output is gone from store \
-                 (GC'd?); resetting to Ready for re-dispatch"
+                ?target,
+                "pre-existing Completed/Skipped node's output is gone from store \
+                 (GC'd?); resetting for re-dispatch"
             );
             metrics::counter!("rio_scheduler_stale_completed_reset_total").increment(1);
 
             if let Err(e) = self
                 .db
-                .update_derivation_status(&drv_hash_k, DerivationStatus::Ready, None)
+                .update_derivation_status(&drv_hash_k, target, None)
                 .await
             {
-                error!(drv_hash = %drv_hash, error = %e,
-                       "failed to persist stale-completed Ready reset \
+                error!(drv_hash = %drv_hash, error = %e, ?target,
+                       "failed to persist stale-completed reset \
                         (build is Active; continuing)");
+            }
+            if !deps_ok {
+                // Queued: no push_ready, no spawn. find_newly_ready
+                // promotes it when its reset dep re-completes.
+                reset.insert(drv_hash);
+                continue;
             }
             // Substitutable subset: spawn the detached fetch (Ready →
             // Substituting) instead of pushing to ready_queue. The
@@ -1482,7 +1661,7 @@ impl DagActor {
         }
 
         // --- Floating-CA store-existence verify (I-048) ----------------
-        // r[impl sched.merge.stale-completed-verify]
+        // r[impl sched.merge.stale-completed-verify+2]
         // The realisations table is scheduler-local PG; store GC doesn't
         // touch it. A realisation can point to a path that's been GC'd.
         // Without this verify, such a node flips to Completed here and
@@ -1650,7 +1829,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown]
+    // r[impl sched.merge.substitute-topdown+2]
     /// Top-down root substitution pre-check (step 0 of `handle_merge_dag`).
     ///
     /// Returns `Some(roots)` if ALL root derivations' IA outputs are
@@ -1796,80 +1975,18 @@ impl DagActor {
             return None;
         }
 
-        // --- Eager-fetch substitutable root NARs --------------------
-        // Same pattern as r[sched.merge.substitute-fetch]: QPI with
-        // JWT triggers the store's NAR fetch. Bounded concurrency;
-        // root count is small (usually 1) so this is fast.
-        //
-        // Reborrow store_client: the breaker calls above took &mut
-        // self, invalidating the earlier shared borrow.
-        let store_client = self.store_client.as_ref()?;
-        if !resp.substitutable_paths.is_empty() {
-            use futures_util::stream::{self, StreamExt};
-            let jwt_pair;
-            let jwt_meta: &[(&'static str, &str)] = match jwt_token {
-                Some(t) => {
-                    jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
-                    &jwt_pair
-                }
-                None => &[],
-            };
-            let mut fetches = stream::iter(resp.substitutable_paths)
-                .map(|p| {
-                    let mut c = store_client.clone();
-                    async move {
-                        let res = rio_proto::client::query_path_info_opt(
-                            &mut c,
-                            &p,
-                            grpc_timeout,
-                            jwt_meta,
-                        )
-                        .await;
-                        (p, res)
-                    }
-                })
-                .buffer_unordered(self.substitute_max_concurrent);
-            while let Some((p, res)) = fetches.next().await {
-                // Fetch failure aborts the short-circuit. The full
-                // merge + check_cached_outputs will retry and demote
-                // to cache-miss if it fails again. Split Ok(None) vs
-                // Err so the log shows WHICH failure mode fired — a
-                // sub-20ms NotFound suggests the store's upstream
-                // probe never actually fetched (JWT/metadata issue),
-                // vs a transport error which is a different bug.
-                match res {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        debug!(
-                            path = %p,
-                            "top-down: root NotFound on QPI; falling through"
-                        );
-                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                            .increment(1);
-                        return None;
-                    }
-                    Err(e) => {
-                        debug!(
-                            path = %p,
-                            error = %e,
-                            "top-down: root QPI error; falling through"
-                        );
-                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                            .increment(1);
-                        return None;
-                    }
-                }
-            }
-            // No cache_hits_total emission here: the caller continues
-            // into the full merge, so apply_cached_hits counts these
-            // roots correctly per-derivation under source="scheduler".
-            // The previous root_paths.len()-based increment was wrong
-            // basis (counted already-present paths), wrong unit
-            // (per-path vs per-derivation), and double-counted.
-        }
-
-        // All roots available and fetched. Return owned root nodes
-        // for the pruned merge.
+        // r[impl sched.substitute.detached]
+        // No inline QPI: awaiting query_path_info_opt here blocked the
+        // actor for the duration of the store-side closure walk
+        // (ghc-sized roots take minutes; grpc_timeout = 30s) — the
+        // very builds the prune helps most timed out and fell through
+        // anyway, AND reintroduced the >100s MergeDag stall that
+        // detached-substitute was created to fix. Instead: return the
+        // pruned root set; the caller continues into the full merge
+        // with roots-only nodes; check_cached_outputs re-probes them,
+        // populates pending_substitute, and spawn_substitute_fetches
+        // does the fetch detached under SUBSTITUTE_FETCH_TIMEOUT.
+        // Prune benefit preserved; actor never blocks on QPI.
         Some(roots.into_iter().cloned().collect())
     }
 }

@@ -65,6 +65,28 @@ impl DagActor {
             } => {
                 let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
             }
+            DebugCmd::ForceStatus {
+                drv_hash,
+                status,
+                reply,
+            } => {
+                let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
+                    s.set_status_for_test(status);
+                    true
+                });
+                let _ = reply.send(ok);
+            }
+            DebugCmd::SetOutputPaths {
+                drv_hash,
+                paths,
+                reply,
+            } => {
+                let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
+                    s.output_paths = paths;
+                    true
+                });
+                let _ = reply.send(ok);
+            }
             DebugCmd::ClearDrvContent { drv_hash, reply } => {
                 let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
             }

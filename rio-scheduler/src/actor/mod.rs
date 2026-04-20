@@ -208,14 +208,6 @@ pub struct DagActor {
     /// rio-scheduler's test build links against rio-common built WITHOUT
     /// `cfg(test)`, so a test-gated constant there is invisible here.
     grpc_timeout: std::time::Duration,
-    /// Max in-flight `QueryPathInfo` calls during merge-time eager
-    /// substitute fetch (r[sched.merge.substitute-fetch]). Bounds
-    /// `buffer_unordered(N)` in `check_cached_outputs`. Unbounded
-    /// fan-out of ~1k concurrent QPI calls saturates the store's S3
-    /// connection pool → "dispatch failure" → false demotes. Default
-    /// [`DEFAULT_SUBSTITUTE_CONCURRENCY`]. Overridable via
-    /// `RIO_SUBSTITUTE_MAX_CONCURRENT` env or scheduler.toml.
-    substitute_max_concurrent: usize,
     /// Bounds in-flight detached substitute-fetch tasks. The
     /// pre-59a6803a synchronous path used `buffer_unordered(max)`; the
     /// detached spawn loop dropped that, so a 17k-path merge spawned
@@ -470,7 +462,6 @@ impl DagActor {
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
-            substitute_max_concurrent: cfg.substitute_max_concurrent.max(1),
             substitute_sem: Arc::new(tokio::sync::Semaphore::new(
                 cfg.substitute_max_concurrent.max(1),
             )),
