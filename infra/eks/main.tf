@@ -248,8 +248,14 @@ module "eks" {
       # `forward . /etc/resolv.conf` (node DHCP option set → 10.42.0.2)
       # is unreachable from the coredns pod: "dial udp 10.42.0.2:53:
       # network is unreachable". Route53 Resolver's well-known v6
-      # address works from any v6-enabled subnet and honours the
-      # subnet-level DNS64 flag (AAAA-synth under 64:ff9b::/96).
+      # address works from any v6-enabled subnet.
+      #
+      # dns64: the subnets have EnableDns64=True, but Resolver does NOT
+      # synthesise 64:ff9b:: AAAA for queries forwarded by in-cluster
+      # CoreDNS (likely gates on query source IP — pod IPs aren't in a
+      # subnet CIDR). Synthesise here instead, same as the k3s fixture.
+      # Plugin order is compile-time fixed: AAAA query → forward returns
+      # NODATA → dns64 issues A → forward answers → dns64 wraps.
       configuration_values = jsonencode({
         corefile = <<-EOT
           .:53 {
@@ -264,6 +270,7 @@ module "eks" {
               }
               prometheus :9153
               forward . fd00:ec2::253
+              dns64 64:ff9b::/96
               cache 30
               loop
               reload

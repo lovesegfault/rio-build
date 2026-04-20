@@ -61,7 +61,7 @@ impl Provider for Eks {
     }
 
     async fn tunnel(&self, local_port: u16) -> Result<crate::k8s::shared::ProcessGuard> {
-        smoke::ssm_tunnel(local_port).await
+        smoke::gateway_port_forward(local_port).await
     }
 
     async fn tunnel_grpc(

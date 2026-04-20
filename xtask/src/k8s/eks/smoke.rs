@@ -1,11 +1,11 @@
-//! End-to-end smoke test via SSM-tunneled gateway.
+//! End-to-end smoke test via port-forwarded gateway.
 //!
 //! EKS-unique surface only — VM tests (`nix/tests/`) cover the
 //! trivial-build path and worker-kill chaos. This validates:
 //!   1. bootstrap tenant via rio-cli (port-forwarded scheduler+store)
 //!   2. install SSH key, restart gateway
 //!   3. NLB target registration + health (aws-lbc reconcile)
-//!   4. SSM tunnel through bastion → NLB → gateway
+//!   4. port-forward gateway:22 (NLB ingress: vm-ingress-v4v6-k3s)
 //!   5. large-output build (NAR > 256 KiB → chunked S3 path → IRSA)
 
 use std::io::Write;
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use ::kube::api::{Api, ListParams};
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info};
@@ -180,11 +180,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         ui::step("install ssh key", || step_install_key(&client)).await?;
         ui::step("restart gateway", || step_restart_gateway(&client)).await?;
         // NLB target registration + health-check cycle is separate
-        // from pod readiness (~30-90s). Wait before starting the SSM
-        // tunnel so the bastion's agent doesn't hit "connection to
-        // destination port failed" while targets are still `initial`.
+        // from pod readiness (~30-90s). Kept as an EKS-unique aws-lbc
+        // assertion even though the build below now goes via port-
+        // forward — the actual NLB ingress path is what
+        // vm-ingress-v4v6-k3s covers.
         ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
-        let _tunnel = ui::step("SSM tunnel", || ssm_tunnel(LOCAL_PORT)).await?;
+        let _tunnel = ui::step("port-forward gateway", || gateway_port_forward(LOCAL_PORT)).await?;
         ui::step("builder pool reconcile", || {
             step_pool_reconciled(&client, NS_BUILDERS, BUILDER_POOL)
         })
@@ -436,73 +437,17 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
     )
 }
 
-/// Spawn SSM tunnel through the bastion → NLB → gateway. Gathers
-/// bastion/region from tofu outputs and NLB hostname from the
-/// Service status. Waits for the SSH banner to read through before
-/// returning — proves the full forward path works, not just that
-/// session-manager-plugin bound the local socket.
-pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
-    let tf = tofu::outputs(TF_DIR)?;
-    let region = tf.get("region")?;
-    let bastion = tf.get("bastion_instance_id")?;
-
-    let client = kube::client().await?;
-    let svcs: Api<Service> = Api::namespaced(client, NS);
-    let nlb = ui::poll("NLB hostname", Duration::from_secs(5), 30, || {
-        let svcs = svcs.clone();
-        async move {
-            Ok(svcs
-                .get("rio-gateway")
-                .await?
-                .status
-                .and_then(|s| s.load_balancer?.ingress?.into_iter().next()?.hostname))
-        }
-    })
-    .await?;
-
-    // I-158: a SIGKILL'd or panicked prior run leaks the
-    // session-manager-plugin (ProcessGuard::drop never fired). Reap
-    // any stale listener before binding — same pre-start cleanup
-    // with_remote_store does (P0539e).
+/// `kubectl port-forward svc/rio-gateway local:22` + SSH-banner
+/// readiness. Replaces the old bastion→NLB:22 SSM path:
+/// `loadBalancerSourceRanges` is set to public CIDRs only, so the
+/// bastion's intra-VPC source isn't in that allowlist. Port-forward
+/// reaches the pod via the apiserver proxy regardless of NLB ingress
+/// rules; the NLB ingress path itself is what vm-ingress-v4v6-k3s
+/// covers.
+pub async fn gateway_port_forward(local_port: u16) -> Result<ProcessGuard> {
     crate::k8s::shared::kill_port_listeners(local_port);
-
-    info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
-    let mut cmd = tokio::process::Command::new("aws");
-    cmd.args([
-        "ssm",
-        "start-session",
-        "--region",
-        &region,
-        "--target",
-        &bastion,
-    ])
-    .args([
-        "--document-name",
-        "AWS-StartPortForwardingSessionToRemoteHost",
-    ])
-    .args([
-        "--parameters",
-        &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::piped());
-    let mut guard = ProcessGuard::spawn(cmd)?;
-    let mut stderr = guard.child.stderr.take().context("no stderr")?;
-
-    // aws ssm fails fast on plugin-missing / IAM-denied / bad-target.
-    // Give it 2s; if it died, surface the stderr instead of timing out
-    // the banner poll 30s later with no clue why.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    if let Some(status) = guard.child.try_wait()? {
-        let mut err = String::new();
-        stderr.read_to_string(&mut err).await?;
-        bail!("aws ssm exited ({status}): {}", err.trim());
-    }
-
-    // 25×3s = 75s. NLB health (TCP accept on traffic-port) flips healthy
-    // ~30s after target registration, but listener→target route propagation
-    // across AZs lags another ~10-30s. The previous 30s window raced that
-    // gap whenever smoke's gateway-restart re-registered targets (I-151).
+    let (_, guard) =
+        crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
