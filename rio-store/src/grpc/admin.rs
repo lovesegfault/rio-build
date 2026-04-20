@@ -188,7 +188,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             extra_roots: req.extra_roots,
         };
 
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("admin-trigger-gc", async move {
             if let Err(e) = gc::run_gc(&pool, chunk_backend, params, tx.clone(), &shutdown).await {
                 // run_gc already warn!-logged the detail. Forward
                 // the terminal Err into the stream so the client's
@@ -248,7 +248,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let pool = self.pool.clone();
         let shutdown = self.shutdown.clone();
 
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("admin-verify-chunks", async move {
             let mut scanned = 0u64;
             let mut missing = 0u64;
             // Keyset cursor: blake3_hash > $cursor ORDER BY blake3_hash.
@@ -406,6 +406,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<ListUpstreamsRequest>,
     ) -> Result<Response<ListUpstreamsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
         let ups = metadata::upstreams::list_for_tenant(&self.pool, tenant_id)
@@ -421,6 +422,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<AddUpstreamRequest>,
     ) -> Result<Response<UpstreamInfo>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
 
@@ -468,6 +470,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<RemoveUpstreamRequest>,
     ) -> Result<Response<()>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
         let n = metadata::upstreams::delete(&self.pool, tenant_id, &req.url)
@@ -493,11 +496,12 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// on it anyway).
     // r[impl store.admin.get-load]
     // r[impl obs.metric.store-pg-pool]
-    #[instrument(skip(self, _request), fields(rpc = "GetLoad"))]
+    #[instrument(skip(self, request), fields(rpc = "GetLoad"))]
     async fn get_load(
         &self,
-        _request: Request<GetLoadRequest>,
+        request: Request<GetLoadRequest>,
     ) -> Result<Response<GetLoadResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let util = Self::pg_pool_utilization(&self.pool);
         metrics::gauge!("rio_store_pg_pool_utilization").set(util as f64);
         debug!(pg_pool_utilization = util, "GetLoad");

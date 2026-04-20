@@ -227,7 +227,7 @@ impl Drop for PlaceholderGuard {
         let pool = self.pool.clone();
         let chunk_backend = self.chunk_backend.take();
         let store_path_hash = std::mem::take(&mut self.store_path_hash);
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("put-path-placeholder-reap", async move {
             if let Err(e) =
                 crate::gc::orphan::reap_one(&pool, &store_path_hash, None, chunk_backend.as_ref())
                     .await
