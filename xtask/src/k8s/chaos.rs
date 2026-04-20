@@ -318,10 +318,20 @@ iptables -C FORWARD -j {CHAIN} 2>/dev/null || iptables -I FORWARD -j {CHAIN}
 iptables -A {CHAIN} -s {target_ip} -j DROP
 iptables -A {CHAIN} -d {target_ip} -j DROP
 echo "blackhole active: {target_ip} via chain {CHAIN}"
-sleep {dur_secs}
+sleep {dur_secs} &
+wait $!
 echo "duration elapsed, exiting (trap will clean)"
 "#
     )
+}
+
+/// Per-invocation pod-name nonce. Unix-seconds — distinct across runs
+/// so a stale Succeeded pod from a SIGKILL'd session doesn't collide
+/// with the next `pods.create` (409 AlreadyExists). NOT derived from
+/// `session_dir.file_name()`: stress passes a fixed `.stress-test/chaos`
+/// dir, so that derivation produced `rio-chaos-chaos-0` every time.
+fn session_nonce() -> i64 {
+    jiff::Timestamp::now().as_second()
 }
 
 /// One-shot remediation script — runs without the trap dance (it's
@@ -415,12 +425,9 @@ pub async fn run(
         info!("from: {desc} on node {node}");
     }
 
-    // Unique pod-name suffix per session (unix-ts dirname). One chaos
-    // pod per node — name is `rio-chaos-<ts>-<idx>`.
-    let session_ts = session_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("0");
+    // Unique pod-name suffix per invocation. One chaos pod per node —
+    // name is `rio-chaos-<ts>-<idx>`.
+    let session_ts = session_nonce();
 
     let dur_secs = duration.as_secs();
     let script = chaos_script(&target_ip, dur_secs);
@@ -602,10 +609,7 @@ pub async fn remediate(session_dir: &Path) -> Result<(usize, bool)> {
     let client = k::client().await?;
     let pods: Api<Pod> = Api::namespaced(client.clone(), CHAOS_NS);
 
-    let session_ts = session_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("0");
+    let session_ts = session_nonce();
     let script = remediation_script();
     let mut remediated = 0;
 
@@ -753,8 +757,12 @@ mod tests {
         // Trap cleanup.
         assert!(s.contains("trap cleanup TERM EXIT"));
         assert!(s.contains("iptables -X RIO-CHAOS"));
-        // Duration interpolated.
-        assert!(s.contains("sleep 60"));
+        // Duration interpolated; sleep MUST be backgrounded + wait so
+        // the TERM trap fires immediately (POSIX sh defers traps until
+        // the foreground utility exits — a foreground `sleep 60` with
+        // terminationGracePeriodSeconds=30 means SIGKILL before cleanup).
+        assert!(s.contains("sleep 60 &\nwait $!"));
+        assert!(!s.contains("sleep 60\necho"));
         // No nsenter — hostNetwork is enough; nsenter -m pulled in
         // Bottlerocket brush.
         assert!(!s.contains("nsenter"));
