@@ -244,31 +244,129 @@ fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T)
     req
 }
 
-/// Regression: with `service_verifier` configured, a request without
-/// `x-rio-service-token` is rejected. Builders share port 9001 with
-/// AdminService; without this gate a compromised builder could forge
-/// `interrupt_samples` to bias λ\[h\] fleet-wide.
+/// Every mutating AdminService RPC is service-token gated. Builders
+/// share port 9001 with this service (CCNP allows scheduler:9001 at L4
+/// only) and the JWT interceptor is permissive-on-absent-header — so
+/// without `ensure_service_caller` a compromised builder reaches every
+/// handler. Per the threat model "the worker is NOT trusted".
+///
+/// **Adding a new RPC:** add it to either this table (mutating) or the
+/// read-only allowlist comment below — never neither. The table is the
+/// structural lock that makes "forgot the gate on a new RPC" surface as
+/// an obvious review diff (bug_013: 7 of 11 mutating RPCs were ungated
+/// before this test became the canonical list).
+///
+/// Read-only RPCs (intentionally ungated — dashboard/grpc-web reach
+/// them with no HMAC): `GetBuildLogs`, `ClusterStatus`, `ListExecutors`,
+/// `ListBuilds`, `ListPoisoned`, `ListTenants`, `GetBuildGraph`,
+/// `GetSpawnIntents`, `InspectBuildDag`, `DebugListExecutors`,
+/// `ListSlaOverrides`, `SlaStatus`, `SlaExplain`, `ExportSlaCorpus`.
 // r[verify sec.authz.service-token]
 #[tokio::test]
-async fn append_interrupt_sample_without_service_token_rejected() {
+async fn mutating_rpcs_require_service_token() {
     let (svc, _signer, _task, _db) = setup_svc_with_service_verifier().await;
-    let r = AppendInterruptSampleRequest {
-        hw_class: "aws-8-nvme-hi".into(),
-        kind: "interrupt".into(),
-        value: 1.0,
-        event_uid: None,
-    };
-    let err = svc
-        .append_interrupt_sample(Request::new(r))
+    let denied = tonic::Code::PermissionDenied;
+
+    macro_rules! assert_gated {
+        ($name:literal, $call:expr) => {{
+            let code = $call.await.unwrap_err().code();
+            assert_eq!(code, denied, "{} must be service-token gated", $name);
+        }};
+    }
+
+    assert_gated!(
+        "DrainExecutor",
+        svc.drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: "victim".into(),
+            force: true,
+        }))
+    );
+    assert_gated!(
+        "ReportExecutorTermination",
+        svc.report_executor_termination(Request::new(ReportExecutorTerminationRequest {
+            executor_id: "victim".into(),
+            reason: TerminationReason::OomKilled as i32,
+        }))
+    );
+    assert_gated!(
+        "AckSpawnedIntents",
+        svc.ack_spawned_intents(Request::new(AckSpawnedIntentsRequest { spawned: vec![] }))
+    );
+    assert_gated!(
+        "AppendInterruptSample",
+        svc.append_interrupt_sample(Request::new(AppendInterruptSampleRequest {
+            hw_class: "aws-8-nvme-hi".into(),
+            kind: "interrupt".into(),
+            value: 1.0,
+            event_uid: None,
+        }))
+    );
+    assert_gated!(
+        "ClearPoison",
+        svc.clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "h".into(),
+        }))
+    );
+    assert_gated!(
+        "CreateTenant",
+        svc.create_tenant(Request::new(CreateTenantRequest::default()))
+    );
+    assert_gated!(
+        "SetSlaOverride",
+        svc.set_sla_override(Request::new(SetSlaOverrideRequest::default()))
+    );
+    assert_gated!(
+        "ClearSlaOverride",
+        svc.clear_sla_override(Request::new(ClearSlaOverrideRequest::default()))
+    );
+    assert_gated!(
+        "ResetSlaModel",
+        svc.reset_sla_model(Request::new(ResetSlaModelRequest::default()))
+    );
+    assert_gated!(
+        "ImportSlaCorpus",
+        svc.import_sla_corpus(Request::new(ImportSlaCorpusRequest::default()))
+    );
+    assert_gated!(
+        "InjectBuildSample",
+        svc.inject_build_sample(Request::new(InjectBuildSampleRequest::default()))
+    );
+    assert_gated!(
+        "CancelBuild",
+        svc.cancel_build(Request::new(CancelBuildRequest {
+            build_id: uuid::Uuid::nil().to_string(),
+            reason: "test".into(),
+        }))
+    );
+
+    // TriggerGC is server-streaming with the grpc-web Trailers-Only
+    // convention: error is yielded IN-STREAM, not as handler-level Err.
+    let mut stream = svc
+        .trigger_gc(Request::new(GcRequest::default()))
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert!(err.message().contains(rio_proto::SERVICE_TOKEN_HEADER));
+        .expect("server-streaming handler returns Ok(stream)")
+        .into_inner();
+    let status = stream
+        .next()
+        .await
+        .expect("one item")
+        .expect_err("first item is Err(PermissionDenied)");
+    assert_eq!(
+        status.code(),
+        denied,
+        "TriggerGC must be service-token gated"
+    );
 }
 
+/// Positive path: valid token with allowlisted `caller` passes the
+/// gate; wrong caller is rejected. One representative RPC per
+/// allowlist shape — the tokenless-reject coverage above is
+/// per-RPC.
 #[tokio::test]
-async fn append_interrupt_sample_with_valid_token_ok() {
+async fn service_token_allowlist_enforced() {
     let (svc, signer, _task, db) = setup_svc_with_service_verifier().await;
+
+    // controller-only allowlist (`["rio-controller"]`).
     let r = AppendInterruptSampleRequest {
         hw_class: "aws-8-nvme-hi".into(),
         kind: "interrupt".into(),
@@ -277,81 +375,43 @@ async fn append_interrupt_sample_with_valid_token_ok() {
     };
     svc.append_interrupt_sample(req_with_token(&signer, "rio-controller", r.clone()))
         .await
-        .expect("valid rio-controller token → Ok");
-
-    // Wrong caller in allowlist → rejected.
+        .expect("rio-controller allowed");
     let err = svc
         .append_interrupt_sample(req_with_token(&signer, "rio-gateway", r))
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     assert!(err.message().contains("allowlist"));
-
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM interrupt_samples")
         .fetch_one(&db.pool)
         .await
         .unwrap();
     assert_eq!(n, 1, "exactly one accepted insert");
-}
 
-/// All controller-only mutating RPCs are gated. A compromised builder
-/// sharing port 9001 must not reach any of them.
-#[tokio::test]
-async fn controller_only_rpcs_without_service_token_rejected() {
-    let (svc, signer, _task, _db) = setup_svc_with_service_verifier().await;
-
-    // ReportExecutorTermination: forged OOMKilled → resource_floor poisoning.
-    let term = ReportExecutorTerminationRequest {
-        executor_id: "victim".into(),
-        reason: TerminationReason::OomKilled as i32,
-    };
-    assert_eq!(
-        svc.report_executor_termination(Request::new(term.clone()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
-    );
-    svc.report_executor_termination(req_with_token(&signer, "rio-controller", term))
-        .await
-        .expect("rio-controller allowed");
-
-    // AckSpawnedIntents: forged ack → false ICE arm.
-    let ack = AckSpawnedIntentsRequest { spawned: vec![] };
-    assert_eq!(
-        svc.ack_spawned_intents(Request::new(ack.clone()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
-    );
-    svc.ack_spawned_intents(req_with_token(&signer, "rio-controller", ack))
-        .await
-        .expect("rio-controller allowed");
-}
-
-/// Sibling: `DrainExecutor` is also gated. A builder draining arbitrary
-/// executors is a DoS.
-#[tokio::test]
-async fn drain_executor_without_service_token_rejected() {
-    let (svc, signer, _task, _db) = setup_svc_with_service_verifier().await;
-    let r = DrainExecutorRequest {
+    // controller+cli allowlist (`["rio-controller","rio-cli"]`).
+    let drain = DrainExecutorRequest {
         executor_id: "victim".into(),
         force: true,
     };
+    svc.drain_executor(req_with_token(&signer, "rio-controller", drain.clone()))
+        .await
+        .expect("rio-controller allowed");
+    svc.drain_executor(req_with_token(&signer, "rio-cli", drain))
+        .await
+        .expect("rio-cli allowed");
+
+    // cli-only allowlist (`["rio-cli"]`).
+    let cp = ClearPoisonRequest {
+        derivation_hash: "h".into(),
+    };
+    svc.clear_poison(req_with_token(&signer, "rio-cli", cp.clone()))
+        .await
+        .expect("rio-cli allowed");
     let err = svc
-        .drain_executor(Request::new(r.clone()))
+        .clear_poison(req_with_token(&signer, "rio-controller", cp))
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-    // rio-controller and rio-cli are both allowlisted callers.
-    svc.drain_executor(req_with_token(&signer, "rio-controller", r.clone()))
-        .await
-        .expect("rio-controller allowed");
-    svc.drain_executor(req_with_token(&signer, "rio-cli", r))
-        .await
-        .expect("rio-cli allowed");
 }
 
 /// `AdminService.CancelBuild` is service-token gated. Builders share

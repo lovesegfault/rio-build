@@ -664,7 +664,7 @@ mod tests {
         let line = vec![b'x'; MAX_LINE_LEN];
         let batch: Vec<&[u8]> = (0..300).map(|_| line.as_slice()).collect();
         bufs.push(&mk_batch("drv-a", 0, &batch));
-        let (count, bytes, _) = bufs.drain("drv-a").unwrap();
+        let (_, count, bytes, _) = bufs.drain("drv-a").unwrap();
         assert!(
             bytes <= RING_BYTE_CAP as u64,
             "bug_080: total bytes must be ≤ RING_BYTE_CAP; got {bytes} \
@@ -681,7 +681,7 @@ mod tests {
         let bufs = LogBuffers::new();
         let huge = vec![b'x'; 200 * 1024];
         bufs.push(&mk_batch("drv-a", 0, &[&huge]));
-        let (_, bytes, lines) = bufs.drain("drv-a").unwrap();
+        let (_, _, bytes, lines) = bufs.drain("drv-a").unwrap();
         assert_eq!(
             lines[0].len(),
             MAX_LINE_LEN,

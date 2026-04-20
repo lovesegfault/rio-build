@@ -324,7 +324,6 @@ pub async fn setup(
     };
 
     Ok(Some(BuilderRuntime {
-        scheduler_addr: cfg.scheduler.addr,
         scheduler_client,
         shutdown,
         fuse_session,

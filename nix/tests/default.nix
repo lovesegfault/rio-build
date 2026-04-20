@@ -468,7 +468,7 @@ in
           #   → worker-ACK → rio_scheduler_warm_prefetch_paths histogram
           #   has had many opportunities to fire. Passive check (~0s).
           "warm-gate"
-          # r[verify builder.shutdown.sigint]
+          # r[verify builder.shutdown.sigint+2]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses worker2 only — no cache-chain coupling.

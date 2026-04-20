@@ -186,14 +186,21 @@ impl AdminServiceImpl {
         self.leader.on_lose();
     }
 
-    /// Gate for controller-only mutating RPCs. Verifies
-    /// `x-rio-service-token` (HMAC-signed [`ServiceClaims`]) and checks
+    /// Gate for mutating RPCs. Verifies `x-rio-service-token`
+    /// (HMAC-signed [`ServiceClaims`]) and checks
     /// `claims.caller ∈ allowed`. `service_verifier == None` → dev-mode
     /// pass-through (parity with the store's assignment-token verifier).
     ///
     /// Builders share port 9001 with this service; without this gate a
     /// compromised builder could write straight into `interrupt_samples`
-    /// (poisoning λ\[h\]) or drain arbitrary executors.
+    /// (poisoning λ\[h\]), drain arbitrary executors, or set SLA
+    /// overrides to bias the solver fleet-wide.
+    ///
+    /// MUST gate every mutating RPC. The canonical list lives in
+    /// `tests::mutating_rpcs_require_service_token` — adding a new
+    /// mutating RPC means adding it there too (so the test fails if
+    /// the gate is forgotten); read-only RPCs go in that test's
+    /// header comment instead.
     ///
     /// Thin wrapper over the shared
     /// [`rio_auth::hmac::ensure_service_caller`] (also used by
@@ -345,7 +352,11 @@ impl AdminService for AdminServiceImpl {
         // grpc-web compatibility: same Trailers-Only constraint as
         // get_build_logs above. ALL error paths return Ok(stream-
         // yielding-Err); the handler never returns Err.
-        if let Err(status) = self.ensure_leader().and_then(|_| self.check_actor_alive()) {
+        if let Err(status) = self
+            .ensure_service_caller(request.metadata(), &["rio-cli"])
+            .and_then(|_| self.ensure_leader())
+            .and_then(|_| self.check_actor_alive())
+        {
             return Ok(Response::new(logs::err_stream(status)));
         }
         let req = request.into_inner();
@@ -370,8 +381,12 @@ impl AdminService for AdminServiceImpl {
 
     /// Mark a worker draining: `has_capacity()` returns false, dispatch
     /// skips it. In-flight builds continue. Called by:
-    ///   - Worker's SIGTERM handler (step 1 of drain)
     ///   - Controller's Pool finalizer cleanup
+    ///   - rio-cli `drain` command (operator workstation)
+    ///
+    /// Builders do NOT call this (their self-drain goodbye was removed
+    /// — heartbeat `draining=true` + stream-close are the deregistration
+    /// path; the service-token gate below excludes builders by design).
     ///
     /// `force=true` reassigns in-flight builds — the worker's nix-daemon
     /// keeps running them (we can't reach into its process tree) but the
@@ -504,6 +519,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ClearPoisonRequest>,
     ) -> Result<Response<ClearPoisonResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -566,6 +582,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<CreateTenantResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         let req = request.into_inner();
         let db = crate::db::SchedulerDb::new(self.pool.clone());
@@ -711,6 +728,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<SetSlaOverrideRequest>,
     ) -> Result<Response<SlaOverride>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         let o = request
             .into_inner()
@@ -749,6 +767,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ClearSlaOverrideRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         let id = request.into_inner().id;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
@@ -764,6 +783,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ResetSlaModelRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
@@ -864,6 +884,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ImportSlaCorpusRequest>,
     ) -> Result<Response<ImportSlaCorpusResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let r = request.into_inner();
@@ -891,6 +912,9 @@ impl AdminService for AdminServiceImpl {
         request: Request<InjectBuildSampleRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Service-token gate first (defence-in-depth: env-gate below is
+        // NOT authz; a misconfigured prod with the var set is still gated).
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         self.ensure_leader()?;
         if std::env::var_os("RIO_ADMIN_TEST_FIXTURES").is_none() {
             return Err(Status::permission_denied(

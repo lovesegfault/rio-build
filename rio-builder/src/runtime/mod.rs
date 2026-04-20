@@ -10,7 +10,7 @@
 //! - `heartbeat`: heartbeat construction + spawn loop
 //! - `prefetch`: PrefetchHint handling + warm-gate ACK
 //! - `setup`: cold-start wiring (identity, cgroup, connect, FUSE)
-//! - `drain`: SIGTERM drain gate + exit-time DrainExecutor RPC
+//! - `drain`: SIGTERM drain gate + build-flushed wait
 
 mod drain;
 mod heartbeat;
@@ -24,7 +24,7 @@ pub use prefetch::handle_prefetch_hint;
 pub use setup::setup;
 pub use slot::{BuildSlot, BuildSlotGuard, try_cancel_build};
 
-use drain::{reconnect_drain_gate, run_drain, wait_build_flushed};
+use drain::{reconnect_drain_gate, wait_build_flushed};
 use prefetch::PrefetchDeps;
 use result::{err_completion, ok_completion, panic_completion, send_completion};
 use setup::{BalanceGuards, WorkerClient};
@@ -461,7 +461,6 @@ pub async fn spawn_build_task(
 /// Holds every long-lived handle the reconnect loop needs so `main()`
 /// reduces to bootstrap → setup → run → teardown.
 pub struct BuilderRuntime {
-    scheduler_addr: String,
     scheduler_client: WorkerClient,
     shutdown: rio_common::signal::Token,
     /// FUSE mount session. Dropped explicitly in [`run`]'s teardown
@@ -608,15 +607,15 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 // bail! not exit(1): unwind the stack so fuse_session
                 // (above) drops → Mount::drop → fusermount -u.
                 // exit(1) would leak the mount → next start EBUSY.
-                // Skip run_drain: heartbeat is the scheduler probe;
-                // if it's dead, DrainExecutor won't land anyway.
+                // Skip teardown: heartbeat is the scheduler probe; if
+                // it's dead the stream is already going.
                 anyhow::bail!("heartbeat loop terminated unexpectedly");
             }
 
             tokio::select! {
                 biased;
 
-                // r[impl builder.shutdown.sigint]
+                // r[impl builder.shutdown.sigint+2]
                 // First SIGTERM: continue to the top of 'reconnect for
                 // the drain transition (set flag, spawn watcher).
                 // `build_stream` is local to this loop body and DROPS
@@ -673,7 +672,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 // biased; ordering: AFTER build_done (a completed
                 // build's exit wins over an idle-timeout that happens
                 // to coincide).
-                // r[impl builder.idle-exit]
+                // r[impl builder.idle-exit+2]
                 _ = tokio::time::sleep_until(last_activity + rt.idle_timeout),
                     if !rt.slot.is_busy() => {
                     info!(
@@ -799,7 +798,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         }
     }
 
-    run_teardown(rt).await;
+    run_teardown(rt);
     Ok(())
 }
 
@@ -822,49 +821,20 @@ async fn reconnect_backoff(rt: &BuilderRuntime) -> std::ops::ControlFlow<()> {
     }
 }
 
-/// Exit teardown after `'reconnect` breaks: heartbeat abort,
-/// `DrainExecutor`, FUSE abort. By now `in_flight=0` (drain_done fired,
-/// or the single build returned its permit).
-async fn run_teardown(rt: BuilderRuntime) {
-    // r[impl builder.ephemeral.exit-aborts-heartbeat]
-    // I-142: stop the heartbeat task FIRST, before run_drain. While
-    // it's alive the scheduler sees `heartbeat-alive but stream_tx
-    // closed` and keeps the executor in its map (undispatchable
-    // zombie). run_drain below has no inherent timeout — if the
-    // scheduler is overloaded, the heartbeat would tick indefinitely.
-    // Abort is fire-and-forget: the task holds only Arcs (no Drop
-    // ordering hazards), and any in-flight HeartbeatRequest is
-    // harmless (scheduler tolerates a final heartbeat after Drain).
-    //
-    // Manual verification (no main-loop test harness): start a
-    // builder against a scheduler with admin RPCs blocked
-    // (iptables DROP), trigger a build → completion. Pre-fix: process
-    // logs "drain complete, exiting" never appears; heartbeats keep
-    // landing every 10s. Post-fix: heartbeats stop within one
-    // interval; process exits at the 5s timeout below.
+/// Exit teardown after `'reconnect` breaks: heartbeat abort, FUSE
+/// abort. By now `in_flight=0` (drain_done fired, or the single build
+/// returned its permit). Deregistration happens via the stream-close
+/// that follows (process exit drops the bidi → `ExecutorDisconnected`);
+/// heartbeat already reported `draining=true` during the wait.
+fn run_teardown(rt: BuilderRuntime) {
+    // r[impl builder.ephemeral.exit-aborts-heartbeat+2]
+    // I-142: stop the heartbeat task FIRST. While it's alive the
+    // scheduler sees `heartbeat-alive but stream_tx closed` and keeps
+    // the executor in its map (undispatchable zombie). Abort is
+    // fire-and-forget: the task holds only Arcs (no Drop ordering
+    // hazards), and any in-flight HeartbeatRequest is harmless.
     rt.heartbeat_handle.abort();
-
-    // Exit deregister. By now in_flight=0 (drain_done fired, or the
-    // single build returned its permit). DrainExecutor
-    // here is the explicit "I'm leaving" — heartbeat already told
-    // the scheduler `draining=true` during the wait. Best-effort:
-    // 50% chance of standby (I-046), but the stream-close that
-    // follows (process exit drops the bidi) triggers
-    // ExecutorDisconnected anyway.
-    //
-    // I-142: 5s hard timeout. run_drain's connect + RPC have no
-    // built-in timeout; an overloaded scheduler stalls this and the
-    // process never reaches drop(fuse_session) below. Best-effort
-    // means best-effort — log and move on.
-    if tokio::time::timeout(
-        Duration::from_secs(5),
-        run_drain(&rt.scheduler_addr, &rt.build_ctx.executor_id),
-    )
-    .await
-    .is_err()
-    {
-        tracing::debug!("DrainExecutor timed out (5s); proceeding to exit");
-    }
+    info!("drain complete, exiting");
 
     // r[impl builder.shutdown.fuse-abort]
     // I-165: abort the FUSE connection FIRST. The builder both serves
@@ -992,11 +962,10 @@ async fn handle_assignment(
     // still be in sink_rx if relay_target=None),
     // then exit. The select arm on
     // `build_done.notified()` breaks the inner
-    // loop → outer loop breaks → run_drain
-    // (no-op here: slot already idle,
-    // DrainExecutor deregisters us) → FUSE
-    // drop → exit 0 → pod terminates → Job
-    // complete.
+    // loop → outer loop breaks → teardown
+    // (heartbeat abort + FUSE drop; stream-close
+    // deregisters us) → exit 0 → pod terminates
+    // → Job complete.
     //
     // Why not break immediately here: the build
     // is still RUNNING (spawn_build_task
@@ -1005,7 +974,7 @@ async fn handle_assignment(
     // the CompletionReport to land in the
     // scheduler. The slot going idle is the
     // synchronization point — same mechanism
-    // run_drain uses.
+    // the drain watcher uses.
     //
     // Why spawn a watcher task (not inline
     // wait_idle here): inlining would block
@@ -2039,7 +2008,7 @@ mod tests {
     /// FUSE/gRPC entanglement — so this reproduces the two arms that
     /// matter under paused time).
     #[tokio::test(start_paused = true)]
-    // r[verify builder.idle-exit]
+    // r[verify builder.idle-exit+2]
     async fn idle_timeout_fires_with_no_assignment() {
         let slot = Arc::new(BuildSlot::default());
         let idle_timeout = Duration::from_secs(120);
