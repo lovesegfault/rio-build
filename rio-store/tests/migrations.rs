@@ -80,6 +80,48 @@ async fn concurrent_migrations_no_deadlock() {
     assert_eq!(applied, MIGRATOR.iter().count() as i64);
 }
 
+/// M_050 regression: 020's `[[:space:]]` / `trim()` are ASCII-only;
+/// Rust `NormalizedName::new` is Unicode-aware. NBSP (U+00A0) passed
+/// 020's CHECK but failed Rust → manual-INSERT zombie row. 050's
+/// `^[a-zA-Z0-9._-]+$` allowlist rejects ALL non-allowlisted chars,
+/// closing the gap.
+///
+/// Direct INSERT bypasses CreateTenant's Rust-side validation, so a
+/// failing INSERT proves the *database* layer rejects it.
+#[tokio::test]
+async fn migration_050_allowlist_rejects_unicode_ws() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    // Interior NBSP: passed 020 (NBSP ∉ POSIX [[:space:]]); rejected
+    // by 050's allowlist.
+    let err = sqlx::query("INSERT INTO tenants (tenant_name) VALUES ('team' || chr(160) || 'a')")
+        .execute(&db.pool)
+        .await
+        .expect_err("interior NBSP must fail tenant_name_allowlist");
+    assert!(
+        err.to_string().contains("tenant_name_allowlist"),
+        "expected tenant_name_allowlist violation, got: {err}"
+    );
+
+    // Trailing NBSP: PG trim() does NOT strip it (only U+0020), so
+    // 020's `tenant_name = trim(tenant_name)` passed; allowlist rejects.
+    let err = sqlx::query("INSERT INTO tenants (tenant_name) VALUES ('team-a' || chr(160))")
+        .execute(&db.pool)
+        .await
+        .expect_err("trailing NBSP must fail tenant_name_allowlist");
+    assert!(
+        err.to_string().contains("tenant_name_allowlist"),
+        "expected tenant_name_allowlist violation, got: {err}"
+    );
+
+    // Positive control: allowlisted name inserts cleanly. Without
+    // this, a `CHECK (false)` typo would pass both negatives above.
+    sqlx::query("INSERT INTO tenants (tenant_name) VALUES ('team-a.0_1')")
+        .execute(&db.pool)
+        .await
+        .expect("allowlisted name must pass both 020 and 050 CHECKs");
+}
+
 /// sqlx checksums migration files by content — editing a comment
 /// changes the checksum and bricks persistent-DB deploys. This test
 /// pins the checksum of each migration after it ships.
@@ -155,6 +197,7 @@ fn migration_checksums_frozen() {
         (47, "0217805341c7bdceb715de6b59c7a7d96db79ed9bcd5d5647ee0266a55f58d69e991edd775f6fa84d66939f0f1517886"),
         (48, "324d53bc92cf2964c8dc4384603a7fc02723c19a74cb714b2aeaef9b32e3dbd73cb3e792ddd345a2cc661d7660340091"),
         (49, "267516c69f42c689bc0accf6916179555fffc49a3cab334f8c17b0f539ddcaf4ff3b9444313d143ed21ab2db015ed692"),
+        (50, "b8093c0b8573af60de08ee8eb07c12453023a790a99fca6678442dafd1867a8b4c66cc2c92d9df2b9bdd90a4a84ca0c6"),
         (52, "ada24ea4f6799486d131027e7a8c995e64bd3e56d0716b614eabb683ca3c18beb2eea860de60dc1b6c63003002ab7516"),
     ];
 

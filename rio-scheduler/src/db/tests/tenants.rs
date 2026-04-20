@@ -58,11 +58,11 @@ async fn tenant_seed_optional_columns() {
     );
 }
 
-/// Migration 020 adds a CHECK constraint that rejects tenant
+/// Migrations 020 + 050 add CHECK constraints that reject tenant
 /// names violating the `NormalizedName` invariant (untrimmed,
-/// empty, or containing interior whitespace). This makes the
-/// rio-store auth.rs "PG-stored name failed normalization"
-/// branch provably dead for post-migration rows.
+/// empty, or containing interior whitespace) and the strict ASCII
+/// allowlist respectively. See `rio-store/src/migrations.rs` M_020
+/// for why 020 alone is weaker than `NormalizedName` (Unicode gap).
 ///
 /// Probe via direct INSERT — bypasses CreateTenant's Rust-side
 /// validation, so a failing INSERT proves the *database* layer
@@ -72,11 +72,13 @@ async fn tenant_seed_optional_columns() {
 async fn migration_020_check_rejects_non_normalized_name() {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
 
-    // Each bad case should fail the CHECK with a constraint-name
-    // mention in the error. Positive control at the end: a good
-    // name still inserts. Without the positive control, a
-    // universally-rejecting CHECK (e.g., `CHECK (false)`) would
-    // pass all the negative assertions.
+    // Each bad case should fail a tenant_name CHECK with the
+    // constraint named in the error. PG evaluates multiple CHECKs in
+    // implementation-defined order, so accept either 020's
+    // `tenant_name_normalized` or 050's `tenant_name_allowlist`.
+    // Positive control at the end: a good name still inserts. Without
+    // the positive control, a universally-rejecting CHECK (e.g.,
+    // `CHECK (false)`) would pass all the negative assertions.
     let bad_cases = [
         ("  team  ", "leading+trailing whitespace (trim mismatch)"),
         ("team a", "interior space"),
@@ -95,9 +97,9 @@ async fn migration_020_check_rejects_non_normalized_name() {
         ));
         let msg = err.to_string();
         assert!(
-            msg.contains("tenant_name_normalized"),
-            "error for {bad:?} should name the constraint \
-             `tenant_name_normalized` — got: {msg}"
+            msg.contains("tenant_name_normalized") || msg.contains("tenant_name_allowlist"),
+            "error for {bad:?} should name a tenant_name CHECK \
+             (tenant_name_normalized / tenant_name_allowlist) — got: {msg}"
         );
     }
 

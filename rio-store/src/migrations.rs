@@ -125,6 +125,37 @@ pub const M_009: () = ();
 /// prevent the third.
 pub const M_018: () = ();
 
+/// `migrations/020_tenant_name_check.sql`
+///
+/// ## Header overstates the guarantee
+///
+/// The frozen header claims "PG-side enforcement of the
+/// `NormalizedName` invariant" and that a Rust-side rejection branch
+/// is "provably dead". That holds only for ASCII whitespace: PG
+/// `trim()` strips only U+0020 and POSIX `[[:space:]]` matches only
+/// the six ASCII whitespace chars, while `NormalizedName::new`
+/// (`rio-common/src/tenant.rs`) uses Unicode-aware `str::trim()` /
+/// `char::is_whitespace()` (~25 codepoints incl. NBSP U+00A0). A name
+/// like `'team\u{00A0}a'` passes this CHECK but is rejected by Rust —
+/// a manual-INSERT (which the header explicitly scopes in) yields a
+/// zombie row reachable by no normalized request.
+///
+/// ## Stale file reference
+///
+/// Header line 10 references "rio-store auth.rs", which does not
+/// exist. The relevant Rust-side normalization lives in
+/// `rio-common/src/tenant.rs`; tenant resolution callers are in
+/// `rio-scheduler/src/grpc/` and `rio-scheduler/src/db/tenants.rs`.
+///
+/// ## Superseded
+///
+/// Migration 050 (`tenant_name_allowlist`) adds a strict ASCII
+/// allowlist `^[a-zA-Z0-9._-]+$`, which is strictly stronger than
+/// both 020's CHECK and Rust's whitespace check — any string passing
+/// the allowlist has no whitespace of any kind. 020's
+/// `tenant_name_normalized` constraint stays (cheap, redundant).
+pub const M_020: () = ();
+
 /// `migrations/023_chunks_refcount_nonneg.sql`
 ///
 /// Adds `CHECK (refcount >= 0)` to `chunks`.
@@ -771,6 +802,23 @@ pub const M_048: () = ();
 /// Hot-apply with `CREATE INDEX CONCURRENTLY` first; the migration's
 /// `IF NOT EXISTS` then no-ops on deploy (same pattern as M_029).
 pub const M_049: () = ();
+
+/// `migrations/050_tenant_name_allowlist.sql`
+///
+/// Strict ASCII allowlist `^[a-zA-Z0-9._-]+$` on `tenants.tenant_name`,
+/// superseding 020's weak `[[:space:]]` check (see [`M_020`] for the
+/// Unicode-whitespace gap it left). Allowlist over Unicode-regex
+/// because PG's POSIX classes are locale-dependent and `\s` does not
+/// match NBSP under either `C` (CI) or `en_US.UTF-8` (prod); an
+/// explicit allowlist is unambiguous and matches what tenant names
+/// actually look like (the 8 OceanSprint tenants are all `[a-z0-9-]+`).
+///
+/// `NormalizedName::new` is NOT tightened to the allowlist in this
+/// change — that's a Rust-side behaviour change with wider blast
+/// radius (every CreateTenant/SubmitBuild caller). The migration alone
+/// makes PG ⊇ Rust-rejection-set, satisfying 020's frozen-comment
+/// intent. Tightening Rust to match is a separate follow-up.
+pub const M_050: () = ();
 
 /// `migrations/052_manifests_claim_id.sql`
 ///

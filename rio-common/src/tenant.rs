@@ -205,6 +205,26 @@ mod tests {
         );
     }
 
+    /// `str::trim()` / `char::is_whitespace()` are Unicode-aware (full
+    /// `White_Space` property, ~25 codepoints). PG `trim()` and POSIX
+    /// `[[:space:]]` are ASCII-only, so migration 020's CHECK is
+    /// strictly weaker than this — migration 050's allowlist closes
+    /// that gap PG-side. This test pins the Rust behaviour the
+    /// allowlist now backs.
+    #[test]
+    fn unicode_whitespace_is_whitespace() {
+        // Interior NBSP → rejected.
+        assert_eq!(
+            NormalizedName::new("team\u{00a0}a"),
+            Err(NameError::InteriorWhitespace("team\u{00a0}a".into()))
+        );
+        // Trailing NBSP → trimmed (PG trim() would NOT strip it).
+        assert_eq!(
+            NormalizedName::new("team-a\u{00a0}").unwrap().as_str(),
+            "team-a"
+        );
+    }
+
     #[test]
     fn from_maybe_empty_maps_to_none() {
         // The single-tenant-mode helper: None for invalid, Some for
