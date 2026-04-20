@@ -8,12 +8,15 @@
 //!   4. SSM tunnel through bastion → NLB → gateway
 //!   5. large-output build (NAR > 256 KiB → chunked S3 path → IRSA)
 
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use ::kube::api::{Api, ListParams};
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
+use nix::sys::memfd::{MFdFlags, memfd_create};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info};
 
@@ -42,34 +45,71 @@ const BUILDER_POOL: &str = "x86-64";
 const FETCHER_POOL: &str = "x86-64-fetcher";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
-/// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
-/// — dropping this tears everything down. Fetched once at the top of
-/// the phase and threaded through to each step that needs rio-cli
-/// (cheaper than re-opening tunnels per step, and keeps `step_tenant`/
-/// `step_status` provider-agnostic).
+/// scheduler+store. Holds the tunnel guards, the mTLS cert tempdir,
+/// and the service-HMAC key memfd — dropping this tears everything
+/// down. Fetched once at the top of the phase and threaded through to
+/// each step that needs rio-cli (cheaper than re-opening tunnels per
+/// step, and keeps `step_tenant`/ `step_status` provider-agnostic).
 pub struct CliCtx {
     _guards: ((u16, ProcessGuard), (u16, ProcessGuard)),
     sched: u16,
     store: u16,
+    /// Service-identity HMAC key, fetched from the live `rio-service-
+    /// hmac` Secret. rio-cli reads `RIO_SERVICE_HMAC_KEY_PATH` and
+    /// attaches `x-rio-service-token` to AdminService RPCs (G10 gates
+    /// `CreateTenant`/`upstream` on it). Held in an anonymous memfd so
+    /// the key never touches disk; child processes read it via
+    /// `/dev/fd/N`. `None` when the Secret doesn't exist (dev cluster
+    /// without HMAC) — rio-cli then runs tokenless and the server side
+    /// admits when its verifier is also `None`.
+    hmac_key_fd: Option<std::fs::File>,
 }
 
 impl CliCtx {
-    /// Open scheduler+store tunnels. Cheap: two `kubectl port-forward`
-    /// children.
-    pub async fn open(_client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
+    /// Open scheduler+store tunnels and fetch the service-HMAC key
+    /// from the cluster. Cheap: two `kubectl port-forward` children +
+    /// one Secret GET.
+    pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
         let guards = crate::k8s::shared::tunnel_grpc(sched, store).await?;
         // I-101: tunnel_grpc may bind ephemeral ports when 0 was
         // passed — use what kubectl actually bound, not the request.
         let (sched, store) = (guards.0.0, guards.1.0);
+
+        // Raw 32-byte key (openssl rand 32) — NOT UTF-8, so fetch
+        // bytes directly rather than via `kube::get_secret_key`.
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
+        let hmac_key_fd = match secrets.get_opt("rio-service-hmac").await? {
+            Some(s) => {
+                let key = s
+                    .data
+                    .and_then(|d| d.get("service-hmac.key").map(|v| v.0.clone()))
+                    .context("Secret rio-service-hmac missing key 'service-hmac.key'")?;
+                // memfd_create(2): key only ever lives in anonymous
+                // RAM. NO MFD_CLOEXEC — the rio-cli child must inherit
+                // the fd to open /dev/fd/N. `HmacSigner::load` reads
+                // via `std::fs::read`, which works on /dev/fd paths.
+                let fd = memfd_create(c"rio-service-hmac", MFdFlags::empty())?;
+                let mut f = std::fs::File::from(fd);
+                f.write_all(&key)?;
+                Some(f)
+            }
+            None => {
+                debug!("Secret rio-service-hmac not found — rio-cli runs tokenless");
+                None
+            }
+        };
+
         Ok(Self {
             _guards: guards,
             sched,
             store,
+            hmac_key_fd,
         })
     }
 
     /// Run rio-cli locally with RIO_SCHEDULER_ADDR/RIO_STORE_ADDR/
-    /// `rio-cli` on PATH; falls back to `cargo run -p rio-cli`.
+    /// RIO_SERVICE_HMAC_KEY_PATH set. `rio-cli` on PATH; falls back to
+    /// `cargo run -p rio-cli`.
     ///
     /// **Exit-code contract:** non-zero exit propagates as `Err` via
     /// [`sh::try_read`]. Callers that tolerate expected-failure exits
@@ -80,6 +120,12 @@ impl CliCtx {
         let sh = shell()?;
         let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{}", self.sched));
         let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{}", self.store));
+        let _e3 = self.hmac_key_fd.as_ref().map(|f| {
+            sh.push_env(
+                "RIO_SERVICE_HMAC_KEY_PATH",
+                format!("/dev/fd/{}", f.as_raw_fd()),
+            )
+        });
         let on_path = sh::try_read(cmd!(sh, "command -v rio-cli")).is_ok();
         if on_path {
             sh::try_read(cmd!(sh, "rio-cli {args...}"))
