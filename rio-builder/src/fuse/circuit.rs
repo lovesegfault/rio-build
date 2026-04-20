@@ -216,23 +216,34 @@ impl<C: Clock> CircuitBreaker<C> {
     ///
     /// Pure sync — no `.await`.
     pub fn record(&self, ok: bool) {
+        let now = self.clock.now();
+        let mut guard = self.open.lock().ignore_poison();
         // The half-open probe (if this thread was it) is over — clear
         // the gate UNCONDITIONALLY: regardless of `ok`, regardless of
         // `n >= threshold`. A wall-clock-trip open at cf<threshold whose
         // probe fails would otherwise leave `probing` set forever
         // (cf=2<5 → the `n>=threshold` arm below isn't taken → no other
-        // place clears it → permanent EIO). Harmless when this thread
-        // wasn't the probe. Not RAII-guarded: a panic between `check()`
-        // and here would leak the gate, but the fetch path between them
+        // place clears it → permanent EIO). Held under the SAME guard as
+        // the `since` update below so a concurrent `check()` can never
+        // observe `{since: stale-half-open, probing: false}` and admit a
+        // second probe (bug_053 — separate statement-temporary
+        // acquisitions defeated the L97-101 single-mutex invariant).
+        // Not RAII-guarded: a panic between `check()` and here would
+        // leak the gate, but the fetch path between them
         // (`fetch_extract_insert`) is network+fs I/O that returns Err,
         // not panics; fuser also catches callback panics.
-        self.open.lock().ignore_poison().probing = false;
+        guard.probing = false;
 
         if ok {
             self.consecutive_failures.store(0, Ordering::Relaxed);
-            *self.last_success.lock().ignore_poison() = Some(self.clock.now());
             // take(): clear + return whether we WERE open, atomically.
-            let was_open = self.open.lock().ignore_poison().since.take().is_some();
+            let was_open = guard.since.take().is_some();
+            // Drop `open` BEFORE taking `last_success` — preserves the
+            // never-nested order (`check()` at L188 takes `last_success`
+            // standalone; nesting them here would risk inversion if a
+            // future caller ever holds `last_success` across `open`).
+            drop(guard);
+            *self.last_success.lock().ignore_poison() = Some(now);
             if was_open {
                 metrics::gauge!("rio_builder_fuse_circuit_open").set(0.0);
                 tracing::info!("FUSE circuit breaker CLOSING — store recovered");
@@ -243,8 +254,6 @@ impl<C: Clock> CircuitBreaker<C> {
             // returns 0) but that's 4 billion consecutive failures —
             // not reachable in practice.
             let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            let now = self.clock.now();
-            let mut guard = self.open.lock().ignore_poison();
             // Refresh `since` when EITHER threshold is reached OR a
             // half-open probe failed (since already Some). The wall-clock
             // trip opens at cf=1; without the `since.is_some()` arm, a
@@ -678,5 +687,66 @@ mod tests {
         assert!(!b.is_open());
         assert!(b.check().is_ok(), "closed: ungated");
         assert!(b.check().is_ok(), "closed: still ungated");
+    }
+
+    /// bug_053: a stale pre-open fetch's `record(false)` racing against
+    /// concurrent half-open `check()` calls MUST NOT leak a second probe.
+    /// Before the fix, `record()` released `open` between `probing=false`
+    /// and the `since` update; in that window `check()` saw
+    /// `{since: stale-half-open, probing: false}` and admitted probe #2.
+    /// With a single guard the intermediate state is unrepresentable.
+    ///
+    /// Best-effort race detector — single-guard makes the bug structurally
+    /// impossible; the loop catches a future re-split of the lock.
+    // r[verify builder.fuse.circuit-breaker+3]
+    #[test]
+    fn stale_record_during_half_open_does_not_leak_second_probe() {
+        const N: usize = 8;
+        const ITERS: usize = 2000;
+        for iter in 0..ITERS {
+            let b = breaker();
+            // Open via threshold; advance to half-open.
+            for _ in 1..=5 {
+                b.record(false);
+            }
+            b.clock.advance(Duration::from_secs(31));
+            // Probe A claims the gate (the legitimate single probe).
+            assert!(b.check().is_ok(), "iter {iter}: probe A admitted");
+
+            // Now race a stale `record(false)` (thread X — a fetch that
+            // started BEFORE the circuit opened and is only now reporting)
+            // against N concurrent `check()` callers. With the bug, X's
+            // `probing=false` write between its two lock acquisitions
+            // lets ONE of the N checkers slip through.
+            let barrier = std::sync::Barrier::new(N + 1);
+            let ok_count = std::thread::scope(|s| {
+                let checkers: Vec<_> = (0..N)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            b.check()
+                        })
+                    })
+                    .collect();
+                s.spawn(|| {
+                    barrier.wait();
+                    b.record(false); // stale fetch X reporting
+                });
+                checkers
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .filter(|r| r.is_ok())
+                    .count()
+            });
+
+            // Probe A is already in flight; NONE of the N racers may be
+            // admitted. With a single guard, every racer sees either
+            // `probing=true` (X hasn't run) or `since=Some(fresh)` (X's
+            // whole critical section ran) — both EIO.
+            assert_eq!(
+                ok_count, 0,
+                "iter {iter}: stale record() leaked {ok_count} extra probe(s)"
+            );
+        }
     }
 }
