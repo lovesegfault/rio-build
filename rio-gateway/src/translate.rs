@@ -560,6 +560,7 @@ pub async fn filter_and_inline_drv(
     let mut total_inlined: usize = 0;
     let mut inlined_count: usize = 0;
     let mut skipped_budget: usize = 0;
+    let mut budget_exhausted = false;
 
     for node in nodes.iter_mut() {
         // At least one output missing → this node will dispatch.
@@ -580,16 +581,18 @@ pub async fn filter_and_inline_drv(
             continue;
         }
 
-        // Budget fast-path. Once total_inlined ≥ INLINE_BUDGET_BYTES no
-        // remaining node can fit (per-node cost is ≥1 byte), so the
-        // gate below would `continue` every time — but only AFTER
-        // paying for parse + cache lookup + full `to_aterm()`
-        // serialize. On a 150k-node cold DAG that's ~148k throwaway
-        // serializations with no `.await` in the loop → multi-second
-        // tokio worker stall. Short-circuit here; the per-node gate
-        // below still handles the bin-packing case (small node fits in
-        // remaining headroom).
-        if total_inlined >= INLINE_BUDGET_BYTES {
+        // Budget fast-path. Once the per-node gate below has rejected
+        // ANY node, we stop serializing — otherwise every remaining
+        // will-dispatch node pays parse + cache lookup + full
+        // `to_aterm()` before rejection. On a 150k-node cold DAG that's
+        // ~148k throwaway serializations with no `.await` in the loop →
+        // multi-second tokio worker stall. The flag arms on first
+        // rejection; this sacrifices bin-packing tiny nodes into the
+        // last few KB of headroom (irrelevant: real .drvs >100 bytes,
+        // MAX_INLINE_DRV_BYTES filters huge ones). `total_inlined`
+        // stays accurate for the debug! metric below — it's NOT
+        // saturated to the cap.
+        if budget_exhausted {
             skipped_budget += 1;
             continue;
         }
@@ -615,11 +618,13 @@ pub async fn filter_and_inline_drv(
             continue;
         }
 
-        // Budget gate. Once we hit 16 MB, skip. Remaining nodes fall
-        // back to worker-fetch. We still loop to count skipped_budget
-        // for the metric, but no more inlining happens.
+        // Budget gate. Once we hit 16 MB, arm the fast-path flag so
+        // subsequent iterations skip BEFORE `to_aterm()`. Remaining
+        // nodes fall back to worker-fetch. We still loop to count
+        // skipped_budget for the metric, but no more inlining happens.
         if total_inlined + aterm_bytes.len() > INLINE_BUDGET_BYTES {
             skipped_budget += 1;
+            budget_exhausted = true;
             continue;
         }
 
@@ -1410,6 +1415,87 @@ mod tests {
             !nodes[1].drv_content.is_empty(),
             "CA node should inline (empty path → always dispatches)"
         );
+        Ok(())
+    }
+
+    /// Once the budget gate rejects ANY node, the fast-path arms and
+    /// every subsequent node (including tiny ones that would fit in
+    /// the headroom) skips `to_aterm()`.
+    ///
+    /// Regression for the dead fast-path: `total_inlined >=
+    /// INLINE_BUDGET_BYTES` could only be true on EXACT equality
+    /// (the per-node gate caps `total_inlined ≤ BUDGET`), so once
+    /// budget was nearly full every remaining will-dispatch node
+    /// still paid the full serialize before rejection — ~148k
+    /// throwaway `to_aterm()` calls on a 150k-node cold DAG, no
+    /// `.await` in the loop → multi-second tokio worker stall.
+    ///
+    /// Structural assertion: trailing 1 KiB nodes have empty
+    /// `drv_content`. Pre-fix they'd bin-pack into the few-KB
+    /// headroom left after the last 60 KiB rejection.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_budget_exhaustion_short_circuits() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (_store, mut store_client, _h) = spawn_mock_store_with_client().await?;
+
+        // Derivation whose to_aterm() is ~pad bytes (env var dominates).
+        // 60 KiB < MAX_INLINE_DRV_BYTES (64 KiB) so the per-node size
+        // gate doesn't fire. INLINE_BUDGET_BYTES (16 MiB) / 60 KiB ≈
+        // 273 — somewhere around node 273-279 the budget gate trips.
+        let make_padded = |out: &str, pad: usize| -> Derivation {
+            let pad_val = "x".repeat(pad);
+            let aterm = format!(
+                r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",[],[("PAD","{pad_val}"),("out","{out}")])"#
+            );
+            Derivation::parse(&aterm).expect("padded ATerm parses")
+        };
+
+        // 280 × ~60 KiB nodes (fills budget, then a few rejected),
+        // then 5 × ~1 KiB nodes. All outputs missing → all dispatch.
+        const N_BIG: usize = 280;
+        const N_SMALL: usize = 5;
+        let mut cache = HashMap::new();
+        let mut nodes = Vec::with_capacity(N_BIG + N_SMALL);
+        for i in 0..(N_BIG + N_SMALL) {
+            // nixbase32 omits e/o/u/t — pad with '0' (valid).
+            let drv_path = sp(&format!("/nix/store/{i:0>32}-b{i}.drv"));
+            let out = format!("/nix/store/{i:0>32}-b{i}-out");
+            let pad = if i < N_BIG { 60 * 1024 } else { 1024 };
+            let drv = make_padded(&out, pad);
+            nodes.push(build_node(drv_path.as_str(), &drv));
+            cache.insert(drv_path, drv);
+        }
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        // Find the first rejection (first will-dispatch node with
+        // empty drv_content). All subsequent nodes — including the
+        // trailing 1 KiB ones — must also be empty.
+        let first_empty = nodes
+            .iter()
+            .position(|n| n.drv_content.is_empty())
+            .expect("budget must exhaust before all 280×60KiB are inlined");
+        assert!(
+            first_empty < N_BIG,
+            "first rejection should be a 60 KiB node (budget ≈ 273 of them)"
+        );
+        for (i, n) in nodes.iter().enumerate().skip(first_empty) {
+            assert!(
+                n.drv_content.is_empty(),
+                "node {i} inlined after budget exhausted at {first_empty} — \
+                 fast-path didn't arm (pre-fix: 1 KiB tail nodes bin-pack into headroom)"
+            );
+        }
+        // Explicit witness: the 1 KiB tail is fully skipped.
+        for n in &nodes[N_BIG..] {
+            assert!(n.drv_content.is_empty(), "1 KiB tail must be skipped");
+        }
+
+        // total_inlined stayed accurate (≤ budget). Sum is the actual
+        // bytes inlined, not the cap.
+        let total: usize = nodes.iter().map(|n| n.drv_content.len()).sum();
+        assert!(total <= INLINE_BUDGET_BYTES);
         Ok(())
     }
 
