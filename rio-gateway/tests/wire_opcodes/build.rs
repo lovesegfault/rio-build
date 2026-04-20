@@ -1451,12 +1451,13 @@ async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
 //
 // r[verify gw.reconnect.backoff]
 //
-// The exhausted test uses `start_paused = true` so tokio auto-advances
-// through the 1s/2s/4s/8s/16s backoff sleeps instantly. The success-case
-// test does NOT use paused time: it goes through real gRPC I/O (WatchBuild
-// creates a new stream + delivers events), and paused-time auto-advance
-// fires gRPC timeout wrappers prematurely while the TCP I/O is pending.
-// One 1s backoff is tolerable for one test.
+// Paused-time auto-advance fires gRPC timeout wrappers prematurely
+// while real-TCP I/O to the in-process mocks is pending. Both tests
+// therefore start in REAL time. The success-case test pays one 1s
+// backoff. The exhausted test reads stderr until the first
+// "reconnecting" log (proving the gRPC phase is done), THEN pauses so
+// auto-advance collapses the remaining 111s of backoff sleeps —
+// `watch_build` has no timeout wrapper so paused-time TCP works there.
 
 /// SubmitBuild stream errors mid-build (transport error after Started event)
 /// → gateway reconnects via WatchBuild → WatchBuild delivers Completed →
@@ -1596,12 +1597,28 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
 }
 
 /// SubmitBuild stream errors → gateway tries WatchBuild → WatchBuild fails
-/// every time (fail_count > MAX_RECONNECT) → gateway gives up →
-/// MiscFailure with "reconnect exhausted".
+/// every time (fail_count ≥ MAX_RECONNECT) → gateway gives up →
+/// `TransientFailure` with "reconnect exhausted".
 ///
 /// Uses opcode 46 so we can read the BuildResult back (opcode 9 would
 /// send STDERR_ERROR; here we want the structured failure).
-#[tokio::test(start_paused = true)]
+///
+/// Starts in REAL time so the resolve/FindMissingPaths/SubmitBuild
+/// gRPC calls (real TCP to in-process mocks) complete without
+/// auto-advance firing their timeout wrappers. Once the handler emits
+/// the first "reconnecting..." `STDERR_NEXT` (proving it's past all
+/// gRPC and into the backoff loop), the test calls `pause()` so
+/// auto-advance collapses the 1+2+4+8+16+5×16=111s of `sleep`s. The
+/// `watch_build` call has no timeout wrapper, so paused-time TCP I/O
+/// to the mock completes normally.
+///
+/// bug_230 history: previously `#[tokio::test(start_paused = true)]`,
+/// which made `resolve_derivation`'s `grpc_get_path` time out
+/// instantly → `resolve_built_dag` `Err` → `MiscFailure(9)` at
+/// build.rs:1300. The test then asserted `status==9` and "passed" —
+/// vacuously, never reaching the reconnect loop it claims to cover.
+// r[verify gw.reconnect.backoff]
+#[tokio::test(flavor = "current_thread")]
 async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
@@ -1617,13 +1634,15 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
         error_after_n: Some((1, tonic::Code::Unavailable)),
         interval: None,
     });
-    // fail_count > MAX_RECONNECT (5) → every WatchBuild attempt fails.
+    // fail_count ≥ MAX_RECONNECT (10) → every WatchBuild attempt fails.
     // The gateway's reconnect loop: process_build_events on dead stream →
     // Transport err → attempt++ → backoff+watch_build → watch_build errs →
-    // next loop iter → dead stream errs again → ... After 5 attempts it
-    // gives up.
+    // next loop iter → dead stream errs again → ... After 10 attempts
+    // (`reconnect_attempts > 10`) it gives up. The loop makes exactly
+    // 10 watch_build calls before the cap fires; 11 fail-tokens covers
+    // the off-by-one in either direction.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+        fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(11)),
         scripted_events: None, // irrelevant — fail_count blocks
     });
     let drv_path = seed_minimal_drv(&h);
@@ -1634,16 +1653,56 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
+    // Real-time: read until the FIRST "reconnecting" log. The handler
+    // emits this AFTER `reconnect_attempts++` and BEFORE
+    // `sleep(backoff)`; seeing it proves resolve/submit gRPC is done.
+    let mut frames = Vec::new();
+    loop {
+        let msg = read_stderr_message(&mut h.stream)
+            .await
+            .expect("read stderr");
+        let is_reconnect = matches!(&msg, StderrMessage::Next(s) if s.contains("reconnecting"));
+        frames.push(msg);
+        if is_reconnect {
+            break;
+        }
+        assert!(
+            !matches!(
+                frames.last(),
+                Some(StderrMessage::Last | StderrMessage::Error(_))
+            ),
+            "handler terminated before reaching reconnect loop: {frames:?}"
+        );
+    }
+
+    // Paused-time: auto-advance collapses the backoff sleeps. No
+    // gRPC timeout wrappers remain (watch_build is bare).
+    tokio::time::pause();
+    loop {
+        let msg = read_stderr_message(&mut h.stream)
+            .await
+            .expect("read stderr");
+        if matches!(msg, StderrMessage::Last) {
+            break;
+        }
+        frames.push(msg);
+    }
+    tokio::time::resume();
+
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1);
     let _derived_path = wire::read_string(&mut h.stream).await?;
     let status = wire::read_u64(&mut h.stream).await?;
     let error_msg = wire::read_string(&mut h.stream).await?;
-    assert_eq!(status, 9, "MiscFailure after reconnect exhausted");
+    // bug_230: was `assert_eq!(status, 9)` (MiscFailure) — handler at
+    // build.rs:870 returns TransientFailure(6). The old assertion
+    // could only have passed by hitting an unintended MiscFailure path
+    // (resolve_built_dag/unknown-path), making the test vacuous for
+    // the reconnect-exhausted arm it claims to cover.
+    assert_eq!(status, 6, "TransientFailure after reconnect exhausted");
     assert!(
-        error_msg.contains("reconnect exhausted") || error_msg.contains("stream error"),
-        "error_msg: {error_msg}"
+        error_msg.contains("reconnect exhausted"),
+        "error_msg must prove the reconnect-exhausted arm was reached, got: {error_msg}"
     );
 
     h.finish().await;
