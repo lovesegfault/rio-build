@@ -664,6 +664,29 @@ impl DerivationDag {
         })
     }
 
+    // r[impl sched.state.transitions]
+    /// Canonical 3-way revert/reset target for a node whose own status is
+    /// being recomputed from its dependencies' CURRENT states. Mirrors
+    /// [`Self::compute_initial_states`]: terminally-failed dep →
+    /// `DependencyFailed`; all deps satisfied → `Ready`; otherwise
+    /// `Queued`.
+    ///
+    /// Exists so callers can't repeat the 2-way `Ready|Queued` mistake
+    /// that drops the `any_dep_terminally_failed` check — a node reverted
+    /// to `Queued` with a `Poisoned` dep is stuck forever
+    /// (`find_newly_ready` only fires on dep→Completed; `poison_and_
+    /// cascade` only fires on dep *transitioning to* terminal-failure).
+    /// See [`Self::any_dep_terminally_failed`].
+    pub fn revert_target_for(&self, drv_hash: &str) -> DerivationStatus {
+        if self.any_dep_terminally_failed(drv_hash) {
+            DerivationStatus::DependencyFailed
+        } else if self.all_deps_completed(drv_hash) {
+            DerivationStatus::Ready
+        } else {
+            DerivationStatus::Queued
+        }
+    }
+
     /// Get all parent drv_hashes that depend on the given child.
     pub fn get_parents(&self, child_hash: &str) -> Vec<DrvHash> {
         self.parents

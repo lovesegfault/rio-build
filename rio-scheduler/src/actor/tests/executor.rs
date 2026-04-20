@@ -3877,8 +3877,12 @@ async fn test_disconnect_discards_only_unknown_drvs() -> anyhow::Result<()> {
     });
 
     // One real drv "lbdisc" in the DAG; one fabricated path.
+    // `fake_path` needs a DISTINCT store-hash: G10's `LogBuffers` keys
+    // on `drv_log_hash` (the store-hash portion), so two
+    // `test_drv_path(...)` calls (same `TEST_HASH`) would alias to one
+    // buffer and discarding the fake would also discard the real.
     let real_path = test_drv_path("lbdisc");
-    let fake_path = test_drv_path("never-merged");
+    let fake_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-never-merged.drv".to_string();
     let _rx = connect_executor(&handle, "lb-w", "x86_64-linux").await?;
     merge_single_node(&handle, Uuid::new_v4(), "lbdisc", PriorityClass::Scheduled).await?;
     barrier(&handle).await;

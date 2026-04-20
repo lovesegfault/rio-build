@@ -1328,7 +1328,7 @@ async fn cgroup_oom_doubles_mem_floor(
     Ok(())
 }
 
-// r[verify sched.dispatch.unroutable-system]
+// r[verify sched.dispatch.unroutable-system+2]
 /// Ready drv whose `system` is advertised by zero registered executors:
 /// stays Ready (deferred), WARN fires once (edge-triggered, not per
 /// tick). Connecting a matching executor dispatches it.
@@ -2573,23 +2573,28 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
     });
 
     // Seed substitutable so the dispatch-time batch spawns a detached
-    // fetch (Ready → Substituting). Arm a permanent QPI failure so the
-    // task posts ok=false (we don't depend on the value — the test
-    // sends its own SubstituteComplete{ok=true} after lease loss).
+    // fetch (Ready → Substituting). Arm the QPI gate so the detached
+    // task PARKS (not fails) — we need status==Substituting when the
+    // explicit ok=true arrives, otherwise the status guard at
+    // dispatch.rs:874 shadows the leader gate under test and a
+    // delete-the-leader-gate mutation would still pass.
     let out = test_store_path("sub-standby-out");
     store.state.substitutable.write().unwrap().push(out.clone());
     store
         .faults
-        .fail_query_path_info_permanent
+        .query_path_info_gate_armed
         .store(true, Ordering::SeqCst);
     let mut n = make_node("sub-standby");
     n.expected_output_paths = vec![out];
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
-    settle_substituting(&handle, &["sub-standby"]).await;
+    // Wait for ENTERED Substituting (not exited — task is parked at
+    // the QPI gate).
+    wait_for_status(&handle, "sub-standby", DerivationStatus::Substituting).await;
 
-    // Lease lost. The detached task may have already posted; either way
-    // we now send an explicit ok=true as the standby. Pre-fix this
-    // wrote `derivations.status = 'completed'` to PG.
+    // Lease lost while status is STILL Substituting. The explicit
+    // ok=true now exercises ONLY the leader gate — guard #2
+    // (status!=Substituting) cannot fire. Pre-fix this wrote
+    // `derivations.status = 'completed'` to PG.
     is_leader.store(false, Ordering::SeqCst);
     let before = handle.debug_counters().await?.persist_status_calls;
     handle
@@ -2614,6 +2619,30 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
         handle.debug_counters().await?.persist_status_calls,
         before,
         "standby SubstituteComplete must not call persist_status"
+    );
+
+    // Release the parked detached task; its eventual post is ALSO
+    // dropped by the leader gate. Node stays Substituting (correct —
+    // both messages dropped) so don't settle_substituting; just give
+    // the task time to post and re-check.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+        barrier(&handle).await;
+    }
+    assert_eq!(
+        handle.debug_counters().await?.persist_status_calls,
+        before,
+        "released detached task's post must also be dropped on standby"
+    );
+    assert_eq!(
+        expect_drv(&handle, "sub-standby").await.status,
+        DerivationStatus::Substituting,
+        "leader gate dropped BOTH messages; node stays Substituting"
     );
     Ok(())
 }
@@ -2848,6 +2877,190 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
     assert_eq!(
         row.1, None,
         "rollback_assignment must clear assigned_builder_id in PG"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
+// ---------------------------------------------------------------------------
+
+// r[verify sched.dispatch.fod-substitute]
+/// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
+/// failing-open, the truncated tail must NOT fall through to the
+/// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =
+/// O(N) sequential 30s timeouts in the actor). Pre-fix:
+/// `find_missing_calls == 1 + tail` (tail × 30s ≈ 24h stall with an
+/// unreachable store). Post-fix: 1 batch + 0 per-drv; tail dispatches
+/// fail-open and is batch-probed next pass.
+#[tokio::test]
+async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // CAP+12 IA leaves with non-empty expected_output_paths so they're
+    // batch candidates. No worker connected → all defer (we only care
+    // about FMP call count, not assignment).
+    let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 12;
+    let nodes: Vec<_> = (0..n)
+        .map(|i| {
+            let tag = format!("bpt-{i}");
+            let mut node = make_node(&tag);
+            node.expected_output_paths = vec![test_store_path(&format!("bpt-{i}-out"))];
+            node
+        })
+        .collect();
+    // Batch FMP fails-open (Unavailable). Per-drv calls would also fail
+    // — but the bug is they're MADE at all.
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    let after_merge = store.calls.find_missing_calls.load(Ordering::SeqCst);
+    // dispatch_ready runs inside merge (post-6e); count what THAT did.
+    tick(&handle).await?;
+    let total = store.calls.find_missing_calls.load(Ordering::SeqCst);
+    // 1 batch per dispatch_ready pass (merge_dag's inline + our explicit
+    // tick). Neither pass may trigger per-drv tail calls. Allow up to
+    // BECAME_IDLE_INLINE_CAP+2 batch passes; the bug case is +12 EXTRA
+    // (one per tail node).
+    let dispatch_calls = total - after_merge;
+    assert!(
+        dispatch_calls <= 2,
+        "tick → ≤2 dispatch_ready passes → ≤2 batch FMPs; \
+         got {dispatch_calls} (pre-fix: 1 batch + 12 per-drv tail = 13)"
+    );
+    assert!(
+        total <= crate::actor::BECAME_IDLE_INLINE_CAP + 4,
+        "total FMPs across merge+tick bounded by batch passes, NOT by \
+         tail size; got {total} (CAP+12 nodes; pre-fix tail=12 leaked \
+         to per-drv path each pass)"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `unroutable_ready{system}` label cardinality bound
+// ---------------------------------------------------------------------------
+
+// r[verify sched.dispatch.unroutable-system+2]
+/// Tenant-supplied `system` strings outside `[a-z0-9_-]{1,32}` must
+/// bucket to `unknown` so a tenant can't mint unbounded Prometheus
+/// series. Real-but-unrouted systems stay visible by name. Pre-fix:
+/// each garbage value created its own permanent gauge series.
+#[tokio::test]
+async fn unroutable_system_label_bounded() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (_db, handle, _task) = setup().await;
+    let _w = connect_executor(&handle, "ub-w", "x86_64-linux").await?;
+
+    // 5 garbage systems (uppercase, dot, too-long, braces, space) + 1
+    // real-but-unrouted (aarch64-linux: matches the shape, no executor
+    // advertises it).
+    let garbage = [
+        "Fake-System",
+        "x86.64-linux",
+        "this-system-string-is-definitely-longer-than-thirty-two-chars",
+        "x{uuid}",
+        "has space",
+    ];
+    let mut nodes: Vec<_> = garbage
+        .iter()
+        .enumerate()
+        .map(|(i, sys)| make_test_node(&format!("ub-g{i}"), sys))
+        .collect();
+    nodes.push(make_test_node("ub-real", "aarch64-linux"));
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    tick(&handle).await?;
+
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_unroutable_ready{system=unknown}"),
+        Some(5.0),
+        "garbage systems collapse to one `unknown` series; gauges={:?}",
+        recorder.gauge_names()
+    );
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_unroutable_ready{system=aarch64-linux}"),
+        Some(1.0),
+        "plausible-but-unrouted system stays visible by name"
+    );
+    for sys in garbage {
+        assert!(
+            recorder
+                .gauge_value(&format!("rio_scheduler_unroutable_ready{{system={sys}}}"))
+                .is_none(),
+            "garbage system {sys:?} must NOT get its own series (pre-fix: did)"
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SubstituteComplete{ok=false} 3-way revert (DependencyFailed branch)
+// ---------------------------------------------------------------------------
+
+// r[verify sched.state.transitions]
+/// `handle_substitute_complete{ok=false}` on a node whose dep is
+/// terminally-failed must revert to `DependencyFailed`, not `Queued`.
+/// `Queued` with a `Poisoned` dep is stuck forever (find_newly_ready
+/// never fires; poison_and_cascade already ran). Pre-fix: 2-way
+/// `Ready|Queued` only.
+#[tokio::test]
+async fn substitute_fail_with_poisoned_dep_goes_dependency_failed() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // X depends on Y. Force Y Poisoned-at-limit; force X Substituting
+    // (the I-094 reprobe lane reaches this state via DependencyFailed →
+    // Substituting; here we set it directly to isolate the handler).
+    let x_out = test_store_path("sfp-x-out");
+    let mut x = make_node("sfp-x");
+    x.expected_output_paths = vec![x_out];
+    let build = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build,
+        vec![x, make_node("sfp-y")],
+        vec![make_test_edge("sfp-x", "sfp-y")],
+        false,
+    )
+    .await?;
+    handle
+        .debug_force_poisoned("sfp-y", POISON_RESUBMIT_RETRY_LIMIT)
+        .await?;
+    handle
+        .debug_force_status("sfp-x", DerivationStatus::Substituting)
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "sfp-x").await.status,
+        DerivationStatus::Substituting,
+        "precondition"
+    );
+
+    // Detached fetch failed.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "sfp-x".into(),
+            ok: false,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let xs = expect_drv(&handle, "sfp-x").await;
+    assert_eq!(
+        xs.status,
+        DerivationStatus::DependencyFailed,
+        "dep Y Poisoned → X reverts to DependencyFailed (pre-fix: Queued, \
+         stuck forever — never Ready since Y≠Completed, never cascaded \
+         since cascade only fires on Y's TRANSITION to Poisoned)"
+    );
+    // Build completion check fired (terminal_failure_epilogue): build
+    // terminates instead of hanging Active.
+    let st = query_status(&handle, build).await?;
+    assert_ne!(
+        st.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build must terminate, not hang Active"
     );
     Ok(())
 }

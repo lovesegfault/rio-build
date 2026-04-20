@@ -333,7 +333,20 @@ impl DagActor {
                 // its `systems` entry). The latter sat silently Ready
                 // for hours; surface it via gauge + a one-shot WARN.
                 if !self.any_executor_advertises_system(&system, want_kind) {
-                    *ctx.unroutable_systems.entry(system).or_insert(0) += 1;
+                    // r[impl sched.dispatch.unroutable-system+2]
+                    // `system` is tenant-supplied (raw drv.platform());
+                    // bucket so the Prometheus label cardinality is
+                    // bounded by the Nix system-string shape, not
+                    // tenant input. Real-but-unrouted systems
+                    // (`aarch64-linux` with no aarch64 pool) stay
+                    // visible by name; garbage (`fake-{uuid}`)
+                    // collapses to one `unknown` series.
+                    let label_sys = if Self::is_plausible_system(&system) {
+                        system
+                    } else {
+                        "unknown".to_string()
+                    };
+                    *ctx.unroutable_systems.entry(label_sys).or_insert(0) += 1;
                 }
                 // Defer and track by kind.
                 *ctx.kind_deferred.entry(want_kind).or_insert(0) += 1;
@@ -384,7 +397,7 @@ impl DagActor {
     /// kinds emit a value every pass (zero is a legitimate value) so
     /// Prometheus doesn't persist stale nonzero.
     // r[impl sched.freeze-detector]
-    // r[impl sched.dispatch.unroutable-system]
+    // r[impl sched.dispatch.unroutable-system+2]
     fn publish_dispatch_gauges(
         &mut self,
         kind_deferred: HashMap<rio_proto::types::ExecutorKind, u64>,
@@ -476,6 +489,21 @@ impl DagActor {
             .any(|w| w.kind == kind && w.is_registered() && w.systems.iter().any(|s| s == system))
     }
 
+    /// True if `system` matches the Nix `<arch>-<os>` shape (short,
+    /// `[a-z0-9_-]` only). Used to bucket the tenant-supplied `system`
+    /// label on `rio_scheduler_unroutable_ready` — anything outside
+    /// this shape is collapsed to `"unknown"` so a tenant submitting
+    /// `system = "fake-{uuid}"` can't mint unbounded Prometheus series.
+    /// 32 covers the longest real Nix systems (`aarch64-unknown-linux-
+    /// gnu` style is not used by Nix; the longest in nixpkgs lib.systems
+    /// is well under).
+    fn is_plausible_system(system: &str) -> bool {
+        system.len() <= 32
+            && system
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    }
+
     /// I-067: best-effort store check for a Ready IA derivation's
     /// outputs (was FOD-only; generalised per the >4096 cap-gap).
     ///
@@ -492,12 +520,13 @@ impl DagActor {
     /// single-threaded so there's no contention; for a 1085-node merge
     /// the scan is sub-ms vs. ~25s of sequential RPCs it replaces.
     ///
-    /// Returns the set of hashes that were CHECKED (regardless of
-    /// outcome). The drain loop skips `ready_check_or_spawn` for these
-    /// (I-163) — they were either completed here or definitively
-    /// found-missing one RPC ago. Empty set on fail-open paths (no
-    /// store / RPC error / timeout): the per-drv fallback then runs as
-    /// before, so the fail-open semantics are unchanged.
+    /// Returns the set of hashes the drain loop must skip
+    /// `ready_check_or_spawn` for (I-163). On success this is the
+    /// batch-probed head (completed here or definitively found-missing
+    /// one RPC ago) plus the truncated tail (deferred to next pass's
+    /// batch). On RPC error/timeout this is the tail only — the
+    /// stamped head is protected via `probed_generation`, so neither
+    /// hits the per-drv fallback.
     // r[impl sched.dispatch.fod-substitute]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
@@ -524,11 +553,21 @@ impl DagActor {
         if candidates.is_empty() {
             return HashSet::new();
         }
-        // Belt under the store-side 4096 cap. The truncated tail keeps
-        // probed_generation < probe_gen, so the per-drv
-        // ready_check_or_spawn fallback (same drain loop) still probes
-        // them — sequentially, but bounded to one FMP each.
-        candidates.truncate(super::DISPATCH_PROBE_BATCH_CAP);
+        // Belt under the store-side 4096 cap. The truncated tail is
+        // inserted into `checked` (so the drain loop skips the per-drv
+        // `ready_check_or_spawn` fallback) but NOT stamped with
+        // `probed_generation` — the next inline `dispatch_ready` (same
+        // generation) batch-probes that window. Letting the tail fall
+        // through to the per-drv path would be O(N) sequential 30s-
+        // timeout RPCs in the actor (24h+ stall with a wide layer and
+        // an unreachable store; I-139/I-140 invariant).
+        let mut checked = HashSet::with_capacity(candidates.len());
+        if candidates.len() > super::DISPATCH_PROBE_BATCH_CAP {
+            for (h, _) in &candidates[super::DISPATCH_PROBE_BATCH_CAP..] {
+                checked.insert(h.clone());
+            }
+            candidates.truncate(super::DISPATCH_PROBE_BATCH_CAP);
+        }
         for (h, _) in &candidates {
             if let Some(s) = self.dag.node_mut(h) {
                 s.probed_generation = probe_gen;
@@ -565,17 +604,20 @@ impl DagActor {
                         candidates = candidates.len(),
                         error = %e,
                         "batched Ready store-check FindMissingPaths failed; \
-                         per-drv fallback will retry"
+                         dispatching fail-open (next pass batch-retries)"
                     );
-                    return HashSet::new();
+                    // Tail already in `checked`; head protected via the
+                    // probed_generation stamp at `ready_check_or_spawn`.
+                    return checked;
                 }
                 Err(_) => {
                     debug!(
                         candidates = candidates.len(),
                         timeout = ?self.grpc_timeout,
-                        "batched Ready store-check timed out; per-drv fallback will retry"
+                        "batched Ready store-check timed out; \
+                         dispatching fail-open (next pass batch-retries)"
                     );
-                    return HashSet::new();
+                    return checked;
                 }
             };
 
@@ -588,7 +630,6 @@ impl DagActor {
         // when the closure walk pulled ghc-sized NARs.
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-        let mut checked = HashSet::with_capacity(candidates.len());
         // I-139: collect-then-batch. The locally-present branch awaited
         // `complete_ready_from_store` per item (≥3 sequential PG RTTs
         // each); on warm-restart of a large closure ~all 2048 candidates
@@ -702,13 +743,22 @@ impl DagActor {
                     continue;
                 }
             };
+            // Stash the realized paths now so SubstituteComplete →
+            // complete_ready_from_store_batch doesn't have to recompute
+            // them. Dispatch-time callers pass `expected_output_paths`
+            // (no-op semantically); the verify_preexisting_completed
+            // reprobe lane passes the REALIZED floating-CA path which
+            // would otherwise be lost (cleared at merge.rs reset, then
+            // clobbered with `[""]` at the IA-only assignment below).
+            state.output_paths = paths.clone();
             // I-094 reprobe substitutable lane: failure history is moot
             // — we're fetching the upstream-built output. Mirror the
             // poison-clear in apply_cached_hits. Clearing here (not on
             // SubstituteComplete{ok=true}) means a later fetch failure
-            // demotes to Ready and gets one more dispatch attempt —
-            // acceptable, since substitutability is evidence the world
-            // changed (Hydra/another tenant built it).
+            // demotes via `revert_target_for` (Ready/Queued/
+            // DependencyFailed) and may get one more dispatch attempt
+            // — acceptable, since substitutability is evidence the
+            // world changed (Hydra/another tenant built it).
             if matches!(
                 from,
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
@@ -954,11 +1004,12 @@ impl DagActor {
             }
             return;
         }
-        let to = if self.dag.all_deps_completed(drv_hash) {
-            DerivationStatus::Ready
-        } else {
-            DerivationStatus::Queued
-        };
+        // 3-way revert (NOT 2-way Ready|Queued): the I-094 reprobe lane
+        // can transition a node whose dep is Poisoned directly →
+        // Substituting; on fetch-fail it must go DependencyFailed, not
+        // Queued (Queued with a Poisoned dep is stuck forever — see
+        // `revert_target_for`).
+        let to = self.dag.revert_target_for(drv_hash);
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -972,9 +1023,22 @@ impl DagActor {
             return;
         }
         self.persist_status(drv_hash, to, None).await;
-        if to == DerivationStatus::Ready {
-            self.push_ready(drv_hash.clone());
-            self.dispatch_dirty = true;
+        match to {
+            DerivationStatus::Ready => {
+                self.push_ready(drv_hash.clone());
+                self.dispatch_dirty = true;
+            }
+            DerivationStatus::DependencyFailed => {
+                // Cascade + per-build completion-check so the interested
+                // build terminates instead of hanging Active.
+                self.terminal_failure_epilogue(
+                    drv_hash,
+                    "substitute fetch failed and a dependency is terminally failed",
+                    rio_proto::types::BuildResultStatus::DependencyFailed,
+                )
+                .await;
+            }
+            _ => {}
         }
         // build_summary counts Substituting as running; revert flips
         // running→queued. Mirror `rollback_assignment` /
@@ -1114,7 +1178,16 @@ impl DagActor {
                       "store-hit Ready→Completed rejected; dispatching instead");
                 continue;
             }
-            state.output_paths = state.expected_output_paths.clone();
+            // IA-only convenience: `expected_output_paths` IS the
+            // realised path. Non-destructive when a path is already
+            // known — the floating-CA reprobe→re-substitute lane
+            // arrives here with `output_paths` set to the realized
+            // path by `spawn_substitute_fetches`; clobbering it with
+            // `expected_output_paths == [""]` would drop GC retention
+            // and emit `[""]` to clients.
+            if state.output_paths.is_empty() {
+                state.output_paths = state.expected_output_paths.clone();
+            }
             ok.push(Done {
                 hash: drv_hash.clone(),
                 drv_path: state.drv_path().to_string(),

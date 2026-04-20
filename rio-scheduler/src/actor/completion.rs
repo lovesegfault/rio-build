@@ -1768,7 +1768,7 @@ impl DagActor {
     /// "permanent failures forgot to unpin" can't recur per-handler.
     ///
     /// [`poison_and_cascade`]: Self::poison_and_cascade
-    async fn terminal_failure_epilogue(
+    pub(super) async fn terminal_failure_epilogue(
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,

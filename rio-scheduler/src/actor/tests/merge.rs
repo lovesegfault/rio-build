@@ -2621,3 +2621,135 @@ async fn test_seed_ignores_reprobe_pending_substitute_dep() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.substitute.detached]
+/// Floating-CA reprobe → re-substitute lane: `verify_preexisting_
+/// completed` finds a Completed floating-CA node's REALIZED output
+/// gone-but-substitutable, resets + spawns the detached fetch with the
+/// realized path. After `SubstituteComplete{ok=true}`, `output_paths`
+/// must be the realized path — pre-fix `complete_ready_from_store_batch`
+/// clobbered it with `expected_output_paths == [""]` (GC retention
+/// lost; clients got `[""]`).
+#[tokio::test]
+async fn reprobe_substitute_floating_ca_preserves_realized_path() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Floating-CA: expected_output_paths == [""] (path unknown until
+    // built). Hold a build1 reference so X stays in DAG.
+    let mut x = make_node("rsc-x");
+    x.is_content_addressed = true;
+    x.expected_output_paths = vec![String::new()];
+    let real = test_store_path("rsc-x-realized");
+    merge_dag(&handle, Uuid::new_v4(), vec![x.clone()], vec![], false).await?;
+    handle
+        .debug_force_status("rsc-x", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths("rsc-x", vec![real.clone()])
+        .await?;
+    barrier(&handle).await;
+
+    // Realized output is gone-from-store but upstream-substitutable.
+    // Gate QPI so we can seed the path between FMP (reports missing+
+    // substitutable) and the detached fetch's QPI (succeeds).
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(real.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    // Build 2 references X (pre-existing Completed). verify_preexisting_
+    // completed: output missing+substitutable → reset to Ready → to_spawn
+    // → spawn_substitute_fetches with the REALIZED path.
+    merge_dag(&handle, Uuid::new_v4(), vec![x], vec![], false).await?;
+    wait_for_status(&handle, "rsc-x", DerivationStatus::Substituting).await;
+    // Detached task is parked at the QPI gate. output_paths must already
+    // hold the realized path (spawn_substitute_fetches stashes it).
+    let mid = expect_drv(&handle, "rsc-x").await;
+    assert_eq!(
+        mid.output_paths,
+        vec![real.clone()],
+        "spawn_substitute_fetches must stash the realized path on state"
+    );
+
+    // Seed locally so the released QPI succeeds → ok=true.
+    store.seed_with_content(&real, b"rsc-x-contents");
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    settle_substituting(&handle, &["rsc-x"]).await;
+
+    let post = expect_drv(&handle, "rsc-x").await;
+    assert_eq!(post.status, DerivationStatus::Completed);
+    assert_eq!(
+        post.output_paths,
+        vec![real],
+        "complete_ready_from_store_batch must NOT clobber the realized \
+         path with expected_output_paths==[\"\"] (pre-fix: did)"
+    );
+    Ok(())
+}
+
+// r[verify sched.state.transitions]
+/// `verify_preexisting_completed` reset on a node whose dep is
+/// terminally-failed must go `DependencyFailed`, not `Queued`. Pre-fix
+/// 2-way `Ready|Queued` → stuck forever (same hole as
+/// `handle_substitute_complete`).
+#[tokio::test]
+async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // X depends on Y. Build1 holds them in DAG.
+    let x_out = test_store_path("vpd-x-out");
+    let mut x = make_node("vpd-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![x.clone(), make_node("vpd-y")],
+        vec![make_test_edge("vpd-x", "vpd-y")],
+        false,
+    )
+    .await?;
+    // Y Poisoned-at-limit (so re-merge does NOT reset it). X Completed
+    // with output_paths set (so it's a verify_preexisting candidate).
+    handle
+        .debug_force_poisoned("vpd-y", POISON_RESUBMIT_RETRY_LIMIT)
+        .await?;
+    handle
+        .debug_force_status("vpd-x", DerivationStatus::Completed)
+        .await?;
+    handle.debug_set_output_paths("vpd-x", vec![x_out]).await?;
+    barrier(&handle).await;
+
+    // Build 2 references X→Y. X's output is NOT in store (never seeded)
+    // and NOT substitutable → verify_preexisting_completed resets X.
+    // revert_target_for(X): Y Poisoned → DependencyFailed.
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![x, make_node("vpd-y")],
+        vec![make_test_edge("vpd-x", "vpd-y")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let xs = expect_drv(&handle, "vpd-x").await;
+    assert_eq!(
+        xs.status,
+        DerivationStatus::DependencyFailed,
+        "dep Y Poisoned → X resets to DependencyFailed (pre-fix: Queued, \
+         stuck forever)"
+    );
+    Ok(())
+}

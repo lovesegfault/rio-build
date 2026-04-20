@@ -206,8 +206,8 @@ The merge-time `FindMissingPaths` cache check goes through a circuit breaker tha
 r[sched.freeze-detector]
 `dispatch_ready` WARNs once per minute when `kind_deferred[k] > 0 && registered_streams[k] == 0` holds for ≥60s, for each `ExecutorKind k` (Builder, Fetcher). The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
 
-r[sched.dispatch.unroutable-system]
-When a Ready derivation's `system` is advertised by zero registered executors of the matching kind, dispatch defers it (same as no-capacity) but additionally counts it under `rio_scheduler_unroutable_ready{system=…}` and WARNs once when the system first becomes unroutable. The WARN re-arms after the system has been observed routable. This distinguishes "no capacity right now" (autoscaler resolves) from "no pool exists" (operator action: add the system to a `Pool`'s `systems` list, e.g. `i686-linux` on an x86_64 pool per `r[builder.platform.i686]`).
+r[sched.dispatch.unroutable-system+2]
+When a Ready derivation's `system` is advertised by zero registered executors of the matching kind, dispatch defers it (same as no-capacity) but additionally counts it under `rio_scheduler_unroutable_ready{system=…}` and WARNs once when the system first becomes unroutable. The WARN re-arms after the system has been observed routable. This distinguishes "no capacity right now" (autoscaler resolves) from "no pool exists" (operator action: add the system to a `Pool`'s `systems` list, e.g. `i686-linux` on an x86_64 pool per `r[builder.platform.i686]`). The `system` label is normalized: values not matching `[a-z0-9_-]{1,32}` are bucketed as `unknown` (the string is tenant-supplied via `drv.platform()`; without bucketing, label cardinality would be unbounded).
 
 ## Multi-Build DAG Merging
 

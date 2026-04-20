@@ -1307,28 +1307,26 @@ impl DagActor {
                 continue;
             };
             let drv_hash_k: DrvHash = drv_hash.as_str().into();
-            // deps_ok: every child is Completed/Skipped AND not itself
-            // being reset. The substitutable→to_spawn lane is
-            // technically safe even when !deps_ok per
-            // r[sched.substitute.detached] (store-side closure walk
-            // fetched the full reference set), but gating it on
-            // deps_ok too is strictly safe and simpler — Queued falls
-            // through to normal dispatch which re-probes
-            // substitutability.
-            let deps_ok = self.dag.get_children(&drv_hash).into_iter().all(|d| {
-                !reset_set.contains(&d)
-                    && self.dag.node(&d).is_some_and(|s| {
-                        matches!(
-                            s.status(),
-                            DerivationStatus::Completed | DerivationStatus::Skipped
-                        )
-                    })
-            });
-            let target = if deps_ok {
-                DerivationStatus::Ready
-            } else {
-                DerivationStatus::Queued
-            };
+            // 3-way revert via the canonical helper (NOT 2-way
+            // Ready|Queued — a Poisoned dep would leave this node
+            // stuck Queued forever). reset_set overlay: a child being
+            // reset THIS pass is currently still Completed/Skipped in
+            // DAG state (so revert_target_for would say Ready) but is
+            // about to become Ready/Queued, so cap at Queued. The
+            // substitutable→to_spawn lane is gated on deps_ok too —
+            // strictly safe and simpler; Queued falls through to
+            // normal dispatch which re-probes substitutability.
+            let mut target = self.dag.revert_target_for(&drv_hash_k);
+            if target == DerivationStatus::Ready
+                && self
+                    .dag
+                    .get_children(&drv_hash)
+                    .into_iter()
+                    .any(|d| reset_set.contains(&d))
+            {
+                target = DerivationStatus::Queued;
+            }
+            let deps_ok = target == DerivationStatus::Ready;
             let Some(state) = self.dag.node_mut(&drv_hash_k) else {
                 continue;
             };
@@ -1372,8 +1370,10 @@ impl DagActor {
                         (build is Active; continuing)");
             }
             if !deps_ok {
-                // Queued: no push_ready, no spawn. find_newly_ready
+                // Queued: no push_ready, no spawn — find_newly_ready
                 // promotes it when its reset dep re-completes.
+                // DependencyFailed: terminal — the build's completion
+                // check (later in handle_merge) handles it.
                 reset.insert(drv_hash);
                 continue;
             }

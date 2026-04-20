@@ -118,6 +118,16 @@ pub struct MockStoreFaults {
     /// Whether `get_path_gate` is armed. When false, `GetPath` ignores the
     /// gate (backwards-compatible with existing tests).
     pub get_path_gate_armed: Arc<AtomicBool>,
+    /// If `query_path_info_gate_armed` is true, `QueryPathInfo` awaits
+    /// this Notify BEFORE the existing fault checks. Mirrors
+    /// `get_path_gate`: tests arm it, drive the actor until the
+    /// detached substitute-fetch task is parked here, then
+    /// `.notify_waiters()` to release. Distinct from the `fail_*`
+    /// knobs (which return immediately) — this holds-then-proceeds.
+    pub query_path_info_gate: Arc<tokio::sync::Notify>,
+    /// Whether `query_path_info_gate` is armed. When false,
+    /// `QueryPathInfo` ignores the gate (backwards-compatible).
+    pub query_path_info_gate_armed: Arc<AtomicBool>,
     /// Per-NarChunk delay (millis) injected in `GetPath`'s stream. 0 = no
     /// delay. For I-211 progress-based timeout tests: with a multi-chunk
     /// NAR, `delay × chunk_count > idle_timeout` proves the fetch
@@ -566,6 +576,13 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::QueryPathInfoRequest>,
     ) -> Result<Response<types::PathInfo>, Status> {
+        if self
+            .faults
+            .query_path_info_gate_armed
+            .load(Ordering::SeqCst)
+        {
+            self.faults.query_path_info_gate.notified().await;
+        }
         if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
             return Err(Status::unavailable(
                 "mock: injected query_path_info failure",

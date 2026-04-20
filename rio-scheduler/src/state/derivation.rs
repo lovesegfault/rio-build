@@ -213,8 +213,12 @@ impl DerivationStatus {
             // completed-verify]
             (Self::Ready, Self::Queued) => true,
             (Self::Queued, Self::DependencyFailed) => true, // dep poisoned, cascade
-            (Self::Ready, Self::DependencyFailed) => true, // dep poisoned, cascade
+            (Self::Ready, Self::DependencyFailed) => true,  // dep poisoned, cascade
             (Self::Created, Self::DependencyFailed) => true, // dep poisoned before queue
+            // I-047 stale-completed reset, dep terminally-failed (the
+            // I-094 reprobe lane can leave a Poisoned dep under a
+            // Completed parent; `revert_target_for` 3-way).
+            (Self::Completed | Self::Skipped, Self::DependencyFailed) => true,
             (Self::Ready, Self::Assigned) => true, // worker selected
             (Self::Assigned, Self::Running) => true, // worker ack
             (Self::Assigned, Self::Ready) => true, // worker lost
@@ -258,6 +262,10 @@ impl DerivationStatus {
             // today) but kept parallel to the →Completed arms above.
             (Self::Poisoned | Self::DependencyFailed | Self::Failed, Self::Substituting) => true,
             (Self::Substituting, Self::Completed | Self::Ready | Self::Queued) => true,
+            // Fetch failed AND a dep is terminally-failed (I-094
+            // reprobe of a node whose dep stayed Poisoned). Mirror
+            // compute_initial_states' 3-way via `revert_target_for`.
+            (Self::Substituting, Self::DependencyFailed) => true,
             (Self::Substituting, Self::Cancelled) => true,
             _ => false,
         };
@@ -1481,9 +1489,11 @@ mod tests {
             (Poisoned, Created),
             // Output GC'd between completion and later merge (I-047)
             (Completed, Ready),
-            (Completed, Queued), // dep also reset
+            (Completed, Queued),           // dep also reset
+            (Completed, DependencyFailed), // dep terminally-failed (revert_target_for)
             (Skipped, Ready),
             (Skipped, Queued),
+            (Skipped, DependencyFailed),
             // I-094 deferred re-probe (output present, dep in-flight)
             (Poisoned, Queued),
             (Failed, Queued),
@@ -1504,6 +1514,7 @@ mod tests {
             (Substituting, Completed),
             (Substituting, Ready),
             (Substituting, Queued),
+            (Substituting, DependencyFailed), // fetch failed + dep terminally-failed
             (Substituting, Cancelled),
             // Terminal self-transitions (idempotent)
             (Completed, Completed),

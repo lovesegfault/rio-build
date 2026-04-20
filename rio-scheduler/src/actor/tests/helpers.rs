@@ -1015,6 +1015,28 @@ pub(crate) async fn settle_substituting(handle: &ActorHandle, hashes: &[&str]) {
     panic!("settle_substituting: timed out waiting for SubstituteComplete on {hashes:?}");
 }
 
+/// Poll until `hash` reaches `want` — i.e. the actor has ENTERED the
+/// target status. Inverse of [`settle_substituting`] (which waits for
+/// exit). Same 10ms × 100 bound. For tests that need to observe a node
+/// IN a transient status (e.g. `Substituting`) before flipping a knob.
+pub(crate) async fn wait_for_status(
+    handle: &ActorHandle,
+    hash: &str,
+    want: crate::state::DerivationStatus,
+) {
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        barrier(handle).await;
+        if let Ok(Some(d)) = handle.debug_query_derivation(hash).await
+            && d.status == want
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("wait_for_status: timed out waiting for {hash:?} to reach {want:?}");
+}
+
 // Re-export for test modules. Canonical impl moved to rio-test-support
 // (P0330) — was 3× copied with method-name drift before that.
 pub(crate) use rio_test_support::metrics::CountingRecorder;
