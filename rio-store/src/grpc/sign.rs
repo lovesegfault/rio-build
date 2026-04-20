@@ -760,10 +760,11 @@ mod tests {
             let mut info = make_path_info(p, &nar, nar_hash);
             let path_hash = info.store_path.sha256_digest();
             info.store_path_hash = path_hash.to_vec();
-            metadata::insert_manifest_uploading(&db.pool, &path_hash, p, &[])
+            let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, p, &[])
                 .await
+                .unwrap()
                 .unwrap();
-            metadata::complete_manifest_inline(&db.pool, &info, nar.into())
+            metadata::complete_manifest_inline(&db.pool, &info, claim, nar.into())
                 .await
                 .unwrap();
         }

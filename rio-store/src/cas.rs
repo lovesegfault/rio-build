@@ -376,7 +376,7 @@ pub async fn stage_chunked(
 /// so the upfront collect can store `(hash, Range<usize>)` and defer
 /// the owned `Bytes` copy into the stream `.map()` closure — bounding
 /// unbudgeted overshoot to `max_concurrent × CHUNK_MAX` instead of
-/// ~the full to-upload set (`r[store.put.nar-bytes-budget+2]`).
+/// ~the full to-upload set (`r[store.put.nar-bytes-budget+3]`).
 // r[impl store.cas.upload-bounded]
 async fn do_upload(
     heartbeat_target: Option<(&PgPool, &[u8], uuid::Uuid)>,
@@ -411,7 +411,7 @@ async fn do_upload(
     // `.map()` closure so at most `max_concurrent × CHUNK_MAX` of
     // owned `Bytes` is in flight; collecting `Bytes` upfront here
     // would hold a second ~full-NAR allocation alongside the
-    // semaphore-charged `nar_data` (r[store.put.nar-bytes-budget+2]).
+    // semaphore-charged `nar_data` (r[store.put.nar-bytes-budget+3]).
     //
     // `needs_upload.contains()` does NOT dedup: `chunks` is the raw
     // in-order list, so an intra-NAR repeat (zero-filled pages etc.)
