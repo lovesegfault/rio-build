@@ -129,6 +129,11 @@ where
                 // tokio::select! RANDOMIZES branch choice when multiple
                 // arms are ready — a ready tick could beat a ready
                 // cancellation, delaying shutdown by one interval.
+                //
+                // Redundant with the inner select's `biased;` below: each
+                // one's shutdown arm covers for the other's absence. Kept
+                // as defense-in-depth; tested as a pair
+                // (`spawn_periodic_biased_shutdown_wins`).
                 biased;
                 _ = shutdown.cancelled() => {
                     tracing::debug!(task = name, "periodic task shutting down");
@@ -174,32 +179,35 @@ mod tests {
     /// `tokio::select!` picks randomly — under load, shutdown could
     /// lose to tick indefinitely (unlikely but possible).
     ///
-    /// Mutation check: drop `biased;` from `spawn_periodic_with` →
-    /// this test FAILS (50/50 chance per round that the loop ticks
-    /// once more before breaking; across 24 rounds the probability
-    /// of NO extra ticks is 2^-24 ≈ 6e-8).
+    /// Mutation check: drop BOTH `biased;` from `spawn_periodic_with`
+    /// (outer select + inner select) → this test FAILS. Per round,
+    /// P(extra tick) = 0.5 × 0.5 × 0.5 = 0.125 (body wins inner ×
+    /// tick wins outer × body polled first in next inner). Across
+    /// 200 rounds, P(NO extra ticks) = 0.875^200 ≈ 2.5e-12.
     ///
-    /// Mechanics: the body holds a gate (`Notify`) open until the
-    /// test has BOTH armed the next interval AND cancelled the
-    /// shutdown token. When the gate releases, the loop re-enters
-    /// `select!` with BOTH arms ready — biased; picks shutdown;
-    /// random picks either.
+    /// Removing EITHER `biased;` alone passes — each select's
+    /// shutdown arm covers for the other. The two are tested as a
+    /// pair; line-level isolation is not black-box observable.
+    ///
+    /// Mechanics: the body parks on a gate inside the INNER select.
+    /// We arm the next tick + cancel shutdown, then release the gate.
+    /// With biased, the inner select breaks on shutdown; without,
+    /// body may complete → outer select sees tick+shutdown both ready.
     // r[verify common.task.periodic-biased]
     #[tokio::test(start_paused = true)]
     async fn spawn_periodic_biased_shutdown_wins() {
         use tokio::sync::Notify;
 
-        const ROUNDS: u32 = 24;
+        const ROUNDS: u32 = 200;
         let mut extra_ticks = 0u32;
 
         for _round in 0..ROUNDS {
             let shutdown = Token::new();
             let ticks = Arc::new(AtomicU32::new(0));
             let t = Arc::clone(&ticks);
-            // Gate the body: it increments tick then awaits. While
-            // blocked, we prime both the interval and the cancellation.
-            // When released, body returns → loop re-enters select!
-            // with BOTH arms ready.
+            // Gate the body: it increments tick then awaits. The body
+            // parks INSIDE the inner select. While parked, we prime both
+            // the interval and the cancellation, then release the gate.
             let gate = Arc::new(Notify::new());
             let g = Arc::clone(&gate);
 
@@ -229,10 +237,11 @@ mod tests {
             tokio::time::advance(Duration::from_millis(15)).await;
             shutdown.cancel();
 
-            // Release the gate. body() returns → loop re-enters
-            // select! with both arms ready. biased; → shutdown
-            // arm wins, break, tick stays at 1. random → ~50%
-            // chance tick arm wins → body runs again (tick=2),
+            // Release the gate. With biased: inner select polls
+            // shutdown first → break, tick stays at 1. Without
+            // (both biased; removed): body may complete → outer
+            // select sees tick+shutdown both ready → tick may win
+            // → next inner select may poll body() first → tick=2,
             // re-blocks on gate.
             gate.notify_one();
             for _ in 0..8 {
@@ -265,7 +274,8 @@ mod tests {
         }
 
         // With biased; → shutdown ALWAYS wins → extra_ticks == 0.
-        // Without biased; → P(extra_ticks == 0) = 2^-ROUNDS ≈ 6e-8.
+        // Without (both biased; removed) → P(extra_ticks == 0)
+        // = 0.875^ROUNDS ≈ 2.5e-12.
         assert_eq!(
             extra_ticks, 0,
             "biased; should make shutdown win over ready tick every time; \
