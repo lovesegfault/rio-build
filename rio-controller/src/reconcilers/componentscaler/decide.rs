@@ -207,14 +207,16 @@ pub fn decide(
         None => (predicted, ratio_in, status.low_load_ticks),
     };
 
-    // Clamp. Defensive min>max swap (CEL enforces, but a pre-CEL CRD
-    // or --validate=false bypass would panic on i32::clamp).
+    // Clamp. Defensive min>max swap and >=0 floor (CEL enforces both,
+    // but a pre-CEL CRD or --validate=false bypass would panic on
+    // i32::clamp / patch the /scale subresource with a negative value
+    // → 422 → reconciler error-loops with no apply-time feedback).
     let (min, max) = if spec.replicas.min > spec.replicas.max {
         (spec.replicas.max, spec.replicas.min)
     } else {
         (spec.replicas.min, spec.replicas.max)
     };
-    let mut desired = raw_desired.clamp(min, max);
+    let mut desired = raw_desired.clamp(min, max).max(0);
 
     // Scale-down safety: 5m stabilization since last UP, then max
     // −1/tick.
@@ -223,7 +225,7 @@ pub fn decide(
             .map(|d| d >= SCALE_DOWN_STABILIZATION)
             .unwrap_or(true);
         if !stabilized {
-            desired = current.clamp(min, max);
+            desired = current.clamp(min, max).max(0);
         } else {
             // `.min(max)`: `current` is the OBSERVED Deployment
             // replicas, not bounded by [min,max] (operator lowered
@@ -328,6 +330,34 @@ mod tests {
         // 10000 builders → 200 → clamped to max=14.
         let d = decide(&s, &status(None, 0), 2, 10_000, None, None);
         assert_eq!(d.desired, 14);
+    }
+
+    /// Negative replicas (CEL-bypassed via --validate=false or pre-CEL
+    /// CRD) must floor at 0. Before the .max(0): {min:-5,max:-2} clamped
+    /// a non-negative raw_desired into [-5,-2], walked down −1/tick,
+    /// patched replicas=-1 → apiserver 422 → reconciler error-loops.
+    // r[verify ctrl.crd.componentscaler]
+    #[test]
+    fn decide_clamps_negative_replicas_to_zero() {
+        let s = spec(-5, -2);
+        let d = decide(&s, &status(None, 0), 0, 100, None, None);
+        assert!(
+            d.desired >= 0,
+            "negative replicas range must floor at 0, got {}",
+            d.desired
+        );
+        assert_eq!(d.desired, 0);
+        // Scale-down stabilization branch must also floor: current=3,
+        // not-yet-stabilized → would otherwise re-clamp into [-5,-2].
+        let d = decide(
+            &s,
+            &status(None, 0),
+            3,
+            100,
+            None,
+            Some(std::time::Duration::from_secs(1)),
+        );
+        assert!(d.desired >= 0, "stabilization branch leaked {}", d.desired);
     }
 
     /// High load: +1 over current AND ratio decays. Asymmetric —

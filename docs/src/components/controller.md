@@ -449,7 +449,7 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 | Pool | `size(self.systems) > 0` | A pool with no target systems accepts no work. |
 | Pool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
 | SeccompProfileKind | type ∈ allowed; `Localhost ⇔ has(localhostProfile)` | See `r[ctrl.crd.seccomp-cel]`. |
-| ComponentScaler.Replicas | `self.min <= self.max` | Clamp range must be non-empty. |
+| ComponentScaler.Replicas | `self.min >= 0 && self.min <= self.max` | Clamp range must be non-empty and non-negative (`/scale` subresource rejects negative replicas). |
 | ComponentScaler.TargetRef | `self.kind == 'Deployment'` | Reconciler patches `apps/v1 deployments/scale` only. |
 | ComponentScaler.LoadThresholds | `0.0 < low < high <= 1.0` | Threshold ordering for ratio correction. |
 

@@ -101,8 +101,8 @@ spec:
                 - min
                 type: object
                 x-kubernetes-validations:
-                - message: replicas.min must be <= replicas.max
-                  rule: self.min <= self.max
+                - message: replicas must satisfy 0 <= min <= max
+                  rule: self.min >= 0 && self.min <= self.max
               seedRatio:
                 default: 50.0
                 description: 'Initial `builders_per_replica` for a fresh CR (no

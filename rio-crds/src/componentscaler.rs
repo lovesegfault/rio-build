@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[serde(rename_all = "camelCase")]
 #[x_kube(
-    validation = Rule::new("self.min <= self.max").message(
-        "replicas.min must be <= replicas.max"
+    validation = Rule::new("self.min >= 0 && self.min <= self.max").message(
+        "replicas must satisfy 0 <= min <= max"
     )
 )]
 pub struct Replicas {
@@ -290,7 +290,7 @@ mod tests {
         let crd = ComponentScaler::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(
-            json.contains("self.min <= self.max"),
+            json.contains("self.min >= 0 && self.min <= self.max"),
             "Replicas CEL renders"
         );
         assert!(
