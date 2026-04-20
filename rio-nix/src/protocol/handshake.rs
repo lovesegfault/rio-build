@@ -29,6 +29,14 @@ pub const PROTOCOL_VERSION: u64 = 0x126;
 /// so this floor is the lowest that admits Lix as a remote-builder client.
 pub const MIN_CLIENT_VERSION: u64 = 0x123; // 1.35
 
+/// Minimum protocol version we accept from a daemon when WE are the
+/// client (`client_handshake`). Symmetric with [`MIN_CLIENT_VERSION`]:
+/// an unexpectedly-old daemon must fail at handshake with a clear
+/// `VersionTooOld` rather than a wire desync at the first
+/// version-dependent read (e.g. `read_build_result`'s `>=1.37` cpu
+/// fields).
+pub const MIN_DAEMON_VERSION: u64 = 0x123; // 1.35
+
 /// Result of a successful handshake.
 #[must_use]
 #[non_exhaustive]

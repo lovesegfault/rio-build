@@ -76,14 +76,11 @@ pub(in crate::executor) async fn run_daemon_build(
     // value for its owned reader task. So: put stdout in an Option, borrow
     // mutably for setup, then take() it for the loop.
     let mut stdout = Some(stdout);
-    tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
+    let negotiated_version = tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
         let stdout_ref = stdout.as_mut().expect("taken only once, after this block");
         let handshake_result = client_handshake(stdout_ref, &mut stdin).await?;
-
-        tracing::debug!(
-            version = handshake_result.negotiated_version(),
-            "daemon handshake complete"
-        );
+        let negotiated = handshake_result.negotiated_version();
+        tracing::debug!(version = negotiated, "daemon handshake complete");
 
         client_set_options(
             stdout_ref,
@@ -95,7 +92,7 @@ pub(in crate::executor) async fn run_daemon_build(
 
         client_send_build_derivation(&mut stdin, drv_path, basic_drv, BuildMode::Normal).await?;
 
-        Ok::<_, ExecutorError>(())
+        Ok::<_, ExecutorError>(negotiated)
     })
     .await
     .map_err(|_| ExecutorError::DaemonSetup("daemon setup sequence timed out".into()))??;
@@ -124,10 +121,12 @@ pub(in crate::executor) async fn run_daemon_build(
     // cgroup.kill() (executor/mod.rs) reaps the tree.
     //
     // r[impl builder.timeout.no-reassign]
+    // r[impl builder.daemon.negotiated-version]
     let build_result = read_build_stderr_loop(
         stdout,
         opts.max_silent_time,
         opts.build_timeout,
+        negotiated_version,
         batcher,
         log_tx,
     )
@@ -232,7 +231,19 @@ impl<'a> StderrLoop<'a> {
     /// spew); does NOT reset the silence deadline (a build that only
     /// emits phase markers but no actual output is still "silent" by
     /// the maxSilentTime contract — same rule as Progress chatter).
-    async fn forward_phase(&self, phase: &str) -> std::ops::ControlFlow<LoopOutcome> {
+    ///
+    /// Flushes any buffered log lines first: `BuildPhase` carries no
+    /// `first_line_number`, so if the phase marker overtook the ≤63
+    /// lines awaiting `flush_tick` on `log_tx` the gateway/nom could
+    /// not reorder them. This is the only `Continue` path that sends
+    /// directly on `log_tx` instead of going through the batcher; the
+    /// pre-flush keeps the channel's order monotone.
+    async fn forward_phase(&mut self, phase: &str) -> std::ops::ControlFlow<LoopOutcome> {
+        if self.batcher.has_pending() && !send_batch(self.log_tx, self.batcher.flush()).await {
+            return std::ops::ControlFlow::Break(Ok(Some(misc_fail(
+                "log channel closed during build (scheduler stream gone)",
+            ))));
+        }
         let msg = ExecutorMessage {
             msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
                 derivation_path: self.batcher.drv_path().to_owned(),
@@ -392,6 +403,7 @@ async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
     build_timeout: Duration,
+    negotiated_version: u64,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, wire::WireError>
@@ -549,14 +561,7 @@ where
                     "stderr reader task join failed: {e}"
                 )))
             })?;
-            // The local nix-daemon is rio's pinned CppNix from the
-            // container image, always ≥ 1.37, so PROTOCOL_VERSION here
-            // matches what was negotiated at client_handshake.
-            rio_nix::protocol::build::read_build_result(
-                &mut reader,
-                rio_nix::protocol::handshake::PROTOCOL_VERSION,
-            )
-            .await
+            rio_nix::protocol::build::read_build_result(&mut reader, negotiated_version).await
         }
     }
 }
@@ -574,6 +579,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use rio_nix::protocol::build::write_build_result;
+    use rio_nix::protocol::handshake::{PROTOCOL_VERSION, encode_version};
     use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
 
     /// Effectively-disabled build_timeout for tests that don't exercise
@@ -581,10 +587,11 @@ mod tests {
     /// `tokio::time::advance` in this module reaches it.
     const NO_BUILD_TIMEOUT: Duration = Duration::from_secs(86400 * 365);
 
-    /// Serialize a BuildResult to wire bytes.
+    /// Serialize a BuildResult to wire bytes at `PROTOCOL_VERSION` (test
+    /// controls both write and read sides, so the constant is correct).
     async fn build_result_bytes(r: &BuildResult) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        write_build_result(&mut buf, r, rio_nix::protocol::handshake::PROTOCOL_VERSION).await?;
+        write_build_result(&mut buf, r, PROTOCOL_VERSION).await?;
         Ok(buf)
     }
 
@@ -600,7 +607,9 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
+        let result =
+            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
+                .await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -703,7 +712,9 @@ mod tests {
         drop(rx); // channel closed before loop starts
         let cursor = std::io::Cursor::new(buf);
 
-        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
+        let result =
+            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
+                .await;
         let br = result.expect("channel-closed is Ok(failure)");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert!(
@@ -779,7 +790,15 @@ mod tests {
 
         // Spawn the loop. It will read from read_half (which we write to).
         let loop_handle = tokio::spawn(async move {
-            read_build_stderr_loop(read_half, 0, NO_BUILD_TIMEOUT, batcher, &log_tx).await
+            read_build_stderr_loop(
+                read_half,
+                0,
+                NO_BUILD_TIMEOUT,
+                PROTOCOL_VERSION,
+                batcher,
+                &log_tx,
+            )
+            .await
         });
 
         // Send exactly one STDERR_NEXT line, then go silent.
@@ -855,7 +874,15 @@ mod tests {
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
         let loop_handle = tokio::spawn(async move {
-            read_build_stderr_loop(read_half, 0, NO_BUILD_TIMEOUT, batcher, &log_tx).await
+            read_build_stderr_loop(
+                read_half,
+                0,
+                NO_BUILD_TIMEOUT,
+                PROTOCOL_VERSION,
+                batcher,
+                &log_tx,
+            )
+            .await
         });
 
         // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
@@ -951,6 +978,7 @@ mod tests {
                 read_half,
                 max_silent_time,
                 NO_BUILD_TIMEOUT,
+                PROTOCOL_VERSION,
                 batcher,
                 &log_tx,
             )
@@ -1134,7 +1162,9 @@ mod tests {
         let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, batcher, &tx).await;
+        let result =
+            read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, PROTOCOL_VERSION, batcher, &tx)
+                .await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -1580,6 +1610,13 @@ mod tests {
     /// `build_timeout` was an outer `tokio::time::timeout` wrapper, the
     /// inner future was DROPPED mid-select on elapse, discarding the
     /// owned `LogBatcher` (≤63 buffered lines) without flush.
+    ///
+    /// `build_timeout` is set to `< BATCH_TIMEOUT` (50ms < 100ms) so
+    /// `flush_tick` is structurally Pending when the deadline fires.
+    /// With any 100ms-multiple timeout, `biased;` lets the co-scheduled
+    /// `flush_tick` win first and the line-count assertion passes for
+    /// the wrong reason — `final_flush()` then runs on an empty batcher
+    /// and the assertion would not catch its removal.
     #[tokio::test(start_paused = true)]
     async fn test_build_deadline_flushes_buffered_lines() -> anyhow::Result<()> {
         let (mut write_half, read_half) = tokio::io::duplex(4096);
@@ -1590,7 +1627,15 @@ mod tests {
         );
         let (log_tx, mut log_rx) = mpsc::channel(8);
         let loop_handle = tokio::spawn(async move {
-            read_build_stderr_loop(read_half, 0, Duration::from_secs(10), batcher, &log_tx).await
+            read_build_stderr_loop(
+                read_half,
+                0,
+                Duration::from_millis(50),
+                PROTOCOL_VERSION,
+                batcher,
+                &log_tx,
+            )
+            .await
         });
 
         // 3 lines (< MAX_BATCH_LINES=64): stay buffered, no flush yet.
@@ -1606,9 +1651,10 @@ mod tests {
             "3 lines < 64, no flush_tick yet → batcher still holding them"
         );
 
-        // Advance past build_timeout. Deadline arm breaks; final_flush
-        // sends the 3 buffered lines BEFORE returning TimedOut.
-        tokio::time::advance(Duration::from_secs(11)).await;
+        // Advance past build_timeout (50ms) but not BATCH_TIMEOUT (100ms):
+        // flush_tick is Pending, deadline arm fires, final_flush is the
+        // ONLY path that can have sent the 3 lines.
+        tokio::time::advance(Duration::from_millis(60)).await;
         drain_tasks().await;
 
         let br = loop_handle
@@ -1616,7 +1662,7 @@ mod tests {
             .expect("build-deadline is Ok(TimedOut), not Err");
         assert_eq!(br.status, BuildStatus::TimedOut);
         assert!(
-            br.error_msg.contains("10s"),
+            br.error_msg.contains("0s"),
             "error_msg names the configured timeout: {}",
             br.error_msg
         );
@@ -1630,6 +1676,88 @@ mod tests {
             3,
             "build-deadline arm MUST reach final_flush (was dropped under outer-timeout shape)"
         );
+        Ok(())
+    }
+
+    // r[verify builder.stderr.forward-set-phase]
+    /// A `SetPhase` arriving immediately after a buffered log line MUST
+    /// NOT overtake it on `log_tx`: `forward_phase` flushes the batcher
+    /// first. Regression: previously the line stayed in the batcher
+    /// until `final_flush` (after STDERR_LAST), so the receiver saw
+    /// `Phase` at index 0 and `LogBatch` at index 1.
+    #[tokio::test]
+    async fn test_stderr_loop_phase_after_buffered_line_preserves_order() -> anyhow::Result<()> {
+        use rio_nix::protocol::stderr::{ResultField, ResultType};
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.result(
+                42,
+                ResultType::BuildLogLine,
+                &[ResultField::String("configuring...".into())],
+            )
+            .await?;
+            w.result(
+                42,
+                ResultType::SetPhase,
+                &[ResultField::String("buildPhase".into())],
+            )
+            .await?;
+            w.finish().await?;
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
+
+        let (result, msgs) = run_loop(buf).await;
+        result.expect("should succeed");
+        assert_eq!(msgs.len(), 2, "one LogBatch + one Phase: {msgs:?}");
+        assert!(
+            matches!(
+                &msgs[0].msg,
+                Some(executor_message::Msg::LogBatch(b)) if b.lines == [b"configuring...".to_vec()]
+            ),
+            "msgs[0] must be the buffered log line, got: {:?}",
+            msgs[0]
+        );
+        assert!(
+            matches!(
+                &msgs[1].msg,
+                Some(executor_message::Msg::Phase(p)) if p.phase == "buildPhase"
+            ),
+            "msgs[1] must be the phase marker, got: {:?}",
+            msgs[1]
+        );
+        Ok(())
+    }
+
+    // r[verify builder.daemon.negotiated-version]
+    /// `read_build_stderr_loop` MUST decode `BuildResult` at the
+    /// negotiated version, not `PROTOCOL_VERSION`. Regression: the
+    /// negotiated value from `client_handshake` was logged then
+    /// discarded; `read_build_result` was called with the hardcoded
+    /// constant, so a daemon at 1.36 (no cpu fields) would desync.
+    #[tokio::test]
+    async fn test_stderr_loop_uses_negotiated_version_for_build_result() -> anyhow::Result<()> {
+        let v136 = encode_version(1, 36);
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.finish().await?;
+        }
+        // BuildResult serialized at 1.36 — NO cpu_user/cpu_system fields.
+        write_build_result(&mut buf, &BuildResult::success(), v136).await?;
+
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        let cursor = std::io::Cursor::new(buf);
+        let br = read_build_stderr_loop(cursor, 0, NO_BUILD_TIMEOUT, v136, batcher, &tx)
+            .await
+            .expect("1.36-serialized BuildResult must parse at negotiated_version=1.36");
+        assert_eq!(br.status, BuildStatus::Built);
+        assert_eq!(br.times_built, 1);
         Ok(())
     }
 }

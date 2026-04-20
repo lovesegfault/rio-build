@@ -219,6 +219,9 @@ Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurab
 r[builder.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
 
+r[builder.daemon.negotiated-version]
+The builder MUST pass the version negotiated by `client_handshake` to all subsequent version-dependent wire reads (notably `read_build_result`). Hardcoding `PROTOCOL_VERSION` desyncs on the next protocol bump if the pinned daemon lags, or on any container rebuild with a daemon that negotiates lower. `client_handshake` enforces a `MIN_DAEMON_VERSION` floor (mirroring `server_handshake`'s `MIN_CLIENT_VERSION`) so an unexpectedly-old daemon fails at handshake with a clear error rather than a wire desync at result-read.
+
 r[builder.retry.daemon-transient]
 The build-spawn loop retries `execute_build` locally when the failure is daemon-transient: `DaemonSpawn` (nix-daemon failed to exec), `Handshake` (daemon died before protocol negotiation), or `Wire(Io(UnexpectedEof))` (daemon crashed mid-conversation --- core dump, OOM-kill, SIGABRT). Up to `DAEMON_RETRY_MAX=3` attempts with backoff `500ms/1s/2s` (no jitter --- one daemon per pod, no herd). After exhaustion the error propagates as `InfrastructureFailure` and the scheduler's own retry policy takes over. The retry MUST short-circuit if the build's cancelled flag is set. `BuildFailed`, network-side errors (`Upload`/`Grpc`/`MetadataFetch`), and deterministic setup failures (`Overlay`/`SynthDb`/`NixConf`) are NOT retried locally. Rationale: a scheduler round-trip re-dispatches + re-fetches closure + re-generates synth DB; without the local retry a hot-loop daemon crash flooded the scheduler with 800+ `InfrastructureFailure` reports in <10min.
 

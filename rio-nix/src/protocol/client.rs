@@ -232,6 +232,15 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 
     let server_version = wire::read_u64(reader).await?;
+    if server_version < super::handshake::MIN_DAEMON_VERSION {
+        // Mirror server_handshake's MIN_CLIENT_VERSION floor: an
+        // older-than-expected daemon must fail HERE with a clear error,
+        // not desync later at the first version-dependent read.
+        return Err(HandshakeError::VersionTooOld {
+            client_major: server_version >> 8,
+            client_minor: server_version & 0xFF,
+        });
+    }
     wire::write_u64(writer, PROTOCOL_VERSION).await?;
     writer.flush().await.map_err(WireError::Io)?;
 
@@ -485,6 +494,43 @@ mod tests {
         let result = client_handshake(&mut cr, &mut cw).await?;
 
         assert_eq!(result.negotiated_version(), server_version);
+        server_handle.await??;
+        Ok(())
+    }
+
+    /// A daemon advertising < `MIN_DAEMON_VERSION` is rejected at
+    /// handshake. Mirror of `handshake::test_version_too_old_rejected`.
+    /// Regression: previously `client_handshake` had no floor, so a
+    /// 1.34 daemon negotiated successfully and then desynced at
+    /// `read_build_result`'s `>=1.37` cpu-field read.
+    #[tokio::test]
+    async fn client_handshake_rejects_v134_daemon() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server_version = encode_version(1, 34);
+
+        let server_handle = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let _magic = wire::read_u64(&mut sr).await?;
+            wire::write_u64(&mut sw, WORKER_MAGIC_2).await?;
+            wire::write_u64(&mut sw, server_version).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let err = client_handshake(&mut cr, &mut cw)
+            .await
+            .expect_err("1.34 daemon must be rejected at handshake");
+        assert!(
+            matches!(
+                err,
+                HandshakeError::VersionTooOld {
+                    client_major: 1,
+                    client_minor: 34
+                }
+            ),
+            "got: {err:?}"
+        );
         server_handle.await??;
         Ok(())
     }
