@@ -104,6 +104,19 @@ pub async fn reconstruct_dag(
             break;
         }
         let frontier_len = frontier.len();
+        // Gate at enqueue, not after fetch. The `count > cap` check
+        // above lags one BFS level: a 3-node `current` can declare 3M
+        // unique inputDrvs and `count` is still 4 when we hand the
+        // frontier to `resolve_derivations_batch` — which buffers ALL
+        // of them as parsed `Derivation`s before `insert_drv_bounded`
+        // can fire. Reject here so the cap actually bounds peak memory.
+        if count + frontier_len > cap {
+            return Err(anyhow::anyhow!(
+                "transitive input limit exceeded: {} derivations \
+                 (max {cap}; raise RIO_MAX_TRANSITIVE_INPUTS to allow larger DAGs)",
+                count + frontier_len
+            ));
+        }
         // If any child can't be resolved (store unreachable, .drv missing
         // from store), the build cannot proceed: a stub leaf with
         // system="" would never match any worker and hang forever. Fail
@@ -523,6 +536,8 @@ pub async fn filter_and_inline_drv(
         // calculation accurate across upload contexts.
         match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            // no-jwt: anonymous lookup — gates whether to inline .drv
+            // content (an optimization), not tenant-scoped visibility.
             store_client.find_missing_paths(types::FindMissingPathsRequest {
                 store_paths: all_outputs,
             }),
@@ -562,6 +577,20 @@ pub async fn filter_and_inline_drv(
             .iter()
             .any(|p| p.is_empty() || missing.contains(p));
         if !will_dispatch {
+            continue;
+        }
+
+        // Budget fast-path. Once total_inlined ≥ INLINE_BUDGET_BYTES no
+        // remaining node can fit (per-node cost is ≥1 byte), so the
+        // gate below would `continue` every time — but only AFTER
+        // paying for parse + cache lookup + full `to_aterm()`
+        // serialize. On a 150k-node cold DAG that's ~148k throwaway
+        // serializations with no `.await` in the loop → multi-second
+        // tokio worker stall. Short-circuit here; the per-node gate
+        // below still handles the bin-packing case (small node fits in
+        // remaining headroom).
+        if total_inlined >= INLINE_BUDGET_BYTES {
+            skipped_budget += 1;
             continue;
         }
 
@@ -1118,6 +1147,48 @@ mod tests {
 
         assert_eq!(nodes.len(), 3, "A->B->C chain -> 3 nodes");
         assert_eq!(edges.len(), 2, "A->B and B->C -> 2 edges");
+    }
+
+    /// bug_351: a wide BFS frontier must be rejected BEFORE
+    /// `resolve_derivations_batch` fires any RPCs. Pre-fix the
+    /// `count > cap` check lagged one level: `count` was still
+    /// `1 + parents` while the unbounded frontier was handed to the
+    /// fetch loop. With cap=10 and 15 distinct frontier children all
+    /// uncached, the dead store would error first ("store unreachable
+    /// or .drv missing") — proving fetch ran before the gate. Post-fix
+    /// the cap fires at enqueue.
+    #[tokio::test]
+    async fn test_reconstruct_dag_wide_frontier_rejected_before_fetch() {
+        crate::drv_cache::override_max_transitive_inputs(10);
+
+        // Root with 15 distinct inputDrv children, none cached.
+        let children: Vec<String> = (0..15)
+            .map(|i| format!("/nix/store/{:032}-child{i}.drv", i))
+            .collect();
+        let child_refs: Vec<(&str, &[&str])> = children
+            .iter()
+            .map(|p| (p.as_str(), &["out"][..]))
+            .collect();
+        let root_path = sp(&test_drv_path("wide"));
+        let root_drv = make_test_derivation("/nix/store/aaa-wide-out", &child_refs);
+
+        let mut store = unreachable_store();
+        let mut cache = HashMap::new();
+
+        let err = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+            .await
+            .expect_err("over-cap frontier must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("transitive input limit exceeded"),
+            "gate must fire BEFORE fetch; got error from fetch path instead: {msg}"
+        );
+        // 1 (root processed) + 15 (frontier) = 16 — the error should
+        // report the would-be total, proving the frontier was counted.
+        assert!(
+            msg.contains("16"),
+            "error should report count+frontier: {msg}"
+        );
     }
 
     // -------------------------------------------------------------------

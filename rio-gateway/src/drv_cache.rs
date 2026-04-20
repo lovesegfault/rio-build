@@ -43,9 +43,32 @@ pub fn init_max_transitive_inputs(n: usize) {
     let _ = MAX_TRANSITIVE_INPUTS.set(n);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test override. OnceLock above is process-global (first test
+    /// to call `init_` wins, all others see its value); this lets a
+    /// single test set a small cap without poisoning siblings.
+    /// Thread-local is safe under `#[tokio::test]` default
+    /// `current_thread` runtime — `reconstruct_dag` runs on the test
+    /// task, no `spawn` crosses threads.
+    static TEST_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Per-test override of [`max_transitive_inputs()`]. Scoped to the
+/// calling thread; subsequent tests on the same nextest worker see the
+/// default again (each `#[test]` is a fresh thread).
+#[cfg(test)]
+pub(crate) fn override_max_transitive_inputs(n: usize) {
+    TEST_CAP.with(|c| c.set(Some(n)));
+}
+
 /// Current cap. Falls back to [`DEFAULT_MAX_TRANSITIVE_INPUTS`] if main()
 /// never called init (tests, or a future binary that forgot to wire it).
 pub(crate) fn max_transitive_inputs() -> usize {
+    #[cfg(test)]
+    if let Some(n) = TEST_CAP.with(|c| c.get()) {
+        return n;
+    }
     *MAX_TRANSITIVE_INPUTS
         .get()
         .unwrap_or(&DEFAULT_MAX_TRANSITIVE_INPUTS)
@@ -207,6 +230,19 @@ pub(crate) async fn resolve_derivations_batch(
     }
     if to_fetch.is_empty() {
         return Ok(resolved);
+    }
+    // Defensive self-contained gate. The caller (`reconstruct_dag`) now
+    // checks `count + frontier.len()` BEFORE calling us, but this
+    // function is the chokepoint where an unbounded `to_fetch` becomes
+    // an unbounded `Vec<Derivation>` in memory — keep the check local
+    // so a future caller can't bypass the budget.
+    let cap = max_transitive_inputs();
+    if to_fetch.len() > cap {
+        return Err(GatewayError::DrvCacheFull {
+            count: to_fetch.len(),
+            cap,
+        }
+        .into());
     }
 
     // tonic clients are cheap clones over a shared Channel; each
