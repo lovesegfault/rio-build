@@ -205,3 +205,54 @@ async fn test_transition_build_db_fault_leaves_state_retryable() -> TestResult {
     );
     Ok(())
 }
+
+/// Retry DRIVER for the case above: after the last derivation
+/// completes, no event-driven path calls `check_build_completion`
+/// again. `tick_recheck_stuck_completions` (called from `handle_tick`)
+/// re-checks Active builds with `completed+failed >= total` so a
+/// transient PG blip on the final `update_build_status` recovers on
+/// the next Tick instead of hanging `WatchBuild` until the user
+/// disconnects (→ orphan-watcher wrongly Cancels) or the scheduler
+/// restarts.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_transition_build_db_fault_retried_by_tick() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("tickretry-w", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "tickretry-h", PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx).await;
+
+    db.pool.close().await;
+    complete_success_empty(&handle, "tickretry-w", &test_drv_path("tickretry-h")).await?;
+    barrier(&handle).await;
+
+    // Stuck Active (load-bearing precondition; covered by
+    // test_transition_build_db_fault_leaves_state_retryable above).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+
+    // Reopen the DB (fresh pool to the same database) and install it
+    // on the actor; then drive one Tick.
+    let fresh = db.reopen().await;
+    let (tx, ack) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::Debug(DebugCmd::SwapDb {
+            pool: fresh,
+            reply: tx,
+        }))
+        .await?;
+    ack.await?;
+    tick(&handle).await?;
+
+    // tick_recheck_stuck_completions → check_build_completion →
+    // transition_build (now succeeds) → Succeeded. Pre-fix: no tick
+    // path called check_build_completion → stayed Active.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "Tick must drive the transition_build retry after a transient DB error"
+    );
+    Ok(())
+}

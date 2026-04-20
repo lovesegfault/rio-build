@@ -545,6 +545,16 @@ pub enum DebugCmd {
         factors: std::collections::HashMap<String, f64>,
         reply: oneshot::Sender<()>,
     },
+    /// Swap the actor's `SchedulerDb` for a fresh pool. For
+    /// transient-DB-fault recovery tests: `db.pool.close()` closes
+    /// all clones (incl. the actor's), so [`TestDb::reopen`] mints a
+    /// fresh pool to the same database and this installs it.
+    ///
+    /// [`TestDb::reopen`]: rio_test_support::TestDb::reopen
+    SwapDb {
+        pool: sqlx::PgPool,
+        reply: oneshot::Sender<()>,
+    },
     /// Snapshot the actor's [`TestCounters`](super::TestCounters).
     /// For structural assertions on call-count (vs. wall-clock or
     /// absence-of-side-effect) — see I-163 / I-139 regression tests.

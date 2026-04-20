@@ -426,6 +426,19 @@ impl TestDb {
             admin_url,
         }
     }
+
+    /// Fresh `PgPool` connecting to this same test database. For tests
+    /// that `pool.close().await` to inject a transient DB fault and
+    /// then need a working pool to assert recovery (`PgPool::close()`
+    /// closes all clones; the actor's clone cannot be reused).
+    pub async fn reopen(&self) -> PgPool {
+        let test_url = replace_db_name(&self.admin_url, &self.db_name);
+        PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&test_url)
+            .await
+            .expect("failed to reconnect to test database")
+    }
 }
 
 #[cfg(feature = "full")]

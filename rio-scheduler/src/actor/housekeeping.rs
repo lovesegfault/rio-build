@@ -146,6 +146,7 @@ impl DagActor {
         self.tick_process_backstop_timeouts(&backstop_timeouts)
             .await;
         self.tick_check_build_timeouts().await;
+        self.tick_recheck_stuck_completions().await;
         self.tick_check_orphaned_builds().await;
         self.tick_process_expired_poisons(expired_poisons).await;
 
@@ -438,6 +439,35 @@ impl DagActor {
             if let Err(e) = self.transition_build_to_failed(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist per-build-timeout failure");
             }
+        }
+    }
+
+    /// Retry-driver for `transition_build` DB errors swallowed by
+    /// `check_build_completion`. The DB-first ordering in
+    /// `transition_build` makes retry POSSIBLE (in-mem stays Active on
+    /// PG error), but every `check_build_completion` caller is
+    /// event-driven (per-drv completion, dispatch cache-hit, merge,
+    /// recovery) — after the LAST derivation completes there are no
+    /// more events. Without a periodic re-check, the build sticks
+    /// Active and `WatchBuild` hangs until the user disconnects (→
+    /// orphan-watcher wrongly Cancels) or the scheduler restarts.
+    ///
+    /// O(builds) per tick, no DAG walk; idempotent
+    /// (`check_build_completion` early-returns on `is_terminal()`).
+    /// Runs BEFORE `tick_check_orphaned_builds` so completion-retry is
+    /// attempted before orphan-cancel.
+    async fn tick_recheck_stuck_completions(&mut self) {
+        let candidates: Vec<Uuid> = self
+            .builds
+            .iter()
+            .filter(|(_, b)| {
+                b.state() == BuildState::Active
+                    && (b.completed_count + b.failed_count) >= b.derivation_hashes.len() as u32
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in candidates {
+            self.check_build_completion(id).await;
         }
     }
 

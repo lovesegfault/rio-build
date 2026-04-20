@@ -109,6 +109,10 @@ impl DagActor {
                     .seed_hw(crate::sla::hw::HwTable::from_map(factors));
                 let _ = reply.send(());
             }
+            DebugCmd::SwapDb { pool, reply } => {
+                self.db = crate::db::SchedulerDb::new(pool);
+                let _ = reply.send(());
+            }
             DebugCmd::Counters { reply } => {
                 let _ = reply.send(self.test_counters.snapshot());
             }
