@@ -87,9 +87,9 @@ pub struct LogBatcher {
     /// Lines accepted in the current rate window.
     lines_this_window: u64,
     /// Lines dropped (rate-suppressed) in the current rate window.
-    lines_dropped_this_window: u64,
+    pub(crate) lines_dropped_this_window: u64,
     /// Start of the current rate window.
-    window_start: Instant,
+    pub(crate) window_start: Instant,
     /// Total bytes across all lines ever added (including flushed batches).
     total_bytes: u64,
 }
@@ -199,32 +199,20 @@ impl LogBatcher {
         }
     }
 
-    /// Flush any remaining lines as a final batch.
+    /// Flush buffered lines as a batch.
     ///
-    /// Drains `lines_dropped_this_window` first: a build whose final burst
-    /// exceeds the rate and then exits within the same 1s window never
-    /// triggers `add_line()`'s window-reset, so the suppression marker +
-    /// metric would otherwise be lost (silent truncation, undercounted
-    /// `rio_builder_log_lines_suppressed_total`).
+    /// Does NOT drain `lines_dropped_this_window` — drops belong to the
+    /// rate window, not the batch. Draining here would let the 100ms
+    /// `flush_tick` emit a fragmentary marker mid-window whenever some
+    /// accepted lines are still buffered alongside drops (any
+    /// `rate % MAX_BATCH_LINES != 0`), violating the spec's "single
+    /// marker at window reset" (`r[builder.log-limit+2]`). Only
+    /// `add_line`'s window-reset and [`final_flush`](Self::final_flush)
+    /// drain drops.
     ///
-    /// Callers: `BatchReady` (mid-build, lines always non-empty), the
-    /// periodic `flush_tick` (gated on `has_pending()` so it never fires
-    /// during pure suppression — the marker stays single-per-window per
-    /// `r[builder.log-limit+2]`), and the exit paths (`STDERR_LAST`,
-    /// `LimitExceeded`, silence-timeout) which call unconditionally and
-    /// skip the send when the resulting batch is empty.
+    /// Callers: `BatchReady` (mid-build), the periodic `flush_tick`
+    /// (gated on `has_pending()`), and `final_flush()`.
     pub fn flush(&mut self) -> BuildLogBatch {
-        let dropped = std::mem::take(&mut self.lines_dropped_this_window);
-        if dropped > 0 {
-            metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
-            let marker = format!(
-                "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
-                self.limits.rate_lines_per_sec
-            )
-            .into_bytes();
-            self.total_bytes += marker.len() as u64;
-            self.lines.push(marker);
-        }
         let first_line_number = self.next_line_number;
         self.next_line_number += self.lines.len() as u64;
 
@@ -238,15 +226,37 @@ impl LogBatcher {
         }
     }
 
+    /// Terminal flush: drain `lines_dropped_this_window` (emitting the
+    /// suppression marker + metric) then [`flush`](Self::flush).
+    ///
+    /// Call ONLY on exit paths (`STDERR_LAST`, `LimitExceeded`,
+    /// silence-timeout). A build whose final burst exceeds the rate and
+    /// then exits within the same 1s window never triggers `add_line`'s
+    /// window-reset, so without this the marker + metric would be lost
+    /// (silent truncation, undercounted
+    /// `rio_builder_log_lines_suppressed_total`).
+    pub fn final_flush(&mut self) -> BuildLogBatch {
+        let dropped = std::mem::take(&mut self.lines_dropped_this_window);
+        if dropped > 0 {
+            metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
+            let marker = format!(
+                "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
+                self.limits.rate_lines_per_sec
+            )
+            .into_bytes();
+            self.total_bytes += marker.len() as u64;
+            self.lines.push(marker);
+        }
+        self.flush()
+    }
+
     /// Whether there are buffered lines waiting to be sent.
     ///
     /// Used by `executor/daemon/stderr_loop.rs` to gate the periodic
     /// `flush_tick`. Deliberately does NOT check
-    /// `lines_dropped_this_window`: during sustained suppression `lines`
-    /// stays empty and the 100ms tick must be a no-op, otherwise it emits
-    /// a fragmentary marker every tick instead of the spec's single
-    /// marker at window-reset (`r[builder.log-limit+2]`). Exit paths
-    /// drain drops by calling `flush()` unconditionally.
+    /// `lines_dropped_this_window`: it's not this tick's job to emit the
+    /// marker (only window-reset / `final_flush` do), and reporting
+    /// "pending" with no lines would send an empty batch every 100ms.
     pub fn has_pending(&self) -> bool {
         !self.lines.is_empty()
     }
@@ -367,18 +377,19 @@ mod tests {
                 other => panic!("line {i} should be Buffered, got {other:?}"),
             }
         }
-        let batch = batcher.flush();
+        let batch = batcher.final_flush();
         assert_eq!(batch.lines.len(), 6, "5 buffered + 1 suppression marker");
         assert_eq!(batch.lines[4], vec![4u8], "last buffered is index 4");
         let marker = std::str::from_utf8(&batch.lines[5]).unwrap();
         assert!(
             marker.contains("5 lines suppressed"),
-            "flush() emits marker for drops never followed by window-reset: {marker}"
+            "final_flush() emits marker for drops never followed by window-reset: {marker}"
         );
     }
 
-    /// Regression: build ends within the suppression window → flush() must
-    /// emit the marker (was lost: only add_line()'s window-reset drained it).
+    /// Regression: build ends within the suppression window → final_flush()
+    /// must emit the marker (was lost: only add_line()'s window-reset drained
+    /// it).
     #[test]
     fn rate_limit_flush_emits_marker_when_build_ends_in_window() {
         let mut batcher = mk(LogLimits {
@@ -390,14 +401,64 @@ mod tests {
         }
         // No sleep, no further add_line — straight to final flush.
         // has_pending() is true here because 3 lines are buffered; it
-        // does NOT report the 4 drops (flush_tick must stay quiet during
-        // pure suppression). Exit paths call flush() unconditionally.
+        // does NOT report the 4 drops. Exit paths call final_flush()
+        // unconditionally.
         assert!(batcher.has_pending());
-        let batch = batcher.flush();
+        let batch = batcher.final_flush();
         assert_eq!(batch.lines.len(), 4, "3 accepted + 1 marker");
         let marker = std::str::from_utf8(&batch.lines[3]).unwrap();
         assert!(marker.contains("4 lines suppressed"));
         assert!(!batcher.has_pending(), "drained after flush");
+    }
+
+    /// Regression: mid-window tick `flush()` with buffered lines + drops
+    /// must NOT drain drops (would emit a fragmentary marker, then a
+    /// second one at window-reset — violates `r[builder.log-limit+2]`'s
+    /// "single marker at window reset"). Only `add_line`'s reset and
+    /// `final_flush()` drain.
+    // r[verify builder.log-limit+2]
+    #[test]
+    fn rate_limit_single_marker_per_window_under_mixed_tick_flush() {
+        let mut b = mk(LogLimits {
+            rate_lines_per_sec: 5,
+            total_bytes: 0,
+        });
+        // Window 0: 5 accepted + 3 suppressed. lines.len()==5 (< MAX_BATCH_LINES).
+        for _ in 0..8 {
+            b.add_line(b"x".to_vec());
+        }
+        assert_eq!(b.lines_dropped_this_window, 3);
+        // Mid-window tick flush — must NOT emit a marker.
+        let batch = b.flush();
+        assert_eq!(batch.lines.len(), 5, "tick flush must not inject marker");
+        assert_eq!(
+            b.lines_dropped_this_window, 3,
+            "drops survive tick flush (belong to window, not batch)"
+        );
+        // 2 more suppressed in same window.
+        for _ in 0..2 {
+            b.add_line(b"x".to_vec());
+        }
+        assert_eq!(b.lines_dropped_this_window, 5);
+        // Force window reset (back-date window_start; LogBatcher uses
+        // real Instant so paused tokio-time wouldn't help).
+        b.window_start = Instant::now() - Duration::from_secs(2);
+        b.add_line(b"y".to_vec());
+        // add_line's reset injected ONE marker for the full 5 drops.
+        let batch = b.flush();
+        let markers: Vec<_> = batch
+            .lines
+            .iter()
+            .filter(|l| l.starts_with(b"[rio:"))
+            .collect();
+        assert_eq!(markers.len(), 1, "exactly one marker per window");
+        assert!(
+            std::str::from_utf8(markers[0])
+                .unwrap()
+                .contains("5 lines suppressed"),
+            "marker reports total window drops, not a fragment"
+        );
+        assert_eq!(b.lines_dropped_this_window, 0, "window-reset drained drops");
     }
 
     #[test]
