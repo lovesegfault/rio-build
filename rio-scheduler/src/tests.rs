@@ -19,7 +19,6 @@ fn config_defaults_are_stable() {
     assert!(d.database_url.is_empty());
     // Phase2b additions — off by default.
     assert_eq!(d.log_s3_bucket, None);
-    assert_eq!(d.log_s3_prefix, "logs");
     // Size-classes: optional feature, off by default.
     assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
     // Phase 4a (plan 21E): lease config via figment, not raw env.

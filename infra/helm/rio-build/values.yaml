@@ -211,7 +211,11 @@ store:
     # s3 requires bucket (+ endpoint/region/creds via env or IRSA).
     kind: s3
     bucket: ""
-    prefix: chunks/
+    # Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).
+    # Empty = dedicated bucket (the xtask/EKS assumption): keys land at
+    # `chunks/ab/...` and `logs/...` directly. Set only when sharing a
+    # bucket with non-rio data, e.g. `prefix: rio` → `rio/chunks/ab/...`.
+    prefix: ""
     # For Rook RGW in dev: http://rook-ceph-rgw-rio-store.rook-ceph:80
     endpoint: ""
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).

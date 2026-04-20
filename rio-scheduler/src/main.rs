@@ -55,7 +55,6 @@ async fn main() -> anyhow::Result<()> {
     let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
     let (log_flush_tx, admin_s3) = init_log_pipeline(
         cfg.log_s3_bucket.as_deref(),
-        &cfg.log_s3_prefix,
         pool.clone(),
         Arc::clone(&log_buffers),
     )
@@ -639,7 +638,6 @@ type AdminS3 = (aws_sdk_s3::Client, String);
 /// AdminService can only serve active-derivation logs.
 async fn init_log_pipeline(
     bucket: Option<&str>,
-    prefix: &str,
     pool: sqlx::PgPool,
     log_buffers: Arc<rio_scheduler::logs::LogBuffers>,
 ) -> (Option<LogFlushTx>, Option<AdminS3>) {
@@ -657,15 +655,10 @@ async fn init_log_pipeline(
     // for both services. See rio_common::s3::default_client.
     let s3 = rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
     let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
-    let flusher = rio_scheduler::logs::LogFlusher::new(
-        s3.clone(),
-        bucket.to_owned(),
-        prefix.to_owned(),
-        pool,
-        log_buffers,
-    );
+    let flusher =
+        rio_scheduler::logs::LogFlusher::new(s3.clone(), bucket.to_owned(), pool, log_buffers);
     flusher.spawn(flush_rx);
-    info!(%bucket, %prefix, "log flusher spawned");
+    info!(%bucket, "log flusher spawned");
     (Some(flush_tx), Some((s3, bucket.to_owned())))
 }
 

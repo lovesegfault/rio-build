@@ -448,16 +448,14 @@ pub struct S3ChunkBackend {
 impl S3ChunkBackend {
     pub fn new(client: Client, bucket: String, prefix: String) -> Self {
         // Normalize: strip trailing slashes. `s3_key()` below joins with
-        // a literal "/chunks/", so a prefix of "chunks/" would produce
-        // "chunks//chunks/ab/..." — which S3 treats as a DISTINCT key
-        // from "chunks/chunks/ab/..." (no path normalization). Observed
-        // on EKS with `prefix = "chunks/"` from the Helm chart: every
-        // PutObject wrote to the double-slash key, every GetObject
-        // looked there too (consistent with itself), but inspection/
-        // cleanup tooling that expects the documented key scheme missed
-        // them. Stripping leading slashes too would be surprising (a
-        // prefix of "/foo" is unusual but intentional); trailing is
-        // almost always a config mistake.
+        // a literal "/chunks/", so a prefix of "foo/" would produce
+        // "foo//chunks/ab/..." — which S3 treats as a DISTINCT key from
+        // "foo/chunks/ab/..." (no path normalization). I-040: an early
+        // Helm default of `prefix = "chunks/"` wrote every object to the
+        // double-slash key; self-consistent on read, but invisible to
+        // tooling that expected the documented scheme. Stripping leading
+        // slashes too would be surprising (a prefix of "/foo" is unusual
+        // but intentional); trailing is almost always a config mistake.
         let normalized = prefix.trim_end_matches('/').to_string();
         Self {
             client,
@@ -962,8 +960,9 @@ mod tests {
             format!("chunks/ab/{}", "ab".repeat(32))
         );
 
-        // Trailing slash normalized away at construction. Regression:
-        // Helm chart set prefix="chunks/" → "chunks//chunks/ab/..." keys.
+        // Trailing slash normalized away at construction. I-040 regression
+        // pin: an early Helm default of prefix="chunks/" produced
+        // "chunks//chunks/ab/..." keys (current default is "").
         let trailing = S3ChunkBackend::new(client.clone(), "b".into(), "chunks/".into());
         let bare = S3ChunkBackend::new(client.clone(), "b".into(), "chunks".into());
         assert_eq!(

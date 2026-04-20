@@ -26,7 +26,6 @@ pub(super) struct Config {
     /// S3 bucket for build-log flush. `None` = flush disabled.
     /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
     pub(super) log_s3_bucket: Option<String>,
-    pub(super) log_s3_prefix: String,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
@@ -125,7 +124,6 @@ impl Default for Config {
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
             log_s3_bucket: None,
-            log_s3_prefix: "logs".into(),
             soft_features: Vec::new(),
             hmac_key_path: None,
             service_hmac_key_path: None,
@@ -171,11 +169,6 @@ pub(super) struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) log_s3_bucket: Option<String>,
-
-    /// S3 key prefix for build logs
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) log_s3_prefix: Option<String>,
 }
 
 impl rio_common::config::ValidateConfig for Config {

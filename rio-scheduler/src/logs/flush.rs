@@ -61,24 +61,15 @@ pub struct FlushRequest {
 pub struct LogFlusher {
     s3: S3Client,
     bucket: String,
-    /// Key prefix, no trailing slash. Typically `"logs"`.
-    prefix: String,
     pool: PgPool,
     buffers: Arc<LogBuffers>,
 }
 
 impl LogFlusher {
-    pub fn new(
-        s3: S3Client,
-        bucket: String,
-        prefix: String,
-        pool: PgPool,
-        buffers: Arc<LogBuffers>,
-    ) -> Self {
+    pub fn new(s3: S3Client, bucket: String, pool: PgPool, buffers: Arc<LogBuffers>) -> Self {
         Self {
             s3,
             bucket,
-            prefix,
             pool,
             buffers,
         }
@@ -102,7 +93,6 @@ impl LogFlusher {
 
             info!(
                 bucket = %self.bucket,
-                prefix = %self.prefix,
                 interval = ?PERIODIC_FLUSH_INTERVAL,
                 "log flusher started"
             );
@@ -221,25 +211,24 @@ impl LogFlusher {
         lines: Vec<Vec<u8>>,
         is_final: bool,
     ) {
-        // S3 key: for finals, `{prefix}/{min_build_id}/{drv_hash}.log.zst`
-        // via `log_s3_key()`. Per spec (observability.md:12-14). We use the
-        // MIN interested build's id for the key path (deterministic:
+        // S3 key: for finals, `logs/{min_build_id}/{drv_hash}.log.zst` via
+        // `log_s3_key()`. Per spec (observability.md:12-14). We use the MIN
+        // interested build's id for the key path (deterministic:
         // `get_interested_builds()` sorts, so `.first()` is min(UUID) — the
         // spec doesn't say which build_id when N>1, and PG rows all point
         // at the same s3_key anyway).
         //
         // For periodic: interested_builds is empty → key is
-        // `{prefix}/periodic/{drv_hash}.log.zst`.
+        // `logs/periodic/{drv_hash}.log.zst`.
         let drv_hash = drv_log_hash(&req.drv_path);
         debug_assert!(
             !drv_hash.is_empty(),
             "drv_log_hash({:?}) yielded empty hash — drv_path not store-path-shaped",
             req.drv_path
         );
-        let s3_key = if let Some(bid) = req.interested_builds.first() {
-            log_s3_key(&self.prefix, bid, &req.drv_path)
-        } else {
-            format!("{}/periodic/{drv_hash}.log.zst", self.prefix)
+        let s3_key = match req.interested_builds.first() {
+            Some(bid) => log_s3_key(bid, &req.drv_path),
+            None => format!("logs/periodic/{drv_hash}.log.zst"),
         };
 
         // Compress in spawn_blocking. ~10 MiB of log compresses in ~50ms on
@@ -517,7 +506,6 @@ mod tests {
         let flusher = LogFlusher::new(
             s3,
             "test-bucket".into(),
-            "logs".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
         );
@@ -571,13 +559,7 @@ mod tests {
         let buffers = Arc::new(LogBuffers::new());
         // DON'T push anything.
 
-        let flusher = LogFlusher::new(
-            s3,
-            "test-bucket".into(),
-            "logs".into(),
-            db.pool.clone(),
-            buffers,
-        );
+        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
 
         flusher
             .flush_final(FlushRequest {
@@ -608,7 +590,6 @@ mod tests {
         let flusher = LogFlusher::new(
             s3,
             "test-bucket".into(),
-            "logs".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
         );
@@ -703,13 +684,7 @@ mod tests {
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(drv_path, 0, &[b"shared-line"]));
 
-        let flusher = LogFlusher::new(
-            s3,
-            "test-bucket".into(),
-            "logs".into(),
-            db.pool.clone(),
-            buffers,
-        );
+        let flusher = LogFlusher::new(s3, "test-bucket".into(), db.pool.clone(), buffers);
 
         flusher
             .flush_final(FlushRequest {
@@ -779,7 +754,6 @@ mod tests {
         let flusher = LogFlusher::new(
             client,
             "test-bucket".into(),
-            "logs".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
         );
@@ -844,7 +818,6 @@ mod tests {
         let flusher = LogFlusher::new(
             client,
             "test-bucket".into(),
-            "logs".into(),
             db.pool.clone(),
             Arc::clone(&buffers),
         );
@@ -885,14 +858,7 @@ mod tests {
         ));
 
         let (tx, rx) = mpsc::channel::<FlushRequest>(8);
-        LogFlusher::new(
-            s3,
-            "b".into(),
-            "logs".into(),
-            db.pool.clone(),
-            Arc::clone(&buffers),
-        )
-        .spawn(rx);
+        LogFlusher::new(s3, "b".into(), db.pool.clone(), Arc::clone(&buffers)).spawn(rx);
 
         // Auto-advance drives the interval; tx open so the loop is
         // recv-vs-tick (not the channel-close final sweep).

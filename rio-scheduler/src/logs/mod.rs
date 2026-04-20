@@ -68,12 +68,15 @@ pub fn drv_log_hash(s: &str) -> String {
 }
 
 /// Construct the canonical S3 key for a completed derivation's log blob:
-/// `{prefix}/{build_id}/{drv_hash}.log.zst` per `observability.md`.
+/// `logs/{build_id}/{drv_hash}.log.zst` per `observability.md`. The
+/// `logs/` segment is fixed (peer to rio-store's `chunks/` in the same
+/// bucket); rio assumes a dedicated bucket, so there is no configurable
+/// prefix.
 ///
 /// `drv_path` is the full `/nix/store/...` path (the ring-buffer key);
 /// the hash is extracted via [`drv_log_hash`].
-pub fn log_s3_key(prefix: &str, build_id: &Uuid, drv_path: &str) -> String {
-    format!("{prefix}/{build_id}/{}.log.zst", drv_log_hash(drv_path))
+pub fn log_s3_key(build_id: &Uuid, drv_path: &str) -> String {
+    format!("logs/{build_id}/{}.log.zst", drv_log_hash(drv_path))
 }
 
 /// Max lines retained per derivation. Beyond this, oldest lines are evicted.
@@ -351,6 +354,16 @@ mod tests {
             first_line_number: first_line,
             executor_id: "test-worker".into(),
         }
+    }
+
+    #[test]
+    fn log_s3_key_layout() {
+        let bid = Uuid::nil();
+        let drv = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-hello.drv";
+        assert_eq!(
+            log_s3_key(&bid, drv),
+            format!("logs/{bid}/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2.log.zst"),
+        );
     }
 
     #[test]

@@ -42,12 +42,6 @@ in
       '';
     };
 
-    logS3Prefix = lib.mkOption {
-      type = lib.types.str;
-      default = "logs";
-      description = "S3 key prefix for build logs (`RIO_LOG_S3_PREFIX`).";
-    };
-
     extraConfig = lib.mkOption {
       type = lib.types.str;
       default = "";
@@ -130,7 +124,6 @@ in
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
-        RIO_LOG_S3_PREFIX = cfg.logS3Prefix;
       }
       // lib.optionalAttrs (cfg.logS3Bucket != null) {
         RIO_LOG_S3_BUCKET = cfg.logS3Bucket;
