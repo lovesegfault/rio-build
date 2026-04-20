@@ -54,6 +54,7 @@ scope: with scope; ''
       try:
           standby_out = k3s_server.fail(
               "${grpcurl} ${grpcurlTls} -max-time 15 "
+              f"-H 'x-rio-service-token: {service_token}' "
               "-protoset ${protoset}/rio.protoset "
               '-d \'{"tenantName": "prod-parity-standby-reject"}\' '
               "localhost:19301 rio.admin.AdminService/CreateTenant 2>&1"
@@ -97,6 +98,7 @@ scope: with scope; ''
           ldr = leader_pod()
           out = pf_exec(ldr, 9001,
               f"${grpcurl} ${grpcurlTls} -max-time 15 "
+              f"-H 'x-rio-service-token: {service_token}' "
               f"-protoset ${protoset}/rio.protoset "
               f"-d '{{\"tenantName\": \"{tenant_name}\"}}' "
               f"localhost:__PORT__ rio.admin.AdminService/CreateTenant",
@@ -124,6 +126,7 @@ scope: with scope; ''
       # view). Response is JSON (grpcurl default output).
       list_out = pf_exec(leader_pod(), 9001,
           "${grpcurl} ${grpcurlTls} -max-time 15 "
+          f"-H 'x-rio-service-token: {service_token}' "
           "-protoset ${protoset}/rio.protoset -d '{}' "
           "localhost:__PORT__ rio.admin.AdminService/ListTenants")
       print(f"bootstrap-tenant: ListTenants:\n{list_out}")

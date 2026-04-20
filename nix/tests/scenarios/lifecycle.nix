@@ -127,6 +127,28 @@ let
     print(jwt.encode(claims, sk, algorithm="EdDSA"))
   '';
 
+  # Mint an x-rio-service-token (rio_auth::hmac::ServiceClaims) for
+  # AdminService grpcurl calls. G10 gated CreateTenant/TriggerGC/etc.
+  # on ensure_service_caller(); the test acts as rio-cli would. The
+  # key is read from the LIVE rio-service-hmac Secret (base64 on
+  # stdin) — NOT from fixture.hmacKeys: hmac-keys.nix is openssl-rand
+  # non-deterministic, and the cached hmacSecretsManifest may embed a
+  # different realization than the one currently in the store
+  # (ci-failure-patterns.md "IFD × non-determinism"). Format matches
+  # HmacSigner::sign: base64url_nopad(json) "." base64url_nopad(tag).
+  signServiceToken = pkgs.writeScript "sign-service-token-lifecycle" ''
+    #!${pkgs.python3}/bin/python3
+    import base64, hashlib, hmac, json, sys, time
+    key = base64.b64decode(sys.stdin.read().strip())
+    claims = json.dumps(
+        {"caller": "rio-cli", "expiry_unix": int(time.time()) + 3600},
+        separators=(",", ":"),
+    ).encode()
+    tag = hmac.new(key, claims, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    print(f"{b64(claims)}.{b64(tag)}")
+  '';
+
   # rio-* gRPC is plaintext-on-WireGuard; grpcurl needs -plaintext.
   grpcurlTls = "-plaintext";
 
@@ -443,11 +465,14 @@ let
     # RPC itself; port-forward is killed by trap even if grpcurl hangs.
     def sched_grpc(payload, method):
         """TriggerGC etc. on the scheduler leader. Returns stdout+stderr.
-        Carries x-rio-tenant-token (require_tenant gate); AdminService
-        ignores it, SchedulerService requires it when jwtEnabled."""
+        Carries x-rio-tenant-token (require_tenant gate) AND
+        x-rio-service-token (ensure_service_caller gate on
+        AdminService). SchedulerService ignores the service token;
+        AdminService ignores the tenant token."""
         return pf_exec(leader_pod(), 9001,
             f"${grpcurl} ${grpcurlTls} -max-time 30 "
             f"-H 'x-rio-tenant-token: {tenant_jwt}' "
+            f"-H 'x-rio-service-token: {service_token}' "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{payload}' localhost:__PORT__ {method}")
 
@@ -533,6 +558,10 @@ let
         "VALUES ('vm-lifecycle', 0) RETURNING tenant_id"
     )
     tenant_jwt = k3s_server.succeed(f"${signJwt} {tenant_id}").strip()
+    service_token = k3s_server.succeed(
+        "k3s kubectl -n ${ns} get secret rio-service-hmac "
+        "-o jsonpath='{.data.service-hmac\\.key}' | ${signServiceToken}"
+    ).strip()
     print(f"lifecycle: tenant vm-lifecycle={tenant_id}")
 
     # ── SSH + seed ────────────────────────────────────────────────────

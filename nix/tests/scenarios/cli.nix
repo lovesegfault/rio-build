@@ -20,11 +20,10 @@ let
   rioCli = "${common.rio-workspace}/bin/rio-cli";
   # G10 gated AdminService RPCs on x-rio-service-token. rio-cli mints
   # the token via ServiceTokenInterceptor when RIO_SERVICE_HMAC_KEY_PATH
-  # is set; the key derivation is the same one the chart Secret was
-  # rendered from, so signer and verifier agree.
-  cliEnv =
-    "RIO_SCHEDULER_ADDR=localhost:19001 "
-    + "RIO_SERVICE_HMAC_KEY_PATH=${fixture.hmacKeys}/service-hmac.key ";
+  # is set. The key is fetched from the live rio-service-hmac Secret
+  # below (NOT fixture.hmacKeys: openssl-rand is non-deterministic and
+  # the cached hmacSecretsManifest may embed a different realization).
+  cliEnv = "RIO_SCHEDULER_ADDR=localhost:19001 " + "RIO_SERVICE_HMAC_KEY_PATH=/tmp/service-hmac.key ";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
@@ -42,6 +41,14 @@ pkgs.testers.runNixOSTest {
     # lifecycle.nix's per-call pf_exec, this stays up for the whole
     # test — all CLI calls go through localhost:19001.
     pf_open(leader_pod(), 19001, 9001, tag="pf-cli")
+
+    # Fetch the service-HMAC key from the chart Secret so rio-cli signs
+    # with the exact bytes the scheduler verifies against.
+    k3s_server.succeed(
+        "k3s kubectl -n ${fixture.ns} get secret rio-service-hmac "
+        "-o jsonpath='{.data.service-hmac\\.key}' "
+        "| base64 -d > /tmp/service-hmac.key"
+    )
 
     # One CLI invocation. Always returns stdout+stderr (2>&1) so error
     # messages show up in the test log on failure. covShellEnv sets
