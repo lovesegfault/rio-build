@@ -665,40 +665,43 @@ pub async fn execute_build(
         peak_disk_bytes,
     };
 
-    // Propagate any daemon error AFTER cgroup teardown ran inside
-    // run_daemon_lifecycle — but WITH peaks attached, not via `?`.
-    let build_result = match build_result {
-        Ok(r) => r,
-        Err(e) => return post_err(e),
+    // 10. Collect outputs (borrows &overlay_mount; must precede teardown).
+    // The daemon error is NOT propagated yet — teardown below must run
+    // on the spawn_blocking pool for both Ok AND Err. A `return
+    // post_err(e)` here would drop `overlay_mount` synchronously on this
+    // tokio worker (multi-GB `remove_dir_all`), and `Wire(UnexpectedEof)`
+    // is `is_daemon_transient()` → the retry loop at runtime/mod.rs calls
+    // back in instead of exiting, so the worker would block across the
+    // retry and starve heartbeats.
+    let collect_result = match build_result {
+        Err(e) => Err(e),
+        Ok(br) => collect_outputs(
+            &br,
+            store_client,
+            &overlay_mount,
+            &drv,
+            drv_path,
+            is_fod,
+            &input_paths,
+            &assignment.assignment_token,
+        )
+        .await
+        .map(|o| (br, o)),
     };
 
-    // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
-    let BuildOutputs { proto_result } = match collect_outputs(
-        &build_result,
-        store_client,
-        &overlay_mount,
-        &drv,
-        drv_path,
-        is_fod,
-        &input_paths,
-        &assignment.assignment_token,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => return post_err(e),
-    };
-
-    // 11. Tear down overlay (explicit, before Drop).
+    // 11. Tear down overlay UNCONDITIONALLY via spawn_blocking — covers
+    // Ok AND Err. The post_err returns below no longer hold a mounted
+    // OverlayMount, so Drop is a no-op (mounted=false after
+    // teardown_overlay). teardown_overlay does `remove_dir_all` over
+    // upper/nix/store/ — multi-GB / 100k+ inodes for large builds. Same
+    // heartbeat-starvation concern as setup_overlay above.
+    //
     // We don't override a successful build result just because its own
     // teardown fails. Teardown failure increments
     // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
-    // centralized so ?-early-returns and panics also count); with one build
-    // per pod a leaked mount is reclaimed when the pod is discarded.
+    // centralized so ?-early-returns and panics also count); with one
+    // build per pod a leaked mount is reclaimed when the pod is discarded.
     let merged_path = overlay_mount.merged_dir().to_path_buf();
-    // teardown_overlay does `remove_dir_all` over upper/nix/store/ —
-    // multi-GB / 100k+ inodes for large builds. Same heartbeat-starvation
-    // concern as setup_overlay above; same spawn_blocking treatment.
     match tokio::task::spawn_blocking(move || overlay::teardown_overlay(overlay_mount)).await {
         Err(join_err) => return post_err(ExecutorError::OverlayTaskPanic(join_err)),
         Ok(Err(e)) => {
@@ -711,6 +714,13 @@ pub async fn execute_build(
         }
         Ok(Ok(())) => {}
     }
+
+    // Propagate any daemon/collect error AFTER teardown ran — WITH peaks
+    // attached, not via `?`.
+    let (_build_result, BuildOutputs { proto_result }) = match collect_result {
+        Ok(pair) => pair,
+        Err(e) => return post_err(e),
+    };
 
     ExecuteOutcome {
         result: Ok(ExecutionResult {

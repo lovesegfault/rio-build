@@ -163,9 +163,16 @@ impl OverlayMount {
 
 impl Drop for OverlayMount {
     /// Synchronous last-resort fallback for `?`-early-returns and panics.
-    /// The explicit `teardown_overlay()` calls in `executor::execute_build`
-    /// are `spawn_blocking`-wrapped; Drop structurally can't be, but
-    /// single-shot pods mean Drop-time blocking only ever delays exit.
+    /// The explicit `teardown_overlay()` call in `executor::execute_build`
+    /// is `spawn_blocking`-wrapped and runs UNCONDITIONALLY before any
+    /// post-build return; Drop structurally can't be async. The
+    /// daemon-transient retry loop (`runtime/mod.rs`) means Drop is NOT
+    /// always exit-adjacent — a `Wire(UnexpectedEof)` mid-build retries
+    /// `execute_build` without exiting — so the explicit
+    /// `spawn_blocking(teardown_overlay)` before every post-build return
+    /// is load-bearing. This Drop is a panic-path safety net only; a
+    /// multi-GB upper falling through here on a non-exit path WOULD
+    /// block a tokio worker for seconds.
     fn drop(&mut self) {
         if self.mounted {
             if let Err(e) = teardown_overlay_inner(&self.merged, &self.build_dir) {
