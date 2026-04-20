@@ -910,20 +910,7 @@ async fn run_daemon_lifecycle(
     // path fast stop (guard fires redundantly after, which is a no-op
     // on an already-aborted handle).
     let (peak_cpu_cores, oom_detected) = monitors.stop();
-
-    // OOM override: if the watcher fired, run_daemon_build returned
-    // some Err (Wire(UnexpectedEof) from the cgroup.kill, or possibly
-    // a daemon-reported MiscFailure if the daemon caught the child
-    // death first). Replace it with CgroupOom so runtime.rs reports
-    // InfrastructureFailure with the resource-floor hint, NOT a transient-
-    // retry (UnexpectedEof would hit `is_daemon_transient` → 3× local
-    // retry → 3× more OOM-loops) and NOT BuildFailed (drv isn't broken).
-    let build_result = if oom_detected {
-        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
-        Err(ExecutorError::CgroupOom)
-    } else {
-        build_result
-    };
+    let build_result = apply_oom_override(oom_detected, build_result);
 
     // Read cgroup memory.peak. Kernel-tracked lifetime max of the
     // WHOLE TREE — daemon + builder + every child. One read, no
@@ -961,6 +948,44 @@ async fn run_daemon_lifecycle(
         peak_memory_bytes,
         peak_cpu_cores,
     })
+}
+
+/// Reclassify a daemon error as `CgroupOom` when `oom_detected` AND
+/// the build already failed; preserve `Ok(Built)` even if OOM fired.
+///
+/// Two paths set `oom_detected`:
+/// - the 1Hz watcher writes `cgroup.kill` → daemon EOF →
+///   `Err(Wire(UnexpectedEof))`. `is_err()` always true.
+/// - `monitors.stop()`'s `final_oom` synchronous read does NOT kill,
+///   so a build whose script tolerated a child OOM (`tool || true`,
+///   `make -k`, retry-runner) returns `Ok(Built)` here. Discarding
+///   that would loop re-dispatch on a build that deterministically
+///   succeeds-with-child-OOM, ratcheting the floor until poisoned.
+///
+/// `Err` → `CgroupOom` keeps the runtime from hitting
+/// `is_daemon_transient` (3× local OOM-loop) and from `BuildFailed`
+/// (drv isn't broken). `Ok` → kept; metric still emitted because the
+/// OOM is a real sizing signal.
+// r[impl builder.oom.cgroup-watch+3]
+fn apply_oom_override(
+    oom_detected: bool,
+    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
+    match (oom_detected, &build_result) {
+        (true, Err(_)) => {
+            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+            Err(ExecutorError::CgroupOom)
+        }
+        (true, Ok(_)) => {
+            metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+            tracing::warn!(
+                "oom_kill incremented but build succeeded; keeping Ok(Built) \
+                 (script tolerated the OOM-killed child)"
+            );
+            build_result
+        }
+        (false, _) => build_result,
+    }
 }
 
 /// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
@@ -1256,6 +1281,51 @@ mod tests {
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_permanent());
         // is_permanent and is_daemon_transient are disjoint.
         assert!(!ExecutorError::InvalidDerivation("x".into()).is_daemon_transient());
+    }
+
+    // r[verify builder.oom.cgroup-watch+3]
+    /// `apply_oom_override` MUST preserve `Ok(Built)` even when
+    /// `oom_detected` is true (the `final_oom` path does not
+    /// `cgroup.kill`, so a build that tolerated a child OOM reports
+    /// `Built`). Regression: previously the override was unconditional
+    /// and discarded the completed outputs → re-dispatch loop.
+    #[test]
+    fn test_apply_oom_override_preserves_ok_built() {
+        use rio_nix::protocol::build::BuildResult;
+        use rio_nix::protocol::wire::WireError;
+        use std::io::{Error as IoError, ErrorKind};
+
+        // (true, Ok(Built)) → Ok(Built). The bug case.
+        let r = apply_oom_override(true, Ok(BuildResult::success()));
+        assert!(
+            matches!(&r, Ok(br) if br.status == rio_nix::protocol::build::BuildStatus::Built),
+            "Ok(Built) must be preserved when oom_detected, got: {r:?}"
+        );
+
+        // (true, Err(Wire(UnexpectedEof))) → Err(CgroupOom). Watcher path.
+        let r = apply_oom_override(
+            true,
+            Err(ExecutorError::Wire(WireError::Io(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "eof",
+            )))),
+        );
+        assert!(matches!(r, Err(ExecutorError::CgroupOom)), "got: {r:?}");
+
+        // (true, Err(BuildFailed)) → Err(CgroupOom). final_oom reclassify.
+        let r = apply_oom_override(true, Err(ExecutorError::BuildFailed("exit 137".into())));
+        assert!(matches!(r, Err(ExecutorError::CgroupOom)), "got: {r:?}");
+
+        // (false, Ok) → Ok unchanged.
+        let r = apply_oom_override(false, Ok(BuildResult::success()));
+        assert!(r.is_ok());
+
+        // (false, Err) → Err unchanged (NOT reclassified).
+        let r = apply_oom_override(false, Err(ExecutorError::BuildFailed("exit 1".into())));
+        assert!(
+            matches!(r, Err(ExecutorError::BuildFailed(_))),
+            "got: {r:?}"
+        );
     }
 
     fn test_env() -> ExecutorEnv {

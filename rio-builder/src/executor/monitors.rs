@@ -53,6 +53,13 @@ impl CgroupMonitors {
     /// `memory.events oom_kill` is cumulative and outlives the killed
     /// process; the build cgroup is destroyed *later* by
     /// `drain_build_cgroup`.
+    ///
+    /// Unlike the watcher tick, this final read does NOT write
+    /// `cgroup.kill`, so `oom_detected` can be `true` while the daemon
+    /// reported `Built` (script tolerated the killed child via
+    /// `|| true` / `make -k` / retry-runner). The caller
+    /// (`apply_oom_override`) gates the `CgroupOom` reclassification on
+    /// `build_result.is_err()` for that reason.
     pub(super) fn stop(self) -> (f64, bool) {
         self.cpu_poll.abort();
         self.oom_watch.abort();
@@ -149,7 +156,7 @@ pub(super) fn spawn_cgroup_monitors(
         }
     });
 
-    // r[impl builder.oom.cgroup-watch+2]
+    // r[impl builder.oom.cgroup-watch+3]
     // OOM watcher (I-196 defense-in-depth). Polls the POD-level
     // `memory.events` (delegated root — where k8s set memory.max; the
     // per-build sub-cgroup has no limit of its own) for `oom_kill`
@@ -284,7 +291,7 @@ mod tests {
         std::fs::write(dir.join("memory.events"), format!("oom 0\noom_kill {n}\n")).unwrap();
     }
 
-    // r[verify builder.oom.cgroup-watch+2]
+    // r[verify builder.oom.cgroup-watch+3]
     /// `stop()` MUST do a final synchronous `read_oom_kill`: an OOM that
     /// lands between the watcher's last 1Hz tick and build-exit (fast-exit
     /// toolchains: cargo / single cc exit ~100ms after a child OOM) would
