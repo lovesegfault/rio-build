@@ -33,6 +33,16 @@ pub(crate) type AdminClient = AdminServiceClient<
     >,
 >;
 
+/// Shared `StoreAdminServiceClient` shape. Same interceptor as
+/// [`AdminClient`] — `r[store.admin.service-gate]` requires
+/// `x-rio-service-token` on every `StoreAdminService` RPC.
+pub(crate) type StoreAdminClient = StoreAdminServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        Channel,
+        rio_auth::hmac::ServiceTokenInterceptor,
+    >,
+>;
+
 // Subcommand handlers. Each module owns its `#[derive(Args)]` struct
 // and `run*` fn so `main.rs` deltas for a new subcommand stay at enum
 // variant + match arm + mod decl.
@@ -193,11 +203,22 @@ impl Config {
 
     /// Connect to the store's `StoreAdminService`. Only `upstream` /
     /// `verify-chunks` need this; called per-arm so scheduler-only
-    /// subcommands don't fail on an unreachable store.
-    async fn connect_store_admin(&self) -> anyhow::Result<StoreAdminServiceClient<Channel>> {
-        rio_proto::client::connect_single(&self.store_addr)
+    /// subcommands don't fail on an unreachable store. Wraps with
+    /// [`ServiceTokenInterceptor`](rio_auth::hmac::ServiceTokenInterceptor)
+    /// — `r[store.admin.service-gate]`.
+    async fn connect_store_admin(&self) -> anyhow::Result<StoreAdminClient> {
+        let ch = rio_proto::client::connect_channel(&self.store_addr)
             .await
-            .map_err(|e| anyhow!("connect to store at {}: {e}", self.store_addr))
+            .map_err(|e| anyhow!("connect to store at {}: {e}", self.store_addr))?;
+        let signer = rio_auth::hmac::HmacSigner::load(self.service_hmac_key_path.as_deref())
+            .map_err(|e| anyhow!("service HMAC key load: {e}"))?
+            .map(std::sync::Arc::new);
+        Ok(StoreAdminServiceClient::with_interceptor(
+            ch,
+            rio_auth::hmac::ServiceTokenInterceptor::new(signer, "rio-cli"),
+        )
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size()))
     }
 }
 

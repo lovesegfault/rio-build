@@ -331,13 +331,24 @@ pub(crate) const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
 /// balanced channel). The ComponentScaler reconciler fans out
 /// `GetLoad` to every store pod — it needs each pod's individual
 /// reading, so the p2c balanced channel (which would route all calls
-/// to one or two pods) is the wrong tool.
-pub async fn connect_store_admin_at(
+/// to one or two pods) is the wrong tool. Takes an interceptor so the
+/// caller can attach `x-rio-service-token`
+/// (`r[store.admin.service-gate]`).
+pub async fn connect_store_admin_at<I>(
     addr: SocketAddr,
-) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
+    interceptor: I,
+) -> anyhow::Result<
+    crate::StoreAdminServiceClient<tonic::service::interceptor::InterceptedService<Channel, I>>,
+>
+where
+    I: tonic::service::Interceptor,
+{
     let ep = build_endpoint(addr)?;
     let ch = ep.connect().await?;
-    Ok(super::ProtoClient::wrap(ch))
+    Ok(crate::StoreAdminServiceClient::with_interceptor(
+        ch,
+        interceptor,
+    ))
 }
 
 #[cfg(test)]

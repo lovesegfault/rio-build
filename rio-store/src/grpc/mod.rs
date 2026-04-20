@@ -314,9 +314,13 @@ impl StoreServiceImpl {
 
     /// Enable `x-rio-service-token` verification on PutPath. Builder-
     /// style. Verifier is keyed with `RIO_SERVICE_HMAC_KEY_PATH`
-    /// (NOT the assignment key — separate secret).
-    pub fn with_service_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
-        self.service_verifier = Some(Arc::new(verifier));
+    /// (NOT the assignment key — separate secret). Takes `Arc` so
+    /// `main.rs` can share one verifier with `StoreAdminServiceImpl`.
+    pub fn with_service_hmac_verifier(
+        mut self,
+        verifier: Arc<rio_auth::hmac::HmacVerifier>,
+    ) -> Self {
+        self.service_verifier = Some(verifier);
         self
     }
 
@@ -757,7 +761,7 @@ mod tests {
         let key = b"probe-gate-test-key-32-bytes!!!!".to_vec();
         let pool = sqlx::PgPool::connect_lazy("postgres://unused").unwrap();
         let svc = StoreServiceImpl::new(pool)
-            .with_service_hmac_verifier(HmacVerifier::from_key(key.clone()));
+            .with_service_hmac_verifier(Arc::new(HmacVerifier::from_key(key.clone())));
         let tid = uuid::Uuid::new_v4();
         let mk = |caller: Option<&str>| {
             let mut r = Request::new(());

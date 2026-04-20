@@ -126,6 +126,12 @@ pub struct Ctx {
     /// reporter); `publish` takes the object_ref per-call. So we
     /// hold one Recorder and pass the ref at publish time.
     pub recorder: kube::runtime::events::Recorder,
+    /// `x-rio-service-token` minting interceptor
+    /// (`caller="rio-controller"`). Cloned onto every
+    /// `StoreAdminServiceClient` channel — `r[store.admin.service-gate]`
+    /// requires it on `TriggerGC` / `GetLoad`. Same interceptor
+    /// instance as the `admin` client above (same key, same caller).
+    pub service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
     /// Consecutive error count per `{kind}/{ns}/{name}`. Incremented
     /// by `error_policy`, reset on successful reconcile. Drives
     /// exponential backoff so a persistent apiserver 5xx doesn't

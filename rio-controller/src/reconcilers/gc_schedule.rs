@@ -104,11 +104,17 @@ impl TickResult {
 /// `store_addr` is the same address as `Config::store_addr` (shared
 /// gRPC port — StoreAdminService is hosted alongside StoreService/
 /// ChunkService).
-pub async fn run(store_addr: String, tick: Duration, shutdown: rio_common::signal::Token) {
+pub async fn run(
+    store_addr: String,
+    service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
+    tick: Duration,
+    shutdown: rio_common::signal::Token,
+) {
     info!(store_addr = %store_addr, tick_secs = tick.as_secs(), "GC cron starting");
     run_loop(tick, shutdown, move || {
         let addr = store_addr.clone();
-        async move { tick_once(&addr).await }
+        let int = service_interceptor.clone();
+        async move { tick_once(&addr, int).await }
     })
     .await;
     info!("GC cron stopped");
@@ -188,15 +194,19 @@ pub(crate) async fn run_loop<F, Fut>(
 /// and it proxies via `AdminService.TriggerGC`, not us). For
 /// background GC, the default roots (uploading manifests + grace
 /// window + scheduler_live_pins + tenant retention) are sufficient.
-async fn tick_once(store_addr: &str) -> TickResult {
-    // Connect with timeout. The inner connect_single has a 10s
+async fn tick_once(
+    store_addr: &str,
+    service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
+) -> TickResult {
+    // Connect with timeout. The inner connect_channel has a 10s
     // connect_timeout on the Channel builder, but wrap again:
     // belt-and-suspenders against any code path that bypasses
     // the builder timeout (e.g. DNS resolution stalls before the
-    // socket connect even starts).
-    let connect =
-        rio_proto::client::connect_single::<rio_proto::StoreAdminServiceClient<_>>(store_addr);
-    let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+    // socket connect even starts). Wrapped with the service-token
+    // interceptor — `r[store.admin.service-gate]` requires it on
+    // `TriggerGC`.
+    let connect = rio_proto::client::connect_channel(store_addr);
+    let ch = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             warn!(error = %e, addr = %store_addr, "GC cron: store-admin connect failed");
@@ -208,6 +218,9 @@ async fn tick_once(store_addr: &str) -> TickResult {
             return TickResult::ConnectFailure;
         }
     };
+    let mut client = rio_proto::StoreAdminServiceClient::with_interceptor(ch, service_interceptor)
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size());
 
     let req = GcRequest {
         dry_run: false,

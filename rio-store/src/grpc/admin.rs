@@ -47,6 +47,15 @@ pub struct StoreAdminServiceImpl {
     /// (never-cancelled) token — tests that don't `.with_shutdown()`
     /// get the old infinite behavior.
     shutdown: rio_common::signal::Token,
+    /// HMAC verifier for `x-rio-service-token` on every handler.
+    /// `None` → dev-mode pass-through (parity with `StoreServiceImpl`).
+    /// This service shares port 9002 with `StoreService` behind only
+    /// the permissive-on-absent JWT interceptor, and builder-egress
+    /// CCNP allows builders → 9002 at L4 — so without this gate a
+    /// compromised builder can call `AddUpstream{tenant_id: <victim>,
+    /// trusted_keys: [attacker_key]}` and poison every other tenant's
+    /// substitution path. See `r[store.admin.service-gate]`.
+    service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
 }
 
 impl StoreAdminServiceImpl {
@@ -55,6 +64,7 @@ impl StoreAdminServiceImpl {
             pool,
             chunk_backend,
             shutdown: rio_common::signal::Token::new(),
+            service_verifier: None,
         }
     }
 
@@ -65,6 +75,37 @@ impl StoreAdminServiceImpl {
     pub fn with_shutdown(mut self, shutdown: rio_common::signal::Token) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// Enable `x-rio-service-token` verification on every handler.
+    /// Builder-style. Same key as
+    /// [`super::StoreServiceImpl::with_service_hmac_verifier`].
+    pub fn with_service_verifier(
+        mut self,
+        verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    ) -> Self {
+        self.service_verifier = verifier;
+        self
+    }
+
+    /// Gate for control-plane-only callers. Thin wrapper over
+    /// [`rio_auth::hmac::ensure_service_caller`] supplying
+    /// `self.service_verifier`. Per-RPC `allowed` lists are at each
+    /// handler — `trigger_gc` admits scheduler/controller/cli;
+    /// upstream CRUD admits cli only; `get_load` admits controller.
+    // r[impl store.admin.service-gate]
+    // r[impl sec.authz.service-token]
+    fn ensure_service_caller<T>(
+        &self,
+        request: &Request<T>,
+        allowed: &[&str],
+    ) -> Result<(), Status> {
+        rio_auth::hmac::ensure_service_caller(
+            request.metadata(),
+            self.service_verifier.as_deref(),
+            allowed,
+        )?;
+        Ok(())
     }
 
     /// Compute `(checked_out / max_connections)` for the PG pool.
@@ -138,6 +179,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-scheduler", "rio-controller", "rio-cli"])?;
         let req = request.into_inner();
 
         // Bound extra_roots BEFORE spawning. A 10M-element array stalls
@@ -233,6 +275,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<VerifyChunksRequest>,
     ) -> Result<Response<Self::VerifyChunksStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-cli"])?;
         let req = request.into_inner();
 
         // Inline-only stores have nothing to verify (no chunk
@@ -414,6 +457,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<ListUpstreamsRequest>,
     ) -> Result<Response<ListUpstreamsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-cli"])?;
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
         let ups = metadata::upstreams::list_for_tenant(&self.pool, tenant_id)
@@ -430,6 +474,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<AddUpstreamRequest>,
     ) -> Result<Response<UpstreamInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-cli"])?;
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
 
@@ -478,6 +523,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<RemoveUpstreamRequest>,
     ) -> Result<Response<()>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-cli"])?;
         let req = request.into_inner();
         let tenant_id = parse_tenant_id(&req.tenant_id)?;
         let n = metadata::upstreams::delete(&self.pool, tenant_id, &req.url)
@@ -509,6 +555,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<GetLoadRequest>,
     ) -> Result<Response<GetLoadResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(&request, &["rio-controller"])?;
         let util = Self::pg_pool_utilization(&self.pool);
         metrics::gauge!("rio_store_pg_pool_utilization").set(util as f64);
         debug!(pg_pool_utilization = util, "GetLoad");

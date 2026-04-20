@@ -366,6 +366,9 @@ S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks 
 
 ## Admin RPCs
 
+r[store.admin.service-gate]
+Every `StoreAdminService` RPC MUST verify `x-rio-service-token` against a per-RPC caller allowlist (via `rio_auth::hmac::ensure_service_caller`) before reading the request body. `StoreAdminService` shares port 9002 with `StoreService` behind only the permissive-on-absent JWT interceptor, and builder-egress CCNP allows builders → 9002 at L4; builders are untrusted (`r[sec.authz.service-token]`). Without this gate a compromised builder could call `AddUpstream{tenant_id: <victim>, trusted_keys: [attacker_key]}` and poison every other tenant's substitution path. Per-RPC allowlists: `TriggerGC` ← `["rio-scheduler", "rio-controller", "rio-cli"]`; `VerifyChunks`/`ListUpstreams`/`AddUpstream`/`RemoveUpstream` ← `["rio-cli"]`; `GetLoad` ← `["rio-controller"]`. `service_verifier == None` → dev-mode pass-through.
+
 r[store.admin.verify-chunks]
 `StoreAdminService.VerifyChunks` server-streams `VerifyChunksProgress{scanned, missing, missing_hashes, is_complete}` while keyset-paginating `chunks WHERE deleted=FALSE AND blake3_hash > $cursor ORDER BY blake3_hash LIMIT batch_size` and calling `ChunkBackend.exists_batch` per page. Keyset (NOT OFFSET) so a 100k-chunk store is O(N) overall. `batch_size=0` → default; clamped at `VERIFY_BATCH_MAX`. `deleted=TRUE` rows are skipped (awaiting S3-delete drain --- presence is undefined); `refcount=0` IS verified (could be a mid-upload row in grace TTL --- the object SHOULD exist once `uploaded_at` is set). Returns `FAILED_PRECONDITION` for inline-only stores (no chunk backend). Read-only --- no `--repair` (deleting the PG row would be wrong if the object is recoverable; the operator decides). Aborts on shutdown token per `r[store.gc.shutdown-abort]`.
 

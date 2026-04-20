@@ -195,6 +195,10 @@ impl AdminServiceImpl {
     /// compromised builder could write straight into `interrupt_samples`
     /// (poisoning λ\[h\]) or drain arbitrary executors.
     ///
+    /// Thin wrapper over the shared
+    /// [`rio_auth::hmac::ensure_service_caller`] (also used by
+    /// rio-store's `StoreAdminServiceImpl`).
+    ///
     /// [`ServiceClaims`]: rio_auth::hmac::ServiceClaims
     // r[impl sec.authz.service-token]
     fn ensure_service_caller(
@@ -202,27 +206,7 @@ impl AdminServiceImpl {
         md: &tonic::metadata::MetadataMap,
         allowed: &[&str],
     ) -> Result<(), Status> {
-        let Some(verifier) = &self.service_verifier else {
-            return Ok(());
-        };
-        let tok = md
-            .get(rio_proto::SERVICE_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                Status::permission_denied(format!(
-                    "{} header required for this RPC",
-                    rio_proto::SERVICE_TOKEN_HEADER
-                ))
-            })?;
-        let claims = verifier
-            .verify::<rio_auth::hmac::ServiceClaims>(tok)
-            .map_err(|e| Status::permission_denied(format!("service token: {e}")))?;
-        if !allowed.contains(&claims.caller.as_str()) {
-            return Err(Status::permission_denied(format!(
-                "service-token caller {:?} not in allowlist {allowed:?}",
-                claims.caller
-            )));
-        }
+        rio_auth::hmac::ensure_service_caller(md, self.service_verifier.as_deref(), allowed)?;
         Ok(())
     }
 }
@@ -365,11 +349,22 @@ impl AdminService for AdminServiceImpl {
             return Ok(Response::new(logs::err_stream(status)));
         }
         let req = request.into_inner();
-        let stream =
-            match gc::trigger_gc(&self.actor, &self.store_addr, self.shutdown.clone(), req).await {
-                Ok(s) => s,
-                Err(s) => logs::err_stream(s),
-            };
+        // `service_verifier` doubles as the signer for OUTGOING calls
+        // — `HmacSigner` and `HmacVerifier` are aliases of `HmacKey`
+        // (same secret, scheduler both gates incoming and authorizes
+        // outgoing with it). r[store.admin.service-gate].
+        let stream = match gc::trigger_gc(
+            &self.actor,
+            &self.store_addr,
+            self.service_verifier.clone(),
+            self.shutdown.clone(),
+            req,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(s) => logs::err_stream(s),
+        };
         Ok(Response::new(stream))
     }
 

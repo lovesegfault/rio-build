@@ -202,14 +202,18 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?
         .map(std::sync::Arc::new);
     if service_signer.is_some() {
-        info!("x-rio-service-token minting enabled on AdminService RPCs");
+        info!("x-rio-service-token minting enabled on AdminService + StoreAdminService RPCs");
     }
-    let admin: AdminClient = rio_proto::AdminServiceClient::with_interceptor(
-        admin_ch,
-        rio_auth::hmac::ServiceTokenInterceptor::new(service_signer, "rio-controller"),
-    )
-    .max_decoding_message_size(rio_common::grpc::max_message_size())
-    .max_encoding_message_size(rio_common::grpc::max_message_size());
+    // One interceptor instance, cloned for every controller→service
+    // client (scheduler `AdminService` + store `StoreAdminService`).
+    // Both gates check `caller="rio-controller"` against per-RPC
+    // allowlists. r[store.admin.service-gate].
+    let service_interceptor =
+        rio_auth::hmac::ServiceTokenInterceptor::new(service_signer, "rio-controller");
+    let admin: AdminClient =
+        rio_proto::AdminServiceClient::with_interceptor(admin_ch, service_interceptor.clone())
+            .max_decoding_message_size(rio_common::grpc::max_message_size())
+            .max_encoding_message_size(rio_common::grpc::max_message_size());
 
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -233,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler: cfg.scheduler.clone(),
         store: cfg.store.clone(),
         recorder: recorder.clone(),
+        service_interceptor: service_interceptor.clone(),
         error_counts: Default::default(),
         scaler: Default::default(),
     });
@@ -322,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
             "gc-cron",
             rio_controller::reconcilers::gc_schedule::run(
                 cfg.store.addr.clone(),
+                service_interceptor.clone(),
                 gc_tick,
                 shutdown.clone(),
             ),

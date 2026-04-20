@@ -143,7 +143,7 @@ pub(in crate::grpc) fn validate_put_metadata(
     // skip the membership check here: the output path is computed
     // post-build from the NAR hash, so expected_outputs is [""] at
     // sign time. Authorization for the CA case is enforced by
-    // `verify_ca_store_path` (r[sec.authz.ca-path-derived]) which runs
+    // `verify_ca_store_path` (sec.authz.ca-path-derived) which runs
     // BEFORE `claim_placeholder` in both PutPath and PutPathBatch: the
     // store recomputes the CA path from the server-verified `nar_hash`
     // and rejects on mismatch, so an is_ca worker can never claim a

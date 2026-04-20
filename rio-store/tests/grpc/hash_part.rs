@@ -178,23 +178,42 @@ async fn test_add_signatures_not_found() -> TestResult {
     Ok(())
 }
 
-/// AddSignatures with empty list is a no-op (not an error). Happens when
-/// `nix store sign` runs with no configured signing keys.
+/// AddSignatures with empty list is a no-op (not an error) for an
+/// EXISTING path. Happens when `nix store sign` runs with no configured
+/// signing keys. The sig-visibility gate (`r[store.api.add-signatures]`)
+/// runs BEFORE the empty-list short-circuit, so a non-existent path now
+/// returns NOT_FOUND even with empty sigs — this is intentional:
+/// otherwise empty-sigs would be a cheap cross-tenant existence probe.
 #[tokio::test]
 async fn test_add_signatures_empty_is_noop() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    // Path doesn't exist, but empty-sigs short-circuits before the DB
-    // query — so NOT_FOUND is not returned. This is intentional: the
-    // no-op should be cheap, not a PG roundtrip just to tell the client
-    // "yes, you successfully did nothing to a path that doesn't exist".
+    // Path exists → empty sigs → Ok (no-op, no UPDATE).
+    let path = test_store_path("addsig-empty");
+    let (nar, _) = make_nar(b"addsig-empty");
+    let info = make_path_info_for_nar(&path, &nar);
+    put_path(&mut s.client, info, nar)
+        .await
+        .context("seed path")?;
     s.client
         .add_signatures(AddSignaturesRequest {
-            store_path: test_store_path("addsig-empty"),
+            store_path: path,
             signatures: vec![],
         })
         .await
-        .context("empty sigs should be OK")?;
+        .context("empty sigs on existing path should be OK")?;
+
+    // Path does NOT exist → NotFound (gate queries before short-circuit;
+    // blocks existence-probe via empty-sigs).
+    let err = s
+        .client
+        .add_signatures(AddSignaturesRequest {
+            store_path: test_store_path("addsig-empty-absent"),
+            signatures: vec![],
+        })
+        .await
+        .expect_err("absent path → NotFound even with empty sigs");
+    assert_eq!(err.code(), tonic::Code::NotFound);
 
     Ok(())
 }

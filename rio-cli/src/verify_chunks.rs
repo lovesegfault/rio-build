@@ -10,11 +10,9 @@
 //! prefix-normalize fix stranded 3465 objects this way.
 
 use anyhow::anyhow;
-use rio_proto::StoreAdminServiceClient;
 use rio_proto::types::VerifyChunksRequest;
-use tonic::transport::Channel;
 
-use crate::RPC_TIMEOUT;
+use crate::{RPC_TIMEOUT, StoreAdminClient};
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct Args {
@@ -24,10 +22,7 @@ pub(crate) struct Args {
 }
 
 // r[impl cli.cmd.verify-chunks]
-pub(crate) async fn run(
-    client: &mut StoreAdminServiceClient<Channel>,
-    a: Args,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(client: &mut StoreAdminClient, a: Args) -> anyhow::Result<()> {
     let mut stream = rio_common::grpc::with_timeout(
         "VerifyChunks",
         RPC_TIMEOUT,

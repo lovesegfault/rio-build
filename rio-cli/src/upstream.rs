@@ -8,12 +8,10 @@
 //! merge).
 
 use clap::Subcommand;
-use tonic::transport::Channel;
 
-use rio_proto::StoreAdminServiceClient;
 use rio_proto::types::{AddUpstreamRequest, ListUpstreamsRequest, RemoveUpstreamRequest};
 
-use crate::{json, rpc};
+use crate::{StoreAdminClient, json, rpc};
 
 /// Validate a `name:base64pubkey` entry in nix `trusted-public-keys`
 /// shape. Format-only check: a 32-byte ed25519 key base64-encodes to 44
@@ -139,12 +137,12 @@ pub enum UpstreamCmd {
 
 /// Run the `upstream` subcommand.
 ///
-/// Takes a `StoreAdminServiceClient` (not `AdminServiceClient`) — the
+/// Takes a [`StoreAdminClient`] (not `AdminServiceClient`) — the
 /// caller connects to the store directly. `as_json` follows the same
 /// convention as other subcommands: one JSON document to stdout.
 pub(crate) async fn run(
     as_json: bool,
-    client: &mut StoreAdminServiceClient<Channel>,
+    client: &mut StoreAdminClient,
     cfg: &crate::Config,
     cmd: UpstreamCmd,
 ) -> anyhow::Result<()> {

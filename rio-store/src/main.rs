@@ -91,9 +91,10 @@ async fn main() -> anyhow::Result<()> {
         info!("HMAC assignment token verification enabled on PutPath");
     }
     let service_verifier = rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
-        .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?
+        .map(Arc::new);
     if service_verifier.is_some() {
-        info!("x-rio-service-token bypass enabled on PutPath");
+        info!("x-rio-service-token verification enabled on PutPath + StoreAdminService");
     }
 
     // Tenant-aware signer (with prior-cluster-key history). Computed
@@ -141,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         store_service = store_service.with_hmac_verifier(v);
     }
     store_service = store_service.with_service_bypass_callers(cfg.service_bypass_callers);
-    if let Some(v) = service_verifier {
+    if let Some(v) = service_verifier.clone() {
         store_service = store_service.with_service_hmac_verifier(v);
     }
     if let Some(budget) = cfg.nar_buffer_budget_bytes {
@@ -188,7 +189,8 @@ async fn main() -> anyhow::Result<()> {
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
     let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
-        .with_shutdown(shutdown.clone());
+        .with_shutdown(shutdown.clone())
+        .with_service_verifier(service_verifier);
     rio_store::gc::orphan::spawn_scanner(
         pool.clone(),
         chunk_backend_for_gc.clone(),

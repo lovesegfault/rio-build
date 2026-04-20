@@ -57,6 +57,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
             ..rio_common::config::UpstreamAddrs::with_port(9002)
         },
         recorder,
+        service_interceptor: rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
         error_counts: Default::default(),
         scaler: Default::default(),
     })

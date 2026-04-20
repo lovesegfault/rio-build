@@ -197,6 +197,49 @@ impl tonic::service::Interceptor for ServiceTokenInterceptor {
     }
 }
 
+/// Gate for control-plane-only RPCs. Verifies `x-rio-service-token`
+/// (HMAC-signed [`ServiceClaims`]) and checks `claims.caller ∈ allowed`.
+/// `verifier == None` → dev-mode pass-through (parity with the
+/// assignment-token verifier; returns synthetic `caller="dev-mode"`).
+///
+/// Shared by scheduler `AdminService` and store `StoreAdminService` —
+/// both share a port with builder-reachable services, so without this
+/// gate a compromised builder could call `AddUpstream` cross-tenant
+/// (cache poisoning) or `AppendInterruptSample` (poison λ\[h\]). See
+/// `r[sec.authz.service-token]`.
+// r[impl sec.authz.service-token]
+pub fn ensure_service_caller(
+    md: &tonic::metadata::MetadataMap,
+    verifier: Option<&HmacVerifier>,
+    allowed: &[&str],
+) -> Result<ServiceClaims, tonic::Status> {
+    let Some(verifier) = verifier else {
+        return Ok(ServiceClaims {
+            caller: "dev-mode".to_string(),
+            expiry_unix: u64::MAX,
+        });
+    };
+    let tok = md
+        .get(rio_common::grpc::SERVICE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            tonic::Status::permission_denied(format!(
+                "{} header required for this RPC",
+                rio_common::grpc::SERVICE_TOKEN_HEADER
+            ))
+        })?;
+    let claims = verifier
+        .verify::<ServiceClaims>(tok)
+        .map_err(|e| tonic::Status::permission_denied(format!("service token: {e}")))?;
+    if !allowed.contains(&claims.caller.as_str()) {
+        return Err(tonic::Status::permission_denied(format!(
+            "service-token caller {:?} not in allowlist {allowed:?}",
+            claims.caller
+        )));
+    }
+    Ok(claims)
+}
+
 /// Shared HMAC key. The scheduler signs, the store verifies — same key
 /// file, same field, and a process is one role or the other (never
 /// both), so a single struct with both methods is sufficient. The
@@ -521,6 +564,49 @@ mod tests {
                 .get(rio_common::grpc::SERVICE_TOKEN_HEADER)
                 .is_none()
         );
+    }
+
+    // r[verify sec.authz.service-token]
+    // r[verify store.admin.service-gate]
+    #[test]
+    fn ensure_service_caller_gates() {
+        use tonic::service::Interceptor;
+        let key = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let signer = std::sync::Arc::new(HmacSigner::from_key(TEST_KEY.to_vec()));
+
+        // None verifier → dev-mode pass-through (synthetic caller).
+        let md = tonic::metadata::MetadataMap::new();
+        let c = ensure_service_caller(&md, None, &["rio-cli"]).expect("dev-mode passes");
+        assert_eq!(c.caller, "dev-mode");
+
+        // Verifier present, no header → PermissionDenied.
+        let err = ensure_service_caller(&md, Some(&key), &["rio-cli"]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("required"), "msg: {}", err.message());
+
+        // Valid token, caller in allowlist → Ok.
+        let mut int = ServiceTokenInterceptor::new(Some(signer.clone()), "rio-cli");
+        let req = int.call(tonic::Request::new(())).unwrap();
+        let c = ensure_service_caller(req.metadata(), Some(&key), &["rio-cli", "rio-controller"])
+            .expect("allowlisted caller passes");
+        assert_eq!(c.caller, "rio-cli");
+
+        // Valid token, caller NOT in allowlist → PermissionDenied.
+        let err =
+            ensure_service_caller(req.metadata(), Some(&key), &["rio-controller"]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("not in allowlist"),
+            "msg: {}",
+            err.message()
+        );
+
+        // Wrong-key token (e.g. assignment key leaked) → PermissionDenied.
+        let bad_signer = std::sync::Arc::new(HmacSigner::from_key(b"wrong-key-32-bytes!!!".into()));
+        let mut bad = ServiceTokenInterceptor::new(Some(bad_signer), "rio-cli");
+        let req = bad.call(tonic::Request::new(())).unwrap();
+        let err = ensure_service_caller(req.metadata(), Some(&key), &["rio-cli"]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub fn spawn_store_size_refresh(
 pub(super) async fn trigger_gc(
     actor: &ActorHandle,
     store_addr: &str,
+    service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     shutdown: rio_common::signal::Token,
     mut req: GcRequest,
 ) -> Result<ReceiverStream<Result<GcProgress, Status>>, Status> {
@@ -96,10 +97,17 @@ pub(super) async fn trigger_gc(
 
     // Step 2: connect to store admin service. Same TLS config
     // as connect_single (OnceLock rio_common::grpc::CLIENT_TLS).
-    let mut store_admin: rio_proto::StoreAdminServiceClient<_> =
-        rio_proto::client::connect_single(store_addr)
-            .await
-            .status_unavailable("store admin connect failed")?;
+    // Wrapped with ServiceTokenInterceptor — `r[store.admin.service-gate]`
+    // requires `x-rio-service-token` on `TriggerGC`.
+    let ch = rio_proto::client::connect_channel(store_addr)
+        .await
+        .status_unavailable("store admin connect failed")?;
+    let mut store_admin = rio_proto::StoreAdminServiceClient::with_interceptor(
+        ch,
+        rio_auth::hmac::ServiceTokenInterceptor::new(service_signer, "rio-scheduler"),
+    )
+    .max_decoding_message_size(rio_common::grpc::max_message_size())
+    .max_encoding_message_size(rio_common::grpc::max_message_size());
 
     // Step 3: proxy the call. The store's stream becomes OUR
     // stream — we wrap it in a forwarding task. inject_current

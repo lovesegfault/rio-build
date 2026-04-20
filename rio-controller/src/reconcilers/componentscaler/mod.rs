@@ -101,7 +101,7 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     };
 
     // ── Observed: max(GetLoad) across loadEndpoint pods ──────────
-    let max_load = poll_max_load(&spec.load_endpoint).await;
+    let max_load = poll_max_load(&spec.load_endpoint, ctx.service_interceptor.clone()).await;
 
     // ── Current replica count from the Deployment ────────────────
     let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
@@ -202,7 +202,10 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 /// cost N×2s under N stale headless-DNS endpoints (rolling restart,
 /// drained node) — 5 stale = the entire `REQUEUE` budget gone before
 /// `decide()` runs (bug_194).
-async fn poll_max_load(endpoint: &str) -> Option<f64> {
+async fn poll_max_load(
+    endpoint: &str,
+    service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
+) -> Option<f64> {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         warn!(
             endpoint,
@@ -234,22 +237,27 @@ async fn poll_max_load(endpoint: &str) -> Option<f64> {
         debug!(host, "componentscaler: loadEndpoint resolved to 0 addrs");
         return None;
     }
-    poll_max_load_addrs(addrs).await
+    poll_max_load_addrs(addrs, service_interceptor).await
 }
 
 /// Concurrent per-pod `GetLoad` fan-out → max. Split from
 /// [`poll_max_load`] so the timeout-aggregate behavior is
 /// unit-testable without DNS.
-async fn poll_max_load_addrs(addrs: Vec<SocketAddr>) -> Option<f64> {
+async fn poll_max_load_addrs(
+    addrs: Vec<SocketAddr>,
+    service_interceptor: rio_auth::hmac::ServiceTokenInterceptor,
+) -> Option<f64> {
     // `connect_store_admin_at` (not the balanced channel): we need
     // each pod's individual GetLoad reading for the max(), so dial
     // every resolved IP directly — p2c would route all calls to one
-    // or two pods.
+    // or two pods. Wrapped with the service-token interceptor —
+    // `r[store.admin.service-gate]` requires it on `GetLoad`.
     let mut set = tokio::task::JoinSet::new();
     for addr in addrs {
+        let int = service_interceptor.clone();
         set.spawn(async move {
             let load = async {
-                let mut c = rio_proto::client::balance::connect_store_admin_at(addr).await?;
+                let mut c = rio_proto::client::balance::connect_store_admin_at(addr, int).await?;
                 let r = c
                     .get_load(rio_proto::types::GetLoadRequest {})
                     .await?
@@ -453,7 +461,8 @@ mod tests {
             addrs.push(l.local_addr().unwrap());
             listeners.push(l);
         }
-        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 2, poll_max_load_addrs(addrs)).await;
+        let int = rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller");
+        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 2, poll_max_load_addrs(addrs, int)).await;
         assert!(
             res.is_ok(),
             "concurrent fan-out must complete within 2×LOAD_RPC_TIMEOUT \
@@ -505,7 +514,8 @@ mod tests {
     async fn poll_max_load_end_to_end_bounded() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
-        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 3, poll_max_load(&endpoint)).await;
+        let int = rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller");
+        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 3, poll_max_load(&endpoint, int)).await;
         assert!(
             res.is_ok(),
             "poll_max_load must complete within 3×LOAD_RPC_TIMEOUT end-to-end \

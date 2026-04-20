@@ -126,7 +126,9 @@ impl StoreSession {
         let db = TestDb::new(&MIGRATOR).await;
         let service = StoreServiceImpl::new(db.pool.clone())
             .with_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(assignment_key))
-            .with_service_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(service_key));
+            .with_service_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+                service_key,
+            )));
         let (client, server) = spawn_store_server(service).await?;
         Ok(Self { db, client, server })
     }
