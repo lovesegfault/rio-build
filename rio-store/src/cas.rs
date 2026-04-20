@@ -22,7 +22,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::ChunkBackend;
 use crate::chunker;
-use crate::manifest::{Manifest, ManifestEntry};
+use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::metadata;
 
 /// NARs below this size bypass chunking and go into `manifests.inline_blob`.
@@ -62,6 +62,22 @@ pub fn should_chunk(
 /// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (figment env).
 // r[impl store.cas.upload-bounded]
 pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 32;
+
+/// Run CPU-bound work without stalling the tokio worker. Uses
+/// `block_in_place` on the multi-thread runtime (production); falls
+/// back to inline execution on `current_thread` (the `#[tokio::test]`
+/// default) where `block_in_place` would panic. The fallback is fine
+/// for tests — they hash kilobyte-scale NARs, not 4 GiB.
+pub(crate) fn cpu_bound<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() != RuntimeFlavor::CurrentThread => {
+            tokio::task::block_in_place(f)
+        }
+        // No runtime (sync #[test]) or current_thread → inline.
+        _ => f(),
+    }
+}
 
 /// Heartbeat interval (time): bump `manifests.updated_at` at least
 /// this often during long chunk uploads. Paired with
@@ -208,8 +224,29 @@ pub async fn stage_chunked(
     // --- Step 1: Chunk ---
     // Borrows from nar_data — zero-copy. The slices stay valid until
     // after step 4's uploads (nar_data outlives this function body).
-    let chunks = chunker::chunk_nar(nar_data);
+    //
+    // cpu_bound (block_in_place): FastCDC + per-chunk BLAKE3 over
+    // ≤ MAX_NAR_SIZE (4 GiB) is multi-second CPU-bound work; running
+    // it inline on a tokio worker thread stalls every other future
+    // scheduled on that worker. spawn_blocking would require
+    // nar_data: 'static (it's a borrow); block_in_place keeps the
+    // borrow and tells the runtime to hand off other work.
+    let chunks = cpu_bound(|| chunker::chunk_nar(nar_data));
     debug!(chunks = chunks.len(), "NAR chunked");
+
+    // Trust-boundary guard: reject before any PG/S3 commit. MAX_CHUNKS
+    // is sized ≥ MAX_NAR_SIZE/CHUNK_MIN (compile-asserted in
+    // manifest.rs), so this can only fire on a NAR that already
+    // violated MAX_NAR_SIZE — but enforcing here means a future limit
+    // bump can't silently produce a manifest that deserialize rejects.
+    if chunks.len() > manifest::MAX_CHUNKS {
+        anyhow::bail!(
+            "NAR produced {} chunks, exceeds MAX_CHUNKS {} \
+             (likely adversarial CHUNK_MIN-forcing input)",
+            chunks.len(),
+            manifest::MAX_CHUNKS,
+        );
+    }
 
     // Build the manifest + parallel arrays for PG.
     // Vec<Vec<u8>> because sqlx binds bytea[] as &[Vec<u8>], not &[[u8;32]]
@@ -236,8 +273,8 @@ pub async fn stage_chunked(
     // (chunk_list_bytes) — reassembly needs the full in-order chunk
     // list. Only the refcount arrays dedup.
     //
-    // `chunks` vec (for S3 upload) stays undeduped — S3 PutObject is
-    // idempotent, and do_upload's need_upload HashSet implicitly dedups.
+    // `chunks` vec stays undeduped — manifest serialization needs the
+    // full in-order list. do_upload dedups intra-NAR repeats itself.
     let (chunk_hashes, chunk_sizes): (Vec<Vec<u8>>, Vec<i64>) = {
         let mut seen = std::collections::HashSet::<[u8; 32]>::new();
         chunks
@@ -346,9 +383,15 @@ async fn do_upload(
     // was always necessary anyway (S3 wants owned), so collecting
     // upfront is cost-neutral; it just moves the copy out of the
     // closure.
+    // `needs_upload.contains()` does NOT dedup: `chunks` is the raw
+    // in-order list, so an intra-NAR repeat (zero-filled pages etc.)
+    // would issue N redundant Bytes::copy_from_slice + S3 PUTs and
+    // miscount `uploaded` (feeds rio_store_chunk_dedup_ratio). The
+    // `seen` set collapses repeats to one upload per unique hash.
+    let mut seen = std::collections::HashSet::<[u8; 32]>::new();
     let to_upload: Vec<([u8; 32], Bytes)> = chunks
         .iter()
-        .filter(|c| needs_upload.contains(c.hash.as_slice()))
+        .filter(|c| needs_upload.contains(c.hash.as_slice()) && seen.insert(c.hash))
         .map(|c| (c.hash, Bytes::copy_from_slice(c.data)))
         .collect();
     let uploaded = to_upload.len();
@@ -405,7 +448,10 @@ async fn do_upload(
                 anyhow::Ok(())
             }
         })
-        .buffer_unordered(max_concurrent)
+        // .max(1): buffer_unordered(0) is Pending-forever; Config::validate
+        // rejects 0 at startup, but library callers (tests, embedders)
+        // bypass Config.
+        .buffer_unordered(max_concurrent.max(1))
         .try_for_each(|()| async { Ok(()) })
         .await?;
 
@@ -1052,11 +1098,13 @@ mod upload_tests {
     struct HighWaterBackend {
         in_flight: AtomicUsize,
         high_water: AtomicUsize,
+        put_count: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl ChunkBackend for HighWaterBackend {
         async fn put(&self, _hash: &[u8; 32], _data: Bytes) -> anyhow::Result<()> {
+            self.put_count.fetch_add(1, Ordering::SeqCst);
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.high_water.fetch_max(now, Ordering::SeqCst);
             // Yield so the buffer_unordered driver can start more
@@ -1121,6 +1169,48 @@ mod upload_tests {
         // Sanity: all 200 uploaded (no dedup in this synthetic set).
         assert_eq!(stats.total_chunks, 200);
         assert_eq!(stats.deduped_chunks, 0);
+    }
+
+    /// `chunks` is the raw in-order list from `chunk_nar`, so an
+    /// intra-NAR repeat (zero-filled pages, identical 16KB+ runs)
+    /// appears N times. `needs_upload.contains()` is a predicate, not
+    /// a dedup — without the `seen` set, do_upload issues N redundant
+    /// PUTs and reports `deduped_chunks = 0` (feeds dedup_ratio gauge).
+    #[tokio::test]
+    async fn do_upload_dedupes_intra_nar_repeats() {
+        let backend = Arc::new(HighWaterBackend::default());
+        let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
+
+        // 10× the same chunk hash + 1 distinct → 11 total, 2 unique.
+        static DATA: &[u8] = b"y";
+        let dup = [0xAAu8; 32];
+        let other = [0xBBu8; 32];
+        let mut chunks: Vec<chunker::Chunk<'static>> = (0..10)
+            .map(|_| chunker::Chunk {
+                hash: dup,
+                data: DATA,
+            })
+            .collect();
+        chunks.push(chunker::Chunk {
+            hash: other,
+            data: DATA,
+        });
+        let needs: HashSet<Vec<u8>> = [dup.to_vec(), other.to_vec()].into_iter().collect();
+
+        let stats = do_upload(None, &backend_dyn, &chunks, &needs, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.put_count.load(Ordering::SeqCst),
+            2,
+            "exactly one PUT per unique hash"
+        );
+        assert_eq!(stats.total_chunks, 11);
+        assert_eq!(
+            stats.deduped_chunks, 9,
+            "11 total - 2 uploaded = 9 deduped (intra-NAR repeats)"
+        );
     }
 
     /// Bound=1 degrades to serial — high-water-mark exactly 1.

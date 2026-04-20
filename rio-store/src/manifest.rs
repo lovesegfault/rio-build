@@ -35,15 +35,27 @@ const VERSION: u8 = 1;
 /// Bytes per entry: 32 (BLAKE3) + 4 (u32 size).
 const ENTRY_SIZE: usize = 36;
 
-/// Upper bound on chunk count. 200k chunks at 64 KiB avg ≈ 12.2 GiB NAR —
-/// above MAX_NAR_SIZE (4 GiB). Above 10 GiB / CHUNK_MIN too. If a manifest
-/// claims more, it's corrupted or hostile; don't preallocate 200k × 36 B
-/// = 7 MB just because the length field says so.
+/// Upper bound on chunk count. Derived from the worst case:
+/// `MAX_NAR_SIZE / CHUNK_MIN = 4 GiB / 16 KiB = 262_144`, rounded up.
+/// Any accepted (MAX_NAR_SIZE-gated) NAR's chunk list MUST round-trip
+/// through `serialize` → `deserialize` — the prior 200_000 bound was
+/// below the worst case (the "above 10 GiB / CHUNK_MIN too" comment was
+/// arithmetically false), so an adversarial CHUNK_MIN-forcing input could
+/// commit a manifest that `deserialize` rejects on read.
 ///
-/// Not a `const { assert! }` tripwire against MAX_NAR_SIZE because that
-/// constant lives in rio-common and pulling it here would be a dep-cycle
-/// concern. The margin is wide enough that manual drift-checking suffices.
-pub const MAX_CHUNKS: usize = 200_000;
+/// `stage_chunked` enforces this at the trust boundary (after
+/// `chunk_nar`, before any PG/S3 commit). The `deserialize` check is
+/// defense-in-depth against a corrupt/hostile blob: don't preallocate
+/// 300k × 36 B = ~10 MB just because the length field says so.
+pub const MAX_CHUNKS: usize = 300_000;
+
+/// Compile-time tripwire: rio-store already depends on rio-common and on
+/// chunker (same crate), so there is no dep-cycle. Future drift to either
+/// constant fails the build.
+const _: () = assert!(
+    MAX_CHUNKS as u64 >= rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64,
+    "MAX_CHUNKS must cover MAX_NAR_SIZE / CHUNK_MIN"
+);
 
 /// A single manifest entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +192,33 @@ mod tests {
         let m = sample();
         let bytes = m.serialize();
         let parsed = Manifest::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, m);
+    }
+
+    /// Worst-case accepted input: a `MAX_NAR_SIZE` NAR chunked entirely
+    /// at `CHUNK_MIN` boundaries produces 262_144 entries. `serialize`
+    /// → `deserialize` MUST round-trip — the prior `MAX_CHUNKS=200_000`
+    /// rejected on read with `TooManyChunks`, so an adversarial input
+    /// could commit a permanently-unreadable manifest.
+    #[test]
+    fn roundtrip_at_worst_case_chunk_count() {
+        let n = (rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64) as usize;
+        assert!(n <= MAX_CHUNKS, "const-assert should guarantee this");
+        let m = Manifest {
+            entries: (0..n)
+                .map(|i| ManifestEntry {
+                    hash: {
+                        let mut h = [0u8; 32];
+                        h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                        h
+                    },
+                    size: crate::chunker::CHUNK_MIN,
+                })
+                .collect(),
+        };
+        let bytes = m.serialize();
+        let parsed = Manifest::deserialize(&bytes).expect("worst-case must round-trip");
+        assert_eq!(parsed.entries.len(), n);
         assert_eq!(parsed, m);
     }
 
