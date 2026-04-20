@@ -13,15 +13,16 @@ use super::slot::BuildSlot;
 /// the permanent sink / relay. The drain-done and build-done watchers
 /// use this (NOT bare `wait_idle()`) before signalling exit.
 ///
-/// bug_472: `_slot_guard` drops at the end of `executor_future` AFTER
-/// `send_completion` has queued the report into `sink_rx`. When
-/// `relay_target=None` (stream-retry sleep), `relay_loop` is parked on
-/// `target.changed()` and never drains it; gating on `wait_idle()`
-/// alone let the loop exit with the report still in-process.
-/// `completion_pending` is set by `send_completion` and cleared by
-/// `relay_loop` only after a successful `grpc_tx.send()` into a
-/// confirmed-open stream — so this returns iff the report has reached
-/// tonic's body buffer (which tonic flushes on graceful close).
+/// `completion_pending` is armed at the START of `executor_future`
+/// (before any await/panic point — bug_012) and again by
+/// `send_completion`, and cleared by `relay_loop` only after a
+/// successful `grpc_tx.send()` into a confirmed-open stream. So
+/// slot-idle ⇒ `completion_pending` reflects whether a completion is
+/// owed-but-not-yet-flushed, on BOTH the normal path (bug_472:
+/// `_slot_guard` drops AFTER `send_completion`) and the panic path
+/// (bug_012: `_slot_guard` drops during unwind BEFORE the
+/// panic-catcher's late `send_completion`). This returns iff the
+/// report has reached tonic's body buffer.
 ///
 /// Same `enable()`-before-check pattern as `BuildSlot::wait_idle` —
 /// see tokio::sync::Notify docs §"Avoiding missed notifications".

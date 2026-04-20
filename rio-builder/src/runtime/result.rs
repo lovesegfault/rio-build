@@ -175,11 +175,15 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 /// - `completion_pending` is set BEFORE the message enters `sink_rx`.
 ///   The drain machinery (`reconnect_drain_gate`, `wait_build_flushed`)
 ///   keys off this — NOT `slot.is_busy()` — to decide whether the
-///   reconnect loop may exit. bug_472: `_slot_guard` drops AFTER this
-///   send, so "slot idle" alone meant "completion queued in sink_rx"
-///   when `relay_target=None`, and `run_teardown` dropped it on the
-///   floor. `relay_loop` clears the flag only after a successful
-///   `grpc_tx.send()` into a confirmed-open stream.
+///   reconnect loop may exit. The flag is ALSO armed at the start of
+///   `executor_future` (before any await) so it means "completion
+///   owed" rather than "completion queued" — bug_012: on panic,
+///   `_slot_guard` drops during unwind BEFORE the panic-catcher's
+///   `handle.await` lets it call this; the early arm makes the store
+///   here redundant on the normal path but load-bearing for any
+///   future caller outside `executor_future`. `relay_loop` clears the
+///   flag only after a successful `grpc_tx.send()` into a confirmed-
+///   open stream.
 pub(super) async fn send_completion(
     stream_tx: &mpsc::Sender<ExecutorMessage>,
     completion_pending: &AtomicBool,
