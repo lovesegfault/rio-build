@@ -168,12 +168,7 @@ pub(crate) async fn run(
             println!();
             // Per-derivation lines.
             for d in &drvs {
-                let name = d
-                    .drv_path
-                    .rsplit_once('-')
-                    .map(|(_, n)| n)
-                    .unwrap_or(&d.drv_path);
-                let name = name.strip_suffix(".drv").unwrap_or(name);
+                let name = drv_display_name(&d.drv_path);
                 let fod = if d.is_fod { " [FOD]" } else { "" };
                 // I-062: surface hard_filter inputs that would
                 // explain a stuck-Ready. system always shown
@@ -288,4 +283,46 @@ struct Out<'a> {
     build_id: Option<&'a str>,
     derivations: Vec<DrvRow<'a>>,
     live_executor_ids: &'a [String],
+}
+
+/// Derivation display name from a `/nix/store/HASH-name.drv` path.
+///
+/// Nixbase32 alphabet has no `-`, so the FIRST `-` after the
+/// `/nix/store/` prefix is always the hash/name boundary. Splitting at
+/// the last `-` (`rsplit_once`) yields the version suffix instead
+/// (e.g. `2.12.1` for `hello-2.12.1.drv`) — useless for the I-025
+/// "which derivation is wedged" diagnostic.
+fn drv_display_name(drv_path: &str) -> &str {
+    let name = drv_path
+        .strip_prefix("/nix/store/")
+        .and_then(|b| b.split_once('-'))
+        .map(|(_, n)| n)
+        .unwrap_or(drv_path);
+    name.strip_suffix(".drv").unwrap_or(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drv_display_name_hyphenated() {
+        // Hyphenated name — `rsplit_once('-')` would yield "2.12.1".
+        assert_eq!(
+            drv_display_name("/nix/store/7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y-hello-2.12.1.drv"),
+            "hello-2.12.1"
+        );
+        // Multi-hyphen name, no version.
+        assert_eq!(
+            drv_display_name("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-stdenv-linux.drv"),
+            "stdenv-linux"
+        );
+        // Single-segment name.
+        assert_eq!(
+            drv_display_name("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bash.drv"),
+            "bash"
+        );
+        // Fallback: non-store-path → returned unchanged.
+        assert_eq!(drv_display_name("not-a-store-path"), "not-a-store-path");
+    }
 }
