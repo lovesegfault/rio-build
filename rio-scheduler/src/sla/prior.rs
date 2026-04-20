@@ -18,6 +18,12 @@ use super::types::ModelKey;
 /// (S, P, Q, a, b) flat tuple. Distinct from [`super::types::FittedParams`]
 /// (which carries the staged enums + explore state) because the prior
 /// machinery only needs the five scalars the fitter regresses on.
+///
+/// All time-domain fields (`s`, `p`, `q`) are in this cluster's
+/// reference-second basis (`r[sched.sla.hw-ref-seconds]`). Construct via
+/// `ingest::extract_fit_params` / [`SeedCorpus::into_seed_map`] /
+/// [`operator_to_spq`]; never from wall-seconds directly. (`a`, `b` are
+/// in raw bytes / dimensionless and are NOT hw-normalized.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitParams {
     pub s: f64,
@@ -68,12 +74,14 @@ impl SeedCorpus {
             .map_err(|e| anyhow::anyhow!("parse seed_corpus {}: {e}", path.display()))
     }
 
-    /// Project to the seed map, rescaling time-domain params (S, P) by
-    /// `factor[self.ref_hw_class] / factor[hw.reference]`. The exporter
-    /// recorded (S, P) in THEIR reference-seconds; locally that hw_class
-    /// has some `factor` ≠ 1.0 if it's not our reference. Q (contention,
-    /// per-core) and (a, b) (memory, raw bytes) are NOT rescaled —
-    /// neither is hw-throughput-dominated.
+    /// Project to the seed map, rescaling time-domain params (S, P, Q)
+    /// by `factor[self.ref_hw_class] / factor[hw.reference]`. The
+    /// exporter recorded (S, P, Q) in THEIR reference-seconds; locally
+    /// that hw_class has some `factor` ≠ 1.0 if it's not our reference.
+    /// Q is regressed against the same hw-normalized samples as S and P
+    /// (units: ref-seconds/core in the exporter's basis), so it
+    /// rescales the same way. (a, b) — memory, raw bytes — are NOT
+    /// rescaled.
     ///
     /// Unknown `ref_hw_class` → factor 1.0 (pass through unscaled). The
     /// returned `f64` is the applied factor, for the RPC response.
@@ -88,7 +96,7 @@ impl SeedCorpus {
                     FitParams {
                         s: e.s * scale,
                         p: e.p * scale,
-                        q: e.q,
+                        q: e.q * scale,
                         a: e.a,
                         b: e.b,
                     },
@@ -128,8 +136,11 @@ pub struct PriorSources {
     pub fleet: Option<FitParams>,
     pub operator: ProbeShape,
     /// [`Tier::binding_bound`](super::solve::Tier::binding_bound) of
-    /// `[sla].default_tier`. Feeds [`operator_to_spq`]'s "a build the
-    /// operator expects to take `target` on `probe.cpu` cores".
+    /// `[sla].default_tier`, in **reference-seconds** (converted from
+    /// the wall-second config value × `factor[hw.reference]` each
+    /// refresh by [`super::SlaEstimator`]). Feeds [`operator_to_spq`]'s
+    /// "a build the operator expects to take `target` on `probe.cpu`
+    /// cores".
     pub default_tier_target: f64,
 }
 
@@ -217,19 +228,27 @@ fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_target: f64) -> Fi
 /// per tenant regardless of how many `ModelKey`s that tenant has fit —
 /// a tenant with 10k builds of one package can't drag the fleet prior
 /// (Sybil-resistant in the "noisy neighbour" sense, not the crypto
-/// sense). Returns `None` below `min_keys` so an empty/cold fleet falls
-/// through to [`PriorSource::Operator`].
+/// sense). Returns `None` below `min_keys` (empty/cold fleet) OR below
+/// `min_tenants` (a "median" of one tenant's median is just that
+/// tenant) so both cases fall through to [`PriorSource::Operator`].
 ///
 /// Caller is expected to pre-filter to keys whose `MemFit` is
 /// [`Coupled`](super::types::MemFit::Coupled) — `FitParams.{a,b}` are
 /// only meaningful for those.
-pub fn fleet_median(all: &[(ModelKey, FitParams)], min_keys: usize) -> Option<FitParams> {
+pub fn fleet_median(
+    all: &[(ModelKey, FitParams)],
+    min_keys: usize,
+    min_tenants: usize,
+) -> Option<FitParams> {
     if all.len() < min_keys {
         return None;
     }
     let mut by_tenant: HashMap<&str, Vec<&FitParams>> = HashMap::new();
     for (k, f) in all {
         by_tenant.entry(k.tenant.as_str()).or_default().push(f);
+    }
+    if by_tenant.len() < min_tenants {
+        return None;
     }
     let tenant_medians: Vec<FitParams> = by_tenant.values().map(|v| median_fitparams(v)).collect();
     Some(median_fitparams(&tenant_medians.iter().collect::<Vec<_>>()))
@@ -486,7 +505,7 @@ mod tests {
             ));
         }
         assert_eq!(all.len(), 60);
-        let m = fleet_median(&all, 20).expect("60 ≥ 20");
+        let m = fleet_median(&all, 20, 2).expect("60 ≥ 20, 3 tenants ≥ 2");
         assert!((m.p - 500.0).abs() < 1e-9, "got {}", m.p);
         assert!((m.s - 50.0).abs() < 1e-9);
         assert!((m.a - 22.0).abs() < 1e-9);
@@ -498,14 +517,34 @@ mod tests {
             (tkey("t0", "a"), fp(1.0, 1.0, 0.0, 1.0, 1.0)),
             (tkey("t1", "b"), fp(2.0, 2.0, 0.0, 2.0, 1.0)),
         ];
-        assert!(fleet_median(&all, 20).is_none());
-        assert!(fleet_median(&all, 2).is_some());
+        assert!(fleet_median(&all, 20, 1).is_none());
+        assert!(fleet_median(&all, 2, 1).is_some());
+    }
+
+    #[test]
+    fn fleet_median_none_below_min_tenants() {
+        // 60 keys all from one tenant: passes min_keys=50, but a
+        // "median-of-tenant-medians" of one tenant is just that tenant's
+        // median — must fall through to PriorSource::Operator.
+        let all: Vec<_> = (0..60)
+            .map(|i| {
+                (
+                    tkey("t0", &format!("p{i}")),
+                    fp(10.0, 100.0, 0.0, 20.0, 1.0),
+                )
+            })
+            .collect();
+        assert!(fleet_median(&all, 50, 2).is_none(), "1 tenant < 2");
+        // Adding one key from a second tenant crosses the threshold.
+        let mut all = all;
+        all.push((tkey("t1", "x"), fp(50.0, 500.0, 0.0, 22.0, 1.0)));
+        assert!(fleet_median(&all, 50, 2).is_some(), "2 tenants ≥ 2");
     }
 
     #[test]
     fn corpus_roundtrip_rescales_time_domain() {
         // Exporter recorded on ref="aws-6-ebs". Our hw table says that
-        // class is 1.5× our reference → S/P scale by 1.5; Q/a/b don't.
+        // class is 1.5× our reference → S/P/Q scale by 1.5; a/b don't.
         let corpus = SeedCorpus {
             ref_hw_class: "aws-6-ebs".into(),
             entries: vec![SeedEntry {
@@ -530,7 +569,10 @@ mod tests {
         let fp = &map[&("hello".into(), "x86_64-linux".into())];
         assert!((fp.s - 15.0).abs() < 1e-9);
         assert!((fp.p - 150.0).abs() < 1e-9);
-        assert!((fp.q - 0.02).abs() < 1e-9, "q not rescaled");
+        assert!(
+            (fp.q - 0.03).abs() < 1e-9,
+            "q rescaled (ref-sec/core in exporter's basis)"
+        );
         assert!((fp.a - 22.0).abs() < 1e-9, "a (mem) not rescaled");
     }
 
@@ -563,7 +605,7 @@ mod tests {
             (tkey("t0", "a"), fp(10.0, 100.0, 0.0, 20.0, 0.8)),
             (tkey("t1", "b"), fp(30.0, 300.0, 0.2, 24.0, 1.2)),
         ];
-        let m = fleet_median(&all, 2).unwrap();
+        let m = fleet_median(&all, 2, 2).unwrap();
         assert!((m.s - 20.0).abs() < 1e-9);
         assert!((m.p - 200.0).abs() < 1e-9);
         assert!((m.q - 0.1).abs() < 1e-9);

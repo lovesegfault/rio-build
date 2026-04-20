@@ -639,7 +639,9 @@ message ImportSlaCorpusResponse {
   uint32 entries_loaded = 1;
   // The hw_class the corpus was referenced against, and the local
   // factor it was rescaled by. `rescale_factor=1.0` ⇔ unknown
-  // ref_hw_class (passed through unscaled).
+  // ref_hw_class (passed through unscaled). `rescale_factor=NaN` ⇔ hw
+  // table not yet populated; corpus stashed and rescaled on the next
+  // populated refresh tick.
   string ref_hw_class = 2;
   double rescale_factor = 3;
 }

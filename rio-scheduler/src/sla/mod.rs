@@ -35,6 +35,12 @@ const DT_POLL_SECS: f64 = 1.0;
 /// that one tenant's monoculture can't drag the median".
 const FLEET_MEDIAN_MIN_KEYS: usize = 50;
 
+/// Minimum distinct-tenant count before [`prior::fleet_median`] is
+/// trusted. A "median-of-tenant-medians" with one tenant is that
+/// tenant's median — not a fleet aggregate. Below this fall through to
+/// [`prior::PriorSource::Operator`].
+const FLEET_MEDIAN_MIN_TENANTS: usize = 2;
+
 /// Cache of per-`ModelKey` [`FittedParams`](types::FittedParams). The
 /// dispatch path reads via [`Self::cached`] (lock-free clone of one
 /// entry); a background tick calls [`Self::refresh`] to refit only the
@@ -65,8 +71,19 @@ pub struct SlaEstimator {
     /// before the first DB tick so `self.hw` is still the empty default
     /// (`factor(anything)=1.0`); converting there would silently bypass
     /// cross-fleet rescaling. [`Self::refresh`] one-shot-converts this
-    /// after the first `HwTable::load`.
+    /// after the first POPULATED `HwTable::load` (Ok ∧ non-empty).
     pending_seed: Mutex<Option<prior::SeedCorpus>>,
+    /// `[sla].default_tier`'s [`binding_bound`] in the operator-facing
+    /// **wall-second** basis (as written in config). `refresh()`
+    /// converts to ref-seconds (`× factor[hw.reference]`) and stores
+    /// into `priors.default_tier_target` after each populated hw load,
+    /// so [`prior::operator_to_spq`] / `clamp_to_operator` compare
+    /// ref-second fleet medians against a ref-second basis. Contrast
+    /// `reassign_tier`, which converts the OTHER direction (ref→wall
+    /// via `/ min_factor`) to compare against `binding_bound`.
+    ///
+    /// [`binding_bound`]: solve::Tier::binding_bound
+    default_tier_target_wall: f64,
     /// `[sla].cluster` — passed to `read_sla_overrides` so rows scoped
     /// to a different cluster are filtered at SQL read time.
     cluster: String,
@@ -100,7 +117,7 @@ impl SlaEstimator {
                         None
                     }
                 });
-        let default_tier_target = cfg
+        let default_tier_target_wall = cfg
             .tiers
             .iter()
             .find(|t| t.name == cfg.default_tier)
@@ -110,7 +127,9 @@ impl SlaEstimator {
             seed: HashMap::new(),
             fleet: None,
             operator: cfg.probe.clone(),
-            default_tier_target,
+            // factor=1.0 until first populated hw load — same harmless
+            // degradation as the rest of the empty-hw path.
+            default_tier_target: default_tier_target_wall,
         }));
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -118,6 +137,7 @@ impl SlaEstimator {
             hw: Arc::new(RwLock::new(hw::HwTable::default())),
             priors,
             pending_seed: Mutex::new(pending_seed),
+            default_tier_target_wall,
             cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
             halflife_secs: cfg.halflife_secs,
@@ -125,10 +145,40 @@ impl SlaEstimator {
         }
     }
 
+    /// Swap in a freshly-loaded hw table, plus the per-populated-load
+    /// side effects (pending-seed rescale, operator-basis wall→ref).
+    /// Separate from `refresh()` so it can be unit-tested without a
+    /// `SchedulerDb`.
+    fn apply_hw(&self, t: hw::HwTable) {
+        // Pending seed conversion gated on a POPULATED load (Ok ∧
+        // non-empty, checked inside apply_pending_seed): running it
+        // against the empty default would rescale by factor=1.0
+        // everywhere and `.take()` would consume the seed so the next
+        // tick can't retry.
+        self.apply_pending_seed(&t);
+        if !t.is_empty() {
+            // r[impl sched.sla.hw-ref-seconds]
+            // binding_bound() is wall-seconds (operator-facing);
+            // operator_to_spq / clamp_to_operator compare against
+            // ref-second fleet medians. Convert at the chokepoint where
+            // hw becomes available.
+            self.priors.write().default_tier_target =
+                self.default_tier_target_wall * t.factor(&t.reference);
+        }
+        *self.hw.write() = t;
+    }
+
     /// One-shot: rescale and merge any pending startup seed corpus
     /// against `hw`. Separate from `refresh()` so it can be unit-tested
     /// without a `SchedulerDb`.
     fn apply_pending_seed(&self, hw: &hw::HwTable) {
+        if hw.is_empty() {
+            // Ok-but-empty (no hw_class has ≥3 benched pods yet — i.e.
+            // always on a fresh cluster) is functionally the Err arm:
+            // scale would be 1.0/1.0 and `.take()` would consume the
+            // seed so the next tick can't retry. Defer.
+            return;
+        }
         if let Some(corpus) = self.pending_seed.lock().take() {
             let (map, scale) = corpus.into_seed_map(hw);
             tracing::info!(
@@ -169,7 +219,7 @@ impl SlaEstimator {
     /// [`SeedCorpus`]: prior::SeedCorpus
     pub fn export_corpus(&self, tenant: Option<&str>, min_n: u32) -> prior::SeedCorpus {
         let cache = self.cache.read();
-        let entries = cache
+        let mut entries: Vec<prior::SeedEntry> = cache
             .values()
             .filter(|f| tenant.is_none_or(|t| f.key.tenant == t))
             .filter(|f| f.n_eff >= f64::from(min_n))
@@ -200,6 +250,23 @@ impl SlaEstimator {
                 })
             })
             .collect();
+        // tenant=None: cache is keyed by (pname, system, tenant) but
+        // SeedEntry is tenant-agnostic (prior::SeedKey), so N tenants ×
+        // gcc/x86_64-linux produce N entries with identical (pname,
+        // system). into_seed_map's HashMap collect is last-write-wins on
+        // HashMap iteration order — non-deterministic. Dedup HERE
+        // (export, not import) so the on-disk corpus is clean: keep the
+        // highest-n representative (most observations → most reliable
+        // single fit), tie-break on (pname, system) for determinism.
+        if tenant.is_none() {
+            entries.sort_by(|a, b| {
+                (&a.pname, &a.system)
+                    .cmp(&(&b.pname, &b.system))
+                    .then(b.n.cmp(&a.n))
+                    .then(a.s.total_cmp(&b.s))
+            });
+            entries.dedup_by(|a, b| a.pname == b.pname && a.system == b.system);
+        }
         prior::SeedCorpus {
             ref_hw_class: self.hw.read().reference.clone(),
             entries,
@@ -208,9 +275,19 @@ impl SlaEstimator {
 
     /// Merge a parsed corpus into the seed-prior table, rescaling
     /// time-domain params via the current hw table. Returns `(entries,
-    /// applied_factor)`.
+    /// applied_factor)`. `applied_factor.is_nan()` ⇔ hw table not yet
+    /// populated (RPC arrived before ≥3 pods/hw_class benched, e.g.
+    /// `rio-cli sla import-corpus` scripted immediately after `helm
+    /// install`); the corpus is stashed into `pending_seed` and
+    /// rescaled on the next populated `refresh` tick.
     pub fn import_seed(&self, corpus: prior::SeedCorpus) -> (usize, f64) {
-        let (map, scale) = corpus.into_seed_map(&self.hw.read());
+        let hw = self.hw.read();
+        if hw.is_empty() {
+            let n = corpus.entries.len();
+            *self.pending_seed.lock() = Some(corpus);
+            return (n, f64::NAN);
+        }
+        let (map, scale) = corpus.into_seed_map(&hw);
         let n = map.len();
         self.priors.write().seed.extend(map);
         (n, scale)
@@ -328,14 +405,7 @@ impl SlaEstimator {
         // overrides (a few dozen rows from a view). Failure → keep
         // previous; an empty table is factor=1.0 everywhere.
         match hw::HwTable::load(db).await {
-            Ok(t) => {
-                // Pending seed conversion gated on a SUCCESSFUL load:
-                // running it in the Err arm would rescale against the
-                // empty default (factor=1.0 everywhere) and `.take()`
-                // would consume the seed so the next tick can't retry.
-                self.apply_pending_seed(&t);
-                *self.hw.write() = t;
-            }
+            Ok(t) => self.apply_hw(t),
             Err(e) => tracing::warn!(error = %e, "sla hw-table refresh failed; keeping previous"),
         }
         let hw_snapshot = self.hw.read().clone();
@@ -366,7 +436,10 @@ impl SlaEstimator {
         // (read+trim ×N) blocked the actor for O(N×RTT) — ~30s at 10k
         // keys × 1.5ms cross-AZ RDS — during which no SubmitBuild /
         // CompletionReport / dispatch_ready was processed. With the
-        // batch, the loop body below is await-free.
+        // batch, the loop body below has no DB awaits — but it IS
+        // CPU-bound (ingest::refit → t_min_ci(500 reps) ≈ 1ms/key when
+        // bootstrapping a cold cache), so it yields every 64 keys to
+        // bound per-slice actor stall to ~64ms.
         let mut pnames = Vec::with_capacity(touched.len());
         let mut systems = Vec::with_capacity(touched.len());
         let mut tenants = Vec::with_capacity(touched.len());
@@ -391,7 +464,10 @@ impl SlaEstimator {
             });
 
         let mut outlier_ids: HashSet<i64> = HashSet::new();
-        for key in &touched {
+        for (i, key) in touched.iter().enumerate() {
+            if i > 0 && i.is_multiple_of(64) {
+                tokio::task::yield_now().await;
+            }
             let prev = self.cache.read().get(key).cloned();
             // r[impl sched.sla.outlier-mad-reject]
             // BEFORE refit: score each NEW sample for this key against
@@ -481,7 +557,8 @@ impl SlaEstimator {
                 Some((f.key.clone(), prior::FitParams { s, p, q, a, b }))
             })
             .collect();
-        self.priors.write().fleet = prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS);
+        self.priors.write().fleet =
+            prior::fleet_median(&coupled, FLEET_MEDIAN_MIN_KEYS, FLEET_MEDIAN_MIN_TENANTS);
 
         Ok(touched.len())
     }
@@ -573,8 +650,12 @@ mod tests {
         assert_eq!(corpus.entries.len(), 5, "n_eff=1 filtered");
         let json = serde_json::to_string(&corpus).unwrap();
 
-        // Fresh estimator, import the corpus.
+        // Fresh estimator, import the corpus. hw must be populated or
+        // import_seed defers (factor=NaN).
         let dst = SlaEstimator::for_test(&cfg());
+        let mut m = HashMap::new();
+        m.insert("ref".into(), 1.0);
+        dst.seed_hw(hw::HwTable::from_map(m));
         let parsed: prior::SeedCorpus = serde_json::from_str(&json).unwrap();
         let (n, _) = dst.import_seed(parsed);
         assert_eq!(n, 5);
@@ -606,6 +687,32 @@ mod tests {
         src.seed(other);
         assert_eq!(src.export_corpus(Some("t0"), 3).entries.len(), 1);
         assert_eq!(src.export_corpus(None, 3).entries.len(), 2);
+    }
+
+    #[test]
+    fn export_corpus_dedup_across_tenants() {
+        let src = SlaEstimator::for_test(&cfg());
+        // Same (pname, system), two tenants, distinct n_eff.
+        let mut t0 = fitted("gcc", 5.0);
+        t0.key.tenant = "t0".into();
+        src.seed(t0);
+        let mut t1 = fitted("gcc", 10.0);
+        t1.key.tenant = "t1".into();
+        src.seed(t1);
+        // Distinct pname, one tenant.
+        src.seed(fitted("hello", 5.0));
+
+        let entries = src.export_corpus(None, 3).entries;
+        assert_eq!(entries.len(), 2, "gcc dedup'd to 1; hello = 1");
+        let gcc = entries.iter().find(|e| e.pname == "gcc").unwrap();
+        assert_eq!(gcc.n, 10, "highest-n representative survives");
+        // Determinism: two exports moments apart yield identical output.
+        let again = src.export_corpus(None, 3).entries;
+        assert_eq!(entries.len(), again.len());
+        for (a, b) in entries.iter().zip(again.iter()) {
+            assert_eq!(a.pname, b.pname);
+            assert_eq!(a.n, b.n);
+        }
     }
 
     #[test]
@@ -671,6 +778,112 @@ mod tests {
         // One-shot: second call is a no-op.
         est.apply_pending_seed(&hw);
         assert_eq!(est.prior_sources().seed.len(), 1);
+    }
+
+    #[test]
+    fn pending_seed_survives_empty_hw_table() {
+        // HwTable::load returns Ok({}) when hw_perf_factors has zero
+        // rows (HAVING count(DISTINCT pod_id) >= 3 floor — always on a
+        // fresh cluster). apply_pending_seed must NOT consume the seed
+        // against an empty table (scale would be 1.0/1.0).
+        let est = SlaEstimator::for_test(&cfg());
+        *est.pending_seed.lock() = Some(prior::SeedCorpus {
+            ref_hw_class: "fast".into(),
+            entries: vec![prior::SeedEntry {
+                pname: "hello".into(),
+                system: "x86_64-linux".into(),
+                s: 100.0,
+                p: 200.0,
+                q: 0.0,
+                p_bar: 0.0,
+                a: 22.0,
+                b: 0.5,
+                n: 5,
+            }],
+        });
+        est.apply_pending_seed(&hw::HwTable::default());
+        assert!(
+            est.pending_seed.lock().is_some(),
+            "seed not consumed against empty hw"
+        );
+        assert!(est.prior_sources().seed.is_empty());
+
+        // Populated table → consumed and rescaled.
+        let mut m = HashMap::new();
+        m.insert("fast".into(), 2.0);
+        m.insert("slow".into(), 1.0);
+        est.apply_pending_seed(&hw::HwTable::from_map(m));
+        let seed = est.prior_sources().seed;
+        assert_eq!(seed.len(), 1);
+        assert_eq!(
+            seed[&("hello".into(), "x86_64-linux".into())].s,
+            200.0,
+            "rescaled by 2.0, not 1.0"
+        );
+    }
+
+    #[test]
+    fn import_seed_defers_on_empty_hw() {
+        let est = SlaEstimator::for_test(&cfg());
+        let corpus = prior::SeedCorpus {
+            ref_hw_class: "fast".into(),
+            entries: vec![prior::SeedEntry {
+                pname: "x".into(),
+                system: "x86_64-linux".into(),
+                s: 100.0,
+                p: 200.0,
+                q: 0.0,
+                p_bar: 0.0,
+                a: 22.0,
+                b: 0.5,
+                n: 5,
+            }],
+        };
+        // hw empty → stashed, factor=NaN sentinel.
+        let (n, scale) = est.import_seed(corpus);
+        assert_eq!(n, 1);
+        assert!(scale.is_nan(), "deferred sentinel");
+        assert!(est.prior_sources().seed.is_empty());
+        assert!(est.pending_seed.lock().is_some(), "stashed for next tick");
+
+        // Next refresh with populated hw picks it up.
+        let mut m = HashMap::new();
+        m.insert("fast".into(), 2.0);
+        m.insert("slow".into(), 1.0);
+        est.apply_pending_seed(&hw::HwTable::from_map(m));
+        assert_eq!(
+            est.prior_sources().seed[&("x".into(), "x86_64-linux".into())].s,
+            200.0
+        );
+    }
+
+    // r[verify sched.sla.hw-ref-seconds]
+    #[test]
+    fn operator_basis_tracks_hw_reference() {
+        // cfg().tiers[0].p90 = 1200 (wall-seconds). After a populated
+        // hw load with factor[reference]=1.3, priors.default_tier_target
+        // must be 1200 × 1.3 ref-seconds so operator_to_spq /
+        // clamp_to_operator compare ref-against-ref. Before the fix the
+        // wall value was used directly.
+        let est = SlaEstimator::for_test(&cfg());
+        assert_eq!(
+            est.prior_sources().default_tier_target,
+            1200.0,
+            "factor=1.0 until first populated load"
+        );
+        let mut m = HashMap::new();
+        m.insert("ref".into(), 1.3);
+        est.apply_hw(hw::HwTable::from_map(m));
+        let got = est.prior_sources().default_tier_target;
+        assert!(
+            (got - 1200.0 * 1.3).abs() < 1e-9,
+            "wall→ref converted: got {got}, want {}",
+            1200.0 * 1.3
+        );
+        // Empty load → unchanged (no conversion against factor=1.0).
+        let est2 = SlaEstimator::for_test(&cfg());
+        est2.apply_hw(hw::HwTable::default());
+        assert_eq!(est2.prior_sources().default_tier_target, 1200.0);
     }
 
     #[test]
