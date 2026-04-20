@@ -709,36 +709,11 @@ async fn test_query_missing_unrealised_floating_ca_in_willbuild() -> anyhow::Res
     Ok(())
 }
 
-/// RegisterDrvOutput (42): missing/garbage `outPath` → soft-fail
-/// (STDERR_LAST + Ok), NOT STDERR_ERROR. Before the fix, the unparseable
-/// `out_path` flowed through to RegisterRealisation → store-side
-/// `validate_store_path` → `Status::invalid_argument` → session-terminating
-/// `stderr_err!`, contradicting the documented soft-fail policy.
-#[rstest]
-#[case::missing(r#"{"id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!out","signatures":[]}"#)]
-#[case::garbage(r#"{"id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!out","outPath":"garbage","signatures":[]}"#)]
-#[tokio::test]
-async fn test_register_drv_output_bad_outpath_soft_fails(#[case] json: &str) -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-
-    wire_send!(&mut h.stream; u64: 42, string: json);
-    // Soft-fail: STDERR_LAST, no STDERR_ERROR, no response data.
-    drain_stderr_until_last(&mut h.stream).await?;
-
-    // Nothing was registered.
-    assert!(
-        h.store.state.realisations.read().unwrap().is_empty(),
-        "malformed outPath should not reach RegisterRealisation"
-    );
-
-    // Session stays usable: a follow-up opcode works.
-    wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_MISSING);
-    drain_stderr_until_last(&mut h.stream).await?;
-    let _ = wire::read_bool(&mut h.stream).await?;
-
-    h.finish().await;
-    Ok(())
-}
+// test_register_drv_output_bad_outpath_soft_fails removed:
+// wopRegisterDrvOutput now hard-rejects with "requires trusted-user"
+// (G22 realisation auth gate) BEFORE outPath validation runs, so the
+// soft-fail-on-bad-outpath path is unreachable. The trusted-user
+// rejection itself is covered in opcodes_write.rs.
 
 /// QueryValidPaths with empty input returns empty output.
 #[tokio::test]

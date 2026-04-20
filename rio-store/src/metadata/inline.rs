@@ -31,16 +31,19 @@ use tracing::{debug, instrument};
 ///
 /// See `r[store.gc.sweep-recheck]` for the full race trace.
 ///
-/// Returns `true` if inserted, `false` if another upload already holds a
-/// placeholder (caller should re-check `check_manifest_complete` — the race
-/// winner may have finished).
+/// Returns `Some(claim_id)` if inserted (the caller now OWNS the
+/// placeholder and uses `claim_id` for its cleanup paths — see
+/// `r[store.put.placeholder-claim]`), `None` if another upload already
+/// holds a placeholder (caller should re-check `check_manifest_complete`
+/// — the race winner may have finished).
+// r[impl store.put.placeholder-claim]
 #[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
 pub async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
     references: &[String],
-) -> Result<bool> {
+) -> Result<Option<uuid::Uuid>> {
     let mut tx = pool.begin().await?;
 
     // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
@@ -65,21 +68,27 @@ pub async fn insert_manifest_uploading(
     .await?;
 
     // manifests placeholder. ON CONFLICT DO NOTHING for the same reason.
-    // rows_affected = 0 means another uploader owns this slot.
+    // rows_affected = 0 means another uploader owns this slot. claim_id
+    // is the ownership token: every owner-side cleanup (abort_placeholder,
+    // the drop-guard, put_chunked's complete-failure rollback) passes it
+    // to `reap_one(ReapBy::Claim(id))` so a late-firing cleanup cannot
+    // match a fresh re-upload at the same store_path_hash.
+    let claim_id = uuid::Uuid::new_v4();
     let result = sqlx::query(
         r#"
-        INSERT INTO manifests (store_path_hash, status)
-        VALUES ($1, 'uploading')
+        INSERT INTO manifests (store_path_hash, status, claim_id)
+        VALUES ($1, 'uploading', $2)
         ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
     .bind(store_path_hash)
+    .bind(claim_id)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
-    Ok(result.rows_affected() > 0)
+    Ok((result.rows_affected() > 0).then_some(claim_id))
 }
 
 /// Finalize an inline upload: fill real narinfo + store the NAR in

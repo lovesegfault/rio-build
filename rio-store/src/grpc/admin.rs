@@ -129,7 +129,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// CTE handles this gracefully (unnest of non-existent path
     /// = 0 rows, the root itself stays in reachable).
     ///
-    /// r[impl store.gc.dry-run]
+    /// r[impl store.gc.dry-run+2]
     /// `dry_run`: compute stats, ROLLBACK sweep tx. Operator sees
     /// "would delete N paths, free M bytes" without committing.
     #[instrument(skip(self, request), fields(rpc = "TriggerGC"))]

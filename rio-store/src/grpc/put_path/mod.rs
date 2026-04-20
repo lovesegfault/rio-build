@@ -154,7 +154,7 @@ impl StoreServiceImpl {
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        match self
+        let claim = match self
             .claim_placeholder(
                 &store_path_hash,
                 info.store_path.as_str(),
@@ -163,7 +163,7 @@ impl StoreServiceImpl {
             )
             .await
         {
-            Ok(PlaceholderClaim::Owned) => {}
+            Ok(PlaceholderClaim::Owned(claim)) => claim,
             Ok(PlaceholderClaim::AlreadyComplete) => {
                 debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete");
                 drain_stream(&mut stream).await;
@@ -189,9 +189,9 @@ impl StoreServiceImpl {
                 drain_stream(&mut stream).await;
                 return Err(putpath_metadata_status("PutPath: claim_placeholder", e));
             }
-        }
+        };
 
-        let placeholder_guard = self.spawn_placeholder_guard(store_path_hash.clone());
+        let placeholder_guard = self.spawn_placeholder_guard(store_path_hash.clone(), claim);
 
         let (nar_data, _held_permits) = match self
             .ingest_nar_stream(&mut stream, &mut info, auth.hmac_claims.as_ref())
@@ -199,12 +199,13 @@ impl StoreServiceImpl {
         {
             Ok(x) => x,
             Err(e) => {
-                self.abort_upload(&store_path_hash).await;
+                self.abort_upload(&store_path_hash, claim).await;
                 return Err(e);
             }
         };
 
-        self.finalize_single(info, nar_data, auth.tenant_id).await?;
+        self.finalize_single(info, claim, nar_data, auth.tenant_id)
+            .await?;
         placeholder_guard.defuse();
         Ok(Response::new(PutPathResponse { created: true }))
     }

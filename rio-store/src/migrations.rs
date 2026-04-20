@@ -772,6 +772,23 @@ pub const M_048: () = ();
 /// `IF NOT EXISTS` then no-ops on deploy (same pattern as M_029).
 pub const M_049: () = ();
 
+/// `migrations/052_manifests_claim_id.sql`
+///
+/// `claim_id UUID` on `manifests`: ownership token for `'uploading'`
+/// placeholders. `insert_manifest_uploading` generates a fresh v4 and
+/// returns it; owner-side cleanup (`reap_one(ReapBy::Claim(id))`,
+/// `abort_placeholder`, the PutPath drop-guard) filters
+/// `AND claim_id = $2` so a late-firing cleanup CANNOT match a fresh
+/// re-upload at the same `store_path_hash`. Before this column,
+/// `reap_one(threshold=None)` filtered `status='uploading'` only —
+/// status alone is not ownership: the orphan scanner (or stage_chunked
+/// rollback) deletes A's row, B inserts a fresh one, then A's
+/// `tokio::spawn`'d drop-guard fires and reaps B's narinfo + chunk
+/// refcounts mid-upload. NULLable: only `'uploading'` rows carry it;
+/// `'complete'` rows and pre-052 rows have NULL (matched only by
+/// `ReapBy::Stale`).
+pub const M_052: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

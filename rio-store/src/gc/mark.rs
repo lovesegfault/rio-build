@@ -358,7 +358,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(inserted, "placeholder inserted");
+        assert!(inserted.is_some(), "placeholder inserted");
 
         // B is now protected: seed (b) picks up A (status='uploading'),
         // CTE walks A's references → B reachable.

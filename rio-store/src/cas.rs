@@ -171,6 +171,7 @@ pub async fn put_chunked(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
     nar_data: &[u8],
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
@@ -182,9 +183,17 @@ pub async fn put_chunked(
         // Chunks are uploaded to S3. reap_one decrements refcounts →
         // GC-eligible. We DON'T delete from S3 — GC sweep's job.
         // Deleting now races with a concurrent uploader that just
-        // incremented the same chunk.
-        if let Err(e2) =
-            crate::gc::orphan::reap_one(pool, &info.store_path_hash, None, Some(backend)).await
+        // incremented the same chunk. ReapBy::Claim: stage_chunked's
+        // own rollback may have already deleted OUR row and a fresh
+        // uploader may now hold the slot — claim_id mismatch makes
+        // this a no-op there (M_052).
+        if let Err(e2) = crate::gc::orphan::reap_one(
+            pool,
+            &info.store_path_hash,
+            crate::gc::orphan::ReapBy::Claim(claim),
+            Some(backend),
+        )
+        .await
         {
             warn!(error = %e2, "rollback after complete failure also failed; orphan scanner will clean up");
         }

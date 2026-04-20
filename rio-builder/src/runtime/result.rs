@@ -284,11 +284,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(4);
         let pending = AtomicBool::new(false);
-        let completion = panic_completion(
-            "/nix/store/aaa-x.drv".into(),
-            "tok".into(),
-            stamp(),
-        );
+        let completion = panic_completion("/nix/store/aaa-x.drv".into(), "tok".into(), stamp());
 
         send_completion(&tx, &pending, completion).await;
 

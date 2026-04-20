@@ -22,11 +22,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use sqlx::PgPool;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::ChunkBackend;
 use crate::cas;
+use crate::gc::orphan::ReapBy;
 use crate::metadata::{self, MetadataError};
 use crate::substitute::SUBSTITUTE_STALE_THRESHOLD;
 
@@ -38,8 +40,12 @@ pub enum PlaceholderClaim {
     AlreadyComplete,
     /// We inserted (or stale-reclaimed-then-inserted) the
     /// `status='uploading'` placeholder. Caller now OWNS it and MUST
-    /// [`abort_placeholder`] on any error path.
-    Owned,
+    /// [`abort_placeholder`] on any error path. The carried [`Uuid`] is
+    /// the `manifests.claim_id` ownership token (M_052) — every
+    /// owner-side cleanup passes it to `reap_one(ReapBy::Claim(id))`
+    /// so a late-firing cleanup cannot reap a fresh re-upload at the
+    /// same `store_path_hash`.
+    Owned(Uuid),
     /// Another uploader holds a live (heartbeating) placeholder. Caller
     /// returns `aborted` so the client retries.
     Concurrent,
@@ -97,18 +103,23 @@ pub async fn claim_placeholder(
     // them into the placeholder narinfo. Mark's CTE walks them from
     // commit → the closure is GC-protected without holding a session
     // lock for the full upload.
-    let mut inserted =
+    let mut claim =
         metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs).await?;
 
-    if !inserted {
+    if claim.is_none() {
         // r[impl store.substitute.stale-reclaim]
         // I-040: chunk-aware reap (reads manifest_data.chunk_list and
         // decrements refcounts) — the inline-only delete leaks chunk
         // refcounts when the stale placeholder is from an interrupted
         // `cas::put_chunked`.
         let threshold = SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-        match crate::gc::orphan::reap_one(pool, store_path_hash, Some(threshold), chunk_backend)
-            .await
+        match crate::gc::orphan::reap_one(
+            pool,
+            store_path_hash,
+            ReapBy::Stale { secs: threshold },
+            chunk_backend,
+        )
+        .await
         {
             Ok(true) => {
                 warn!(
@@ -121,7 +132,7 @@ pub async fn claim_placeholder(
                 // placeholder is gone; collapsing Err into the
                 // Concurrent path here would silently swallow a DB
                 // failure with no log (asymmetric with line 101).
-                inserted =
+                claim =
                     metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs)
                         .await?;
             }
@@ -131,10 +142,10 @@ pub async fn claim_placeholder(
         }
     }
 
-    if !inserted {
-        return Ok(PlaceholderClaim::Concurrent);
+    match claim {
+        Some(id) => Ok(PlaceholderClaim::Owned(id)),
+        None => Ok(PlaceholderClaim::Concurrent),
     }
-    Ok(PlaceholderClaim::Owned)
 }
 
 /// How [`persist_nar`] failed. The caller maps this to its own error
@@ -166,14 +177,22 @@ pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     info: &ValidatedPathInfo,
+    claim: Uuid,
     nar_data: Vec<u8>,
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
 ) -> Result<(), PersistError> {
     if let Some(backend) = cas::should_chunk(chunk_backend, nar_data.len()) {
-        let stats = cas::put_chunked(pool, backend, info, &nar_data, chunk_upload_max_concurrent)
-            .await
-            .map_err(PersistError::Chunked)?;
+        let stats = cas::put_chunked(
+            pool,
+            backend,
+            info,
+            claim,
+            &nar_data,
+            chunk_upload_max_concurrent,
+        )
+        .await
+        .map_err(PersistError::Chunked)?;
         debug!(
             store_path = %info.store_path.as_str(),
             total_chunks = stats.total_chunks,
@@ -205,6 +224,12 @@ pub(crate) struct PlaceholderGuard {
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     store_path_hash: Vec<u8>,
+    /// `r[store.put.placeholder-claim]`: ownership token from
+    /// [`PlaceholderClaim::Owned`]. The drop-path reap filters
+    /// `claim_id = $claim` so it's a no-op if our row was already
+    /// reaped (orphan scanner / `cas::put_chunked` rollback) and a
+    /// fresh re-upload now holds the slot.
+    claim: Uuid,
     defused: bool,
 }
 
@@ -227,10 +252,15 @@ impl Drop for PlaceholderGuard {
         let pool = self.pool.clone();
         let chunk_backend = self.chunk_backend.take();
         let store_path_hash = std::mem::take(&mut self.store_path_hash);
+        let claim = self.claim;
         rio_common::task::spawn_monitored("put-path-placeholder-reap", async move {
-            if let Err(e) =
-                crate::gc::orphan::reap_one(&pool, &store_path_hash, None, chunk_backend.as_ref())
-                    .await
+            if let Err(e) = crate::gc::orphan::reap_one(
+                &pool,
+                &store_path_hash,
+                ReapBy::Claim(claim),
+                chunk_backend.as_ref(),
+            )
+            .await
             {
                 warn!(
                     store_path_hash = %hex::encode(&store_path_hash),
@@ -264,6 +294,7 @@ pub fn spawn_placeholder_guard(
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     store_path_hash: Vec<u8>,
+    claim: Uuid,
 ) -> PlaceholderGuard {
     let heartbeat = {
         let pool = pool.clone();
@@ -283,21 +314,27 @@ pub fn spawn_placeholder_guard(
         pool,
         chunk_backend,
         store_path_hash,
+        claim,
         defused: false,
     }
 }
 
 /// Best-effort placeholder cleanup after a failed ingest. Chunk-aware
 /// (reads `manifest_data.chunk_list` and decrements refcounts).
-/// `threshold=None`: this is OUR placeholder, no stale check needed.
-/// Safe to call even if `cas::put_chunked`'s internal rollback already
-/// deleted it (no-op).
+/// `claim` is the ownership token from [`PlaceholderClaim::Owned`] —
+/// `reap_one` filters `claim_id = $claim` so this is a no-op if the
+/// row was already reaped (orphan scanner / `cas::put_chunked` rollback)
+/// AND a fresh re-upload now holds the slot.
 pub async fn abort_placeholder(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     store_path_hash: &[u8],
+    claim: Uuid,
 ) {
-    if let Err(e) = crate::gc::orphan::reap_one(pool, store_path_hash, None, chunk_backend).await {
+    if let Err(e) =
+        crate::gc::orphan::reap_one(pool, store_path_hash, ReapBy::Claim(claim), chunk_backend)
+            .await
+    {
         warn!(
             store_path_hash = %hex::encode(store_path_hash),
             error = %e,

@@ -426,11 +426,13 @@ impl StoreServiceImpl {
     pub(in crate::grpc) fn spawn_placeholder_guard(
         &self,
         store_path_hash: Vec<u8>,
+        claim: uuid::Uuid,
     ) -> PlaceholderGuard {
         crate::ingest::spawn_placeholder_guard(
             self.pool.clone(),
             self.chunk_backend.clone(),
             store_path_hash,
+            claim,
         )
     }
 
@@ -516,12 +518,13 @@ impl StoreServiceImpl {
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
+        claim: uuid::Uuid,
         nar_data: Vec<u8>,
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
-        if let Err(e) = self.persist_nar(&info, nar_data, "PutPath").await {
-            self.abort_upload(&info.store_path_hash).await;
+        if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
+            self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
@@ -560,7 +563,7 @@ impl StoreServiceImpl {
                     "reason" => "concurrent_upload")
                 .increment(1);
             }
-            PlaceholderClaim::Owned => {}
+            PlaceholderClaim::Owned(_) => {}
         }
         Ok(claim)
     }
@@ -580,6 +583,7 @@ impl StoreServiceImpl {
     pub(in crate::grpc) async fn persist_nar(
         &self,
         info: &ValidatedPathInfo,
+        claim: uuid::Uuid,
         nar_data: Vec<u8>,
         ctx_label: &str,
     ) -> Result<bool, Status> {
@@ -588,6 +592,7 @@ impl StoreServiceImpl {
             &self.pool,
             self.chunk_backend.as_ref(),
             info,
+            claim,
             nar_data,
             self.chunk_upload_max_concurrent,
             PUTPATH_HOOKS,

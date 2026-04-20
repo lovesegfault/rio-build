@@ -573,7 +573,7 @@ impl Substituter {
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
 
-        match ingest::claim_placeholder(
+        let claim = match ingest::claim_placeholder(
             &self.pool,
             self.chunk_backend.as_ref(),
             &store_path_hash,
@@ -583,7 +583,7 @@ impl Substituter {
         )
         .await?
         {
-            PlaceholderClaim::Owned => {}
+            PlaceholderClaim::Owned(claim) => claim,
             PlaceholderClaim::AlreadyComplete => {
                 // Lost the race; winner completed. Append our sigs to
                 // the existing row (idempotent — append_signatures
@@ -605,7 +605,7 @@ impl Substituter {
                 debug!(%store_path, "concurrent uploader holds placeholder");
                 return Ok(UpstreamOutcome::Raced);
             }
-        }
+        };
 
         // r[impl store.put.drop-cleanup+2]
         // We OWN the placeholder. Guard against future-drop (client
@@ -615,6 +615,7 @@ impl Substituter {
             self.pool.clone(),
             self.chunk_backend.clone(),
             store_path_hash.to_vec(),
+            claim,
         );
 
         // The remaining steps are fallible AND we own the placeholder;
@@ -649,6 +650,7 @@ impl Substituter {
                 &self.pool,
                 self.chunk_backend.as_ref(),
                 &info,
+                claim,
                 nar_bytes.into(),
                 self.chunk_upload_max_concurrent,
                 SUBSTITUTE_HOOKS,
@@ -676,6 +678,7 @@ impl Substituter {
                     &self.pool,
                     self.chunk_backend.as_ref(),
                     &store_path_hash,
+                    claim,
                 )
                 .await;
                 Err(e)

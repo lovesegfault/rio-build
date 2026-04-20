@@ -1,6 +1,7 @@
 //! Sweep phase: delete unreachable paths + decrement chunks + enqueue S3.
 // r[impl store.gc.two-phase]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use tracing::{info, instrument, warn};
 
 use crate::backend::ChunkBackend;
 
-use super::{GcStats, decrement_and_enqueue};
+use super::{GcStats, decrement_hashes_and_enqueue, parse_unique_chunk_hashes};
 
 /// Terminal state of [`sweep`] other than success.
 #[derive(Debug)]
@@ -102,6 +103,56 @@ async fn setup_sweep_unreachable(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Referrer-first iteration order over `sweep_unreachable`: depth 0 =
+/// paths with NO referrer inside the set; depth N = paths whose only
+/// in-set referrers are at depth <N. ORDER BY depth ASC (within a
+/// depth: by hash for determinism).
+///
+/// Ensures any Y appears at index ≤ its dep Z, so the delete loop
+/// re-checks (and possibly resurrects + closure-removes Z from) Y
+/// BEFORE Z's batch. Without this, a `PutPath(P, refs=[Y])` landing
+/// between batch K's commit (Z) and batch K+M's re-check (Y) leaves
+/// live Y with `references=[deleted Z]`. Cycles (Y↔Z) get the same
+/// depth (recursive UNION dedups); the within-batch `still_unreachable`
+/// probe handles them.
+// r[impl store.gc.sweep-referrer-order]
+async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>>, sqlx::Error> {
+    // Cycle-safe via `visited` array (PG can't reference the
+    // recursive CTE in a subquery of the recursive arm). LEFT JOIN
+    // back to sweep_unreachable so cycle-only members (no path from a
+    // depth-0 seed → NULL d) are included LAST — within-batch
+    // `still_unreachable` handles them.
+    sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE depth(path_hash, d, visited) AS (
+            SELECT su.path_hash, 0, ARRAY[su.path_hash]
+              FROM sweep_unreachable su
+              JOIN narinfo n ON n.store_path_hash = su.path_hash
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM narinfo r
+                   JOIN sweep_unreachable su2 ON su2.path_hash = r.store_path_hash
+                  WHERE n.store_path = ANY(r."references")
+                    AND r.store_path_hash <> su.path_hash
+             )
+          UNION ALL
+            SELECT dep.store_path_hash, depth.d + 1, visited || dep.store_path_hash
+              FROM depth
+              JOIN narinfo n ON n.store_path_hash = depth.path_hash
+              JOIN narinfo dep ON dep.store_path = ANY(n."references")
+              JOIN sweep_unreachable su ON su.path_hash = dep.store_path_hash
+             WHERE NOT dep.store_path_hash = ANY(visited)
+        )
+        SELECT su.path_hash
+          FROM sweep_unreachable su
+          LEFT JOIN (SELECT path_hash, MIN(d) AS d FROM depth GROUP BY path_hash) dd
+            USING (path_hash)
+         ORDER BY COALESCE(dd.d, 2147483647), su.path_hash
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
 }
 
 /// Delete one swept path's metadata: realisations + path_tenants +
@@ -250,6 +301,13 @@ pub async fn sweep(
         return Ok(stats);
     }
 
+    // Reset on ANY exit (Ok, SweepAbort, panic). The gauge contract is
+    // 0 between sweeps; before this scopeguard, an abort left it at the
+    // last per-batch set() and read as "sweep stalled".
+    let _gauge_reset = scopeguard::guard((), |()| {
+        metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
+    });
+
     // Dedicated connection: the sweep_unreachable temp table below is
     // session-scoped and must survive across the batch-transaction
     // boundaries in the loop. pool.begin() would acquire a FRESH
@@ -264,6 +322,16 @@ pub async fn sweep(
 
     setup_sweep_unreachable(&mut conn, &unreachable).await?;
 
+    // Referrer-first iteration order: Y before its dep Z so a mid-loop
+    // resurrection of Y closure-removes Z before Z's batch. Computed
+    // BEFORE pass-1 (from the full set) and used for BOTH pass-1 and
+    // the delete loop — pass-1's closure_remove drains the temp table,
+    // so an order computed AFTER it would skip drained paths and lose
+    // their `paths_resurrected` accounting.
+    // r[impl store.gc.sweep-referrer-order]
+    let ordered = select_sweep_order(&mut conn).await?;
+    let total = ordered.len();
+
     // Pass 1 (whole-sweep): drain resurrections from sweep_unreachable.
     // For each candidate, re-check for a live referrer; if found,
     // closure-delete the candidate and its reference tree from the temp
@@ -273,7 +341,7 @@ pub async fn sweep(
     // Y-in-batch-N+1 (Y→Z) was resurrected. The delete loop re-runs
     // the same re-check under FOR UPDATE; that remains the
     // LOAD-BEARING guard for uploads landing DURING the sweep.
-    for batch in unreachable.chunks(SWEEP_BATCH_SIZE) {
+    for batch in ordered.chunks(SWEEP_BATCH_SIZE) {
         if shutdown.is_cancelled() {
             return Err(SweepAbort::Shutdown);
         }
@@ -296,8 +364,7 @@ pub async fn sweep(
         tx.commit().await?;
     }
 
-    let total = unreachable.len();
-    for (i, batch) in unreachable.chunks(SWEEP_BATCH_SIZE).enumerate() {
+    for (i, batch) in ordered.chunks(SWEEP_BATCH_SIZE).enumerate() {
         // Progress gauge: paths NOT yet processed (including this batch).
         // Emitted at batch boundary so an operator watching a long sweep
         // sees `remaining` ticking down per SWEEP_BATCH_SIZE commit. Set
@@ -316,174 +383,45 @@ pub async fn sweep(
         if shutdown.is_cancelled() {
             info!(
                 swept = stats.paths_deleted,
-                remaining = unreachable.len() as u64 - stats.paths_deleted,
+                remaining = total as u64 - stats.paths_deleted - stats.paths_resurrected,
                 "sweep: shutdown signal received, aborting at batch boundary"
             );
             return Err(SweepAbort::Shutdown);
         }
-        let mut tx = conn.begin().await?;
-        // Snapshot for per-batch counter deltas (emitted post-commit below).
-        let batch_start = stats.clone();
-
-        // Within-batch two-pass: lock + re-check every batch item before
-        // any narinfo DELETE. The whole-sweep resurrection drain above
-        // settled sweep_unreachable for uploads that landed BEFORE the
-        // sweep; this remaining split + the still_unreachable filter
-        // below catch a PutPath landing DURING this delete loop where
-        // the resurrecting path is later in the same batch.
-        let mut to_delete: Vec<(&Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(batch.len());
-
-        for store_path_hash in batch {
-            // Step 1: SELECT chunk_list FOR UPDATE. NULL for
-            // inline storage. The FOR UPDATE locks the MANIFEST
-            // row — a concurrent PutPath for the SAME path blocks
-            // until we COMMIT (prevents re-upload mid-sweep).
-            //
-            // This does NOT guard chunk-level races: a DIFFERENT
-            // path sharing chunk X can PutPath after we've already
-            // set X to deleted=true+refcount=0 and enqueued it.
-            // That race is handled by drain.rs's blake3_hash
-            // re-check against chunks.(deleted AND refcount=0)
-            // before calling S3 DeleteObject — PutPath's upsert
-            // clears deleted=false, drain sees "not dead", skips.
-            //
-            // LEFT JOIN manifest_data: inline paths have no row
-            // there. `chunk_list` is NULL for inline; we skip
-            // the chunk decrement loop.
-            let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
-                r#"
-                SELECT md.chunk_list
-                  FROM manifests m
-                  LEFT JOIN manifest_data md USING (store_path_hash)
-                 WHERE m.store_path_hash = $1
-                   FOR UPDATE OF m
-                "#,
-            )
-            .bind(store_path_hash)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
-
-            // Step 1b: reference re-check. Mark's CTE took a
-            // point-in-time MVCC snapshot; a PutPath that committed
-            // AFTER that snapshot (during mark, or between mark and
-            // now) may have written references=[this_path] —
-            // including `'uploading'` placeholders, which carry
-            // references from insert. Re-check via GIN index before
-            // deleting. If found: skip, increment resurrected metric.
-            // I-192: this is the LOAD-BEARING mark-vs-PutPath guard
-            // (there is no advisory lock).
-            // r[impl store.gc.sweep-recheck]
-            //
-            // The subquery resolves hash→path because narinfo."references"
-            // is TEXT[] (store_path strings, not hashes). The GIN index
-            // (migration 008) makes `"references" @> ARRAY[$path]` an
-            // index scan. I-145: the previous `$path = ANY("references")`
-            // form is semantically equivalent but does NOT use GIN — PG's
-            // array-GIN opclass supports `@>`/`<@`/`&&`/`=` only, and the
-            // planner does not rewrite `scalar = ANY(arrcol)` into `@>`.
-            // At 100k+ narinfo rows that was a ~1.3s seqscan per swept
-            // path. EXPLAIN-verified: `@>` → Bitmap Index Scan on
-            // idx_narinfo_references_gin even with the InitPlan subquery.
-            //
-            // The NOT EXISTS anti-join against sweep_unreachable
-            // excludes referrers that are themselves in the unreachable
-            // set. Without this, mutual-reference cycles (A→B, B→A) and
-            // self-references (A→A) are never swept: the re-check sees
-            // an intra-set referrer and skips both paths forever. The
-            // temp table holds the WHOLE `unreachable` set (not just
-            // `batch`) — a cycle may span SWEEP_BATCH_SIZE boundaries.
-            // r[impl store.gc.sweep-cycle-reclaim]
-            //
-            // Also re-check `scheduler_live_pins`: a scheduler dispatch
-            // that landed between mark and now is a direct root on THIS
-            // path that mark's snapshot missed. The table keys on
-            // store_path_hash (first index column) so the EXISTS is a
-            // point probe.
-            if recheck_has_live_referrer(&mut tx, store_path_hash).await? {
-                tracing::debug!(
-                    store_path_hash = %hex::encode(store_path_hash),
-                    "GC sweep: path resurrected (new referrer after mark), skipping"
-                );
-                stats.paths_resurrected += 1;
-                // Transitive resurrection: this path is now live, so
-                // its own references (and theirs, recursively) must
-                // not be excluded by the anti-join above when later
-                // batch entries are checked.
-                closure_remove_from_unreachable(&mut tx, store_path_hash).await?;
-                continue;
+        // Retry-once-on-40P01 (defense-in-depth: the single
+        // decrement_hashes_and_enqueue per batch SHOULD give btree-
+        // scan-order locking, but PG can still 40P01 under
+        // index-page-split contention). The `?` propagates
+        // SweepAbort::Db on the second failure.
+        let delta = match sweep_one_batch(&mut conn, batch, dry_run, chunk_backend).await {
+            Err(e) if is_deadlock(&e) => {
+                warn!(error = %e, "sweep: 40P01 on batch tx; retrying once");
+                tokio::time::sleep(crate::metadata::jitter()).await;
+                sweep_one_batch(&mut conn, batch, dry_run, chunk_backend).await?
             }
-            to_delete.push((store_path_hash, chunk_list));
-        }
-
-        // A closure-delete from a LATER item in the lock loop above may
-        // have removed an EARLIER candidate from sweep_unreachable.
-        // One batch probe.
-        let still_unreachable: std::collections::HashSet<Vec<u8>> = if to_delete.is_empty() {
-            std::collections::HashSet::new()
-        } else {
-            let candidate_hashes: Vec<Vec<u8>> =
-                to_delete.iter().map(|(h, _)| (*h).clone()).collect();
-            sqlx::query_scalar(
-                "SELECT path_hash FROM sweep_unreachable WHERE path_hash = ANY($1::bytea[])",
-            )
-            .bind(&candidate_hashes)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .collect()
+            r => r?,
         };
+        stats.paths_deleted += delta.paths_deleted;
+        stats.paths_resurrected += delta.paths_resurrected;
+        stats.chunks_deleted += delta.chunks_deleted;
+        stats.s3_keys_enqueued += delta.s3_keys_enqueued;
+        stats.bytes_freed += delta.bytes_freed;
 
-        for (store_path_hash, chunk_list) in to_delete {
-            if !still_unreachable.contains(store_path_hash) {
-                stats.paths_resurrected += 1;
-                continue;
-            }
-
-            if !delete_swept_path(&mut tx, store_path_hash).await? {
-                // narinfo already gone (concurrent sweep? shouldn't
-                // happen under FOR UPDATE). Skip chunk handling.
-                continue;
-            }
-            stats.paths_deleted += 1;
-
-            // Steps 3-5: chunk refcount + pending_s3_deletes.
-            // Only if chunked storage (chunk_list non-None).
-            if let Some(bytes) = chunk_list {
-                let dec = decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
-                stats.chunks_deleted += dec.chunks_zeroed;
-                stats.s3_keys_enqueued += dec.s3_keys_enqueued;
-                stats.bytes_freed += dec.bytes_freed;
-            }
-        }
-
-        // Commit or rollback the batch.
-        if dry_run {
-            // Rollback: all changes in this tx are discarded.
-            // Stats were accumulated from what WOULD have
-            // happened — operator sees the impact without
-            // committing.
-            tx.rollback().await?;
-        } else {
-            tx.commit().await?;
+        if !dry_run {
             // Per-batch, post-commit: every increment ↔ exactly one
             // committed tx. Survives SweepAbort (prior batches already
-            // emitted); never fires under dry_run (rolled back above —
+            // emitted); never fires under dry_run (rolled back —
             // a counter is a promise of monotonic fact, not a what-if).
             // Singular naming matches observability.md:138; `s3_key`
             // not `chunk` — chunks are marked deleted in PG, KEYS are
             // what get queued for S3 DeleteObject.
-            metrics::counter!("rio_store_gc_path_swept_total")
-                .increment(stats.paths_deleted - batch_start.paths_deleted);
+            metrics::counter!("rio_store_gc_path_swept_total").increment(delta.paths_deleted);
             metrics::counter!("rio_store_gc_s3_key_enqueued_total")
-                .increment(stats.s3_keys_enqueued - batch_start.s3_keys_enqueued);
+                .increment(delta.s3_keys_enqueued);
             metrics::counter!("rio_store_gc_path_resurrected_total")
-                .increment(stats.paths_resurrected - batch_start.paths_resurrected);
+                .increment(delta.paths_resurrected);
         }
     }
-    // On SweepAbort the per-batch set() above already left this at the
-    // correct remaining count; reaching here means the sweep completed.
-    metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
 
     info!(
         paths_deleted = stats.paths_deleted,
@@ -496,6 +434,189 @@ pub async fn sweep(
     );
 
     Ok(stats)
+}
+
+/// SQLSTATE 40P01 (deadlock_detected). Same check as
+/// `MetadataError::from(sqlx::Error)` but on the bare `sqlx::Error`
+/// (sweep's batch tx body returns that, not `MetadataError`).
+fn is_deadlock(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "40P01")
+}
+
+/// One sweep-batch transaction body. Extracted so [`sweep`] can
+/// retry-once on 40P01 (PG aborts the whole txn on deadlock).
+/// Returns per-batch deltas; caller accumulates.
+async fn sweep_one_batch(
+    conn: &mut sqlx::PgConnection,
+    batch: &[Vec<u8>],
+    dry_run: bool,
+    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<GcStats, sqlx::Error> {
+    let mut delta = GcStats::default();
+    let mut tx = conn.begin().await?;
+
+    // Within-batch two-pass: lock + re-check every batch item before
+    // any narinfo DELETE. The whole-sweep resurrection drain above
+    // settled sweep_unreachable for uploads that landed BEFORE the
+    // sweep; this remaining split + the still_unreachable filter
+    // below catch a PutPath landing DURING this delete loop where
+    // the resurrecting path is later in the same batch.
+    let mut to_delete: Vec<(&Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(batch.len());
+
+    for store_path_hash in batch {
+        // Step 1: SELECT chunk_list FOR UPDATE. NULL for
+        // inline storage. The FOR UPDATE locks the MANIFEST
+        // row — a concurrent PutPath for the SAME path blocks
+        // until we COMMIT (prevents re-upload mid-sweep).
+        //
+        // This does NOT guard chunk-level races: a DIFFERENT
+        // path sharing chunk X can PutPath after we've already
+        // set X to deleted=true+refcount=0 and enqueued it.
+        // That race is handled by drain.rs's blake3_hash
+        // re-check against chunks.(deleted AND refcount=0)
+        // before calling S3 DeleteObject — PutPath's upsert
+        // clears deleted=false, drain sees "not dead", skips.
+        //
+        // LEFT JOIN manifest_data: inline paths have no row
+        // there. `chunk_list` is NULL for inline; we skip
+        // the chunk decrement loop.
+        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+                SELECT md.chunk_list
+                  FROM manifests m
+                  LEFT JOIN manifest_data md USING (store_path_hash)
+                 WHERE m.store_path_hash = $1
+                   FOR UPDATE OF m
+                "#,
+        )
+        .bind(store_path_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+
+        // Step 1b: reference re-check. Mark's CTE took a
+        // point-in-time MVCC snapshot; a PutPath that committed
+        // AFTER that snapshot (during mark, or between mark and
+        // now) may have written references=[this_path] —
+        // including `'uploading'` placeholders, which carry
+        // references from insert. Re-check via GIN index before
+        // deleting. If found: skip, increment resurrected metric.
+        // I-192: this is the LOAD-BEARING mark-vs-PutPath guard
+        // (there is no advisory lock).
+        // r[impl store.gc.sweep-recheck]
+        //
+        // The subquery resolves hash→path because narinfo."references"
+        // is TEXT[] (store_path strings, not hashes). The GIN index
+        // (migration 008) makes `"references" @> ARRAY[$path]` an
+        // index scan. I-145: the previous `$path = ANY("references")`
+        // form is semantically equivalent but does NOT use GIN — PG's
+        // array-GIN opclass supports `@>`/`<@`/`&&`/`=` only, and the
+        // planner does not rewrite `scalar = ANY(arrcol)` into `@>`.
+        // At 100k+ narinfo rows that was a ~1.3s seqscan per swept
+        // path. EXPLAIN-verified: `@>` → Bitmap Index Scan on
+        // idx_narinfo_references_gin even with the InitPlan subquery.
+        //
+        // The NOT EXISTS anti-join against sweep_unreachable
+        // excludes referrers that are themselves in the unreachable
+        // set. Without this, mutual-reference cycles (A→B, B→A) and
+        // self-references (A→A) are never swept: the re-check sees
+        // an intra-set referrer and skips both paths forever. The
+        // temp table holds the WHOLE `unreachable` set (not just
+        // `batch`) — a cycle may span SWEEP_BATCH_SIZE boundaries.
+        // r[impl store.gc.sweep-cycle-reclaim]
+        //
+        // Also re-check `scheduler_live_pins`: a scheduler dispatch
+        // that landed between mark and now is a direct root on THIS
+        // path that mark's snapshot missed. The table keys on
+        // store_path_hash (first index column) so the EXISTS is a
+        // point probe.
+        if recheck_has_live_referrer(&mut tx, store_path_hash).await? {
+            tracing::debug!(
+                store_path_hash = %hex::encode(store_path_hash),
+                "GC sweep: path resurrected (new referrer after mark), skipping"
+            );
+            delta.paths_resurrected += 1;
+            // Transitive resurrection: this path is now live, so
+            // its own references (and theirs, recursively) must
+            // not be excluded by the anti-join above when later
+            // batch entries are checked.
+            closure_remove_from_unreachable(&mut tx, store_path_hash).await?;
+            continue;
+        }
+        to_delete.push((store_path_hash, chunk_list));
+    }
+
+    // A closure-delete from a LATER item in the lock loop above may
+    // have removed an EARLIER candidate from sweep_unreachable.
+    // One batch probe.
+    let still_unreachable: std::collections::HashSet<Vec<u8>> = if to_delete.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let candidate_hashes: Vec<Vec<u8>> = to_delete.iter().map(|(h, _)| (*h).clone()).collect();
+        sqlx::query_scalar(
+            "SELECT path_hash FROM sweep_unreachable WHERE path_hash = ANY($1::bytea[])",
+        )
+        .bind(&candidate_hashes)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect()
+    };
+
+    // SAVEPOINT: under dry_run we ROLLBACK TO this point, undoing the
+    // narinfo DELETEs + chunk decrements + pending_s3_deletes INSERTs
+    // but KEEPING the closure_remove temp-table mutations above (so
+    // batch N+1's still_unreachable probe sees Y's resurrection of Z).
+    // Without this, dry-run rolled back the closure_remove and
+    // re-counted Z in batch N+1 → over-reported paths_deleted.
+    // r[impl store.gc.dry-run+2]
+    sqlx::query("SAVEPOINT sweep_deletes")
+        .execute(&mut *tx)
+        .await?;
+
+    // Collect cross-path chunk hashes into ONE set so the batch tx
+    // issues ONE `UPDATE chunks ... ANY($1)` (btree-scan-order locking
+    // → r[store.chunk.lock-order] satisfied across paths). Per-path
+    // calls issued N statements per tx; lock order within each path
+    // was scan-order, but cross-path it was path-iteration-order →
+    // 40P01 against a concurrent single-statement chunk writer.
+    let mut all_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for (store_path_hash, chunk_list) in to_delete {
+        if !still_unreachable.contains(store_path_hash) {
+            delta.paths_resurrected += 1;
+            continue;
+        }
+
+        if !delete_swept_path(&mut tx, store_path_hash).await? {
+            // narinfo already gone (concurrent sweep? shouldn't
+            // happen under FOR UPDATE). Skip chunk handling.
+            continue;
+        }
+        delta.paths_deleted += 1;
+
+        if let Some(bytes) = chunk_list {
+            all_hashes.extend(parse_unique_chunk_hashes(&bytes));
+        }
+    }
+
+    // r[impl store.chunk.lock-order]
+    let unique_hashes: Vec<Vec<u8>> = all_hashes.into_iter().map(|h| h.to_vec()).collect();
+    let dec = decrement_hashes_and_enqueue(&mut tx, &unique_hashes, chunk_backend).await?;
+    delta.chunks_deleted += dec.chunks_zeroed;
+    delta.s3_keys_enqueued += dec.s3_keys_enqueued;
+    delta.bytes_freed += dec.bytes_freed;
+
+    if dry_run {
+        // Rollback DELETES only; closure_remove temp-table writes
+        // (above the savepoint) survive the outer commit.
+        sqlx::query("ROLLBACK TO SAVEPOINT sweep_deletes")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(delta)
 }
 
 /// Sweep standalone chunks: `refcount=0` rows whose grace window
@@ -551,44 +672,69 @@ pub async fn sweep_orphan_chunks(
     // Snapshot semantics: rows returned here may be stale by the
     // time we reach the inner loop (PutPath bumped refcount). The
     // inner UPDATE re-checks.
-    let candidates: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        r#"
-        SELECT blake3_hash, size FROM chunks
-         WHERE refcount = 0 AND deleted = FALSE
-           AND created_at < now() - make_interval(secs => $1)
-        "#,
-    )
-    .bind(grace_secs)
-    .fetch_all(pool)
-    .await?;
-
-    if candidates.is_empty() {
-        return Ok((0, 0));
-    }
-
+    //
+    // LIMIT + loop-until-short: bounds memory after a mass-crash
+    // backlog (the unbounded fetch_all would otherwise materialize
+    // every refcount=0 row at once). ORDER BY blake3_hash so the
+    // re-SELECT advances past committed batches. The `size` column
+    // is NOT selected — `bytes_freed` comes from the inner UPDATE's
+    // RETURNING (the only authoritative source; outer rows may be
+    // stale).
     let mut chunks_deleted = 0u64;
     let mut bytes_freed = 0u64;
-
-    // Batched transactions. Same SWEEP_BATCH_SIZE rationale as the
-    // main sweep: small enough to roll back cheaply, large enough
-    // to amortize. A pathological crash mid-upload of a many-chunk
-    // NAR produces a large candidate set; batching keeps each tx
-    // bounded.
-    for batch in candidates.chunks(SWEEP_BATCH_SIZE) {
-        // r[impl store.chunk.lock-order]
-        // Sort before binding to ANY($1): the outer SELECT returns rows
-        // in PG scan order (not sorted); a concurrent rollback path
-        // (delete_manifest_chunked_uploading) sorts ITS input. If we
-        // don't sort here, sweep locks in SELECT order while rollback
-        // locks in sort order — overlapping sets → circular wait →
-        // 40P01. Sorting + single retry via the shared helper.
-        let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
-        let (zd, bf) = crate::metadata::with_sorted_retry(hashes, |sorted| async move {
-            sweep_orphan_batch(pool, &sorted, chunk_backend).await
-        })
+    let outer_limit = (SWEEP_BATCH_SIZE * 10) as i64;
+    loop {
+        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT blake3_hash FROM chunks
+             WHERE refcount = 0 AND deleted = FALSE
+               AND created_at < now() - make_interval(secs => $1)
+             ORDER BY blake3_hash
+             LIMIT $2
+            "#,
+        )
+        .bind(grace_secs)
+        .bind(outer_limit)
+        .fetch_all(pool)
         .await?;
-        chunks_deleted += zd;
-        bytes_freed += bf;
+
+        let n = candidates.len();
+        if n == 0 {
+            break;
+        }
+
+        // Batched transactions. Same SWEEP_BATCH_SIZE rationale as the
+        // main sweep: small enough to roll back cheaply, large enough
+        // to amortize. A pathological crash mid-upload of a many-chunk
+        // NAR produces a large candidate set; batching keeps each tx
+        // bounded.
+        for batch in candidates.chunks(SWEEP_BATCH_SIZE) {
+            // r[impl store.chunk.lock-order]
+            // Sort before binding to ANY($1): the outer SELECT returns
+            // rows in PG scan order (not sorted); a concurrent rollback
+            // path (delete_manifest_chunked_uploading) sorts ITS input.
+            // If we don't sort here, sweep locks in SELECT order while
+            // rollback locks in sort order — overlapping sets →
+            // circular wait → 40P01. Sorting + single retry via the
+            // shared helper.
+            let hashes: Vec<Vec<u8>> = batch.to_vec();
+            let (zd, bf) = crate::metadata::with_sorted_retry(hashes, |sorted| async move {
+                sweep_orphan_batch(pool, &sorted, chunk_backend).await
+            })
+            .await?;
+            chunks_deleted += zd;
+            bytes_freed += bf;
+            // Per-batch, post-commit (sweep_orphan_batch commits
+            // internally). A `?` mid-loop must not drop the count for
+            // already-committed batches; emitting here makes each
+            // increment ↔ exactly one committed tx (same discipline as
+            // the main sweep's per-batch counters).
+            metrics::counter!("rio_store_gc_chunk_orphan_swept_total").increment(zd);
+        }
+
+        if (n as i64) < outer_limit {
+            break;
+        }
     }
 
     if chunks_deleted > 0 {
@@ -596,10 +742,6 @@ pub async fn sweep_orphan_chunks(
             chunks_deleted,
             bytes_freed, grace_secs, "orphan chunk sweep: reaped standalone chunks past grace TTL"
         );
-        // Matches the naming convention of rio_store_gc_path_swept_total
-        // (observability.md). Counter (not gauge) — monotonic "chunks
-        // ever reaped by orphan sweep".
-        metrics::counter!("rio_store_gc_chunk_orphan_swept_total").increment(chunks_deleted);
     }
 
     Ok((chunks_deleted, bytes_freed))
@@ -925,7 +1067,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(inserted);
+        assert!(inserted.is_some());
 
         // Sanity: P is status='uploading', nar_size=0 — a real
         // placeholder, not a complete path.
@@ -1434,11 +1576,231 @@ mod tests {
     /// Sweep → the outer SELECT would have found it (had we run
     /// it first), but the inner UPDATE's `WHERE refcount=0` must
     /// skip it.
+    /// bug_176: `rio_store_gc_sweep_paths_remaining` MUST be 0 after
+    /// any exit. Seed 3 paths, cancel the shutdown token BEFORE sweep
+    /// so the first batch-boundary check fires. Before the scopeguard,
+    /// the gauge stayed at 3.0 (set at the per-batch boundary, never
+    /// reset on Err(Shutdown)).
+    #[tokio::test]
+    async fn sweep_paths_remaining_reset_on_abort() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h1 = StoreSeed::path("rem-a").seed(&db.pool).await;
+        let h2 = StoreSeed::path("rem-b").seed(&db.pool).await;
+        let h3 = StoreSeed::path("rem-c").seed(&db.pool).await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let shutdown = rio_common::signal::Token::new();
+        shutdown.cancel();
+        let r = sweep(&db.pool, None, vec![h1, h2, h3], false, &shutdown).await;
+        assert!(matches!(r, Err(SweepAbort::Shutdown)));
+
+        assert_eq!(
+            rec.gauge_value("rio_store_gc_sweep_paths_remaining{}"),
+            Some(0.0),
+            "gauge MUST be reset on abort; saw {:?}",
+            rec.gauge_names()
+        );
+    }
+
+    /// bug_111 + bug_331: `select_sweep_order` returns Y before its
+    /// dep Z; dry-run on Y,Z (Y resurrected by live P→Y) reports
+    /// `paths_deleted=0` (Z transitively resurrected via the
+    /// committed closure_remove).
+    // r[verify store.gc.sweep-referrer-order]
+    // r[verify store.gc.dry-run+2]
+    #[tokio::test]
+    async fn sweep_referrer_first_and_dry_run_closure_survives() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Z leaf; Y→Z; live P→Y. Filler W to span SWEEP_BATCH_SIZE=2.
+        let z = test_store_path("ord-z");
+        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
+        let y = test_store_path("ord-y");
+        let y_hash = StoreSeed::raw_path(&y)
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+        let w_hash = StoreSeed::path("ord-filler").seed(&db.pool).await;
+        StoreSeed::path("ord-p")
+            .with_refs(&[&y])
+            .seed(&db.pool)
+            .await;
+
+        // Ordering: Y before Z (referrer-first). Probe via direct call.
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, &[y_hash.clone(), z_hash.clone()])
+            .await
+            .unwrap();
+        let order = select_sweep_order(&mut conn).await.unwrap();
+        let iy = order.iter().position(|h| *h == y_hash).unwrap();
+        let iz = order.iter().position(|h| *h == z_hash).unwrap();
+        assert!(iy < iz, "Y (referrer) must precede Z (dep): {iy} < {iz}");
+        drop(conn);
+
+        // Dry-run with Z, W, Y: Y resurrects (P→Y), closure-removes Z;
+        // savepoint commits the closure_remove → Z NOT counted in
+        // batch N+1. Filler W is genuinely deleted. Before the fix,
+        // dry-run rolled back the closure_remove and reported Z
+        // deleted too.
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![z_hash.clone(), w_hash, y_hash.clone()],
+            true,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_resurrected, 2, "Y by P; Z by Y");
+        assert_eq!(
+            stats.paths_deleted, 1,
+            "dry-run: only filler W deleted (Z transitively resurrected)"
+        );
+
+        // Nothing actually deleted (dry-run).
+        let z_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM narinfo WHERE store_path_hash = $1)")
+                .bind(&z_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(z_exists);
+    }
+
+    /// bug_329: sweep batch with cross-path chunk hashes locks via ONE
+    /// `ANY($1)` (btree-scan order) → no 40P01 against a per-row
+    /// contender obeying r\[store.chunk.lock-order\].
+    // r[verify store.chunk.lock-order]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sweep_batch_cross_path_single_decrement() {
+        use crate::manifest::{Manifest, ManifestEntry};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::timeout;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Chunk 0xFF (path A) and 0x01 (path B) at refcount=2.
+        let chunk_hi = [0xFFu8; 32];
+        let chunk_lo = [0x01u8; 32];
+        for h in [&chunk_hi, &chunk_lo] {
+            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 2, 100)")
+                .bind(&h[..])
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let mk = |h| {
+            Manifest {
+                entries: vec![ManifestEntry { hash: h, size: 100 }],
+            }
+            .serialize()
+        };
+        let a_hash = StoreSeed::path("xpath-a").seed(&db.pool).await;
+        let b_hash = StoreSeed::path("xpath-b").seed(&db.pool).await;
+        for (sph, cl) in [(&a_hash, mk(chunk_hi)), (&b_hash, mk(chunk_lo))] {
+            sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+                .bind(sph)
+                .bind(cl)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Per-row contender on {0x01,0xFF} (single tx, locks in array
+        // order via with_sorted_retry). Sweep iterates [A=0xFF, B=0x01]
+        // — cross-path order is high→low; with the per-path loop
+        // restored, 40P01 → attempts==3.
+        async fn contend(pool: &PgPool, sorted: &[Vec<u8>]) -> crate::metadata::Result<()> {
+            let mut tx = pool.begin().await?;
+            for h in sorted {
+                sqlx::query("UPDATE chunks SET size = size WHERE blake3_hash = $1")
+                    .bind(h)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let att = Arc::clone(&attempts);
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+        let unreachable = vec![a_hash, b_hash];
+
+        let task_sweep =
+            tokio::spawn(
+                async move { sweep(&pool_a, None, unreachable, false, &no_shutdown()).await },
+            );
+        let task_contend = tokio::spawn(async move {
+            crate::metadata::with_sorted_retry(
+                vec![chunk_lo.to_vec(), chunk_hi.to_vec()],
+                move |sorted| {
+                    att.fetch_add(1, Ordering::Relaxed);
+                    let pool_b = pool_b.clone();
+                    async move { contend(&pool_b, &sorted).await }
+                },
+            )
+            .await
+        });
+
+        let (rs, rc) = timeout(Duration::from_secs(10), async {
+            tokio::try_join!(task_sweep, task_contend).unwrap()
+        })
+        .await
+        .expect("sweep+contender must complete within 10s");
+        let stats = rs.expect("sweep ok");
+        rc.expect("contender ok");
+        assert_eq!(stats.paths_deleted, 2);
+        // Single ANY($1) per batch tx → btree-scan-order → no 40P01.
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "cross-path single decrement → no 40P01 → contender ran once"
+        );
+    }
+
+    /// bug_352: outer SELECT is paginated; loop-until-short reaps a
+    /// backlog larger than the per-iteration LIMIT.
+    #[tokio::test]
+    async fn sweep_orphan_chunks_paginates() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // SWEEP_BATCH_SIZE*10 + 5 = 25 (cfg(test) batch=2).
+        let n = SWEEP_BATCH_SIZE * 10 + 5;
+        for i in 0..n {
+            sqlx::query(
+                "INSERT INTO chunks (blake3_hash, refcount, size, deleted, created_at) \
+                 VALUES ($1, 0, 100, FALSE, NOW() - INTERVAL '1 hour')",
+            )
+            .bind(vec![i as u8; 32])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let (deleted, _) = sweep_orphan_chunks(&db.pool, None, 100).await.unwrap();
+        assert_eq!(deleted, n as u64, "all reaped across pagination boundary");
+
+        // Structural lock on the LIMIT (memory bound is not directly
+        // testable in a unit; this catches a regression that drops it).
+        let body = include_str!("sweep.rs");
+        assert!(
+            body.contains("ORDER BY blake3_hash\n             LIMIT $2"),
+            "sweep_orphan_chunks outer SELECT must be paginated"
+        );
+    }
+
+    // r[verify store.chunk.grace-ttl]
+    /// Mutation-tested: removing `AND refcount = 0` from
+    /// sweep_orphan_batch's inner UPDATE → fails here.
     #[tokio::test]
     async fn orphan_chunk_resurrected_by_putpath_survives() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        let grace = 100i64;
         // Old enough to be a candidate.
         let hash = seed_orphan_chunk(&db.pool, 0xC1, 333, 200).await;
 
@@ -1455,15 +1817,22 @@ mod tests {
         .await
         .unwrap();
 
-        // Sweep. The inner UPDATE's `WHERE refcount = 0` must reject.
-        let (deleted, _) = sweep_orphan_chunks(&db.pool, None, grace).await.unwrap();
+        // Call sweep_orphan_batch directly (bypasses the outer
+        // `WHERE refcount=0` SELECT, which would never find this hash
+        // and made the previous test vacuous — removing the inner
+        // UPDATE's `AND refcount=0` passed). Same pattern as
+        // sweep_vs_rollback_no_deadlock.
+        let (zd, _) = sweep_orphan_batch(&db.pool, &[hash.to_vec()], None)
+            .await
+            .unwrap();
         assert_eq!(
-            deleted, 0,
+            zd, 0,
             "resurrected chunk (refcount now 1) must NOT be reaped — \
              inner UPDATE's WHERE refcount=0 re-check"
         );
 
-        // Chunk is alive: refcount=1, deleted=false.
+        // Vacuity sentinel: deleted column still false → UPDATE was
+        // reached and REJECTED, not skipped.
         let (refcount, deleted): (i32, bool) =
             sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
                 .bind(hash.as_slice())
@@ -1471,7 +1840,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(refcount, 1);
-        assert!(!deleted);
+        assert!(!deleted, "inner UPDATE rejected (not skipped)");
     }
 
     /// Regression: concurrent orphan-chunk sweep vs another chunk

@@ -41,7 +41,7 @@ use kube::{Api, Client};
 use tracing::{debug, info, warn};
 
 use super::POOL_LABEL;
-use crate::reconcilers::{admin_call, AdminClient};
+use crate::reconcilers::{AdminClient, admin_call};
 
 /// Run the watcher. Returns on `shutdown.cancelled()` or if the
 /// watch stream ends (never — `default_backoff()` retries

@@ -488,13 +488,14 @@ mod tests {
     /// Seed an 'uploading' placeholder for the given store-path hash.
     /// Path string is synthesized from the first hash byte (distinct
     /// enough for unit tests; the narinfo placeholder just needs a
-    /// valid-shaped path).
-    async fn seed_placeholder(pool: &PgPool, store_path_hash: &[u8]) {
+    /// valid-shaped path). Returns the M_052 claim_id.
+    async fn seed_placeholder(pool: &PgPool, store_path_hash: &[u8]) -> uuid::Uuid {
         let b = store_path_hash[0];
         let path = format!("/nix/store/{}-p208-test", format!("{b:02x}").repeat(16));
         crate::metadata::insert_manifest_uploading(pool, store_path_hash, &path, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .expect("fresh path → placeholder inserted")
     }
 
     /// Sequential upserts simulate two PutPaths: first inserts {A,B},
@@ -751,7 +752,7 @@ mod tests {
 
         // --- Step 1: PutPath A's upsert, then SIGKILL ---
         let sph_a = vec![0xAAu8; 32];
-        seed_placeholder(&db.pool, &sph_a).await;
+        let claim_a = seed_placeholder(&db.pool, &sph_a).await;
         let (need_a, _) =
             upgrade_manifest_to_chunked(&db.pool, &sph_a, &chunk_list, one_chunk, &[1024])
                 .await
@@ -801,9 +802,14 @@ mod tests {
         // reap_one decrements rc 3→2. uploaded_at stays set (B's
         // upload is real). A future PutPath still dedups correctly.
         let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
-        let reaped = crate::gc::orphan::reap_one(&db.pool, &sph_a, None, no_backend)
-            .await
-            .unwrap();
+        let reaped = crate::gc::orphan::reap_one(
+            &db.pool,
+            &sph_a,
+            crate::gc::orphan::ReapBy::Claim(claim_a),
+            no_backend,
+        )
+        .await
+        .unwrap();
         assert!(reaped, "A's stale 'uploading' placeholder reaped");
         let (rc, up): (i32, bool) = sqlx::query_as(
             "SELECT refcount, (uploaded_at IS NOT NULL) FROM chunks WHERE blake3_hash = $1",
@@ -1103,9 +1109,14 @@ mod tests {
 
         // --- Reaper: reclaims A's stale placeholder (rc 1→0). ---
         let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
-        let reaped = crate::gc::orphan::reap_one(&db.pool, &sph, None, no_backend)
-            .await
-            .unwrap();
+        let reaped = crate::gc::orphan::reap_one(
+            &db.pool,
+            &sph,
+            crate::gc::orphan::ReapBy::Stale { secs: 0 },
+            no_backend,
+        )
+        .await
+        .unwrap();
         assert!(reaped, "reaper reclaims A's placeholder");
 
         // --- B: re-uploads same path, same chunk hash, completes. ---
@@ -1202,9 +1213,14 @@ mod tests {
         // --- Reaper: reclaims A. ---
         let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
         assert!(
-            crate::gc::orphan::reap_one(&db.pool, &sph, None, no_backend)
-                .await
-                .unwrap()
+            crate::gc::orphan::reap_one(
+                &db.pool,
+                &sph,
+                crate::gc::orphan::ReapBy::Stale { secs: 0 },
+                no_backend
+            )
+            .await
+            .unwrap()
         );
 
         // --- B: fresh placeholder + upgrade, SAME chunks. STILL

@@ -852,7 +852,7 @@ mod tests {
         );
     }
 
-    // r[verify store.api.batch-manifest]
+    // r[verify store.api.batch-manifest+2]
     /// `get_manifest` racing GC sweep's CASCADE delete: every result
     /// is `Ok(Some(..))` or `Ok(None)`; never `InvariantViolation`.
     /// Previously: two separate `.fetch_optional(pool)` calls under
@@ -975,7 +975,7 @@ mod tests {
         }
     }
 
-    // r[verify store.api.hash-part]
+    // r[verify store.api.hash-part+2]
     /// Migration 049: `idx_narinfo_store_path_pattern` exists with
     /// opclass `text_pattern_ops`. Under non-C collation (production
     /// default `en_US.UTF-8`), the default-opclass `idx_narinfo_

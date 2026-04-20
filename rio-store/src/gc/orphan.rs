@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::backend::ChunkBackend;
 
@@ -53,6 +54,29 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 const SCAN_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Max stale-placeholder rows fetched per outer SELECT in [`scan_once`].
+/// The loop re-SELECTs until short. Bounds memory after a mass-crash
+/// backlog (drain.rs uses the same LIMIT-then-loop pattern).
+const SCAN_BATCH_SIZE: i64 = 1000;
+
+/// Selector for [`reap_one`]. Replaces the old `Option<i64>` threshold —
+/// `None` ("this is mine, no stale check") was not an ownership check:
+/// `manifests` is keyed by `store_path_hash` alone, so a late-firing
+/// cleanup matched any fresh `'uploading'` row at the same hash.
+/// Ownership is now unrepresentable-as-absent; every caller supplies
+/// either a staleness gate or its claim token (M_052).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReapBy {
+    /// Reap iff `updated_at < now() - secs`. Used by [`scan_once`] and
+    /// the hot-path stale-reclaim. Never matches a heartbeating uploader.
+    Stale { secs: i64 },
+    /// Reap iff `claim_id = id`. Used by owner-side cleanup
+    /// (`abort_placeholder`, the PutPath drop-guard, `put_chunked`'s
+    /// complete-failure rollback). Never matches another uploader's
+    /// fresh placeholder.
+    Claim(Uuid),
+}
+
 /// Run one scan iteration. Returns count of orphans reaped.
 ///
 /// For each stale uploading manifest:
@@ -66,34 +90,74 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(200);
 pub async fn scan_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
-) -> Result<u64, sqlx::Error> {
+) -> Result<(u64, u64), sqlx::Error> {
     // Find stale uploading manifests. SELECT hash only — chunk_list
     // is re-read INSIDE the tx (see TOCTOU handling below). I-148:
     // covered by the partial index from migration 031 (predicate
     // matches `WHERE status = 'uploading'` exactly); without it this
     // was a ~4s seq-scan over ~1.5M rows per replica per interval.
+    //
+    // LIMIT + loop-until-short: bounds memory after a mass-crash
+    // backlog (the unbounded fetch_all would otherwise materialize
+    // every stale row at once).
     let threshold_secs = STALE_THRESHOLD.as_secs() as i64;
-    let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
-        r#"
-        SELECT m.store_path_hash
-          FROM manifests m
-         WHERE m.status = 'uploading'
-           AND m.updated_at < now() - make_interval(secs => $1)
-        "#,
-    )
-    .bind(threshold_secs)
-    .fetch_all(pool)
-    .await?;
-
-    if stale.is_empty() {
-        debug!("orphan scan: no stale uploading manifests");
-        return Ok(0);
-    }
-
     let mut reaped = 0u64;
-    for (store_path_hash,) in stale {
-        if reap_one(pool, &store_path_hash, Some(threshold_secs), chunk_backend).await? {
-            reaped += 1;
+    let mut failed = 0u64;
+    loop {
+        let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
+            r#"
+            SELECT m.store_path_hash
+              FROM manifests m
+             WHERE m.status = 'uploading'
+               AND m.updated_at < now() - make_interval(secs => $1)
+             LIMIT $2
+            "#,
+        )
+        .bind(threshold_secs)
+        .bind(SCAN_BATCH_SIZE)
+        .fetch_all(pool)
+        .await?;
+
+        let n = stale.len();
+        if n == 0 {
+            if reaped == 0 && failed == 0 {
+                debug!("orphan scan: no stale uploading manifests");
+            }
+            break;
+        }
+
+        for (store_path_hash,) in stale {
+            // Per-row isolation: a poison row (e.g. M023's
+            // `chunks_refcount_nonneg` CHECK from a pre-existing
+            // accounting bug) must not wedge the scanner. Log + count;
+            // next 15min tick re-finds it (and the metric makes it
+            // operator-visible).
+            match reap_one(
+                pool,
+                &store_path_hash,
+                ReapBy::Stale {
+                    secs: threshold_secs,
+                },
+                chunk_backend,
+            )
+            .await
+            {
+                Ok(true) => reaped += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        store_path_hash = %hex::encode(&store_path_hash),
+                        error = %e,
+                        "orphan scan: reap_one failed (will retry next interval)",
+                    );
+                    metrics::counter!("rio_store_gc_orphan_reap_failed_total").increment(1);
+                    failed += 1;
+                }
+            }
+        }
+
+        if (n as i64) < SCAN_BATCH_SIZE {
+            break;
         }
     }
 
@@ -103,18 +167,19 @@ pub async fn scan_once(
             "orphan scan: reaped stale uploading manifests"
         );
     }
-    Ok(reaped)
+    Ok((reaped, failed))
 }
 
 /// Reap a single 'uploading' placeholder: chunk-aware DELETE.
 ///
-/// `threshold_secs`: `Some(t)` re-checks `updated_at < now() - t`
-/// inside the tx (TOCTOU guard against reaping a fresh re-upload).
-/// `None` skips the stale check (callers that KNOW the placeholder
-/// is theirs — e.g. cleanup-on-failure).
+/// `by`: [`ReapBy::Stale`] re-checks `updated_at < now() - secs` inside
+/// the tx (TOCTOU guard against reaping a fresh re-upload).
+/// [`ReapBy::Claim`] re-checks `claim_id = id` (owner-side cleanup —
+/// see `r[store.put.placeholder-claim]`).
 ///
 /// Returns `true` if reaped, `false` if no matching placeholder
-/// (already gone, completed, or fresher than threshold).
+/// (already gone, completed, fresher than threshold, or different
+/// claim_id).
 ///
 /// # Why this exists (I-040)
 ///
@@ -137,10 +202,11 @@ pub async fn scan_once(
 /// `decrement_and_enqueue` discipline as [`scan_once`]'s loop body,
 /// so any caller that needs to reap an uploading placeholder gets
 /// chunk-aware semantics for free.
+// r[impl store.put.placeholder-claim]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
-    threshold_secs: Option<i64>,
+    by: ReapBy,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -153,13 +219,15 @@ pub(crate) async fn reap_one(
     // UPDATE locking the manifest row) guarantees we decrement the
     // chunk_list that we DELETE.
     //
-    // (2) Reap-then-reupload (when threshold_secs is Some): store-0
-    // + store-1 both outer-SELECT the same stale hash; store-0
-    // reaps; worker re-uploads (NEW row, same hash, status=
-    // 'uploading', updated_at=now()); store-1's FOR UPDATE would
-    // match the NEW row (status is 'uploading' ✓) and reap a FRESH
-    // upload. Re-checking the stale threshold inside the tx catches
-    // this — fresh re-uploads have updated_at=now() → don't match.
+    // (2) Reap-then-reupload (ReapBy::Stale): store-0 + store-1 both
+    // outer-SELECT the same stale hash; store-0 reaps; worker
+    // re-uploads (NEW row, same hash, status='uploading',
+    // updated_at=now()); store-1's FOR UPDATE would match the NEW row
+    // (status is 'uploading' ✓) and reap a FRESH upload. Re-checking
+    // the stale threshold inside the tx catches this — fresh
+    // re-uploads have updated_at=now() → don't match. ReapBy::Claim
+    // covers the analogous owner-side race (A's drop-guard fires
+    // after B's fresh insert) via claim_id mismatch.
     //
     // The FOR UPDATE blocks any concurrent re-upload until this tx
     // commits — same pattern as sweep.rs.
@@ -167,8 +235,8 @@ pub(crate) async fn reap_one(
     // Two query strings (not a runtime-built one) so sqlx can prepare
     // both at compile time. The EXISTS-guard DELETE below mirrors the
     // same shape.
-    let chunk_list: Option<Vec<u8>> = match threshold_secs {
-        Some(t) => sqlx::query_scalar(
+    let chunk_list: Option<Vec<u8>> = match by {
+        ReapBy::Stale { secs } => sqlx::query_scalar(
             r#"
             SELECT md.chunk_list
               FROM manifests m
@@ -180,21 +248,23 @@ pub(crate) async fn reap_one(
             "#,
         )
         .bind(store_path_hash)
-        .bind(t)
+        .bind(secs)
         .fetch_optional(&mut *tx)
         .await?
         .flatten(),
-        None => sqlx::query_scalar(
+        ReapBy::Claim(id) => sqlx::query_scalar(
             r#"
             SELECT md.chunk_list
               FROM manifests m
               LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
                AND m.status = 'uploading'
+               AND m.claim_id = $2
                FOR UPDATE OF m
             "#,
         )
         .bind(store_path_hash)
+        .bind(id)
         .fetch_optional(&mut *tx)
         .await?
         .flatten(),
@@ -202,19 +272,19 @@ pub(crate) async fn reap_one(
 
     // DELETE narinfo → CASCADE to manifests/manifest_data.
     //
-    // Status (+ stale, when thresholded) guards in EXISTS: atomic
-    // re-check at DELETE time. rows_affected()==0 catches: (a)
-    // another replica already reaped (gone), (b) upload completed
-    // since FOR UPDATE (status='complete' → EXISTS false), (c)
-    // reap-then-reupload: a FRESH 'uploading' row exists
-    // (updated_at recent → stale clause false → EXISTS false).
+    // Status (+ stale or claim) guards in EXISTS: atomic re-check at
+    // DELETE time. rows_affected()==0 catches: (a) another replica
+    // already reaped (gone), (b) upload completed since FOR UPDATE
+    // (status='complete' → EXISTS false), (c) reap-then-reupload: a
+    // FRESH 'uploading' row exists (updated_at recent / claim_id
+    // different → EXISTS false).
     //
-    // The FOR UPDATE above already re-checked status (+ stale) and
-    // locked the row — the EXISTS guard is defense-in-depth for the
-    // case where FOR UPDATE returned 0 rows (chunk_list=None) but
+    // The FOR UPDATE above already re-checked status (+ stale/claim)
+    // and locked the row — the EXISTS guard is defense-in-depth for
+    // the case where FOR UPDATE returned 0 rows (chunk_list=None) but
     // the DELETE would otherwise match a fresh row.
-    let deleted = match threshold_secs {
-        Some(t) => {
+    let deleted = match by {
+        ReapBy::Stale { secs } => {
             sqlx::query(
                 r#"
             DELETE FROM narinfo n
@@ -228,11 +298,11 @@ pub(crate) async fn reap_one(
             "#,
             )
             .bind(store_path_hash)
-            .bind(t)
+            .bind(secs)
             .execute(&mut *tx)
             .await?
         }
-        None => {
+        ReapBy::Claim(id) => {
             sqlx::query(
                 r#"
             DELETE FROM narinfo n
@@ -241,10 +311,12 @@ pub(crate) async fn reap_one(
                    SELECT 1 FROM manifests m
                     WHERE m.store_path_hash = $1
                       AND m.status = 'uploading'
+                      AND m.claim_id = $2
                )
             "#,
             )
             .bind(store_path_hash)
+            .bind(id)
             .execute(&mut *tx)
             .await?
         }
@@ -301,11 +373,13 @@ mod tests {
     /// +1, manifest_data written), backdate. Simulates: prior
     /// `cas::put_chunked` crashed AFTER `upgrade_manifest_to_chunked`.
     ///
-    /// Returns the chunk hash so the caller can check refcount.
-    async fn seed_stale_chunked(pool: &PgPool, hash: &[u8], path: &str) -> [u8; 32] {
-        crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
+    /// Returns (chunk_hash, claim_id) so callers can check refcount
+    /// and exercise `ReapBy::Claim`.
+    async fn seed_stale_chunked(pool: &PgPool, hash: &[u8], path: &str) -> ([u8; 32], Uuid) {
+        let claim = crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .expect("fresh path → placeholder inserted");
         // One-chunk manifest. The chunk_list bytes must deserialize
         // (decrement_and_enqueue calls Manifest::deserialize), so
         // build it via the real serializer.
@@ -334,7 +408,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        chunk_hash
+        (chunk_hash, claim)
     }
 
     // r[verify store.substitute.stale-reclaim]
@@ -349,7 +423,7 @@ mod tests {
 
         let hash = vec![0x40u8; 32];
         let path = rio_test_support::fixtures::test_store_path("i040-reap-chunked");
-        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+        let (chunk_hash, claim) = seed_stale_chunked(&db.pool, &hash, &path).await;
 
         // Verify setup: refcount=1, manifest_data exists.
         let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
@@ -359,8 +433,10 @@ mod tests {
             .unwrap();
         assert_eq!(rc, 1, "setup: chunk at refcount=1");
 
-        // reap_one (unconditional — None threshold).
-        let reaped = reap_one(&db.pool, &hash, None, None).await.unwrap();
+        // reap_one (owner-side — by claim).
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim), None)
+            .await
+            .unwrap();
         assert!(reaped, "chunked placeholder reaped");
 
         // Refcount decremented to 0. Before I-040 fix, the inline
@@ -391,10 +467,11 @@ mod tests {
 
         let hash = vec![0x41u8; 32];
         let path = rio_test_support::fixtures::test_store_path("i040-scan-chunked");
-        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+        let (chunk_hash, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
 
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, failed) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 1);
+        assert_eq!(failed, 0);
 
         let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
             .bind(chunk_hash.as_slice())
@@ -413,7 +490,7 @@ mod tests {
 
         let hash = vec![0x42u8; 32];
         let path = rio_test_support::fixtures::test_store_path("i040-fresh-chunked");
-        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+        let (chunk_hash, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
         // Re-freshen: undo the backdate from the seed helper.
         sqlx::query(
             "UPDATE manifests SET updated_at = now() + interval '10 seconds' \
@@ -425,7 +502,9 @@ mod tests {
         .unwrap();
 
         // 5min threshold → fresh placeholder NOT reaped.
-        let reaped = reap_one(&db.pool, &hash, Some(300), None).await.unwrap();
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Stale { secs: 300 }, None)
+            .await
+            .unwrap();
         assert!(!reaped, "fresh placeholder skipped under threshold");
 
         // Refcount UNCHANGED (still 1).
@@ -435,6 +514,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 1, "fresh chunked placeholder's refcount untouched");
+    }
+
+    // r[verify store.put.placeholder-claim]
+    /// bug_235: `ReapBy::Claim(a)` MUST NOT match a fresh placeholder
+    /// inserted with claim_b at the same hash. Before M_052 the
+    /// equivalent (`reap_one(threshold=None)`) filtered
+    /// `status='uploading'` only — A's late drop-guard reaped B's
+    /// narinfo + chunk refcounts mid-upload.
+    #[tokio::test]
+    async fn reap_one_claim_mismatch_is_noop() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x43u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("claim-mismatch");
+
+        // A inserts + is reaped by the orphan scanner (its row is GONE).
+        let (_, claim_a) = seed_stale_chunked(&db.pool, &hash, &path).await;
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 1, "scanner reaped A's stale placeholder");
+
+        // B inserts a FRESH placeholder at the same hash.
+        let (chunk_hash, claim_b) = seed_stale_chunked(&db.pool, &hash, &path).await;
+        assert_ne!(claim_a, claim_b);
+
+        // A's late drop-guard fires with claim_a → MUST NOT match B.
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_a), None)
+            .await
+            .unwrap();
+        assert!(!reaped, "claim_a mismatch → no-op (B's row protected)");
+
+        // B's narinfo + manifests intact; B's chunk refcount unchanged.
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "B's manifests row survives");
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "B's chunk refcount untouched");
+
+        // B's own claim DOES match.
+        let reaped = reap_one(&db.pool, &hash, ReapBy::Claim(claim_b), None)
+            .await
+            .unwrap();
+        assert!(reaped, "claim_b matches → B's placeholder reaped");
+    }
+
+    /// bug_360: a poison row (CHECK violation in decrement_and_enqueue)
+    /// must not abort the whole scan — `scan_once` continues past it.
+    /// Before the fix, `?` propagated the first per-row error and
+    /// every subsequent stale placeholder leaked forever.
+    #[tokio::test]
+    async fn scan_once_continues_past_poison_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A: chunked placeholder whose chunk is pre-decremented to 0 →
+        // reap_one's decrement_and_enqueue trips chunks_refcount_nonneg.
+        let hash_a = vec![0x44u8; 32];
+        let path_a = rio_test_support::fixtures::test_store_path("poison-a");
+        let (chunk_a, _) = seed_stale_chunked(&db.pool, &hash_a, &path_a).await;
+        sqlx::query("UPDATE chunks SET refcount = 0 WHERE blake3_hash = $1")
+            .bind(chunk_a.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // B: well-formed stale chunked placeholder.
+        let hash_b = vec![0x45u8; 32];
+        let path_b = rio_test_support::fixtures::test_store_path("poison-b");
+        seed_stale_chunked(&db.pool, &hash_b, &path_b).await;
+
+        let (reaped, failed) = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(failed, 1, "A failed (CHECK violation)");
+        assert_eq!(reaped, 1, "B reaped despite A's failure");
+
+        let b_gone: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash_b)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(b_gone, 0, "B's narinfo deleted");
     }
 
     /// Helper: insert an 'uploading' placeholder AND backdate
@@ -464,7 +630,7 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("orphan-stale");
         seed_stale_uploading(&db.pool, &hash, &path).await;
 
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 1, "stale uploading manifest reaped");
 
         // narinfo gone (CASCADE took manifests too).
@@ -554,7 +720,7 @@ mod tests {
 
         // And scan_once itself finds nothing (status already
         // complete → SELECT filters it out).
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 0, "scan_once found nothing (status=complete)");
     }
 
@@ -580,7 +746,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 0, "fresh upload not reaped");
 
         // narinfo still present.
@@ -611,7 +777,7 @@ mod tests {
 
         // --- store-0's turn: seed stale + reap ---
         seed_stale_uploading(&db.pool, &hash, &path).await;
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 1, "store-0 reaped the stale upload");
 
         // --- Worker re-uploads same path (FRESH placeholder) ---
@@ -758,7 +924,7 @@ mod tests {
         // No heartbeat.
 
         // Scan: dead reaped, live skipped.
-        let reaped = scan_once(&db.pool, None).await.unwrap();
+        let (reaped, _) = scan_once(&db.pool, None).await.unwrap();
         assert_eq!(reaped, 1, "exactly the non-heartbeated placeholder reaped");
 
         // live still present; dead gone.

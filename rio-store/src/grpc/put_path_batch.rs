@@ -157,9 +157,9 @@ impl StoreServiceImpl {
                     n_exists_emitted += 1;
                     continue;
                 }
-                Ok(PlaceholderClaim::Owned) => {
+                Ok(PlaceholderClaim::Owned(claim)) => {
                     placeholder_guards
-                        .push(self.spawn_placeholder_guard(accum.store_path_hash.clone()));
+                        .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
                 }
                 Ok(PlaceholderClaim::Concurrent) => bail!(Status::aborted(format!(
                     "{ctx}: {}; retry",

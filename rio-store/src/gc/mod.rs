@@ -244,10 +244,14 @@ pub async fn run_gc(
     // Progress after mark: scanned count. We don't have
     // a "total paths" count cheaply (would need COUNT(*)
     // on narinfo), so paths_scanned = unreachable count
-    // (what mark found). Not ideal but informative.
+    // (what mark found). Captured here so the FINAL message
+    // can report the same number — `unreachable` is moved into
+    // sweep, and `stats.paths_deleted` regresses below this
+    // mid-progress value when paths_resurrected > 0.
+    let found_unreachable = unreachable.len() as u64;
     let _ = progress_tx
         .send(Ok(GcProgress {
-            paths_scanned: unreachable.len() as u64,
+            paths_scanned: found_unreachable,
             paths_collected: 0,
             bytes_freed: 0,
             is_complete: false,
@@ -287,25 +291,33 @@ pub async fn run_gc(
         }
     };
 
-    // Final progress: complete with stats.
+    // Final progress: complete with stats. paths_scanned echoes the
+    // mid-progress `found_unreachable` so it never goes backward;
+    // resurrections surface in the `current_path` summary string
+    // (proto has no `paths_resurrected` field — adding one is a
+    // cross-crate change deferred to keep this fix store-local).
     let _ = progress_tx
         .send(Ok(GcProgress {
-            paths_scanned: stats.paths_deleted, // reuse for "found unreachable"
+            paths_scanned: found_unreachable,
             paths_collected: stats.paths_deleted,
             bytes_freed: stats.bytes_freed,
             is_complete: true,
             current_path: if params.dry_run {
                 format!(
-                    "dry run: would delete {} paths, {} chunks, free {} bytes",
-                    stats.paths_deleted, stats.chunks_deleted, stats.bytes_freed
+                    "dry run: would delete {} paths, {} chunks, free {} bytes, {} resurrected",
+                    stats.paths_deleted,
+                    stats.chunks_deleted,
+                    stats.bytes_freed,
+                    stats.paths_resurrected
                 )
             } else {
                 format!(
-                    "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed",
+                    "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed, {} resurrected",
                     stats.paths_deleted,
                     stats.chunks_deleted,
                     stats.s3_keys_enqueued,
-                    stats.bytes_freed
+                    stats.bytes_freed,
+                    stats.paths_resurrected
                 )
             },
         }))
@@ -443,27 +455,50 @@ pub(super) async fn decrement_and_enqueue(
     chunk_list: &[u8],
     backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<DecrementStats, sqlx::Error> {
-    let mut stats = DecrementStats::default();
+    let unique_hashes: Vec<Vec<u8>> = parse_unique_chunk_hashes(chunk_list)
+        .into_iter()
+        .map(|h| h.to_vec())
+        .collect();
+    decrement_hashes_and_enqueue(tx, &unique_hashes, backend).await
+}
 
+/// Deserialize a manifest's `chunk_list` and return its dedup'd hashes.
+/// A corrupt `chunk_list` is logged and yields empty (the narinfo
+/// DELETE has already CASCADEd the manifest away; worst case is leaked
+/// refcounts). A manifest CAN repeat chunks (duplicate content blocks
+/// in the NAR) — decrement once per unique hash.
+pub(super) fn parse_unique_chunk_hashes(chunk_list: &[u8]) -> Vec<[u8; 32]> {
     let manifest = match Manifest::deserialize(chunk_list) {
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "GC: corrupt chunk_list, skipping decrement");
-            return Ok(stats);
+            return Vec::new();
         }
     };
+    let mut seen = std::collections::HashSet::<[u8; 32]>::new();
+    manifest
+        .entries
+        .into_iter()
+        .filter(|e| seen.insert(e.hash))
+        .map(|e| e.hash)
+        .collect()
+}
 
-    // Dedup chunk hashes: a manifest CAN repeat chunks if the NAR has
-    // duplicate content blocks; decrement once per unique hash.
-    let mut unique_hashes: Vec<Vec<u8>> = {
-        let mut seen = std::collections::HashSet::<[u8; 32]>::new();
-        manifest
-            .entries
-            .into_iter()
-            .filter(|e| seen.insert(e.hash))
-            .map(|e| e.hash.to_vec())
-            .collect()
-    };
+/// Decrement-and-enqueue body: takes pre-deduped hashes (typically the
+/// union across a sweep batch's chunk_lists — `r[store.chunk.lock-order]`
+/// requires ONE statement per tx so cross-path lock acquisition is in
+/// btree-scan order). Single-path callers use [`decrement_and_enqueue`]
+/// (parse + this).
+pub(super) async fn decrement_hashes_and_enqueue(
+    tx: &mut Transaction<'_, Postgres>,
+    unique_hashes: &[Vec<u8>],
+    backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<DecrementStats, sqlx::Error> {
+    let mut stats = DecrementStats::default();
+    if unique_hashes.is_empty() {
+        return Ok(stats);
+    }
+
     // r[impl store.chunk.lock-order]
     // Defense-in-depth only: with batch `= ANY($1)` PG locks rows in
     // btree scan order regardless of array order, so this sort is NOT
@@ -471,10 +506,8 @@ pub(super) async fn decrement_and_enqueue(
     // The load-bearing lock-order discipline for chunk-hash writers is
     // `with_sorted_retry`'s sort at the per-row contender boundary.
     // Kept for clarity and so any future per-row rewrite stays safe.
+    let mut unique_hashes: Vec<Vec<u8>> = unique_hashes.to_vec();
     unique_hashes.sort_unstable();
-    if unique_hashes.is_empty() {
-        return Ok(stats);
-    }
 
     // Decrement refcounts. ANY($1) for batch.
     sqlx::query("UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)")
@@ -782,6 +815,66 @@ mod tests {
         );
     }
 
+    /// bug_304: final `GcProgress.paths_scanned` MUST equal the
+    /// mid-progress value (`found_unreachable`), never regress to
+    /// `stats.paths_deleted`. Resurrection (which makes the two
+    /// diverge) requires a write landing between mark's snapshot and
+    /// sweep's re-check — not deterministically reachable through
+    /// `run_gc` in a unit test — so this pins the contract on a
+    /// non-resurrecting run and asserts the summary string carries
+    /// the resurrected count (the second half of the fix).
+    #[tokio::test]
+    async fn run_gc_final_paths_scanned_monotone() {
+        use crate::test_helpers::StoreSeed;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        StoreSeed::path("monotone-a")
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+        StoreSeed::path("monotone-b")
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let stats = run_gc(
+            &db.pool,
+            None,
+            GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut msgs = Vec::new();
+        while let Some(m) = rx.recv().await {
+            msgs.push(m.unwrap());
+        }
+        assert!(msgs.len() >= 2, "mid + final");
+        let mid = &msgs[0];
+        let fin = msgs.last().unwrap();
+        assert!(fin.is_complete);
+        assert_eq!(mid.paths_scanned, 2, "mark found both");
+        assert_eq!(
+            fin.paths_scanned, mid.paths_scanned,
+            "final paths_scanned echoes found_unreachable, not paths_deleted"
+        );
+        assert!(fin.paths_scanned >= fin.paths_collected);
+        assert!(
+            fin.current_path.contains("0 resurrected"),
+            "resurrections surfaced in summary: {}",
+            fin.current_path
+        );
+        assert_eq!(stats.paths_deleted, 2);
+    }
+
     /// I-192 liveness: `run_gc` (full mark+sweep orchestration)
     /// concurrent with a burst of `insert_manifest_uploading` calls.
     /// Every insert MUST succeed — GC never blocks PutPath. This IS
@@ -853,7 +946,10 @@ mod tests {
             }));
         }
         for t in insert_tasks {
-            assert!(t.await.unwrap(), "fresh path → placeholder inserted");
+            assert!(
+                t.await.unwrap().is_some(),
+                "fresh path → placeholder inserted"
+            );
         }
 
         let stats = gc.await.unwrap().expect("GC_LOCK_ID free → Some(stats)");
@@ -910,7 +1006,7 @@ mod tests {
             }));
         }
         for t in insert_tasks {
-            assert!(t.await.unwrap());
+            assert!(t.await.unwrap().is_some());
         }
 
         // T2: sweep with mark's stale unreachable list. Re-check must

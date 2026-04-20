@@ -187,6 +187,13 @@ pub fn describe_metrics() {
         "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
     );
     describe_counter!(
+        "rio_store_gc_orphan_reap_failed_total",
+        "Per-row reap_one failures during the orphan scanner's loop \
+         (e.g. chunks_refcount_nonneg CHECK violation from a pre-existing \
+         accounting bug). The scan continues; sustained nonzero = a poison \
+         row needs manual intervention."
+    );
+    describe_counter!(
         "rio_store_gc_chunk_orphan_swept_total",
         "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader \
          crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. \

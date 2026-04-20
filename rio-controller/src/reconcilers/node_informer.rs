@@ -36,7 +36,7 @@ use kube::{Api, Client};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::reconcilers::{admin_call, AdminClient};
+use crate::reconcilers::{AdminClient, admin_call};
 
 /// Pod annotation the [`run_pod_annotator`] watcher stamps with the
 /// node's [`HwClass::as_string`]. Builder reads it via downward-API
