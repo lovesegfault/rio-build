@@ -414,7 +414,7 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.stale-completed-verify+2]
+// r[verify sched.merge.stale-completed-verify+3]
 /// CA realisation cache-check: realisation row in PG ± path in store.
 ///
 /// - **stale** (I-048): realisation row exists but path GC'd from store
@@ -664,7 +664,7 @@ async fn test_substitute_fetch_transient_retry() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+2]
+// r[verify sched.merge.substitute-topdown+3]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -746,7 +746,192 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+2]
+// r[verify sched.merge.substitute-topdown+3]
+/// Top-down + deferred-fetch failure: when the prune commits and the
+/// detached `query_path_info` then fails, the build MUST fail with a
+/// resubmit-directing error — NOT dispatch the root as a build.
+///
+/// Before the fix: `handle_substitute_complete{ok=false}` set
+/// `substitute_tried=true`, computed `all_deps_completed(R)` = true
+/// (vacuous — deps were pruned), pushed R Ready, and the next
+/// dispatch pass routed R to a worker. Worker walks `inputDrvs`,
+/// finds none in store → ENOENT → Failed → retry → Poisoned.
+#[tokio::test]
+async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Seed: root output substitutable (so topdown FMP says "all
+    // available" and prune fires). QPI then fails permanently
+    // (Internal — non-transient → ok=false on first try).
+    let root_out = test_store_path("td-fail-hello");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    store
+        .faults
+        .fail_query_path_info_permanent
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // hello (root) → glibc, gcc, stdenv. Deps NOT seeded.
+    let mut root = make_node("td-fail-hello");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut glibc = make_node("td-fail-glibc");
+    glibc.expected_output_paths = vec![test_store_path("td-fail-glibc-out")];
+    let mut gcc = make_node("td-fail-gcc");
+    gcc.expected_output_paths = vec![test_store_path("td-fail-gcc-out")];
+    let mut stdenv = make_node("td-fail-stdenv");
+    stdenv.expected_output_paths = vec![test_store_path("td-fail-stdenv-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![root, glibc, gcc, stdenv],
+        vec![
+            make_test_edge("td-fail-hello", "td-fail-glibc"),
+            make_test_edge("td-fail-hello", "td-fail-gcc"),
+            make_test_edge("td-fail-hello", "td-fail-stdenv"),
+        ],
+        false,
+    )
+    .await?;
+    settle_substituting(&handle, &["td-fail-hello"]).await;
+    barrier(&handle).await;
+
+    // Root was stamped topdown_pruned, then SubstituteComplete{ok=
+    // false} → build Failed (not Active, not Succeeded).
+    let r = expect_drv(&handle, "td-fail-hello").await;
+    assert!(
+        r.topdown_pruned,
+        "topdown prune fired → root stamped topdown_pruned"
+    );
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "topdown-pruned root with failed substitute MUST NOT be \
+         dispatched/Ready (deps were dropped); got {:?}",
+        r.status
+    );
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "topdown-pruned root + ok=false → build Failed (was: stayed Active \
+         or root dispatched as build → ENOENT → Poisoned)"
+    );
+    assert!(
+        status.error_summary.contains("topdown") && status.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        status.error_summary
+    );
+    // Deps never entered the DAG (prune fired).
+    for dep in ["td-fail-glibc", "td-fail-gcc", "td-fail-stdenv"] {
+        assert!(
+            handle.debug_query_derivation(dep).await?.is_none(),
+            "dep {dep} should be pruned, not in global DAG"
+        );
+    }
+    // total_derivations = 1 confirms prune committed (not 4).
+    assert_eq!(status.total_derivations, 1);
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+3]
+/// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
+/// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
+/// pre-existing `Substituting` so `dag.merge` doesn't reset it; the
+/// `topdown_pruned` flag persists. Fetch then fails. Before the fix:
+/// `handle_substitute_complete` saw `topdown_pruned=true` and failed
+/// EVERY interested build — including B2, whose deps ARE in the DAG.
+/// After: gate on `get_children(R).is_empty()`; R has children → flag
+/// cleared, fall through to normal Queued handling.
+///
+/// Race staged deterministically via `debug_force_status`/
+/// `debug_set_topdown_pruned` + injected `SubstituteComplete{ok=false}`
+/// (see `r[sched.substitute.detached]` — the actor only checks `status
+/// == Substituting`, so an injected message is indistinguishable from
+/// the spawned task's).
+#[tokio::test]
+async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B2: full-merge {app, R, glibc} with app→R, R→glibc. None
+    // substitutable → topdown falls through. R newly_inserted with
+    // child glibc. (B1's topdown-prune-then-B2-adds-deps end state is
+    // identical to this; staging it directly avoids the spawn-task
+    // race.)
+    let mut app = make_node("tdp-app");
+    app.expected_output_paths = vec![test_store_path("tdp-app-out")];
+    let mut r = make_node("tdp-r");
+    r.expected_output_paths = vec![test_store_path("tdp-r-out")];
+    let mut glibc = make_node("tdp-glibc");
+    glibc.expected_output_paths = vec![test_store_path("tdp-glibc-out")];
+
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![app, r, glibc],
+        vec![
+            make_test_edge("tdp-app", "tdp-r"),
+            make_test_edge("tdp-r", "tdp-glibc"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Stage: R was topdown-pruned by an earlier build (B1) and is
+    // mid-fetch when B2 merged. R has child glibc (B2's full merge
+    // added it). topdown_pruned persists from B1.
+    handle
+        .debug_force_status("tdp-r", DerivationStatus::Substituting)
+        .await?;
+    handle.debug_set_topdown_pruned("tdp-r", true).await?;
+    let pre = expect_drv(&handle, "tdp-r").await;
+    assert!(pre.topdown_pruned, "precondition: flag set");
+    assert_eq!(pre.status, DerivationStatus::Substituting);
+
+    // B1's deferred fetch fails → SubstituteComplete{ok=false}.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdp-r".into(),
+            ok: false,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // B2 MUST stay Active: R has children (glibc) → "deps were
+    // dropped" invariant doesn't hold → no fail-fast. R falls through
+    // to Queued (glibc not Completed → all_deps_completed=false).
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(
+        s2.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B2 full-merged R with deps → R has DAG children → topdown \
+         fail-fast must NOT fire (was: collaterally Failed via stale \
+         topdown_pruned flag)"
+    );
+    let post = expect_drv(&handle, "tdp-r").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Queued,
+        "R falls through to normal Substituting→Queued (deps not done)"
+    );
+    assert!(
+        !post.topdown_pruned,
+        "flag cleared once R gained children (invariant moot)"
+    );
+    assert!(post.substitute_tried, "one-shot fall-through still applies");
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+3]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -916,7 +1101,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+2]
+// r[verify sched.merge.substitute-topdown+3]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
@@ -1018,7 +1203,7 @@ enum GcState {
     StoreUnreachable,
 }
 
-// r[verify sched.merge.stale-completed-verify+2]
+// r[verify sched.merge.stale-completed-verify+3]
 // r[verify sched.merge.stale-substitutable]
 /// Pre-existing `Completed` node verification at merge time.
 ///
@@ -1827,7 +2012,7 @@ async fn merge_hydrates_resource_floor_from_db() -> TestResult {
 // deferred re-probe on Poisoned-at-limit
 // ===========================================================================
 
-// r[verify sched.merge.stale-completed-verify+2]
+// r[verify sched.merge.stale-completed-verify+3]
 /// I-047 dep-gating: when GC sweeps a chain {A→B}, both reset; A goes
 /// to `Queued` (NOT `Ready`) so it cannot dispatch ahead of B. Without
 /// the two-pass reset, A and B both reset to `Ready` and A can dispatch
@@ -1915,7 +2100,7 @@ async fn test_stale_reset_chain_gates_parent_at_queued() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.stale-completed-verify+2]
+// r[verify sched.merge.stale-completed-verify+3]
 /// I-047 covers `Skipped` too: a pre-existing `Skipped` node with GC'd
 /// output_paths resets the same as `Completed`. Skipped carries real
 /// output_paths and unlocks dependents via `all_deps_completed`; before
@@ -2222,6 +2407,204 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
         ),
         "after dep completes, X (Queued) promotes; got {:?}",
         xs2.status
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.reconcile-order]
+// r[verify sched.merge.stale-completed-verify+3]
+/// bug_089: `apply_cached_hits`' `reprobe_unlocked` advance fired
+/// BEFORE `verify_preexisting_completed` reset stale-Completed deps.
+/// D depends on {X, Y}. Y is stale-Completed (output GC'd). X is
+/// Ready, then its output appears locally → re-probe cache-hit. With
+/// the old phase order: 6a's `find_newly_ready(X)` sees Y still
+/// Completed → `all_deps_completed(D)=true` → D pushed Ready; 6c then
+/// resets Y but D stays Ready → dispatched against missing output.
+/// With the fix: 6a only collects `reprobe_unlocked`; 6f re-checks
+/// `all_deps_completed(D)` post-6c, finds Y reset → D stays Queued.
+#[tokio::test]
+async fn test_reprobe_unlocked_deferred_past_stale_reset() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let x_out = test_store_path("ro-x-out");
+    let y_out = test_store_path("ro-y-out");
+    let mut x = make_node("ro-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut y = make_node("ro-y");
+    y.expected_output_paths = vec![y_out.clone()];
+    let mut d = make_node("ro-d");
+    d.expected_output_paths = vec![test_store_path("ro-d-out")];
+
+    // Build #1: D → {X, Y}. No outputs seeded → all 3 newly_inserted.
+    // Y, X leaves → Ready; D → Queued.
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![d.clone(), x.clone(), y.clone()],
+        vec![make_test_edge("ro-d", "ro-x"), make_test_edge("ro-d", "ro-y")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    // Precondition setup: Y forced Completed with output_paths set
+    // (simulates a prior run that completed Y, then GC swept y_out).
+    // y_out is NOT seeded in MockStore → 6c's FMP reports it missing.
+    handle
+        .debug_force_status("ro-y", DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths("ro-y", vec![y_out.clone()])
+        .await?;
+    // X stays Ready (∈ existing_reprobe). D forced Queued (waiting on X).
+    handle
+        .debug_force_status("ro-d", DerivationStatus::Queued)
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "ro-x").await.status,
+        DerivationStatus::Ready
+    );
+
+    // X's output now locally present → cached_hits lane (NOT
+    // substitutable: avoids the pending_substitute split).
+    store.seed_with_content(&x_out, b"x");
+
+    // Build #2: same DAG. Uncached sibling root Z so topdown's
+    // all-or-nothing falls through (D's output isn't seeded but D is
+    // the only "root" without Z; defensive — make_node doesn't seed).
+    let mut z = make_node("ro-z");
+    z.expected_output_paths = vec![test_store_path("ro-z-out")];
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![d, x, y, z],
+        vec![make_test_edge("ro-d", "ro-x"), make_test_edge("ro-d", "ro-y")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Y was reset (stale Completed → Ready/Queued; output_paths cleared).
+    let ys = expect_drv(&handle, "ro-y").await;
+    assert!(
+        matches!(ys.status, DerivationStatus::Ready | DerivationStatus::Queued),
+        "6c reset stale-Completed Y; got {:?}",
+        ys.status
+    );
+    // D stayed Queued: 6f's all_deps_completed re-check (post-6c) sees
+    // Y no longer Completed → D NOT advanced. Before: D was Ready.
+    let ds = expect_drv(&handle, "ro-d").await;
+    assert_eq!(
+        ds.status,
+        DerivationStatus::Queued,
+        "r[sched.merge.reconcile-order]: reprobe_unlocked advance must \
+         re-check all_deps_completed AFTER stale-reset; D's dep Y was \
+         reset → D stays Queued (was: Ready against Y's stale Completed)"
+    );
+    // X completed via re-probe.
+    assert_eq!(
+        expect_drv(&handle, "ro-x").await.status,
+        DerivationStatus::Completed
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.reconcile-order]
+/// bug_132: `seed_initial_states` ran BEFORE `spawn_substitute_fetches`
+/// rescued a reprobe-Poisoned dep. A (newly-inserted) depends on B
+/// (hard-Poisoned, retry≥limit so dag.merge does NOT reset). B's
+/// output is upstream-substitutable. With the old order: 6d seed reads
+/// `any_dep_terminally_failed(A)` → B Poisoned → A=DependencyFailed,
+/// `first_dep_failed=Some(A)`; 6e then flips B→Substituting too late.
+/// !keep_going build fail-fasts while B's fetch is mid-flight. With
+/// the fix: 6d (reprobe_sub spawn) runs FIRST → B is Substituting
+/// when 6e seed reads it → A goes Queued, build stays Active.
+#[tokio::test]
+async fn test_seed_ignores_reprobe_pending_substitute_dep() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let b_out = test_store_path("rs-b-out");
+    let mut b = make_node("rs-b");
+    b.expected_output_paths = vec![b_out.clone()];
+    let mut a = make_node("rs-a");
+    a.expected_output_paths = vec![test_store_path("rs-a-out")];
+
+    // Build #1: B alone. Force-poison at the limit so resubmit does
+    // NOT reset (`is_retriable_on_resubmit=false`).
+    merge_dag(&handle, Uuid::new_v4(), vec![b.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned("rs-b", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "rs-b").await.status,
+        DerivationStatus::Poisoned,
+        "precondition"
+    );
+
+    // B's output now upstream-substitutable (NOT locally present →
+    // pending_substitute lane, not cached_hits).
+    store.state.substitutable.write().unwrap().push(b_out);
+
+    // Build #2: {A, B} with edge A→B. !keep_going.
+    // B ∈ existing_reprobe (Poisoned), B ∈ pending_substitute. A is
+    // newly_inserted. With the fix: 6d reprobe_sub spawns B
+    // →Substituting BEFORE 6e seed → A sees B non-terminal → Queued.
+    let build2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build2,
+        vec![a, b],
+        vec![make_test_edge("rs-a", "rs-b")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Build #2 stayed Active (NOT fail-fasted on stale Poisoned B).
+    let s = query_status(&handle, build2).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Active as i32,
+        "r[sched.merge.reconcile-order]: reprobe-Poisoned B → Substituting \
+         BEFORE seed; A must NOT be marked DependencyFailed (was: !keep_going \
+         build fail-fasted with 'derivation A failed' while B mid-fetch)"
+    );
+    let as_ = expect_drv(&handle, "rs-a").await;
+    assert_ne!(
+        as_.status,
+        DerivationStatus::DependencyFailed,
+        "A must NOT be DependencyFailed (B was Substituting at seed-time, \
+         not Poisoned); got {:?}",
+        as_.status
+    );
+    let bs = expect_drv(&handle, "rs-b").await;
+    assert!(
+        matches!(
+            bs.status,
+            DerivationStatus::Substituting | DerivationStatus::Completed
+        ),
+        "B Poisoned → Substituting via reprobe_sub spawn; got {:?}",
+        bs.status
+    );
+
+    // Let B's fetch complete → A advances → build succeeds.
+    settle_substituting(&handle, &["rs-b"]).await;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "rs-b").await.status,
+        DerivationStatus::Completed
+    );
+    let as2 = expect_drv(&handle, "rs-a").await;
+    assert!(
+        matches!(as2.status, DerivationStatus::Ready | DerivationStatus::Queued),
+        "after B completes via substitute, A promotes; got {:?}",
+        as2.status
     );
     Ok(())
 }

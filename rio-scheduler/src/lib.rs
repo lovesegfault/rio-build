@@ -221,6 +221,10 @@ pub fn describe_metrics() {
         "Submissions pruned to roots-only by the top-down substitution pre-check"
     );
     describe_counter!(
+        "rio_scheduler_topdown_substitute_fail_total",
+        "Top-down-pruned roots whose deferred substitute fetch failed (build failed fast; resubmit re-probes)"
+    );
+    describe_counter!(
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );

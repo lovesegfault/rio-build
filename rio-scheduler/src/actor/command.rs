@@ -516,6 +516,13 @@ pub enum DebugCmd {
         paths: Vec<String>,
         reply: oneshot::Sender<bool>,
     },
+    /// Set a derivation's `topdown_pruned`. For staging the
+    /// B1-topdown / B2-full-merge race deterministically.
+    SetTopdownPruned {
+        drv_hash: String,
+        value: bool,
+        reply: oneshot::Sender<bool>,
+    },
     /// Clear a derivation's `drv_content`. Simulates the post-recovery
     /// state for the `sched.ca.resolve` recovery-fetch test.
     ClearDrvContent {

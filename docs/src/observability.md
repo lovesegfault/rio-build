@@ -101,6 +101,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_substitute_fetch_failures_total` | Counter | Substitutable-path eager fetches (QueryPathInfo) that failed. Path demoted to cache-miss; derivation falls through to normal dispatch. Alert if rate > 0 sustained: upstream reported path available but fetch failed --- upstream lying or transient network. |
 | `rio_scheduler_substitute_fetch_retries_total` | Counter | Transient substitute-fetch errors that triggered a backoff retry (`SUBSTITUTE_FETCH_BACKOFF`, up to 5 attempts). High rate without matching `_failures` = store load absorbed; high rate WITH `_failures` = backoff insufficient or store genuinely degraded. |
 | `rio_scheduler_substitute_spawned_total` | Counter | Derivations transitioned to `Substituting` (detached upstream fetch spawned, `r[sched.substitute.detached]`). Pairs with `substitute_fetch_failures_total` to derive success rate. |
+| `rio_scheduler_topdown_substitute_fail_total` | Counter | Top-down-pruned roots whose deferred substitute fetch failed (`r[sched.merge.substitute-topdown]`). Build failed fast with a resubmit-directing error; alert if rate > 0 sustained --- upstream HEAD probe is reporting substitutable for paths whose GET fails. |
 | `rio_scheduler_queue_backpressure` | Counter | Backpressure activations (queue reached 80% capacity) |
 | `rio_scheduler_workers_active` | Gauge | Fully-registered executors (stream + heartbeat) |
 | `rio_scheduler_assignments_total` | Counter | Total derivation->executor assignments |

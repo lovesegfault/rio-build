@@ -876,6 +876,7 @@ impl DagActor {
                    "SubstituteComplete: not Substituting (cancelled/re-merged); dropping");
             return;
         }
+        let topdown_pruned = state.topdown_pruned;
         if ok {
             // complete_ready_from_store does Substituting→Completed
             // (valid transition) + the full post-completion machinery
@@ -886,6 +887,71 @@ impl DagActor {
             // mark dirty so the next Tick dispatches them (this
             // handler runs outside dispatch_ready's drain loop).
             self.dispatch_dirty = true;
+            return;
+        }
+        // r[impl sched.merge.substitute-topdown+3]
+        // Topdown-pruned root: the dep subgraph was dropped from this
+        // submission, so a build dispatch cannot succeed (worker
+        // ENOENTs on inputDrvs). Fail every interested build with a
+        // resubmit-directing error instead of demoting to Ready
+        // (vacuously all_deps_completed → would dispatch). keep_going
+        // is irrelevant: a topdown-pruned graph is roots-only by
+        // construction; there is no other work to "keep going" with,
+        // and leaving the build Active would hang it.
+        //
+        // Gate on `get_children().is_empty()`: `topdown_pruned` is set
+        // once at merge and never cleared, so a later full-merge that
+        // adds R's deps to the DAG (while R's fetch is in-flight)
+        // would still see the flag here and collaterally fail that
+        // build even though R IS now buildable. If R has children the
+        // "deps were dropped" invariant no longer holds — clear the
+        // flag and fall through to normal Ready/Queued handling.
+        if topdown_pruned && !self.dag.get_children(drv_hash).is_empty() {
+            debug!(%drv_hash,
+                   "topdown-pruned root gained DAG children via later \
+                    full-merge; invariant moot, clearing flag");
+            if let Some(s) = self.dag.node_mut(drv_hash) {
+                s.topdown_pruned = false;
+            }
+        } else if topdown_pruned {
+            warn!(%drv_hash,
+                  "topdown-pruned root: detached substitute fetch failed; \
+                   deps were dropped from DAG — failing build (resubmit \
+                   will re-probe or full-merge)");
+            metrics::counter!("rio_scheduler_topdown_substitute_fail_total").increment(1);
+            let msg = format!(
+                "topdown-pruned root {drv_hash}: upstream substitute fetch failed \
+                 after deps were pruned; resubmit to re-probe or full-merge"
+            );
+            // Queued (not Ready): zero DAG deps → vacuous Ready would
+            // re-dispatch on the next Tick. cancel_build_derivations
+            // strips interest below; with zero remaining interest the
+            // node is reaped on the next sweep.
+            if let Some(s) = self.dag.node_mut(drv_hash) {
+                s.substitute_tried = true;
+                if let Err(e) = s.transition(DerivationStatus::Queued) {
+                    warn!(%drv_hash, %e, "topdown-fail: Substituting→Queued rejected");
+                }
+            }
+            self.persist_status(drv_hash, DerivationStatus::Queued, None)
+                .await;
+            for build_id in self.get_interested_builds(drv_hash) {
+                if let Some(build) = self.builds.get_mut(&build_id) {
+                    build.error_summary.get_or_insert_with(|| msg.clone());
+                    build
+                        .failed_derivation
+                        .get_or_insert_with(|| drv_hash.to_string());
+                }
+                self.cancel_build_derivations(
+                    build_id,
+                    &format!("build {build_id}: topdown substitute fetch failed"),
+                )
+                .await;
+                if let Err(e) = self.transition_build_to_failed(build_id).await {
+                    error!(%build_id, error = %e,
+                           "failed to persist build-failed after topdown substitute fail");
+                }
+            }
             return;
         }
         let to = if self.dag.all_deps_completed(drv_hash) {

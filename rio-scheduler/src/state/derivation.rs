@@ -187,14 +187,31 @@ impl DerivationStatus {
             // later build references it. If the output now exists
             // (e.g., upstream cache configured AFTER first insert),
             // skip directly to Completed regardless of current state.
-            // Poisoned/DependencyFailed → Completed: prior failure is
-            // moot — we have the output. Caller is responsible for
-            // clearing poison fields and DB state.
+            // Poisoned/DependencyFailed/Failed → Completed: prior
+            // failure is moot — we have the output. Caller is
+            // responsible for clearing poison fields and DB state.
             (Self::Queued, Self::Completed) => true,
             (Self::Poisoned, Self::Completed) => true,
             (Self::DependencyFailed, Self::Completed) => true,
+            // Failed is symmetry-only: Failed is reset by dag.merge
+            // today (`is_retriable_on_resubmit`), so a pre-existing
+            // Failed node lands in newly_inserted and re-enters at
+            // Created. Kept parallel to Poisoned/DependencyFailed for
+            // the I-094 reprobe lane so the state machine and the
+            // merge.rs callers (existing_reprobe match,
+            // apply_cached_hits, deferred-reprobe stanza) agree —
+            // defense-in-depth if `is_retriable_on_resubmit` ever
+            // bounds Failed by retry-count.
+            (Self::Failed, Self::Completed) => true,
             (Self::Created, Self::Queued) => true, // build accepted
             (Self::Queued, Self::Ready) => true,   // all deps complete
+            // I-047 parent-side: a dep's output was GC'd and reset
+            // (Completed→Ready/Queued above), so this node's Ready
+            // verdict ("all deps' outputs available") no longer
+            // holds. Demote to Queued; find_newly_ready re-promotes
+            // when the reset dep re-completes. r[sched.merge.stale-
+            // completed-verify]
+            (Self::Ready, Self::Queued) => true,
             (Self::Queued, Self::DependencyFailed) => true, // dep poisoned, cascade
             (Self::Ready, Self::DependencyFailed) => true, // dep poisoned, cascade
             (Self::Created, Self::DependencyFailed) => true, // dep poisoned before queue
@@ -233,13 +250,13 @@ impl DerivationStatus {
             // cancelled mid-fetch (orphan task is benign — it still
             // populates the store, the SubstituteComplete is dropped).
             (Self::Created | Self::Queued | Self::Ready, Self::Substituting) => true,
-            // I-094 reprobe, substitutable lane: poisoned/dep-failed
-            // node's output is upstream-substitutable on resubmit —
-            // same "prior failure is moot" rationale as the
-            // (Poisoned, Completed) arm above. DependencyFailed is
-            // symmetry-only (reset by dag.merge today) but kept
-            // parallel to line 173.
-            (Self::Poisoned | Self::DependencyFailed, Self::Substituting) => true,
+            // I-094 reprobe, substitutable lane: poisoned/dep-failed/
+            // failed node's output is upstream-substitutable on
+            // resubmit — same "prior failure is moot" rationale as
+            // the (Poisoned, Completed) arm above. DependencyFailed
+            // and Failed are symmetry-only (both reset by dag.merge
+            // today) but kept parallel to the →Completed arms above.
+            (Self::Poisoned | Self::DependencyFailed | Self::Failed, Self::Substituting) => true,
             (Self::Substituting, Self::Completed | Self::Ready | Self::Queued) => true,
             (Self::Substituting, Self::Cancelled) => true,
             _ => false,
@@ -596,6 +613,17 @@ pub struct DerivationState {
     /// reaches `find_executor` (FMP HEAD probe vs. QPI GET drift).
     /// In-mem only — recovery resets `Substituting` to dep-walk anyway.
     pub substitute_tried: bool,
+    /// Set when `check_roots_topdown` pruned this node's dep subgraph
+    /// from the submission. Carries the invariant "this node MUST
+    /// complete via substitution; building is invalid" — its
+    /// `inputDrvs` were never merged/built/substituted, so a
+    /// dispatched build would ENOENT on them. On
+    /// `SubstituteComplete{ok=false}`, `handle_substitute_complete`
+    /// fails every interested build instead of demoting to Ready
+    /// (which would dispatch a doomed build). r[sched.merge.
+    /// substitute-topdown]. In-mem only — same recovery semantics as
+    /// `substitute_tried`.
+    pub topdown_pruned: bool,
 }
 
 impl DerivationState {
@@ -652,6 +680,7 @@ impl DerivationState {
             traceparent: String::new(),
             probed_generation: 0,
             substitute_tried: false,
+            topdown_pruned: false,
         })
     }
 
@@ -750,6 +779,7 @@ impl DerivationState {
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
             substitute_tried: false,
+            topdown_pruned: false,
         })
     }
 
@@ -815,6 +845,7 @@ impl DerivationState {
             traceparent: String::new(),
             probed_generation: 0,
             substitute_tried: false,
+            topdown_pruned: false,
         })
     }
 
@@ -1208,9 +1239,13 @@ mod tests {
         assert!(Running.validate_transition(Queued).is_err());
         assert!(Running.validate_transition(Assigned).is_err());
 
-        // Failed can only go to Ready or Queued (I-094 deferred re-probe)
+        // Failed can go to Ready (retry), Queued (I-094 deferred), or
+        // Completed/Substituting (I-094/I-099 re-probe cache-hit;
+        // symmetry-only — Failed is reset by dag.merge today, but the
+        // state machine and the merge.rs reprobe callers must agree).
         assert!(Failed.validate_transition(Running).is_err());
-        assert!(Failed.validate_transition(Completed).is_err());
+        assert!(Failed.validate_transition(Completed).is_ok());
+        assert!(Failed.validate_transition(Substituting).is_ok());
         assert!(Failed.validate_transition(Queued).is_ok());
 
         // Poisoned can go to Created (TTL), Queued (I-094 deferred),
@@ -1237,6 +1272,29 @@ mod tests {
         assert!(Assigned.validate_transition(Assigned).is_err());
         assert!(Running.validate_transition(Running).is_err());
         assert!(Failed.validate_transition(Failed).is_err());
+    }
+
+    // r[verify sched.state.transitions]
+    /// Failed→Completed/Substituting symmetry: `existing_reprobe`
+    /// includes `Failed`, and `apply_cached_hits` /
+    /// `spawn_substitute_fetches` attempt these transitions on a
+    /// re-probe hit. Today `Failed` is reset by `dag.merge`
+    /// (`is_retriable_on_resubmit`), so the path is unreachable; the
+    /// arms are kept parallel to Poisoned/DependencyFailed so the
+    /// state machine and the I-094 reprobe-lane callers agree —
+    /// defense-in-depth if `is_retriable_on_resubmit` ever bounds
+    /// `Failed` by retry-count (which would silently activate the
+    /// "re-probe hit on Failed dropped with warn!" gap).
+    #[test]
+    fn test_failed_reprobe_transitions_symmetry() {
+        use DerivationStatus::*;
+        assert!(Failed.validate_transition(Completed).is_ok());
+        assert!(Failed.validate_transition(Substituting).is_ok());
+        // Parallel: the existing I-094 lanes these mirror.
+        assert!(Poisoned.validate_transition(Completed).is_ok());
+        assert!(Poisoned.validate_transition(Substituting).is_ok());
+        assert!(DependencyFailed.validate_transition(Completed).is_ok());
+        assert!(DependencyFailed.validate_transition(Substituting).is_ok());
     }
 
     #[test]
@@ -1361,8 +1419,10 @@ mod tests {
             (Queued, Completed),           // merge-time re-probe (I-099)
             (Poisoned, Completed),         // merge-time re-probe unpoisons (I-094)
             (DependencyFailed, Completed), // merge-time re-probe (I-099)
+            (Failed, Completed),           // merge-time re-probe (I-094 symmetry)
             (Created, Queued),
             (Queued, Ready),
+            (Ready, Queued), // I-047 parent-side: dep output GC'd
             (Ready, Assigned),
             (Assigned, Running),
             (Assigned, Ready), // worker lost
@@ -1398,6 +1458,7 @@ mod tests {
             (Ready, Substituting),
             (Poisoned, Substituting), // I-094 reprobe substitutable lane
             (DependencyFailed, Substituting),
+            (Failed, Substituting), // I-094 symmetry
             (Substituting, Completed),
             (Substituting, Ready),
             (Substituting, Queued),

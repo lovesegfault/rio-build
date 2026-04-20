@@ -129,7 +129,23 @@ impl DagActor {
         // If a newly merged node depends on an already-poisoned existing
         // node, handle the failure now (fail build if !keepGoing, or sync
         // counts + check completion if keepGoing).
-        if let Some(failed_hash) = first_dep_failed {
+        // r[impl sched.merge.reconcile-order]
+        // Defense-in-depth: re-read the node's CURRENT status before
+        // fail-fasting. reconcile_merged_state's phase ordering
+        // guarantees all dep-state corrections (cache-hit, stale-reset,
+        // reprobe-Poisoned→Substituting) ran before any verdict was
+        // computed, but a future reordering could regress this; the
+        // re-check is cheap and also suppresses the phantom
+        // error_summary side-effect under keep_going=true if the node
+        // has since transitioned out of a failed state.
+        if let Some(failed_hash) = first_dep_failed
+            && self.dag.node(&failed_hash).is_some_and(|s| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+                )
+            })
+        {
             self.handle_derivation_failure(build_id, &failed_hash).await;
             // handle_derivation_failure may have transitioned the build to
             // Failed. If so, don't dispatch.
@@ -222,7 +238,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down root substitution check ===============
-        // r[impl sched.merge.substitute-topdown+2]
+        // r[impl sched.merge.substitute-topdown+3]
         // Before merging the full DAG, check if the ROOT derivations'
         // outputs are already available. If ALL roots are cached, the
         // deps are transitively unnecessary — prune the submission to
@@ -235,10 +251,13 @@ impl DagActor {
         // build that needs them triggers its own cache-check.
         //
         // Falls through to the full DAG on any uncertainty (store
-        // unreachable, partial root cache, CA roots, fetch failure).
-        // The existing check_cached_outputs at step 4 handles those
+        // unreachable, partial root cache, CA roots). The fetch
+        // itself is deferred (`r[sched.substitute.detached]`); on
+        // fetch failure the build fails fast (`r[sched.merge.
+        // substitute-topdown]` — resubmit re-probes). The existing
+        // check_cached_outputs at step 4 handles fall-through
         // correctly — this is a fast-path, not a replacement.
-        let (nodes, edges) = match self
+        let (nodes, edges, topdown_fired) = match self
             .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
             .await
         {
@@ -250,9 +269,9 @@ impl DagActor {
                     "top-down: all roots substitutable; pruning deps from submission"
                 );
                 metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
-                (roots_only, Vec::new())
+                (roots_only, Vec::new(), true)
             }
-            None => (nodes, edges),
+            None => (nodes, edges, false),
         };
         phase!("0-topdown-roots");
 
@@ -287,6 +306,19 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
+        // r[impl sched.merge.substitute-topdown+3]
+        // Stamp topdown_pruned on roots AFTER dag.merge (node didn't
+        // exist before). Idempotent if a root pre-existed in the DAG.
+        // handle_substitute_complete reads this on
+        // SubstituteComplete{ok=false} and fails the build instead of
+        // dispatching (deps were dropped — worker would ENOENT).
+        if topdown_fired {
+            for n in &nodes {
+                if let Some(s) = self.dag.node_mut(&n.drv_hash) {
+                    s.topdown_pruned = true;
+                }
+            }
+        }
         phase!("2-dag-merge-inmem");
 
         // === Step 3: In-memory map inserts ============================
@@ -319,6 +351,10 @@ impl DagActor {
             .filter_map(|n| {
                 use DerivationStatus::*;
                 let st = self.dag.node(&n.drv_hash)?.status();
+                // Failed/DependencyFailed are reset by dag.merge →
+                // newly_inserted today; listed for symmetry with the
+                // I-094 transition arms (defense-in-depth if
+                // is_retriable_on_resubmit ever bounds Failed).
                 matches!(
                     st,
                     Created | Queued | Ready | Failed | Poisoned | DependencyFailed
@@ -463,10 +499,12 @@ impl DagActor {
     /// DB write failures are log-and-continue (build is already Active;
     /// DB sync catches up on next status update or heartbeat
     /// reconciliation).
+    // r[impl sched.merge.reconcile-order]
     async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
         let MergeIngest {
             nodes,
             merge_result,
+            existing_reprobe,
             cached_hits,
             pending_substitute,
             jwt_token,
@@ -489,7 +527,33 @@ impl DagActor {
             };
         }
 
-        let (mut cached_count, deferred_hits, other_builds) =
+        let jwt_meta: Vec<(&'static str, String)> = jwt_token
+            .as_deref()
+            .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
+            .unwrap_or_default();
+
+        // r[sched.merge.reconcile-order]: split pending_substitute by
+        // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
+        // DependencyFailed) MUST transition →Substituting BEFORE
+        // seed_initial_states reads `any_dep_terminally_failed` (6d);
+        // newly-inserted substitutable nodes need seed to put them at
+        // Created/Queued/Ready first (6g). Partition keys on
+        // existing_reprobe (the only set whose members can BE Poisoned
+        // here — newly_inserted nodes are at Created).
+        let (reprobe_sub, new_sub): (Vec<_>, Vec<_>) = pending_substitute
+            .iter()
+            .cloned()
+            .partition(|(h, _)| existing_reprobe.contains(h));
+
+        // === Phase ordering invariant ==============================
+        // All dep-state CORRECTIONS (6a cache-hit→Completed, 6c stale-
+        // Completed reset, 6d reprobe-Poisoned→Substituting) MUST
+        // complete before any dependent VERDICT that reads dep status
+        // (6e seed_initial_states, 6f reprobe_unlocked Queued→Ready).
+        // Violations: bug_089 (6a's advance fired before 6c reset),
+        // bug_132 (6e seed fired before 6d Poisoned→Substituting).
+
+        let (mut cached_count, deferred_hits, other_builds, reprobe_unlocked) =
             self.apply_cached_hits(ingest, &node_index).await;
         phase!("6a-cached-hits-loop");
 
@@ -516,11 +580,26 @@ impl DagActor {
         // otherwise newly-inserted dependents would be unlocked against a
         // dep whose output is gone, and the worker fails on isValidPath.
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify+2]
+        // r[impl sched.merge.stale-completed-verify+3]
         let stale_reset = self
             .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
             .await;
         phase!("6c-verify-preexisting");
+
+        // r[impl sched.substitute.detached]
+        // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
+        // output is now upstream-substitutable transitions Poisoned →
+        // Substituting BEFORE seed_initial_states reads
+        // `any_dep_terminally_failed` for its dependents. Otherwise a
+        // newly-inserted dependent A of a reprobe-Poisoned B is marked
+        // DependencyFailed against B's stale Poisoned status,
+        // first_dep_failed=Some(A), and !keep_going builds fail-fast
+        // while B's fetch is mid-flight.
+        if !reprobe_sub.is_empty() {
+            self.spawn_substitute_fetches(reprobe_sub, jwt_meta.clone())
+                .await;
+        }
+        phase!("6d-spawn-substitute-reprobe");
 
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
@@ -531,25 +610,50 @@ impl DagActor {
             .cloned()
             .collect();
         let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
-        phase!("6d-seed-initial-states");
+        phase!("6e-seed-initial-states");
+
+        // I-099: advance pre-existing Queued dependents of re-probe
+        // hits (collected in 6a). Runs AFTER 6c so a sibling dep that
+        // 6c reset Completed→Ready is no longer counted as Completed:
+        // re-check `all_deps_completed` against the post-6c DAG and
+        // skip if it's now false (D stays Queued; find_newly_ready
+        // picks it up when the reset dep re-completes). The Queued
+        // re-check guards the I-099 fixed-point Completed-capture as
+        // before.
+        for ready_hash in reprobe_unlocked {
+            if self
+                .dag
+                .node(&ready_hash)
+                .is_some_and(|s| s.status() == DerivationStatus::Queued)
+                && self.dag.all_deps_completed(&ready_hash)
+                && self
+                    .dag
+                    .node_mut(&ready_hash)
+                    .is_some_and(|s| s.transition(DerivationStatus::Ready).is_ok())
+            {
+                if let Err(e) = self
+                    .db
+                    .update_derivation_status(&ready_hash, DerivationStatus::Ready, None)
+                    .await
+                {
+                    warn!(drv_hash = %ready_hash, error = %e,
+                          "failed to persist re-probe-unlocked Ready status");
+                }
+                self.push_ready(ready_hash);
+            }
+        }
+        phase!("6f-reprobe-unlocked");
 
         // r[impl sched.substitute.detached]
-        // Upstream-substitutable nodes from check_cached_outputs:
-        // newly-inserted ones are at Created/Queued/Ready (via
-        // seed_initial_states above); reprobe ones may still be
-        // Poisoned/DependencyFailed and transition directly →
-        // Substituting (I-094). Nodes whose transition is rejected
-        // (e.g. apply_cached_hits already completed a chain that
-        // included them) fall through to normal scheduling.
-        if !pending_substitute.is_empty() {
-            let jwt_meta: Vec<(&'static str, String)> = jwt_token
-                .as_deref()
-                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
-                .unwrap_or_default();
-            self.spawn_substitute_fetches(pending_substitute.clone(), jwt_meta)
-                .await;
+        // Newly-inserted substitutable lane: nodes are at Created/
+        // Queued/Ready (via seed_initial_states above). Nodes whose
+        // transition is rejected (e.g. apply_cached_hits already
+        // completed a chain that included them) fall through to normal
+        // scheduling.
+        if !new_sub.is_empty() {
+            self.spawn_substitute_fetches(new_sub, jwt_meta).await;
         }
-        phase!("6e-spawn-substitute");
+        phase!("6g-spawn-substitute-new");
 
         // Pre-existing Ready nodes whose interest set grew: their
         // critical-path priority may have risen (compute_initial above
@@ -579,7 +683,7 @@ impl DagActor {
         if first_dep_failed.is_none() {
             first_dep_failed = preexisting_failed;
         }
-        phase!("6f-preexisting-nodes-loop");
+        phase!("6h-preexisting-nodes-loop");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         MergeReconcile {
@@ -591,14 +695,19 @@ impl DagActor {
 
     /// Step-6a body: apply `ingest.cached_hits` — transition each hit
     /// to `Completed`, set `output_paths`, clear retry state for
-    /// previously-failed re-probes, batch-persist `Completed`, advance
-    /// pre-existing Queued dependents of re-probe hits, and emit
-    /// `DerivationCached` events. Returns `(cached_count,
-    /// deferred_hits, other_builds)` — `deferred_hits` are cache-hits
-    /// whose inputDrvs are incomplete (closure invariant), so the
-    /// caller seeds them as Queued instead; `other_builds` are builds
-    /// other than `ingest.build_id` interested in a re-probe
-    /// completion (caller fans out count-update + completion-check).
+    /// previously-failed re-probes, batch-persist `Completed`, and
+    /// emit `DerivationCached` events. Returns `(cached_count,
+    /// deferred_hits, other_builds, reprobe_unlocked)` —
+    /// `deferred_hits` are cache-hits whose inputDrvs are incomplete
+    /// (closure invariant), so the caller seeds them as Queued
+    /// instead; `other_builds` are builds other than `ingest.build_id`
+    /// interested in a re-probe completion (caller fans out
+    /// count-update + completion-check); `reprobe_unlocked` are
+    /// pre-existing Queued dependents of re-probe hits — the CALLER
+    /// transitions them Queued→Ready AFTER `verify_preexisting_
+    /// completed` (6c) has reset stale-Completed deps, re-checking
+    /// `all_deps_completed` against the post-reset DAG
+    /// (r[sched.merge.reconcile-order]).
     ///
     /// All I/O here is best-effort log-and-continue (build is Active).
     /// Kept as a `&mut self` method (not a free decision fn) because
@@ -609,7 +718,7 @@ impl DagActor {
         &mut self,
         ingest: &MergeIngest,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
-    ) -> (u32, HashSet<DrvHash>, HashSet<Uuid>) {
+    ) -> (u32, HashSet<DrvHash>, HashSet<Uuid>, Vec<DrvHash>) {
         let MergeIngest {
             build_id,
             existing_reprobe,
@@ -714,9 +823,12 @@ impl DagActor {
                 if is_reprobe {
                     info!(drv_hash = %drv_hash, from = ?from_status,
                       "re-probe: existing not-done node found in upstream cache");
-                    // Existing dependents in Queued can now advance.
+                    // Existing dependents in Queued may now advance.
+                    // Collected here, transitioned by the CALLER after
+                    // 6c (stale-reset) so the all_deps_completed
+                    // re-check sees post-reset dep status.
                     // Newly-inserted dependents are handled by
-                    // compute_initial_states below; this catches the
+                    // compute_initial_states; this catches the
                     // pre-existing ones.
                     reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
                     reprobe_completed.push(drv_hash.clone());
@@ -815,33 +927,6 @@ impl DagActor {
             }
             self.upsert_path_tenants_for_batch(&completed_batch).await;
         }
-        // I-099: advance pre-existing Queued dependents of re-probe
-        // hits. Newly-inserted dependents are handled by
-        // compute_initial_states; this is the pre-existing-DAG side.
-        // find_newly_ready captured these while they were Queued, but
-        // a later fixed-point pass may have transitioned a captured
-        // hash Queued→Completed (it was itself a cache-hit). Without
-        // the explicit Queued re-check, transition(Ready) on a
-        // Completed node SUCCEEDS via the I-047 carve-out and we
-        // push_ready a node we just marked Completed (cached_count
-        // over-counts; PG sees Completed then Ready). Re-check the
-        // find_newly_ready precondition at use-site.
-        for ready_hash in reprobe_unlocked {
-            if let Some(s) = self.dag.node_mut(&ready_hash)
-                && s.status() == DerivationStatus::Queued
-                && s.transition(DerivationStatus::Ready).is_ok()
-            {
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(&ready_hash, DerivationStatus::Ready, None)
-                    .await
-                {
-                    warn!(drv_hash = %ready_hash, error = %e,
-                          "failed to persist re-probe-unlocked Ready status");
-                }
-                self.push_ready(ready_hash);
-            }
-        }
         // Fan-out: collect other builds interested in re-probe-
         // completed nodes + emit DerivationCached to each. Caller
         // does update_build_counts + check_build_completion per build.
@@ -867,10 +952,10 @@ impl DagActor {
                 other_builds.insert(b);
             }
         }
-        (cached_count, deferred_hits, other_builds)
+        (cached_count, deferred_hits, other_builds, reprobe_unlocked)
     }
 
-    /// Step-6f body: walk pre-existing nodes (not newly-inserted, not
+    /// Step-6h body: walk pre-existing nodes (not newly-inserted, not
     /// stale-reset, not already counted as a cache-hit) and classify.
     /// `Completed`/`Skipped` → bump cached count + path-tenants upsert;
     /// `Poisoned`/`DependencyFailed` → surface first failed hash so the
@@ -1199,6 +1284,11 @@ impl DagActor {
         // retry, can cascade to Poisoned. "Ready ⟹ all deps' outputs
         // available in store" is the invariant.
         //
+        // The same invariant requires demoting any pre-existing READY
+        // parent of a reset node to Queued (the parent's prior Ready
+        // verdict was computed against the now-stale Completed dep).
+        // Collected in `demote_parents` and applied after pass 2.
+        //
         // Pass 1: collect reset_set (no mutation).
         let reset_set: HashSet<DrvHash> = candidates
             .iter()
@@ -1211,6 +1301,7 @@ impl DagActor {
         // also reset / not done).
         let mut reset = HashSet::new();
         let mut to_spawn: Vec<(DrvHash, Vec<String>)> = Vec::new();
+        let mut demote_parents: HashSet<DrvHash> = HashSet::new();
         for (drv_hash, output_paths) in candidates {
             let Some(gone) = output_paths.iter().find(|p| missing.contains(p.as_str())) else {
                 continue;
@@ -1247,6 +1338,20 @@ impl DagActor {
                 continue;
             }
             state.output_paths.clear();
+            // r[impl sched.merge.stale-completed-verify+3]
+            // Pre-existing Ready parents of this reset node were Ready
+            // against its now-gone output. Collect for demotion to
+            // Queued after pass 2 (try_dispatch_one's `!= Ready` guard
+            // drops the stale ready_queue entry).
+            for p in self.dag.get_parents(&drv_hash) {
+                if self
+                    .dag
+                    .node(&p)
+                    .is_some_and(|s| s.status() == DerivationStatus::Ready)
+                {
+                    demote_parents.insert(p);
+                }
+            }
 
             warn!(
                 drv_hash = %drv_hash,
@@ -1286,6 +1391,41 @@ impl DagActor {
                 self.push_ready(drv_hash_k);
             }
             reset.insert(drv_hash);
+        }
+
+        // Pass 3: demote Ready parents of reset nodes → Queued. The
+        // parent's prior Ready verdict was computed against a dep
+        // whose output is now gone; "Ready ⟹ all deps' outputs
+        // available" no longer holds. find_newly_ready re-promotes
+        // when the reset dep re-completes. Skip parents that pass 2
+        // itself reset (already at Ready/Queued via the reset, not a
+        // stale-Ready). The (Ready, Queued) transition arm is the
+        // I-047 parent-side analog of (Completed, Ready/Queued).
+        for p in demote_parents {
+            if reset.contains(p.as_str()) {
+                continue;
+            }
+            let Some(state) = self.dag.node_mut(&p) else {
+                continue;
+            };
+            if state.status() != DerivationStatus::Ready {
+                continue;
+            }
+            if let Err(e) = state.transition(DerivationStatus::Queued) {
+                warn!(drv_hash = %p, error = %e,
+                      "stale-completed verify: Ready-parent demotion rejected");
+                continue;
+            }
+            warn!(drv_hash = %p,
+                  "stale-completed verify: demoting Ready parent of reset dep → Queued");
+            if let Err(e) = self
+                .db
+                .update_derivation_status(&p, DerivationStatus::Queued, None)
+                .await
+            {
+                error!(drv_hash = %p, error = %e,
+                       "failed to persist Ready-parent demotion (continuing)");
+            }
         }
 
         if !to_spawn.is_empty() {
@@ -1676,7 +1816,7 @@ impl DagActor {
         }
 
         // --- Floating-CA store-existence verify (I-048) ----------------
-        // r[impl sched.merge.stale-completed-verify+2]
+        // r[impl sched.merge.stale-completed-verify+3]
         // The realisations table is scheduler-local PG; store GC doesn't
         // touch it. A realisation can point to a path that's been GC'd.
         // Without this verify, such a node flips to Completed here and
@@ -1844,18 +1984,24 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+2]
+    // r[impl sched.merge.substitute-topdown+3]
     /// Top-down root substitution pre-check (step 0 of `handle_merge_dag`).
     ///
     /// Returns `Some(roots)` if ALL root derivations' IA outputs are
-    /// available (present in store or upstream-substitutable AND
-    /// successfully eager-fetched). The caller prunes the submission
-    /// to roots-only, dropping the dep subgraph before merge.
+    /// available (present in store or upstream-substitutable). The
+    /// caller prunes the submission to roots-only, dropping the dep
+    /// subgraph before merge, and stamps `topdown_pruned=true` on the
+    /// root nodes. The actual fetch is deferred (`r[sched.substitute.
+    /// detached]`) and runs AFTER the prune commits; on
+    /// `SubstituteComplete{ok=false}` for a `topdown_pruned` root,
+    /// `handle_substitute_complete` fails every interested build
+    /// (resubmit re-probes or full-merges) — building is invalid
+    /// because the root's `inputDrvs` were dropped.
     ///
     /// Returns `None` to fall through to the full bottom-up
     /// `check_cached_outputs`. Reasons: no store client, any root
     /// is floating-CA (no expected path), any root output missing
-    /// and not substitutable, any eager-fetch fails, store error.
+    /// and not substitutable, store error.
     ///
     /// Roots are nodes with no parent edge IN THIS SUBMISSION.
     /// Local computation — doesn't consult the global DAG (parents

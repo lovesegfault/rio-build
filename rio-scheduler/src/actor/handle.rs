@@ -58,6 +58,7 @@ pub struct DebugDerivationInfo {
     pub ca: crate::state::CaState,
     pub sched: crate::state::SchedHint,
     pub substitute_tried: bool,
+    pub topdown_pruned: bool,
 }
 
 /// Handle for sending commands to the actor.
@@ -339,6 +340,22 @@ impl ActorHandle {
         self.debug(|reply| DebugCmd::SetOutputPaths {
             drv_hash,
             paths,
+            reply,
+        })
+        .await
+    }
+
+    /// Set a derivation's `topdown_pruned`. Returns `false` if not
+    /// found.
+    pub async fn debug_set_topdown_pruned(
+        &self,
+        drv_hash: &str,
+        value: bool,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SetTopdownPruned {
+            drv_hash,
+            value,
             reply,
         })
         .await
