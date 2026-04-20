@@ -852,6 +852,19 @@ pub const M_052: () = ();
 /// it as a full reset.
 pub const M_051: () = ();
 
+/// `migrations/053_build_logs_first_line.sql`
+///
+/// `first_line bigint` on `build_logs`: the worker-assigned line number
+/// of the FIRST line in the S3 blob. Non-zero iff the ring buffer
+/// evicted (>100k lines). Before this column the blob's offset was
+/// discarded on `LogBuffers::drain()`; `try_s3` then compared the
+/// client's `since` cursor (true-line-number space) against
+/// `line_count` (≤100k survivors) — `since=120000` against a 150k-line
+/// build short-circuited at `120000 >= 100000` and silently dropped the
+/// final 30k lines (bug_084). `DEFAULT 0` is backwards-compat for
+/// pre-053 rows: at worst the client re-receives lines it already has.
+pub const M_053: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

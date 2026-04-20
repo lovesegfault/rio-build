@@ -4,7 +4,7 @@
 //! `admin/logs.rs` submodule seam introduced by P0383.
 
 use super::*;
-use crate::admin::logs::{decompress_and_chunk, try_ring_buffer};
+use crate::admin::logs::{decompress_and_chunk, s3_is_caught_up, try_ring_buffer};
 use crate::logs::drv_log_hash;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -253,7 +253,7 @@ fn decompress_and_chunk_roundtrip() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", 0, 0)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 5, "trailing \\n artifact stripped");
     assert_eq!(chunks[0].lines[0], b"line-0");
@@ -281,7 +281,29 @@ fn try_ring_buffer_caught_up_returns_empty_incomplete_chunk() {
 #[test]
 fn try_ring_buffer_absent_returns_none() {
     let bufs = LogBuffers::new();
-    assert!(try_ring_buffer(&bufs, "never-seen", 0).is_none());
+    assert!(try_ring_buffer(&bufs, "neverseen", 0).is_none());
+}
+
+/// Regression for bug_126: ring-buffer lookup must normalize input the
+/// same way the S3 path does. The worker pushes under the full
+/// `/nix/store/...` path; `rio-cli logs <basename>` (or bare hash) must
+/// hit the same buffer. Before: only the S3 fallback called
+/// `drv_log_hash`, so a basename for an ACTIVE build missed the ring
+/// buffer keyed on the full path → fell through → "no active ring
+/// buffer" while the buffer existed under a different key form.
+#[test]
+fn try_ring_buffer_normalizes_input() {
+    let bufs = LogBuffers::new();
+    let full = "/nix/store/amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-hello.drv";
+    let basename = "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2-hello.drv";
+    let bare = "amnhr5p1w6gmjb7bynh7vxdfjs8x3kr2";
+    bufs.push(&mk_batch(full, 0, &[b"l0", b"l1"]));
+
+    for input in [full, basename, bare] {
+        let chunks = try_ring_buffer(&bufs, input, 0)
+            .unwrap_or_else(|| panic!("input form {input:?} must hit the ring buffer"));
+        assert_eq!(chunks[0].lines.len(), 2, "input form {input:?}");
+    }
 }
 
 /// Regression: with 255 lines and `since=0`, `(255-0) % 256 == 255` —
@@ -299,7 +321,7 @@ fn decompress_and_chunk_255_lines_no_trailing_empty() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 0)?;
+    let chunks = decompress_and_chunk(&zst, "test", 0, 0)?;
     assert_eq!(chunks.len(), 1, "255 < CHUNK_LINES → one chunk");
     assert_eq!(
         chunks[0].lines.len(),
@@ -381,9 +403,61 @@ fn decompress_and_chunk_since_filtering() -> anyhow::Result<()> {
     }
     let zst = enc.finish()?;
 
-    let chunks = decompress_and_chunk(&zst, "test", 3)?;
+    let chunks = decompress_and_chunk(&zst, "test", 0, 3)?;
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].lines.len(), 2, "since=3 → lines 3,4 only");
     assert_eq!(chunks[0].first_line_number, 3);
     Ok(())
+}
+
+/// Regression for bug_084: blob holds true lines [50_000..50_100); a
+/// client at `since=50_070` must receive content of original lines
+/// 50_070..50_099 labeled `first_line_number=50_070` — NOT blob
+/// indices 70..99 mislabeled as 70, and NOT zero lines.
+#[test]
+fn decompress_and_chunk_with_first_line_offset() -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), 6)?;
+    for i in 0..100 {
+        enc.write_all(format!("orig-{}", 50_000 + i).as_bytes())?;
+        enc.write_all(b"\n")?;
+    }
+    let zst = enc.finish()?;
+
+    let chunks = decompress_and_chunk(&zst, "test", 50_000, 50_070)?;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].lines.len(), 30, "true lines 50_070..50_099");
+    assert_eq!(chunks[0].first_line_number, 50_070);
+    assert_eq!(chunks[0].lines[0], b"orig-50070");
+    assert_eq!(chunks[0].lines[29], b"orig-50099");
+    assert!(chunks[0].is_complete);
+
+    // since < first_line (client never saw the evicted head — fresh
+    // poll after completion). All 100 survivors returned, labeled
+    // from first_line.
+    let chunks = decompress_and_chunk(&zst, "test", 50_000, 0)?;
+    assert_eq!(chunks[0].lines.len(), 100);
+    assert_eq!(chunks[0].first_line_number, 50_000);
+    assert_eq!(chunks[0].lines[0], b"orig-50000");
+    Ok(())
+}
+
+/// Regression for bug_084: the short-circuit must compare `since`
+/// against `first_line + line_count`, not bare `line_count`. A 150k-line
+/// build whose ring evicted to survivors [50_000..150_000) has
+/// `first_line=50_000, line_count=100_000`; a client at `since=120_000`
+/// is NOT caught up (30k lines remain).
+#[test]
+fn s3_short_circuit_respects_first_line() {
+    // The bug: previously `120_000 >= 100_000` → short-circuit → 30k
+    // lines silently dropped.
+    assert!(
+        !s3_is_caught_up(120_000, 50_000, 100_000),
+        "since=120k < first+count=150k → NOT caught up"
+    );
+    // Genuine caught-up at the boundary.
+    assert!(s3_is_caught_up(150_000, 50_000, 100_000));
+    // No-eviction case (first_line=0) reduces to the old comparison.
+    assert!(s3_is_caught_up(5, 0, 5));
+    assert!(!s3_is_caught_up(4, 0, 5));
 }

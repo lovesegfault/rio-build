@@ -47,7 +47,11 @@ pub use flush::{FlushRequest, LogFlusher};
 /// Accepts any of:
 /// - full store path `/nix/store/{hash}-{name}.drv` → `{hash}`
 /// - basename `{hash}-{name}.drv` → `{hash}`
-/// - bare hash `{hash}` → unchanged (dashboard passes this directly)
+/// - bare hash `{hash}` → unchanged
+///
+/// Idempotent: `drv_log_hash(drv_log_hash(s)) == drv_log_hash(s)`.
+/// [`LogBuffers`] keys on this hash for both push and read so the
+/// ring-buffer and S3 paths resolve client input identically.
 pub fn drv_log_hash(s: &str) -> String {
     // Full store path → parsed hash_part. Validates nixbase32 + length.
     if let Ok(sp) = StorePath::parse(s) {
@@ -112,12 +116,22 @@ struct RingBuf {
     bytes: usize,
 }
 
-/// Per-derivation log ring buffers, keyed by `drv_path`.
+/// Per-derivation log ring buffers, keyed by [`drv_log_hash`] of the
+/// derivation path.
 ///
-/// `drv_path` (not `drv_hash`) because that's what `BuildLogBatch` carries.
-/// A derivation is built exactly once even if N builds want it (DAG merging),
-/// so one ring buffer per drv_path is correct — the S3 flush writes one
-/// blob and N `build_logs` PG rows (one per interested build, same s3_key).
+/// Every accessor normalizes its `drv_path` argument through
+/// [`drv_log_hash`] before the DashMap/DashSet op, so callers may pass
+/// any of full store path / basename / bare hash and resolve to the
+/// same buffer — the same normalizer the S3 read path uses, so the two
+/// data sources can never disagree on input shape (bug_126: a basename
+/// passed to `rio-cli logs` for an active build used to miss the ring
+/// buffer keyed on the full path and fall through to a misleading
+/// `not_found`).
+///
+/// A derivation is built exactly once even if N builds want it (DAG
+/// merging), so one ring buffer per drv_hash is correct — the S3 flush
+/// writes one blob and N `build_logs` PG rows (one per interested
+/// build, same s3_key).
 pub struct LogBuffers {
     buffers: DashMap<String, RingBuf>,
     /// Tombstone set: derivations that have reached a terminal state.
@@ -147,17 +161,15 @@ impl LogBuffers {
     /// snapshot, and a few trailing batched lines are not worth an
     /// unbounded entry-count leak.
     pub fn push(&self, batch: &BuildLogBatch) {
-        if self.sealed.contains(&batch.derivation_path) {
+        let key = drv_log_hash(&batch.derivation_path);
+        if self.sealed.contains(&key) {
             return;
         }
         // `entry()` locks the shard's write lock for the duration of the
         // closure. For the same-key case (one worker per drv_path), this is
         // uncontended. For cross-key, DashMap's sharding means we rarely
         // block other drv_paths.
-        let mut buf = self
-            .buffers
-            .entry(batch.derivation_path.clone())
-            .or_default();
+        let mut buf = self.buffers.entry(key).or_default();
 
         let base = batch.first_line_number;
         for (i, line) in batch.lines.iter().enumerate() {
@@ -187,17 +199,22 @@ impl LogBuffers {
     /// Called on completion flush. Returns `None` if the buffer doesn't
     /// exist (never logged anything, or already drained).
     ///
-    /// Returns `(line_count, total_bytes, lines_in_order)`. `line_count` may
-    /// be less than the total emitted by the worker if ring eviction kicked
-    /// in — in that case the earliest lines are gone, which the S3 blob
-    /// will reflect (starts at a non-zero line number). That's the
-    /// intentional tradeoff of a ring buffer.
-    pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, Vec<Vec<u8>>)> {
-        let (_key, rb) = self.buffers.remove(drv_path)?;
+    /// Returns `(first_line, line_count, total_bytes, lines_in_order)`.
+    /// `first_line` is the worker-assigned line number of `lines[0]` —
+    /// non-zero iff ring eviction kicked in (>RING_CAPACITY lines emitted).
+    /// `line_count` may be less than the total emitted by the worker for
+    /// the same reason. The S3 blob and PG `build_logs` row carry
+    /// `first_line` so the read path operates in the same true-line-number
+    /// space as the ring buffer (bug_084: previously the offset was
+    /// discarded here and `try_s3` treated the client's `since` cursor as
+    /// a 0-based blob index → silent log-tail loss after eviction).
+    pub fn drain(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+        let (_key, rb) = self.buffers.remove(&drv_log_hash(drv_path))?;
+        let first_line = rb.lines.front().map(|(n, _)| *n).unwrap_or(0);
         let line_count = rb.lines.len() as u64;
         let total_bytes = rb.bytes as u64;
         let lines: Vec<Vec<u8>> = rb.lines.into_iter().map(|(_n, bytes)| bytes).collect();
-        Some((line_count, total_bytes, lines))
+        Some((first_line, line_count, total_bytes, lines))
     }
 
     /// Read lines with line number ≥ `since`, non-consuming.
@@ -214,7 +231,7 @@ impl LogBuffers {
     /// signature) made `try_ring_buffer` map "caught up on an active
     /// build" → S3 → `NotFound`.
     pub fn read_since(&self, drv_path: &str, since: u64) -> Option<Vec<Line>> {
-        let buf = self.buffers.get(drv_path)?;
+        let buf = self.buffers.get(&drv_log_hash(drv_path))?;
         // Could binary-search for `since` since line numbers are monotone,
         // but `read_since` is called by dashboard polls (infrequent) on a
         // buffer that's already in-memory. Linear scan is fine until
@@ -238,8 +255,9 @@ impl LogBuffers {
     /// dropped-FlushRequest leak to the ~30s cleanup delay). Idempotent;
     /// no-op on a missing entry.
     pub fn discard(&self, drv_path: &str) {
-        self.buffers.remove(drv_path);
-        self.sealed.remove(drv_path);
+        let key = drv_log_hash(drv_path);
+        self.buffers.remove(&key);
+        self.sealed.remove(&key);
     }
 
     /// Mark `drv_path` terminal: subsequent [`Self::push`] calls drop.
@@ -254,7 +272,7 @@ impl LogBuffers {
     /// Idempotent. Retry / re-dispatch un-seals via [`Self::unseal`] (or
     /// [`Self::discard`], which also un-seals).
     pub fn seal(&self, drv_path: &str) {
-        self.sealed.insert(drv_path.to_owned());
+        self.sealed.insert(drv_log_hash(drv_path));
     }
 
     /// Reverse [`Self::seal`]: re-open `drv_path` for pushes. Called on
@@ -262,7 +280,7 @@ impl LogBuffers {
     /// and by the recv task / flusher on terminal cleanup to bound
     /// `sealed`. Idempotent; no-op if not sealed.
     pub fn unseal(&self, drv_path: &str) {
-        self.sealed.remove(drv_path);
+        self.sealed.remove(&drv_log_hash(drv_path));
     }
 
     /// Whether `drv_path` is currently sealed (a completion landed and
@@ -272,7 +290,7 @@ impl LogBuffers {
     /// handler (the unsynchronized `is_sealed` branch here raced the
     /// actor's `seal()` under load).
     pub fn is_sealed(&self, drv_path: &str) -> bool {
-        self.sealed.contains(drv_path)
+        self.sealed.contains(&drv_log_hash(drv_path))
     }
 
     /// Number of active buffers. For metrics + flusher periodic-scan skip.
@@ -306,12 +324,13 @@ impl LogBuffers {
     /// log (wasteful in S3 PUTs, but bounded: at most one per 30s per active
     /// derivation, and the spec explicitly accepts that tradeoff at
     /// `observability.md:38-40`).
-    pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, Vec<Vec<u8>>)> {
-        let buf = self.buffers.get(drv_path)?;
+    pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+        let buf = self.buffers.get(&drv_log_hash(drv_path))?;
+        let first_line = buf.lines.front().map(|(n, _)| *n).unwrap_or(0);
         let line_count = buf.lines.len() as u64;
         let total_bytes = buf.bytes as u64;
         let lines: Vec<Vec<u8>> = buf.lines.iter().map(|(_n, bytes)| bytes.clone()).collect();
-        Some((line_count, total_bytes, lines))
+        Some((first_line, line_count, total_bytes, lines))
     }
 }
 
@@ -429,12 +448,33 @@ mod tests {
         bufs.push(&mk_batch("drv-a", 0, &[b"hello", b"world"]));
         assert_eq!(bufs.active_count(), 1);
 
-        let (count, bytes, lines) = bufs.drain("drv-a").expect("buffer exists");
+        let (first, count, bytes, lines) = bufs.drain("drv-a").expect("buffer exists");
+        assert_eq!(first, 0, "no eviction → first_line=0");
         assert_eq!(count, 2);
         assert_eq!(bytes, 5 + 5);
         assert_eq!(lines, vec![b"hello".to_vec(), b"world".to_vec()]);
         assert_eq!(bufs.active_count(), 0, "drain removed the entry");
         assert!(bufs.drain("drv-a").is_none(), "second drain returns None");
+    }
+
+    /// Regression for bug_084: after ring eviction, `drain` must return
+    /// the FIRST surviving line's true number — NOT zero, NOT line_count.
+    /// This is the offset persisted in `build_logs.first_line` so the
+    /// S3 read path stays in true-line-number space.
+    #[test]
+    fn drain_after_eviction_returns_first_surviving_line_number() {
+        let bufs = LogBuffers::new();
+        let lines: Vec<Vec<u8>> = (0..RING_CAPACITY).map(|i| vec![i as u8]).collect();
+        let line_refs: Vec<&[u8]> = lines.iter().map(|v| v.as_slice()).collect();
+        bufs.push(&mk_batch("drv-a", 0, &line_refs));
+        // 50 more → first 50 evicted; survivors are true lines [50..100050).
+        let extra: Vec<Vec<u8>> = (0..50).map(|i| vec![i as u8]).collect();
+        let extra_refs: Vec<&[u8]> = extra.iter().map(|v| v.as_slice()).collect();
+        bufs.push(&mk_batch("drv-a", RING_CAPACITY as u64, &extra_refs));
+
+        let (first, count, _bytes, _lines) = bufs.drain("drv-a").unwrap();
+        assert_eq!(first, 50, "first surviving true line number");
+        assert_eq!(count, RING_CAPACITY as u64, "survivor count (capped)");
     }
 
     #[test]
@@ -454,15 +494,17 @@ mod tests {
 
     #[test]
     fn separate_drv_paths_are_independent() {
+        // Keys with no `-` so `drv_log_hash` leaves them distinct
+        // (`drv-a`/`drv-b` both normalize to `drv`).
         let bufs = LogBuffers::new();
-        bufs.push(&mk_batch("drv-a", 0, &[b"a0"]));
-        bufs.push(&mk_batch("drv-b", 0, &[b"b0", b"b1"]));
+        bufs.push(&mk_batch("aaa", 0, &[b"a0"]));
+        bufs.push(&mk_batch("bbb", 0, &[b"b0", b"b1"]));
 
-        assert_eq!(bufs.read_since("drv-a", 0).unwrap().len(), 1);
-        assert_eq!(bufs.read_since("drv-b", 0).unwrap().len(), 2);
+        assert_eq!(bufs.read_since("aaa", 0).unwrap().len(), 1);
+        assert_eq!(bufs.read_since("bbb", 0).unwrap().len(), 2);
 
-        bufs.drain("drv-a");
-        assert_eq!(bufs.read_since("drv-b", 0).unwrap().len(), 2, "b untouched");
+        bufs.drain("aaa");
+        assert_eq!(bufs.read_since("bbb", 0).unwrap().len(), 2, "b untouched");
     }
 
     /// DashMap's sharded locking should handle concurrent push from
@@ -475,7 +517,8 @@ mod tests {
         for i in 0..16 {
             let bufs = bufs.clone();
             handles.push(tokio::spawn(async move {
-                let drv = format!("drv-{i}");
+                // No `-` so `drv_log_hash` leaves keys distinct.
+                let drv = format!("drv{i}");
                 let five_lines: [&[u8]; 5] = [b"l", b"l", b"l", b"l", b"l"];
                 for batch_n in 0..10 {
                     bufs.push(&mk_batch(&drv, batch_n * 5, &five_lines));
@@ -488,9 +531,9 @@ mod tests {
         assert_eq!(bufs.active_count(), 16);
         for i in 0..16 {
             assert_eq!(
-                bufs.read_since(&format!("drv-{i}"), 0).unwrap().len(),
+                bufs.read_since(&format!("drv{i}"), 0).unwrap().len(),
                 50,
-                "drv-{i} should have all 50 lines"
+                "drv{i} should have all 50 lines"
             );
         }
     }
@@ -512,7 +555,7 @@ mod tests {
 
         // Flusher drains: gets the 2 pre-seal lines (seal did NOT
         // remove the buffer, only tombstoned it).
-        let (count, _bytes, lines) = bufs.drain("drv-a").expect("buffer should exist");
+        let (_first, count, _bytes, lines) = bufs.drain("drv-a").expect("buffer should exist");
         assert_eq!(count, 2);
         assert_eq!(lines, vec![b"line0".to_vec(), b"line1".to_vec()]);
 
@@ -572,7 +615,7 @@ mod tests {
         // Worker W2 pushes from line 0 (fresh attempt).
         bufs.push(&mk_batch("drv-a", 0, &[b"w2-0", b"w2-1", b"w2-2"]));
         // Final flush drains: must be exactly W2's 3 lines, not 8.
-        let (count, _bytes, lines) = bufs.drain("drv-a").expect("buffer exists");
+        let (_first, count, _bytes, lines) = bufs.drain("drv-a").expect("buffer exists");
         assert_eq!(count, 3, "stale W1 partial must be gone");
         assert_eq!(
             lines,

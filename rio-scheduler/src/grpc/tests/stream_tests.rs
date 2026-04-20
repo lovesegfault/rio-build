@@ -490,13 +490,15 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
     let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
 
-    // 12 distinct fake paths; cap is 8.
+    // 12 distinct fake paths; cap is 8. Distinct HASH portions —
+    // LogBuffers keys on `drv_log_hash` (bug_126), so `test_drv_path`
+    // (one shared TEST_HASH) would collapse to a single buffer.
     for i in 0..12 {
         stream_tx
             .send(rio_proto::types::ExecutorMessage {
                 msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
                     rio_proto::types::BuildLogBatch {
-                        derivation_path: test_drv_path(&format!("cap-{i}")),
+                        derivation_path: format!("/nix/store/cap{i}-test.drv"),
                         lines: vec![b"x".to_vec()],
                         first_line_number: 0,
                         executor_id: "cap-worker".into(),

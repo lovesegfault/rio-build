@@ -151,7 +151,7 @@ impl LogFlusher {
         // Clear so `sealed` stays bounded even if the recv task is
         // still running (or never saw a LogBatch — silent build).
         self.buffers.unseal(&req.drv_path);
-        let Some((line_count, raw_bytes, lines)) = drained else {
+        let Some((first_line, line_count, raw_bytes, lines)) = drained else {
             // Buffer doesn't exist. Two legitimate causes:
             // (a) Derivation produced zero log output. Rare but possible
             //     (e.g., a silent `cp` FOD). No blob to write.
@@ -160,7 +160,7 @@ impl LogFlusher {
             debug!(drv_path = %req.drv_path, "no buffer to flush (silent build or dup)");
             return;
         };
-        self.upload_and_record(req, line_count, raw_bytes, lines, true)
+        self.upload_and_record(req, first_line, line_count, raw_bytes, lines, true)
             .await;
     }
 
@@ -175,7 +175,8 @@ impl LogFlusher {
         debug!(active = keys.len(), "periodic log snapshot");
 
         for drv_path in keys {
-            let Some((line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path) else {
+            let Some((first_line, line_count, raw_bytes, lines)) = self.buffers.snapshot(&drv_path)
+            else {
                 // Buffer vanished between active_keys() and snapshot() —
                 // drained by a concurrent flush_final. Fine, skip.
                 continue;
@@ -195,7 +196,7 @@ impl LogFlusher {
                 drv_path,
                 interested_builds: Vec::new(), // no PG rows for periodic
             };
-            self.upload_and_record(req, line_count, raw_bytes, lines, false)
+            self.upload_and_record(req, first_line, line_count, raw_bytes, lines, false)
                 .await;
         }
     }
@@ -214,6 +215,7 @@ impl LogFlusher {
     async fn upload_and_record(
         &self,
         req: FlushRequest,
+        first_line: u64,
         line_count: u64,
         _raw_bytes: u64,
         lines: Vec<Vec<u8>>,
@@ -282,6 +284,7 @@ impl LogFlusher {
 
         debug!(
             s3_key = %s3_key,
+            first_line,
             line_count,
             compressed_size,
             is_final,
@@ -297,6 +300,7 @@ impl LogFlusher {
                 &req.interested_builds,
                 &drv_hash,
                 &s3_key,
+                first_line,
                 line_count,
                 is_final,
             )
@@ -371,6 +375,7 @@ async fn insert_log_rows(
     build_ids: &[Uuid],
     drv_hash: &str,
     s3_key: &str,
+    first_line: u64,
     line_count: u64,
     is_complete: bool,
 ) -> sqlx::Result<()> {
@@ -378,10 +383,12 @@ async fn insert_log_rows(
     // and the S3 PUT above already dominates latency.
     for bid in build_ids {
         sqlx::query(
-            "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO build_logs
+                 (build_id, drv_hash, s3_key, first_line, line_count, is_complete)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (build_id, drv_hash) DO UPDATE SET
                  s3_key = EXCLUDED.s3_key,
+                 first_line = EXCLUDED.first_line,
                  line_count = EXCLUDED.line_count,
                  is_complete = EXCLUDED.is_complete,
                  created_at = now()",
@@ -389,6 +396,7 @@ async fn insert_log_rows(
         .bind(bid)
         .bind(drv_hash)
         .bind(s3_key)
+        .bind(first_line as i64)
         .bind(line_count as i64)
         .bind(is_complete)
         .execute(pool)
@@ -540,15 +548,17 @@ mod tests {
         assert_eq!(&body[..4], &[0x28, 0xb5, 0x2f, 0xfd], "should be zstd");
 
         // PG row inserted with is_complete=true.
-        let row: (i64, bool) = sqlx::query_as(
-            "SELECT line_count, is_complete FROM build_logs WHERE build_id = $1 AND drv_hash = $2",
+        let row: (i64, i64, bool) = sqlx::query_as(
+            "SELECT first_line, line_count, is_complete FROM build_logs \
+             WHERE build_id = $1 AND drv_hash = $2",
         )
         .bind(build_id)
         .bind(drv_hash)
         .fetch_one(&db.pool)
         .await?;
-        assert_eq!(row.0, 3, "line_count");
-        assert!(row.1, "is_complete should be true for final flush");
+        assert_eq!(row.0, 0, "first_line (no eviction)");
+        assert_eq!(row.1, 3, "line_count");
+        assert!(row.2, "is_complete should be true for final flush");
         Ok(())
     }
 
@@ -649,11 +659,11 @@ mod tests {
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v1", 10, false).await?;
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v2", 50, true).await?;
+        insert_log_rows(&db.pool, &[build_id], "hash", "key-v1", 0, 10, false).await?;
+        insert_log_rows(&db.pool, &[build_id], "hash", "key-v2", 7, 50, true).await?;
 
-        let row: (String, i64, bool) = sqlx::query_as(
-            "SELECT s3_key, line_count, is_complete FROM build_logs
+        let row: (String, i64, i64, bool) = sqlx::query_as(
+            "SELECT s3_key, first_line, line_count, is_complete FROM build_logs
              WHERE build_id = $1 AND drv_hash = $2",
         )
         .bind(build_id)
@@ -661,8 +671,9 @@ mod tests {
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(row.0, "key-v2", "UPSERT should overwrite");
-        assert_eq!(row.1, 50);
-        assert!(row.2);
+        assert_eq!(row.1, 7, "first_line UPSERTed");
+        assert_eq!(row.2, 50);
+        assert!(row.3);
 
         // Still exactly one row (UPSERT, not duplicate insert).
         let count: (i64,) =
@@ -761,8 +772,9 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule_fail, &rule_ok]);
 
         let buffers = Arc::new(LogBuffers::new());
-        buffers.push(&mk_batch("drv-fail", 0, &[b"will-be-lost"]));
-        buffers.push(&mk_batch("drv-ok", 0, &[b"will-survive"]));
+        // Keys with no `-` so `drv_log_hash` leaves them distinct.
+        buffers.push(&mk_batch("drvfail", 0, &[b"will-be-lost"]));
+        buffers.push(&mk_batch("drvok", 0, &[b"will-survive"]));
 
         let flusher = LogFlusher::new(
             client,
@@ -776,20 +788,20 @@ mod tests {
         // is lost. NOT a panic.
         flusher
             .flush_final(FlushRequest {
-                drv_path: "drv-fail".into(),
+                drv_path: "drvfail".into(),
                 interested_builds: vec![build_id],
             })
             .await;
         assert_eq!(
             buffers.active_count(),
             1,
-            "drv-fail drained (even though S3 failed), drv-ok still there"
+            "drvfail drained (even though S3 failed), drvok still there"
         );
 
         // Second flush → S3 succeeds. Proves the flusher is still alive.
         flusher
             .flush_final(FlushRequest {
-                drv_path: "drv-ok".into(),
+                drv_path: "drvok".into(),
                 interested_builds: vec![build_id],
             })
             .await;
@@ -799,7 +811,7 @@ mod tests {
             .fetch_all(&db.pool)
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "drv");
+        assert_eq!(rows[0].0, "drvok");
         Ok(())
     }
 

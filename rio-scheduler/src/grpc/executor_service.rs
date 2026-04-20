@@ -285,7 +285,8 @@ impl ExecutorService for SchedulerGrpc {
                             //    one S3 PUT each. The actor's `hash_for_path`
                             //    gate runs AFTER push and only drops the
                             //    gateway-forward, not the buffer entry.
-                            if !seen_drvs.contains(&log.derivation_path) {
+                            let key = crate::logs::drv_log_hash(&log.derivation_path);
+                            if !seen_drvs.contains(&key) {
                                 if seen_drvs.len() >= MAX_DRVS_PER_STREAM {
                                     metrics::counter!(
                                         "rio_scheduler_log_unknown_drv_dropped_total"
@@ -293,7 +294,7 @@ impl ExecutorService for SchedulerGrpc {
                                     .increment(1);
                                     continue;
                                 }
-                                seen_drvs.insert(log.derivation_path.clone());
+                                seen_drvs.insert(key);
                             }
                             // 1. Ring buffer write — direct, no actor involvement.
                             //    This is the durability path: even if the actor is

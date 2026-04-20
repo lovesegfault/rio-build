@@ -175,8 +175,8 @@ async fn try_s3(
 
     // PG lookup: find the s3_key. The flusher wrote this row with
     // is_complete=true on the final flush.
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT s3_key, line_count FROM build_logs
+    let row: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT s3_key, first_line, line_count FROM build_logs
          WHERE build_id = $1 AND drv_hash = $2 AND is_complete = true",
     )
     .bind(build_id)
@@ -185,9 +185,10 @@ async fn try_s3(
     .await
     .status_internal("PG query failed")?;
 
-    let Some((s3_key, line_count)) = row else {
+    let Some((s3_key, first_line, line_count)) = row else {
         return Ok(None); // not in S3 either → truly not found
     };
+    let first_line = first_line as u64;
 
     // Short-circuit: client already has every line. Don't fetch +
     // zstd-decode a (potentially 10 MiB) blob just to produce zero
@@ -195,7 +196,7 @@ async fn try_s3(
     // `chunks.last_mut()` is None, so no `is_complete=true` would ship
     // (client never learns the build finished). One empty terminal
     // chunk satisfies the proto contract.
-    if since >= line_count as u64 {
+    if s3_is_caught_up(since, first_line, line_count as u64) {
         return Ok(Some(vec![BuildLogChunk {
             derivation_path: drv_hash.to_string(),
             lines: vec![],
@@ -224,7 +225,7 @@ async fn try_s3(
     // Decompress in spawn_blocking — same rationale as the flusher's encode.
     let drv_hash_owned = drv_hash.to_string();
     let chunks = tokio::task::spawn_blocking(move || {
-        decompress_and_chunk(&compressed, &drv_hash_owned, since)
+        decompress_and_chunk(&compressed, &drv_hash_owned, first_line, since)
     })
     .await
     .status_internal("zstd decode task panicked")?
@@ -233,8 +234,29 @@ async fn try_s3(
     Ok(Some(chunks))
 }
 
+/// Short-circuit predicate for [`try_s3`]: the client's `since` cursor
+/// is at or past the last line in the blob (true line number
+/// `first_line + line_count - 1`), so fetching + decoding would yield
+/// zero lines.
+///
+/// Extracted as a pure fn so the bug_084 arithmetic
+/// (`since >= first_line + line_count`, NOT `since >= line_count`) is
+/// directly unit-testable. Before bug_084 the comparison ignored
+/// `first_line`: a 150k-line build with the client at `since=120000`
+/// short-circuited against `line_count=100000` (ring-capped survivors)
+/// → silently dropped the final 30k lines.
+pub(super) fn s3_is_caught_up(since: u64, first_line: u64, line_count: u64) -> bool {
+    since >= first_line + line_count
+}
+
 /// Decompress the zstd blob, split on `\n`, apply `since` filtering, chunk.
 /// Standalone so spawn_blocking can take it without `self`.
+///
+/// `first_line` is the true worker-assigned line number of blob index 0
+/// (`build_logs.first_line` — non-zero iff ring eviction happened).
+/// `since` is in the same true-line-number space; both are rebased here
+/// so the returned `first_line_number` matches what `try_ring_buffer`
+/// would have reported.
 ///
 /// `drv_label` goes into `BuildLogChunk.derivation_path`. The S3 path uses
 /// `drv_hash` but the proto field is called `derivation_path` — we put the
@@ -243,6 +265,7 @@ async fn try_s3(
 pub(super) fn decompress_and_chunk(
     compressed: &[u8],
     drv_label: &str,
+    first_line: u64,
     since: u64,
 ) -> std::io::Result<Vec<BuildLogChunk>> {
     let decoded = zstd::decode_all(compressed)?;
@@ -255,11 +278,12 @@ pub(super) fn decompress_and_chunk(
     // case structurally.
     let raw: &[u8] = decoded.strip_suffix(b"\n").unwrap_or(&decoded);
 
-    // Line numbers are the index into this split, starting from 0 (the
-    // flusher writes them in buffer order, which IS line-number order).
+    // True line numbers are blob-index + first_line offset (the flusher
+    // writes survivors in buffer order, which IS line-number order, but
+    // ring eviction means blob index 0 may be true line N>0).
     let mut chunks = Vec::new();
     let mut buf: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_LINES);
-    let mut chunk_first_line = since;
+    let mut chunk_first_line = since.max(first_line);
 
     #[allow(
         clippy::sliced_string_as_bytes,
@@ -267,8 +291,8 @@ pub(super) fn decompress_and_chunk(
                   writes raw bytes joined by 0x0A — splitting on 0x0A is the \
                   inverse, no Unicode line-break handling wanted"
     )]
-    for (n, line) in raw.split(|b| *b == b'\n').enumerate() {
-        let n = n as u64;
+    for (i, line) in raw.split(|b| *b == b'\n').enumerate() {
+        let n = first_line + i as u64;
         if n < since {
             continue; // client already has this line
         }
