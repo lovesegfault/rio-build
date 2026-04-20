@@ -498,7 +498,7 @@ mod conn_cap_tests {
     fn semaphore_at_cap_rejects() {
         let sem = Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS));
         // Drain.
-        let permits: Vec<_> = (0..DEFAULT_MAX_CONNECTIONS)
+        let mut permits: Vec<_> = (0..DEFAULT_MAX_CONNECTIONS)
             .map(|_| Arc::clone(&sem).try_acquire_owned().expect("under cap"))
             .collect();
         // At cap → Err.
@@ -506,12 +506,16 @@ mod conn_cap_tests {
             Arc::clone(&sem).try_acquire_owned().is_err(),
             "N+1th acquire on Semaphore::new(N) must fail"
         );
-        // Drop one → slot freed.
-        drop(permits.into_iter().next());
+        // Drop one → slot freed. NOT `into_iter().next()` — that moves
+        // the Vec into a temporary IntoIter whose end-of-statement drop
+        // releases ALL N permits, making the assertion below vacuous.
+        drop(permits.pop());
+        assert_eq!(sem.available_permits(), 1, "exactly one slot freed");
         assert!(
             Arc::clone(&sem).try_acquire_owned().is_ok(),
             "dropping a permit must free a slot"
         );
+        drop(permits);
     }
 
     /// `ensure_permit` with `conn_permit: None` returns Err. This is
