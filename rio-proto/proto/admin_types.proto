@@ -40,6 +40,15 @@ message ListExecutorsRequest {
 
 message ListExecutorsResponse {
   repeated ExecutorInfo executors = 1;
+  // Seconds since this replica acquired leadership. Consumers MUST
+  // treat the executor list as potentially incomplete (workers
+  // reconnecting) when this is small. The controller's
+  // orphan_reap_gate fail-closes when leader_for_secs <
+  // ORPHAN_REAP_GRACE: a non-empty PARTIAL list during the reconnect
+  // window cannot prove absence, and select_orphan_running's
+  // None=>true arm would otherwise foreground-delete every
+  // not-yet-reconnected worker's Running Job mid-build.
+  uint64 leader_for_secs = 2;
 }
 
 message ExecutorInfo {

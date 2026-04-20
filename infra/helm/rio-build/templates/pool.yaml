@@ -21,8 +21,6 @@ spec:
   image: {{ include "rio.image" (list $root $p.image) }}
   systems:
     {{- toYaml (required "pool: systems must be non-empty" $p.systems) | nindent 4 }}
-  features:
-    {{- toYaml ($p.features | default list) | nindent 4 }}
   {{- with $p.maxConcurrent }}
   maxConcurrent: {{ . }}
   {{- end }}
@@ -37,8 +35,10 @@ spec:
   {{- if ne $p.kind "Fetcher" }}
   {{- /* CEL forbids these for Fetcher; the reconciler forces ADR-019
          hardening regardless. Render only for Builder so a Fetcher
-         entry inheriting poolDefaults.{privileged,seccomp} isn't
-         rejected at admission. */}}
+         entry inheriting poolDefaults.{privileged,seccomp,features}
+         isn't rejected at admission. */}}
+  features:
+    {{- toYaml ($p.features | default list) | nindent 4 }}
   {{- include "rio.optBool" (list $p "privileged" $p.privileged) | nindent 2 }}
   {{- with $p.seccompProfile }}
   seccompProfile:

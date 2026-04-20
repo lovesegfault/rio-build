@@ -54,7 +54,7 @@ pub(super) async fn setup_svc(
         // fast, never listened on) not a timeout-prone addr.
         "127.0.0.1:1".into(),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
         // service_verifier=None → dev-mode pass-through. Tests that
@@ -223,7 +223,7 @@ async fn setup_svc_with_service_verifier() -> (
         actor,
         "127.0.0.1:1".into(),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
         Some(verifier),

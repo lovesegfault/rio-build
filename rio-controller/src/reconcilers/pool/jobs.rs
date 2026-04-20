@@ -282,14 +282,14 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // I-183: spawn-only is half a control loop. `None` when scheduler
     // unreachable: reap is fail-CLOSED (spawn is fail-open).
     let queued_known = scheduler_err.is_none().then_some(queued);
-    reap_excess_pending(&jobs_api, &jobs.items, queued_known, &name).await;
+    reap_excess_pending(&jobs_api, &jobs.items, &reaped, queued_known, &name).await;
 
     // ---- Reap orphan Running ----
     // I-165: a builder stuck in D-state (FUSE wait, OOM-loop) can't
     // self-exit and never disconnects, so the scheduler never
     // reassigns. After ORPHAN_REAP_GRACE (5min), any Running Job the
     // scheduler doesn't consider busy is deleted.
-    reap_orphan_running(&jobs_api, &jobs.items, ctx, &name).await;
+    reap_orphan_running(&jobs_api, &jobs.items, &reaped, ctx, &name).await;
 
     // ---- Report terminations ----
     report_terminated_pods(ctx, &ns, &name).await;
@@ -324,13 +324,15 @@ async fn queued_for_pool(
     pool: &Pool,
 ) -> std::result::Result<Vec<SpawnIntent>, tonic::Status> {
     // I-176: `filter_features=true` even when `features` is empty: a
-    // featureless pool then sees only featureless work. Fetcher pools
-    // have `features=[]` always (FODs route by is_fixed_output alone).
+    // featureless pool then sees only featureless work.
+    // `effective_features` (Fetcher → []) is the same chokepoint
+    // `RIO_FEATURES` reads — keeps the spawn-decision query and the
+    // spawned worker's capabilities derived from one value.
     let resp = admin_call(ctx.admin.clone().get_spawn_intents(
         rio_proto::types::GetSpawnIntentsRequest {
             kind: Some(super::executor_kind_to_proto(pool.spec.kind).into()),
             systems: pool.spec.systems.clone(),
-            features: pool.spec.features.clone(),
+            features: pod::effective_features(&pool.spec),
             filter_features: true,
         },
     ))

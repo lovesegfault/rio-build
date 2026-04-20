@@ -83,7 +83,7 @@ pub(crate) const REASON_FETCHER_PRIVILEGED_SUPPRESSED: &str = "FetcherPrivileged
 pub(crate) const REASON_FETCHER_HOST_NETWORK_SUPPRESSED: &str = "FetcherHostNetworkSuppressed";
 pub(crate) const REASON_FETCHER_SECCOMP_OVERRIDDEN: &str = "FetcherSeccompOverridden";
 pub(crate) const REASON_FETCHER_FUSE_TUNING_IGNORED: &str = "FetcherFuseTuningIgnored";
-pub(crate) const REASON_FETCHER_KVM_FEATURE_IGNORED: &str = "FetcherKvmFeatureIgnored";
+pub(crate) const REASON_FETCHER_FEATURES_IGNORED: &str = "FetcherFeaturesIgnored";
 
 /// One spec-degrade check. `applies` is a pure predicate over the
 /// spec; if true, a `Warning` event with `reason`/`note` is emitted.
@@ -108,8 +108,18 @@ fn is_fetcher_spec(s: &rio_crds::pool::PoolSpec) -> bool {
 /// 121-155` plus the non-CEL `wants_kvm` drop.
 pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
     // r[impl ctrl.crd.host-users-network-exclusive]
+    // Builder-only: the pod.rs:327 suppression this mirrors only fires
+    // on the Builder path. Fetchers always get `Some(false)` from
+    // `effective_host_users` (never omitted) and `host_network=None`
+    // forced — entry [2] (`FetcherHostNetworkSuppressed`) is the
+    // correct event for a Fetcher with `hostNetwork:true`. Without
+    // this gate, a pre-CEL `Fetcher{hostNetwork:true}` emitted a
+    // factually-wrong "hostUsers omitted" + unactionable "Set
+    // privileged:true" (forced false for Fetchers).
     DegradeCheck {
-        applies: |s| s.host_network == Some(true) && s.privileged != Some(true),
+        applies: |s| {
+            !is_fetcher_spec(s) && s.host_network == Some(true) && s.privileged != Some(true)
+        },
         reason: REASON_HOST_USERS_SUPPRESSED,
         note: "hostNetwork:true forces hostUsers omitted \
                (K8s admission rejects the combo). Set \
@@ -143,12 +153,15 @@ pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
         note: "kind=Fetcher ignores fuseThreads/fusePassthrough — fetches \
                are network-bound, not FUSE-bound. Drop the FUSE tuning knobs.",
     },
+    // r[impl ctrl.crd.fetcher-no-features]
+    // ANY non-empty features (not just "kvm"): the I-181 ∅-guard at
+    // scheduler `snapshot.rs:221` filters featureless FODs whenever
+    // the pool's features list is non-empty, regardless of value.
     DegradeCheck {
-        applies: |s| is_fetcher_spec(s) && s.features.iter().any(|f| f == pod::KVM_FEATURE),
-        reason: REASON_FETCHER_KVM_FEATURE_IGNORED,
-        note: "kind=Fetcher ignores the kvm feature — FODs route by \
-               is_fixed_output alone, never by features. Drop kvm from \
-               features.",
+        applies: |s| is_fetcher_spec(s) && !s.features.is_empty(),
+        reason: REASON_FETCHER_FEATURES_IGNORED,
+        note: "kind=Fetcher ignores features — FODs route by \
+               is_fixed_output alone. Drop features.",
     },
 ];
 

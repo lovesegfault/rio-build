@@ -109,7 +109,10 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
 
         // Env var injected with the canonical pod-side template (NOT
         // the controller's own — the pod writes to the same mount
-        // path, but %p/%m expand inside the pod).
+        // path, but %p/%m expand inside the pod). $(RIO_EXECUTOR_ID)
+        // disambiguates per-pod: the cov hostPath is shared across all
+        // executor pods on a node, each runs PID 1 → %p→1, same image
+        // → %m identical.
         let envs = container.env.as_ref().expect("env vars");
         let profile_env = envs
             .iter()
@@ -117,7 +120,7 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
             .expect("LLVM_PROFILE_FILE env injected");
         assert_eq!(
             profile_env.value.as_deref(),
-            Some("/var/lib/rio/cov/rio-%p-%m.profraw")
+            Some("/var/lib/rio/cov/rio-$(RIO_EXECUTOR_ID)-%p-%m.profraw")
         );
 
         // Volume: hostPath to /var/lib/rio/cov on the k8s node.
@@ -281,8 +284,8 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 #[tokio::test]
 async fn warn_fires_for_every_degrade_check() {
     use crate::reconcilers::pool::DEGRADE_CHECKS;
-    // Structural floor: 1 host-users + 4 Fetcher CEL rules + 1 non-CEL
-    // wants_kvm. New CEL rules without a DegradeCheck entry trip this.
+    // Structural floor: 1 host-users + 5 Fetcher CEL rules. New CEL
+    // rules without a DegradeCheck entry trip this.
     assert!(
         DEGRADE_CHECKS.len() >= 6,
         "DEGRADE_CHECKS shrank below the count of silent overrides in \
@@ -300,7 +303,9 @@ async fn warn_fires_for_every_degrade_check() {
         localhost_profile: None,
     });
     wp.spec.fuse_threads = Some(8);
-    wp.spec.features = vec!["kvm".into()];
+    // NOT "kvm" — proves DEGRADE_CHECKS[5] fires for ANY non-empty
+    // features (the I-181 ∅-guard starves on any value, not just kvm).
+    wp.spec.features = vec!["big-parallel".into()];
 
     let (client, verifier) = ApiServerVerifier::new();
     let ctx = test_ctx(client);
@@ -323,4 +328,60 @@ async fn warn_fires_for_every_degrade_check() {
         .expect("apply completes (reconcile path)");
 
     guard.verified().await;
+}
+
+// r[verify ctrl.crd.host-users-network-exclusive]
+/// `DEGRADE_CHECKS[0]` (`HostUsersSuppressed`) is Builder-only. The
+/// pod.rs:327 suppression it mirrors only fires on the Builder path —
+/// Fetchers always get `Some(false)` from `effective_host_users`
+/// (never omitted) and `host_network=None` forced. A pre-CEL
+/// `Fetcher{hostNetwork:true}` previously emitted a factually-wrong
+/// "hostUsers omitted" + unactionable "Set privileged:true"; now only
+/// the correct `FetcherHostNetworkSuppressed` (entry [2]) fires.
+#[test]
+fn degrade_host_users_suppressed_builder_only() {
+    use crate::reconcilers::pool::{
+        DEGRADE_CHECKS, REASON_FETCHER_HOST_NETWORK_SUPPRESSED, REASON_HOST_USERS_SUPPRESSED,
+    };
+    use rio_crds::pool::PoolSpec;
+
+    let find = |reason: &str| {
+        DEGRADE_CHECKS
+            .iter()
+            .find(|c| c.reason == reason)
+            .expect("entry present")
+    };
+    let host_users = find(REASON_HOST_USERS_SUPPRESSED);
+    let fetcher_hn = find(REASON_FETCHER_HOST_NETWORK_SUPPRESSED);
+
+    // Fetcher: hostNetwork:true, privileged unset → entry [0] does
+    // NOT fire (Builder-only); the correct Fetcher entry does.
+    let fetcher = PoolSpec {
+        kind: ExecutorKind::Fetcher,
+        host_network: Some(true),
+        privileged: None,
+        ..crate::fixtures::test_pool("f", ExecutorKind::Fetcher).spec
+    };
+    assert!(
+        !(host_users.applies)(&fetcher),
+        "HostUsersSuppressed must NOT fire for Fetcher (factually wrong: \
+         hostUsers is never omitted; advice unactionable)"
+    );
+    assert!(
+        (fetcher_hn.applies)(&fetcher),
+        "FetcherHostNetworkSuppressed is the correct event"
+    );
+
+    // Builder: same combo → entry [0] DOES fire.
+    let builder = PoolSpec {
+        kind: ExecutorKind::Builder,
+        host_network: Some(true),
+        privileged: None,
+        ..crate::fixtures::test_pool("b", ExecutorKind::Builder).spec
+    };
+    assert!(
+        (host_users.applies)(&builder),
+        "HostUsersSuppressed fires for Builder (the pod.rs:327 suppression \
+         it mirrors is on the Builder path)"
+    );
 }

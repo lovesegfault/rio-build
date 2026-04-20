@@ -106,7 +106,7 @@ Without this reap, a cancelled build leaves already-spawned Pending
 Jobs sitting until `activeDeadlineSeconds` (default 1h), and Karpenter
 keeps provisioning nodes for them.
 
-r[ctrl.ephemeral.reap-orphan-running+2]
+r[ctrl.ephemeral.reap-orphan-running+3]
 When a Running Job (`JobStatus.ready > 0`) is older than the orphan
 grace (default 5min) AND the scheduler does not consider its executor
 busy --- either the pod's `executor_id` is absent from `ListExecutors`,
@@ -120,9 +120,13 @@ process-level exit is given first chance; the controller reap fires only
 when the process cannot act on its own. A Job whose executor reports
 `busy == true` is NOT reaped --- the scheduler believes a build is
 in progress; `activeDeadlineSeconds` is the backstop for stuck-mid-build.
-The reap is **skipped entirely** when `ListExecutors` fails or returns
-empty (scheduler unreachable, or new-leader pre-reconnect window) ---
-fail-closed, same posture as `r[ctrl.ephemeral.reap-excess-pending]`.
+The reap is **skipped entirely** when `ListExecutors` fails, returns
+empty, **or reports `leader_for_secs` below the orphan grace**
+(scheduler unreachable, new-leader pre-reconnect, or partial-reconnect
+window) --- fail-closed, same posture as
+`r[ctrl.ephemeral.reap-excess-pending]`. The new leader's executor map
+fills incrementally as workers reconnect over a 1--10s spread; a
+non-empty partial list cannot prove absence.
 
 **Cleanup:** the finalizer's `cleanup()` returns immediately. In-flight
 Jobs finish their one build naturally; ownerRef GC removes them after
@@ -470,10 +474,14 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 |---|---|---|
 | Pool | `size(self.systems) > 0` | A pool with no target systems accepts no work. |
 | Pool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
+| Pool | `kind=Fetcher ⇒ features empty` | See `r[ctrl.crd.fetcher-no-features]`. |
 | SeccompProfileKind | type ∈ allowed; `Localhost ⇔ has(localhostProfile)` | See `r[ctrl.crd.seccomp-cel]`. |
 | ComponentScaler.Replicas | `self.min >= 0 && self.min <= self.max` | Clamp range must be non-empty and non-negative (`/scale` subresource rejects negative replicas). |
 | ComponentScaler.TargetRef | `self.kind == 'Deployment'` | Reconciler patches `apps/v1 deployments/scale` only. |
 | ComponentScaler.LoadThresholds | `0.0 < low < high <= 1.0` | Threshold ordering for ratio correction. |
+
+r[ctrl.crd.fetcher-no-features]
+The controller MUST reject `Pool` specs with `kind: Fetcher` and a non-empty `features` list. FODs route by `is_fixed_output` alone, not features (ADR-019). The reconciler forces `effective_features() == []` for Fetchers regardless (belt-and-suspenders for pre-CEL specs); without it, a non-empty `features` on a Fetcher pool hits the I-181 ∅-guard at scheduler `snapshot.rs` and filters out every featureless FOD --- the fetcher pool never spawns and all fetches stall silently. The single `effective_features` chokepoint ensures the spawn-decision query (`GetSpawnIntents.features`) and the spawned worker's `RIO_FEATURES` cannot diverge.
 
 r[ctrl.crd.seccomp-cel]
 `SeccompProfileKind` is a struct (`{type, localhostProfile?}`), not a Rust enum: kube-core's structural-schema rewriter rejects oneOf-variant subschemas with non-identical shared properties, so the type/localhostProfile coupling is enforced by CEL instead of the Rust type system. Two rules: `self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']`, and `self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)`. The struct mirrors `pod.spec.securityContext.seccompProfile` exactly so operators can copy-paste; nested `KubeSchema` carries the rules through into the `Pool` schema.

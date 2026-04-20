@@ -153,6 +153,14 @@ impl ExecutorKind {
         "kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not FUSE-bound"
     )
 )]
+// r[impl ctrl.crd.fetcher-no-features]
+#[x_kube(
+    validation = Rule::new(
+        "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0"
+    ).message(
+        "kind=Fetcher forbids features — FODs route by is_fixed_output alone, not features (ADR-019)"
+    )
+)]
 pub struct PoolSpec {
     /// Builder or Fetcher. Required — there is no sensible default
     /// (the two have opposite network postures).
@@ -415,6 +423,11 @@ mod tests {
             (
                 "self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))",
                 "kind=Fetcher forbids FUSE tuning knobs",
+            ),
+            // r[verify ctrl.crd.fetcher-no-features]
+            (
+                "self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0",
+                "kind=Fetcher forbids features",
             ),
         ];
         // Count guard: ties the assertion list to the actual rendered

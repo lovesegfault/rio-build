@@ -1,6 +1,6 @@
 //! `AdminService.ListExecutors` implementation.
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
 use tonic::Status;
@@ -31,9 +31,17 @@ fn executor_status(s: &ExecutorSnapshot) -> &'static str {
 }
 
 /// Query the actor for all executors, filter by status, convert to proto.
+///
+/// `leader_for`: elapsed since this replica acquired leadership
+/// (`LeaderState::leader_for()`). Populates `leader_for_secs` so the
+/// controller's `orphan_reap_gate` can fail-closed during the
+/// post-failover partial-reconnect window. `None` is unreachable here
+/// (`ensure_leader()` is checked first); treated as 0 (young).
+// r[impl sched.admin.list-executors-leader-age]
 pub(super) async fn list_executors(
     actor: &ActorHandle,
     status_filter: &str,
+    leader_for: Option<Duration>,
 ) -> Result<ListExecutorsResponse, Status> {
     let snapshots = super::query_actor(actor, |reply| {
         ActorCommand::Admin(AdminQuery::ListExecutors { reply })
@@ -63,7 +71,10 @@ pub(super) async fn list_executors(
         .map(snapshot_to_proto)
         .collect();
 
-    Ok(ListExecutorsResponse { executors })
+    Ok(ListExecutorsResponse {
+        executors,
+        leader_for_secs: leader_for.map_or(0, |d| d.as_secs()),
+    })
 }
 
 fn snapshot_to_proto(s: ExecutorSnapshot) -> ExecutorInfo {

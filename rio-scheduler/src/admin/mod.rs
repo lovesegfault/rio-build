@@ -12,7 +12,6 @@
 //! after collision count hit 20.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
@@ -107,9 +106,11 @@ pub struct AdminServiceImpl {
     /// until the first refresh fires. Keeps `ClusterStatus` fast
     /// (it's on the autoscaler's 30s poll path).
     store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
-    /// Shared with the lease loop (same Arc as `SchedulerGrpc`).
+    /// Shared with the lease loop (same Arcs as `SchedulerGrpc`).
     /// Admin RPCs mutate state via the actor — standby must refuse.
-    is_leader: Arc<AtomicBool>,
+    /// Carries `leader_for()` for `ListExecutorsResponse.
+    /// leader_for_secs` (controller orphan-reap fail-closed gate).
+    leader: crate::lease::LeaderState,
     /// For aborting long-running proxy tasks (TriggerGC forward).
     /// Parent token, not serve_shutdown — the forward task should
     /// exit IMMEDIATELY on SIGTERM (store-side GC continues; we
@@ -140,7 +141,7 @@ impl AdminServiceImpl {
         actor: ActorHandle,
         store_addr: String,
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
-        is_leader: Arc<AtomicBool>,
+        leader: crate::lease::LeaderState,
         shutdown: rio_common::signal::Token,
         cluster: String,
         service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
@@ -153,7 +154,7 @@ impl AdminServiceImpl {
             started_at: Instant::now(),
             store_addr,
             store_size_bytes,
-            is_leader,
+            leader,
             shutdown,
             cluster,
             service_verifier,
@@ -173,7 +174,7 @@ impl AdminServiceImpl {
     /// and its view is stale. Delegates to the shared
     /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
     fn ensure_leader(&self) -> Result<(), Status> {
-        crate::grpc::actor_guards::ensure_leader(&self.is_leader)
+        crate::grpc::actor_guards::ensure_leader(&self.leader.is_leader_arc())
     }
 
     /// Flip to standby. For tests exercising the in-stream-err leader
@@ -182,8 +183,7 @@ impl AdminServiceImpl {
     /// modules, so a method is the cleanest accessor).
     #[cfg(test)]
     pub(super) fn force_standby(&self) {
-        self.is_leader
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.leader.on_lose();
     }
 
     /// Gate for controller-only mutating RPCs. Verifies
@@ -318,7 +318,9 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let resp = executors::list_executors(&self.actor, &req.status_filter).await?;
+        let resp =
+            executors::list_executors(&self.actor, &req.status_filter, self.leader.leader_for())
+                .await?;
         Ok(Response::new(resp))
     }
 

@@ -173,6 +173,16 @@ pub struct LeaderState {
     /// then fire-and-forgets LeaderAcquired. Recovery may take
     /// seconds; dispatch waits.
     recovery_complete: Arc<AtomicBool>,
+    /// `Instant` of the last [`on_acquire`](Self::on_acquire). `None`
+    /// when not leading. Exposed via [`leader_for`](Self::leader_for)
+    /// and surfaced as `ListExecutorsResponse.leader_for_secs` so the
+    /// controller's `orphan_reap_gate` can fail-closed during the
+    /// post-failover partial-reconnect window: `self.executors` fills
+    /// incrementally as workers reconnect (1-10s spread), and a
+    /// non-empty PARTIAL list cannot prove absence. RwLock not atomic:
+    /// `Instant` is 16B; reads are on a slow admin path,
+    /// acquire/lose are rare.
+    became_leader_at: Arc<parking_lot::RwLock<Option<Instant>>>,
 }
 
 impl Default for LeaderState {
@@ -230,6 +240,13 @@ impl LeaderState {
         self.recovery_complete.store(true, Ordering::SeqCst);
     }
 
+    /// Elapsed since this replica acquired leadership, or `None` when
+    /// not leading. Populates `ListExecutorsResponse.leader_for_secs`.
+    // r[impl sched.admin.list-executors-leader-age]
+    pub fn leader_for(&self) -> Option<Duration> {
+        self.became_leader_at.read().map(|t| t.elapsed())
+    }
+
     /// Monotonically raise generation to at least `target`. `Release`
     /// `fetch_max` — defensive against Lease annotation reset
     /// (`kubectl delete lease` zeros the annotation; PG's high-water
@@ -246,10 +263,15 @@ impl LeaderState {
         is_leader: Arc<AtomicBool>,
         recovery_complete: Arc<AtomicBool>,
     ) -> Self {
+        // Test fixtures: `became_leader_at` mirrors `is_leader` —
+        // Some(now) when leading, None when standby. Avoids a fourth
+        // param at every from_parts callsite.
+        let became_leader_at = is_leader.load(Ordering::SeqCst).then(Instant::now);
         Self {
             generation,
             is_leader,
             recovery_complete,
+            became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
         }
     }
 
@@ -265,6 +287,11 @@ impl LeaderState {
             generation,
             is_leader: Arc::new(AtomicBool::new(true)),
             recovery_complete: Arc::new(AtomicBool::new(true)),
+            // Non-K8s/test mode reports a real (small but growing) age
+            // so consumers reading `leader_for_secs` don't see 0
+            // forever (which the controller treats as "young leader,
+            // fail-closed").
+            became_leader_at: Arc::new(parking_lot::RwLock::new(Some(Instant::now()))),
         }
     }
 
@@ -279,6 +306,7 @@ impl LeaderState {
             generation,
             is_leader: Arc::new(AtomicBool::new(false)),
             recovery_complete: Arc::new(AtomicBool::new(false)),
+            became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -293,6 +321,10 @@ impl LeaderState {
     pub fn on_acquire(&self) -> u64 {
         let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_leader.store(true, Ordering::SeqCst);
+        // AFTER is_leader=true: a reader seeing `leader_for().is_some()`
+        // also sees is_leader=true (RwLock acquire/release pairs with
+        // the SeqCst store above).
+        *self.became_leader_at.write() = Some(Instant::now());
         new_gen
     }
 
@@ -305,6 +337,7 @@ impl LeaderState {
     pub fn on_lose(&self) {
         self.is_leader.store(false, Ordering::SeqCst);
         self.recovery_complete.store(false, Ordering::SeqCst);
+        *self.became_leader_at.write() = None;
     }
 }
 
@@ -782,6 +815,26 @@ mod tests {
     // HOSTNAME fallback to UUID is a one-liner
     // (`.unwrap_or_else(|| Uuid::new_v4())`). Not worth a test —
     // the UUID crate tests itself.
+
+    // r[verify sched.admin.list-executors-leader-age]
+    /// `leader_for()` tracks acquire/lose. `pending` → None;
+    /// `on_acquire` → Some; `on_lose` → None; `always_leader`/
+    /// `Default` → Some (non-K8s mode reports a real age so the
+    /// controller's `leader_for_secs` gate isn't permanently 0).
+    #[test]
+    fn leader_for_tracks_acquire_lose() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        assert!(state.leader_for().is_none(), "pending → None");
+        state.on_acquire();
+        assert!(state.leader_for().is_some(), "on_acquire → Some(elapsed)");
+        state.on_lose();
+        assert!(state.leader_for().is_none(), "on_lose → None");
+
+        assert!(
+            LeaderState::default().leader_for().is_some(),
+            "Default (always_leader) → Some so non-K8s mode reports real age"
+        );
+    }
 
     #[test]
     fn leader_state_always_leader() {

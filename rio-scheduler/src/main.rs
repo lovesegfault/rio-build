@@ -102,10 +102,12 @@ async fn main() -> anyhow::Result<()> {
             rio_scheduler::lease::LeaderState::always_leader(Arc::clone(&generation))
         }
     };
-    // Clone for the health toggle loop + gRPC layer. The actor and
-    // lease task each get a `LeaderState` clone (cheap triple-Arc).
+    // Clone for the health toggle loop + gRPC layer + AdminService.
+    // The actor and lease task each get a `LeaderState` clone (cheap
+    // multi-Arc).
     let is_leader_for_health = leader.is_leader_arc();
     let is_leader_for_grpc = leader.is_leader_arc();
+    let leader_for_admin = leader.clone();
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -334,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
         actor.clone(),
         cfg.store.addr.clone(),
         store_size_bytes,
-        is_leader_for_grpc,
+        leader_for_admin,
         shutdown.clone(),
         sla_cluster,
         service_verifier,

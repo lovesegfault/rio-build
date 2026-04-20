@@ -47,8 +47,9 @@ namespaces:
   fetchers: {name: rio-fetchers, psa: privileged}
 
 # LLVM coverage profraw collection. When enabled, each rio pod gets
-# LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw + a hostPath
-# volume mounted there. Profraws flush via atexit on graceful SIGTERM.
+# LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw + a
+# hostPath volume mounted there. Profraws flush via atexit on graceful
+# SIGTERM.
 # The k3s-full VM test fixture passes coverage.enabled=true via --set
 # when running instrumented binaries.
 coverage:

@@ -20,7 +20,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
 
-use rio_crds::pool::{ExecutorKind, Pool, SeccompProfileKind};
+use rio_crds::pool::{ExecutorKind, Pool, PoolSpec, SeccompProfileKind};
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
@@ -120,6 +120,23 @@ pub use rio_common::config::UpstreamAddrs;
 #[inline]
 fn is_fetcher(pool: &Pool) -> bool {
     pool.spec.kind == ExecutorKind::Fetcher
+}
+
+/// FODs route by `is_fixed_output` alone, not features — fetchers
+/// always advertise empty. Single chokepoint so the spawn-decision
+/// query (`jobs::queued_for_pool`) and the spawned worker's
+/// `RIO_FEATURES` cannot diverge: a non-empty `features` on a Fetcher
+/// would otherwise hit the I-181 ∅-guard at scheduler
+/// `snapshot.rs:221` and filter out every featureless FOD → fetcher
+/// pool never spawns → all fetches stall silently.
+// r[impl ctrl.crd.fetcher-no-features]
+#[inline]
+pub(super) fn effective_features(spec: &PoolSpec) -> Vec<String> {
+    if spec.kind == ExecutorKind::Fetcher {
+        Vec::new()
+    } else {
+        spec.features.clone()
+    }
 }
 
 /// Fetchers face the open internet — never privileged. Builders honor
@@ -556,16 +573,8 @@ fn build_executor_container(
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
                 env("RIO_LOG_FORMAT", "json"),
                 env("RIO_SYSTEMS", &pool.spec.systems.join(",")),
-                // FODs route by is_fixed_output alone, not features —
-                // fetchers always advertise empty.
-                env(
-                    "RIO_FEATURES",
-                    &if fetcher {
-                        String::new()
-                    } else {
-                        pool.spec.features.join(",")
-                    },
-                ),
+                // Single source: `effective_features` (Fetcher → []).
+                env("RIO_FEATURES", &effective_features(&pool.spec).join(",")),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
                 // Job pods are `<job-name>-<suffix>` — unique per
@@ -623,11 +632,17 @@ fn build_executor_container(
                 }
             }
             // Coverage + RUST_LOG passthrough (test-only / operator
-            // knob respectively).
+            // knob respectively). `$(RIO_EXECUTOR_ID)` (downward-API
+            // metadata.name, defined ABOVE so kubelet's dependent-var
+            // expansion applies) disambiguates per-pod: the `cov`
+            // hostPath is shared across all executor pods on a node,
+            // each runs PID 1 → `%p`→1, same image → `%m` identical.
+            // `%h` is NOT used — `host_network=true` (builder pools
+            // may set it) makes the pod hostname the NODE hostname.
             if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
                 e.push(env(
                     "LLVM_PROFILE_FILE",
-                    "/var/lib/rio/cov/rio-%p-%m.profraw",
+                    "/var/lib/rio/cov/rio-$(RIO_EXECUTOR_ID)-%p-%m.profraw",
                 ));
             }
             if let Ok(level) = std::env::var("RUST_LOG") {
@@ -861,5 +876,104 @@ mod tests {
         // unknown → no constraint
         assert_eq!(nix_systems_to_k8s_arch(&s(&["riscv64-linux"])), None);
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
+    }
+
+    // r[verify ctrl.pool.fetcher-hardening]
+    // r[verify ctrl.crd.fetcher-no-features]
+    /// `effective_features` is the single chokepoint: Fetcher → []
+    /// regardless of spec; Builder → verbatim. Both `RIO_FEATURES`
+    /// (worker capabilities) and `queued_for_pool` (spawn-decision
+    /// query) read it, so they cannot diverge. Before the chokepoint,
+    /// `poolDefaults.features:["kvm"]` deep-merged onto Fetcher entries
+    /// → I-181 ∅-guard filtered every featureless FOD → fetcher pool
+    /// never spawned.
+    #[test]
+    fn effective_features_empty_for_fetcher() {
+        let mut fetcher = crate::fixtures::test_pool("f", ExecutorKind::Fetcher);
+        fetcher.spec.features = s(&["kvm", "big-parallel"]);
+        assert!(
+            effective_features(&fetcher.spec).is_empty(),
+            "Fetcher: features forced empty regardless of spec"
+        );
+
+        let mut builder = crate::fixtures::test_pool("b", ExecutorKind::Builder);
+        builder.spec.features = s(&["kvm", "big-parallel"]);
+        assert_eq!(
+            effective_features(&builder.spec),
+            s(&["kvm", "big-parallel"]),
+            "Builder: features verbatim"
+        );
+
+        // The spawned worker's `RIO_FEATURES` env reads the same value.
+        let c = build_executor_container(
+            &fetcher,
+            &crate::fixtures::test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+            false,
+            true,
+            None,
+        );
+        let rio_features = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "RIO_FEATURES")
+            .expect("RIO_FEATURES present");
+        assert_eq!(
+            rio_features.value.as_deref(),
+            Some(""),
+            "RIO_FEATURES empty for Fetcher (same chokepoint)"
+        );
+    }
+
+    /// `LLVM_PROFILE_FILE` carries `$(RIO_EXECUTOR_ID)` for per-pod
+    /// disambiguation: the `cov` hostPath is shared across all executor
+    /// pods on a node, each runs PID 1 → `%p`→1, same image → `%m`
+    /// identical. Without the per-pod token, concurrent executors
+    /// overwrite each other's profraw. Kubelet's dependent-var
+    /// expansion requires `RIO_EXECUTOR_ID` to be defined EARLIER in
+    /// the env vec — the index assertion is structural (catches a
+    /// future reorder that would silently break expansion).
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Error is 208B, API-fixed
+    fn coverage_profraw_path_per_pod_unique() {
+        // figment Jail serializes env access across parallel tests
+        // (same pattern as the lease-config tests).
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("LLVM_PROFILE_FILE", "/dev/null");
+            let pool = crate::fixtures::test_pool("p", ExecutorKind::Builder);
+            let c = build_executor_container(
+                &pool,
+                &crate::fixtures::test_sched_addrs(),
+                &crate::fixtures::test_store_addrs(),
+                false,
+                true,
+                None,
+            );
+            let env = c.env.as_ref().unwrap();
+            let idx = |name: &str| {
+                env.iter()
+                    .position(|e| e.name == name)
+                    .unwrap_or_else(|| panic!("env {name} present"))
+            };
+            let prof_idx = idx("LLVM_PROFILE_FILE");
+            let exec_idx = idx("RIO_EXECUTOR_ID");
+            let prof = &env[prof_idx];
+            assert!(
+                prof.value
+                    .as_deref()
+                    .is_some_and(|v| v.contains("$(RIO_EXECUTOR_ID)")),
+                "LLVM_PROFILE_FILE carries per-pod token; got {:?}",
+                prof.value
+            );
+            assert!(
+                exec_idx < prof_idx,
+                "RIO_EXECUTOR_ID (idx {exec_idx}) must precede \
+                 LLVM_PROFILE_FILE (idx {prof_idx}) for kubelet \
+                 dependent-var expansion"
+            );
+            Ok(())
+        });
     }
 }

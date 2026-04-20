@@ -3,7 +3,7 @@
 //! patch status. Consumed only by `jobs.rs`; kept as a separate file
 //! because the merged module would top 2000 LoC.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
@@ -229,7 +229,7 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 /// Active AND `status.ready > 0` — the Job's pod container has
 /// started. Complement of [`is_pending_job`] within the active set
 /// (both predicates exclude terminating Jobs). The orphan-reap
-/// boundary for `r[ctrl.ephemeral.reap-orphan-running+2]`: only Running
+/// boundary for `r[ctrl.ephemeral.reap-orphan-running+3]`: only Running
 /// Jobs are candidates (Pending is handled by `reap_excess_pending`;
 /// Complete/Failed by TTL).
 ///
@@ -292,10 +292,30 @@ pub(super) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 /// them. A Running pod may already hold an assignment; the scheduler's
 /// cancel-on-disconnect handles those when the gateway session that
 /// queued the work closes.
-pub(super) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration) -> Vec<&Job> {
+///
+/// `reaped`: names already foreground-deleted THIS tick by
+/// `reap_stale_for_intents`. Those Jobs' snapshot `deletion_timestamp`
+/// is still `None` (snapshot pre-dates the delete), so without this
+/// filter a younger reaped orphan still counts toward `pending`, the
+/// oldest-first sort then deletes a still-WANTED Job — exactly what
+/// the orphan-first reap exists to prevent (see `jobs.rs` callsite).
+pub(super) fn select_excess_pending<'a>(
+    jobs: &'a [Job],
+    reaped: &HashSet<String>,
+    queued: u32,
+    min_age: Duration,
+) -> Vec<&'a Job> {
     let mut pending: Vec<&Job> = jobs
         .iter()
-        .filter(|j| is_pending_job(j) && job_older_than(j, min_age))
+        .filter(|j| {
+            is_pending_job(j)
+                && job_older_than(j, min_age)
+                && !j
+                    .metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| reaped.contains(n))
+        })
         .collect();
     let queued = queued as usize;
     if pending.len() <= queued {
@@ -329,6 +349,7 @@ pub(super) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration
 pub(super) async fn reap_excess_pending(
     jobs_api: &Api<Job>,
     jobs: &[Job],
+    reaped: &HashSet<String>,
     queued: Option<u32>,
     pool: &str,
 ) -> u32 {
@@ -339,7 +360,7 @@ pub(super) async fn reap_excess_pending(
         );
         return 0;
     };
-    let excess = select_excess_pending(jobs, queued, REAP_PENDING_GRACE);
+    let excess = select_excess_pending(jobs, reaped, queued, REAP_PENDING_GRACE);
     if excess.is_empty() {
         return 0;
     }
@@ -401,7 +422,7 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 
 /// Running Jobs older than `min_age` whose executor is NOT busy in
 /// the scheduler's view — the reap set for
-/// `r[ctrl.ephemeral.reap-orphan-running+2]`.
+/// `r[ctrl.ephemeral.reap-orphan-running+3]`.
 ///
 /// "Not busy" = no `ExecutorInfo` whose `executor_id` starts with
 /// `{job_name}-` (pod never registered / already disconnected), OR
@@ -418,13 +439,27 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 ///
 /// Pending Jobs are excluded ([`is_running_job`] requires `ready >
 /// 0`) — those are [`reap_excess_pending`]'s territory.
+///
+/// `reaped`: names already foreground-deleted THIS tick by
+/// `reap_stale_for_intents`. The 5-min grace makes the same-tick race
+/// unlikely but the filter is structurally consistent with
+/// [`select_excess_pending`] and free.
 pub(super) fn select_orphan_running<'a>(
     jobs: &'a [Job],
+    reaped: &HashSet<String>,
     executors: &[rio_proto::types::ExecutorInfo],
     min_age: Duration,
 ) -> Vec<&'a Job> {
     jobs.iter()
-        .filter(|j| is_running_job(j) && job_older_than(j, min_age))
+        .filter(|j| {
+            is_running_job(j)
+                && job_older_than(j, min_age)
+                && !j
+                    .metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| reaped.contains(n))
+        })
         .filter(|j| {
             let Some(job_name) = j.metadata.name.as_deref() else {
                 // Can't delete by name anyway — and can't match
@@ -452,23 +487,39 @@ pub(super) fn select_orphan_running<'a>(
 }
 
 /// Fail-closed gate for [`reap_orphan_running`]: `None` (skip the
-/// reap) for both `Err` AND `Ok(empty)`. On 2-replica scheduler
-/// failover the new leader returns `Ok([])` — `self.executors` is
-/// empty until workers reconnect, but `ListExecutors` passes
-/// `ensure_leader()`. `select_orphan_running`'s `None => true` arm
-/// would mark every Running Job past the 5-min grace as orphan and
-/// foreground-delete it. In the genuine zero-executors steady state
-/// there are no Running Jobs to reap anyway (workers register before
-/// `ready>0`), so the empty-check costs nothing.
+/// reap) for `Err`, `Ok` with `leader_for_secs < ORPHAN_REAP_GRACE`,
+/// AND `Ok(empty)`. On 2-replica scheduler failover the new leader's
+/// `self.executors` map fills INCREMENTALLY as workers reconnect over
+/// a 1-10s spread — `ListExecutors` passes `ensure_leader()` and
+/// returns a non-empty PARTIAL list as soon as ONE worker (any pool)
+/// reconnects. `select_orphan_running`'s `None => true` arm would
+/// mark every not-yet-reconnected worker's Running Job past the 5-min
+/// grace as orphan and foreground-delete it mid-build.
+/// `ORPHAN_REAP_GRACE` checks Job CREATION age, not time-since-
+/// failover, so any build >5min old is exposed.
 ///
-/// A server-side `recovery_complete` gate on `ListExecutors` is the
-/// cleaner long-term fix but touches `rio-scheduler` + `rio-proto`.
+/// `leader_for_secs` is the scheduler's own leadership age
+/// (`LeaderState::leader_for()`); gating on it means the controller
+/// trusts absence-from-list only once the leader has held the lease
+/// long enough that every worker has had `ORPHAN_REAP_GRACE` to
+/// reconnect. The empty-check is kept as belt-and-suspenders for the
+/// genuine zero-executors steady state (where there are no Running
+/// Jobs to reap anyway, so it costs nothing).
 pub(super) fn orphan_reap_gate(
-    result: std::result::Result<Vec<rio_proto::types::ExecutorInfo>, tonic::Status>,
+    result: std::result::Result<rio_proto::types::ListExecutorsResponse, tonic::Status>,
     pool: &str,
 ) -> Option<Vec<rio_proto::types::ExecutorInfo>> {
     match result {
-        Ok(execs) if execs.is_empty() => {
+        Ok(resp) if resp.leader_for_secs < ORPHAN_REAP_GRACE.as_secs() => {
+            warn!(
+                pool,
+                leader_for_secs = resp.leader_for_secs,
+                "scheduler leader younger than orphan grace; skipping \
+                 orphan-reap (fail-closed: workers may still be reconnecting)"
+            );
+            None
+        }
+        Ok(resp) if resp.executors.is_empty() => {
             warn!(
                 pool,
                 "ListExecutors returned empty; skipping orphan-reap \
@@ -476,7 +527,7 @@ pub(super) fn orphan_reap_gate(
             );
             None
         }
-        Ok(execs) => Some(execs),
+        Ok(resp) => Some(resp.executors),
         Err(e) => {
             warn!(
                 pool, error = %e,
@@ -487,7 +538,7 @@ pub(super) fn orphan_reap_gate(
     }
 }
 
-// r[impl ctrl.ephemeral.reap-orphan-running+2]
+// r[impl ctrl.ephemeral.reap-orphan-running+3]
 /// Delete Running ephemeral Jobs the scheduler doesn't consider busy
 /// after [`ORPHAN_REAP_GRACE`]. Same I-165 stuck-process failure
 /// mode applies to both builder and fetcher pools.
@@ -505,15 +556,23 @@ pub(super) fn orphan_reap_gate(
 pub(super) async fn reap_orphan_running(
     jobs_api: &Api<Job>,
     jobs: &[Job],
+    reaped: &HashSet<String>,
     ctx: &Ctx,
     pool: &str,
 ) -> u32 {
     // Cheap pre-filter: any candidates at all? Avoids the RPC on the
-    // hot path (every 10s tick × every pool).
-    if !jobs
-        .iter()
-        .any(|j| is_running_job(j) && job_older_than(j, ORPHAN_REAP_GRACE))
-    {
+    // hot path (every 10s tick × every pool). Same `reaped` skip as
+    // `select_orphan_running` so the lazy-RPC short-circuit is
+    // consistent with the actual selection.
+    if !jobs.iter().any(|j| {
+        is_running_job(j)
+            && job_older_than(j, ORPHAN_REAP_GRACE)
+            && !j
+                .metadata
+                .name
+                .as_deref()
+                .is_some_and(|n| reaped.contains(n))
+    }) {
         return 0;
     }
     let result = admin_call(ctx.admin.clone().list_executors(
@@ -522,11 +581,11 @@ pub(super) async fn reap_orphan_running(
         },
     ))
     .await
-    .map(|r| r.into_inner().executors);
+    .map(|r| r.into_inner());
     let Some(executors) = orphan_reap_gate(result, pool) else {
         return 0;
     };
-    let orphans = select_orphan_running(jobs, &executors, ORPHAN_REAP_GRACE);
+    let orphans = select_orphan_running(jobs, reaped, &executors, ORPHAN_REAP_GRACE);
     if orphans.is_empty() {
         return 0;
     }
@@ -617,13 +676,14 @@ pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// one pod per intent with that intent's resources stamped in — the
 /// closure receives the item so `build_job(pool, intent)` can read it.
 ///
-/// Returns the subset of `intents` whose Job now observably exists
-/// (`Spawned` or `NameCollision` — a 409 means the Job is there).
-/// `Failed` and `build_job`-Err entries are logged and OMITTED so the
-/// caller does NOT ack them: acking a failed spawn arms the
+/// Returns the subset of `intents` whose Job was `Spawned`. `Failed`,
+/// `NameCollision`, and `build_job`-Err entries are logged and OMITTED
+/// so the caller does NOT ack them: acking a failed spawn arms the
 /// scheduler's ICE-backoff timer for a Job that doesn't exist → no
 /// heartbeat ever clears it → false ICE mark on the `(band, cap)`
-/// cell. `skip_existing` hits are also omitted — the caller's
+/// cell. A 409 on the post-reap path is the terminating old-selector
+/// Job — same shape as `Failed` (won't heartbeat for the new
+/// selector). `skip_existing` hits are also omitted — the caller's
 /// `pending_job_names` re-ack covers those independently.
 ///
 /// The loop CONTINUES on every error — the P0516 invariant: a spawn
@@ -664,8 +724,11 @@ pub(super) async fn spawn_for_each(
                 info!(pool, job = %job_name, "spawned ephemeral Job");
             }
             SpawnOutcome::NameCollision => {
-                // 409 ⇒ a Job by that name exists; safe to ack.
-                spawned.push(intent.clone());
+                // 409 ⇒ a Job by that name exists — but on the common
+                // post-reap path it's the terminating old-selector
+                // Job, which won't heartbeat. Don't ack; the rare
+                // healthy-collision case is covered by next tick's
+                // `pending_job_names` re-ack once the Job lists.
                 debug!(pool, job = %job_name, "Job name collision; will retry");
             }
             SpawnOutcome::Failed(e) => {
@@ -1297,7 +1360,8 @@ mod tests {
             job_with("med-mid", Some(0), Some(0), 60),
             job_with("med-old", Some(0), Some(0), 120),
         ];
-        let excess = select_excess_pending(&jobs, 1, NO_GRACE);
+        let none = HashSet::new();
+        let excess = select_excess_pending(&jobs, &none, 1, NO_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -1305,10 +1369,10 @@ mod tests {
             "deletes 2 oldest, keeps 1 newest"
         );
         // queued >= pending → nothing to reap.
-        assert!(select_excess_pending(&jobs, 3, NO_GRACE).is_empty());
-        assert!(select_excess_pending(&jobs, 5, NO_GRACE).is_empty());
+        assert!(select_excess_pending(&jobs, &none, 3, NO_GRACE).is_empty());
+        assert!(select_excess_pending(&jobs, &none, 5, NO_GRACE).is_empty());
         // queued=0 → reap all pending.
-        assert_eq!(select_excess_pending(&jobs, 0, NO_GRACE).len(), 3);
+        assert_eq!(select_excess_pending(&jobs, &none, 0, NO_GRACE).len(), 3);
     }
 
     // r[verify ctrl.ephemeral.reap-excess-pending+2]
@@ -1323,7 +1387,7 @@ mod tests {
             job_with("run-b", Some(1), Some(0), 90),
             job_with("done", Some(0), Some(1), 120),
         ];
-        let excess = select_excess_pending(&jobs, 0, NO_GRACE);
+        let excess = select_excess_pending(&jobs, &HashSet::new(), 0, NO_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -1345,7 +1409,8 @@ mod tests {
             job_with("fresh", Some(0), Some(0), 3),
             job_with("aged", Some(0), Some(0), 60),
         ];
-        let excess = select_excess_pending(&jobs, 0, REAP_PENDING_GRACE);
+        let none = HashSet::new();
+        let excess = select_excess_pending(&jobs, &none, 0, REAP_PENDING_GRACE);
         let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -1356,8 +1421,53 @@ mod tests {
         let mut no_ts = job_with("no-ts", Some(0), Some(0), 60);
         no_ts.metadata.creation_timestamp = None;
         assert!(
-            select_excess_pending(&[no_ts], 0, REAP_PENDING_GRACE).is_empty(),
+            select_excess_pending(&[no_ts], &none, 0, REAP_PENDING_GRACE).is_empty(),
             "no creation_timestamp → not reapable (conservative)"
+        );
+    }
+
+    // r[verify ctrl.ephemeral.reap-excess-pending+2]
+    /// bug_015: `reap_stale_for_intents` foreground-deletes orphan D
+    /// (younger), but the unfiltered snapshot still counts it as
+    /// Pending → `pending=2 > queued=1` → oldest-first deletes WANTED
+    /// Job A (mid-Karpenter-provisioning). With `reaped={D}`, D is
+    /// filtered → `pending=1 ≤ 1` → empty result.
+    #[test]
+    fn select_excess_pending_skips_reaped() {
+        let jobs = vec![
+            job_with("rio-builder-p-a", Some(0), Some(0), 30),
+            job_with("rio-builder-p-d", Some(0), Some(0), 20),
+        ];
+        let reaped: HashSet<String> = ["rio-builder-p-d".into()].into();
+        assert!(
+            select_excess_pending(&jobs, &reaped, 1, NO_GRACE).is_empty(),
+            "reaped D filtered → pending=1 ≤ queued=1 → no excess"
+        );
+        // Without the filter (pre-fix behavior): D counts, A is oldest
+        // → A would be returned. Prove the filter is load-bearing.
+        let names: Vec<_> = select_excess_pending(&jobs, &HashSet::new(), 1, NO_GRACE)
+            .iter()
+            .map(|j| j.name_any())
+            .collect();
+        assert_eq!(names, vec!["rio-builder-p-a"]);
+    }
+
+    // r[verify ctrl.ephemeral.reap-orphan-running+3]
+    /// Same-tick consistency for the orphan-running selector: a Job
+    /// already foreground-deleted by `reap_stale_for_intents` is not
+    /// re-selected (would re-delete + double-count the metric).
+    #[test]
+    fn select_orphan_running_skips_reaped() {
+        let jobs = vec![job_with("rio-builder-p-stuck", Some(1), Some(0), 600)];
+        let reaped: HashSet<String> = ["rio-builder-p-stuck".into()].into();
+        assert!(
+            select_orphan_running(&jobs, &reaped, &[], ORPHAN_REAP_GRACE).is_empty(),
+            "reaped this tick → not re-selected"
+        );
+        assert_eq!(
+            select_orphan_running(&jobs, &HashSet::new(), &[], ORPHAN_REAP_GRACE).len(),
+            1,
+            "control: not in `reaped` → selected"
         );
     }
 
@@ -1395,7 +1505,7 @@ mod tests {
         }
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+2]
+    // r[verify ctrl.ephemeral.reap-orphan-running+3]
     /// I-165: Running Jobs older than grace, scheduler has no live
     /// assignment for them → reap. Jobs whose executor reports
     /// `busy` are skipped (build in progress per scheduler;
@@ -1417,7 +1527,7 @@ mod tests {
             executor("rio-builder-x86-idle01-fghij", false),
             // ghost1 has no entry
         ];
-        let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
+        let orphans = select_orphan_running(&jobs, &HashSet::new(), &executors, ORPHAN_REAP_GRACE);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(
             names,
@@ -1426,7 +1536,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+2]
+    // r[verify ctrl.ephemeral.reap-orphan-running+3]
     /// Grace + phase filtering: Jobs younger than grace are excluded
     /// (process-level idle-exit gets first chance); Pending and
     /// Completed Jobs are excluded (other reapers' territory).
@@ -1454,7 +1564,8 @@ mod tests {
                 j
             },
         ];
-        let orphans = select_orphan_running(&jobs, &[], ORPHAN_REAP_GRACE);
+        let none = HashSet::new();
+        let orphans = select_orphan_running(&jobs, &none, &[], ORPHAN_REAP_GRACE);
         let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
         assert_eq!(names, vec!["rio-builder-x86-stuck1"]);
 
@@ -1462,12 +1573,12 @@ mod tests {
         let mut no_ts = job_with("rio-builder-x86-nots01", Some(1), Some(0), 600);
         no_ts.metadata.creation_timestamp = None;
         assert!(
-            select_orphan_running(&[no_ts], &[], ORPHAN_REAP_GRACE).is_empty(),
+            select_orphan_running(&[no_ts], &none, &[], ORPHAN_REAP_GRACE).is_empty(),
             "no creation_timestamp → not orphan-reapable (conservative)"
         );
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+2]
+    // r[verify ctrl.ephemeral.reap-orphan-running+3]
     /// `{job_name}-` prefix match: trailing dash prevents Job
     /// "pool-abc" from matching executor of Job "pool-abcdef".
     #[test]
@@ -1475,7 +1586,7 @@ mod tests {
         let jobs = vec![job_with("rio-builder-x86-abc", Some(1), Some(0), 600)];
         // Executor for a DIFFERENT Job whose name shares the prefix.
         let executors = vec![executor("rio-builder-x86-abcdef-qwert", true)];
-        let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
+        let orphans = select_orphan_running(&jobs, &HashSet::new(), &executors, ORPHAN_REAP_GRACE);
         assert_eq!(
             orphans.len(),
             1,

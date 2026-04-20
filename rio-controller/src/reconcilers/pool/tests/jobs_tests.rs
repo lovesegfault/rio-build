@@ -230,7 +230,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         },
     ]);
 
-    let reaped = reap_excess_pending(&jobs_api, &jobs, Some(1), "med-pool").await;
+    let reaped = reap_excess_pending(&jobs_api, &jobs, &HashSet::new(), Some(1), "med-pool").await;
     guard.verified().await;
 
     assert_eq!(reaped, 1, "404 not counted; one successful delete");
@@ -525,13 +525,17 @@ async fn spawn_for_each_skips_existing_names() {
     guard.verified().await;
 }
 
-/// `spawn_for_each` returns ONLY intents whose Job now exists
-/// (`Spawned`/`NameCollision`); `Failed` entries are omitted so the
-/// caller does not ack them. Acking a failed spawn arms the
-/// scheduler's ICE timer for a Job that will never heartbeat → false
-/// ICE mark on the `(band, cap)` cell.
+/// `spawn_for_each` returns ONLY intents whose Job was `Spawned`.
+/// `Failed` AND `NameCollision` entries are omitted so the caller does
+/// not ack them. Acking a failed spawn arms the scheduler's ICE timer
+/// for a Job that will never heartbeat → false ICE mark on the
+/// `(band, cap)` cell. A 409 on the post-reap path (selector-drift
+/// reap → create same name → 409 against still-terminating old Job)
+/// has the same shape: the Job that exists won't heartbeat for the
+/// new selector. The rare healthy-collision (list-race) is covered by
+/// next tick's `pending_job_names` re-ack once the Job lists.
 #[tokio::test]
-async fn spawn_for_each_omits_failed_from_ack_set() {
+async fn spawn_for_each_acks_spawned_only() {
     let (client, verifier) = ApiServerVerifier::new();
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
@@ -588,8 +592,9 @@ async fn spawn_for_each_omits_failed_from_ack_set() {
     let ids: Vec<_> = spawned.iter().map(|i| i.intent_id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["ok", "exists"],
-        "Failed (403) omitted; Spawned + NameCollision (409 ⇒ Job exists) included"
+        vec!["ok"],
+        "Failed (403) AND NameCollision (409 — post-reap terminating Job) \
+         omitted; only Spawned acked"
     );
     guard.verified().await;
 }
@@ -608,13 +613,20 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
         pending_job("b", 0, 60),
         pending_job("running", 1, 90),
     ];
+    let none = HashSet::new();
     let guard = verifier.run(vec![]);
     // pending=2, queued=2 → covered.
-    assert_eq!(reap_excess_pending(&jobs_api, &jobs, Some(2), "p").await, 0);
+    assert_eq!(
+        reap_excess_pending(&jobs_api, &jobs, &none, Some(2), "p").await,
+        0
+    );
     // queued=None → fail-closed (scheduler unreachable; spawn treats
     // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
     // on a scheduler restart).
-    assert_eq!(reap_excess_pending(&jobs_api, &jobs, None, "p").await, 0);
+    assert_eq!(
+        reap_excess_pending(&jobs_api, &jobs, &none, None, "p").await,
+        0
+    );
     guard.verified().await;
 }
 
@@ -732,16 +744,23 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+2]
-/// `orphan_reap_gate` returns `None` (skip reap) for both `Err` AND
+// r[verify ctrl.ephemeral.reap-orphan-running+3]
+/// `orphan_reap_gate` returns `None` (skip reap) for `Err` AND
 /// `Ok(empty)`. On 2-replica scheduler failover the new leader returns
 /// `Ok([])` until workers reconnect; `select_orphan_running`'s
 /// `None => true` arm would foreground-delete every Running Job past
 /// the 5-min grace.
 #[test]
 fn orphan_reap_gate_failclosed_on_empty_and_err() {
+    use rio_proto::types::ListExecutorsResponse;
+    let resp = |execs: Vec<rio_proto::types::ExecutorInfo>| ListExecutorsResponse {
+        executors: execs,
+        // Past ORPHAN_REAP_GRACE (300s) so the leader-age arm is NOT
+        // what's under test here.
+        leader_for_secs: 600,
+    };
     assert!(
-        orphan_reap_gate(Ok(vec![]), "p").is_none(),
+        orphan_reap_gate(Ok(resp(vec![])), "p").is_none(),
         "Ok(empty) → None (new-leader pre-reconnect)"
     );
     assert!(
@@ -753,7 +772,62 @@ fn orphan_reap_gate_failclosed_on_empty_and_err() {
         ..Default::default()
     };
     assert!(
-        orphan_reap_gate(Ok(vec![exec]), "p").is_some(),
-        "Ok(nonempty) → Some"
+        orphan_reap_gate(Ok(resp(vec![exec])), "p").is_some(),
+        "Ok(nonempty, old leader) → Some"
+    );
+}
+
+// r[verify ctrl.ephemeral.reap-orphan-running+3]
+// r[verify sched.admin.list-executors-leader-age]
+/// bug_073: during scheduler failover, `self.executors` fills
+/// INCREMENTALLY as workers reconnect over a 1-10s spread. A
+/// non-empty PARTIAL list cannot prove absence —
+/// `select_orphan_running`'s `None => true` arm would
+/// foreground-delete every not-yet-reconnected worker's Running Job
+/// mid-build. `leader_for_secs < ORPHAN_REAP_GRACE` → fail-closed.
+#[test]
+fn orphan_reap_gate_failclosed_on_young_leader() {
+    use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
+    let one = vec![ExecutorInfo {
+        executor_id: "a-1-pqrst".into(),
+        ..Default::default()
+    }];
+    // 10s into failover: one foreign-pool worker reconnected. Gate
+    // MUST NOT pass — pool-B workers haven't reconnected yet.
+    assert!(
+        orphan_reap_gate(
+            Ok(ListExecutorsResponse {
+                executors: one.clone(),
+                leader_for_secs: 10
+            }),
+            "pool-b"
+        )
+        .is_none(),
+        "young leader (10s < 300s grace) → None even with non-empty list"
+    );
+    // Past grace: every worker has had ORPHAN_REAP_GRACE to reconnect;
+    // absence is now meaningful.
+    assert!(
+        orphan_reap_gate(
+            Ok(ListExecutorsResponse {
+                executors: one,
+                leader_for_secs: 301
+            }),
+            "pool-b"
+        )
+        .is_some(),
+        "leader past grace (301s ≥ 300s) → Some"
+    );
+    // Past grace BUT empty: still fail-closed (belt-and-suspenders).
+    assert!(
+        orphan_reap_gate(
+            Ok(ListExecutorsResponse {
+                executors: vec![],
+                leader_for_secs: 600
+            }),
+            "pool-b"
+        )
+        .is_none(),
+        "empty still gates regardless of leader age"
     );
 }

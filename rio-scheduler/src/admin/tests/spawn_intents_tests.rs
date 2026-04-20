@@ -28,7 +28,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
         actor.clone(),
         "127.0.0.1:1".into(),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        crate::lease::LeaderState::default(),
         rio_common::signal::Token::new(),
         String::new(),
         None,
