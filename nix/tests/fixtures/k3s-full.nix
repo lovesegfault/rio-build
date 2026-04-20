@@ -1,4 +1,4 @@
-# Two-node k3s fixture running the full Helm chart.
+# Seven-node IPv6-only k3s fixture running the full Helm chart.
 #
 # First time gateway.yaml / scheduler.yaml / store.yaml / pdb.yaml /
 # rbac.yaml / postgres-secret.yaml are applied in CI. Closes the
@@ -6,8 +6,12 @@
 # scheduler.replicas=2 podAntiAffinity spreads across server+agent,
 # enabling the leader-election scenario.
 #
-# Topology: k3s-server (8GB) + k3s-agent (6GB) + client (1GB).
-# ~15GB total (normal), ~19GB coverage — use withMinCpu 8 in flake.nix.
+# Topology mirrors EKS (v6-only private subnets + NLB + NAT64):
+#   k3s-server (8GB) + k3s-agent (6GB) — v6-only k8s nodes
+#   edge (512MB)                       — dual-stack: Jool NAT64 + socat v4→v6
+#   client-v6 / client-v4 (1GB each)   — single-family SSH users
+#   upstream-v6 / upstream-v4 (512MB)  — single-family http.server :8080
+# ~18GB total (normal), ~22GB coverage — use withMinCpu 8 in flake.nix.
 #
 # Airgapped: every image preloaded via services.k3s.images on BOTH
 # nodes (pods can schedule on either). NodePort gateway → client
@@ -364,10 +368,10 @@ let
         4244 # hubble (Phase 4)
       ];
       allowedUDPPorts = [
-        8472 # cilium VXLAN tunnel (chart default routingMode=tunnel)
+        6081 # cilium Geneve tunnel (cilium-render.nix tunnelProtocol=geneve)
         51871 # cilium WireGuard
       ];
-      # Pod→Service after socketLB redirect (10.43.0.1→192.168.1.3:6443)
+      # Pod→Service after socketLB redirect ([2001:db8:43::1]→node-v6:6443)
       # arrives on cilium_host with a pod-CIDR source. Without trust, the
       # NixOS firewall INPUT chain + checkReversePath drop it. Cilium's
       # own datapath enforces policy; the host firewall on these
@@ -460,11 +464,38 @@ let
     ];
   };
 
+  # ── v6-only k3s node overlay ────────────────────────────────────────
+  # rio is v6-only end-to-end: k3s nodes lose their auto-assigned eth1
+  # v4 (common.mkSingleFamily — see its comment for why both the address
+  # AND primaryIPAddress must be forced) and gain a static 64:ff9b::/96
+  # route via the dual-stack `edge` node so DNS64-synthesised AAAAs
+  # reach Jool. Separate from k3sBase so it can take `nodes` as a
+  # module arg.
+  k3sV6Only =
+    { lib, nodes, ... }:
+    {
+      networking = lib.mkMerge [
+        (common.mkSingleFamily "v6")
+        {
+          interfaces.eth1.ipv6.routes = [
+            {
+              address = "64:ff9b::";
+              prefixLength = 96;
+              via = nodes.edge.networking.primaryIPv6Address;
+            }
+          ];
+        }
+      ];
+    };
+
   # ── Server node ─────────────────────────────────────────────────────
   serverNode =
-    { config, ... }:
+    { config, nodes, ... }:
     {
-      imports = [ k3sBase ];
+      imports = [
+        k3sBase
+        k3sV6Only
+      ];
       networking.hostName = "k3s-server";
 
       services.k3s = {
@@ -525,6 +556,45 @@ let
           # 01-: byte-sort places this AFTER 01-rio-rbac (which creates
           # the ${ns} Namespace) and BEFORE 02-rio-workloads.
           "01z-rio-hmac-secrets".source = hmacSecretsManifest;
+          # CoreDNS dns64 + test-VM hostnames. k3s's bundled CoreDNS
+          # mounts the optional `coredns-custom` ConfigMap at
+          # /etc/coredns/custom/; the Corefile imports `*.override`
+          # into the .:53 server block AND `*.server` as additional
+          # top-level server blocks.
+          #
+          # dns64.override: synthesise 64:ff9b::<v4> AAAA in the .:53
+          # block when only A exists (covers any upstream-DNS-resolved
+          # name forwarded via /etc/resolv.conf).
+          #
+          # test-vms.server: pods resolve via CoreDNS, NOT node
+          # /etc/hosts; CoreDNS's NodeHosts only carries k8s Node
+          # names. The `hosts` plugin is once-per-server-block — the
+          # .:53 block already has `hosts /etc/coredns/NodeHosts`, so
+          # a `*.override` hosts{} entry crashes CoreDNS at config-
+          # load. Separate server block (zone-scoped to the bare
+          # names) sidesteps that. Plugin chain order is compile-time
+          # fixed: `hosts` is a backend, `dns64` a response-rewriter
+          # that runs after — AAAA query for upstream-v4 → hosts
+          # NODATA → dns64 issues A → hosts answers → dns64 wraps.
+          "001-coredns-dns64".source = pkgs.writeText "coredns-dns64.yaml" ''
+            apiVersion: v1
+            kind: ConfigMap
+            metadata:
+              name: coredns-custom
+              namespace: kube-system
+            data:
+              dns64.override: |
+                dns64 64:ff9b::/96
+              test-vms.server: |
+                upstream-v4 upstream-v6 edge {
+                  hosts {
+                    ${nodes.upstream-v4.networking.primaryIPAddress} upstream-v4
+                    ${nodes.upstream-v6.networking.primaryIPv6Address} upstream-v6
+                    ${nodes.edge.networking.primaryIPv6Address} edge
+                  }
+                  dns64 64:ff9b::/96
+                }
+          '';
         };
         extraFlags = [
           # Cilium IS the CNI — disable k3s's bundled flannel + kube-router
@@ -543,21 +613,18 @@ let
           # bitnami PG's PVC binds against it.
           "--tls-san"
           "k3s-server"
-          # Dual-stack (P0542): the chart defaults to PreferDualStack +
-          # ipFamilies=[IPv6,IPv4] on Services. k3s must have a v6
-          # service CIDR or the apiserver assigns v4-only and the
-          # production EKS path (ip_family=ipv6) goes unexercised. The
-          # NixOS test driver auto-assigns 2001:db8:${vlan}::N/64 to
-          # eth1 and exposes it as primaryIPv6Address; node-ip lists v4
-          # first to keep it the primary family (kubelet/hostNetwork
-          # binds, cilium NodePort) so existing v4-only assertions in
-          # scenarios stay valid.
+          # IPv6 single-stack: rio is v6-only end-to-end. Pods/Services
+          # get v6 only; v4 ingress/egress is the `edge` node's job
+          # (Jool NAT64 + socat). Mirrors EKS private_subnet_ipv6_native.
+          # The NixOS test driver auto-assigns 2001:db8:${vlan}::N/64
+          # to eth1 and exposes it as primaryIPv6Address; k3sV6Only
+          # strips the auto-assigned 192.168.1.x.
           "--cluster-cidr"
-          "10.42.0.0/16,2001:db8:42::/56"
+          "2001:db8:42::/56"
           "--service-cidr"
-          "10.43.0.0/16,2001:db8:43::/112"
+          "2001:db8:43::/112"
           "--node-ip"
-          "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
+          config.networking.primaryIPv6Address
           # Quiet the "Failed to record snapshots: nodes not found"
           # spam during startup. The etcd snapshot reconciler fires
           # on a tight loop before the kubelet registers the node
@@ -587,21 +654,24 @@ let
   agentNode =
     { config, nodes, ... }:
     {
-      imports = [ k3sBase ];
+      imports = [
+        k3sBase
+        k3sV6Only
+      ];
       networking.hostName = "k3s-agent";
 
       services.k3s = {
         enable = true;
         role = "agent";
         inherit tokenFile;
-        serverAddr = "https://${nodes.k3s-server.networking.primaryIPAddress}:6443";
+        serverAddr = "https://[${nodes.k3s-server.networking.primaryIPv6Address}]:6443";
         # Agent loads images into its OWN containerd. Pods scheduled
         # here need local images — this is where the second scheduler
         # replica (antiAffinity) + maybe workers land.
         images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
         extraFlags = [
           "--node-ip"
-          "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
+          config.networking.primaryIPv6Address
         ];
       };
 
@@ -640,17 +710,33 @@ rec {
     hmacKeys
     ;
 
+  # 7-node v6-only topology. k3s nodes + clients + upstreams are
+  # single-family; only `edge` keeps both (it IS the v4↔v6 boundary).
   nodes = {
     k3s-server = serverNode;
     k3s-agent = agentNode;
-    client = common.mkClientNode {
+    edge.imports = [ ./edge.nix ];
+    # v6 client → gateway NodePort directly (proves r[gw.ingress.v6-direct]).
+    client-v6 = common.mkClientNode {
       gatewayHost = "k3s-server";
       gatewayPort = 32222;
       # Chart's gateway pod runs as non-root; the SSH server inside
       # accepts any user (auth is pubkey), but ssh-ng defaults to the
       # local username. Match what the chart expects.
       gatewayUser = "rio";
+      addressFamily = "v6";
     };
+    # v4 client → edge:22 socat → gateway NodePort over v6 (proves
+    # r[gw.ingress.v4-via-nat]). gatewayHost="edge" so mkClientNode's
+    # ssh_config routes ssh-ng://edge to the proxy.
+    client-v4 = common.mkClientNode {
+      gatewayHost = "edge";
+      gatewayPort = 22;
+      gatewayUser = "rio";
+      addressFamily = "v4";
+    };
+    upstream-v6 = common.mkUpstreamNode { addressFamily = "v6"; };
+    upstream-v4 = common.mkUpstreamNode { addressFamily = "v4"; };
   };
 
   # ── testScript snippets ─────────────────────────────────────────────
@@ -749,6 +835,21 @@ rec {
   # Full bring-up: ~3-4min wall. Heavy ordering dependency chain —
   # each step gated on the previous.
   waitReady = ''
+    # ── Python alias: client → client_v6 ────────────────────────────
+    # The v6-only fixture renamed `client` → `client-v6`/`client-v4`.
+    # Shared testScript helpers (common.nix mkBuildHelperV2/seedBusybox/
+    # mkSubmitHelpers, this fixture's sshKeySetupFor) and every k3s
+    # scenario address the build-issuing client as `client`. Aliasing to
+    # the v6 node here means every existing `client.` reference takes
+    # the direct-v6 path; only ingress-v4v6 references client_v4/
+    # client_v6 explicitly.
+    client = client_v6
+
+    # ── Infra nodes up ──────────────────────────────────────────────
+    edge.wait_for_unit("jool-nat64-default.service")
+    upstream_v4.wait_for_unit("upstream-http.service")
+    upstream_v6.wait_for_unit("upstream-http.service")
+
     # ── Both k3s units running ──────────────────────────────────────
     k3s_server.wait_for_unit("k3s.service")
     k3s_agent.wait_for_unit("k3s.service")

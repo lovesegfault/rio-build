@@ -78,11 +78,11 @@ let
   # Cilium creates per-Gateway Services as type:LoadBalancer. With k3s
   # --disable=servicelb and no LB-IPAM pool, the Service stays Pending
   # for an external IP → Gateway never Programmed:True. This pool lets
-  # Cilium's lbipam assign an address from the eth1 vlan subnet
-  # (192.168.1.0/24, .240-.255 reserved for LB IPs — node IPs are
-  # .3/.4). l2announcements makes a Cilium node ARP-reply for the IP
-  # on eth1 so it's actually reachable (without it the IP only exists
-  # in Service.status, no node claims it → curl times out).
+  # Cilium's lbipam assign an address from the eth1 vlan v6 subnet
+  # (2001:db8:1::/64, ::f0-::ff reserved for LB IPs — node IPs are
+  # low-numbered). l2announcements makes a Cilium node NDP-reply for
+  # the IP on eth1 so it's actually reachable (without it the IP only
+  # exists in Service.status, no node claims it → curl times out).
   lbIpamPool = pkgs.writeText "lbipam-pool.yaml" ''
     apiVersion: cilium.io/v2
     kind: CiliumLoadBalancerIPPool
@@ -90,7 +90,7 @@ let
       name: vm-test-pool
     spec:
       blocks:
-        - cidr: "192.168.1.240/28"
+        - cidr: "2001:db8:1::f0/124"
     ---
     apiVersion: cilium.io/v2alpha1
     kind: CiliumL2AnnouncementPolicy
@@ -133,8 +133,9 @@ pkgs.runCommand "cilium-rendered"
       `# and gets RST (the EKS NLB bug, commit 022ae5a3). In-cluster` \
       `# tests are socket-LB false positives — connect() is intercepted` \
       `# via [::] wildcard before the physical-IP path. Mirrors` \
-      `# infra/eks/addons.tf.` \
-      --set "nodePort.addresses={2001:db8:1::/64,192.168.1.0/24}" \
+      `# infra/eks/addons.tf. v6-only: 192.168.1.0/24 dropped (k3s` \
+      `# nodes have no eth1-v4).` \
+      --set "nodePort.addresses={2001:db8:1::/64}" \
       --set cgroup.autoMount.enabled=false \
       --set cgroup.hostRoot=/sys/fs/cgroup \
       --set bpf.masquerade=true \
@@ -160,6 +161,14 @@ pkgs.runCommand "cilium-rendered"
       --set image.useDigest=false \
       --set operator.image.useDigest=false \
       --set ipv6.enabled=true \
+      `# v6 single-stack (de-risks the matching infra/eks/addons.tf` \
+      `# change). Top-level underlayProtocol — NOT` \
+      `# tunnel.underlayProtocol, which silently no-ops.` \
+      `# ipv6NativeRoutingCIDR not required for routingMode=tunnel.` \
+      --set ipv4.enabled=false \
+      --set routingMode=tunnel \
+      --set tunnelProtocol=geneve \
+      --set underlayProtocol=ipv6 \
       > all.yaml
 
     yq 'select(${split.kindIs split.rbacKinds})' all.yaml > $out/01-cilium-rbac.yaml

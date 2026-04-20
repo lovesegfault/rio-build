@@ -6,11 +6,14 @@
 # gateway (no cloud LB). Inline chunk backend (no S3).
 
 dualStack:
-  # k3s-full.nix runs dual-stack (61d547cd / P0542). v6-primary ordering
-  # so getaddrinfo clients try AAAA first. Chart default leaves
-  # ipFamilies unset (single-stack-safe); explicit here because this
-  # overlay's cluster is known dual-stack.
-  ipFamilies: [IPv6, IPv4]
+  # k3s-full.nix runs IPv6 single-stack (7-node v6-only topology with
+  # external NAT64 — mirrors EKS private_subnet_ipv6_native).
+  # PreferDualStack with [IPv6,IPv4] is rejected by a v6-only apiserver:
+  # spec.ipFamilies[1] "IPv4" not configured. The chart-wide
+  # rio.ipFamily helper still reads .Values.dualStack; once it
+  # hardcodes SingleStack/[IPv6] this block goes away.
+  policy: SingleStack
+  ipFamilies: [IPv6]
 
 global:
   image:

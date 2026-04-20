@@ -428,6 +428,27 @@ rec {
       };
     };
 
+  # ── addressFamily override ──────────────────────────────────────────
+  # Stripping ONE family from a NixOS-test node needs BOTH the eth1
+  # address list AND networking.primaryIP{,v6}Address forced.
+  # The test driver computes primaryIP* from a pre-merge let-binding
+  # (nixos/lib/testing/network.nix:59-65) then injects both into every
+  # node's /etc/hosts — address-only override leaves a stale hosts entry,
+  # which breaks DNS64 (upstream-v4 would resolve AAAA → dns64 no-ops).
+  # mkForce "" yields a harmless `" hostname"` line glibc ignores.
+  mkSingleFamily =
+    addressFamily:
+    lib.mkMerge [
+      (lib.mkIf (addressFamily == "v6") {
+        interfaces.eth1.ipv4.addresses = lib.mkForce [ ];
+        primaryIPAddress = lib.mkForce "";
+      })
+      (lib.mkIf (addressFamily == "v4") {
+        interfaces.eth1.ipv6.addresses = lib.mkForce [ ];
+        primaryIPv6Address = lib.mkForce "";
+      })
+    ];
+
   # ── Client node config ──────────────────────────────────────────────
   #
   # Parameterized by `gatewayHost`: the SSH target hostname (varies by
@@ -446,9 +467,16 @@ rec {
       # nixpkgs-pinned CppNix; vm-protocol-warm-lix-standalone overrides
       # to Lix (protocol 1.35) to exercise the MIN_CLIENT_VERSION floor.
       nixPackage ? pkgs.nix,
+      # "v4" | "v6" | "dual". k3s-full has client-v4 (reaches gateway
+      # via the edge socat v4→v6 proxy) + client-v6 (direct NodePort).
+      # standalone keeps the dual-stack default.
+      addressFamily ? "dual",
     }:
     {
-      networking.hostName = "client";
+      # No explicit hostName: the test-driver derives it from the nodes
+      # attr key (so client-v4/client-v6 each get distinct hostnames; the
+      # standalone fixture's `client` key still yields hostname "client").
+      networking = mkSingleFamily addressFamily;
 
       nix.package = nixPackage;
       # ca-derivations: ca-cutoff.nix evaluates `__contentAddressed = true`
@@ -482,6 +510,33 @@ rec {
 
       virtualisation.memorySize = 1024;
       virtualisation.cores = 4;
+    };
+
+  # ── Upstream node config ────────────────────────────────────────────
+  # Minimal HTTP server for the k3s-full NAT64/DNS64 egress checks.
+  # Serves /srv on :8080. upstream-v6 is reached directly; upstream-v4
+  # is v4-only so a v6-only pod must go DNS64→64:ff9b→edge Jool→v4.
+  mkUpstreamNode =
+    { addressFamily }:
+    { pkgs, ... }:
+    {
+      networking = lib.mkMerge [
+        { firewall.allowedTCPPorts = [ 8080 ]; }
+        (mkSingleFamily addressFamily)
+      ];
+      systemd.services.upstream-http = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          WorkingDirectory = "/srv";
+          ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /srv";
+          # --bind :: → AF_INET6 wildcard. Linux bindv6only=0 (default)
+          # dual-binds IPv4-mapped, so this listens on the v4 address
+          # of upstream-v4 too. Default (0.0.0.0) is v4-only — on
+          # upstream-v6 it binds lo:127.0.0.1 and is unreachable.
+          ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8080 --bind ::";
+        };
+      };
+      virtualisation.memorySize = 512;
     };
 
   # ── SSH key setup testScript snippet ────────────────────────────────

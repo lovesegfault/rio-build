@@ -54,6 +54,7 @@ let
   dashboard = import ./scenarios/dashboard.nix;
   netpol = import ./scenarios/netpol.nix;
   cilium-encrypt = import ./scenarios/cilium-encrypt.nix;
+  ingress-v4v6 = import ./scenarios/ingress-v4v6.nix;
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
@@ -790,6 +791,18 @@ in
   # positives).
   # r[verify sec.transport.cilium-wireguard]
   vm-cilium-encrypt-k3s = cilium-encrypt {
+    inherit pkgs common;
+    fixture = k3sFull { };
+  };
+
+  # 2×2 ingress/egress on the v6-only k3s fixture. client-v6 → NodePort
+  # direct, client-v4 → edge:22 socat → NodePort over v6; both nix-build
+  # over ssh-ng. Then egress: k3s host reaches upstream-v4 via 64:ff9b::
+  # (Jool), pod resolves upstream-v4 → 64:ff9b:: AAAA (CoreDNS dns64).
+  # ~6min (k3s bring-up + two trivial builds + curl probes).
+  # r[verify gw.ingress.v6-direct]
+  # r[verify gw.ingress.v4-via-nat]
+  vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
     fixture = k3sFull { };
   };

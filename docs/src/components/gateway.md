@@ -11,6 +11,16 @@ The gateway is the entry point. It terminates SSH connections and speaks the Nix
 - Translate protocol ops into internal gRPC calls to scheduler and store
 - Each SSH channel maintains independent protocol state (separate handshake and option negotiation)
 
+## Network reachability
+
+r[gw.ingress.v6-direct]
+
+The gateway MUST be reachable from an IPv6-only client over the cluster's IPv6 NodePort with no translation layer.
+
+r[gw.ingress.v4-via-nat]
+
+The gateway MUST be reachable from an IPv4-only client via an external v4→v6 translator (AWS NLB `enable-prefix-for-ipv6-source-nat`, or equivalent). rio does not implement this translation; it is an infrastructure requirement.
+
 ## Critical Opcodes
 
 r[gw.opcode.mandatory-set]
