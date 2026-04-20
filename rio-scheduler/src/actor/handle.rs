@@ -312,17 +312,17 @@ impl ActorHandle {
         .await
     }
 
-    /// Force a derivation into `Poisoned` with the given `retry_count`.
-    /// Returns `false` if not found.
+    /// Force a derivation into `Poisoned` with the given
+    /// `resubmit_cycles`. Returns `false` if not found.
     pub async fn debug_force_poisoned(
         &self,
         drv_hash: &str,
-        retry_count: u32,
+        resubmit_cycles: u32,
     ) -> Result<bool, ActorError> {
         let drv_hash = drv_hash.to_string();
         self.debug(|reply| DebugCmd::ForcePoisoned {
             drv_hash,
-            retry_count,
+            resubmit_cycles,
             reply,
         })
         .await

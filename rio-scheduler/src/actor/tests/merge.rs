@@ -1299,9 +1299,9 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
 /// Sensitivity: before the fix, build #2 sees A is Poisoned →
 /// `first_dep_failed` set → fail-fasts. With the fix, A is reset in
 /// `dag.merge` → in `newly_inserted` → skipped by pre-existing loop.
-// r[verify sched.merge.poisoned-resubmit-bounded]
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
 #[rstest::rstest]
-#[case::under_limit(2, DerivationStatus::Ready, rio_proto::types::BuildState::Active)]
+#[case::under_limit(1, DerivationStatus::Ready, rio_proto::types::BuildState::Active)]
 #[case::at_limit(
     crate::state::POISON_RESUBMIT_RETRY_LIMIT,
     DerivationStatus::Poisoned,
@@ -1309,17 +1309,17 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
 )]
 #[tokio::test]
 async fn test_resubmit_poisoned_retry_limit_bound(
-    #[case] retry_count: u32,
+    #[case] resubmit_cycles: u32,
     #[case] expect_status: DerivationStatus,
     #[case] expect_build_state: rio_proto::types::BuildState,
 ) -> TestResult {
     let (_db, handle, _task) = setup().await;
     let tag = "i169-resubmit";
 
-    // Build #1: single node, force-poison at given retry_count.
+    // Build #1: single node, force-poison at given resubmit_cycles.
     let node = make_node(tag);
     merge_dag(&handle, Uuid::new_v4(), vec![node.clone()], vec![], false).await?;
-    assert!(handle.debug_force_poisoned(tag, retry_count).await?);
+    assert!(handle.debug_force_poisoned(tag, resubmit_cycles).await?);
     barrier(&handle).await;
     assert_eq!(
         expect_drv(&handle, tag).await.status,
@@ -1336,8 +1336,13 @@ async fn test_resubmit_poisoned_retry_limit_bound(
     assert_eq!(info.status, expect_status, "post-resubmit drv status");
     if expect_status == DerivationStatus::Ready {
         assert_eq!(
-            info.retry.count, retry_count,
-            "retry_count carried over so the bound accumulates"
+            info.retry.resubmit_cycles,
+            resubmit_cycles + 1,
+            "resubmit_cycles incremented so the bound accumulates"
+        );
+        assert_eq!(
+            info.retry.count, 0,
+            "per-cycle retry budget reset on resubmit"
         );
     }
     assert_eq!(
@@ -1348,7 +1353,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
     Ok(())
 }
 
-// r[verify sched.merge.poisoned-resubmit-bounded]
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
 // r[verify sched.substitute.detached]
 /// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
 /// whose output is upstream-substitutable (NOT locally present) on
@@ -1413,7 +1418,7 @@ async fn test_resubmit_poisoned_at_limit_substitutable(
             "Substituting"
         }
     );
-    assert_eq!(info.retry.count, 0, "poison retry cleared");
+    assert_eq!(info.retry.resubmit_cycles, 0, "poison retry cleared");
     assert_eq!(
         query_status(&handle, build2).await?.state,
         rio_proto::types::BuildState::Succeeded as i32,
@@ -2173,7 +2178,7 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
         .await?;
     let pre = expect_drv(&handle, "dr-x").await;
     assert_eq!(pre.status, DerivationStatus::Poisoned);
-    assert_eq!(pre.retry.count, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(pre.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
 
     // X's output now locally present (cached_hits lane).
     store.seed_with_content(&x_out, b"x");
@@ -2201,7 +2206,7 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
          find_newly_ready never picks up Poisoned)"
     );
     assert_eq!(
-        xs.retry.count, 0,
+        xs.retry.resubmit_cycles, 0,
         "failure history cleared (output present)"
     );
 

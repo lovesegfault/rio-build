@@ -491,12 +491,12 @@ pub enum DebugCmd {
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
-    /// Force a derivation into `Poisoned` with the given `retry_count`.
-    /// For the I-169 resubmit-bound tests
+    /// Force a derivation into `Poisoned` with the given
+    /// `resubmit_cycles`. For the I-169 resubmit-bound tests
     /// (`sched.merge.poisoned-resubmit-bounded`).
     ForcePoisoned {
         drv_hash: String,
-        retry_count: u32,
+        resubmit_cycles: u32,
         reply: oneshot::Sender<bool>,
     },
     /// Force a derivation into an arbitrary status, bypassing the

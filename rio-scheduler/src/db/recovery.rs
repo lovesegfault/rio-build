@@ -59,7 +59,7 @@ impl SchedulerDb {
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
                    required_features,
                    assigned_builder_id,
-                   retry_count,
+                   retry_count, resubmit_cycles,
                    expected_output_paths, output_names, is_fixed_output,
                    is_ca,
                    failed_builders,

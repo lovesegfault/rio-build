@@ -171,9 +171,11 @@ pub(crate) struct RecoveryBuildRow {
 }
 
 /// Row from `load_poisoned_derivations`. Minimal — poisoned rows
-/// aren't dispatched, just TTL-tracked. `elapsed_secs` is computed
-/// PG-side (`now() - poisoned_at`) so the caller can reconstruct
-/// an `Instant` via `Instant::now() - Duration::from_secs_f64(elapsed)`.
+/// aren't dispatched, just TTL-tracked + resubmit-bound checked
+/// (`is_retriable_on_resubmit` reads `resubmit_cycles`). `elapsed_secs`
+/// is computed PG-side (`now() - poisoned_at`) so the caller can
+/// reconstruct an `Instant` via
+/// `Instant::now() - Duration::from_secs_f64(elapsed)`.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct PoisonedDerivationRow {
     pub derivation_id: Uuid,
@@ -188,6 +190,9 @@ pub(crate) struct PoisonedDerivationRow {
     /// to a builder via the kind XOR in `hard_filter`, hit `WrongKind`
     /// at executor/mod.rs:390, and re-poison. Thread it through.
     pub is_fixed_output: bool,
+    /// `M_051`: resubmit-bound counter; persisted so the bound survives
+    /// failover (bug_001).
+    pub resubmit_cycles: i32,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
@@ -204,6 +209,7 @@ pub(crate) struct RecoveryDerivationRow {
     pub required_features: Vec<String>,
     pub assigned_builder_id: Option<String>,
     pub retry_count: i32,
+    pub resubmit_cycles: i32,
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
@@ -231,6 +237,7 @@ impl RecoveryDerivationRow {
             required_features: vec![],
             assigned_builder_id: None,
             retry_count: 0,
+            resubmit_cycles: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,

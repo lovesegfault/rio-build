@@ -68,9 +68,10 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
 }
 
 // r[verify sched.db.clear-poison-batch]
-/// `clear_poison_batch` clears N rows in one round-trip. Asserts both
-/// the column-set parity with scalar `clear_poison` and the
-/// rows_affected count (N hashes in → N rows touched, single statement).
+/// `clear_poison_batch` clears N rows in one round-trip. Asserts the
+/// rows_affected count (N hashes in → N rows touched, single statement)
+/// and the column set: per-cycle state cleared, `resubmit_cycles`
+/// INCREMENTED (vs scalar `clear_poison` which zeroes it).
 #[tokio::test]
 async fn test_clear_poison_batch() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -92,15 +93,18 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     let affected = db.clear_poison_batch(&hashes).await?;
     assert_eq!(affected, 100, "one ANY($1) UPDATE should touch all 100");
 
-    // Same column set as scalar clear_poison: status='created',
-    // poisoned_at NULL, failed_builders empty, retry_count 0.
+    // Per-cycle state cleared (status='created', poisoned_at NULL,
+    // failed_builders empty, retry_count 0); resubmit_cycles incremented
+    // (0 → 1). NOT zeroed: scalar `clear_poison` zeroes it (admin/TTL =
+    // full reset); the batch variant is the resubmit chokepoint.
     assert!(db.load_poisoned_derivations().await?.is_empty());
-    let (n_created, n_clean): (i64, i64) = sqlx::query_as(
+    let (n_created, n_clean, n_bumped): (i64, i64, i64) = sqlx::query_as(
         "SELECT
              COUNT(*) FILTER (WHERE status = 'created'),
              COUNT(*) FILTER (WHERE poisoned_at IS NULL
                               AND failed_builders = '{}'
-                              AND retry_count = 0)
+                              AND retry_count = 0),
+             COUNT(*) FILTER (WHERE resubmit_cycles = 1)
          FROM derivations WHERE drv_hash = ANY($1)",
     )
     .bind(hashes.iter().map(DrvHash::as_str).collect::<Vec<_>>())
@@ -108,6 +112,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     .await?;
     assert_eq!(n_created, 100);
     assert_eq!(n_clean, 100);
+    assert_eq!(n_bumped, 100, "resubmit_cycles incremented in PG");
 
     // Empty input: no-op, no PG round-trip.
     assert_eq!(db.clear_poison_batch(&[]).await?, 0);

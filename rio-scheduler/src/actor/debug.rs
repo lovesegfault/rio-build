@@ -60,10 +60,10 @@ impl DagActor {
             }
             DebugCmd::ForcePoisoned {
                 drv_hash,
-                retry_count,
+                resubmit_cycles,
                 reply,
             } => {
-                let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
+                let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, resubmit_cycles));
             }
             DebugCmd::ForceStatus {
                 drv_hash,
@@ -256,14 +256,18 @@ impl DagActor {
         true
     }
 
-    /// Force a derivation into `Poisoned` with the given `retry_count`.
-    /// For the I-169 resubmit-bound tests.
-    pub(super) fn handle_debug_force_poisoned(&mut self, drv_hash: &str, retry_count: u32) -> bool {
+    /// Force a derivation into `Poisoned` with the given
+    /// `resubmit_cycles`. For the I-169 resubmit-bound tests.
+    pub(super) fn handle_debug_force_poisoned(
+        &mut self,
+        drv_hash: &str,
+        resubmit_cycles: u32,
+    ) -> bool {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return false;
         };
         state.set_status_for_test(DerivationStatus::Poisoned);
-        state.retry.count = retry_count;
+        state.retry.resubmit_cycles = resubmit_cycles;
         state.retry.poisoned_at = Some(std::time::Instant::now());
         true
     }

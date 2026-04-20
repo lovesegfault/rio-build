@@ -270,13 +270,16 @@ impl SchedulerDb {
     }
 
     /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
-    /// zero `retry_count`, status='created'. Used by ClearPoison admin
-    /// RPC + TTL expiry in `handle_tick`.
+    /// zero `retry_count`, zero `resubmit_cycles`, status='created'. Used
+    /// by ClearPoison admin RPC + TTL expiry in `handle_tick` — admin
+    /// override and TTL expiry are full resets (unlike
+    /// [`Self::clear_poison_batch`], which preserves+increments
+    /// `resubmit_cycles` for the resubmit-bound).
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
-                 status = 'created', updated_at = now()
+                 resubmit_cycles = 0, status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -286,13 +289,22 @@ impl SchedulerDb {
     }
 
     // r[impl sched.db.clear-poison-batch]
-    /// Batch variant of [`clear_poison`]: one round-trip for N hashes
-    /// via `WHERE drv_hash = ANY($1)`. Same column set as the scalar.
+    /// Batch poison clear for the resubmit-reset path: one round-trip
+    /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears per-cycle
+    /// state (`poisoned_at`, `failed_builders`, `retry_count`) AND
+    /// increments `resubmit_cycles` so the
+    /// `r[sched.merge.poisoned-resubmit-bounded]` bound survives leader
+    /// failover. The in-mem increment at `dag::merge` is the
+    /// dispatch-time source of truth; PG mirrors it here.
     ///
     /// I-169: `merge.rs`' resubmit-reset path called `clear_poison`
     /// per-hash inside the single-threaded actor — a 500-node resubmit
     /// blocked heartbeat/dispatch for 500 sequential PG round-trips.
     /// Same shape as [`update_derivation_status_batch`].
+    ///
+    /// NOT the same column set as [`clear_poison`]: that one zeroes
+    /// `resubmit_cycles` (admin/TTL → full reset); this one increments
+    /// it (resubmit → bound accumulates).
     ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
@@ -304,6 +316,7 @@ impl SchedulerDb {
         let result = sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 resubmit_cycles = resubmit_cycles + 1,
                  status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
@@ -384,7 +397,8 @@ impl SchedulerDb {
     /// can never be in this state.
     ///
     /// Returns minimal fields — poisoned rows aren't dispatched, just
-    /// TTL-tracked. The `failed_builders` count matters for display;
+    /// TTL-tracked + resubmit-bound checked. `failed_builders` matters
+    /// for display; `resubmit_cycles` for `is_retriable_on_resubmit`;
     /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
     /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
     pub(crate) async fn load_poisoned_derivations(
@@ -393,7 +407,7 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders, is_fixed_output,
+                   failed_builders, is_fixed_output, resubmit_cycles,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0

@@ -134,9 +134,9 @@ fn test_initial_states() -> anyhow::Result<()> {
 // Failed: non-terminal but stuck without a retry driver. build1 still
 // interested → preserved across reset so the stuck build also benefits.
 #[case::failed(DerivationStatus::Failed, 0, false, true, DerivationStatus::Created)]
-// I-169 bound: at retry_count >= LIMIT, Poisoned stays Poisoned on
+// I-169 bound: at resubmit_cycles >= LIMIT, Poisoned stays Poisoned on
 // resubmit. 24h TTL or ClearPoison are the only overrides.
-// r[verify sched.merge.poisoned-resubmit-bounded]
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
 #[case::poisoned_at_limit(
     DerivationStatus::Poisoned,
     crate::state::POISON_RESUBMIT_RETRY_LIMIT,
@@ -158,7 +158,7 @@ fn merge_reset_single_node(
     {
         let n = dag.nodes.get_mut("h").unwrap();
         n.set_status_for_test(prior);
-        n.retry.count = retry;
+        n.retry.resubmit_cycles = retry;
         if clear_interest {
             n.interested_builds.clear();
         }
@@ -189,6 +189,61 @@ fn merge_reset_single_node(
     Ok(())
 }
 
+/// bug_152: the resubmit bound must fire via NATURAL accumulation of
+/// poison→resubmit→poison cycles, with NO direct injection of the limit
+/// value. Before the `resubmit_cycles` split, `retry.count` was both the
+/// per-cycle `max_retries` gate (capped at 2) and the cross-cycle
+/// `POISON_RESUBMIT_RETRY_LIMIT` gate (6) — `2 < 6` was permanently
+/// true and this loop never terminated.
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
+#[test]
+fn test_poison_resubmit_bound_fires_via_natural_accumulation() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let nodes = vec![make_node("nat", "x86_64-linux")];
+    dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+
+    // Cycle 1..=LIMIT: poison (resubmit_cycles untouched — natural
+    // poison only sets status), resubmit (merge increments cycles).
+    for cycle in 1..=POISON_RESUBMIT_RETRY_LIMIT {
+        dag.nodes
+            .get_mut("nat")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Poisoned);
+        let result = dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+        assert!(
+            result.newly_inserted.contains("nat"),
+            "cycle {cycle}: under limit → reset"
+        );
+        let n = &dag.nodes["nat"];
+        assert_eq!(n.status(), DerivationStatus::Created);
+        assert_eq!(
+            n.retry.resubmit_cycles, cycle,
+            "cycle {cycle}: resubmit_cycles incremented"
+        );
+        assert_eq!(n.retry.count, 0, "cycle {cycle}: per-cycle count fresh");
+    }
+
+    // Cycle LIMIT+1: poison again, resubmit → bound MUST fire.
+    dag.nodes
+        .get_mut("nat")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Poisoned);
+    let result = dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
+    assert!(
+        !result.newly_inserted.contains("nat"),
+        "at limit → NOT reset (bound fired)"
+    );
+    assert_eq!(
+        dag.nodes["nat"].status(),
+        DerivationStatus::Poisoned,
+        "bug_152: bound must fire via natural accumulation; \
+         pre-fix retry.count was capped at max_retries=2 < LIMIT=6 → \
+         this resubmit would loop forever"
+    );
+    Ok(())
+}
+
 /// Reset-on-resubmit, parent→child cascade cases. `DependencyFailed` is
 /// retriable because it's a DERIVED state: reset lets
 /// `compute_initial_states` re-evaluate `any_dep_terminally_failed`
@@ -198,10 +253,11 @@ fn merge_reset_single_node(
 // Worker-side TimedOut → handle_timeout_failure: child Cancelled, parent
 // DependencyFailed cascade. Resubmit resets BOTH; child→Ready, parent→Queued.
 #[case::timeout_cascade(DerivationStatus::Cancelled, 0, true, DerivationStatus::Queued)]
-// I-169: Poisoned with retry_count < LIMIT resets; retry_count carried so
-// the bound accumulates; surfaced in reset_on_resubmit for db.clear_poison.
-// r[verify sched.merge.poisoned-resubmit-bounded]
-#[case::poisoned_under_limit(DerivationStatus::Poisoned, 2, true, DerivationStatus::Queued)]
+// I-169: Poisoned with resubmit_cycles < LIMIT resets; resubmit_cycles
+// incremented so the bound accumulates; surfaced in reset_on_resubmit for
+// db.clear_poison.
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
+#[case::poisoned_under_limit(DerivationStatus::Poisoned, 1, true, DerivationStatus::Queued)]
 // DependencyFailed reset is self-correcting when dep is STILL Poisoned (at
 // limit): compute_initial_states re-checks any_dep_terminally_failed and
 // re-derives parent as DependencyFailed. Same fast-fail, via reset path.
@@ -227,7 +283,7 @@ fn merge_reset_parent_child(
     {
         let c = dag.nodes.get_mut("child").unwrap();
         c.set_status_for_test(child_prior);
-        c.retry.count = child_retry;
+        c.retry.resubmit_cycles = child_retry;
     }
     dag.nodes
         .get_mut("parent")
@@ -241,8 +297,10 @@ fn merge_reset_parent_child(
     assert_eq!(result.newly_inserted.contains("child"), expect_child_reset);
     if expect_child_reset {
         assert_eq!(dag.nodes["child"].status(), DerivationStatus::Created);
-        // retry_count carried over so the I-169 bound accumulates.
-        assert_eq!(dag.nodes["child"].retry.count, child_retry);
+        // resubmit_cycles incremented so the I-169 bound accumulates;
+        // retry.count reset to 0 → fresh per-cycle max_retries budget.
+        assert_eq!(dag.nodes["child"].retry.resubmit_cycles, child_retry + 1);
+        assert_eq!(dag.nodes["child"].retry.count, 0);
         if child_prior == DerivationStatus::Poisoned {
             assert!(
                 result.reset_on_resubmit.iter().any(|h| h == "child"),
@@ -277,7 +335,7 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     {
         let leaf = dag.nodes.get_mut("leafP").expect("leafP");
         leaf.set_status_for_test(DerivationStatus::Poisoned);
-        leaf.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+        leaf.retry.resubmit_cycles = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     }
 
     assert!(!dag.any_dep_terminally_failed("leafP")); // no deps
@@ -508,17 +566,18 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
 
 /// Resubmit-reset destructively removes a retriable node before
 /// validation. If the merge then fails (cycle), rollback must restore
-/// the prior node verbatim — status, interested_builds, retry.count,
-/// path_to_hash entry, AND pre-existing edges keyed on its hash. Without
-/// restore, `{retriable-X, cycle}` wipes X and resets its retry counter,
-/// defeating `POISON_RESUBMIT_RETRY_LIMIT` (I-169).
-// r[verify sched.merge.poisoned-resubmit-bounded]
+/// the prior node verbatim — status, interested_builds,
+/// retry.resubmit_cycles, path_to_hash entry, AND pre-existing edges
+/// keyed on its hash. Without restore, `{retriable-X, cycle}` wipes X
+/// and resets its resubmit counter, defeating
+/// `POISON_RESUBMIT_RETRY_LIMIT` (I-169).
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
 #[test]
 fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let b1 = Uuid::new_v4();
 
-    // B1: W depends on X. X then fails with retry.count=4.
+    // B1: W depends on X. X then fails with retry.resubmit_cycles=1.
     dag.merge(
         b1,
         &[
@@ -531,7 +590,7 @@ fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
     {
         let x = dag.node_mut("hashX").expect("hashX");
         x.set_status_for_test(DerivationStatus::Failed);
-        x.retry.count = 4;
+        x.retry.resubmit_cycles = 1;
     }
     let x_path = test_drv_path("hashX");
 
@@ -558,8 +617,8 @@ fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
         "prior status restored"
     );
     assert_eq!(
-        x.retry.count, 4,
-        "retry.count toward poison-limit preserved"
+        x.retry.resubmit_cycles, 1,
+        "retry.resubmit_cycles toward poison-limit preserved"
     );
     assert_eq!(
         x.interested_builds,
@@ -594,7 +653,7 @@ fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
 /// touched so far: earlier-iteration fresh inserts, interest added to
 /// pre-existing nodes, and removed retriable nodes. Previously the `?`
 /// dropped all rollback state on the floor.
-// r[verify sched.merge.poisoned-resubmit-bounded]
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
 #[test]
 fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -613,7 +672,7 @@ fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     {
         let x = dag.node_mut("hashX").expect("hashX");
         x.set_status_for_test(DerivationStatus::Failed);
-        x.retry.count = 2;
+        x.retry.resubmit_cycles = 1;
     }
 
     // B2: [good-pre (interest), X (resubmit-reset), GOOD-NEW (fresh), BAD].
@@ -636,7 +695,7 @@ fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     // X restored verbatim.
     let x = dag.node("hashX").expect("hashX restored");
     assert_eq!(x.status(), DerivationStatus::Failed);
-    assert_eq!(x.retry.count, 2);
+    assert_eq!(x.retry.resubmit_cycles, 1);
     assert_eq!(x.interested_builds, HashSet::from([b1]));
     // Earlier-iteration fresh insert rolled back.
     assert!(
@@ -1988,7 +2047,7 @@ fn test_initial_states_transitive_dep_failed(#[case] mids: &[&str]) -> anyhow::R
     {
         let x = dag.nodes.get_mut("X").expect("X");
         x.set_status_for_test(DerivationStatus::Poisoned);
-        x.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+        x.retry.resubmit_cycles = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     }
 
     // Merge chain A→[mids…]→X.

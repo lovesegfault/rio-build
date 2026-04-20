@@ -243,7 +243,7 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
-    // r[impl sched.merge.poisoned-resubmit-bounded]
+    // r[impl sched.merge.poisoned-resubmit-bounded+2]
     pub fn merge(
         &mut self,
         build_id: Uuid,
@@ -262,7 +262,8 @@ impl DerivationDag {
         // Full prior state of retriable nodes destructively removed below
         // for resubmit-reset. rollback_merge restores these so a failed
         // merge leaves the DAG exactly as it was (status, interest set,
-        // retry.count toward POISON_RESUBMIT_RETRY_LIMIT all preserved).
+        // retry.resubmit_cycles toward POISON_RESUBMIT_RETRY_LIMIT all
+        // preserved).
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
         // Pre-existing nodes whose empty traceparent was upgraded below.
         let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
@@ -296,17 +297,17 @@ impl DerivationDag {
             //
             // Prior interested_builds are carried over so any OTHER build
             // that was stuck on this Cancelled node also benefits from the
-            // reset. retry_count is carried over so the Poisoned-resubmit
-            // bound (POISON_RESUBMIT_RETRY_LIMIT) accumulates across
-            // resubmits — without this, every reset would start at 0 and
-            // the bound would never fire (I-169).
+            // reset. resubmit_cycles is carried over so the
+            // Poisoned-resubmit bound (POISON_RESUBMIT_RETRY_LIMIT)
+            // accumulates across resubmits — without this, every reset
+            // would start at 0 and the bound would never fire (I-169).
             let prior = if self
                 .nodes
                 .get(&drv_hash)
                 .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
                 let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                let carry = (old.interested_builds.clone(), old.retry.count);
+                let carry = (old.interested_builds.clone(), old.retry.resubmit_cycles);
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
             } else {
@@ -367,13 +368,16 @@ impl DerivationDag {
                 // kvm pool skips it (I-181 ∅ guard).
                 self.apply_soft_features(&mut state);
                 state.interested_builds.insert(build_id);
-                // Carry over interested_builds + retry_count from the
+                // Carry over interested_builds + resubmit_cycles from the
                 // removed retriable node (if any) — other stuck builds
-                // get the reset too; retry_count accumulates toward
-                // POISON_RESUBMIT_RETRY_LIMIT.
-                if let Some((prior_interest, prior_retry)) = prior {
+                // get the reset too; resubmit_cycles is INCREMENTED here
+                // (the reset itself IS the cycle event) so the
+                // POISON_RESUBMIT_RETRY_LIMIT bound accumulates.
+                // retry.count stays at the fresh-state default (0) → full
+                // per-cycle max_retries budget restored on every resubmit.
+                if let Some((prior_interest, prior_cycles)) = prior {
                     state.interested_builds.extend(prior_interest);
-                    state.retry.count = prior_retry;
+                    state.retry.resubmit_cycles = prior_cycles + 1;
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();

@@ -837,6 +837,21 @@ pub const M_050: () = ();
 /// `ReapBy::Stale`).
 pub const M_052: () = ();
 
+/// `migrations/051_derivations_resubmit_cycles.sql`
+///
+/// `resubmit_cycles` on `derivations`: counts poison→resubmit reset
+/// events (NOT per-attempt retries). Splits the cross-cycle accumulator
+/// from `retry_count`: a single counter cannot be both
+/// per-cycle-reset (`max_retries` gate) and cross-cycle-accumulated
+/// (`POISON_RESUBMIT_RETRY_LIMIT` gate). With both roles on
+/// `retry_count`, the per-cycle cap (`max_retries=2`) was the
+/// permanent ceiling, so `2 < 6` was always true and the resubmit
+/// bound never fired (bug_152). `resubmit_cycles` is incremented in PG
+/// by `clear_poison_batch` (the resubmit-reset chokepoint) so the
+/// bound survives leader failover; `clear_poison` (admin/TTL) zeroes
+/// it as a full reset.
+pub const M_051: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

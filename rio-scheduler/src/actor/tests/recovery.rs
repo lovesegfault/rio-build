@@ -1129,6 +1129,56 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
     Ok(())
 }
 
+/// bug_001 + discovered_001: `resubmit_cycles` survives recovery.
+/// Poison + resubmit twice (PG `resubmit_cycles` → 2 = LIMIT), restart
+/// scheduler, resubmit → bound MUST hold. Before `M_051`,
+/// `from_poisoned_row` left the cross-cycle counter at default 0 and
+/// `clear_poison_batch` zeroed PG on every resubmit, so failover gave a
+/// fresh budget.
+// r[verify sched.merge.poisoned-resubmit-bounded+2]
+#[tokio::test]
+async fn test_poisoned_recovery_preserves_resubmit_cycles() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let f = RecoveryFixture::run(async |handle, pool| {
+        seed_poisoned(&handle, "rs-cyc").await?;
+        // Drive resubmit_cycles to LIMIT in PG (mirror the in-mem
+        // increment that `clear_poison_batch` would have done over
+        // LIMIT resubmit cycles). Status stays 'poisoned' so recovery
+        // loads via `load_poisoned_derivations`.
+        sqlx::query("UPDATE derivations SET resubmit_cycles = $2 WHERE drv_hash = $1")
+            .bind("rs-cyc")
+            .bind(POISON_RESUBMIT_RETRY_LIMIT as i32)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    // After recovery: resubmit_cycles loaded from PG.
+    let post = expect_drv(&f.handle, "rs-cyc").await;
+    assert_eq!(post.status, DerivationStatus::Poisoned);
+    assert_eq!(
+        post.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT,
+        "bug_001: from_poisoned_row must load resubmit_cycles from PG"
+    );
+
+    // Resubmit on the fresh actor → bound holds (stays Poisoned).
+    let build2 = Uuid::new_v4();
+    merge_dag(&f.handle, build2, vec![make_node("rs-cyc")], vec![], false).await?;
+    barrier(&f.handle).await;
+    let after = expect_drv(&f.handle, "rs-cyc").await;
+    assert_eq!(
+        after.status,
+        DerivationStatus::Poisoned,
+        "discovered_001: resubmit bound must survive failover"
+    );
+    assert_eq!(
+        query_status(&f.handle, build2).await?.state,
+        rio_proto::types::BuildState::Failed as i32
+    );
+    Ok(())
+}
+
 /// Recovery loads a poisoned row whose PG `poisoned_at` is already past
 /// TTL. Recovery should clear it in PG and NOT insert it into the DAG.
 ///

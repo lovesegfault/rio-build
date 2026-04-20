@@ -265,8 +265,19 @@ impl DerivationStatus {
 /// re-derived from it on recovery (same-worker repeats forgiven).
 #[derive(Debug, Clone, Default)]
 pub struct RetryState {
-    /// Number of retry attempts so far.
+    /// Number of retry attempts so far in the CURRENT poison cycle.
+    /// Gated against `RetryPolicy::max_retries` at completion. Reset to
+    /// 0 on resubmit-after-poison (fresh per-cycle budget). See
+    /// [`Self::resubmit_cycles`] for the cross-cycle counter.
     pub count: u32,
+    /// Number of poison→resubmit reset events. Gated against
+    /// [`POISON_RESUBMIT_RETRY_LIMIT`]. Incremented by `dag::merge` on
+    /// each resubmit-reset; persisted (`M_051`) so the bound survives
+    /// leader failover. Distinct from [`Self::count`]: a single counter
+    /// cannot be both per-cycle-reset and cross-cycle-accumulated —
+    /// when `count` served both roles, the `max_retries=2` cap was the
+    /// permanent ceiling and the resubmit bound never fired (bug_152).
+    pub resubmit_cycles: u32,
     /// Number of InfrastructureFailure re-dispatches so far. Separate
     /// from `count` because infra failures don't count toward the
     /// transient-failure budget (they're worker-local, not build-local)
@@ -324,6 +335,7 @@ impl RetryState {
     /// exists. Does NOT change `status`; caller transitions separately.
     pub fn clear(&mut self) {
         self.count = 0;
+        self.resubmit_cycles = 0;
         self.infra_count = 0;
         self.timeout_count = 0;
         self.last_infra_failure_at = None;
@@ -712,6 +724,7 @@ impl DerivationState {
             drv_content: Vec::new(), // worker fetches from store
             retry: RetryState {
                 count: row.retry_count.max(0) as u32,
+                resubmit_cycles: row.resubmit_cycles.max(0) as u32,
                 // failure_count: initialize from failed_builders.len() —
                 // same-worker repeats are lost (in-mem only), conservative.
                 failure_count: row.failed_builders.len() as u32,
@@ -741,7 +754,8 @@ impl DerivationState {
     }
 
     /// Construct from a `PoisonedDerivationRow` during recovery.
-    /// Minimal — poisoned rows aren't dispatched, just TTL-tracked.
+    /// Minimal — poisoned rows aren't dispatched, just TTL-tracked +
+    /// resubmit-bound checked (`is_retriable_on_resubmit`).
     /// `elapsed_secs` comes from PG's `EXTRACT(EPOCH FROM (now() -
     /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
@@ -787,6 +801,7 @@ impl DerivationState {
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             retry: RetryState {
+                resubmit_cycles: row.resubmit_cycles.max(0) as u32,
                 failure_count: row.failed_builders.len() as u32,
                 failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
                 poisoned_at: Some(poisoned_at),
@@ -915,25 +930,24 @@ impl DerivationState {
         }
     }
 
-    // r[impl sched.merge.poisoned-resubmit-bounded]
+    // r[impl sched.merge.poisoned-resubmit-bounded+2]
     /// Whether a resubmit of THIS node should reset it for re-dispatch.
     ///
     /// Wraps [`DerivationStatus::is_retriable_on_resubmit`] (the
     /// unconditionally-retriable states) and adds the bounded `Poisoned`
-    /// case: a `Poisoned` node resets iff `retry_count <
+    /// case: a `Poisoned` node resets iff `resubmit_cycles <
     /// POISON_RESUBMIT_RETRY_LIMIT`. An explicit client re-submission is
     /// retry intent — the operator presumably fixed the underlying cause
     /// (I-169: I-167's `?id=` patch poisoned, then 27k dependents
     /// re-derived `DependencyFailed` from the still-poisoned parent on
-    /// every resubmit). `retry_count` is carried over across the reset
-    /// (`dag::merge`) so the bound accumulates: at the default poison
-    /// threshold (3) this allows roughly two poison cycles before the
-    /// node sticks. At/above the limit, 24h TTL or `ClearPoison` are the
-    /// only overrides.
+    /// every resubmit). `resubmit_cycles` is incremented on each reset
+    /// (`dag::merge`) and persisted (`M_051`) so the bound accumulates
+    /// across re-submissions and survives leader failover. At/above the
+    /// limit, 24h TTL or `ClearPoison` are the only overrides.
     pub fn is_retriable_on_resubmit(&self) -> bool {
         self.status.is_retriable_on_resubmit()
             || (self.status == DerivationStatus::Poisoned
-                && self.retry.count < POISON_RESUBMIT_RETRY_LIMIT)
+                && self.retry.resubmit_cycles < POISON_RESUBMIT_RETRY_LIMIT)
     }
 
     /// Test-only: directly set status bypassing state machine validation.
@@ -993,13 +1007,14 @@ impl PoisonConfig {
     }
 }
 
-/// Max `retry_count` at which a `Poisoned` node still resets on explicit
-/// resubmit. At/above this, the node stays `Poisoned` and the build
-/// fail-fasts (24h TTL or `ClearPoison` to override). `retry_count` is
-/// carried over across resets so this accumulates: at the default poison
-/// threshold (3 distinct workers) ≈ two poison cycles. See
+/// Max `resubmit_cycles` at which a `Poisoned` node still resets on
+/// explicit resubmit. At/above this, the node stays `Poisoned` and the
+/// build fail-fasts (24h TTL or `ClearPoison` to override).
+/// `resubmit_cycles` is incremented on each reset and persisted
+/// (`M_051`) so this accumulates across re-submissions and scheduler
+/// restarts: two poison cycles before the node sticks. See
 /// [`DerivationState::is_retriable_on_resubmit`].
-pub const POISON_RESUBMIT_RETRY_LIMIT: u32 = 6;
+pub const POISON_RESUBMIT_RETRY_LIMIT: u32 = 2;
 
 /// Poison TTL: duration after which a poisoned derivation is reset to created.
 /// 24h in production. Short in tests so poison-expiry can be observed without
@@ -1268,6 +1283,7 @@ mod tests {
             failed_builders: vec![],
             elapsed_secs: 100.0,
             is_fixed_output: false,
+            resubmit_cycles: 0,
         };
         let err = DerivationState::from_poisoned_row(row).unwrap_err();
         assert_eq!(
@@ -1298,6 +1314,7 @@ mod tests {
             required_features: vec![],
             assigned_builder_id: None,
             retry_count: 0,
+            resubmit_cycles: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,
@@ -1428,6 +1445,7 @@ mod tests {
             failed_builders: vec![],
             elapsed_secs: f64::INFINITY,
             is_fixed_output: false,
+            resubmit_cycles: 0,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
         // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →

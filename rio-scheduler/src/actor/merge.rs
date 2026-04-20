@@ -420,10 +420,9 @@ impl DagActor {
         // is overwritten by `update_derivation_status_batch` below
         // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
         // resurrect it; this is about keeping failed_builders/poisoned_at
-        // consistent for the NEXT poison cycle. retry_count is carried
-        // over IN-MEMORY only (`dag.merge`); PG zeroes it here, so the
-        // resubmit bound resets across leader failover — conservative,
-        // matches `infra_retry_count`'s precedent. Best-effort.
+        // consistent for the NEXT poison cycle. resubmit_cycles is
+        // INCREMENTED in PG here so the bound survives leader failover.
+        // Best-effort.
         // r[impl sched.db.clear-poison-batch]
         if let Err(e) = self
             .db
