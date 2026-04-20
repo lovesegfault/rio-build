@@ -654,9 +654,12 @@ impl DagActor {
     /// standby never reaches here so it exports no series (see
     /// `test_not_leader_does_not_set_gauges`). A was-leader-now-standby
     /// has its gauges zeroed once by `handle_leader_lost` so its frozen
-    /// last-tick values don't sit in Prometheus indefinitely. Net:
-    /// queries see one non-zero series, no max() wrapper needed.
-    // r[impl obs.metric.scheduler-leader-gate]
+    /// last-tick values don't sit in Prometheus indefinitely —
+    /// EXCEPT `workers_active`, which is connection-state (not
+    /// leader-state) and is maintained by the inc/dec path on standby
+    /// as workers rebalance away. Net: queries see one non-zero series
+    /// for the leader-state gauges, no max() wrapper needed.
+    // r[impl obs.metric.scheduler-leader-gate+2]
     fn tick_publish_gauges(&self) {
         metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
         metrics::gauge!("rio_scheduler_workers_active").set(

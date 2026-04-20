@@ -216,6 +216,66 @@ async fn test_recovery_failed_dep_transitions_parent_not_ready() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.recovery.failed-dep-cascade]
+/// Transitive (depth ≥2) ancestors of a PG-terminal-failed child must
+/// ALSO be persisted as DependencyFailed, not just transitioned in-DAG.
+///
+/// 3-deep chain: child←parent←grand. PG has child=poisoned, parent and
+/// grand both queued. The `cascade_failed` loop persists `parent`
+/// (immediate parent of a PG-failed child); `compute_initial_states`
+/// returns DependencyFailed for `grand` (its dep `parent` is now
+/// DepFailed in-DAG + `will_fail` propagation). Without the persist
+/// after that transition, `grand` stays 'queued' in PG and leaks
+/// permanently once the build_derivations link is GC'd
+/// (gc_orphan_terminal_derivations filters `status IN TERMINAL`).
+#[tokio::test]
+async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        merge_chain(
+            &handle,
+            build_id,
+            &["fdc-child", "fdc-parent", "fdc-grand"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate: child → poisoned (cascade_dependency_failure
+        // persisted child but crashed before parent/grand). Build
+        // stays Active (interested_builds non-empty).
+        sqlx::query("UPDATE derivations SET status = 'poisoned' WHERE drv_hash = 'fdc-child'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    // In-DAG: grand must be DependencyFailed (compute_initial_states
+    // sees parent as DepFailed via cascade_failed + will_fail).
+    let grand = expect_drv(&f.handle, "fdc-grand").await;
+    assert_eq!(
+        grand.status,
+        DerivationStatus::DependencyFailed,
+        "depth-2 ancestor must be DependencyFailed in-DAG"
+    );
+
+    // PG: grand must ALSO be persisted (not stuck at 'queued'). This
+    // is the leak guard — before the fix, only the in-DAG transition
+    // happened.
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'fdc-grand'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(
+        pg_status,
+        DerivationStatus::DependencyFailed.as_str(),
+        "depth-2 ancestor must be persisted to PG (else permanent row leak)"
+    );
+
+    Ok(())
+}
+
 /// Recovery failure (PG down mid-recovery) → recovery_complete set
 /// TRUE with empty DAG. Degrade, don't block. The alternative (leave
 /// recovery_complete=false) would block dispatch forever while the
@@ -557,11 +617,13 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
         "build should be Succeeded after orphan completion"
     );
 
-    // Per-derivation Completed event must be emitted (with output
-    // paths) BEFORE the build-level Completed; without this,
-    // clients see the drv frozen at Started.
+    // Per-derivation Completed event must be emitted exactly once (with
+    // output paths) BEFORE the build-level Completed; without this,
+    // clients see the drv frozen at Started. Count (not just observe)
+    // so a duplicate emission fails the test — emit() has no dedup, so
+    // a second loop would write 2× build_event_log rows + 2× broadcasts.
     use rio_proto::types::{DerivationEventKind, build_event::Event};
-    let mut got_drv_completed = None;
+    let mut drv_completed: Vec<rio_proto::types::DerivationEvent> = Vec::new();
     let mut got_build_completed = false;
     while let Ok(ev) = events.try_recv() {
         match ev.event {
@@ -570,14 +632,19 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
                     !got_build_completed,
                     "DerivationCompleted must precede BuildCompleted"
                 );
-                got_drv_completed = Some(d);
+                drv_completed.push(d);
             }
             Some(Event::Completed(_)) => got_build_completed = true,
             _ => {}
         }
     }
-    let d =
-        got_drv_completed.expect("adopt_orphan_completion must emit DerivationEvent::Completed");
+    assert_eq!(
+        drv_completed.len(),
+        1,
+        "adopt_orphan_completion emitted DerivationCompleted {}× (expected exactly 1)",
+        drv_completed.len()
+    );
+    let d = &drv_completed[0];
     assert_eq!(d.derivation_path, test_drv_path("orphan-drv"));
     assert_eq!(d.output_paths, vec![out_path]);
 
@@ -1688,15 +1755,24 @@ async fn ex_leader_drops_process_completion() -> TestResult {
         .await?;
     barrier(&handle).await;
 
-    // PG status MUST NOT be Completed.
+    // PG status MUST NOT be Completed. Compare via the type-checked
+    // accessor so a typo in the literal can't make this vacuous (PG
+    // stores lowercase per db_str_enum!). Positive equality against
+    // the pre-state (the dispatch path persists Assigned) is robust
+    // against future status-enum additions.
     let row: Option<(String,)> =
         sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'ex-drv'")
             .fetch_optional(&db.pool)
             .await?;
     assert_ne!(
         row.as_ref().map(|r| r.0.as_str()),
-        Some("Completed"),
+        Some(DerivationStatus::Completed.as_str()),
         "ex-leader must NOT persist Completed; got {row:?}"
+    );
+    assert_eq!(
+        row.as_ref().map(|r| r.0.as_str()),
+        Some(DerivationStatus::Assigned.as_str()),
+        "ex-leader ProcessCompletion must leave PG status untouched; got {row:?}"
     );
     Ok(())
 }
@@ -1745,7 +1821,13 @@ async fn ex_leader_heartbeat_prefetch_no_pg_writes() -> TestResult {
         })
         .await?;
     // Heartbeat became_idle path → dispatch_ready inline + (if
-    // phantoms) drain_phantoms. Gated at call site.
+    // phantoms) drain_phantoms. Gated at call site. Phantom
+    // confirmation is two-strike (executor.rs: prior_suspect ==
+    // suspect), so a SECOND heartbeat is required for
+    // confirmed_phantoms to be non-empty — otherwise
+    // !phantoms.is_empty() short-circuits before is_leader() is
+    // evaluated and this test is vacuous for the drain_phantoms gate.
+    send_heartbeat_with(&handle, "exhb-w", "x86_64-linux", |_| {}).await?;
     send_heartbeat_with(&handle, "exhb-w", "x86_64-linux", |_| {}).await?;
     barrier(&handle).await;
 
@@ -1758,6 +1840,135 @@ async fn ex_leader_heartbeat_prefetch_no_pg_writes() -> TestResult {
     assert_eq!(
         baseline, after,
         "ex-leader Heartbeat/PrefetchComplete must not write PG"
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.poisoned-failed-count]
+/// Sticky `had_failure` (`error_summary.is_some()`) MUST survive
+/// recovery. `restore_builds` reconstructs via `new_pending` →
+/// `error_summary=None`; `finalize_recovered_builds` must seed it from
+/// `failed_count` (which `update_build_counts` sets from the DAG, which
+/// includes Poisoned). Otherwise: ClearPoison removes the node →
+/// `failed_count=0` → keep_going build spuriously Succeeds.
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_clear_poison() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // 2 independent drvs, keep_going=true. Backdate X→poisoned
+        // (failure persisted, build still Active — crash between
+        // handle_derivation_failure setting in-mem error_summary and
+        // any later persist).
+        let _ev = merge_dag(
+            &handle,
+            build_id,
+            vec![make_node("kgs-x"), make_node("kgs-y")],
+            vec![],
+            true, // keep_going
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'poisoned', poisoned_at = now() \
+             WHERE drv_hash = 'kgs-x'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // ClearPoison X → node removed from DAG + derivation_hashes (per
+    // prune_interested_keep_going). Now total=1 (just Y), failed=0.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClearPoison {
+            drv_hash: "kgs-x".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await?, "ClearPoison → cleared=true");
+
+    // Complete Y. Without sticky error_summary reconstruction:
+    // all_completed && failed==0 && !had_failure → spurious Succeeded.
+    let mut wrx = connect_executor(&handle, "kgs-w", "x86_64-linux").await?;
+    let _a = recv_assignment(&mut wrx).await;
+    complete_success_empty(&handle, "kgs-w", &test_drv_path("kgs-y")).await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build with pre-restart failure must Fail (not Succeed) \
+         after ClearPoison removes the poisoned node post-restart"
+    );
+    Ok(())
+}
+
+// r[verify sched.timeout.per-build]
+/// `build_timeout` is "wall-clock since SUBMISSION" — recovery must
+/// seed `submitted_at` from PG, not reset to `Instant::now()`. Otherwise
+/// each failover grants a fresh full timeout window.
+#[tokio::test]
+async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                req: MergeDagRequest {
+                    build_id,
+                    tenant_id: None,
+                    priority_class: PriorityClass::Scheduled,
+                    nodes: vec![make_node("bto-drv")],
+                    edges: vec![],
+                    options: BuildOptions {
+                        build_timeout: 60,
+                        ..Default::default()
+                    },
+                    keep_going: false,
+                    traceparent: String::new(),
+                    jti: None,
+                    jwt_token: None,
+                },
+                reply: tx,
+            })
+            .await?;
+        let _ev = rx.await??;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate submission past the timeout. With submitted_at
+        // restored from PG, tick_check_build_timeouts fires
+        // immediately on the recovered actor's first Tick.
+        sqlx::query(
+            "UPDATE builds SET submitted_at = now() - interval '120 seconds' \
+             WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+
+    f.handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&f.handle).await;
+
+    let status = query_status(&f.handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "build_timeout=60 with submitted_at 120s ago must time out on \
+         first Tick after recovery (submitted_at must be restored, not \
+         reset to now())"
+    );
+    assert!(
+        status.error_summary.contains("build_timeout"),
+        "error_summary should name build_timeout: {:?}",
+        status.error_summary
     );
     Ok(())
 }

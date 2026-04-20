@@ -307,9 +307,10 @@ impl DagActor {
     }
 
     /// Reconstruct `BuildInfo` + broadcast channels + `build_sequences`
-    /// from the loaded rows. Lossy on Instants (submitted_at → now);
-    /// total/completed/cached counts are seeded from PG denorm columns
-    /// (I-111).
+    /// from the loaded rows. `submitted_at` is reconstructed from PG's
+    /// `now() - submitted_at` (so `r[sched.timeout.per-build]` survives
+    /// failover); total/completed/cached counts are seeded from PG
+    /// denorm columns (I-111).
     async fn restore_builds(
         &mut self,
         build_rows: Vec<RecoveryBuildRow>,
@@ -331,8 +332,7 @@ impl DagActor {
             let options = row.options_json.map(|j| j.0).unwrap_or_default();
             let hashes = build_drv_hashes.remove(&row.build_id).unwrap_or_default();
 
-            // BuildInfo::new_pending then transition. Lossy:
-            // submitted_at resets to now() (can't restore Instant).
+            // BuildInfo::new_pending then transition.
             // completed_count/failed_count reset to 0 —
             // check_build_completion recomputes from DAG status on the
             // next completion (relative to derivation_hashes, which is
@@ -357,6 +357,17 @@ impl DagActor {
             info.total_count = row.total_drvs as u32;
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
+            // Seed submitted_at from PG so r[sched.timeout.per-build]
+            // and rio_scheduler_build_duration_seconds survive failover
+            // (otherwise each failover grants a fresh full
+            // build_timeout window, contradicting "wall-clock since
+            // submission"). PG-side elapsed → Instant reconstruction,
+            // same as PoisonedDerivationRow.
+            info.submitted_at = Instant::now()
+                .checked_sub(std::time::Duration::from_secs_f64(
+                    row.submitted_age_secs.max(0.0),
+                ))
+                .unwrap_or_else(Instant::now);
             // Transition to current state (Pending → Active if the
             // row says active). new_pending starts at Pending.
             if state == BuildState::Active
@@ -464,8 +475,7 @@ impl DagActor {
         //
         // I-059 orphan gate also applies here: a parent with no
         // active interested build is left at PG status (it's not in
-        // `to_recompute`, so the intersection below skips it; the
-        // orphan-derivation GC will eventually reap it).
+        // `to_recompute`, so the intersection below skips it).
         let mut cascade_failed: Vec<DrvHash> = Vec::new();
         let to_recompute: HashSet<DrvHash> = to_recompute
             .into_iter()
@@ -540,6 +550,16 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, from = ?from, to = ?target, error = %e,
                       "recovery: initial-state transition failed");
                 continue;
+            }
+            if target == DerivationStatus::DependencyFailed {
+                // Same as cascade_failed (500-504): without this, PG
+                // stays 'queued', gc_orphan_terminal_derivations
+                // (filters status IN TERMINAL) never reaps the row
+                // after the build link is GC'd → permanent leak.
+                // Reaches here for depth-≥2 ancestors (immediate
+                // parents handled above by cascade_failed).
+                self.persist_status(&drv_hash, DerivationStatus::DependencyFailed, None)
+                    .await;
             }
             if target == DerivationStatus::Ready {
                 transitioned_ready += 1;
@@ -636,6 +656,22 @@ impl DagActor {
                 continue;
             }
             self.update_build_counts(build_id).await;
+            // Reconstruct sticky had_failure (build.rs:461).
+            // update_build_counts just set failed_count from the DAG
+            // (which includes Poisoned/DepFailed per
+            // r[sched.recovery.poisoned-failed-count]). Without this,
+            // a later ClearPoison/TTL removes the node →
+            // failed_count=0 → keep_going build spuriously Succeeds.
+            // error_summary is the sticky; failed_count is not.
+            if let Some(b) = self.builds.get_mut(&build_id)
+                && b.failed_count > 0
+                && b.error_summary.is_none()
+            {
+                b.error_summary = Some(format!(
+                    "recovered with {} failed derivation(s)",
+                    b.failed_count
+                ));
+            }
             self.check_build_completion(build_id).await;
         }
     }
@@ -665,13 +701,19 @@ impl DagActor {
     /// `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
     // r[impl sched.lease.standby-tick-noop]
-    // r[impl obs.metric.scheduler-leader-gate]
+    // r[impl obs.metric.scheduler-leader-gate+2]
     pub(super) fn handle_leader_lost(&mut self) {
         info!("leader lost: clearing persisted actor state");
         self.clear_persisted_state();
+        // workers_active is NOT zeroed: `executors` is retained
+        // (clear_persisted_state keeps live connections), and
+        // ExecutorDisconnected is not leader-gated — the inc/dec path
+        // (executor.rs) maintains the gauge on standby. Zeroing it
+        // here desyncs from N retained entries; each subsequent
+        // disconnect would decrement to −1…−N. Workers rebalancing to
+        // the new leader drain it naturally.
         for g in [
             "rio_scheduler_derivations_queued",
-            "rio_scheduler_workers_active",
             "rio_scheduler_builds_active",
             "rio_scheduler_derivations_running",
         ] {
@@ -1023,7 +1065,7 @@ impl DagActor {
                       "orphan completion transition failed");
                 return;
             }
-            state.output_paths = expected_outputs.clone();
+            state.output_paths = expected_outputs;
             state.assigned_executor = None;
         }
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
@@ -1063,23 +1105,6 @@ impl DagActor {
         // reconcile (the drv was Assigned/Running in PG then —
         // kept), so it won't catch this one.
         self.unpin_best_effort(drv_hash).await;
-        // Per-derivation Completed event BEFORE release_downstream
-        // (which may emit BuildCompleted) — same ordering as
-        // handle_success_completion. Clients tracking per-derivation
-        // state (rio-cli, dashboard, gateway outPathOf) and PG
-        // event-log replay otherwise see this drv frozen at Started.
-        let drv_path = self.dag.path_or_hash_fallback(drv_hash);
-        for build_id in &interested {
-            self.events.emit(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::completed(
-                        drv_path.clone(),
-                        expected_outputs.clone(),
-                    ),
-                ),
-            );
-        }
         self.release_downstream(drv_hash, &interested, HashSet::new())
             .await;
     }

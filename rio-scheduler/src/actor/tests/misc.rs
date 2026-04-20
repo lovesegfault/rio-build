@@ -112,7 +112,7 @@ async fn test_dispatch_gated_on_leader_and_recovery(
     Ok(())
 }
 
-// r[verify obs.metric.scheduler-leader-gate]
+// r[verify obs.metric.scheduler-leader-gate+2]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but workers don't
 /// connect to it (leader-guarded gRPC) — its counts are stale/zero.
@@ -170,7 +170,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 }
 
 // r[verify sched.lease.standby-tick-noop]
-// r[verify obs.metric.scheduler-leader-gate]
+// r[verify obs.metric.scheduler-leader-gate+2]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
 /// NOT write `Cancelled` to PG for builds the new leader is running.
@@ -225,10 +225,12 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
             .is_none(),
         "LeaderLost should clear_persisted_state (DAG empty)"
     );
-    // LeaderLost zeroed the gauges (one-shot, not per-Tick).
+    // LeaderLost zeroed the leader-state gauges (one-shot, not
+    // per-Tick). workers_active is NOT in this list — it's
+    // connection-state (executors map is retained on lose), maintained
+    // by inc/dec on standby.
     for g in [
         "rio_scheduler_derivations_queued",
-        "rio_scheduler_workers_active",
         "rio_scheduler_builds_active",
         "rio_scheduler_derivations_running",
     ] {
@@ -262,6 +264,66 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
          on stale state would; gate + LeaderLost prevent it)"
     );
 
+    Ok(())
+}
+
+// r[verify obs.metric.scheduler-leader-gate+2]
+/// `handle_leader_lost` must NOT zero `rio_scheduler_workers_active`:
+/// `executors` is retained (live connections, not persisted) and
+/// `ExecutorDisconnected` is not leader-gated. Zeroing it desyncs from
+/// N retained entries; each worker rebalancing away then decrements
+/// from the zeroed baseline → −1…−N. The inc/dec path maintains it
+/// correctly on standby; workers leaving drain it naturally to 0.
+#[tokio::test]
+async fn test_leader_lost_workers_active_stays_nonneg() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
+
+    // Connect+register 2 workers as leader. inc/dec at executor.rs
+    // sets workers_active=2.
+    let _rx1 = connect_executor(&handle, "wa-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "wa-w2", "x86_64-linux").await?;
+    barrier(&handle).await;
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_workers_active{}"),
+        Some(2.0),
+        "precondition: 2 workers registered"
+    );
+
+    // Lose the lease. handle_leader_lost must NOT zero workers_active
+    // (executors map still has 2 entries).
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_workers_active{}"),
+        Some(2.0),
+        "LeaderLost must NOT zero workers_active (executors retained)"
+    );
+
+    // Workers rebalance to the new leader → streams to this pod drop
+    // → ExecutorDisconnected (NOT leader-gated) → decrement.
+    for w in ["wa-w1", "wa-w2"] {
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: w.into(),
+                stream_epoch: stream_epoch_for(w),
+            })
+            .await?;
+    }
+    barrier(&handle).await;
+
+    // Gauge must be 0, NOT −2. Before the fix: set(0.0) on LeaderLost
+    // followed by 2× decrement → −2.0.
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_workers_active{}"),
+        Some(0.0),
+        "workers_active must drain to 0 (not go negative) after \
+         LeaderLost + disconnects"
+    );
     Ok(())
 }
 

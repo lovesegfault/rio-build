@@ -168,6 +168,12 @@ pub(crate) struct RecoveryBuildRow {
     pub total_drvs: i32,
     pub completed_drvs: i32,
     pub cached_drvs: i32,
+    /// PG-side `now() - submitted_at` so the caller can reconstruct an
+    /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds
+    /// `BuildInfo::submitted_at` so `r[sched.timeout.per-build]` and
+    /// `rio_scheduler_build_duration_seconds` survive failover instead
+    /// of resetting to recovery-time.
+    pub submitted_age_secs: f64,
 }
 
 /// Row from `load_poisoned_derivations`. Minimal — poisoned rows
