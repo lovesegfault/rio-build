@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::config::XtaskConfig;
@@ -96,6 +96,12 @@ pub struct UpOpts {
     /// AMI architecture(s) to build. EKS-only.
     #[arg(long = "ami-arch", value_enum, default_value_t = AmiArch::All)]
     ami_arch: AmiArch,
+    /// Skip the post-ami stale-AMI GC. By default, after a successful
+    /// `up` that built a new AMI, prior `rio-nixos-node-*` AMIs older
+    /// than 2d (and not tagged `ami-latest`) are deregistered + their
+    /// snapshots deleted. EKS-only.
+    #[arg(long = "skip-ami-gc")]
+    skip_ami_gc: bool,
     /// Tenant name for the authorized_keys comment. Overrides
     /// RIO_SSH_TENANT. When neither is set, preserves the existing
     /// Secret's comment (I-100); falls back to "default" only on
@@ -543,6 +549,7 @@ async fn run_up(
     // doesn't see. Tests inject their own ami future directly.
     let ami_selected = selected.contains(&Phase::Ami);
     let ami_arch = o.ami_arch;
+    let skip_ami_gc = o.skip_ami_gc;
     let ami_branch = async move {
         if !ami_selected {
             return Ok(());
@@ -560,6 +567,18 @@ async fn run_up(
 
     ui::step("k8s up", || async move {
         run_up_phases(p, cfg, &selected, pp, ami_branch).await?;
+        // Auto-GC stale AMIs once the new one is registered + deployed.
+        // Gated on the ami phase having run (that's when accumulation
+        // happens — `up --deploy` alone creates nothing to reap).
+        // 2d keeps yesterday's AMI for rollback; `ami-latest` is never
+        // collected regardless. dry_run=false: the standalone `ami gc`
+        // subcommand defaults to dry-run, but auto-gc here is the
+        // point — actually delete.
+        if matches!(kind, ProviderKind::Eks) && ami_selected && !skip_ami_gc {
+            ui::step("ami gc (>2d)", || eks::ami::gc(2, false))
+                .await
+                .context("auto ami-gc failed; re-run with --skip-ami-gc to bypass")?;
+        }
         if !explicit {
             info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
         }
