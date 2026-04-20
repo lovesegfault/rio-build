@@ -372,7 +372,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.nar-bytes-budget+2]
+    // r[impl store.put.nar-bytes-budget+3]
     /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
     /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
     /// into the caller's incremental `hasher` so [`verify_nar`] never

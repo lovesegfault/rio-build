@@ -36,6 +36,12 @@ pub const MAX_REFERENCES: usize = 10_000;
 /// Maximum number of signatures in a single PathInfo.
 pub const MAX_SIGNATURES: usize = 100;
 
+/// Maximum store paths a single `try_substitute` will recursively fetch
+/// via `ensure_references`. Bounds the closure walk against a hostile
+/// upstream serving an infinite reference chain. Real closures (full
+/// nixpkgs stdenv ~5k, full system ~20k) are well under this.
+pub const MAX_SUBSTITUTE_CLOSURE: usize = 50_000;
+
 /// Minimum NAR-budget charge per `NarChunk` message, in bytes.
 ///
 /// `accumulate_chunk` charges `chunk.len().max(MIN_NAR_CHUNK_CHARGE)`

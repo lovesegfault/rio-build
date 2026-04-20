@@ -162,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
     let chunk_backend: Option<Arc<dyn ChunkBackend>> = chunk_cache.as_ref().map(|c| c.backend());
     let substituter = {
         let mut s = Substituter::new(pool.clone(), chunk_backend)
-            .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent);
+            .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
+            .with_nar_bytes_budget(store_service.nar_bytes_budget().clone());
         if let Some(signer) = store_service.signer() {
             s = s.with_signer(Arc::clone(signer));
         }

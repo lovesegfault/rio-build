@@ -220,9 +220,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_substitute_total",
         "Upstream substitution attempts, labeled by result (hit/miss/error) \
-         and upstream (URL; empty for pre-loop failures). Per-upstream: \
-         hit=ingested, miss=upstream returned 404, error=upstream \
-         fetch/verify failed."
+         and tenant (UUID). Per-upstream debugging detail is in the \
+         debug!/warn! log lines (which carry upstream=<url>); the metric \
+         label is bounded by tenant count, not by tenant-supplied URL."
     );
     describe_counter!(
         "rio_store_substitute_bytes_total",
@@ -240,8 +240,16 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_integrity_failures_total",
-        "Upstream substitution NAR hash mismatches. Nonzero is a \
-         security-relevant signal: upstream served corrupt or tampered bytes."
+        "Upstream substitution NAR hash or size mismatches, labeled by \
+         tenant (UUID). Nonzero is a security-relevant signal: upstream \
+         served corrupt or tampered bytes / a lying NarSize."
+    );
+    describe_counter!(
+        "rio_store_substitute_closure_truncated_total",
+        "try_substitute closure walks that hit MAX_SUBSTITUTE_CLOSURE and \
+         were truncated. Nonzero is a security-relevant signal: a \
+         tenant-configured upstream is serving an implausibly deep \
+         reference chain."
     );
     describe_counter!(
         "rio_store_putpath_stale_reclaimed_total",

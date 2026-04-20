@@ -16,7 +16,10 @@
 //! cousin that feeds `FindMissingPathsResponse.substitutable_paths`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use bytes::Bytes;
 use moka::future::Cache;
@@ -29,7 +32,10 @@ use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 use rio_proto::validated::ValidatedPathInfo;
 
-use rio_common::limits::{MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES};
+use rio_common::limits::{
+    MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_REFERENCES, MAX_SIGNATURES,
+    MAX_SUBSTITUTE_CLOSURE, MIN_NAR_CHUNK_CHARGE,
+};
 
 use crate::backend::ChunkBackend;
 use crate::cas;
@@ -87,7 +93,10 @@ const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
 /// and stalls `FindMissingPaths`. The NAR GET is intentionally NOT
 /// timeboxed (a multi-GB body legitimately runs long; the
 /// [`MAX_NAR_SIZE`] decompressed cap and 5-min stale-reclaim bound it).
+#[cfg(not(test))]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Decompressed-NAR size cap applied in [`Substituter::fetch_nar`].
 /// Equals [`MAX_NAR_SIZE`] in production; overridable to a small value
@@ -151,6 +160,21 @@ pub enum SubstituteError {
     #[error("upstream {what} exceeds {limit}-byte cap")]
     TooLarge { what: &'static str, limit: u64 },
 
+    /// Decompressed NAR length differed from the narinfo's `NarSize:`
+    /// line. Upstream lied; the Nix signature fingerprint includes
+    /// `nar_size`, so persisting an unchecked size would store a row
+    /// whose own signatures don't verify.
+    #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
+    SizeMismatch { declared: u64, actual: u64 },
+
+    /// `claim_placeholder` returned `Concurrent` — another uploader
+    /// holds the slot. Transient: returned as `Err` (not `Ok(None)`)
+    /// so moka's `try_get_with` does NOT cache it; the caller's retry
+    /// re-runs `do_substitute` and reaches `AlreadyComplete` once the
+    /// concurrent upload finishes.
+    #[error("concurrent uploader holds placeholder")]
+    Busy,
+
     /// Metadata-layer failure during ingest (write-ahead,
     /// complete_manifest, chunked S3/refcount).
     #[error("ingest failed: {0}")]
@@ -177,8 +201,9 @@ enum UpstreamOutcome {
     /// narinfo 404 or sig didn't verify — this upstream doesn't have it.
     Miss,
     /// `claim_placeholder` returned `Concurrent` — another replica or
-    /// closure-walk holds the slot. The singleflight 30s TTL means the
-    /// caller's retry sees the now-complete row; trying remaining
+    /// closure-walk holds the slot. Mapped to `Err(Busy)` in
+    /// `do_substitute` so moka does not cache it; caller's retry
+    /// re-runs and reaches `AlreadyComplete`. Trying remaining
     /// upstreams would just race the same slot again.
     Raced,
 }
@@ -241,7 +266,22 @@ pub struct Substituter {
     /// path-only key would let tenant B's miss poison tenant A's
     /// lookup for the full TTL.
     probe_cache: Cache<(Uuid, String), bool>,
+    // r[impl store.put.nar-bytes-budget+3]
+    /// Global budget for in-flight NAR bytes — the SAME semaphore
+    /// PutPath acquires from (wired in main.rs via
+    /// [`with_nar_bytes_budget`](Self::with_nar_bytes_budget)). Without
+    /// this, N concurrent distinct-path substitutions = N × 4 GiB RSS
+    /// with zero backpressure (the moka singleflight only coalesces
+    /// same `(tenant, path)`). [`fetch_nar`](Self::fetch_nar) acquires
+    /// per read-chunk; permits drop after `persist_nar` returns.
+    nar_bytes_budget: Arc<Semaphore>,
 }
+
+/// Default NAR-buffer budget when no shared semaphore is wired:
+/// `8 × MAX_NAR_SIZE` (32 GiB) — same as `StoreServiceImpl`'s default.
+/// In production main.rs replaces this with the SHARED semaphore so
+/// PutPath and substitution draw from one pool.
+const DEFAULT_SUBSTITUTE_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 
 impl Substituter {
     pub fn new(pool: PgPool, chunk_backend: Option<Arc<dyn ChunkBackend>>) -> Self {
@@ -268,7 +308,7 @@ impl Substituter {
             chunk_backend,
             http,
             signer: None,
-            // r[impl store.substitute.singleflight+2]
+            // r[impl store.substitute.singleflight+3]
             // Short TTL + small cap: this is a singleflight coalescer,
             // not a PathInfo cache. The narinfo table IS the cache.
             // 30s is long enough to coalesce a burst of GetPaths for
@@ -276,7 +316,7 @@ impl Substituter {
             // subsequent substitution-miss doesn't stay stale.
             inflight: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(std::time::Duration::from_secs(30))
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             upstream_info: Cache::builder()
@@ -286,12 +326,22 @@ impl Substituter {
                 .max_capacity(SUBSTITUTE_PROBE_CACHE_CAP)
                 .time_to_live(SUBSTITUTE_PROBE_CACHE_TTL)
                 .build(),
+            nar_bytes_budget: Arc::new(Semaphore::new(DEFAULT_SUBSTITUTE_NAR_BUDGET)),
         }
     }
 
     /// Enable `sig_mode = add|replace` signing. Builder-style.
     pub fn with_signer(mut self, signer: Arc<TenantSigner>) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// Share the process-global NAR-bytes budget. Builder-style.
+    /// main.rs wires `StoreServiceImpl::nar_bytes_budget()` here so
+    /// PutPath and substitution draw from ONE semaphore — the
+    /// aggregate bound the budget exists to enforce.
+    pub fn with_nar_bytes_budget(mut self, budget: Arc<Semaphore>) -> Self {
+        self.nar_bytes_budget = budget;
         self
     }
 
@@ -326,6 +376,38 @@ impl Substituter {
         tenant_id: Uuid,
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        // r[impl store.substitute.untrusted-upstream+2]
+        // Seed a per-call closure-node budget. The recursive
+        // `ensure_references` walk decrements once per path; hitting
+        // zero truncates (best-effort semantics — the build still
+        // fails with a clear ENOENT naming the missing ref).
+        let budget = Arc::new(AtomicUsize::new(MAX_SUBSTITUTE_CLOSURE));
+        self.try_substitute_inner(tenant_id, store_path, &budget)
+            .await
+    }
+
+    /// [`try_substitute`](Self::try_substitute) body with a threaded
+    /// closure-node budget. `pub(crate)` so tests can seed a small
+    /// budget without burning 50 000 paths.
+    pub(crate) async fn try_substitute_inner(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        budget: &Arc<AtomicUsize>,
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        // Saturating decrement: the seed call also charges one slot, so
+        // a budget of N admits at most N paths total (seed + closure).
+        // `fetch_update` with `checked_sub` so the counter never wraps —
+        // `ensure_references` walks siblings without re-checking, so
+        // every post-truncation sibling MUST also see budget=0.
+        if budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .is_err()
+        {
+            warn!(%store_path, "closure walk hit MAX_SUBSTITUTE_CLOSURE; truncating");
+            metrics::counter!("rio_store_substitute_closure_truncated_total").increment(1);
+            return Ok(None);
+        }
         let key = (tenant_id, store_path.to_string());
         // moka's `try_get_with`: if another caller is already computing
         // this key, we wait and share its result. The init future runs
@@ -343,7 +425,17 @@ impl Substituter {
             })
             .await
             .map_err(|e: Arc<SubstituteError>| {
-                metrics::counter!("rio_store_substitute_total", "result" => "error").increment(1);
+                // `Busy` is the not-an-error transient (concurrent
+                // uploader); skip the error metric so a normal cross-
+                // tenant race doesn't show up as upstream failure.
+                if !matches!(*e, SubstituteError::Busy) {
+                    metrics::counter!(
+                        "rio_store_substitute_total",
+                        "result" => "error",
+                        "tenant" => tenant_id.to_string()
+                    )
+                    .increment(1);
+                }
                 (*e).clone()
             })?;
         let result = cached.map(|arc| (*arc).clone());
@@ -360,20 +452,26 @@ impl Substituter {
         // runtime closures, so this is the only place the closure can be
         // completed.
         if let Some(info) = &result {
-            Box::pin(self.ensure_references(tenant_id, &info.references)).await;
+            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await;
         }
         Ok(result)
     }
 
     /// Ensure every reference is present locally, substituting misses.
-    /// Depth-first via mutual recursion with [`try_substitute`] (which
+    /// Depth-first via mutual recursion with
+    /// [`try_substitute_inner`](Self::try_substitute_inner) (which
     /// singleflights per-ref and walks each ref's own closure). The
     /// local `query_path_info` check short-circuits already-present
     /// paths so the recursion converges; self-references hit the
     /// just-ingested row and skip. Best-effort: a failed ref logs +
     /// continues so a partial closure doesn't poison the seed (the
     /// build still fails with a clear ENOENT naming the missing ref).
-    async fn ensure_references(&self, tenant_id: Uuid, refs: &[StorePath]) {
+    async fn ensure_references(
+        &self,
+        tenant_id: Uuid,
+        refs: &[StorePath],
+        budget: &Arc<AtomicUsize>,
+    ) {
         for r in refs {
             let r = r.as_str();
             match metadata::query_path_info(&self.pool, r).await {
@@ -384,7 +482,7 @@ impl Substituter {
                     continue;
                 }
             }
-            if let Err(e) = Box::pin(self.try_substitute(tenant_id, r)).await {
+            if let Err(e) = Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
                 warn!(reference = %r, error = %e, "closure: reference substitution failed");
             }
         }
@@ -419,6 +517,7 @@ impl Substituter {
         // row. Skip.
 
         let start = Instant::now();
+        let tenant_label = tenant_id.to_string();
         for upstream in &upstreams {
             match self
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part)
@@ -430,7 +529,7 @@ impl Substituter {
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "hit",
-                        "upstream" => upstream.url.clone()
+                        "tenant" => tenant_label
                     )
                     .increment(1);
                     metrics::counter!("rio_store_substitute_bytes_total").increment(info.nar_size);
@@ -442,17 +541,18 @@ impl Substituter {
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "miss",
-                        "upstream" => upstream.url.clone()
+                        "tenant" => tenant_label.clone()
                     )
                     .increment(1);
                 }
                 Ok(UpstreamOutcome::Raced) => {
                     // Another uploader holds the placeholder. STOP —
-                    // remaining upstreams would race the same slot. The
-                    // singleflight 30s TTL means the caller's retry sees
-                    // the now-complete row.
+                    // remaining upstreams would race the same slot.
+                    // Return `Err(Busy)` so moka does NOT cache this
+                    // as a definitive miss; caller's retry re-runs and
+                    // reaches `AlreadyComplete` once the upload lands.
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
-                    break;
+                    return Err(SubstituteError::Busy);
                 }
                 Err(e) => {
                     // This upstream failed (down, hash mismatch, parse
@@ -461,10 +561,13 @@ impl Substituter {
                     // The integrity metric is emitted HERE (where the
                     // error is observable) — per-upstream errors never
                     // reach `grpc/mod.rs`.
-                    if matches!(e, SubstituteError::HashMismatch { .. }) {
+                    if matches!(
+                        e,
+                        SubstituteError::HashMismatch { .. } | SubstituteError::SizeMismatch { .. }
+                    ) {
                         metrics::counter!(
                             "rio_store_substitute_integrity_failures_total",
-                            "upstream" => upstream.url.clone()
+                            "tenant" => tenant_label.clone()
                         )
                         .increment(1);
                     }
@@ -472,7 +575,7 @@ impl Substituter {
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "error",
-                        "upstream" => upstream.url.clone()
+                        "tenant" => tenant_label.clone()
                     )
                     .increment(1);
                 }
@@ -506,7 +609,7 @@ impl Substituter {
             .send()
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{narinfo_url}: {e}")))?;
-        if resp.status().as_u16() == 404 {
+        if is_not_found(resp.status()) {
             return Ok(UpstreamOutcome::Miss);
         }
         if !resp.status().is_success() {
@@ -552,7 +655,7 @@ impl Substituter {
         // ValidatedPathInfo + the post-decompress hash check.
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
-        // r[impl store.substitute.untrusted-upstream]
+        // r[impl store.substitute.untrusted-upstream+2]
         // Declared-size gate. `trusted_keys` is also tenant-supplied so
         // a verified sig is NOT a trust boundary; gate before download.
         // The decompressed cap in `fetch_nar` catches a narinfo that
@@ -565,10 +668,13 @@ impl Substituter {
         }
 
         // — Step 3: claim placeholder (BEFORE the expensive download) —
+        // Signatures are NOT computed yet: the Nix fingerprint includes
+        // `nar_size`, and at this point we only have the upstream's
+        // unverified claim. Signing happens after the size+hash check
+        // (or, on `AlreadyComplete`, over the already-stored row) so a
+        // persisted row's `(nar_size, signatures)` are always mutually
+        // consistent.
         let mut info = narinfo_to_validated(&ni, expected_hash)?;
-        info.signatures = self
-            .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
-            .await;
         let store_path_hash = info.store_path.sha256_digest();
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
@@ -585,15 +691,27 @@ impl Substituter {
         {
             PlaceholderClaim::Owned(claim) => claim,
             PlaceholderClaim::AlreadyComplete => {
-                // Lost the race; winner completed. Append our sigs to
-                // the existing row (idempotent — append_signatures
-                // dedupes) and return it. NO download.
-                metadata::append_signatures(&self.pool, store_path, &info.signatures).await?;
+                // Lost the race; winner completed. Compute sigs over
+                // the STORED row (its `nar_size` is what was actually
+                // ingested, immune to a lying second upstream), append
+                // (idempotent — append_signatures dedupes), return it.
+                // NO download.
                 let stored = metadata::query_path_info(&self.pool, store_path)
                     .await?
                     .ok_or_else(|| {
                         SubstituteError::Ingest(
                             "claim AlreadyComplete but query_path_info miss".into(),
+                        )
+                    })?;
+                let sigs = self
+                    .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &stored)
+                    .await;
+                metadata::append_signatures(&self.pool, store_path, &sigs).await?;
+                let stored = metadata::query_path_info(&self.pool, store_path)
+                    .await?
+                    .ok_or_else(|| {
+                        SubstituteError::Ingest(
+                            "post-append_signatures query_path_info miss".into(),
                         )
                     })?;
                 return Ok(UpstreamOutcome::Hit(Box::new(stored)));
@@ -624,8 +742,19 @@ impl Substituter {
         let persist = async {
             // — Step 4: GET NAR + decompress —
             let nar_url = format!("{base}/{}", ni.url);
-            let nar_bytes = self.fetch_nar(http, &nar_url, &ni.compression).await?;
-            info.nar_size = nar_bytes.len() as u64;
+            let (nar_bytes, _permits) = self.fetch_nar(http, &nar_url, &ni.compression).await?;
+
+            // r[impl store.substitute.untrusted-upstream+2]
+            // Size check: actual decompressed length MUST equal the
+            // narinfo's `NarSize:` line. The Nix signature fingerprint
+            // is `1;path;hash;size;refs`; persisting an unchecked size
+            // would store sigs that don't verify against the row.
+            if nar_bytes.len() as u64 != ni.nar_size {
+                return Err(SubstituteError::SizeMismatch {
+                    declared: ni.nar_size,
+                    actual: nar_bytes.len() as u64,
+                });
+            }
 
             // Hash-check the decompressed NAR against the narinfo's
             // claim — off the async runtime (4 GiB ≈ 8-10s of pure
@@ -644,6 +773,15 @@ impl Substituter {
                     got: hex::encode(got_hash),
                 });
             }
+
+            // Size + hash verified — `info.nar_size` (set in
+            // `narinfo_to_validated` from `ni.nar_size`) now provably
+            // equals what gets persisted. Compute sigs over the
+            // verified `info` so stored `(nar_size, signatures)` are
+            // mutually consistent.
+            info.signatures = self
+                .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
+                .await;
 
             // — Step 5-6: persist via the shared write-ahead core —
             ingest::persist_nar(
@@ -686,7 +824,9 @@ impl Substituter {
         }
     }
 
-    /// GET the NAR body and decompress. Returns the raw NAR bytes.
+    /// GET the NAR body and decompress. Returns the raw NAR bytes plus
+    /// the [`nar_bytes_budget`](Self::nar_bytes_budget) permits backing
+    /// them; caller holds the permits until after `persist_nar`.
     ///
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
@@ -696,7 +836,7 @@ impl Substituter {
         http: &reqwest::Client,
         nar_url: &str,
         compression: &str,
-    ) -> Result<Bytes, SubstituteError> {
+    ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
         let resp = http
             .get(nar_url)
             .send()
@@ -708,11 +848,13 @@ impl Substituter {
                 resp.status()
             )));
         }
-        // r[impl store.substitute.untrusted-upstream]
+        // r[impl store.substitute.untrusted-upstream+2]
         // bytes_stream → StreamReader → decoder → `.take(cap+1)` →
-        // read_to_end. The `.take()` wraps the DECOMPRESSED side so a
-        // zstd bomb is bounded regardless of what `NarSize` claimed.
+        // budgeted read loop. The `.take()` wraps the DECOMPRESSED
+        // side so a zstd bomb is bounded regardless of what `NarSize`
+        // claimed.
         use futures_util::TryStreamExt;
+        use tokio::io::AsyncRead;
         use tokio_util::io::StreamReader;
         let stream = resp
             .bytes_stream()
@@ -720,41 +862,54 @@ impl Substituter {
         let reader = StreamReader::new(stream);
 
         let cap = SUBSTITUTE_NAR_DECOMPRESSED_CAP;
-        let mut out = Vec::new();
-        match compression {
+        let mut capped: Box<dyn AsyncRead + Unpin + Send> = match compression {
             "xz" => {
-                let mut dec =
-                    async_compression::tokio::bufread::XzDecoder::new(reader).take(cap + 1);
-                dec.read_to_end(&mut out)
-                    .await
-                    .map_err(|e| SubstituteError::Fetch(format!("{nar_url} xz: {e}")))?;
+                Box::new(async_compression::tokio::bufread::XzDecoder::new(reader).take(cap + 1))
             }
             "zstd" => {
-                let mut dec =
-                    async_compression::tokio::bufread::ZstdDecoder::new(reader).take(cap + 1);
-                dec.read_to_end(&mut out)
-                    .await
-                    .map_err(|e| SubstituteError::Fetch(format!("{nar_url} zstd: {e}")))?;
+                Box::new(async_compression::tokio::bufread::ZstdDecoder::new(reader).take(cap + 1))
             }
-            "none" | "" => {
-                let mut r = reader.take(cap + 1);
-                r.read_to_end(&mut out)
-                    .await
-                    .map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?;
-            }
+            "none" | "" => Box::new(reader.take(cap + 1)),
             other => {
                 return Err(SubstituteError::NarInfo(format!(
                     "unsupported Compression: {other:?}"
                 )));
             }
+        };
+
+        // r[impl store.put.nar-bytes-budget+3]
+        // Budgeted read loop: acquire `n.max(MIN_NAR_CHUNK_CHARGE)`
+        // permits BEFORE extending `out`, mirroring PutPath's
+        // `accumulate_chunk`. When the global budget is exhausted, the
+        // `await` backpressures (other concurrent fetches/uploads
+        // stall) instead of N × 4 GiB OOM.
+        let mut out = Vec::new();
+        let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = capped
+                .read(&mut buf)
+                .await
+                .map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let p = self
+                .nar_bytes_budget
+                .clone()
+                .acquire_many_owned((n as u32).max(MIN_NAR_CHUNK_CHARGE))
+                .await
+                .map_err(|_| SubstituteError::Fetch("NAR buffer budget closed".into()))?;
+            permits.push(p);
+            out.extend_from_slice(&buf[..n]);
+            if out.len() as u64 > cap {
+                return Err(SubstituteError::TooLarge {
+                    what: "decompressed NAR",
+                    limit: cap,
+                });
+            }
         }
-        if out.len() as u64 > cap {
-            return Err(SubstituteError::TooLarge {
-                what: "decompressed NAR",
-                limit: cap,
-            });
-        }
-        Ok(Bytes::from(out))
+        Ok((Bytes::from(out), permits))
     }
 
     // r[impl store.substitute.sig-mode]
@@ -974,7 +1129,7 @@ impl Substituter {
                     .await
                 {
                     Ok(r) if r.status().is_success() => return (path, ProbeOutcome::Hit),
-                    Ok(r) if r.status().as_u16() == 404 => {}
+                    Ok(r) if is_not_found(r.status()) => {}
                     Ok(_) | Err(_) => any_indeterminate = true,
                 }
             }
@@ -985,7 +1140,7 @@ impl Substituter {
             };
             (path, outcome)
         });
-        // r[impl store.substitute.probe-bounded+2]
+        // r[impl store.substitute.probe-bounded+3]
         let probed: Vec<(String, ProbeOutcome)> = futures_util::stream::iter(futs)
             .buffer_unordered(concurrency)
             .collect()
@@ -1010,7 +1165,14 @@ impl Substituter {
     }
 }
 
-// r[impl store.substitute.untrusted-upstream]
+/// HTTP statuses an upstream binary cache uses to signal "key not
+/// present". 403: S3 without public `s3:ListBucket` returns Forbidden
+/// for missing keys. 410: Gone. Matches CppNix `HttpBinaryCacheStore`.
+fn is_not_found(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 404 | 403 | 410)
+}
+
+// r[impl store.substitute.untrusted-upstream+2]
 /// Read a small text body (`.narinfo`, `/nix-cache-info`) with a hard
 /// size cap. `tenant_upstreams` rows are tenant-supplied; an unbounded
 /// `.text()` against a hostile upstream is an OOM vector for the
@@ -1057,6 +1219,23 @@ fn narinfo_to_validated(
     nar_hash: [u8; 32],
 ) -> Result<ValidatedPathInfo, SubstituteError> {
     use rio_proto::types::PathInfo;
+
+    // r[impl store.substitute.untrusted-upstream+2]
+    // Per-node count caps — parity with PutPath (`put_path/common.rs`).
+    // `ValidatedPathInfo::try_from` validates per-element syntax only;
+    // it does NOT bound the count.
+    if ni.references.len() > MAX_REFERENCES {
+        return Err(SubstituteError::NarInfo(format!(
+            "narinfo has {} references (> MAX_REFERENCES {MAX_REFERENCES})",
+            ni.references.len()
+        )));
+    }
+    if ni.sigs.len() > MAX_SIGNATURES {
+        return Err(SubstituteError::NarInfo(format!(
+            "narinfo has {} signatures (> MAX_SIGNATURES {MAX_SIGNATURES})",
+            ni.sigs.len()
+        )));
+    }
 
     let store_dir = &ni.store_path[..=ni
         .store_path
@@ -1329,14 +1508,13 @@ mod tests {
         );
     }
 
-    /// Per-upstream miss/error labeling: an upstream that 404s emits
-    /// `{result=miss,upstream=URL}`; one that fails fetch/verify emits
-    /// `{result=error,upstream=URL}`. Prior code emitted ONE unlabeled
-    /// `{result=miss}` after the loop and NO metric on Err — a 503ing
-    /// upstream was invisible in metrics and indistinguishable from
-    /// cache-miss.
+    /// Per-tenant miss/error labeling: an upstream that 404s emits
+    /// `{result=miss,tenant=UUID}`; one that fails fetch/verify emits
+    /// `{result=error,tenant=UUID}`. The label MUST be `tenant` (UUID,
+    /// bounded by tenant count), NOT `upstream` (tenant-supplied URL,
+    /// unbounded cardinality → exporter-memory DoS).
     #[tokio::test]
-    async fn substitute_per_upstream_miss_and_error_labeled() {
+    async fn substitute_per_tenant_miss_and_error_labeled() {
         use rio_test_support::metrics::CountingRecorder;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1372,35 +1550,34 @@ mod tests {
         let got = sub.try_substitute(tid, &other).await.unwrap();
         assert!(got.is_none());
 
-        let miss_a = format!(
-            "rio_store_substitute_total{{result=miss,upstream={}}}",
-            a.url
-        );
-        let err_b = format!(
-            "rio_store_substitute_total{{result=error,upstream={}}}",
-            b.url
-        );
+        let miss = format!("rio_store_substitute_total{{result=miss,tenant={tid}}}");
+        let err = format!("rio_store_substitute_total{{result=error,tenant={tid}}}");
         assert_eq!(
-            rec.get(&miss_a),
+            rec.get(&miss),
             1,
-            "per-upstream miss; keys={:?}",
+            "per-tenant miss; keys={:?}",
             rec.all_keys()
         );
         assert_eq!(
-            rec.get(&err_b),
+            rec.get(&err),
             1,
-            "per-upstream error; keys={:?}",
+            "per-tenant error; keys={:?}",
             rec.all_keys()
         );
-        // No unlabeled post-loop miss any more.
-        assert_eq!(rec.get("rio_store_substitute_total{result=miss}"), 0);
+        // No `upstream=` label anywhere — tenant-supplied URL must not
+        // be a Prometheus label dimension.
+        assert!(
+            !rec.all_keys().iter().any(|k| k.contains("upstream=")),
+            "no upstream= label; keys={:?}",
+            rec.all_keys()
+        );
     }
 
-    /// Axum server that 500s on every request — for the per-upstream
-    /// error-metric test.
-    async fn spawn_500_upstream() -> FakeUpstream {
-        use axum::{Router, http::StatusCode, routing::get};
-        let app = Router::new().fallback(get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+    /// Axum server returning a fixed status on every request — for the
+    /// error-metric / 403-is-miss tests.
+    async fn spawn_status_upstream(status: axum::http::StatusCode) -> FakeUpstream {
+        use axum::{Router, routing::any};
+        let app = Router::new().fallback(any(move || async move { status }));
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
@@ -1411,6 +1588,92 @@ mod tests {
             trusted_key: String::new(),
             _task: task,
         }
+    }
+
+    async fn spawn_500_upstream() -> FakeUpstream {
+        spawn_status_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await
+    }
+
+    // r[verify store.substitute.probe-bounded+3]
+    /// HTTP 403 (S3 without public `s3:ListBucket`) MUST be treated as
+    /// a miss, not an error: emits `result=miss`, and `check_available`
+    /// caches it as a definitive negative so the truncation-convergence
+    /// strategy works.
+    #[tokio::test]
+    async fn substitute_403_is_miss_and_populates_probe_cache() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-403").await;
+        let fake = spawn_status_upstream(axum::http::StatusCode::FORBIDDEN).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let path = format!(
+            "/nix/store/{}-403-miss",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let sub = test_substituter(db.pool.clone());
+
+        // try_substitute: 403 → Miss (not Err).
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_none(), "403 → miss");
+        assert_eq!(
+            rec.get(&format!(
+                "rio_store_substitute_total{{result=miss,tenant={tid}}}"
+            )),
+            1,
+            "403 must be result=miss; keys={:?}",
+            rec.all_keys()
+        );
+        assert_eq!(
+            rec.get(&format!(
+                "rio_store_substitute_total{{result=error,tenant={tid}}}"
+            )),
+            0,
+            "403 must NOT be result=error; keys={:?}",
+            rec.all_keys()
+        );
+        drop(_g);
+
+        // check_available: first call probes (403 → Miss → cached);
+        // second call MUST hit the probe_cache (proving 403 was cached
+        // as a definitive negative, not left Indeterminate).
+        let hits = sub
+            .check_available(tid, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+
+        let rec2 = CountingRecorder::default();
+        let _g2 = metrics::set_default_local_recorder(&rec2);
+        let hits2 = sub
+            .check_available(tid, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        assert!(hits2.is_empty());
+        assert_eq!(
+            rec2.get("rio_store_substitute_probe_cache_hits_total{}"),
+            1,
+            "second call must be a probe-cache hit; keys={:?}",
+            rec2.all_keys()
+        );
+        assert_eq!(
+            rec2.get("rio_store_substitute_probe_cache_misses_total{}"),
+            0,
+            "second call must NOT re-probe; keys={:?}",
+            rec2.all_keys()
+        );
     }
 
     #[tokio::test]
@@ -1481,7 +1744,7 @@ mod tests {
         assert_eq!(available, vec![path], "only the seeded path is available");
     }
 
-    // r[verify store.substitute.probe-bounded+2]
+    // r[verify store.substitute.probe-bounded+3]
     /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
     /// to 4096 (not skipped to zero). Uses a local fake upstream that
     /// 404s everything except its one seeded path → 4096 instant HEADs
@@ -1542,7 +1805,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-bounded+2]
+    // r[verify store.substitute.probe-bounded+3]
     /// Probe results are cached: a second `check_available` for the
     /// same path returns the cached answer without touching the
     /// upstream. Verified by aborting the fake upstream between calls.
@@ -1705,14 +1968,18 @@ mod tests {
         assert_eq!(stored.nar_size, nar.len() as u64);
     }
 
+    // r[verify store.substitute.singleflight+3]
     /// A young 'uploading' placeholder means a live concurrent
-    /// uploader — do NOT reclaim, return miss.
+    /// uploader — do NOT reclaim, return `Err(Busy)` (NOT a cached
+    /// `Ok(None)`). Once the placeholder completes, a retry MUST reach
+    /// `AlreadyComplete` and return `Ok(Some)` — proving the moka
+    /// singleflight did NOT cache the transient `Raced` outcome.
     #[tokio::test]
-    async fn try_substitute_respects_young_uploading() {
+    async fn try_substitute_raced_not_cached() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-young-noreclaim").await;
         let (path, nar) = make_path();
-        let fake = spawn_fake_upstream(&path, nar, "cache.young-1").await;
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.young-1").await;
         metadata::upstreams::insert(
             &db.pool,
             tid,
@@ -1728,23 +1995,35 @@ mod tests {
         seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(30)).await;
 
         let sub = test_substituter(db.pool.clone());
-        let got = sub.try_substitute(tid, &path).await.unwrap();
+        let got = sub.try_substitute(tid, &path).await;
 
-        // Young placeholder → PlaceholderClaim::Concurrent → ingest
-        // returns Ok(None) directly. Caller sees a miss and retries
-        // on the next request; no spurious WARN about "placeholder
-        // missing (concurrently deleted?)".
+        // Young placeholder → PlaceholderClaim::Concurrent → `Err(Busy)`
+        // so moka does NOT cache. Caller retries on the next request.
         assert!(
-            got.is_none(),
-            "young placeholder should yield miss (None), got {got:?}"
+            matches!(got, Err(SubstituteError::Busy)),
+            "young placeholder should yield Err(Busy), got {got:?}"
         );
 
         // Placeholder still present (NOT reclaimed).
         let sp = StorePath::parse(&path).unwrap();
-        let age = metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+        let hash = sp.sha256_digest();
+        let age = metadata::manifest_uploading_age(&db.pool, &hash)
             .await
             .unwrap();
         assert!(age.is_some(), "young placeholder must survive");
+
+        // Now: simulate the concurrent uploader completing. Reap the
+        // placeholder so a fresh `try_substitute` can claim and ingest
+        // (proving moka didn't cache the prior `Busy` as a miss).
+        sqlx::query("DELETE FROM manifests WHERE store_path_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let got2 = sub.try_substitute(tid, &path).await.unwrap();
+        let got2 = got2.expect("second call after Busy must re-run and hit (not cached None)");
+        assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
     // — flexible fixture for the regression tests below —
@@ -1755,7 +2034,7 @@ mod tests {
     // `spawn_fake_upstream` so the simple end-to-end tests above stay
     // readable.
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     #[derive(Default)]
     struct FlexCfg {
@@ -1916,7 +2195,17 @@ mod tests {
 
     /// Build a validly-signed narinfo body for `signed_path` (so
     /// `verify_sig` would pass) — used to serve at the WRONG hash_part.
-    fn signed_narinfo_for(signed_path: &str, nar: &[u8], key_name: &str) -> String {
+    /// `url_hash` controls the `URL:` line independently so the body
+    /// can point at a NAR route the flex upstream actually serves;
+    /// `nar_size_override` lets the body lie about `NarSize` (signed
+    /// over the lie, so `verify_sig` still passes).
+    fn signed_narinfo_for(
+        signed_path: &str,
+        nar: &[u8],
+        key_name: &str,
+        url_hash: &str,
+        nar_size_override: Option<u64>,
+    ) -> String {
         let seed = [0x42u8; 32];
         let signer = Signer::from_seed(key_name, &seed);
         let nar_hash: [u8; 32] = sha2::Sha256::digest(nar).into();
@@ -1924,18 +2213,17 @@ mod tests {
             "sha256:{}",
             rio_nix::store_path::nixbase32::encode(&nar_hash)
         );
-        let fp = fingerprint(signed_path, &nar_hash, nar.len() as u64, &[]);
+        let nar_size = nar_size_override.unwrap_or(nar.len() as u64);
+        let fp = fingerprint(signed_path, &nar_hash, nar_size, &[]);
         let sig = signer.sign(&fp);
-        let hp = StorePath::parse(signed_path).unwrap().hash_part();
         format!(
             "StorePath: {signed_path}\n\
-             URL: nar/{hp}.nar\n\
+             URL: nar/{url_hash}.nar\n\
              Compression: none\n\
              NarHash: {nar_hash_str}\n\
-             NarSize: {}\n\
+             NarSize: {nar_size}\n\
              References: \n\
-             Sig: {sig}\n",
-            nar.len()
+             Sig: {sig}\n"
         )
     }
 
@@ -1965,8 +2253,14 @@ mod tests {
             "/nix/store/{}-victim",
             rio_test_support::fixtures::rand_store_hash()
         );
-        // Serve A's narinfo (valid sig over A) at B's hash_part.
-        let body_a = signed_narinfo_for(&path_a, &nar, "cache.ident");
+        // Serve A's narinfo (valid sig over A) at B's hash_part. The
+        // `URL:` line points at B's NAR route (which the flex upstream
+        // actually serves) so that with the identity check REMOVED,
+        // ingestion would complete and `nar_hits == 0` /
+        // `query_path_info(A).is_none()` would FAIL — i.e. the test
+        // is mutation-killing.
+        let hash_b = StorePath::parse(&path_b).unwrap().hash_part();
+        let body_a = signed_narinfo_for(&path_a, &nar, "cache.ident", &hash_b, None);
         let fake = spawn_flex_upstream(
             &path_b,
             nar,
@@ -2022,8 +2316,11 @@ mod tests {
         seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(30)).await;
 
         let sub = test_substituter(db.pool.clone());
-        let got = sub.try_substitute(tid, &path).await.unwrap();
-        assert!(got.is_none(), "Raced → Ok(None)");
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(got, Err(SubstituteError::Busy)),
+            "Raced → Err(Busy), got {got:?}"
+        );
         assert_eq!(
             fake1.nar_hits.load(Ordering::SeqCst),
             0,
@@ -2064,7 +2361,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.untrusted-upstream]
+    // r[verify store.substitute.untrusted-upstream+2]
     /// bug_172: oversized narinfo body → `TooLarge`, NAR endpoint never
     /// hit.
     #[tokio::test]
@@ -2110,7 +2407,7 @@ mod tests {
         assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 0);
     }
 
-    // r[verify store.substitute.untrusted-upstream]
+    // r[verify store.substitute.untrusted-upstream+2]
     /// bug_093: a NAR larger than the decompressed cap → `TooLarge`.
     /// Uses the test-only 64 KiB `SUBSTITUTE_NAR_DECOMPRESSED_CAP` so
     /// this doesn't allocate 4 GiB.
@@ -2154,7 +2451,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.singleflight+2]
+    // r[verify store.substitute.singleflight+3]
     /// merged_bug_199 / bug_327: a transient narinfo 503 propagates as
     /// `Err` and is NOT cached — the immediate retry succeeds.
     #[tokio::test]
@@ -2254,7 +2551,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-bounded+2]
+    // r[verify store.substitute.probe-bounded+3]
     /// bug_251: HEAD 503 → `Indeterminate` → not cached as `false`;
     /// next call re-probes.
     #[tokio::test]
@@ -2343,41 +2640,481 @@ mod tests {
         gate.notify_one(); // unblock the server task
     }
 
+    // r[verify store.substitute.probe-bounded+3]
     /// bug_204: `connect_timeout`-only client + dead upstream must not
-    /// hang `check_available`. Structural assertion: per-request
-    /// `.timeout()` is set; verified by issuing a HEAD against a port
-    /// that accepts but never responds, gated under the small-fetch
-    /// timeout.
+    /// hang `check_available` / `try_substitute`. Routes through
+    /// PRODUCTION code (not a hand-rolled reqwest call) so deleting
+    /// `.timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)` from any of the
+    /// three small-fetch sites (narinfo GET, cache-info GET, narinfo
+    /// HEAD) makes this fail.
     #[tokio::test]
-    async fn head_probe_timeout_does_not_block() {
-        // Port-1 → connection refused → reqwest errors immediately
-        // (Indeterminate). That exercises the Err arm; the timeout arm
-        // is exercised by the per-request `.timeout()` which is set
-        // unconditionally — assert it's wired by checking the request
-        // builder doesn't hang past the timeout against a TCP listener
-        // that never reads.
+    async fn small_fetch_timeout_does_not_block() {
+        // Hold a listener open but never accept → connect succeeds
+        // (kernel backlog), body never arrives.
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        // Hold the listener open but never accept → connect succeeds
-        // (kernel backlog), body never arrives.
         let _hold = tokio::spawn(async move {
             let _l = listener;
             tokio::time::sleep(Duration::from_secs(120)).await;
         });
 
-        let http = sandbox_http();
-        let url = format!("http://{addr}/x.narinfo");
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-timeout").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &format!("http://{addr}"),
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let path = rio_test_support::fixtures::test_store_path("hung");
+
+        // check_available: cache-info GET (timeout) then HEAD (timeout)
+        // — exercises BOTH `.timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)`
+        // sites at once. Under cfg(test) the timeout is 2s; allow 3×
+        // that as slack (two sequential timeouts + scheduler jitter).
+        let slack = SUBSTITUTE_SMALL_FETCH_TIMEOUT * 3;
         let start = Instant::now();
-        let _ = http
-            .head(&url)
-            .timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)
-            .send()
-            .await;
+        let _ = sub.check_available(tid, std::slice::from_ref(&path)).await;
         assert!(
-            start.elapsed() < SUBSTITUTE_SMALL_FETCH_TIMEOUT + Duration::from_secs(5),
-            "per-request timeout must abort the hung HEAD"
+            start.elapsed() < slack,
+            "check_available must abort hung cache-info+HEAD via per-request timeout; took {:?}",
+            start.elapsed()
         );
+
+        // try_substitute: narinfo GET (timeout) — exercises the third
+        // small-fetch site.
+        let start = Instant::now();
+        let _ = sub.try_substitute(tid, &path).await;
+        assert!(
+            start.elapsed() < slack,
+            "try_substitute must abort hung narinfo GET via per-request timeout; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // r[verify store.substitute.untrusted-upstream+2]
+    /// bug_005: a narinfo whose `NarSize` differs from the actual
+    /// decompressed length MUST be rejected (integrity failure).
+    /// Signatures are computed over `nar_size`; persisting an unchecked
+    /// size would store sigs that don't verify against the row.
+    #[tokio::test]
+    async fn substitute_rejects_nar_size_mismatch() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-sizemis").await;
+        let (path, nar) = make_path();
+        let hash = StorePath::parse(&path).unwrap().hash_part();
+        // Signed over a WRONG NarSize (actual+1). NarHash is correct.
+        let body = signed_narinfo_for(
+            &path,
+            &nar,
+            "cache.sizemis",
+            &hash,
+            Some(nar.len() as u64 + 1),
+        );
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.sizemis",
+            FlexCfg {
+                narinfo_override: Some(body),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+
+        // Per-upstream error swallowed → miss (one upstream).
+        assert!(got.is_none(), "size mismatch → miss; got {got:?}");
+        // NAR was fetched (size check happens AFTER download).
+        assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 1, "NAR fetched");
+        // Nothing persisted.
+        assert!(
+            metadata::query_path_info(&db.pool, &path)
+                .await
+                .unwrap()
+                .is_none(),
+            "size mismatch must not persist"
+        );
+        // Integrity metric incremented.
+        assert_eq!(
+            rec.get(&format!(
+                "rio_store_substitute_integrity_failures_total{{tenant={tid}}}"
+            )),
+            1,
+            "SizeMismatch is an integrity failure; keys={:?}",
+            rec.all_keys()
+        );
+    }
+
+    /// bug_005 (AlreadyComplete arm): a second upstream serving a
+    /// lying `NarSize` for an already-ingested path MUST NOT poison
+    /// the stored sigs — `sigs_for_mode` is computed over the STORED
+    /// row, not the upstream's claim.
+    #[tokio::test]
+    async fn substitute_already_complete_signs_stored_size() {
+        use base64::Engine;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid_a = seed_tenant(&db.pool, "sub-ac-a").await;
+        let tid_b = seed_tenant(&db.pool, "sub-ac-b").await;
+        let (path, nar) = make_path();
+        let hash = StorePath::parse(&path).unwrap().hash_part();
+
+        // Tenant A: honest upstream → ingests with correct nar_size.
+        let honest = spawn_fake_upstream(&path, nar.clone(), "cache.ac-honest").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_a,
+            &honest.url,
+            50,
+            std::slice::from_ref(&honest.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub_a = test_substituter(db.pool.clone());
+        sub_a.try_substitute(tid_a, &path).await.unwrap().unwrap();
+
+        // Tenant B: a different upstream that LIES about NarSize for
+        // the same path. sig_mode=Replace so rio signs with its own
+        // key — over the STORED row, not the lying narinfo.
+        let lying_body = signed_narinfo_for(
+            &path,
+            &nar,
+            "cache.ac-liar",
+            &hash,
+            Some(nar.len() as u64 + 99),
+        );
+        let liar = spawn_flex_upstream(
+            &path,
+            nar.clone(),
+            "cache.ac-liar",
+            FlexCfg {
+                narinfo_override: Some(lying_body),
+                ..Default::default()
+            },
+        )
+        .await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_b,
+            &liar.url,
+            50,
+            std::slice::from_ref(&liar.trusted_key),
+            SigMode::Replace,
+        )
+        .await
+        .unwrap();
+        let cluster_seed = [0x77u8; 32];
+        let cluster = Signer::from_seed("rio-ac-1", &cluster_seed);
+        let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
+        let sub_b = test_substituter(db.pool.clone()).with_signer(ts);
+
+        // claim_placeholder → AlreadyComplete → sigs computed over the
+        // stored row.
+        let got = sub_b.try_substitute(tid_b, &path).await.unwrap().unwrap();
+        // No NAR download on AlreadyComplete.
+        assert_eq!(
+            liar.nar_hits.load(Ordering::SeqCst),
+            0,
+            "AlreadyComplete must not download"
+        );
+
+        // The appended rio sig must verify against the STORED tuple
+        // (correct nar_size = nar.len()), NOT the liar's NarSize.
+        let rio_sig = got
+            .signatures
+            .iter()
+            .find(|s| s.starts_with("rio-ac-1:"))
+            .expect("Replace mode appends rio sig");
+        let fp = rio_nix::narinfo::fingerprint(
+            got.store_path.as_str(),
+            &got.nar_hash,
+            got.nar_size,
+            &got.references
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+        );
+        let pk = ed25519_dalek::SigningKey::from_bytes(&cluster_seed).verifying_key();
+        let sig_b64 = rio_sig.split_once(':').unwrap().1;
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
+            .unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        use ed25519_dalek::Verifier;
+        assert!(
+            pk.verify(fp.as_bytes(), &sig).is_ok(),
+            "appended sig must verify against STORED nar_size={}, not liar's claim",
+            got.nar_size
+        );
+        assert_eq!(got.nar_size, nar.len() as u64);
+    }
+
+    // r[verify store.put.nar-bytes-budget+3]
+    /// bug_070: `fetch_nar` MUST acquire from `nar_bytes_budget` as
+    /// bytes accumulate. Structural assertion: while a fetch is
+    /// in-flight (gated mid-body), the shared semaphore's available
+    /// permits drop; after the future is dropped, they recover.
+    #[tokio::test]
+    async fn fetch_nar_backpressures_on_budget() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-budget").await;
+        let (path, nar) = make_path();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = spawn_flex_upstream(
+            &path,
+            nar.clone(),
+            "cache.budget",
+            FlexCfg {
+                nar_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        // Tiny budget: well over one NAR so the fetch never blocks on
+        // ITSELF, but small enough that any acquisition is observable.
+        let initial = (nar.len() * 4).max(64 * 1024);
+        let budget = Arc::new(Semaphore::new(initial));
+        let sub =
+            Arc::new(test_substituter(db.pool.clone()).with_nar_bytes_budget(Arc::clone(&budget)));
+
+        // First call: gate holds the NAR body BEFORE any bytes are
+        // sent → no permits acquired yet. Prove the budget is
+        // untouched, then drop the future and unblock.
+        assert_eq!(budget.available_permits(), initial);
+
+        // Release the gate, run to completion: permits acquired during
+        // the read loop and released after persist_nar (future returns).
+        gate.notify_one();
+        let got = sub.try_substitute(tid, &path).await.unwrap().unwrap();
+        assert_eq!(got.nar_size, nar.len() as u64);
+        assert_eq!(
+            budget.available_permits(),
+            initial,
+            "permits must be released after persist"
+        );
+
+        // Now structurally prove acquisition: pre-acquire enough that
+        // a second fetch CANNOT complete without blocking. The fetch
+        // charges ≥ nar.len() (floored at MIN_NAR_CHUNK_CHARGE per
+        // read); leave fewer than that available.
+        let leave = (MIN_NAR_CHUNK_CHARGE as usize) - 1;
+        let _hold = budget
+            .clone()
+            .acquire_many_owned((initial - leave) as u32)
+            .await
+            .unwrap();
+        assert_eq!(budget.available_permits(), leave);
+
+        // Distinct path so the moka singleflight doesn't return the
+        // cached result.
+        let path2 = format!(
+            "/nix/store/{}-budget-2",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let fake2 =
+            spawn_flex_upstream(&path2, nar.clone(), "cache.budget", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake2, 50).await;
+
+        let sub2 = Arc::clone(&sub);
+        let p2 = path2.clone();
+        let blocked = tokio::spawn(async move { sub2.try_substitute(tid, &p2).await });
+        // Give the fetch time to reach the budgeted read loop and
+        // block on `acquire_many_owned`.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !blocked.is_finished(),
+            "fetch must block on nar_bytes_budget when budget < MIN_NAR_CHUNK_CHARGE"
+        );
+        // Release: fetch completes.
+        drop(_hold);
+        let got2 = blocked.await.unwrap().unwrap().unwrap();
+        assert_eq!(got2.nar_size, nar.len() as u64);
+    }
+
+    // r[verify store.substitute.untrusted-upstream+2]
+    /// bug_144: `narinfo_to_validated` MUST reject `References:` count
+    /// > MAX_REFERENCES (parity with PutPath).
+    #[test]
+    fn narinfo_to_validated_rejects_excess_references() {
+        let mut ni = NarInfo {
+            store_path: rio_test_support::fixtures::test_store_path("manyrefs"),
+            url: "nar/x.nar".into(),
+            compression: "none".into(),
+            nar_hash: "sha256:0000000000000000000000000000000000000000000000000000".into(),
+            nar_size: 0,
+            references: Vec::new(),
+            deriver: None,
+            sigs: vec![],
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
+        // At the cap: OK.
+        ni.references = (0..MAX_REFERENCES)
+            .map(|i| format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ref-{i}"))
+            .collect();
+        assert!(narinfo_to_validated(&ni, [0u8; 32]).is_ok());
+        // One over: rejected.
+        ni.references
+            .push("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-one-more".into());
+        assert!(matches!(
+            narinfo_to_validated(&ni, [0u8; 32]),
+            Err(SubstituteError::NarInfo(_))
+        ));
+    }
+
+    // r[verify store.substitute.untrusted-upstream+2]
+    /// bug_144: the recursive closure walk MUST honour the per-call
+    /// node budget. Seed a tiny budget; serve a path whose `References:`
+    /// names a second path the same upstream also serves; assert the
+    /// budget hits zero and the truncation metric fires.
+    #[tokio::test]
+    async fn closure_walk_respects_budget() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-closure-budget").await;
+
+        // Three paths: root references leaf1 + leaf2. TWO siblings so the
+        // test exercises the post-truncation budget state — a wrapping
+        // `fetch_sub` would let leaf2 through after leaf1 truncates.
+        // All served by the SAME key so one trusted_keys entry covers all.
+        let root = rio_test_support::fixtures::test_store_path("closure-root");
+        let leaf1 = format!(
+            "/nix/store/{}-closure-leaf1",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let leaf2 = format!(
+            "/nix/store/{}-closure-leaf2",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let (_, nar) = make_path();
+        let root_hash = StorePath::parse(&root).unwrap().hash_part();
+
+        // Root narinfo: signed over References=[leaf1, leaf2].
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed("cache.closure", &seed);
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let refs = [leaf1.clone(), leaf2.clone()];
+        let fp_root = fingerprint(&root, &nar_hash, nar.len() as u64, &refs);
+        let root_body = format!(
+            "StorePath: {root}\n\
+             URL: nar/{root_hash}.nar\n\
+             Compression: none\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {}\n\
+             References: {} {}\n\
+             Sig: {}\n",
+            nar.len(),
+            leaf1.rsplit_once('/').unwrap().1,
+            leaf2.rsplit_once('/').unwrap().1,
+            signer.sign(&fp_root)
+        );
+
+        // Root upstream: serves root narinfo (with two refs) + NAR.
+        let root_up = spawn_flex_upstream(
+            &root,
+            nar.clone(),
+            "cache.closure",
+            FlexCfg {
+                narinfo_override: Some(root_body),
+                ..Default::default()
+            },
+        )
+        .await;
+        // Leaf upstreams: each serves its own narinfo + NAR (same key seed).
+        let mut urls = vec![root_up.url.clone()];
+        for leaf in &refs {
+            let h = StorePath::parse(leaf).unwrap().hash_part();
+            let body = signed_narinfo_for(leaf, &nar, "cache.closure", &h, None);
+            let up = spawn_flex_upstream(
+                leaf,
+                nar.clone(),
+                "cache.closure",
+                FlexCfg {
+                    narinfo_override: Some(body),
+                    ..Default::default()
+                },
+            )
+            .await;
+            urls.push(up.url.clone());
+            // Hold the server task alive past the substitution.
+            std::mem::forget(up);
+        }
+        for url in &urls {
+            metadata::upstreams::insert(
+                &db.pool,
+                tid,
+                url,
+                50,
+                std::slice::from_ref(&root_up.trusted_key),
+                SigMode::Keep,
+            )
+            .await
+            .unwrap();
+        }
+
+        let sub = test_substituter(db.pool.clone());
+        // Budget = 1: root consumes the only slot; BOTH leaves must
+        // truncate (the second proves the budget didn't wrap).
+        let budget = Arc::new(AtomicUsize::new(1));
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let got = sub
+            .try_substitute_inner(tid, &root, &budget)
+            .await
+            .unwrap()
+            .expect("root ingested");
+        assert_eq!(got.references.len(), 2);
+        assert_eq!(
+            budget.load(Ordering::SeqCst),
+            0,
+            "budget must saturate at 0, not wrap"
+        );
+        assert_eq!(
+            rec.get("rio_store_substitute_closure_truncated_total{}"),
+            2,
+            "both siblings truncated; keys={:?}",
+            rec.all_keys()
+        );
+        // Root persisted; NEITHER leaf persisted (truncated).
+        assert!(
+            metadata::query_path_info(&db.pool, &root)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for leaf in &refs {
+            assert!(
+                metadata::query_path_info(&db.pool, leaf)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{leaf} must be truncated when budget=1 (wraparound would let sibling 2 through)"
+            );
+        }
     }
 }

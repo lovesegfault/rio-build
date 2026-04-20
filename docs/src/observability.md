@@ -191,6 +191,9 @@ r[obs.metric.store]
 | `rio_store_get_path_bytes_total` | Counter | Bytes served via GetPath (nar_size on stream start) |
 | `rio_store_get_path_total` | Counter | Total GetPath operations (incremented on successful whole-NAR verify) |
 | `rio_store_get_path_duration_seconds` | Histogram | GetPath latency (stream_path entry to whole-NAR verify) |
+| `rio_store_substitute_total` | Counter | Upstream substitution attempts, labeled by `result` (hit/miss/error) and `tenant` (UUID). Per-upstream debugging detail is in the `debug!`/`warn!` log lines. |
+| `rio_store_substitute_integrity_failures_total` | Counter | Upstream substitution NAR hash or size mismatches, labeled by `tenant`. Nonzero is security-relevant: upstream served corrupt/tampered bytes or a lying `NarSize`. |
+| `rio_store_substitute_closure_truncated_total` | Counter | `try_substitute` closure walks that hit `MAX_SUBSTITUTE_CLOSURE` and were truncated. Nonzero is security-relevant: a tenant-configured upstream is serving an implausibly deep reference chain. |
 | `rio_store_substitute_probe_cache_hits_total` | Counter | `check_available` HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path). |
 | `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued — or the batch hit the 4096-uncached cap). |
 | `rio_store_substitute_stale_reclaimed_total` | Counter | Stale `'uploading'` placeholders reclaimed on the substitution hot path (crashed prior fetch left the placeholder; `try_substitute` deleted + re-inserted rather than waiting for the 15-minute orphan sweep). Nonzero is expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts. |

@@ -272,12 +272,13 @@ pkgs.testers.runNixOSTest {
 
         # Metric proof: rio_store_substitute_total{result="hit",...} ≥ 1.
         # Store metrics on :9092 (scheduler is :9091, builder :9093).
-        # upstream label added to the metric — assert_metric_ge does
-        # exact label-string match, so include it.
+        # Label is `tenant` (UUID, bounded), NOT `upstream` (tenant-
+        # supplied URL → unbounded cardinality). assert_metric_ge does
+        # exact label-string match.
         assert_metric_ge(
             ${gatewayHost}, 9092,
             "rio_store_substitute_total", 1.0,
-            labels='{result="hit",upstream="http://client:8080"}',
+            labels='{result="hit",tenant="' + tid_a + '"}',
         )
 
     # ══════════════════════════════════════════════════════════════════

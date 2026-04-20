@@ -927,7 +927,7 @@ async fn send_batch_output(
 /// default budget) can never self-deadlock. Verified here with a 2 MiB
 /// budget and 3 × 600 KiB outputs (1.8 MiB cumulative — under both
 /// MAX_NAR_SIZE and the budget, so no rejection AND no deadlock).
-// r[verify store.put.nar-bytes-budget+2]
+// r[verify store.put.nar-bytes-budget+3]
 #[tokio::test]
 async fn batch_no_self_deadlock_under_budget() -> TestResult {
     let s =

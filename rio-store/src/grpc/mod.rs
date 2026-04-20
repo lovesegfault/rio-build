@@ -224,16 +224,18 @@ pub struct StoreServiceImpl {
     /// `["rio-gateway", "rio-scheduler"]`.
     service_bypass_callers: Vec<String>,
     /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
-    /// handlers. Each handler acquires `chunk.len()` permits before extending
-    /// its `nar_data: Vec<u8>`; permits release on handler drop. Default
-    /// `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size uploads run in parallel
-    /// before the 9th blocks. Configurable via `store.toml
-    /// nar_buffer_budget_bytes` (or `.with_nar_budget()` in tests).
+    /// AND upstream-substitution handlers. Each acquires `chunk.len()`
+    /// permits before extending its `nar_data: Vec<u8>`; permits release on
+    /// handler drop. Default `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size
+    /// uploads run in parallel before the 9th blocks. Configurable via
+    /// `store.toml nar_buffer_budget_bytes` (or `.with_nar_budget()` in
+    /// tests). main.rs wires this same `Arc<Semaphore>` into the
+    /// `Substituter` so both ingest paths draw from one pool.
     ///
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
-    // r[impl store.put.nar-bytes-budget+2]
+    // r[impl store.put.nar-bytes-budget+3]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
     /// Upstream binary-cache substituter. `None` disables substitution
     /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462
@@ -367,12 +369,10 @@ impl StoreServiceImpl {
         self
     }
 
-    /// Accessor for tests: inspect the budget semaphore directly to
-    /// assert backpressure behavior without mocking the full PutPath
-    /// streaming protocol.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
+    /// Borrow the NAR-bytes budget semaphore. main.rs clones this into
+    /// the `Substituter` so PutPath and substitution share ONE pool;
+    /// tests inspect it to assert backpressure.
+    pub fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
         &self.nar_bytes_budget
     }
 
@@ -488,7 +488,15 @@ impl StoreServiceImpl {
                 SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
                     "upstream substitute {what} exceeds {limit}-byte cap"
                 )),
+                // Transient: another uploader holds the placeholder.
+                // Same observable client behavior as a miss on the
+                // FIRST call; the SECOND call re-runs `do_substitute`
+                // (moka didn't cache `Err`) and reaches `AlreadyComplete`.
+                SubstituteError::Busy => {
+                    Status::not_found("path not found (concurrent upload in progress)")
+                }
                 SubstituteError::HashMismatch { .. }
+                | SubstituteError::SizeMismatch { .. }
                 | SubstituteError::NarInfo(_)
                 | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
             }
