@@ -589,13 +589,13 @@ impl Handler for ConnectionHandler {
         self.stage
             .store(ConnStage::ChannelOpen as u8, Ordering::Relaxed);
         let channel_id = channel.id();
-        // r[impl gw.conn.channel-limit]
+        // r[impl gw.conn.channel-limit+2]
         // Gate on sessions.len(), not "channels ever opened" — a channel
         // without an `exec_request` has no ChannelSession, no spawned
         // tasks, no buffers. Only exec'd channels consume resources.
-        // This DOES mean a client can burst 5 opens before the first
-        // exec lands; russh's event loop serializes handler calls so
-        // in practice exec-after-open is the common interleaving.
+        // Fast-path rejection for well-behaved (open→exec interleaved)
+        // clients; `exec_request` re-checks for the burst-open-then-exec
+        // ordering, which is the load-bearing gate.
         if self.sessions.len() >= MAX_CHANNELS_PER_CONNECTION {
             warn!(
                 peer = ?self.peer_addr,
@@ -630,6 +630,25 @@ impl Handler for ConnectionHandler {
             && args[args.len() - 1] == "--stdio";
         if !is_nix_daemon {
             warn!(command = %command, "rejecting non-nix-daemon exec request");
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        }
+
+        // r[impl gw.conn.channel-limit+2]
+        // Load-bearing re-check: `channel_open_session` gates on
+        // `sessions.len()` but never inserts (this method does, below).
+        // A client that bursts N×CHANNEL_OPEN (each sees len()==0 →
+        // accepted) then N×exec would otherwise spawn N ChannelSessions
+        // — 3 tasks + ~550 KiB buffers each — defeating the ~2 MiB
+        // per-connection bound the global memory budget depends on.
+        if self.sessions.len() >= MAX_CHANNELS_PER_CONNECTION {
+            warn!(
+                peer = ?self.peer_addr,
+                active = self.sessions.len(),
+                limit = MAX_CHANNELS_PER_CONNECTION,
+                "rejecting exec request: per-connection channel limit reached"
+            );
+            metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
             session.channel_failure(channel_id)?;
             return Ok(());
         }

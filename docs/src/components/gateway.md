@@ -562,11 +562,14 @@ cancel loop before the protocol task exits; hard `abort()` on the task
 handle defeats this. Builds not cancelled leak an executor slot until
 `r[sched.backstop.timeout]`.
 
-r[gw.conn.channel-limit]
+r[gw.conn.channel-limit+2]
 A single SSH connection may open at most `MAX_CHANNELS_PER_CONNECTION`
 (default 4) active protocol sessions. Additional `channel_open_session`
-requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The limit matches Nix's
-default `max-jobs`.
+requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`; an `exec_request` on an
+already-open channel that would exceed the cap receives `channel_failure`
+(the load-bearing check — `channel_open_session` does not insert into the
+session map, so a burst of opens followed by execs would otherwise bypass
+the open-time gate). The limit matches Nix's default `max-jobs`.
 
 r[gw.conn.keepalive+2]
 The gateway sends SSH keepalive requests every 30 seconds. After 9

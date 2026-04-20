@@ -175,7 +175,7 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
     Ok((addr, client_key, srv_handle))
 }
 
-// r[verify gw.conn.channel-limit]
+// r[verify gw.conn.channel-limit+2]
 /// Open 4 channels + exec on each (populates `self.sessions`), then
 /// a 5th `channel_open_session` receives `SSH_MSG_CHANNEL_OPEN_FAILURE`.
 /// Closing one channel frees a slot; 6th open succeeds.
@@ -280,6 +280,66 @@ async fn test_auth_publickey_offered_rejects_unknown_key() -> anyhow::Result<()>
         "unknown key must be rejected; auth_publickey_offered short-circuits before signature"
     );
 
+    drop(session);
+    srv.abort();
+    Ok(())
+}
+
+// r[verify gw.conn.channel-limit+2]
+/// Burst N×`channel_open_session` first (each sees `sessions.len()==0`
+/// → accepted), THEN N×exec. The 5th and 6th exec must receive
+/// `channel_failure` — the `exec_request` re-check is the load-bearing
+/// gate; `channel_open_session` alone never inserts into the session
+/// map, so without the re-check all N execs would spawn.
+///
+/// Regression: at b62291b8 all 6 execs succeed (cap bypassed).
+#[tokio::test]
+async fn test_burst_open_then_exec_respects_channel_limit() -> anyhow::Result<()> {
+    common::init_test_logging();
+    let (addr, client_key, srv) = spawn_ssh_server().await?;
+
+    let config = Arc::new(client::Config::default());
+    let mut session = client::connect(config, addr, AcceptAllClient).await?;
+    let auth_ok = session
+        .authenticate_publickey(
+            "nix",
+            PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+        )
+        .await?
+        .success();
+    assert!(auth_ok, "publickey auth should succeed");
+
+    // Burst-open 6 channels with NO exec. `channel_open_session` checks
+    // `sessions.len()` (==0 for all six) so all opens are accepted.
+    let mut chans = Vec::new();
+    for i in 0..6 {
+        let ch = session
+            .channel_open_session()
+            .await
+            .unwrap_or_else(|e| panic!("burst open #{i} should be accepted (len()==0): {e:?}"));
+        chans.push(ch);
+    }
+
+    // Now exec on each. First 4 → channel_success; 5th and 6th →
+    // channel_failure. `exec(true, ...)` only SENDS the request; the
+    // server's success/failure reply arrives via `wait()`.
+    for (i, ch) in chans.iter_mut().enumerate() {
+        ch.exec(true, "nix-daemon --stdio").await?;
+        let msg = ch.wait().await.expect("server reply");
+        if i < 4 {
+            assert!(
+                matches!(msg, russh::ChannelMsg::Success),
+                "exec #{i} should get channel_success: {msg:?}"
+            );
+        } else {
+            assert!(
+                matches!(msg, russh::ChannelMsg::Failure),
+                "exec #{i} must get channel_failure (exec_request channel-limit re-check); got {msg:?}"
+            );
+        }
+    }
+
+    drop(chans);
     drop(session);
     srv.abort();
     Ok(())
