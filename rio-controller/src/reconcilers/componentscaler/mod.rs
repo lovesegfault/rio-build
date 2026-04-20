@@ -164,8 +164,18 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     // at loop-rate (bug_213). `status_write_due` caps to once per
     // REQUEUE window via in-process timestamp (same pattern as
     // `low_ticks`). Worst case: 2 reconciles/10s (the requeue + one
-    // watch-echo whose status-write is suppressed).
-    if status_write_due(last_status_write) && status_changed(&status, &decision, max_load) {
+    // watch-echo whose status-write is suppressed). Scale-ups bypass
+    // the rate-limit: `lastScaleUpTime` is correctness-load-bearing
+    // (gates SCALE_DOWN_STABILIZATION), not observability, and
+    // scale-ups are rare + self-limiting so the watch-loop concern
+    // doesn't apply (bug_060).
+    if status_write_gate(
+        decision.scaled_up,
+        last_status_write,
+        &status,
+        &decision,
+        max_load,
+    ) {
         let cs_api: Api<ComponentScaler> = Api::namespaced(ctx.client.clone(), &ns);
         patch_status(&cs_api, &cs, spec, &status, &decision, max_load).await?;
         ctx.scaler
@@ -179,14 +189,19 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
 
 /// Resolve `loadEndpoint` (headless-svc DNS) → per-pod GetLoad →
 /// max utilization. `None` on total failure (endpoint malformed,
-/// DNS unresolved, all RPCs failed) — the caller skips ratio
-/// correction this tick.
+/// DNS unresolved/timed-out, all RPCs failed) — the caller skips
+/// ratio correction this tick.
 ///
-/// Fan-out is concurrent (JoinSet): bounds total latency to one
-/// `LOAD_RPC_TIMEOUT` regardless of pod count or health. Sequential
-/// would cost N×2s under N stale headless-DNS endpoints (rolling
-/// restart, drained node) — 5 stale = the entire `REQUEUE` budget
-/// gone before `decide()` runs (bug_194).
+/// Bounds total latency to ≤2×`LOAD_RPC_TIMEOUT` (DNS resolve +
+/// concurrent fan-out). DNS is timeout-wrapped: `lookup_host` is
+/// `spawn_blocking(getaddrinfo)` with no inherent deadline; under
+/// k8s `ndots:5` + 3-4 search domains + degraded CoreDNS that's
+/// 20-40s of `glibc timeout:5 × attempts:2` per expansion — the
+/// entire I-105 cliff window with the per-object reconcile parked
+/// (bug_062). Fan-out is concurrent (JoinSet): sequential would
+/// cost N×2s under N stale headless-DNS endpoints (rolling restart,
+/// drained node) — 5 stale = the entire `REQUEUE` budget gone before
+/// `decide()` runs (bug_194).
 async fn poll_max_load(endpoint: &str) -> Option<f64> {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         warn!(
@@ -203,13 +218,18 @@ async fn poll_max_load(endpoint: &str) -> Option<f64> {
         return None;
     };
 
-    let addrs: Vec<_> = match tokio::net::lookup_host((host, port)).await {
-        Ok(it) => it.collect(),
-        Err(e) => {
-            warn!(host, error = %e, "componentscaler: loadEndpoint DNS resolve failed");
-            return None;
-        }
-    };
+    let addrs: Vec<_> =
+        match tokio::time::timeout(LOAD_RPC_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+            Ok(Ok(it)) => it.collect(),
+            Ok(Err(e)) => {
+                warn!(host, error = %e, "componentscaler: loadEndpoint DNS resolve failed");
+                return None;
+            }
+            Err(_) => {
+                warn!(host, "componentscaler: loadEndpoint DNS resolve timed out");
+                return None;
+            }
+        };
     if addrs.is_empty() {
         debug!(host, "componentscaler: loadEndpoint resolved to 0 addrs");
         return None;
@@ -278,6 +298,27 @@ async fn patch_scale(api: &Api<Deployment>, name: &str, replicas: i32) -> Result
 /// patch.
 pub(super) fn status_write_due(last: Option<Instant>) -> bool {
     last.is_none_or(|t| t.elapsed() >= REQUEUE)
+}
+
+/// Combined gate for `patch_status`. Rate-limited to once per
+/// `REQUEUE` AND only on material change — except `scaled_up` always
+/// passes the rate-limit. `lastScaleUpTime` is the sole input to
+/// `decide()`'s `SCALE_DOWN_STABILIZATION` (correctness, not
+/// observability); a scale-up landing in the suppression window
+/// would patch `/scale` but skip the stamp, and by the next
+/// non-suppressed tick `current` has caught up so `scaled_up=false`
+/// preserves the stale timestamp → stabilization bypassed → flap
+/// (bug_060). Scale-ups are rare and self-limiting (next tick sees
+/// `desired==current`), so bypassing the rate-limit for them does
+/// not reintroduce the bug_213 watch-loop.
+pub(super) fn status_write_gate(
+    scaled_up: bool,
+    last: Option<Instant>,
+    prev: &ComponentScalerStatus,
+    d: &Decision,
+    max_load: Option<f64>,
+) -> bool {
+    (scaled_up || status_write_due(last)) && status_changed(prev, d, max_load)
 }
 
 /// True if the new status would differ from `prev` in a way that
@@ -419,5 +460,57 @@ mod tests {
              (sequential would take 3× = 6s and fail this)"
         );
         assert_eq!(res.unwrap(), None, "all hung → no reading");
+    }
+
+    /// bug_060 regression: a scale-up that lands inside the
+    /// `status_write_due` suppression window MUST still write status
+    /// (so `lastScaleUpTime` is stamped). Without the bypass the
+    /// stabilization gate is defeated and the Deployment flaps
+    /// up→down within ~20s.
+    #[test]
+    fn scale_up_bypasses_status_rate_limit() {
+        let prev = ComponentScalerStatus::default();
+        let d = Decision {
+            desired: 5,
+            learned_ratio: 50.0,
+            low_load_ticks: 0,
+            scaled_up: true,
+        };
+        // Just wrote (suppression active): scaled_up=true → gate open.
+        assert!(
+            status_write_gate(true, Some(Instant::now()), &prev, &d, None),
+            "scale-up must write status even inside suppression window"
+        );
+        // Same suppression, scaled_up=false → gate closed (the
+        // bug_213 rate-limit still applies to non-scale-up writes).
+        let d_no_up = Decision {
+            scaled_up: false,
+            ..d
+        };
+        assert!(
+            !status_write_gate(false, Some(Instant::now()), &prev, &d_no_up, None),
+            "non-scale-up inside suppression → suppressed"
+        );
+    }
+
+    /// bug_062 regression: end-to-end `poll_max_load` is bounded.
+    /// Literal IP → DNS resolves instantly, then the never-accepting
+    /// listener exercises the timeout-wrapped fan-out. The DNS-hang
+    /// arm itself can't be portably injected (`getaddrinfo` is
+    /// `spawn_blocking`, ignores `tokio::time::pause()`), but this
+    /// asserts the public entrypoint completes within
+    /// 3×`LOAD_RPC_TIMEOUT` and the DNS step is structurally inside
+    /// the timeout-wrapped region.
+    #[tokio::test]
+    async fn poll_max_load_end_to_end_bounded() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        let res = tokio::time::timeout(LOAD_RPC_TIMEOUT * 3, poll_max_load(&endpoint)).await;
+        assert!(
+            res.is_ok(),
+            "poll_max_load must complete within 3×LOAD_RPC_TIMEOUT end-to-end \
+             (DNS resolve + concurrent fan-out both bounded)"
+        );
+        assert_eq!(res.unwrap(), None, "hung listener → no reading");
     }
 }
