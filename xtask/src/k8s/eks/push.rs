@@ -25,6 +25,19 @@ use crate::{git, tofu, ui};
 /// Nix system → OCI arch (what k8s nodes advertise via kubernetes.io/arch).
 const ARCHES: &[(&str, &str)] = &[("x86_64-linux", "amd64"), ("aarch64-linux", "arm64")];
 
+/// `manifest-tool --platforms` value derived from [`ARCHES`]. Every
+/// other arch step in this file (`build_all`, the per-arch tag suffix,
+/// `assert_in_ecr`) iterates `ARCHES`; the manifest list MUST cover the
+/// same set or new-arch nodes silently ImagePullBackOff on the
+/// manifest-list tag while the per-arch tag exists.
+fn manifest_platforms() -> String {
+    ARCHES
+        .iter()
+        .map(|(_, a)| format!("linux/{a}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// skopeo refuses to run without a policy. "insecureAcceptAnything" =
 /// don't require signature verification. Source is docker-archive
 /// (local nix store), dest is our own ECR — no signatures to verify.
@@ -166,6 +179,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     for name in &names {
         let (name, tag, ecr, docker_cfg) =
             (name.clone(), tag.clone(), ecr.clone(), docker_cfg.clone());
+        let platforms = manifest_platforms();
         joinset.spawn(ui::step_owned(
             format!("manifest rio-{name}:{tag}"),
             async move {
@@ -175,7 +189,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
                     let sh = shell()?;
                     crate::sh::run(cmd!(
                         sh,
-                        "manifest-tool --docker-cfg {docker_cfg} push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
+                        "manifest-tool --docker-cfg {docker_cfg} push from-args --platforms {platforms} --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
                     ))
                 };
                 fut.await.with_context(|| format!("manifest rio-{name}"))
@@ -194,8 +208,9 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     }
 
     info!(
-        "done — pushed {} images × 2 arches + manifest lists, tag: {tag}",
-        names.len()
+        "done — pushed {} images × {} arches + manifest lists, tag: {tag}",
+        names.len(),
+        ARCHES.len()
     );
     Ok(())
 }
@@ -336,4 +351,18 @@ fn indent(s: &str, prefix: &str) -> String {
         .map(|l| format!("{prefix}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_platforms_derives_from_arches() {
+        let p = manifest_platforms();
+        assert_eq!(p.split(',').count(), ARCHES.len());
+        for (_, oci) in ARCHES {
+            assert!(p.contains(&format!("linux/{oci}")), "{p} missing {oci}");
+        }
+    }
 }
