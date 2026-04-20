@@ -15,9 +15,13 @@
 //!      CRs / etc. Tofu's `helm_release.aws_lbc` is what tears down the
 //!      NLB infra, but the *Service* must go first or aws-lbc never gets
 //!      the delete event → NLB orphaned.
-//!   3. **Strip drain finalizers + wait.** With the controller gone
+//!   3. **Strip rio CR finalizers + wait.** With the controller gone
 //!      (step 2), the finalizers from step 1 are orphaned. Patch them
-//!      off so the namespace delete in step 5 doesn't wedge.
+//!      off so the namespace delete in step 5 doesn't wedge. This
+//!      covers EVERY `*.rio.build` CRD on the cluster, not just the
+//!      current `pool` type — a cluster upgraded across ADR-023 still
+//!      has legacy `builderpool`/`builderpoolset`/`fetcherpool` CRs
+//!      with finalizers and no controller to clear them.
 //!   4. **Delete NodeClaims.** Karpenter-provisioned EC2. If we let
 //!      tofu delete `helm_release.karpenter` first, the controller is
 //!      gone before it can terminate its instances → EC2 orphans.
@@ -72,6 +76,36 @@ fn is_benign_destroy_failure(msg: &str) -> bool {
         || msg.contains("Unable to connect to the server")
         || msg.contains("could not find the requested resource")
         || msg.contains("no matches for kind")
+}
+
+/// All `*.rio.build` CRD names registered on the cluster (e.g.
+/// `pools.rio.build`). Covers the current `pool`/`componentscaler`
+/// types AND legacy pre-ADR-023 types (`builderpool`/`builderpoolset`/
+/// `fetcherpool`) that linger on a cluster upgraded in place — those
+/// have no controller anymore, so their drain finalizers wedge
+/// namespace deletion until stripped.
+fn list_rio_crds() -> Result<Vec<String>> {
+    let sh = shell()?;
+    match sh::try_read(cmd!(sh, "kubectl get crd -o name")) {
+        Ok(out) => Ok(parse_rio_crds(&out)),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if is_benign_destroy_failure(&msg) {
+                return Ok(vec![]);
+            }
+            Err(e).context("list CRDs")
+        }
+    }
+}
+
+/// Parse `kubectl get crd -o name` output → `*.rio.build` CRD names.
+fn parse_rio_crds(out: &str) -> Vec<String> {
+    out.lines()
+        // `customresourcedefinition.apiextensions.k8s.io/pools.rio.build`
+        .filter_map(|l| l.rsplit_once('/').map(|(_, name)| name))
+        .filter(|name| name.ends_with(".rio.build"))
+        .map(String::from)
+        .collect()
 }
 
 /// `kubectl patch` has no `--all` — enumerate names first, then patch
@@ -169,15 +203,23 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     })
     .await?;
 
-    // ── 3. Strip orphaned drain finalizers ─────────────────────────
+    // ── 3. Strip orphaned rio CR finalizers ────────────────────────
     // Controller is gone (step 2); finalizers from step 1 are now
-    // orphaned. merge-patch metadata.finalizers=[] (idempotent — also
-    // a no-op if the controller already cleared them). Then wait for
-    // delete to complete so step 5's namespace delete doesn't see
-    // dangling CRs.
-    ui::step("strip pool drain finalizers", || async {
+    // orphaned. merge-patch metadata.finalizers=[] on EVERY instance
+    // of EVERY *.rio.build CRD across all rio namespaces (idempotent —
+    // also a no-op if the controller already cleared them). This
+    // includes legacy pre-ADR-023 types whose controller no longer
+    // exists. Then wait for the step-1 pool deletes to complete so
+    // step 5's namespace delete doesn't see dangling CRs.
+    ui::step("strip *.rio.build CR finalizers", || async {
+        let crds = list_rio_crds()?;
+        info!("rio.build CRDs on cluster: {crds:?}");
+        for crd in &crds {
+            for &(ns, _) in NAMESPACES {
+                k_patch_all(ns, crd, r#"{"metadata":{"finalizers":[]}}"#).await?;
+            }
+        }
         for &ns in POOL_NAMESPACES {
-            k_patch_all(ns, "pool", r#"{"metadata":{"finalizers":[]}}"#).await?;
             k(&[
                 "-n",
                 ns,
@@ -357,7 +399,7 @@ async fn tofu_destroy() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_benign_destroy_failure;
+    use super::{is_benign_destroy_failure, parse_rio_crds};
 
     /// Regression for the partially-provisioned-cluster case: destroy
     /// runs before the rio chart was ever installed, so CRDs don't
@@ -381,5 +423,33 @@ mod tests {
         ] {
             assert!(!is_benign_destroy_failure(msg), "must NOT be benign: {msg}");
         }
+    }
+
+    /// Regression for the upgraded-across-ADR-023 case: legacy CRD
+    /// types still on the cluster must be discovered so step 3 strips
+    /// their finalizers, not just the current `pool` type.
+    #[test]
+    fn parse_rio_crds_filters_and_strips_prefix() {
+        let out = "\
+customresourcedefinition.apiextensions.k8s.io/builderpools.rio.build
+customresourcedefinition.apiextensions.k8s.io/builderpoolsets.rio.build
+customresourcedefinition.apiextensions.k8s.io/ciliumnetworkpolicies.cilium.io
+customresourcedefinition.apiextensions.k8s.io/componentscalers.rio.build
+customresourcedefinition.apiextensions.k8s.io/ec2nodeclasses.karpenter.k8s.aws
+customresourcedefinition.apiextensions.k8s.io/fetcherpools.rio.build
+customresourcedefinition.apiextensions.k8s.io/nodeclaims.karpenter.sh
+customresourcedefinition.apiextensions.k8s.io/pools.rio.build
+";
+        assert_eq!(
+            parse_rio_crds(out),
+            vec![
+                "builderpools.rio.build",
+                "builderpoolsets.rio.build",
+                "componentscalers.rio.build",
+                "fetcherpools.rio.build",
+                "pools.rio.build",
+            ]
+        );
+        assert!(parse_rio_crds("").is_empty());
     }
 }
