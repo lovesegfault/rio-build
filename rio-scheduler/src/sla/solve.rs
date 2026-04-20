@@ -44,6 +44,24 @@ impl Tier {
     pub fn binding_bound(&self) -> Option<f64> {
         self.p90.or(self.p50).or(self.p99)
     }
+
+    /// Startup-time bounds checks. Called from
+    /// [`SlaConfig::validate`](super::config::SlaConfig::validate) so a
+    /// negative/NaN bound fails loud at startup instead of wrapping to 0
+    /// in `solve_tiers()`' `(d * 1000.0) as u64` sort key (which would
+    /// silently sort the broken tier as "tightest").
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (field, v) in [("p50", self.p50), ("p90", self.p90), ("p99", self.p99)] {
+            if let Some(v) = v {
+                anyhow::ensure!(
+                    v.is_finite() && v > 0.0,
+                    "sla.tiers[{}].{field} must be finite and positive, got {v}",
+                    self.name
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

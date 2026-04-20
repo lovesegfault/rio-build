@@ -196,6 +196,9 @@ impl SlaConfig {
             self.default_tier,
             self.tiers.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
+        for t in &self.tiers {
+            t.validate()?;
+        }
         anyhow::ensure!(
             self.max_cores.is_finite() && self.max_cores > 0.0,
             "sla.max_cores must be finite and positive, got {}",
@@ -301,6 +304,31 @@ mod tests {
         let mut cfg = base();
         cfg.probe.cpu = 0.5;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nonpositive_tier_bound() {
+        let mut cfg = base();
+        // Negative: `(d * 1000.0) as u64` would wrap to 0 → broken tier
+        // sorts as "tightest" in solve_tiers().
+        cfg.tiers[0].p90 = Some(-300.0);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tiers[normal].p90") && err.contains("-300"),
+            "{err}"
+        );
+        // NaN: same wrap, plus NaN poisons binding_bound() comparisons.
+        cfg.tiers[0].p90 = None;
+        cfg.tiers[0].p50 = Some(f64::NAN);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tiers[normal].p50"), "{err}");
+        // Zero: degenerate (no build can hit a 0s target).
+        cfg.tiers[0].p50 = None;
+        cfg.tiers[0].p99 = Some(0.0);
+        assert!(cfg.validate().is_err());
+        // Positive control.
+        cfg.tiers[0].p99 = Some(300.0);
+        cfg.validate().unwrap();
     }
 
     #[test]
