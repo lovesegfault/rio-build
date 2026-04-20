@@ -269,6 +269,9 @@ spec:
                   x-kubernetes-preserve-unknown-fields: true
                 nullable: true
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               desiredReplicas:
                 default: 0
                 description: Concurrent-Job target the reconciler is converging on.

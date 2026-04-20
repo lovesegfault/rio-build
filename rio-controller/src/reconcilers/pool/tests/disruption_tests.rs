@@ -269,3 +269,58 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 
     guard.verified().await;
 }
+
+/// `r[ctrl.event.spec-degrade]` says "every spec field the builder
+/// silently degrades" gets a Warning. Before the table-driven
+/// `DEGRADE_CHECKS`, only `hostNetwork && !privileged` was covered —
+/// the four Fetcher CEL rules and the non-CEL `wants_kvm` drop fired
+/// silent overrides in `pod.rs` with no `kubectl get events` signal.
+/// A pre-CEL `kind=Fetcher` Pool with `privileged:true` ran
+/// unprivileged with the operator none the wiser.
+// r[verify ctrl.event.spec-degrade]
+#[tokio::test]
+async fn warn_fires_for_every_degrade_check() {
+    use crate::reconcilers::pool::DEGRADE_CHECKS;
+    // Structural floor: 1 host-users + 4 Fetcher CEL rules + 1 non-CEL
+    // wants_kvm. New CEL rules without a DegradeCheck entry trip this.
+    assert!(
+        DEGRADE_CHECKS.len() >= 6,
+        "DEGRADE_CHECKS shrank below the count of silent overrides in \
+         pod.rs::effective_* — every override needs a Warning entry"
+    );
+
+    // One fixture Pool that triggers every Fetcher check at once
+    // (host-users covered by the test above). Verifier proves one
+    // event POST per matching check fires before the reconcile body.
+    let mut wp = crate::fixtures::test_pool("test-pool", ExecutorKind::Fetcher);
+    wp.spec.privileged = Some(true);
+    wp.spec.host_network = Some(true);
+    wp.spec.seccomp_profile = Some(rio_crds::pool::SeccompProfileKind {
+        type_: "Unconfined".into(),
+        localhost_profile: None,
+    });
+    wp.spec.fuse_threads = Some(8);
+    wp.spec.features = vec!["kvm".into()];
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut scenarios: Vec<Scenario> = DEGRADE_CHECKS
+        .iter()
+        .filter(|c| (c.applies)(&wp.spec))
+        .map(|c| event_post_scenario(c.reason))
+        .collect();
+    assert_eq!(
+        scenarios.len(),
+        5,
+        "fixture should trigger every Fetcher degrade check"
+    );
+    scenarios.extend(ephemeral_reconcile_scenarios());
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), ctx.clone())
+        .await
+        .expect("apply completes (reconcile path)");
+
+    guard.verified().await;
+}

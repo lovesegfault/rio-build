@@ -79,6 +79,78 @@ pub async fn reconcile(pool: Arc<Pool>, ctx: Arc<Ctx>) -> Result<Action> {
 /// K8s Event reason for hostNetwork + !privileged spec-degrade.
 /// Referenced by disruption_tests.rs event-reason reachability tests.
 pub(crate) const REASON_HOST_USERS_SUPPRESSED: &str = "HostUsersSuppressedForHostNetwork";
+pub(crate) const REASON_FETCHER_PRIVILEGED_SUPPRESSED: &str = "FetcherPrivilegedSuppressed";
+pub(crate) const REASON_FETCHER_HOST_NETWORK_SUPPRESSED: &str = "FetcherHostNetworkSuppressed";
+pub(crate) const REASON_FETCHER_SECCOMP_OVERRIDDEN: &str = "FetcherSeccompOverridden";
+pub(crate) const REASON_FETCHER_FUSE_TUNING_IGNORED: &str = "FetcherFuseTuningIgnored";
+pub(crate) const REASON_FETCHER_KVM_FEATURE_IGNORED: &str = "FetcherKvmFeatureIgnored";
+
+/// One spec-degrade check. `applies` is a pure predicate over the
+/// spec; if true, a `Warning` event with `reason`/`note` is emitted.
+/// Each entry mirrors a CEL admission rule (or a non-CEL silent
+/// override in `pod.rs`). Table-driven so adding a CEL rule without a
+/// corresponding entry here is the only way to forget — the spec
+/// `r[ctrl.event.spec-degrade]` says "every", so the test asserts
+/// `DEGRADE_CHECKS.len() >= <count of CEL rules + 1>`.
+pub(crate) struct DegradeCheck {
+    pub applies: fn(&rio_crds::pool::PoolSpec) -> bool,
+    pub reason: &'static str,
+    pub note: &'static str,
+}
+
+#[inline]
+fn is_fetcher_spec(s: &rio_crds::pool::PoolSpec) -> bool {
+    s.kind == ExecutorKind::Fetcher
+}
+
+/// One entry per silent override in `pod.rs::effective_*` /
+/// `wants_kvm`. Mirrors the CEL rules at `rio-crds/src/pool.rs:
+/// 121-155` plus the non-CEL `wants_kvm` drop.
+pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
+    // r[impl ctrl.crd.host-users-network-exclusive]
+    DegradeCheck {
+        applies: |s| s.host_network == Some(true) && s.privileged != Some(true),
+        reason: REASON_HOST_USERS_SUPPRESSED,
+        note: "hostNetwork:true forces hostUsers omitted \
+               (K8s admission rejects the combo). Set \
+               privileged:true explicitly, or drop hostNetwork.",
+    },
+    DegradeCheck {
+        applies: |s| is_fetcher_spec(s) && s.privileged == Some(true),
+        reason: REASON_FETCHER_PRIVILEGED_SUPPRESSED,
+        note: "kind=Fetcher forces privileged:false — fetchers face the \
+               open internet; the escape hatch stays closed (ADR-019). \
+               Drop privileged:true.",
+    },
+    DegradeCheck {
+        applies: |s| is_fetcher_spec(s) && s.host_network == Some(true),
+        reason: REASON_FETCHER_HOST_NETWORK_SUPPRESSED,
+        note: "kind=Fetcher forces hostNetwork:false — fetchers run on \
+               dedicated nodes with pod networking (ADR-019). Drop \
+               hostNetwork:true.",
+    },
+    DegradeCheck {
+        applies: |s| is_fetcher_spec(s) && s.seccomp_profile.is_some(),
+        reason: REASON_FETCHER_SECCOMP_OVERRIDDEN,
+        note: "kind=Fetcher forces seccompProfile=Localhost \
+               operator/rio-fetcher.json (ADR-019). Drop seccompProfile.",
+    },
+    DegradeCheck {
+        applies: |s| {
+            is_fetcher_spec(s) && (s.fuse_threads.is_some() || s.fuse_passthrough.is_some())
+        },
+        reason: REASON_FETCHER_FUSE_TUNING_IGNORED,
+        note: "kind=Fetcher ignores fuseThreads/fusePassthrough — fetches \
+               are network-bound, not FUSE-bound. Drop the FUSE tuning knobs.",
+    },
+    DegradeCheck {
+        applies: |s| is_fetcher_spec(s) && s.features.iter().any(|f| f == pod::KVM_FEATURE),
+        reason: REASON_FETCHER_KVM_FEATURE_IGNORED,
+        note: "kind=Fetcher ignores the kvm feature — FODs route by \
+               is_fixed_output alone, never by features. Drop kvm from \
+               features.",
+    },
+];
 
 /// Emit Warning events for every spec field the builder will silently
 /// degrade. Each check mirrors a CEL rule at apply-time; the builder's
@@ -89,25 +161,20 @@ pub(crate) const REASON_HOST_USERS_SUPPRESSED: &str = "HostUsersSuppressedForHos
 // r[impl ctrl.event.spec-degrade]
 async fn warn_on_spec_degrades(pool: &Pool, ctx: &Ctx) {
     use kube::runtime::events::{Event as KubeEvent, EventType};
-
-    // r[impl ctrl.crd.host-users-network-exclusive]
-    if pool.spec.host_network == Some(true) && pool.spec.privileged != Some(true) {
-        ctx.publish_event(
-            pool,
-            &KubeEvent {
-                type_: EventType::Warning,
-                reason: REASON_HOST_USERS_SUPPRESSED.into(),
-                note: Some(
-                    "hostNetwork:true forces hostUsers omitted \
-                     (K8s admission rejects the combo). Set \
-                     privileged:true explicitly, or drop hostNetwork."
-                        .into(),
-                ),
-                action: "Reconcile".into(),
-                secondary: None,
-            },
-        )
-        .await;
+    for check in DEGRADE_CHECKS {
+        if (check.applies)(&pool.spec) {
+            ctx.publish_event(
+                pool,
+                &KubeEvent {
+                    type_: EventType::Warning,
+                    reason: check.reason.into(),
+                    note: Some(check.note.into()),
+                    action: "Reconcile".into(),
+                    secondary: None,
+                },
+            )
+            .await;
+        }
     }
 }
 

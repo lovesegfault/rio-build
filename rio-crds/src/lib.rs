@@ -101,3 +101,24 @@ pub(crate) fn any_object_array(_: &mut schemars::SchemaGenerator) -> schemars::S
         },
     })
 }
+
+/// Schema for `.status.conditions` fields. Same preserve-unknown
+/// object array as [`any_object_array`] PLUS `x-kubernetes-list-type:
+/// map` keyed on `type`. K8s defaults un-annotated CRD arrays to
+/// `atomic`, under which an SSA `Patch::Apply` takes ownership of the
+/// ENTIRE list — a second field-manager writing a different condition
+/// type would be wiped on every reconcile. `list-type: map` lets each
+/// manager own its keyed entry independently (the K8s `metav1.
+/// Condition` convention).
+pub(crate) fn conditions_array(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "nullable": true,
+        "items": {
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true,
+        },
+        "x-kubernetes-list-type": "map",
+        "x-kubernetes-list-map-keys": ["type"],
+    })
+}

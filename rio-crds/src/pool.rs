@@ -327,7 +327,7 @@ pub struct PoolStatus {
     /// `GetSpawnIntents` RPC fails — disambiguates "scheduler idle,
     /// queued=0" from "scheduler down, queued unknown").
     #[serde(default)]
-    #[schemars(schema_with = "crate::any_object_array")]
+    #[schemars(schema_with = "crate::conditions_array")]
     pub conditions: Vec<Condition>,
 }
 
@@ -348,6 +348,28 @@ mod tests {
         assert!(yaml.contains("kind: Pool"));
         assert!(yaml.contains("shortNames"));
         assert!(yaml.contains("pl"));
+    }
+
+    /// `.status.conditions` is `x-kubernetes-list-type: map` keyed on
+    /// `type`. K8s defaults CRD arrays to `atomic`, under which the
+    /// reconciler's SSA `Patch::Apply + force()` takes ownership of
+    /// the ENTIRE list and wipes any second field-manager's condition
+    /// (the autoscaler's `Scaling`) every 10s tick. `map` lets each
+    /// manager own its keyed entry independently.
+    #[test]
+    fn pool_crd_conditions_are_list_type_map() {
+        let crd = serde_json::to_value(Pool::crd()).expect("serializes");
+        let cond = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["conditions"];
+        assert_eq!(
+            cond["x-kubernetes-list-type"], "map",
+            "conditions must be list-type=map so SSA field-managers \
+             own per-type entries (atomic = second writer wiped)"
+        );
+        assert_eq!(
+            cond["x-kubernetes-list-map-keys"],
+            serde_json::json!(["type"])
+        );
     }
 
     /// CEL validation rules are present in the generated schema.
