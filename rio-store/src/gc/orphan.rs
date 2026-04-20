@@ -175,7 +175,7 @@ pub async fn scan_once(
 /// `by`: [`ReapBy::Stale`] re-checks `updated_at < now() - secs` inside
 /// the tx (TOCTOU guard against reaping a fresh re-upload).
 /// [`ReapBy::Claim`] re-checks `claim_id = id` (owner-side cleanup —
-/// see `r[store.put.placeholder-claim]`).
+/// see `r[store.put.placeholder-claim+2]`).
 ///
 /// Returns `true` if reaped, `false` if no matching placeholder
 /// (already gone, completed, fresher than threshold, or different
@@ -202,7 +202,7 @@ pub async fn scan_once(
 /// `decrement_and_enqueue` discipline as [`scan_once`]'s loop body,
 /// so any caller that needs to reap an uploading placeholder gets
 /// chunk-aware semantics for free.
-// r[impl store.put.placeholder-claim]
+// r[impl store.put.placeholder-claim+2]
 pub(crate) async fn reap_one(
     pool: &PgPool,
     store_path_hash: &[u8],
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(rc, 1, "fresh chunked placeholder's refcount untouched");
     }
 
-    // r[verify store.put.placeholder-claim]
+    // r[verify store.put.placeholder-claim+2]
     /// bug_235: `ReapBy::Claim(a)` MUST NOT match a fresh placeholder
     /// inserted with claim_b at the same hash. Before M_052 the
     /// equivalent (`reap_one(threshold=None)`) filtered
@@ -608,9 +608,10 @@ mod tests {
     /// matches (test STALE_THRESHOLD.as_secs()==0 means the query
     /// needs updated_at < now(), which is fragile if set to now()
     /// in the same statement — backdating avoids the race).
-    async fn seed_stale_uploading(pool: &PgPool, hash: &[u8], path: &str) {
-        crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
+    async fn seed_stale_uploading(pool: &PgPool, hash: &[u8], path: &str) -> uuid::Uuid {
+        let claim = crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
             .await
+            .unwrap()
             .unwrap();
         sqlx::query(
             "UPDATE manifests SET updated_at = now() - interval '1 hour' \
@@ -620,6 +621,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        claim
     }
 
     #[tokio::test]
@@ -873,7 +875,7 @@ mod tests {
         // --- Positive: heartbeat rescues a stale placeholder ---
         let live_hash = vec![0x05u8; 32];
         let live_path = rio_test_support::fixtures::test_store_path("orphan-heartbeat-live");
-        seed_stale_uploading(&db.pool, &live_hash, &live_path).await;
+        let claim = seed_stale_uploading(&db.pool, &live_hash, &live_path).await;
 
         // Before heartbeat: updated_at is 1h in the past (from
         // seed_stale_uploading's backdate).
@@ -888,8 +890,26 @@ mod tests {
             "pre-heartbeat updated_at should be >1min old (seeded 1h back)"
         );
 
-        // Heartbeat.
-        crate::cas::heartbeat_uploading(&db.pool, &live_hash).await;
+        // r[verify store.put.placeholder-claim+2]
+        // Foreign-claim heartbeat is a no-op: a stale uploader whose
+        // row was reaped must NOT refresh a fresh re-uploader's
+        // updated_at. Fire with a wrong claim first; assert age
+        // unchanged.
+        crate::cas::heartbeat_uploading(&db.pool, &live_hash, uuid::Uuid::new_v4()).await;
+        let after_foreign: (sqlx::postgres::types::PgInterval,) =
+            sqlx::query_as("SELECT now() - updated_at FROM manifests WHERE store_path_hash = $1")
+                .bind(&live_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            after_foreign.0.microseconds > 60 * 1_000_000,
+            "foreign-claim heartbeat must NOT refresh updated_at; got {}µs",
+            after_foreign.0.microseconds
+        );
+
+        // Heartbeat with the real claim.
+        crate::cas::heartbeat_uploading(&db.pool, &live_hash, claim).await;
 
         // After heartbeat: updated_at is fresh (< 1min old).
         let after: (sqlx::postgres::types::PgInterval,) =

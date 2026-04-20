@@ -513,13 +513,14 @@ mod tests {
         // "tenant A substituted this from upstream K".
         let info = make_path_info(&path, &nar, nar_hash);
         let path_hash = info.store_path.sha256_digest();
-        metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
             .await
+            .unwrap()
             .unwrap();
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_k.clone()];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
             .await
             .unwrap();
 
@@ -661,13 +662,14 @@ mod tests {
 
         let info = make_path_info(&path, &nar, nar_hash);
         let path_hash = info.store_path.sha256_digest();
-        metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
             .await
+            .unwrap()
             .unwrap();
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_tenant];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
             .await
             .unwrap();
 
@@ -743,8 +745,9 @@ mod tests {
             let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
             let info = make_path_info(&path, &nar, nar_hash);
             let path_hash = info.store_path.sha256_digest();
-            metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
                 .await
+                .unwrap()
                 .unwrap();
             let mut info_with_sig = info.clone();
             info_with_sig.signatures = if sig {
@@ -753,7 +756,7 @@ mod tests {
                 vec![]
             };
             info_with_sig.store_path_hash = path_hash.to_vec();
-            metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+            metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
                 .await
                 .unwrap();
             paths.push(path);
@@ -835,13 +838,14 @@ mod tests {
 
         let info = make_path_info(&path, &nar, nar_hash);
         let path_hash = info.store_path.sha256_digest();
-        metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
             .await
+            .unwrap()
             .unwrap();
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_a];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into())
             .await
             .unwrap();
 

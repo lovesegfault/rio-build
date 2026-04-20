@@ -280,25 +280,29 @@ pub(super) async fn update_narinfo_complete(
     .map(|r| r.rows_affected())
 }
 
-/// Finalize an upload inside a caller-owned tx/connection: narinfo
-/// UPDATE, then flip `manifests.status = 'complete'` (binding
-/// `inline_blob` iff `Some`). `PutPathBatch` calls this N times inside
-/// one `pool.begin()` for cross-output atomicity; the pool-wrapping
+/// Finalize an upload inside a caller-owned tx/connection: flip
+/// `manifests.status = 'complete'` (binding `inline_blob` iff `Some`),
+/// then narinfo UPDATE. `PutPathBatch` calls this N times inside one
+/// `pool.begin()` for cross-output atomicity; the pool-wrapping
 /// [`complete_manifest_inline`] / [`complete_manifest_chunked`] each
 /// wrap a single call.
+///
+/// `claim` is the ownership token from [`insert_manifest_uploading`].
+/// The manifests UPDATE filters on it so a stale uploader whose row
+/// was reaped (and replaced by a fresh re-upload at the same
+/// `store_path_hash`) gets `rows_affected==0 → PlaceholderMissing`
+/// instead of overwriting the re-uploader's `signatures`/`deriver`/
+/// `registration_time` (`r[store.put.placeholder-claim+2]`). The
+/// manifests UPDATE runs FIRST so a foreign-claim call touches zero
+/// rows in any table; `update_narinfo_complete` (no `claim_id` column
+/// on narinfo) only runs once ownership is proven.
+// r[impl store.put.placeholder-claim+2]
 pub async fn complete_manifest_in_conn(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
     inline_blob: Option<&[u8]>,
 ) -> Result<()> {
-    if update_narinfo_complete(conn, info).await? == 0 {
-        // insert_manifest_uploading MUST have run first. If rows_affected
-        // is 0, delete_manifest_uploading raced us and won. The caller's
-        // placeholder is gone; bailing here prevents a half-complete write.
-        return Err(MetadataError::PlaceholderMissing {
-            store_path: info.store_path.to_string(),
-        });
-    }
     // Flip status. inline_blob stays NULL in the chunked case — that's
     // what makes get_manifest() return Chunked instead of Inline.
     let manifest_result = match inline_blob {
@@ -309,11 +313,12 @@ pub async fn complete_manifest_in_conn(
                     status      = 'complete',
                     inline_blob = $2,
                     updated_at  = now()
-                WHERE store_path_hash = $1
+                WHERE store_path_hash = $1 AND claim_id = $3
                 "#,
             )
             .bind(&info.store_path_hash)
             .bind(blob)
+            .bind(claim)
             .execute(&mut *conn)
             .await?
         }
@@ -323,15 +328,27 @@ pub async fn complete_manifest_in_conn(
                 UPDATE manifests SET
                     status     = 'complete',
                     updated_at = now()
-                WHERE store_path_hash = $1
+                WHERE store_path_hash = $1 AND claim_id = $2
                 "#,
             )
             .bind(&info.store_path_hash)
+            .bind(claim)
             .execute(&mut *conn)
             .await?
         }
     };
     if manifest_result.rows_affected() == 0 {
+        // insert_manifest_uploading MUST have run first. If rows_affected
+        // is 0, either delete_manifest_uploading raced us and won, OR
+        // our row was stale-reaped and a fresh re-upload (different
+        // claim_id) now holds the slot. Either way the caller's
+        // placeholder is gone; bailing here prevents a half-complete /
+        // foreign-clobbering write.
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
+    }
+    if update_narinfo_complete(conn, info).await? == 0 {
         return Err(MetadataError::PlaceholderMissing {
             store_path: info.store_path.to_string(),
         });
@@ -473,14 +490,85 @@ mod tests {
             [0xCCu8; 32],
         );
 
-        let err = complete_manifest_inline(&db.pool, &info, Bytes::from_static(b"nar"))
-            .await
-            .expect_err("should fail without placeholder");
+        let err = complete_manifest_inline(
+            &db.pool,
+            &info,
+            uuid::Uuid::new_v4(),
+            Bytes::from_static(b"nar"),
+        )
+        .await
+        .expect_err("should fail without placeholder");
 
         assert!(
             matches!(err, MetadataError::PlaceholderMissing { .. }),
             "expected PlaceholderMissing, got {err:?}"
         );
+    }
+
+    /// `r[store.put.placeholder-claim+2]`: a stale uploader whose row
+    /// was reaped + replaced must NOT clobber the re-uploader's
+    /// metadata. `complete_manifest_in_conn` filters on `claim_id` so
+    /// the foreign call returns `PlaceholderMissing` and touches zero
+    /// rows; the real claim then succeeds.
+    // r[verify store.put.placeholder-claim+2]
+    #[tokio::test]
+    async fn complete_manifest_rejects_foreign_claim() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = rio_test_support::fixtures::test_store_path("foreign-claim");
+        let mut info = rio_test_support::fixtures::make_path_info(&path, b"nar", [0xC1u8; 32]);
+        info.signatures = vec!["good:sig".into()];
+        let store_path_hash = info.store_path.sha256_digest().to_vec();
+        info.store_path_hash = store_path_hash.clone();
+
+        let claim_a = insert_manifest_uploading(&db.pool, &store_path_hash, &path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Foreign claim → PlaceholderMissing; row stays 'uploading'
+        // with the original claim and narinfo untouched (nar_size=0).
+        let mut bad = info.clone();
+        bad.signatures = vec!["evil:sig".into()];
+        let err = complete_manifest_inline(
+            &db.pool,
+            &bad,
+            uuid::Uuid::new_v4(),
+            Bytes::from_static(b"nar"),
+        )
+        .await
+        .expect_err("foreign claim must fail");
+        assert!(
+            matches!(err, MetadataError::PlaceholderMissing { .. }),
+            "expected PlaceholderMissing, got {err:?}"
+        );
+        let (status, claim, nar_size): (String, uuid::Uuid, i64) = sqlx::query_as(
+            "SELECT m.status::text, m.claim_id, n.nar_size \
+             FROM manifests m JOIN narinfo n USING (store_path_hash) \
+             WHERE m.store_path_hash = $1",
+        )
+        .bind(&store_path_hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "uploading", "foreign complete must not flip status");
+        assert_eq!(claim, claim_a, "claim_id unchanged");
+        assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
+
+        // Real claim → Ok; status flipped, OUR signatures landed.
+        complete_manifest_inline(&db.pool, &info, claim_a, Bytes::from_static(b"nar"))
+            .await
+            .unwrap();
+        let (status, sigs): (String, Vec<String>) = sqlx::query_as(
+            "SELECT m.status::text, n.signatures \
+             FROM manifests m JOIN narinfo n USING (store_path_hash) \
+             WHERE m.store_path_hash = $1",
+        )
+        .bind(&store_path_hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "complete");
+        assert_eq!(sigs, vec!["good:sig".to_string()]);
     }
 
     // =======================================================================

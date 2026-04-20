@@ -68,6 +68,11 @@ struct OutputAccum {
     /// inline bytes or `ChunkedStaged` — feeds `inline_blob` of
     /// [`metadata::complete_manifest_in_conn`].
     staged: Option<NarPersist>,
+    /// Ownership token from `PlaceholderClaim::Owned` — set in phase-2
+    /// for every output that is NOT `already_complete`. Threaded into
+    /// phase-3's `complete_manifest_in_conn` so the status flip is
+    /// claim-gated (`r[store.put.placeholder-claim+2]`).
+    claim: Option<uuid::Uuid>,
 }
 
 impl StoreServiceImpl {
@@ -143,7 +148,7 @@ impl StoreServiceImpl {
             }
 
             let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-            match self
+            let claim = match self
                 .claim_placeholder(
                     &accum.store_path_hash,
                     info.store_path.as_str(),
@@ -157,10 +162,7 @@ impl StoreServiceImpl {
                     n_exists_emitted += 1;
                     continue;
                 }
-                Ok(PlaceholderClaim::Owned(claim)) => {
-                    placeholder_guards
-                        .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
-                }
+                Ok(PlaceholderClaim::Owned(c)) => c,
                 Ok(PlaceholderClaim::Concurrent) => bail!(Status::aborted(format!(
                     "{ctx}: {}; retry",
                     rio_proto::CONCURRENT_PUTPATH_MSG
@@ -169,11 +171,14 @@ impl StoreServiceImpl {
                     "PutPathBatch: claim_placeholder",
                     e
                 )),
-            }
+            };
+            placeholder_guards
+                .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
+            accum.claim = Some(claim);
 
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
-            match self.stage_nar_for_batch(info, nar_data).await {
+            match self.stage_nar_for_batch(info, claim, nar_data).await {
                 Ok(p) => accum.staged = Some(p),
                 Err(e) => bail!(e),
             }
@@ -364,8 +369,12 @@ impl StoreServiceImpl {
                 NarPersist::Inline(data) => Some(data),
                 NarPersist::ChunkedStaged => None,
             };
+            let claim = accum
+                .claim
+                .expect("set in phase-2 for non-already_complete");
             if let Err(e) =
-                metadata::complete_manifest_in_conn(&mut tx, &info, inline_blob.as_deref()).await
+                metadata::complete_manifest_in_conn(&mut tx, &info, claim, inline_blob.as_deref())
+                    .await
             {
                 drop(tx);
                 return Err(putpath_metadata_status(

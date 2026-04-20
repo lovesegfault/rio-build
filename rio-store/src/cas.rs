@@ -104,13 +104,21 @@ const HEARTBEAT_CHUNK_INTERVAL: u32 = 64;
 /// scanner would reap it mid-flight, decrement chunk refcounts, and
 /// the uploader's `complete_manifest` would point at chunks already
 /// enqueued to `pending_s3_deletes`.
+///
+/// `claim` is the ownership token from `insert_manifest_uploading`:
+/// if our row was stale-reaped and a fresh re-upload now holds the
+/// slot, the `claim_id = $2` filter makes this a no-op instead of
+/// keeping the foreign placeholder artificially fresh
+/// (`r[store.put.placeholder-claim+2]`).
 // r[impl store.gc.orphan-heartbeat]
-pub(crate) async fn heartbeat_uploading(pool: &PgPool, store_path_hash: &[u8]) {
+// r[impl store.put.placeholder-claim+2]
+pub(crate) async fn heartbeat_uploading(pool: &PgPool, store_path_hash: &[u8], claim: uuid::Uuid) {
     let _ = sqlx::query(
         "UPDATE manifests SET updated_at = now() \
-         WHERE store_path_hash = $1 AND status = 'uploading'",
+         WHERE store_path_hash = $1 AND status = 'uploading' AND claim_id = $2",
     )
     .bind(store_path_hash)
+    .bind(claim)
     .execute(pool)
     .await;
 }
@@ -175,10 +183,10 @@ pub async fn put_chunked(
     nar_data: &[u8],
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
-    let stats = stage_chunked(pool, backend, info, nar_data, max_concurrent).await?;
+    let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
 
     // --- Step 5: Complete ---
-    if let Err(e) = metadata::complete_manifest_chunked(pool, info).await {
+    if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one decrements refcounts →
         // GC-eligible. We DON'T delete from S3 — GC sweep's job.
@@ -225,6 +233,7 @@ pub async fn stage_chunked(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
     nar_data: &[u8],
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
@@ -318,8 +327,9 @@ pub async fn stage_chunked(
     // drop, so explicit match-on-error.
 
     let stats = match do_upload(
-        Some((pool, store_path_hash)),
+        Some((pool, store_path_hash, claim)),
         backend,
+        nar_data,
         &chunks,
         &needs_upload,
         max_concurrent,
@@ -355,15 +365,23 @@ pub async fn stage_chunked(
 /// `needs_upload` is the set of hashes that need upload — computed
 /// atomically by the upsert's RETURNING clause (chunked.rs).
 ///
-/// `heartbeat_target` is `Some((pool, store_path_hash))` in
+/// `heartbeat_target` is `Some((pool, store_path_hash, claim))` in
 /// production — every 30s/64 chunks the upload loop fires
 /// [`heartbeat_uploading`] so the orphan scanner doesn't reap a live
 /// long-running upload. `None` in tests that exercise upload
 /// mechanics without PG.
+///
+/// `nar_data` is the buffer that every `chunks[i].data` borrows from
+/// (by construction in `chunker::chunk_nar`). It's threaded explicitly
+/// so the upfront collect can store `(hash, Range<usize>)` and defer
+/// the owned `Bytes` copy into the stream `.map()` closure — bounding
+/// unbudgeted overshoot to `max_concurrent × CHUNK_MAX` instead of
+/// ~the full to-upload set (`r[store.put.nar-bytes-budget+2]`).
 // r[impl store.cas.upload-bounded]
 async fn do_upload(
-    heartbeat_target: Option<(&PgPool, &[u8])>,
+    heartbeat_target: Option<(&PgPool, &[u8], uuid::Uuid)>,
     backend: &Arc<dyn ChunkBackend>,
+    nar_data: &[u8],
     chunks: &[chunker::Chunk<'_>],
     needs_upload: &std::collections::HashSet<Vec<u8>>,
     max_concurrent: usize,
@@ -385,23 +403,36 @@ async fn do_upload(
     // stragglers serialize the pipeline). Filter to just the hashes
     // that need upload so dedup'd chunks don't occupy slots.
     //
-    // Materialize (hash, Bytes) pairs into an owned Vec before
+    // Materialize (hash, range) pairs into an owned Vec before
     // streaming — keeping borrowed `chunks` slices inside the stream
     // trips rustc's HRTB Send-inference (the future's Send bound
-    // doesn't generalize over the borrowed lifetime). The Bytes copy
-    // was always necessary anyway (S3 wants owned), so collecting
-    // upfront is cost-neutral; it just moves the copy out of the
-    // closure.
+    // doesn't generalize over the borrowed lifetime). The owned
+    // `Bytes` copy (S3 wants owned) is DEFERRED to the stream
+    // `.map()` closure so at most `max_concurrent × CHUNK_MAX` of
+    // owned `Bytes` is in flight; collecting `Bytes` upfront here
+    // would hold a second ~full-NAR allocation alongside the
+    // semaphore-charged `nar_data` (r[store.put.nar-bytes-budget+2]).
+    //
     // `needs_upload.contains()` does NOT dedup: `chunks` is the raw
     // in-order list, so an intra-NAR repeat (zero-filled pages etc.)
     // would issue N redundant Bytes::copy_from_slice + S3 PUTs and
     // miscount `uploaded` (feeds rio_store_chunk_dedup_ratio). The
     // `seen` set collapses repeats to one upload per unique hash.
+    let base = nar_data.as_ptr() as usize;
     let mut seen = std::collections::HashSet::<[u8; 32]>::new();
-    let to_upload: Vec<([u8; 32], Bytes)> = chunks
+    let to_upload: Vec<([u8; 32], std::ops::Range<usize>)> = chunks
         .iter()
         .filter(|c| needs_upload.contains(c.hash.as_slice()) && seen.insert(c.hash))
-        .map(|c| (c.hash, Bytes::copy_from_slice(c.data)))
+        .map(|c| {
+            // c.data is a subslice of nar_data by construction
+            // (chunker::chunk_nar returns borrows into its input).
+            let off = c.data.as_ptr() as usize - base;
+            debug_assert!(
+                off + c.data.len() <= nar_data.len(),
+                "chunk slice must be within nar_data"
+            );
+            (c.hash, off..off + c.data.len())
+        })
         .collect();
     let uploaded = to_upload.len();
 
@@ -410,10 +441,11 @@ async fn do_upload(
     // Cloned into the owned tuple so the per-future closures don't
     // borrow `heartbeat_target` (lifetime would be tied to this fn's
     // stack, which trips Send-inference through buffer_unordered).
-    let hb = heartbeat_target.map(|(pool, hash)| {
+    let hb = heartbeat_target.map(|(pool, hash, claim)| {
         (
             pool.clone(),
             hash.to_vec(),
+            claim,
             Arc::new(Mutex::new((Instant::now(), 0u32))),
         )
     });
@@ -424,7 +456,9 @@ async fn do_upload(
     // rollback decrements refcounts, and the next PutPath attempt
     // retries the whole thing.
     stream::iter(to_upload)
-        .map(|(hash, data)| {
+        .map(|(hash, range)| {
+            // Owned copy deferred to here: ≤ max_concurrent in flight.
+            let data = Bytes::copy_from_slice(&nar_data[range]);
             let backend = Arc::clone(backend);
             let hb = hb.clone();
             async move {
@@ -433,7 +467,7 @@ async fn do_upload(
                 // increment the chunk counter and fire if either
                 // threshold hit. Fire-and-forget via spawn (don't
                 // block upload progress on the PG round-trip).
-                if let Some((pool, sp_hash, state)) = &hb {
+                if let Some((pool, sp_hash, claim, state)) = &hb {
                     let fire = {
                         let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                         g.1 += 1;
@@ -449,8 +483,9 @@ async fn do_upload(
                     if fire {
                         let pool = pool.clone();
                         let sp_hash = sp_hash.clone();
+                        let claim = *claim;
                         rio_common::task::spawn_monitored("chunk-heartbeat", async move {
-                            heartbeat_uploading(&pool, &sp_hash).await;
+                            heartbeat_uploading(&pool, &sp_hash, claim).await;
                         });
                     }
                 }
@@ -1139,18 +1174,26 @@ mod upload_tests {
         }
     }
 
-    /// Synthesize N distinct-hash chunks backed by a static buffer.
+    /// Shared backing buffer for synthetic chunks. `do_upload` computes
+    /// each chunk's offset within `nar_data` by pointer arithmetic, so
+    /// every `Chunk.data` here MUST be a subslice of the same buffer
+    /// the test passes as `nar_data`.
+    static SYNTH_DATA: &[u8] = b"x";
+
+    /// Synthesize N distinct-hash chunks backed by [`SYNTH_DATA`].
     /// The data content doesn't matter (HighWaterBackend ignores it);
     /// hashes just need to be unique so the `inserted` filter passes.
     fn synth_chunks(n: usize) -> (Vec<chunker::Chunk<'static>>, HashSet<Vec<u8>>) {
-        static DATA: &[u8] = b"x";
         let mut chunks = Vec::with_capacity(n);
         let mut inserted = HashSet::with_capacity(n);
         for i in 0..n {
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
             inserted.insert(hash.to_vec());
-            chunks.push(chunker::Chunk { hash, data: DATA });
+            chunks.push(chunker::Chunk {
+                hash,
+                data: SYNTH_DATA,
+            });
         }
         (chunks, inserted)
     }
@@ -1165,7 +1208,7 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(200);
 
-        let stats = do_upload(None, &backend_dyn, &chunks, &inserted, 8)
+        let stats = do_upload(None, &backend_dyn, SYNTH_DATA, &chunks, &inserted, 8)
             .await
             .expect("do_upload should succeed");
 
@@ -1191,22 +1234,21 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
 
         // 10× the same chunk hash + 1 distinct → 11 total, 2 unique.
-        static DATA: &[u8] = b"y";
         let dup = [0xAAu8; 32];
         let other = [0xBBu8; 32];
         let mut chunks: Vec<chunker::Chunk<'static>> = (0..10)
             .map(|_| chunker::Chunk {
                 hash: dup,
-                data: DATA,
+                data: SYNTH_DATA,
             })
             .collect();
         chunks.push(chunker::Chunk {
             hash: other,
-            data: DATA,
+            data: SYNTH_DATA,
         });
         let needs: HashSet<Vec<u8>> = [dup.to_vec(), other.to_vec()].into_iter().collect();
 
-        let stats = do_upload(None, &backend_dyn, &chunks, &needs, 4)
+        let stats = do_upload(None, &backend_dyn, SYNTH_DATA, &chunks, &needs, 4)
             .await
             .unwrap();
 
@@ -1230,7 +1272,7 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(50);
 
-        do_upload(None, &backend_dyn, &chunks, &inserted, 1)
+        do_upload(None, &backend_dyn, SYNTH_DATA, &chunks, &inserted, 1)
             .await
             .unwrap();
 

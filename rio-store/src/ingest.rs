@@ -202,7 +202,7 @@ pub async fn persist_nar(
         );
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
-        metadata::complete_manifest_inline(pool, info, Bytes::from(nar_data))
+        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar_data))
             .await
             .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);
@@ -224,7 +224,7 @@ pub(crate) struct PlaceholderGuard {
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     store_path_hash: Vec<u8>,
-    /// `r[store.put.placeholder-claim]`: ownership token from
+    /// `r[store.put.placeholder-claim+2]`: ownership token from
     /// [`PlaceholderClaim::Owned`]. The drop-path reap filters
     /// `claim_id = $claim` so it's a no-op if our row was already
     /// reaped (orphan scanner / `cas::put_chunked` rollback) and a
@@ -305,7 +305,7 @@ pub fn spawn_placeholder_guard(
             tick.tick().await; // first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                cas::heartbeat_uploading(&pool, &hash).await;
+                cas::heartbeat_uploading(&pool, &hash, claim).await;
             }
         })
     };

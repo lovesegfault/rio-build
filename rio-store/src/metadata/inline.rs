@@ -33,10 +33,10 @@ use tracing::{debug, instrument};
 ///
 /// Returns `Some(claim_id)` if inserted (the caller now OWNS the
 /// placeholder and uses `claim_id` for its cleanup paths — see
-/// `r[store.put.placeholder-claim]`), `None` if another upload already
+/// `r[store.put.placeholder-claim+2]`), `None` if another upload already
 /// holds a placeholder (caller should re-check `check_manifest_complete`
 /// — the race winner may have finished).
-// r[impl store.put.placeholder-claim]
+// r[impl store.put.placeholder-claim+2]
 #[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
 pub async fn insert_manifest_uploading(
     pool: &PgPool,
@@ -69,10 +69,10 @@ pub async fn insert_manifest_uploading(
 
     // manifests placeholder. ON CONFLICT DO NOTHING for the same reason.
     // rows_affected = 0 means another uploader owns this slot. claim_id
-    // is the ownership token: every owner-side cleanup (abort_placeholder,
-    // the drop-guard, put_chunked's complete-failure rollback) passes it
-    // to `reap_one(ReapBy::Claim(id))` so a late-firing cleanup cannot
-    // match a fresh re-upload at the same store_path_hash.
+    // is the ownership token: every owner-side mutation (heartbeat,
+    // completion, abort_placeholder, the drop-guard, put_chunked's
+    // complete-failure rollback) filters on it so a late-firing op
+    // cannot match a fresh re-upload at the same store_path_hash.
     let claim_id = uuid::Uuid::new_v4();
     let result = sqlx::query(
         r#"
@@ -100,10 +100,11 @@ pub async fn insert_manifest_uploading(
 pub async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
     nar_data: Bytes,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, Some(nar_data.as_ref())).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, Some(nar_data.as_ref())).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())

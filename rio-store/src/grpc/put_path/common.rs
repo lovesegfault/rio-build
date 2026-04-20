@@ -617,6 +617,7 @@ impl StoreServiceImpl {
     pub(in crate::grpc) async fn stage_nar_for_batch(
         &self,
         info: &ValidatedPathInfo,
+        claim: uuid::Uuid,
         nar_data: Vec<u8>,
     ) -> Result<NarPersist, Status> {
         if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
@@ -624,6 +625,7 @@ impl StoreServiceImpl {
                 &self.pool,
                 backend,
                 info,
+                claim,
                 &nar_data,
                 self.chunk_upload_max_concurrent,
             )

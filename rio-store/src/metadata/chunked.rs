@@ -251,9 +251,13 @@ pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<(
 /// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
 /// inline variant.
 #[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
-pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) -> Result<()> {
+pub async fn complete_manifest_chunked(
+    pool: &PgPool,
+    info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
+) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, None).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, None).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
@@ -1120,8 +1124,9 @@ mod tests {
         assert!(reaped, "reaper reclaims A's placeholder");
 
         // --- B: re-uploads same path, same chunk hash, completes. ---
-        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+        let claim_b = crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
             .await
+            .unwrap()
             .unwrap();
         let _ = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
             .await
@@ -1129,7 +1134,9 @@ mod tests {
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
         let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
         info.store_path_hash = sph.clone();
-        complete_manifest_chunked(&db.pool, &info).await.unwrap();
+        complete_manifest_chunked(&db.pool, &info, claim_b)
+            .await
+            .unwrap();
 
         // --- A: hung PUT errors → late rollback fires. ---
         delete_manifest_chunked_uploading(&db.pool, &sph, token_a, one_chunk)
