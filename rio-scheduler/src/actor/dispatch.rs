@@ -323,7 +323,8 @@ impl DagActor {
                 // stale IDs that don't count against the
                 // current fleet.
                 if self.failed_builders_exhausts_fleet(&drv_hash) {
-                    self.poison_and_cascade(&drv_hash).await;
+                    self.poison_and_cascade(&drv_hash, "failed on every eligible worker")
+                        .await;
                     return false;
                 }
                 // I-056: distinguish "no capacity right now" (defer,

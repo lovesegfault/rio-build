@@ -103,6 +103,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_assignments_total` | Counter | Total derivation->executor assignments |
 | `rio_scheduler_cleanup_dropped_total` | Counter | Terminal-build cleanup commands dropped due to channel backpressure. Alert if rate > 0 sustained: indicates memory leak under load. |
 | `rio_scheduler_transition_rejected_total` | Counter | State-machine transition rejections in the actor (labeled by `to` target state). Alert if rate > 0: these are defense-in-depth guards that should never fire; any non-zero rate indicates a race or logic bug. |
+| `rio_scheduler_malformed_built_output_total` | Counter | Worker-supplied `BuiltOutput.output_path` that failed `StorePath::parse` and was dropped at the `handle_completion` proto→domain boundary. Alert if rate > 0: indicates a buggy or compromised builder. |
 | `rio_scheduler_log_lines_forwarded_total` | Counter | Log lines forwarded via `BuildEvent::Log` (executor → scheduler → actor → gateway broadcast). Direct signal that the log pipeline's internal plumbing is live. |
 | `rio_scheduler_log_flush_total` | Counter | Successful S3 log flushes (labeled by `kind`: `final`/`periodic`). |
 | `rio_scheduler_log_flush_failures_total` | Counter | Failed S3 log flushes (labeled by `phase`: `s3`/`pg`). Alert if rate > 0 sustained: build logs are being lost. |

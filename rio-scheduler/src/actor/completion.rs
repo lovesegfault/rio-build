@@ -39,15 +39,17 @@ struct CaCutoffVerified {
     output_hash: [u8; 32],
 }
 
-/// Result of [`DagActor::record_failure_and_check_poison`]. The
-/// `promoted` flag lets `handle_transient_failure` exempt
-/// floor-promotion retries from `max_retries` (I-213).
+/// Result of [`DagActor::record_failure_and_check_poison`].
+///
+/// Floor-promotion exemption (`r[sched.retry.promotion-exempt+2]`) is
+/// NOT carried here — `TransientFailure` is never a sizing signal, so
+/// `record_failure_and_check_poison` never bumps the floor. The real
+/// promotion-exempt path is [`super::floor::FloorOutcome::promoted`],
+/// consumed in `handle_infrastructure_failure` /
+/// `handle_timeout_failure`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FailureOutcome {
     pub(super) reached_poison: bool,
-    /// `bump_floor_or_count` actually raised a floor dimension. False
-    /// if already at the relevant ceiling, or non-resource reason.
-    pub(super) promoted: bool,
 }
 
 impl DagActor {
@@ -138,15 +140,45 @@ impl DagActor {
     /// (`release_downstream`, `complete_ready_from_store`,
     /// `ca_cutoff_cascade`, recovery's `adopt_orphan_completion`).
     pub(super) async fn promote_newly_ready(&mut self, completed: &DrvHash) {
-        for ready_hash in self.dag.find_newly_ready(completed) {
-            if let Some(s) = self.dag.node_mut(&ready_hash)
-                && s.transition(DerivationStatus::Ready).is_ok()
-            {
-                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                    .await;
-                self.push_ready(ready_hash);
+        self.promote_newly_ready_batch(std::slice::from_ref(completed))
+            .await;
+    }
+
+    // r[impl sched.db.batch-unnest]
+    /// Slice-taking variant of [`promote_newly_ready`]: walk parents of
+    /// EVERY hash in `completed`, dedup the union (a parent may be
+    /// returned by several completed children), transition + push_ready
+    /// in-mem, then ONE `persist_status_batch(Ready)`.
+    ///
+    /// `find_newly_ready` returns ALL Queued parents whose deps are now
+    /// satisfied — for stdenv/glibc-class nodes that's hundreds. The
+    /// previous per-item `persist_status().await` inside the actor was
+    /// N×PG-RTT of head-of-line blocking on heartbeats and dispatch
+    /// (`r[sched.actor.single-owner]`).
+    ///
+    /// [`promote_newly_ready`]: Self::promote_newly_ready
+    pub(super) async fn promote_newly_ready_batch(&mut self, completed: &[DrvHash]) {
+        let mut newly_ready: Vec<DrvHash> = Vec::new();
+        let mut seen: HashSet<DrvHash> = HashSet::new();
+        for c in completed {
+            for ready_hash in self.dag.find_newly_ready(c) {
+                if !seen.insert(ready_hash.clone()) {
+                    continue;
+                }
+                if let Some(s) = self.dag.node_mut(&ready_hash)
+                    && s.transition(DerivationStatus::Ready).is_ok()
+                {
+                    newly_ready.push(ready_hash.clone());
+                    self.push_ready(ready_hash);
+                }
             }
         }
+        if newly_ready.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = newly_ready.iter().map(DrvHash::as_str).collect();
+        self.persist_status_batch(&refs, DerivationStatus::Ready)
+            .await;
     }
 
     // r[impl sched.gc.path-tenants-upsert]
@@ -535,8 +567,6 @@ impl DagActor {
         // previous I-170/I-173/I-177 over-broad promote here meant a
         // flaky build climbed the ladder and the next submitter paid
         // for an oversized pod.
-        // r[impl sched.retry.promotion-exempt+2]
-        let promoted = false;
         {
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 state.retry.failed_builders.insert(executor_id.clone());
@@ -555,10 +585,7 @@ impl DagActor {
             .node(drv_hash)
             .map(|s| self.poison_config.is_poisoned(s))
             .unwrap_or(false);
-        FailureOutcome {
-            reached_poison,
-            promoted,
-        }
+        FailureOutcome { reached_poison }
     }
 
     // -----------------------------------------------------------------------
@@ -595,7 +622,29 @@ impl DagActor {
         // `prost_types::Timestamp`. `ActorCommand::ProcessCompletion`
         // stays proto-typed so `actor/tests/` keeps constructing it
         // unchanged (b03 reconciles post-integration).
-        let result: crate::domain::BuildResult = result.into();
+        let mut result: crate::domain::BuildResult = result.into();
+        // Threat model: builders are untrusted. `built_outputs.
+        // output_path` reaches PG `realisations` (ca_insert_
+        // realisations) and `path_tenants` (state.output_paths →
+        // upsert_path_tenants_for) and the gateway reads both for
+        // client-facing responses. Filter to valid store paths HERE,
+        // at the boundary, so every consumer sees only well-formed
+        // data. `ca_cutoff_compare`'s `is_empty()` guard becomes
+        // defense-in-depth.
+        result.built_outputs.retain(|o| {
+            if rio_nix::store_path::StorePath::parse(&o.output_path).is_ok() {
+                true
+            } else {
+                warn!(
+                    executor_id = %executor_id,
+                    output_name = %o.output_name,
+                    output_path = %o.output_path,
+                    "dropping malformed worker-supplied output_path"
+                );
+                metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
+                false
+            }
+        });
         let status = result.status;
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
@@ -772,7 +821,26 @@ impl DagActor {
                     .await;
             }
             rio_proto::types::BuildResultStatus::Cancelled => {
-                // Unreachable: handled by the Cancelled early-return above.
+                // The early-return at :661 checks the DAG status, NOT
+                // the worker-reported result.status. An untrusted
+                // worker sending status=Cancelled while the DAG is
+                // Assigned/Running falls through here; running_build
+                // was cleared above, so neither disconnect-reassign
+                // nor the housekeeping backstop would recover it.
+                // Treat as infra (worker-protocol violation, bounded
+                // by infra_count) — not transient (NOT a
+                // build-determinism signal).
+                warn!(
+                    drv_hash = %drv_hash, executor_id = %executor_id,
+                    "unsolicited Cancelled from worker (DAG not Cancelled) \
+                     — treating as infrastructure failure"
+                );
+                self.handle_infrastructure_failure(
+                    drv_hash,
+                    executor_id,
+                    "worker reported Cancelled without scheduler-initiated cancel",
+                )
+                .await;
             }
             rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
@@ -907,6 +975,12 @@ impl DagActor {
         // invalidation handles re-pushing them if needed.
         //
         // Also emit the accuracy metric: how close was our estimate?
+        // r[impl sched.sla.hw-ref-seconds]
+        // `est_duration` is REFERENCE-seconds (sla::wall_estimate
+        // returns t_min().0); `actual` is wall-clock. Normalize the
+        // wall-clock by this completion's hw_factor so the ratio is
+        // ref/ref and "1.0=perfect" holds across a heterogeneous
+        // fleet (same as `score_completion` at :1500-1506).
         if let Some(state) = self.dag.node(drv_hash)
             && state.sched.est_duration > 0.0
             && let Some(actual) = result.duration()
@@ -1082,6 +1156,8 @@ impl DagActor {
         {
             let mut all_matched = !built_outputs.is_empty();
             for (i, output) in built_outputs.iter().enumerate() {
+                // Defense-in-depth — handle_completion already filters
+                // malformed paths at the proto→domain boundary.
                 if output.output_path.is_empty() {
                     debug!(
                         drv_hash = %drv_hash,
@@ -1241,6 +1317,9 @@ impl DagActor {
             // (different modular_hash) so the gateway can't find it
             // without this bridge row.
             let mut realisations: Vec<([u8; 32], String, String, [u8; 32])> = Vec::new();
+            // Per-skipped (drv_path, output_paths, interested_builds)
+            // for the DerivationCached emission below.
+            let mut cached_emit: Vec<(String, Vec<String>, Vec<Uuid>)> = Vec::new();
             for hash in &skipped {
                 if let Some(prior_outs) = verified.get(hash) {
                     if let Some(state) = self.dag.node_mut(hash) {
@@ -1262,6 +1341,11 @@ impl DagActor {
                 }
                 if let Some(state) = self.dag.node(hash) {
                     skipped_interested.extend(state.interested_builds.iter().copied());
+                    cached_emit.push((
+                        self.dag.path_or_hash_fallback(hash),
+                        state.output_paths.clone(),
+                        state.interested_builds.iter().copied().collect(),
+                    ));
                 }
                 debug!(drv_hash = %hash, trigger = %drv_hash,
                        "CA cutoff: skipped (output already in store)");
@@ -1287,6 +1371,25 @@ impl DagActor {
             let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();
             self.persist_status_batch(&skipped_refs, DerivationStatus::Skipped)
                 .await;
+            // r[impl sched.event.derivation-terminal]
+            // Skipped is a terminal cached-equivalent transition: emit
+            // DerivationCached + bump cached_count for each interested
+            // build (matches `apply_cached_hits` / `complete_ready_
+            // from_store`). Without this, WatchBuild clients see
+            // skipped nodes frozen at Queued and the nix client's
+            // SetExpected count doesn't match the Cached events
+            // received.
+            for (drv_path, output_paths, interested) in cached_emit {
+                let event = rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent::cached(drv_path, output_paths),
+                );
+                for build_id in interested {
+                    self.events.emit(build_id, event.clone());
+                    if let Some(b) = self.builds.get_mut(&build_id) {
+                        b.cached_count += 1;
+                    }
+                }
+            }
             // H1 fix (P0399): each newly-Skipped node may have Queued
             // parents whose all-deps are now Completed|Skipped. The
             // find_newly_ready(drv_hash) below at :732 only walks
@@ -1298,32 +1401,7 @@ impl DagActor {
             // (B is Skipped, not Queued); find_newly_ready(B) returns
             // [C] (C is Queued and all_deps_completed — Skipped now
             // accepted there).
-            //
-            // Batched: collect all newly-ready across all skipped
-            // nodes (a parent may be returned by several skipped
-            // children — dedup), transition + push_ready in-mem, then
-            // one persist_status_batch(Ready). Inline expansion of
-            // `promote_newly_ready` with the per-item await hoisted
-            // out; the other promote_newly_ready callsites are
-            // single-node so per-item is correct there.
-            let mut newly_ready: Vec<DrvHash> = Vec::new();
-            let mut seen_ready: HashSet<DrvHash> = HashSet::new();
-            for s in &skipped {
-                for ready_hash in self.dag.find_newly_ready(s) {
-                    if !seen_ready.insert(ready_hash.clone()) {
-                        continue;
-                    }
-                    if let Some(state) = self.dag.node_mut(&ready_hash)
-                        && state.transition(DerivationStatus::Ready).is_ok()
-                    {
-                        newly_ready.push(ready_hash.clone());
-                        self.push_ready(ready_hash);
-                    }
-                }
-            }
-            let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
-            self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
-                .await;
+            self.promote_newly_ready_batch(&skipped).await;
             if cap_hit {
                 tracing::warn!(
                     trigger = %drv_hash,
@@ -1599,7 +1677,7 @@ impl DagActor {
     /// the reassign path (worker disconnect), the caller checks the
     /// threshold BEFORE reset_to_ready — the drv is still
     /// Assigned/Running then.
-    pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash) {
+    pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash, error_msg: &str) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -1627,23 +1705,30 @@ impl DagActor {
         self.persist_poisoned(drv_hash).await;
         self.unpin_best_effort(drv_hash).await;
 
-        // No DerivationFailed event / log flush: transient/infra retry
-        // paths already emitted per-attempt events; the poison is a
-        // state-machine fact, not a fresh worker report.
-        self.terminal_failure_epilogue(drv_hash, None).await;
+        self.terminal_failure_epilogue(
+            drv_hash,
+            error_msg,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+        )
+        .await;
     }
 
+    // r[impl sched.event.derivation-terminal]
     /// Shared tail of every terminal-failure path
     /// ([`poison_and_cascade`], `handle_permanent_failure`,
-    /// `handle_timeout_failure` cap-exhausted): cascade
-    /// `DependencyFailed` to ancestors, optionally flush logs + emit a
-    /// `DerivationFailed` event to interested gateways, then run
-    /// `handle_derivation_failure` for the union of trigger + cascaded
-    /// builds.
+    /// `handle_timeout_failure` cap-exhausted): seal+flush logs, emit
+    /// `DerivationFailed` for the trigger to its interested builds,
+    /// cascade `DependencyFailed` to ancestors, emit `DerivationFailed
+    /// {DependencyFailed}` for EACH cascaded node to ITS interested
+    /// builds, then run `handle_derivation_failure` for the union.
     ///
-    /// `event = None` skips flush+emit (the caller already emitted
-    /// per-attempt events, or has no `error_msg` to attach). `Some`
-    /// carries the wire status the gateway should render.
+    /// Log-flush and the trigger's `DerivationFailed` event are
+    /// unconditional. The previous `Option` form let
+    /// `poison_and_cascade` skip both with a wrong rationale ("retry
+    /// paths already emitted per-attempt events" — they don't; this is
+    /// the only `DerivationEvent::failed` emission in the actor), so
+    /// poison-via-exhaustion produced no S3 log upload and no client-
+    /// visible event.
     ///
     /// This was the I-213 bug-class area — three near-identical ~30L
     /// blocks that drifted on which side-effects ran. Keeping the
@@ -1654,38 +1739,54 @@ impl DagActor {
     async fn terminal_failure_epilogue(
         &mut self,
         drv_hash: &DrvHash,
-        event: Option<(&str, rio_proto::types::BuildResultStatus)>,
+        error_msg: &str,
+        status: rio_proto::types::BuildResultStatus,
     ) {
-        // Seal the log buffer unconditionally — even the `event=None`
-        // path (poison-threshold reached without a fresh failure event)
-        // is a terminal transition for THIS drv. The conditional
-        // trigger_log_flush below still drains for the upload; sealing
-        // only stops late pushes from leaking an orphan entry.
         self.seal_log_buffer(drv_hash);
+
+        // Flush + emit use the trigger's interested set (those builds
+        // saw THIS drv fail); handle_derivation_failure below uses the
+        // union (those builds saw SOME drv fail, possibly a cascaded
+        // one). Flush BEFORE handle_derivation_failure (which may
+        // transition builds to terminal and schedule cleanup).
+        let trigger_builds = self.get_interested_builds(drv_hash);
+        self.trigger_log_flush(drv_hash, trigger_builds.clone());
+        let trigger_path = self.dag.path_or_hash_fallback(drv_hash);
+        for build_id in &trigger_builds {
+            self.events.emit(
+                *build_id,
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent::failed(
+                        trigger_path.clone(),
+                        error_msg.to_string(),
+                        status,
+                    ),
+                ),
+            );
+        }
 
         // Cascade: parents of a terminally-failed derivation can never
         // complete. Transition them to DependencyFailed so keepGoing
         // builds terminate.
         let cascaded = self.cascade_dependency_failure(drv_hash).await;
 
-        if let Some((error_msg, status)) = event {
-            // Flush + emit use the trigger's interested set (those
-            // builds saw THIS drv fail); handle_derivation_failure
-            // below uses the union (those builds saw SOME drv fail,
-            // possibly a cascaded one).
-            let trigger_builds = self.get_interested_builds(drv_hash);
-            // Flush BEFORE handle_derivation_failure (which may
-            // transition builds to terminal and schedule cleanup).
-            self.trigger_log_flush(drv_hash, trigger_builds.clone());
-            let drv_path = self.dag.path_or_hash_fallback(drv_hash);
-            for build_id in &trigger_builds {
+        // r[impl sched.event.derivation-terminal]
+        // Emit a DependencyFailed event per cascaded node to THAT
+        // node's interested builds (a cascaded node may belong to a
+        // merged build the trigger does NOT). Without this, WatchBuild
+        // clients see cascaded derivations frozen at Queued under
+        // keep_going while the build moves on.
+        let dep_msg = format!("dependency '{trigger_path}' failed: {error_msg}");
+        for cascaded_hash in &cascaded {
+            let cascaded_path = self.dag.path_or_hash_fallback(cascaded_hash);
+            for build_id in self.get_interested_builds(cascaded_hash) {
                 self.events.emit(
-                    *build_id,
+                    build_id,
                     rio_proto::types::build_event::Event::Derivation(
                         rio_proto::types::DerivationEvent::failed(
-                            drv_path.clone(),
-                            error_msg.to_string(),
-                            status,
+                            cascaded_path.clone(),
+                            dep_msg.clone(),
+                            rio_proto::types::BuildResultStatus::DependencyFailed,
                         ),
                     ),
                 );
@@ -1794,10 +1895,7 @@ impl DagActor {
         // best-effort) + get poison verdict in one call — same
         // helper as `reassign_derivations` and
         // handle_reconcile_assignments (recovery.rs).
-        let FailureOutcome {
-            reached_poison,
-            promoted,
-        } = self
+        let FailureOutcome { reached_poison } = self
             .record_failure_and_check_poison(drv_hash, executor_id)
             .await;
 
@@ -1819,36 +1917,39 @@ impl DagActor {
         // on both builders never tripped it — fetchers aren't in
         // failed_builders. The kind-aware predicate is shared with the
         // dispatch-time check.
-        let reached_poison = reached_poison || self.failed_builders_exhausts_fleet(drv_hash);
+        let exhausts_fleet = self.failed_builders_exhausts_fleet(drv_hash);
+        let reached_poison = reached_poison || exhausts_fleet;
 
-        let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
-            // r[impl sched.retry.promotion-exempt+2]
-            // I-213: a failure that promoted the floor is a sizing
-            // signal, not a build-determinism signal. It always
-            // retries (on the next-larger class) and doesn't consume
-            // `max_retries` — bounded instead by the ladder length
-            // (`next_*_class` returns None at the top, so `promoted`
-            // is false there and the budget applies). Without this,
-            // `max_retries=2` capped the climb at 3 rungs of a 5-rung
-            // ladder; firefox poisoned at `medium` with xlarge never
-            // tried.
+        let (should_retry, poison_reason) = if let Some(state) = self.dag.node_mut(drv_hash) {
             if reached_poison {
-                false // poison_and_cascade below does the transition
-            } else if promoted || state.retry.count < self.retry_policy.max_retries {
+                let why = if exhausts_fleet {
+                    "failed on every eligible worker".to_string()
+                } else {
+                    format!(
+                        "poison threshold reached after {} distinct-worker failures",
+                        state.retry.failed_builders.len()
+                    )
+                };
+                (false, why) // poison_and_cascade below does the transition
+            } else if state.retry.count < self.retry_policy.max_retries {
                 state.ensure_running();
                 if let Err(e) = state.transition(DerivationStatus::Failed) {
                     warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
                 }
-                true
+                (true, String::new())
             } else {
+                let n = state.retry.count;
                 warn!(
                     drv_hash = %drv_hash,
-                    retry_count = state.retry.count,
+                    retry_count = n,
                     max = self.retry_policy.max_retries,
                     resource_floor = ?state.sched.resource_floor,
                     "transient failure: max_retries exhausted, poisoning"
                 );
-                false // poison_and_cascade below does the transition
+                (
+                    false,
+                    format!("max_retries={n} exhausted after transient failures"),
+                )
             }
         } else {
             return;
@@ -1864,15 +1965,12 @@ impl DagActor {
             // successful dispatch in assign_to_worker.
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 let backoff = self.retry_policy.backoff_duration(state.retry.count);
-                if !promoted {
-                    state.retry.count += 1;
-                }
+                state.retry.count += 1;
                 state.assigned_executor = None;
                 state.retry.backoff_until = Some(Instant::now() + backoff);
                 debug!(
                     drv_hash = %drv_hash,
                     retry_count = state.retry.count,
-                    promoted,
                     backoff_secs = backoff.as_secs_f64(),
                     "scheduling retry after transient failure"
                 );
@@ -1882,7 +1980,7 @@ impl DagActor {
                     self.push_ready(drv_hash.clone());
                 }
             }
-            if !promoted && let Err(e) = self.db.increment_retry_count(drv_hash).await {
+            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
             // PG status: Ready, NOT Failed. The in-mem state machine
@@ -1894,8 +1992,16 @@ impl DagActor {
             // → Failed drv sits in DAG forever, never dispatched.
             self.persist_status(drv_hash, DerivationStatus::Ready, None)
                 .await;
+            // C2c: dashboard's WatchBuild showed stale running_count
+            // through the backoff window (up to 300s) — siblings
+            // (`handle_infrastructure_failure`, `handle_timeout_
+            // failure`) get this via `requeue_after_retry`; the inline
+            // here ported persist_status but not the progress emit.
+            for build_id in self.get_interested_builds(drv_hash) {
+                self.emit_progress(build_id);
+            }
         } else {
-            self.poison_and_cascade(drv_hash).await;
+            self.poison_and_cascade(drv_hash, &poison_reason).await;
         }
     }
 
@@ -1958,9 +2064,9 @@ impl DagActor {
         // D4: a floor bump that returned `promoted=true` is a sizing
         // signal — the next dispatch goes larger; the THIS-attempt
         // failure is not the build's fault. Exempt from the infra cap
-        // alongside the I-127 PutPath case below. At-cap (`counted=
-        // true`) is NOT exempt — bump already incremented infra_count
-        // and the cap check below sees it.
+        // alongside the I-127 PutPath case below. At-cap (`at_cap=
+        // true`) is NOT exempt — the increment after reset_to_ready
+        // counts it toward the cap.
         //
         // I-127: "concurrent PutPath" is NEVER counted toward the
         // infra cap. It means another builder is uploading the SAME
@@ -1989,15 +2095,13 @@ impl DagActor {
         // are independent; only a tight burst (4 fails in 2min)
         // suggests a misclassified permanent error.
         //
-        // `!counted` guard: when the bump above already counted
-        // (at-cap cgroup-OOM), the increment is in `infra_count`
-        // ALREADY — resetting here wipes it, then the `!counted` guard
-        // below skips the re-increment, and the build loops at max_mem
-        // forever (m044). At-cap resource exhaustion is deterministic
+        // `!at_cap` guard: at-cap resource exhaustion is deterministic
         // (build needs > max_mem regardless of when the last attempt
         // ran), so the sparse-vs-burst window doesn't apply — same
-        // rationale as `timeout_count` having no window reset.
-        if !floor_outcome.counted
+        // rationale as `timeout_count` having no window reset. Without
+        // the guard, a slow trickle of at-cap OOMs would reset the
+        // counter every window and loop at max_mem forever (m044).
+        if !floor_outcome.at_cap
             && let Some(last) = state.retry.last_infra_failure_at
             && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
         {
@@ -2019,15 +2123,22 @@ impl DagActor {
         // Exempt errors skip the cap entirely (see above).
         if !exempt_from_cap && state.retry.infra_count >= self.retry_policy.max_infra_retries {
             state.ensure_running();
+            let max = self.retry_policy.max_infra_retries;
             warn!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
                 infra_retry_count = state.retry.infra_count,
-                max = self.retry_policy.max_infra_retries,
+                max,
                 resource_floor = ?state.sched.resource_floor,
                 "infrastructure failure: max_infra_retries exhausted, poisoning"
             );
-            self.poison_and_cascade(drv_hash).await;
+            self.poison_and_cascade(
+                drv_hash,
+                &format!(
+                    "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
+                ),
+            )
+            .await;
             return;
         }
 
@@ -2045,18 +2156,14 @@ impl DagActor {
         // can't indicate a misclassified permanent failure, so the
         // hot-loop guard isn't needed for them.
         //
-        // D4: `bump_floor_or_count` is the single source of truth for
-        // at-cap floor-reason counting (`floor_outcome.counted`). The
-        // increment here covers NON-floor-reason infra (FUSE EIO,
-        // store unreachable, …) AND the cgroup-OOM cold-start case
-        // (`{promoted:false, counted:false}` — est=None, floor=0).
-        // Without the `!counted` guard the at-cap cgroup-OOM
-        // path was double-counted (bump + here) → poisoned at half the
-        // configured `max_infra_retries`.
+        // D4: `bump_floor_or_count` never mutates `infra_count`; THIS
+        // increment is the single source of truth and runs AFTER the
+        // cap check above, so at-cap cgroup-OOM and non-floor infra
+        // (FUSE EIO, store unreachable, …) poison at the same attempt
+        // number. Covers cold-start `{promoted:false, at_cap:false}`
+        // (est=None, floor=0) too.
         if !exempt_from_cap {
-            if !floor_outcome.counted {
-                state.retry.infra_count += 1;
-            }
+            state.retry.infra_count += 1;
             state.retry.last_infra_failure_at = Some(Instant::now());
         }
         info!(
@@ -2106,10 +2213,8 @@ impl DagActor {
 
         self.terminal_failure_epilogue(
             drv_hash,
-            Some((
-                error_msg,
-                rio_proto::types::BuildResultStatus::PermanentFailure,
-            )),
+            error_msg,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
         )
         .await;
     }
@@ -2179,17 +2284,17 @@ impl DagActor {
             // worker problem — the SAME worker with a longer deadline
             // would succeed). NO retry_count++ (separate counter).
             // NO backoff (next dispatch's longer deadline IS the
-            // backoff). I-200: every TimedOut consumes budget UNLESS
-            // bump already counted (at-cap). NOT symmetric with
-            // `handle_infrastructure_failure` — infra has an outer
-            // `!promoted` exemption (via `exempt_from_cap`); timeout
-            // deliberately does not, so `max_timeout_retries` bounds
-            // TOTAL attempts. Covers cold-start (no [sla], est=None,
-            // floor=0 → {false,false}) where `if promoted` would never
-            // increment → infinite retry until globalTimeout.
-            if !floor_outcome.counted {
-                state.retry.timeout_count += 1;
-            }
+            // backoff). I-200: every TimedOut consumes budget. NOT
+            // symmetric with `handle_infrastructure_failure` — infra
+            // has an outer `!promoted` exemption (via `exempt_from_
+            // cap`); timeout deliberately does not, so
+            // `max_timeout_retries` bounds TOTAL attempts. Covers
+            // cold-start (no [sla], est=None, floor=0 → {false,false})
+            // where `if promoted` would never increment → infinite
+            // retry until globalTimeout. `bump_floor_or_count` no
+            // longer mutates the counter, so this is the only
+            // increment site.
+            state.retry.timeout_count += 1;
             info!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
@@ -2223,7 +2328,8 @@ impl DagActor {
 
         self.terminal_failure_epilogue(
             drv_hash,
-            Some((error_msg, rio_proto::types::BuildResultStatus::TimedOut)),
+            error_msg,
+            rio_proto::types::BuildResultStatus::TimedOut,
         )
         .await;
     }
@@ -2241,12 +2347,13 @@ impl DagActor {
     /// leaf hang forever: parents stay Queued, so completed+failed
     /// never reaches total.
     //
-    // Same BFS-frontier shape as speculative_cascade_reachable but
-    // async (per-step persist_status().await) + walks get_parents()
-    // unconditionally rather than eligibility-gated. Not migrated —
-    // see P0405-T3 route-(a). If a 4th async walker appears, consider
-    // route-(b): collect-then-batch-persist (safe because recovery
-    // re-cascades from the original poisoned leaf on partial persist).
+    // r[impl sched.db.batch-unnest]
+    // Collect-then-batch-persist: the BFS runs entirely in-memory
+    // (transitions, ready_queue removes), then ONE persist_status_batch
+    // for all transitioned ancestors. Safe because recovery re-cascades
+    // from the original poisoned leaf on partial persist. The previous
+    // per-step await was unbounded N×PG-RTT inside the actor (no
+    // MAX_CASCADE_NODES cap here).
     pub(super) async fn cascade_dependency_failure(
         &mut self,
         poisoned_hash: &DrvHash,
@@ -2291,12 +2398,14 @@ impl DagActor {
             // Remove from ready queue if present (Ready -> DependencyFailed).
             self.ready_queue.remove(&parent_hash);
 
-            self.persist_status(&parent_hash, DerivationStatus::DependencyFailed, None)
-                .await;
-
             // Continue cascade: this parent's parents also cannot complete.
             to_visit.extend(self.dag.get_parents(&parent_hash));
             transitioned.insert(parent_hash);
+        }
+        if !transitioned.is_empty() {
+            let refs: Vec<&str> = transitioned.iter().map(DrvHash::as_str).collect();
+            self.persist_status_batch(&refs, DerivationStatus::DependencyFailed)
+                .await;
         }
         transitioned
     }
@@ -2329,8 +2438,21 @@ impl DagActor {
             return;
         };
 
+        // r[impl sched.build.keep-going]
+        // Record FIRST-failure summary regardless of keep_going. The
+        // previous `!keep_going`-only assignment meant a keep_going
+        // build's eventual `BuildFailed` had `error_message=""` and
+        // `failed_derivation=""` (transition_build_to_failed
+        // `.unwrap_or_default()`s both). `get_or_insert` keeps the
+        // first failure across multiple calls under keep_going.
+        build
+            .error_summary
+            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
+        build
+            .failed_derivation
+            .get_or_insert_with(|| drv_hash.to_string());
+
         if !build.keep_going {
-            // r[impl sched.build.keep-going]
             // Fail the entire build immediately. Cancel remaining
             // derivations first — without this, sole-interest Queued/
             // Ready/Assigned derivations for this build linger:
@@ -2338,8 +2460,6 @@ impl DagActor {
             // ones occupy the ready queue. cancel_build_derivations
             // sends CancelSignal + transitions DependencyFailed/
             // Cancelled + removes build interest.
-            build.error_summary = Some(format!("derivation {drv_hash} failed"));
-            build.failed_derivation = Some(drv_hash.to_string());
             self.cancel_build_derivations(
                 build_id,
                 &format!("build {build_id} failed fast (keep_going=false)"),

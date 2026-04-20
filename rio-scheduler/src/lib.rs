@@ -270,6 +270,11 @@ pub fn describe_metrics() {
         "State-machine transition rejections (labeled by target state); alert if rate > 0"
     );
     describe_counter!(
+        "rio_scheduler_malformed_built_output_total",
+        "Worker-supplied BuiltOutput.output_path that failed StorePath::parse \
+         (dropped at handle_completion boundary); alert if rate > 0"
+    );
+    describe_counter!(
         "rio_scheduler_log_lines_forwarded_total",
         "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)"
     );

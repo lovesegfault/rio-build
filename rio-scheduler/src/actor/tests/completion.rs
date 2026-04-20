@@ -265,21 +265,22 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 ///   exclusion isn't "any match → None".
 /// - **zero_outputs**: `built_outputs=[]` → `!is_empty()` early-false →
 ///   loop body never runs → no counter increment, unchanged stays false.
-/// - **empty_path**: `output_path=""` → guard short-circuits before PG
-///   query → counted as miss explicitly.
+/// - **empty_path**: `output_path=""` → boundary filter in
+///   `handle_completion` drops it (`rio_scheduler_malformed_built_
+///   output_total` increments) → compare sees 0 outputs.
 /// - **no_prior**: nothing seeded, 2 outputs → first lookup → None →
 ///   miss → short-circuit break.
 #[rstest]
 // bughunt-mc196: own row only → self-exclusion → miss
-#[case::first_build("ca-first", CaSeed::Own, vec![("out", "ca-first-out", 32)], false, Some(1), Some(0))]
+#[case::first_build("ca-first", CaSeed::Own, vec![("out", "ca-first-out", 32)], false, Some(1), Some(0), 0)]
 // own + prior → finds sibling → match → unchanged=true
-#[case::second_build("ca-second", CaSeed::OwnAndPrior, vec![("out", "ca-second-out", 32)], true, Some(0), Some(1))]
+#[case::second_build("ca-second", CaSeed::OwnAndPrior, vec![("out", "ca-second-out", 32)], true, Some(0), Some(1), 0)]
 // built_outputs=[] → !is_empty() guard → no loop iteration
-#[case::zero_outputs("ca-zero", CaSeed::None, vec![], false, Some(0), Some(0))]
-// output_path="" → is_empty() guard short-circuits before PG
-#[case::empty_path("ca-empty", CaSeed::None, vec![("out", "", 32)], false, None, None)]
+#[case::zero_outputs("ca-zero", CaSeed::None, vec![], false, Some(0), Some(0), 0)]
+// output_path="" → boundary filter drops it → malformed counter
+#[case::empty_path("ca-empty", CaSeed::None, vec![("out", "", 32)], false, Some(0), Some(0), 1)]
 // nothing seeded → Ok(None) → miss → break
-#[case::no_prior("ca-noprior", CaSeed::None, vec![("out", "ca-noprior-out1", 32), ("dev", "ca-noprior-out2", 32)], false, Some(1), Some(0))]
+#[case::no_prior("ca-noprior", CaSeed::None, vec![("out", "ca-noprior-out1", 32), ("dev", "ca-noprior-out2", 32)], false, Some(1), Some(0), 0)]
 #[tokio::test]
 async fn ca_compare_edge_cases(
     #[case] key: &str,
@@ -288,6 +289,7 @@ async fn ca_compare_edge_cases(
     #[case] expect_unchanged: bool,
     #[case] expect_miss: Option<u64>,
     #[case] expect_match: Option<u64>,
+    #[case] expect_malformed: u64,
 ) -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
@@ -345,6 +347,11 @@ async fn ca_compare_edge_cases(
     if let Some(m) = expect_match {
         assert_eq!(recorder.get(match_key) - match_before, m, "match delta");
     }
+    assert_eq!(
+        recorder.get("rio_scheduler_malformed_built_output_total{}"),
+        expect_malformed,
+        "malformed-output boundary filter (handle_completion)"
+    );
     Ok(())
 }
 
@@ -984,9 +991,18 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
 }
 
 /// TransientFailure: retry on a different worker up to max_retries (default 2).
+///
+/// `backoff_base_secs=0` so the retry dispatches DETERMINISTICALLY in
+/// the same tick (the previous default 5.0 meant the load-bearing
+/// `assert_ne!(retry_worker, first_worker)` arm never executed —
+/// status was always Ready under backoff).
 #[tokio::test]
 async fn test_transient_retry_different_worker() -> TestResult {
-    let (_db, handle, _task) = setup().await;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.backoff_base_secs = 0.0;
+    });
+    let _db = db;
 
     // Register two workers
     let _rx1 = connect_executor(&handle, "worker-a", "x86_64-linux").await?;
@@ -1015,39 +1031,26 @@ async fn test_transient_retry_different_worker() -> TestResult {
     )
     .await?;
 
-    // Should be retried: retry_count=1. backoff_until is set so
-    // the derivation stays Ready (not immediately re-dispatched).
-    // failed_builders contains first_worker so when backoff elapses,
-    // retry goes to the OTHER worker.
+    // backoff=0 → re-dispatched in the same handle_completion tail.
+    // failed_builders contains first_worker so retry goes to the
+    // OTHER worker. Deterministic — no match-on-status; the
+    // load-bearing assertion is `retry_worker != first_worker`.
+    barrier(&handle).await;
     let info2 = expect_drv(&handle, "retry-hash").await;
     assert_eq!(
         info2.retry.count, 1,
         "transient failure should increment retry_count"
     );
-    // Status: Ready with backoff_until set. NOT Assigned — backoff
-    // blocks immediate re-dispatch. If it IS Assigned, dispatch
-    // raced us between complete_failure and query — still fine for
-    // the test, the worker must be different (failed_builders
-    // exclusion).
-    match info2.status {
-        DerivationStatus::Ready => {
-            // Backoff active: assigned_executor cleared.
-            assert!(
-                info2.assigned_executor.is_none(),
-                "Ready after failure → assigned_executor cleared"
-            );
-        }
-        DerivationStatus::Assigned => {
-            // Raced: dispatch happened. Worker MUST be different
-            // (failed_builders exclusion).
-            let retry_worker = info2.assigned_executor.expect("Assigned → worker set");
-            assert_ne!(
-                retry_worker, first_worker,
-                "failed_builders exclusion: retry must go to a DIFFERENT worker"
-            );
-        }
-        other => panic!("expected Ready or Assigned, got {other:?}"),
-    }
+    assert_eq!(
+        info2.status,
+        DerivationStatus::Assigned,
+        "backoff=0 → immediate re-dispatch"
+    );
+    let retry_worker = info2.assigned_executor.expect("Assigned → worker set");
+    assert_ne!(
+        retry_worker, first_worker,
+        "failed_builders exclusion: retry must go to a DIFFERENT worker"
+    );
     Ok(())
 }
 
@@ -1254,10 +1257,12 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
 ///   (fetcher not in set) → diffutils-3.12.drv stuck Ready forever.
 ///   Fix: predicate is kind-aware.
 ///
-/// `max_retries=10` for clamp/kind_aware so the `retry_count>=2`
-/// branch doesn't mask the threshold/clamp under test.
+/// `max_retries=10` for ALL cases so the `retry_count>=max_retries`
+/// branch doesn't mask the threshold/clamp under test (default
+/// `max_retries=2` would trip on the same iteration as
+/// `is_poisoned(3≥3)` for the threshold case — vacuous coverage).
 #[rstest]
-#[case::threshold(false, 4, &["pt-w1", "pt-w2", "pt-w3"], false)]
+#[case::threshold(true, 4, &["pt-w1", "pt-w2", "pt-w3"], false)]
 #[case::clamp(true, 2, &["pt-w1", "pt-w2"], false)]
 #[case::kind_aware(true, 2, &["pt-w1", "pt-w2"], true)]
 #[tokio::test]
@@ -1999,8 +2004,13 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
     let drv_path = test_drv_path("unk-status");
     merge_single_node(&handle, build_id, "unk-status", PriorityClass::Scheduled).await?;
 
-    // Wait for dispatch (drv → Assigned).
+    // Wait for dispatch (drv → Assigned to unk-w, the only worker).
     barrier(&handle).await;
+    // Padding so fleet-exhaust doesn't poison on the single failure —
+    // we want the retry path, not the poison path. Connect AFTER
+    // dispatch so the drv is deterministically on unk-w.
+    let _rx2 = connect_executor(&handle, "unk-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "unk-w3", "x86_64-linux").await?;
 
     // Send completion with an invalid status int (9999).
     handle
@@ -2027,6 +2037,15 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
             || logs_contain("unknown status"),
         "expected warn for unknown status enum"
     );
+    // Behavioral assertion (the log-only check above passes even if
+    // handle_transient_failure is dropped from the Unspecified arm):
+    // retry.count incremented, NOT poisoned.
+    let info = expect_drv(&handle, "unk-status").await;
+    assert_eq!(
+        info.retry.count, 1,
+        "Unspecified → handle_transient_failure → retry.count++"
+    );
+    assert_ne!(info.status, DerivationStatus::Poisoned);
     Ok(())
 }
 
@@ -2608,15 +2627,20 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
     );
 
     // ── Part B: pruner is unblocked ────────────────────────────────────
+    // Capture derivation_id BEFORE GC deletes the derivations row —
+    // the previous JOIN-after-GC query was vacuous (JOIN yields 0
+    // whether CASCADE fired or not, since the parent row is gone).
+    let derivation_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind("i209")
+            .fetch_one(&db.pool)
+            .await?;
     // Drop the build_derivations link (simulates the owning build's
     // cleanup) so the only remaining gate is the assignments row.
-    sqlx::query(
-        "DELETE FROM build_derivations WHERE derivation_id = \
-                 (SELECT derivation_id FROM derivations WHERE drv_hash = $1)",
-    )
-    .bind("i209")
-    .execute(&db.pool)
-    .await?;
+    sqlx::query("DELETE FROM build_derivations WHERE derivation_id = $1")
+        .bind(derivation_id)
+        .execute(&db.pool)
+        .await?;
 
     let sched_db = SchedulerDb::new(db.pool.clone());
     let deleted = sched_db.gc_orphan_terminal_derivations(10).await?;
@@ -2625,17 +2649,429 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
         "I-209: terminal assignment row no longer blocks the pruner"
     );
 
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM assignments a JOIN derivations d USING (derivation_id) \
-         WHERE d.drv_hash = $1",
-    )
-    .bind("i209")
-    .fetch_one(&db.pool)
-    .await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM assignments WHERE derivation_id = $1")
+            .bind(derivation_id)
+            .fetch_one(&db.pool)
+            .await?;
     assert_eq!(
         remaining, 0,
         "034: CASCADE FK removed the assignment row with the derivation"
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// G01 regressions: batching, terminal-event emission, retry-cap uniformity
+// ---------------------------------------------------------------------------
+
+/// Drain all DerivationEvents currently buffered on `rx` and partition
+/// by kind.
+fn drain_derivation_events(
+    rx: &mut tokio::sync::broadcast::Receiver<rio_proto::types::BuildEvent>,
+) -> Vec<rio_proto::types::DerivationEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event {
+            out.push(d);
+        }
+    }
+    out
+}
+
+// r[verify sched.db.batch-unnest]
+/// `promote_newly_ready` is internally batched: completing a leaf with
+/// 150 Queued parents transitions all 150 to Ready and persists in ONE
+/// batch (no per-item PG round-trip). Correctness check here; batching
+/// is structurally enforced (the helper has exactly one
+/// `persist_status_batch` call).
+#[tokio::test]
+async fn test_high_fanin_completion_batches_ready() -> TestResult {
+    const N: usize = 150;
+    let (db, handle, _task, mut rx) = setup_with_worker("fanin-w", "x86_64-linux").await?;
+
+    let mut nodes = vec![make_node("fanin-leaf")];
+    let mut edges = Vec::with_capacity(N);
+    for i in 0..N {
+        let tag = format!("fanin-p{i:03}");
+        nodes.push(make_node(&tag));
+        edges.push(make_test_edge(&tag, "fanin-leaf"));
+    }
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, true).await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_success_empty(&handle, "fanin-w", &test_drv_path("fanin-leaf")).await?;
+    barrier(&handle).await;
+
+    // All N parents Ready in-mem AND in PG.
+    for i in 0..N {
+        let info = expect_drv(&handle, &format!("fanin-p{i:03}")).await;
+        assert_eq!(info.status, DerivationStatus::Ready, "parent {i}");
+    }
+    let n_ready: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM derivations WHERE drv_hash LIKE 'fanin-p%' AND status = 'ready'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(n_ready as usize, N, "all parents persisted Ready");
+    Ok(())
+}
+
+// r[verify sched.db.batch-unnest]
+// r[verify sched.event.derivation-terminal]
+/// `cascade_dependency_failure` collects-then-batches AND emits a
+/// `DerivationFailed{DependencyFailed}` event per cascaded ancestor.
+/// Permanent-fail the leaf of a 30-deep chain; all 29 ancestors go
+/// DependencyFailed in PG and the WatchBuild stream sees one Failed
+/// event for the leaf + 29 for the chain.
+#[tokio::test]
+async fn test_cascade_emits_failed_per_node() -> TestResult {
+    const N: usize = 30;
+    let (db, handle, _task, mut rx) = setup_with_worker("casc-w", "x86_64-linux").await?;
+
+    let nodes: Vec<_> = (0..N).map(|i| make_node(&format!("casc{i:02}"))).collect();
+    let edges: Vec<_> = (0..N - 1)
+        .map(|i| make_test_edge(&format!("casc{:02}", i + 1), &format!("casc{i:02}")))
+        .collect();
+    let mut ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, true).await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "casc-w",
+        &test_drv_path("casc00"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "leaf busted",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let n_dep_failed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM derivations WHERE drv_hash LIKE 'casc%' \
+         AND status = 'dependency_failed'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        n_dep_failed as usize,
+        N - 1,
+        "all ancestors persisted DependencyFailed"
+    );
+
+    let drv_events = drain_derivation_events(&mut ev);
+    let dep_failed = rio_proto::types::BuildResultStatus::DependencyFailed as i32;
+    let perm_failed = rio_proto::types::BuildResultStatus::PermanentFailure as i32;
+    let failed_kind = rio_proto::types::DerivationEventKind::Failed as i32;
+    let trigger_count = drv_events
+        .iter()
+        .filter(|d| d.kind == failed_kind && d.failure_status == perm_failed)
+        .count();
+    let cascaded_count = drv_events
+        .iter()
+        .filter(|d| d.kind == failed_kind && d.failure_status == dep_failed)
+        .count();
+    assert_eq!(
+        trigger_count, 1,
+        "one PermanentFailure for the trigger leaf"
+    );
+    assert_eq!(
+        cascaded_count,
+        N - 1,
+        "one DependencyFailed event per cascaded ancestor"
+    );
+    // Cascaded error_msg names the trigger.
+    let leaf_path = test_drv_path("casc00");
+    assert!(
+        drv_events
+            .iter()
+            .filter(|d| d.failure_status == dep_failed)
+            .all(|d| d.error_message.contains(&leaf_path)),
+        "cascaded events name the failed dependency"
+    );
+    Ok(())
+}
+
+// r[verify sched.event.derivation-terminal]
+/// Poison-via-max_retries-exhaustion emits `DerivationFailed` and
+/// triggers log flush. Previously `poison_and_cascade` passed
+/// `event=None` so the event + flush were silently skipped.
+#[tokio::test]
+async fn test_poison_via_max_retries_emits_failed_event() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_retries = 0; // first transient → poison
+        c.retry_policy.backoff_base_secs = 0.0;
+    });
+    let _db = db;
+    // Padding so fleet-exhaust doesn't fire (different poison reason).
+    let _rx1 = connect_executor(&handle, "pmax-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "pmax-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "pmax-w3", "x86_64-linux").await?;
+
+    let mut ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "pmax-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+    let first = expect_drv(&handle, "pmax-drv")
+        .await
+        .assigned_executor
+        .expect("assigned");
+    complete_failure(
+        &handle,
+        &first,
+        &test_drv_path("pmax-drv"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "pmax-drv").await.status,
+        DerivationStatus::Poisoned
+    );
+    let drv_events = drain_derivation_events(&mut ev);
+    let failed_kind = rio_proto::types::DerivationEventKind::Failed as i32;
+    let failed: Vec<_> = drv_events
+        .iter()
+        .filter(|d| d.kind == failed_kind)
+        .collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "exactly one DerivationFailed for poison-via-exhaustion"
+    );
+    assert!(
+        failed[0].error_message.contains("max_retries"),
+        "error_message names the poison reason: {:?}",
+        failed[0].error_message
+    );
+    Ok(())
+}
+
+/// `handle_transient_failure` retry path emits BuildProgress (C2c) so
+/// the dashboard sees `running_count` drop during the backoff window.
+#[tokio::test]
+async fn test_transient_retry_emits_progress() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("prog-w", "x86_64-linux").await?;
+
+    let mut ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "prog-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    // Padding so fleet-exhaust doesn't poison on the single failure.
+    // Connect AFTER merge so dispatch deterministically picked prog-w.
+    let _rx2 = connect_executor(&handle, "prog-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "prog-w3", "x86_64-linux").await?;
+    let _ = recv_assignment(&mut rx).await;
+    barrier(&handle).await;
+    // Drain pre-failure events and clear the 250ms emit_progress
+    // debounce so the retry-path emit isn't suppressed.
+    while ev.try_recv().is_ok() {}
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    complete_failure(
+        &handle,
+        "prog-w",
+        &test_drv_path("prog-drv"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flake",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Default backoff_base_secs=5.0 → still Ready (not re-dispatched).
+    let info = expect_drv(&handle, "prog-drv").await;
+    assert_eq!(info.status, DerivationStatus::Ready);
+    assert_eq!(info.retry.count, 1);
+    // A BuildProgress event was emitted post-failure.
+    let mut saw_progress = false;
+    while let Ok(e) = ev.try_recv() {
+        if matches!(
+            e.event,
+            Some(rio_proto::types::build_event::Event::Progress(_))
+        ) {
+            saw_progress = true;
+        }
+    }
+    assert!(
+        saw_progress,
+        "transient retry must emit BuildProgress (running_count dropped)"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.keep-going]
+/// `keep_going=true` build's eventual `BuildFailed` records the FIRST
+/// failed derivation. Previously `error_summary`/`failed_derivation`
+/// were only set in the `!keep_going` branch → empty strings.
+#[tokio::test]
+async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux").await?;
+
+    // Two independent derivations under keep_going; fail one,
+    // succeed the other.
+    let nodes = vec![make_node("kg-fail"), make_node("kg-ok")];
+    let mut ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], true).await?;
+    barrier(&handle).await;
+
+    handle.debug_force_assign("kg-fail", "kg-w").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "kg-w",
+        &test_drv_path("kg-fail"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+    let _rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
+    handle.debug_force_assign("kg-ok", "kg-w2").await?;
+    complete_success_empty(&handle, "kg-w2", &test_drv_path("kg-ok")).await?;
+    barrier(&handle).await;
+
+    // BuildFailed event must name kg-fail.
+    let mut saw_failed = false;
+    while let Ok(e) = ev.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Failed(f)) = e.event {
+            saw_failed = true;
+            assert!(
+                f.failed_derivation.contains("kg-fail"),
+                "failed_derivation must name the first-failed drv: {f:?}"
+            );
+            assert!(!f.error_message.is_empty(), "error_message non-empty");
+        }
+    }
+    assert!(saw_failed, "keep_going build must emit BuildFailed");
+    Ok(())
+}
+
+/// Unsolicited `Cancelled` from a worker (DAG status NOT Cancelled) is
+/// treated as infrastructure failure — drv resets to Ready,
+/// `infra_count` bumps. Previously the match arm was a comment-only
+/// no-op, leaving the drv stuck after the slot was freed.
+#[tokio::test]
+async fn test_unsolicited_cancelled_resets_to_ready() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("ucan-w", "x86_64-linux").await?;
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ucan-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx).await;
+    let pre = expect_drv(&handle, "ucan-drv").await;
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+    assert_eq!(pre.retry.infra_count, 0);
+
+    complete_failure(
+        &handle,
+        "ucan-w",
+        &test_drv_path("ucan-drv"),
+        rio_proto::types::BuildResultStatus::Cancelled,
+        "rogue",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let post = expect_drv(&handle, "ucan-drv").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Ready,
+        "unsolicited Cancelled → reset_to_ready (NOT stuck Assigned)"
+    );
+    assert_eq!(
+        post.retry.infra_count, 1,
+        "treated as infrastructure failure"
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.per-executor-budget]
+/// `max_infra_retries` is a uniform bound: at-cap cgroup-OOM and
+/// non-floor infra (FUSE EIO) poison at the SAME attempt number.
+/// Previously `bump_floor_or_count` incremented BEFORE the cap check
+/// for at-cap, so it poisoned one attempt earlier.
+#[rstest]
+#[case::at_cap_oom("cgroup OOM during build", true)]
+#[case::fuse_eio("FUSE EIO on lower mount", false)]
+#[tokio::test]
+async fn test_infra_retry_cap_uniform_across_reasons(
+    #[case] error_msg: &str,
+    #[case] at_cap_oom: bool,
+) -> TestResult {
+    const MAX: u32 = 3;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_infra_retries = MAX;
+    });
+    let _db = db;
+    let _rx = connect_executor(&handle, "uni-w", "x86_64-linux").await?;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "uni-drv", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    if at_cap_oom {
+        // Pin floor.mem at the ceiling so every cgroup-OOM is at-cap.
+        handle
+            .debug_seed_sched_hint(
+                "uni-drv",
+                None,
+                None,
+                None,
+                Some(crate::state::ResourceFloor {
+                    mem_bytes: u64::MAX,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+    }
+
+    let p = test_drv_path("uni-drv");
+    // MAX failures → NOT poisoned yet (cap-check is BEFORE increment).
+    for i in 0..MAX {
+        handle.debug_force_assign("uni-drv", "uni-w").await?;
+        complete_failure(
+            &handle,
+            "uni-w",
+            &p,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            error_msg,
+        )
+        .await?;
+        barrier(&handle).await;
+        let info = expect_drv(&handle, "uni-drv").await;
+        assert_ne!(
+            info.status,
+            DerivationStatus::Poisoned,
+            "attempt {} of {MAX}: NOT poisoned yet ({error_msg})",
+            i + 1
+        );
+    }
+    // MAX+1-th failure → poison.
+    handle.debug_force_assign("uni-drv", "uni-w").await?;
+    complete_failure(
+        &handle,
+        "uni-w",
+        &p,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        error_msg,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "uni-drv").await.status,
+        DerivationStatus::Poisoned,
+        "attempt {}: poisoned ({error_msg})",
+        MAX + 1
+    );
     Ok(())
 }

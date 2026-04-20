@@ -908,8 +908,8 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
-            max_infra_retries: 2,
-            max_timeout_retries: 2,
+            max_infra_retries: 1,
+            max_timeout_retries: 1,
             ..Default::default()
         };
     });
@@ -942,10 +942,11 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     assert_eq!(s.retry.timeout_count, 0);
 
     // Worker-reported CgroupOom path owns the poison (cap check is
-    // there). One more cycle via InfrastructureFailure(CgroupOom):
-    // floor at cap → promoted=false → exempt_from_cap=false →
-    // bump's infra_count++ (1→2) → cap check (2>=max_infra_retries=2)
-    // → poison.
+    // there). Uniform-cap semantics: cap-check BEFORE increment, so
+    // poison fires on the (max+1)-th attempt — same as non-floor
+    // infra. infra_count is currently 1 (from the controller report
+    // above); one worker-reported at-cap failure → cap-check 1>=1 →
+    // poison.
     let p = test_drv_path("cap-mem");
     let mut rx = connect_builder(&handle, "b-cap-1", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
@@ -998,14 +999,14 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     assert_eq!(
         s.status,
         DerivationStatus::Ready,
-        "1 < max_timeout_retries=2 → re-queued, not yet terminal"
+        "1 ≤ max_timeout_retries=1 → re-queued, not yet terminal"
     );
 
-    // Second at-cap report → timeout_count=2 == max → poison HERE.
-    // Backstop fires when the worker is too wedged to send
-    // CompletionReport{TimedOut}, so handle_timeout_failure's cap-
-    // check never runs; without owning poison this loops at 24h
-    // forever (is_poisoned() never reads timeout_count).
+    // Uniform-cap semantics (cap-check BEFORE increment): 2nd at-cap
+    // → 1>=1 → poison HERE. Backstop fires when the worker is too
+    // wedged to send CompletionReport{TimedOut}, so handle_timeout_
+    // failure's cap-check never runs; without owning poison this
+    // loops at 24h forever (is_poisoned() never reads timeout_count).
     let mut rx = connect_builder(&handle, "rio-b-dl-abc-aaaaa", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "rio-b-dl-abc-aaaaa").await?;
@@ -1013,7 +1014,7 @@ async fn floor_caps_at_ceiling_then_poisons() -> TestResult {
     let promoted = report_termination(&handle, "rio-b-dl-abc", R::DeadlineExceeded).await?;
     assert!(!promoted);
     let s = expect_drv(&handle, "cap-dl").await;
-    assert_eq!(s.retry.timeout_count, 2);
+    assert_eq!(s.retry.timeout_count, 1);
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,
@@ -1111,17 +1112,18 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
 /// fall-through generic-infra increment fired again. Poisoned at half
 /// the configured `max_infra_retries`.
 ///
-/// With `max_infra_retries=4`, 3 at-cap cgroup-OOM cycles MUST leave
-/// `infra_count==3` (not 6), NOT poisoned; the 4th cycle poisons
-/// (bump's increment runs BEFORE the cap check, so cycle N sees
-/// `infra_count==N` at the gate).
+/// With `max_infra_retries=3`, 3 at-cap cgroup-OOM cycles MUST leave
+/// `infra_count==3` (not 6), NOT poisoned; the 4th cycle poisons.
+/// Uniform-cap semantics: cap-check BEFORE increment, so at-cap and
+/// non-floor infra (`test_infrastructure_failure_max_infra_retries_
+/// poisons` in completion.rs) both poison on attempt (max+1).
 #[tokio::test]
 async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     let max_mem = crate::sla::config::SlaConfig::test_default().max_mem;
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
-            max_infra_retries: 4,
+            max_infra_retries: 3,
             ..Default::default()
         };
     });
@@ -1172,11 +1174,11 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
         assert_ne!(
             s.status,
             DerivationStatus::Poisoned,
-            "cycle {i}: infra_count={i} < max_infra_retries=4 → NOT poisoned"
+            "cycle {i}: infra_count={i} ≤ max_infra_retries=3 → NOT poisoned"
         );
     }
 
-    // ── Cycle 4: bump→infra_count=4; cap check 4>=4 → poison ────────
+    // ── Cycle 4: cap check infra_count=3 >= max=3 → poison ──────────
     let mut rx = connect_builder(&handle, "b-coom-4", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     complete_failure(
@@ -1189,11 +1191,11 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     .await?;
     drop(rx);
     let s = expect_drv(&handle, "cap-coom").await;
-    assert_eq!(s.retry.infra_count, 4);
+    assert_eq!(s.retry.infra_count, 3);
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,
-        "cycle 4: infra_count=4 >= max_infra_retries=4 → poison"
+        "cycle 4: infra_count=3 >= max_infra_retries=3 → poison"
     );
     Ok(())
 }
@@ -1216,7 +1218,7 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
-            max_infra_retries: 2,
+            max_infra_retries: 1,
             infra_retry_window_secs: 0.0,
             ..Default::default()
         };
@@ -1259,7 +1261,8 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
     );
     assert_ne!(s.status, DerivationStatus::Poisoned);
 
-    // Cycle 2: bump → infra=2 ≥ max=2 → poison.
+    // Cycle 2: cap-check 1>=1 → poison. Uniform-cap semantics:
+    // cap-check BEFORE increment.
     let mut rx = connect_builder(&handle, "b-win-2", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     complete_failure(
@@ -1272,7 +1275,7 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
     .await?;
     drop(rx);
     let s = expect_drv(&handle, "cap-win").await;
-    assert_eq!(s.retry.infra_count, 2);
+    assert_eq!(s.retry.infra_count, 1);
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,
@@ -1291,8 +1294,9 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
 /// path (`handle_infrastructure_failure`) owns that check, but it
 /// never fires when the pod itself dies.
 ///
-/// With `max_infra_retries=2`: 2 disconnect+report(OomKilled) cycles
-/// at floor==max_mem → poison on cycle 2. Contrast
+/// With `max_infra_retries=1`: 2 disconnect+report(OomKilled) cycles
+/// at floor==max_mem → poison on cycle 2 (uniform-cap: cap-check
+/// BEFORE increment, matches non-floor infra). Contrast
 /// `floor_caps_at_ceiling_then_poisons`, which mixes controller +
 /// worker paths and so masked this.
 #[tokio::test]
@@ -1302,7 +1306,7 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
-            max_infra_retries: 2,
+            max_infra_retries: 1,
             ..Default::default()
         };
     });
@@ -1328,7 +1332,7 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
         .await?;
 
     // Cycle 1: disconnect (re-queues Ready) → controller reports
-    // OomKilled → bump at-cap → infra_count=1. Under cap → not poisoned.
+    // OomKilled → at_cap → cap-check 0<1, ++→1. Not poisoned.
     let mut rx = connect_builder(&handle, "b-ctrl-1", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "b-ctrl-1").await?;
@@ -1340,10 +1344,10 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
     assert_ne!(
         s.status,
         DerivationStatus::Poisoned,
-        "cycle 1: infra_count=1 < max=2 → not poisoned"
+        "cycle 1: infra_count=1 ≤ max=1 → not poisoned"
     );
 
-    // Cycle 2: same again → infra_count=2 ≥ max=2 → poison.
+    // Cycle 2: cap-check 1>=1 → poison.
     let mut rx = connect_builder(&handle, "b-ctrl-2", "x86_64-linux").await?;
     let _ = recv_assignment(&mut rx).await;
     disconnect(&handle, "b-ctrl-2").await?;
@@ -1351,7 +1355,7 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
     let promoted = report_termination(&handle, "b-ctrl-2", R::OomKilled).await?;
     assert!(!promoted);
     let s = expect_drv(&handle, "ctrl-cap").await;
-    assert_eq!(s.retry.infra_count, 2);
+    assert_eq!(s.retry.infra_count, 1);
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,

@@ -932,6 +932,22 @@ impl DagActor {
                 // from a prior CA-cutoff. Same semantics as a cache
                 // hit from the build's perspective.
                 DerivationStatus::Completed | DerivationStatus::Skipped => {
+                    // r[impl sched.event.derivation-terminal]
+                    // Pre-existing Completed/Skipped is a terminal
+                    // cached-equivalent for THIS build's WatchBuild —
+                    // emit so the client doesn't see it stuck Queued.
+                    // `apply_cached_hits` (the upstream-cache analogue)
+                    // already does this; this arm covers the
+                    // already-in-DAG case.
+                    self.events.emit(
+                        ingest.build_id,
+                        rio_proto::types::build_event::Event::Derivation(
+                            rio_proto::types::DerivationEvent::cached(
+                                node.drv_path.clone(),
+                                state.output_paths.clone(),
+                            ),
+                        ),
+                    );
                     // r[impl sched.gc.path-tenants-upsert]
                     // Pre-existing Completed/Skipped merged from
                     // another build: this build's tenant now also

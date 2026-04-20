@@ -386,7 +386,11 @@ impl DagActor {
             if should_poison {
                 info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
                       "reassign: poison threshold reached, poisoning instead of retry");
-                self.poison_and_cascade(drv_hash).await;
+                self.poison_and_cascade(
+                    drv_hash,
+                    "poison threshold reached on worker disconnect after prior failures",
+                )
+                .await;
                 continue;
             }
 
@@ -507,36 +511,44 @@ impl DagActor {
 
         let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
 
-        // m044: at the ceiling (`counted=true`), bump incremented
-        // `infra_count`; this path MUST own the cap check + poison.
-        // Kubelet-level OOMKilled / EvictedDiskPressure means the pod
-        // died — there is no worker-reported `CompletionReport`, so
+        // m044: at the ceiling (`at_cap=true`), this path owns the cap
+        // check + increment + poison. Kubelet-level OOMKilled /
+        // EvictedDiskPressure means the pod died — there is no
+        // worker-reported `CompletionReport`, so
         // `handle_infrastructure_failure`'s cap check never fires and
         // the build loops at the ceiling forever otherwise. Mirrors
-        // completion.rs `handle_infrastructure_failure` cap check.
-        // Guard on `counted` (resource reasons only — non-resource
-        // returned early via reason_label=None) AND a poison-able
-        // status: the disconnect already re-queued (Ready), but a
-        // dispatch tick may have raced (Assigned/Running); any other
-        // state (Completed elsewhere, already Poisoned) → skip.
+        // completion.rs `handle_infrastructure_failure`: cap-check
+        // BEFORE increment, so at-cap poisons at the same attempt
+        // number as non-floor infra. Guard on `at_cap` (resource
+        // reasons only — non-resource returned early via
+        // reason_label=None) AND a poison-able status: the disconnect
+        // already re-queued (Ready), but a dispatch tick may have
+        // raced (Assigned/Running); any other state (Completed
+        // elsewhere, already Poisoned) → skip.
         let max = self.retry_policy.max_infra_retries;
-        if outcome.counted
-            && let Some(state) = self.dag.node(&drv_hash)
-            && state.retry.infra_count >= max
+        if outcome.at_cap
+            && let Some(state) = self.dag.node_mut(&drv_hash)
             && matches!(
                 state.status(),
                 DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             )
         {
-            warn!(
-                drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
-                infra_retry_count = state.retry.infra_count, max,
-                resource_floor = ?state.sched.resource_floor,
-                "controller-reported termination: max_infra_retries \
-                 exhausted at ceiling, poisoning"
-            );
-            self.poison_and_cascade(&drv_hash).await;
-            return false;
+            if state.retry.infra_count >= max {
+                warn!(
+                    drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
+                    infra_retry_count = state.retry.infra_count, max,
+                    resource_floor = ?state.sched.resource_floor,
+                    "controller-reported termination: max_infra_retries \
+                     exhausted at ceiling, poisoning"
+                );
+                self.poison_and_cascade(
+                    &drv_hash,
+                    &format!("max_infra_retries={max} exhausted at resource ceiling ({reason:?})"),
+                )
+                .await;
+                return false;
+            }
+            state.retry.infra_count += 1;
         }
 
         outcome.promoted
@@ -589,23 +601,29 @@ impl DagActor {
             .await;
 
         let max = self.retry_policy.max_timeout_retries;
-        if outcome.counted
-            && let Some(state) = self.dag.node(&drv_hash)
-            && state.retry.timeout_count >= max
+        if outcome.at_cap
+            && let Some(state) = self.dag.node_mut(&drv_hash)
             && matches!(
                 state.status(),
                 DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             )
         {
-            warn!(
-                drv_hash = %drv_hash, job_name = %job_name,
-                timeout_retry_count = state.retry.timeout_count, max,
-                resource_floor = ?state.sched.resource_floor,
-                "DeadlineExceeded backstop: max_timeout_retries exhausted \
-                 at cap, poisoning"
-            );
-            self.poison_and_cascade(&drv_hash).await;
-            return false;
+            if state.retry.timeout_count >= max {
+                warn!(
+                    drv_hash = %drv_hash, job_name = %job_name,
+                    timeout_retry_count = state.retry.timeout_count, max,
+                    resource_floor = ?state.sched.resource_floor,
+                    "DeadlineExceeded backstop: max_timeout_retries exhausted \
+                     at cap, poisoning"
+                );
+                self.poison_and_cascade(
+                    &drv_hash,
+                    &format!("max_timeout_retries={max} exhausted at 24h deadline cap"),
+                )
+                .await;
+                return false;
+            }
+            state.retry.timeout_count += 1;
         }
 
         if let Some(state) = self.dag.node(&drv_hash) {

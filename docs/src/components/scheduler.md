@@ -358,6 +358,9 @@ stateDiagram-v2
     failed --> [*]
 ```
 
+r[sched.event.derivation-terminal]
+Every derivation transition to a terminal state (`Completed`, `Skipped`, `Poisoned`, `DependencyFailed`, `Cancelled`) emits exactly one `DerivationEvent` to each interested build's `WatchBuild` stream. Cached-equivalent transitions (`Skipped`, pre-existing `Completed`) emit `DerivationCached`; failure transitions (including cascade-propagated `DependencyFailed`) emit `DerivationFailed`.
+
 r[sched.build.keep-going]
 **Aggregation rules:**
 - `keepGoing=false` (default): the build fails as soon as any derivation reaches `PermanentFailure` or `poisoned`. Remaining derivations are cancelled.

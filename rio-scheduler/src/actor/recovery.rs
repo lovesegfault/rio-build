@@ -1028,6 +1028,29 @@ impl DagActor {
         }
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
+        // r[impl sched.event.derivation-terminal]
+        // Orphan completion is worker-built (not cached) — emit
+        // DerivationCompleted so WatchBuild clients see it finish.
+        // `release_downstream` below does NOT emit per-drv events
+        // (only progress + build-level); the analogue in
+        // `handle_success_completion` emits before calling it.
+        let output_paths = self
+            .dag
+            .node(drv_hash)
+            .map(|s| s.output_paths.clone())
+            .unwrap_or_default();
+        let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+        for build_id in &interested {
+            self.events.emit(
+                *build_id,
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent::completed(
+                        drv_path.clone(),
+                        output_paths.clone(),
+                    ),
+                ),
+            );
+        }
         // r[impl sched.gc.path-tenants-upsert]
         // Orphan completion during recovery: derivation was
         // Running at crash, completed during downtime. The
@@ -1087,7 +1110,11 @@ impl DagActor {
         if should_poison {
             info!(drv_hash = %drv_hash, executor_id = ?executor_id,
                   "reconcile: poison threshold reached, poisoning");
-            self.poison_and_cascade(drv_hash).await;
+            self.poison_and_cascade(
+                drv_hash,
+                "poison threshold reached on recovery (orphan worker did not reconnect)",
+            )
+            .await;
             return;
         }
 
