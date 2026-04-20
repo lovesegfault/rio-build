@@ -235,11 +235,18 @@ pub(crate) async fn resolve_derivations_batch(
     // checks `count + frontier.len()` BEFORE calling us, but this
     // function is the chokepoint where an unbounded `to_fetch` becomes
     // an unbounded `Vec<Derivation>` in memory — keep the check local
-    // so a future caller can't bypass the budget.
+    // so a future caller can't bypass the budget. Gate on
+    // `drv_cache.len() + to_fetch.len()` so the pre-fetch check rejects
+    // exactly what `insert_drv_bounded` would reject post-fetch — with
+    // `to_fetch.len()` alone, a session that fills `drv_cache` to ~cap
+    // via `try_cache_drv` then issues a disjoint ~cap-miss build would
+    // pass here, fully materialize `fetched` (~cap parsed Derivations),
+    // and only then error: peak ≈ 2× the budget the 4 GiB pod limit was
+    // sized for.
     let cap = max_transitive_inputs();
-    if to_fetch.len() > cap {
+    if drv_cache.len() + to_fetch.len() > cap {
         return Err(GatewayError::DrvCacheFull {
-            count: to_fetch.len(),
+            count: drv_cache.len() + to_fetch.len(),
             cap,
         }
         .into());
@@ -274,4 +281,69 @@ pub(crate) async fn resolve_derivations_batch(
     }
     resolved.append(&mut fetched);
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_drv(tag: &str) -> (StorePath, Derivation) {
+        let path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/{}-{tag}-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+            "b".repeat(32)
+        );
+        (
+            StorePath::parse(&path).unwrap(),
+            Derivation::parse(&aterm).unwrap(),
+        )
+    }
+
+    /// Pre-fetch gate must account for existing `drv_cache` occupancy,
+    /// not just `to_fetch.len()`. With cap=4, drv_cache pre-filled to 3,
+    /// and 2 cache-miss paths requested: gate rejects with count=5
+    /// BEFORE any GetPath fires. Pre-fix: `to_fetch.len()=2 <= 4` →
+    /// gate passed → both fetched → `insert_drv_bounded` errored AFTER
+    /// the Vec<Derivation> was fully materialized (peak ≈ 2× budget).
+    #[tokio::test]
+    async fn resolve_derivations_batch_gate_accounts_for_existing_cache() {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        override_max_transitive_inputs(4);
+
+        let (store, store_client, _h) = spawn_mock_store_with_client().await.unwrap();
+
+        // Pre-fill drv_cache with 3 entries (distinct keys).
+        let mut drv_cache = HashMap::new();
+        for i in 0..3 {
+            let (sp, drv) = parse_drv(&format!("cached{i}"));
+            drv_cache.insert(sp, drv);
+        }
+
+        // Two cache-miss paths. Neither is in drv_cache nor in MockStore
+        // — but the gate must fire before any fetch.
+        let (miss_a, _) = parse_drv("miss-a");
+        let (miss_b, _) = parse_drv("miss-b");
+
+        let err = resolve_derivations_batch(vec![miss_a, miss_b], &store_client, &mut drv_cache)
+            .await
+            .expect_err("3 cached + 2 miss > cap=4 must reject pre-fetch");
+
+        let gw_err = err.downcast_ref::<GatewayError>().expect("GatewayError");
+        match gw_err {
+            GatewayError::DrvCacheFull { count, cap } => {
+                assert_eq!(*count, 5, "count = drv_cache.len() + to_fetch.len()");
+                assert_eq!(*cap, 4);
+            }
+            other => panic!("expected DrvCacheFull, got {other:?}"),
+        }
+
+        // Structural proof: rejection happened BEFORE fetch. MockStore
+        // records every GetPath's manifest_hint — empty ⇒ never called.
+        assert!(
+            store.calls.get_path_hints.read().unwrap().is_empty(),
+            "gate must reject BEFORE any GetPath — pre-fix this was non-empty \
+             (fetch happened, then insert_drv_bounded errored)"
+        );
+    }
 }
