@@ -38,7 +38,7 @@ use tokio::runtime::Handle;
 use tracing::instrument;
 
 use super::NixStoreFs;
-use super::cache::{Cache, FetchClaim, InflightEntry};
+use super::cache::{Cache, FetchClaim, FetchGuard, InflightEntry};
 use super::circuit::CircuitBreaker;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
@@ -93,19 +93,24 @@ impl tokio::io::AsyncWrite for SyncSpool {
 
 /// Per-slice wait for the `WaitFor` arm's condvar heartbeat. NOT a deadline:
 /// after each slice we check whether the fetcher finished and loop if not. The
-/// real deadline is `fetch_timeout + WAIT_SLOP` (see `wait_deadline()`). 30s
-/// in prod for visible debug logs on slow fetches; 200ms in tests so the
-/// concurrent-waiter test runs in under a second.
+/// real bound is on STALENESS (`InflightEntry::stale_for() >= wait_deadline`),
+/// not total elapsed — see `wait_for_fetcher`. 30s in prod for visible debug
+/// logs on slow fetches; 200ms in tests so the concurrent-waiter tests run in
+/// under a second.
 #[cfg(not(test))]
 const WAIT_SLICE: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const WAIT_SLICE: Duration = Duration::from_millis(200);
 
-/// Slop added to `fetch_timeout` for the `WaitFor` loop's deadline. Absorbs
-/// the gap between `block_on` returning and the guard's `Drop` firing. If we
-/// exceed `fetch_timeout + WAIT_SLOP`, the fetcher's own timeout should
-/// already have dropped the guard; something is deeply wrong (executor
-/// starvation?) and EAGAIN is the least-bad errno.
+/// Slop added to `fetch_timeout` for the `WaitFor` loop's STALENESS bound.
+/// `fetch_timeout` is a per-message idle bound on the fetcher's stream
+/// (`r[builder.fuse.fetch-progress-timeout]`); a single attempt either
+/// streams within that bound or trips DeadlineExceeded → guard drops →
+/// waiter wakes via condvar before this check matters. The fetcher
+/// heartbeats the entry on each retry, so a healthy retry loop never goes
+/// stale past `fetch_timeout + WAIT_SLOP`. If staleness DOES exceed that,
+/// the fetcher is genuinely wedged (executor starvation?) and EAGAIN is
+/// the least-bad errno.
 const WAIT_SLOP: Duration = Duration::from_secs(30);
 
 /// Minimum expected store→builder throughput for JIT fetch-timeout
@@ -270,14 +275,16 @@ impl NixStoreFs {
         self.circuit.check()?;
 
         match self.cache.try_start_fetch(store_basename) {
-            FetchClaim::Fetch(_guard) => {
-                // We own the fetch. _guard notifies waiters on drop (success,
-                // error, or panic). The _permit bounds concurrent FUSE-thread
-                // fetches so at least one thread stays free for hot-path ops.
+            FetchClaim::Fetch(guard) => {
+                // We own the fetch. `guard` notifies waiters on drop (success,
+                // error, or panic) and is heartbeat by the retry loop so
+                // waiters bound staleness, not total elapsed. The _permit
+                // bounds concurrent FUSE-thread fetches so at least one
+                // thread stays free for hot-path ops.
                 //
                 // Permit is acquired AFTER the singleflight claim, so waiters
                 // for this path don't contend for a permit — they're parked
-                // on _guard's condvar, which is a cheap sleep, not a block_on.
+                // on `guard`'s condvar, which is a cheap sleep, not a block_on.
                 // If acquire() blocks here, we're the (fuse_threads)th
                 // concurrent fetch; the builder that triggered this lookup
                 // waits, which is the lesser evil vs. starving warm builds.
@@ -286,6 +293,7 @@ impl NixStoreFs {
                     &self.cache,
                     &self.clients,
                     &self.runtime,
+                    &guard,
                     fetch_timeout,
                     store_basename,
                 );
@@ -315,36 +323,40 @@ impl NixStoreFs {
                 Ok(p)
             }
             FetchClaim::WaitFor(entry) => {
-                // Another thread is fetching. The fetcher has `fetch_timeout`
-                // to finish; a single wait(30s) returning false means "slow",
-                // not "dead" — the guard's Drop fires even on panic, so a
-                // truly dead fetcher would have notified. We loop wait() as a
-                // heartbeat and bound the TOTAL wait at fetch_timeout + slop.
-                // If we exceed that, the fetcher's own timeout should already
-                // have fired and dropped the guard; something is deeply wrong
-                // (executor starvation?) and EAGAIN is the least-bad errno.
+                // Another thread is fetching. A single wait(30s) returning
+                // false means "slow", not "dead" — the guard's Drop fires
+                // even on panic, so a truly dead fetcher would have
+                // notified. We loop wait() as a heartbeat and bound
+                // STALENESS (time since the fetcher last heartbeat
+                // progress) at `fetch_timeout + WAIT_SLOP`. The fetcher
+                // heartbeats on each retry-loop iteration; a healthy
+                // fetcher recovering through a store rolling-restart can
+                // run for several × `fetch_timeout` total but never goes
+                // stale past one attempt's idle bound.
                 //
-                // The fetcher MAY have a different (e.g. JIT size-scaled)
-                // timeout than this waiter; we wait for OUR `fetch_timeout`
-                // + slop. A waiter with a shorter budget may EAGAIN while a
-                // long-budget fetcher is still healthy — acceptable, the
-                // kernel re-issues the lookup and the next attempt sees the
-                // populated cache.
-                self.wait_for_fetcher(&entry, store_basename, fetch_timeout)
+                // ops.rs's `KnownInput` Err arm hard-remaps every errno to
+                // EIO (overlay must not negative-cache), so EAGAIN here
+                // surfaces as build failure; the staleness bound MUST
+                // outlast any single healthy attempt.
+                self.wait_for_fetcher(&entry, store_basename, fetch_timeout + WAIT_SLOP)
             }
         }
     }
 
-    /// Park on the singleflight condvar until the fetcher finishes or
-    /// `fetch_timeout + WAIT_SLOP` passes. See the `WaitFor` arm in
-    /// `ensure_cached_with_timeout`.
+    /// Park on the singleflight condvar until the fetcher finishes or it
+    /// goes stale past `wait_deadline` (no heartbeat for that long). See
+    /// the `WaitFor` arm in `ensure_cached_with_timeout`.
+    ///
+    /// `wait_deadline` bounds [`InflightEntry::stale_for`], NOT total
+    /// elapsed. The caller computes it as `fetch_timeout + WAIT_SLOP`
+    /// (matching the fetcher's per-attempt idle bound); tests pass a
+    /// short value directly.
     fn wait_for_fetcher(
         &self,
         entry: &InflightEntry,
         store_basename: &str,
-        fetch_timeout: Duration,
+        wait_deadline: Duration,
     ) -> Result<PathBuf, Errno> {
-        let wait_deadline = fetch_timeout + WAIT_SLOP;
         let started = std::time::Instant::now();
         loop {
             if entry.wait(WAIT_SLICE) {
@@ -356,17 +368,20 @@ impl NixStoreFs {
                 // guard dropped; proceed to the cache check.
                 break;
             }
-            if started.elapsed() >= wait_deadline {
+            let stale = entry.stale_for();
+            if stale >= wait_deadline {
                 tracing::warn!(
                     store_path = store_basename,
                     waited_secs = started.elapsed().as_secs(),
-                    "fetcher exceeded fetch_timeout + slop; returning EAGAIN"
+                    stale_secs = stale.as_secs(),
+                    "fetcher stale past fetch_timeout + slop (no heartbeat); returning EAGAIN"
                 );
                 return Err(Errno::EAGAIN);
             }
             tracing::debug!(
                 store_path = store_basename,
                 waited_secs = started.elapsed().as_secs(),
+                stale_secs = stale.as_secs(),
                 "waiting on concurrent fetch (fetcher still working)"
             );
         }
@@ -455,16 +470,22 @@ pub fn prefetch_path_blocking(
     circuit.check()?;
 
     match cache.try_start_fetch(store_basename) {
-        FetchClaim::Fetch(_guard) => {
-            // We own it. _guard's Drop notifies FUSE waiters (if any
+        FetchClaim::Fetch(guard) => {
+            // We own it. `guard`'s Drop notifies FUSE waiters (if any
             // arrive while we're fetching). Same free-fn delegation
             // as ensure_cached — and the same circuit.record() contract:
             // the singleflight OWNER records, waiters observe. When
             // prefetch wins singleflight and a FUSE thread lands in
             // WaitFor, prefetch's record() is the only feed the breaker
             // gets for that fetch.
-            let result =
-                fetch_extract_insert(cache, clients, runtime, fetch_timeout, store_basename);
+            let result = fetch_extract_insert(
+                cache,
+                clients,
+                runtime,
+                &guard,
+                fetch_timeout,
+                store_basename,
+            );
             match &result {
                 Ok(_) => circuit.record(true),
                 Err(e) if e.code() == Errno::ENOENT.code() => circuit.record(true),
@@ -506,11 +527,12 @@ pub fn prefetch_path_blocking(
 ///
 /// Debug-level span: this is the slow path (cache miss → gRPC + NAR
 /// extract), called at most once per store path per worker lifetime.
-#[instrument(level = "debug", skip(cache, clients, runtime), fields(store_basename = %store_basename))]
+#[instrument(level = "debug", skip(cache, clients, runtime, guard), fields(store_basename = %store_basename))]
 fn fetch_extract_insert(
     cache: &Cache,
     clients: &StoreClients,
     runtime: &Handle,
+    guard: &FetchGuard<'_>,
     fetch_timeout: Duration,
     store_basename: &str,
 ) -> Result<PathBuf, Errno> {
@@ -602,6 +624,7 @@ fn fetch_extract_insert(
         cache,
         clients,
         runtime,
+        guard,
         fetch_timeout,
         &store_path,
         store_basename,
@@ -629,6 +652,7 @@ fn stream_nar_to_spool(
     cache: &Cache,
     clients: &StoreClients,
     runtime: &Handle,
+    guard: &FetchGuard<'_>,
     fetch_timeout: Duration,
     store_path: &str,
     store_basename: &str,
@@ -705,6 +729,14 @@ fn stream_nar_to_spool(
                             );
                             return Err(Errno::EIO);
                         }
+                        // bug_134: heartbeat the inflight entry so
+                        // concurrent WaitFor threads bound STALENESS,
+                        // not total elapsed. A healthy fetcher in this
+                        // retry loop can run for several × fetch_timeout;
+                        // without the heartbeat, waiters give up at
+                        // fetch_timeout+slop and EIO while we're ~20s
+                        // from success.
+                        guard.heartbeat();
                         // I-189: jitter so the herd's retries don't
                         // re-synchronize. Logged backoff is the actual
                         // (jittered) sleep, not the schedule entry.

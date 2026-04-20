@@ -173,7 +173,7 @@ pub async fn collect_nar_stream_to_writer(
     let mut written: u64 = 0;
 
     loop {
-        // r[impl builder.fuse.fetch-progress-timeout]
+        // r[impl builder.fuse.fetch-progress-timeout+2]
         // I-211: per-message idle timeout. Each `stream.message()` is a
         // fresh deadline; receiving any message (Info or NarChunk) is
         // progress. A wall-clock bound on the whole loop would conflate

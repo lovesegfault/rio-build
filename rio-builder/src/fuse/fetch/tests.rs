@@ -458,7 +458,7 @@ async fn test_prefetch_nar_parse_error_returns_eio() {
 /// completes as long as every inter-chunk gap is below the timeout.
 /// 5 chunks × 200ms = 1s total against a 500ms idle bound — pre-I-211
 /// the 500ms wall-clock wrapper aborted at chunk 2-3 → EIO.
-// r[verify builder.fuse.fetch-progress-timeout]
+// r[verify builder.fuse.fetch-progress-timeout+2]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
     let (cache, clients, store, dir, rt, circuit, _srv) = setup_fetch_harness().await;
@@ -501,7 +501,7 @@ async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
 /// trips the idle bound on the FIRST stalled gap → DeadlineExceeded
 /// (non-transient) → EIO without retry. This is the I-165 stuck-store
 /// behavior the idle bound preserves.
-// r[verify builder.fuse.fetch-progress-timeout]
+// r[verify builder.fuse.fetch-progress-timeout+2]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
     let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
@@ -701,12 +701,14 @@ async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
     };
 
     // Park a waiter on the condvar via spawn_blocking (wait_for_fetcher
-    // is sync). fetch_timeout is irrelevant to the path under test —
-    // the guard drop wakes the waiter long before the deadline.
+    // is sync). wait_deadline is irrelevant to the path under test —
+    // the guard drop wakes the waiter long before staleness matters.
     let waiter = {
         let fs = Arc::clone(&fs);
         let bn = basename.clone();
-        tokio::task::spawn_blocking(move || fs.wait_for_fetcher(&entry, &bn, TEST_FETCH_TIMEOUT))
+        tokio::task::spawn_blocking(move || {
+            fs.wait_for_fetcher(&entry, &bn, TEST_FETCH_TIMEOUT + WAIT_SLOP)
+        })
     };
 
     // Let the waiter reach the condvar (one WAIT_SLICE tick is plenty).
@@ -731,6 +733,103 @@ async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
     let cached = cache.get_path(&basename);
     assert!(cached.is_none(), "cache must be empty: {cached:?}");
     drop(dir);
+}
+
+/// bug_134: `wait_for_fetcher` bounds STALENESS (time since the fetcher
+/// last heartbeat), not total elapsed. A fetcher in its retry loop —
+/// healthy, recovering through a store rolling-restart — can run for
+/// several × `fetch_timeout`; concurrent `WaitFor` threads MUST NOT
+/// abandon it as long as it keeps heartbeating. Before the fix, the
+/// waiter checked `started.elapsed()` and gave up at `wait_deadline`
+/// regardless of fetcher progress.
+///
+/// Mechanism: take the Fetch claim manually, spawn a waiter with a
+/// short `wait_deadline`, sleep past it in TOTAL but heartbeat every
+/// slice so staleness stays under it, then commit + drop guard. Waiter
+/// must return `Ok`.
+// r[verify builder.fuse.fetch-progress-timeout+2]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wait_for_fetcher_survives_retry_heartbeat() {
+    let (cache, clients, _store, dir, rt, _circuit, _srv) = setup_fetch_harness().await;
+    let fs = make_fs(Arc::clone(&cache), clients, rt, 4);
+
+    let basename = test_store_basename("heartbeat");
+
+    let FetchClaim::Fetch(guard) = cache.try_start_fetch(&basename) else {
+        panic!("first claim must be Fetch");
+    };
+    let FetchClaim::WaitFor(entry) = cache.try_start_fetch(&basename) else {
+        panic!("second claim must be WaitFor");
+    };
+
+    // wait_deadline = 400ms. WAIT_SLICE in cfg(test) is 200ms, so the
+    // waiter checks staleness at ~200ms, ~400ms, ~600ms.
+    let wait_deadline = Duration::from_millis(400);
+    let waiter = {
+        let fs = Arc::clone(&fs);
+        let bn = basename.clone();
+        tokio::task::spawn_blocking(move || fs.wait_for_fetcher(&entry, &bn, wait_deadline))
+    };
+
+    // Total ~700ms > wait_deadline, but heartbeat every 300ms keeps
+    // staleness ≤ ~300ms < 400ms at every check.
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    guard.heartbeat();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    guard.heartbeat();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Commit + drop: waiter wakes via condvar, finds cache populated.
+    cache.insert(&basename);
+    drop(guard);
+
+    let result = waiter.await.expect("join");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed > wait_deadline,
+        "test precondition: total elapsed ({elapsed:?}) must exceed \
+         wait_deadline ({wait_deadline:?}) or this isn't proving the \
+         total-elapsed bound is gone"
+    );
+    let path = result.unwrap_or_else(|e| {
+        panic!(
+            "waiter MUST survive a heartbeating fetcher past wait_deadline; \
+             before bug_134 fix it returned EAGAIN at ~{wait_deadline:?}: {e:?}"
+        )
+    });
+    assert_eq!(path, dir.path().join(&basename));
+}
+
+/// bug_134 negative case: a fetcher that NEVER heartbeats (genuinely
+/// wedged) IS abandoned once staleness exceeds `wait_deadline`. The
+/// staleness bound preserves the wedged-fetcher escape; only the
+/// healthy-retry case is what changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wait_for_fetcher_wedged_no_heartbeat_eagain() {
+    let (cache, clients, _store, _dir, rt, _circuit, _srv) = setup_fetch_harness().await;
+    let fs = make_fs(Arc::clone(&cache), clients, rt, 4);
+
+    let basename = test_store_basename("wedged");
+    let FetchClaim::Fetch(guard) = cache.try_start_fetch(&basename) else {
+        panic!("first claim must be Fetch");
+    };
+    let FetchClaim::WaitFor(entry) = cache.try_start_fetch(&basename) else {
+        panic!("second claim must be WaitFor");
+    };
+
+    // wait_deadline = 300ms; WAIT_SLICE = 200ms → waiter checks staleness
+    // at ~200ms (300 > 200, not yet) and ~400ms (stale ≈ 400 ≥ 300).
+    let wait_deadline = Duration::from_millis(300);
+    let waiter = {
+        let fs = Arc::clone(&fs);
+        let bn = basename.clone();
+        tokio::task::spawn_blocking(move || fs.wait_for_fetcher(&entry, &bn, wait_deadline))
+    };
+
+    let result = waiter.await.expect("join");
+    let err = result.expect_err("wedged fetcher (no heartbeat) → EAGAIN");
+    assert_eq!(err.code(), Errno::EAGAIN.code());
+    drop(guard);
 }
 
 /// `ensure_cached` with a stale index row (file rm'd, SQLite row intact)
@@ -878,26 +977,23 @@ async fn test_prefetch_skipped_when_circuit_open() {
     );
 }
 
-/// bug_363: a thread that observed `get_path() == None`, was preempted past
-/// another thread's commit tail (rename → cache.insert → guard-drop), and
-/// then enters `try_start_fetch` MUST NOT re-fetch. Before the fix it got
-/// `Fetch` (inflight Vacant), re-downloaded, hit ENOTEMPTY on rename →
-/// spurious EIO + false circuit.record(false). The fix re-checks `cached`
-/// under the `inflight` lock → `AlreadyCached` → `PrefetchSkip`.
+/// bug_363 observable behavior at the `prefetch_path_blocking` boundary:
+/// a path already in `cached` MUST short-circuit to `AlreadyCached`
+/// without contacting gRPC or touching the breaker. NOTE: this exercises
+/// the mod.rs:446 fast-path, NOT the `try_start_fetch` TOCTOU re-check
+/// (the synchronous `cache.insert` below means `get_path()` hits before
+/// `try_start_fetch` is reached). The re-check itself is regression-
+/// covered by `cache::tests::test_try_start_fetch_after_insert_returns_already_cached`
+/// — do not delete that test as "redundant with this one".
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_commit_then_claim_no_refetch() {
     let (cache, clients, store, _dir, rt, circuit, _srv) = setup_fetch_harness().await;
-    // Arm the store to fail: if the second prefetch DID re-fetch, it
-    // would hit gRPC and we'd see retry backoff. AlreadyCached skips
-    // gRPC entirely.
+    // Arm the store to fail: if prefetch DID reach gRPC, we'd see retry
+    // backoff. AlreadyCached skips gRPC entirely.
     store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
     let basename = test_store_basename("toctou");
-    // Simulate T2's commit tail completing AFTER T1's get_path() miss
-    // but BEFORE T1's try_start_fetch: just insert into the cache index.
-    // T1 (this prefetch) saw get_path() == None at some prior point;
-    // here we model it by calling prefetch with the path already in
-    // `cached` but never having gone through fetch in this process.
+    // Path already committed; prefetch must fast-path skip.
     cache.insert(&basename);
 
     let (c, cl, r, cb, bn) = (
@@ -914,10 +1010,10 @@ async fn test_concurrent_commit_then_claim_no_refetch() {
     .await
     .expect("join");
 
-    // Got AlreadyCached (fast-path or TOCTOU re-check), NOT Err(EIO).
+    // Got AlreadyCached via the fast-path, NOT Err(EIO).
     assert!(
         matches!(result, Ok(Some(PrefetchSkip::AlreadyCached))),
-        "TOCTOU re-check must return AlreadyCached, got {result:?}"
+        "already-cached path must short-circuit to AlreadyCached, got {result:?}"
     );
     // And it was immediate (no gRPC contact).
     assert!(

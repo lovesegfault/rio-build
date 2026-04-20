@@ -14,14 +14,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::IgnorePoison;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-path coordination for in-flight fetches.
 ///
-/// Waiters block on `cv` until `done` flips to true.
+/// Waiters block on `cv` until `done` flips to true. `last_progress`
+/// is bumped by the fetcher's [`FetchGuard::heartbeat`] on each retry
+/// so waiters can bound STALENESS (time since the fetcher last made
+/// progress) rather than total elapsed — see `wait_for_fetcher`.
 pub struct InflightEntry {
     done: Mutex<bool>,
     cv: Condvar,
+    last_progress: Mutex<Instant>,
 }
 
 impl InflightEntry {
@@ -32,8 +36,9 @@ impl InflightEntry {
     /// fires on success, error, and panic alike. `false` means only "still
     /// working after `timeout`." Callers that need to distinguish "slow"
     /// from "dead" should loop on `wait()` while [`Self::is_done`] stays
-    /// `false`; the fetcher's own timeout (`GRPC_STREAM_TIMEOUT`) is the
-    /// real deadline.
+    /// `false` and [`Self::stale_for`] stays under their staleness bound;
+    /// the fetcher's per-message idle timeout (`fuse_fetch_timeout`) is
+    /// the real per-attempt deadline.
     pub fn wait(&self, timeout: Duration) -> bool {
         let done = self.done.lock().ignore_poison();
         let (done, wait_result) = self
@@ -47,6 +52,13 @@ impl InflightEntry {
     /// Use after a timed-out `wait()` to decide whether to wait again.
     pub fn is_done(&self) -> bool {
         *self.done.lock().ignore_poison()
+    }
+
+    /// Time since the fetcher last bumped progress via
+    /// [`FetchGuard::heartbeat`]. Initialized to "now" at claim time, so
+    /// before the first heartbeat this is "time since fetch started."
+    pub fn stale_for(&self) -> Duration {
+        self.last_progress.lock().ignore_poison().elapsed()
     }
 }
 
@@ -72,6 +84,22 @@ pub enum FetchClaim<'a> {
 pub struct FetchGuard<'a> {
     cache: &'a Cache,
     path: String,
+    /// Direct handle to the entry this guard owns, for [`Self::heartbeat`].
+    /// `Drop` still removes via `cache.inflight.remove(path)` (the map is
+    /// the source of truth for `try_start_fetch`); this `Arc` is heartbeat-
+    /// only.
+    entry: Arc<InflightEntry>,
+}
+
+impl FetchGuard<'_> {
+    /// Bump the entry's `last_progress` to now. Called by the fetcher's
+    /// retry loop after a transient failure has been handled and a fresh
+    /// attempt is about to start — signals "still making progress" to
+    /// concurrent `WaitFor` threads so they bound staleness, not total
+    /// elapsed (which the retry loop can legitimately exceed).
+    pub fn heartbeat(&self) {
+        *self.entry.last_progress.lock().ignore_poison() = Instant::now();
+    }
 }
 
 impl Drop for FetchGuard<'_> {
@@ -339,13 +367,16 @@ impl Cache {
         match inflight.entry(store_path.to_string()) {
             Entry::Occupied(e) => FetchClaim::WaitFor(Arc::clone(e.get())),
             Entry::Vacant(e) => {
-                e.insert(Arc::new(InflightEntry {
+                let entry = Arc::new(InflightEntry {
                     done: Mutex::new(false),
                     cv: Condvar::new(),
-                }));
+                    last_progress: Mutex::new(Instant::now()),
+                });
+                e.insert(Arc::clone(&entry));
                 FetchClaim::Fetch(FetchGuard {
                     cache: self,
                     path: store_path.to_string(),
+                    entry,
                 })
             }
         }
