@@ -188,16 +188,28 @@ in
         ManageForeignRoutes = false;
         ManageForeignRoutingPolicyRules = false;
       };
-      # Prefix < "99-default" (systemd's built-in MACAddressPolicy=
-      # persistent catch-all). systemd.link(5) sorts ALL .link files
-      # lexically across /etc and /lib; /etc only masks /lib on
-      # IDENTICAL filenames. The AL2023 port originally named this
-      # 99-default (same-name mask); a later "clarity" rename to
-      # 99-vpc-cni sorted AFTER and silently never applied — cilium's
-      # lxc*/cilium_* veths got MACAddressPolicy=persistent, a known
-      # cilium datapath breaker.
+      # Prefix < "99-default" (systemd's built-in catch-all).
+      # systemd.link(5) sorts ALL .link files lexically across /etc and
+      # /lib; /etc only masks /lib on IDENTICAL filenames, and exactly
+      # ONE .link file applies per interface (first match wins). The
+      # AL2023 port originally named this 99-default (same-name mask); a
+      # later "clarity" rename to 99-vpc-cni sorted AFTER and silently
+      # never applied — cilium's lxc*/cilium_* veths got
+      # MACAddressPolicy=persistent, a known cilium datapath breaker.
+      #
+      # OriginalName MUST be narrowed to cilium-created virtuals only.
+      # 868c291e had `OriginalName = "*"`: that won the sort for the
+      # PRIMARY ENI too, and because this file sets only
+      # MACAddressPolicy (no NamePolicy), it shadowed 99-default's
+      # `NamePolicy=keep kernel database onboard slot path` — primary
+      # ENI stayed `eth0` instead of `ens5`, 80-ec2-primary's
+      # `Name=!eth*` excluded it, no DHCP, node never joined. Secondary
+      # ENIs (eni*) have hardware MACs and don't exist under
+      # cluster-pool IPAM anyway; lxc*/cilium_* covers every interface
+      # cilium creates (per-pod veths, lxc_health, cilium_host/_net/
+      # _wg0/_geneve).
       links."80-rio-mac-none" = {
-        matchConfig.OriginalName = "*";
+        matchConfig.OriginalName = "lxc* cilium_*";
         linkConfig.MACAddressPolicy = "none";
       };
       # DHCP the boot-time ENI; ignore hot-attached secondaries.

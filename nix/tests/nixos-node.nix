@@ -174,16 +174,48 @@ pkgs.testers.runNixOSTest {
         stub = node.succeed("cat /run/systemd/resolve/stub-resolv.conf")
         assert "127.0.0.53" in stub, f"stub no longer loopback (precondition changed):\n{stub}"
 
-    # bug_364: 99-vpc-cni sorted AFTER systemd's built-in 99-default.link
-    # (MACAddressPolicy=persistent catch-all) and never applied. Renamed
-    # to 80-rio-mac-none. udevadm test-builtin prints which .link file
-    # matched; eth0 is the qemu test framework's primary nic.
-    with subtest("MACAddressPolicy=none .link sorts before systemd 99-default"):
+    # bug_364 + 868c291e regression: 80-rio-mac-none had
+    # OriginalName="*", which won the lexical sort for EVERY interface
+    # including the primary ENI. systemd.link(5): exactly one .link
+    # file applies; 80-rio-mac-none sets only MACAddressPolicy, so it
+    # shadowed 99-default's NamePolicy → primary ENI kept kernel name
+    # eth0 → 80-ec2-primary's Name=!eth* excluded it → no DHCP → node
+    # never joined. Match is now narrowed to lxc*/cilium_*. Assert BOTH
+    # directions via udevadm test-builtin (prints which .link matched).
+    #
+    # qemu-vm.nix + test-instrumentation.nix hard-set
+    # usePredictableInterfaceNames=false (net.ifnames=0) so the actual
+    # ens5 rename can't be observed here without breaking the test
+    # framework's own eth1 vlan addressing; the .link-file selection IS
+    # observable and is what determines the EC2 rename.
+    with subtest("primary nic falls through to 99-default (NamePolicy intact)"):
         out = node.succeed(
             "SYSTEMD_LOG_LEVEL=debug udevadm test-builtin net_setup_link "
             "/sys/class/net/eth0 2>&1 || true"
         )
-        assert "80-rio-mac-none.link" in out, f"expected rio .link to apply, got:\n{out}"
+        # Debug output lists every .link as "Parsed configuration file";
+        # match the "is applied" line (the one that won the sort).
+        assert "/99-default.link is applied" in out, (
+            f"primary nic should match systemd's 99-default.link "
+            f"(NamePolicy=...slot path); on EC2 this renames eth0->ens5 "
+            f"so 80-ec2-primary DHCPs it:\n{out}"
+        )
+        assert "80-rio-mac-none.link is applied" not in out, (
+            f"80-rio-mac-none must NOT match the primary nic — would "
+            f"shadow NamePolicy and break DHCP:\n{out}"
+        )
+
+    with subtest("cilium-pattern veth still gets 80-rio-mac-none"):
+        node.succeed("ip link add lxc-probe type veth peer name cilium_probe")
+        for dev in ("lxc-probe", "cilium_probe"):
+            out = node.succeed(
+                "SYSTEMD_LOG_LEVEL=debug udevadm test-builtin net_setup_link "
+                f"/sys/class/net/{dev} 2>&1 || true"
+            )
+            assert "80-rio-mac-none.link is applied" in out, (
+                f"expected rio .link (MACAddressPolicy=none) on {dev}:\n{out}"
+            )
+        node.succeed("ip link del lxc-probe")
 
     # bug_479: local-fs.target does NOT order after udev coldplug of
     # non-fstab block devices. Multi-NVMe instances could enumerate a
