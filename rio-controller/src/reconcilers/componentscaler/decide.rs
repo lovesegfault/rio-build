@@ -207,16 +207,21 @@ pub fn decide(
         None => (predicted, ratio_in, status.low_load_ticks),
     };
 
-    // Clamp. Defensive min>max swap and >=0 floor (CEL enforces both,
+    // Clamp. Defensive min>max swap and ≥0 floor (CEL enforces both,
     // but a pre-CEL CRD or --validate=false bypass would panic on
     // i32::clamp / patch the /scale subresource with a negative value
     // → 422 → reconciler error-loops with no apply-time feedback).
+    // Floor the BOUNDS once here so every `clamp(min,max)` /
+    // `.min(max)` downstream is intrinsically ≥0 — avoids re-applying
+    // `.max(0)` at each producer site (one of three was missed and
+    // leaked −2 through the stabilized branch; bug_027).
     let (min, max) = if spec.replicas.min > spec.replicas.max {
         (spec.replicas.max, spec.replicas.min)
     } else {
         (spec.replicas.min, spec.replicas.max)
     };
-    let mut desired = raw_desired.clamp(min, max).max(0);
+    let (min, max) = (min.max(0), max.max(0));
+    let mut desired = raw_desired.clamp(min, max);
 
     // Scale-down safety: 5m stabilization since last UP, then max
     // −1/tick.
@@ -225,7 +230,7 @@ pub fn decide(
             .map(|d| d >= SCALE_DOWN_STABILIZATION)
             .unwrap_or(true);
         if !stabilized {
-            desired = current.clamp(min, max).max(0);
+            desired = current.clamp(min, max);
         } else {
             // `.min(max)`: `current` is the OBSERVED Deployment
             // replicas, not bounded by [min,max] (operator lowered
@@ -233,8 +238,7 @@ pub fn decide(
             // exceed `max`; re-clamp so `Decision.desired`'s
             // "already clamped" contract holds. `saturating_sub`:
             // `current=0` underflow guard (currently unreachable —
-            // branch entered only when `desired ≥ min ≥ 0` and
-            // `desired < current`).
+            // `desired ≥ 0` by floor above and `desired < current`).
             desired = desired
                 .max(current.saturating_sub(MAX_SCALE_DOWN_STEP))
                 .min(max);
@@ -347,7 +351,7 @@ mod tests {
             d.desired
         );
         assert_eq!(d.desired, 0);
-        // Scale-down stabilization branch must also floor: current=3,
+        // Scale-down !stabilized branch must also floor: current=3,
         // not-yet-stabilized → would otherwise re-clamp into [-5,-2].
         let d = decide(
             &s,
@@ -357,7 +361,20 @@ mod tests {
             None,
             Some(std::time::Duration::from_secs(1)),
         );
-        assert!(d.desired >= 0, "stabilization branch leaked {}", d.desired);
+        assert!(d.desired >= 0, "!stabilized branch leaked {}", d.desired);
+        // bug_027 regression: STABILIZED scale-down branch (≥300s) was
+        // the one site missing the floor — `.min(max)` with max=-2
+        // dragged desired to -2. Floor-at-bounds chokepoint covers it.
+        let d = decide(
+            &s,
+            &status(None, 0),
+            3,
+            100,
+            None,
+            Some(std::time::Duration::from_secs(360)),
+        );
+        assert!(d.desired >= 0, "stabilized branch leaked {}", d.desired);
+        assert_eq!(d.desired, 0);
     }
 
     /// High load: +1 over current AND ratio decays. Asymmetric —
