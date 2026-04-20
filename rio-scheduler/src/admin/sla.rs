@@ -87,11 +87,13 @@ pub(super) fn status_from_fit(
     SlaStatusResponse {
         has_fit: true,
         fit_kind: fit_kind.into(),
-        s,
+        // Same 0.0 sentinel for non-finite f64 as `p_bar`/`mem_p90`:
+        // `DurationFit::Probe.spq()` is `(∞, 0, 0)`; protojson encodes
+        // ∞ as the string `"Infinity"`, serde_json as `null` — either
+        // breaks the all-numeric output shape.
+        s: if s.is_finite() { s } else { 0.0 },
         p,
         q,
-        // Same sentinel for the proto field: protojson serializes
-        // f64::INFINITY as the non-standard string "Infinity".
         p_bar: if p_bar.is_finite() { p_bar } else { 0.0 },
         mem_kind: mem_kind.into(),
         mem_p90_bytes: mem_p90,
@@ -188,6 +190,27 @@ mod tests {
         );
         assert_eq!(r.mem_kind, "Coupled");
         assert_eq!(r.fit_kind, "Amdahl");
+    }
+
+    /// Regression for bug_037: `DurationFit::Probe.spq()` returns
+    /// `(∞, 0, 0)`. Before the fix, `s` was written raw → serde_json
+    /// emitted `"s": null` while `p_bar` (same ∞ source) was guarded to
+    /// `0.0`. Probe is the universal cold-start state; every freshly-
+    /// onboarded pname hit this.
+    #[test]
+    fn status_from_fit_probe_finite_s() {
+        let f = FittedParams {
+            fit: DurationFit::Probe,
+            mem: MemFit::Independent {
+                p90: crate::sla::types::MemBytes(100),
+            },
+            ..amdahl_coupled()
+        };
+        let r = status_from_fit(Some(&f), None);
+        assert!(r.has_fit);
+        assert_eq!(r.fit_kind, "Probe");
+        assert_eq!(r.s, 0.0, "Probe spq() s=∞ → 0.0 sentinel");
+        assert_eq!(r.p_bar, 0.0, "p̄=∞ → 0.0 sentinel (same convention)");
     }
 
     /// Finite p̄ (Capped) + Coupled → mem evaluated at p̄, not sentineled.
