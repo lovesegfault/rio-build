@@ -32,6 +32,16 @@ pub fn is_verbose() -> bool {
     *LEVEL.get().unwrap_or(&LevelFilter::WARN) >= LevelFilter::INFO
 }
 
+/// EnvFilter directive string for `level`. xtask is FLOORED at info
+/// (not pinned): target directives win by specificity, so a literal
+/// `xtask=info` would override the global `debug`/`trace` and `-vv`
+/// would never show argv logging from `sh.rs`. Runtime internals stay
+/// capped at info (their trace floods).
+fn build_filter_directive(level: LevelFilter) -> String {
+    let xtask_lvl = level.max(LevelFilter::INFO);
+    format!("{level},xtask={xtask_lvl},tokio=info,runtime=info,mio=info,h2=info")
+}
+
 /// Initialize tracing. Call once from main(). Stock compact fmt to
 /// stderr, env-filter (`RUST_LOG` overrides the flag), span-close
 /// events so `step()` boundaries show up. xtask itself stays at info
@@ -39,11 +49,8 @@ pub fn is_verbose() -> bool {
 /// -vvv (their trace floods).
 pub fn init(level: LevelFilter) {
     LEVEL.set(level).ok();
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(format!(
-            "{level},xtask=info,tokio=info,runtime=info,mio=info,h2=info"
-        ))
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(build_filter_directive(level)));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -199,4 +206,26 @@ where
         tokio::time::sleep(interval).await;
     }
     bail!("timed out after {max} attempts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xtask_directive_floors_at_info() {
+        // Default verbosity (Warn) bumps xtask to info so step() spans show.
+        assert!(build_filter_directive(LevelFilter::WARN).contains("xtask=info"));
+    }
+
+    #[test]
+    fn xtask_directive_scales_with_vv() {
+        // -vv → Debug: xtask must follow (argv logging in sh.rs is debug!).
+        // A literal `xtask=info` would pin and `-vv` would never show argv.
+        let d = build_filter_directive(LevelFilter::DEBUG);
+        assert!(d.contains("xtask=debug"), "{d}");
+        assert!(!d.contains("xtask=info"), "{d}");
+        // -vvv → Trace.
+        assert!(build_filter_directive(LevelFilter::TRACE).contains("xtask=trace"));
+    }
 }
