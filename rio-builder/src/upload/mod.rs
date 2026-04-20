@@ -1231,4 +1231,24 @@ mod tests {
         let r = common::await_dump_bounded("test-dump", Duration::from_secs(10), h).await;
         assert_eq!(r.expect("ok"), 42);
     }
+
+    /// bug_129/137: post-rx-drop join must wait ONLY `DUMP_JOIN_SLACK`,
+    /// not budget+slack — the budget was already spent concurrently with
+    /// the gRPC await. Under paused time, assert the timeout fires at
+    /// exactly 30s (not 330s / not 4830s).
+    #[tokio::test(start_paused = true)]
+    async fn test_await_dump_after_rx_drop_only_slack() {
+        let start = tokio::time::Instant::now();
+        let h: tokio::task::JoinHandle<()> = tokio::spawn(std::future::pending());
+        let r = common::await_dump_after_rx_drop("test", h).await;
+        assert_eq!(
+            r.expect_err("must time out").code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert_eq!(
+            start.elapsed(),
+            common::DUMP_JOIN_SLACK,
+            "post-rx-drop join must NOT re-wait the gRPC budget"
+        );
+    }
 }

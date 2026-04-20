@@ -13,8 +13,8 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use super::UploadError;
 use super::common::{
-    DUMP_JOIN_SLACK, PreparedOutput, STREAM_CHANNEL_BUF, attach_assignment_token, spawn_dump_tee,
-    trailer_mode_path_info, uploaded_info,
+    PreparedOutput, STREAM_CHANNEL_BUF, attach_assignment_token, await_dump_after_rx_drop,
+    spawn_dump_tee, trailer_mode_path_info, uploaded_info,
 };
 
 /// Per-NAR stream budget × N outputs, capped at `MAX_BATCH_OUTPUTS` so a
@@ -133,18 +133,10 @@ pub(super) async fn upload_outputs_batch(
     // forever — the outer rx-drop from the gRPC timeout is invisible at
     // those await points. The blocking thread leaks (tokio limitation);
     // the worker regains control and fails the build instead of hanging.
+    // Producer already had `batch_timeout` of wall-clock concurrently with
+    // the gRPC await above, so only `DUMP_JOIN_SLACK` is needed here.
     // Same error-priority logic as do_upload_streaming: gRPC error wins.
-    let producer_result = tokio::time::timeout(batch_timeout + DUMP_JOIN_SLACK, producer)
-        .await
-        .map_err(|_| {
-            tonic::Status::deadline_exceeded(format!(
-                "batch producer stuck after {}s (disk read hung? FIFO in $out?)",
-                (batch_timeout + DUMP_JOIN_SLACK).as_secs()
-            ))
-        })
-        .and_then(|j| {
-            j.map_err(|e| tonic::Status::internal(format!("batch producer panicked: {e}")))
-        });
+    let producer_result = await_dump_after_rx_drop("batch producer", producer).await;
 
     let resp = put_result.map_err(batch_err)?;
     let hashes = producer_result.and_then(|r| r).map_err(batch_err)?;

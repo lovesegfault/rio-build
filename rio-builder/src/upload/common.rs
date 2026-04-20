@@ -23,9 +23,10 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use super::UploadError;
 
-/// Slack added to a join-timeout beyond the operation's own budget, so the
-/// inner timeout (gRPC) fires first and the join-timeout only catches the
-/// "blocking thread parked in syscall" case.
+/// Post-rx-drop join window: covers scheduler latency for the
+/// "rx-drop observed" case and bounds the "parked in syscall" case to a
+/// value the operator will see before pod deadlines fire
+/// (`activeDeadlineSeconds` etc.).
 pub(crate) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
 
 /// Await a `spawn_blocking` dump `JoinHandle` with a deadline. On timeout
@@ -33,12 +34,17 @@ pub(crate) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
 /// non-abortable); the worker regains control and fails the build instead
 /// of hanging.
 ///
-/// `budget` is the operation's own timeout (e.g. `GRPC_STREAM_TIMEOUT`);
-/// [`DUMP_JOIN_SLACK`] is added so the inner timeout fires first under
-/// normal operation. This guard is for the case where the blocking thread
-/// is parked in `open(2)`/`read(2)` (FIFO in `$out`, wedged FUSE/overlay,
-/// suspended dm device) and never reaches `blocking_send` to observe
-/// rx-drop.
+/// **Use ONLY when this is the operation's primary timeout** (no
+/// preceding bounded await ran concurrently with the handle): `budget`
+/// is the operation's own timeout, [`DUMP_JOIN_SLACK`] is added on top.
+/// If a bounded gRPC await has already run concurrently with the dump,
+/// use [`await_dump_after_rx_drop`] instead — re-waiting `budget` here
+/// would double-count it (the dump task already had `budget` of
+/// wall-clock).
+///
+/// This guard is for the case where the blocking thread is parked in
+/// `open(2)`/`read(2)` (FIFO in `$out`, wedged FUSE/overlay, suspended dm
+/// device) and never reaches `blocking_send` to observe rx-drop.
 pub(crate) async fn await_dump_bounded<T>(
     what: &'static str,
     budget: Duration,
@@ -51,6 +57,36 @@ pub(crate) async fn await_dump_bounded<T>(
             tonic::Status::deadline_exceeded(format!(
                 "{what} stuck after {}s (disk read hung? FIFO in $out?)",
                 deadline.as_secs()
+            ))
+        })?
+        .map_err(|e| tonic::Status::internal(format!("{what} panicked: {e}")))
+}
+
+/// Await a dump `JoinHandle` AFTER its consumer `rx` has been dropped
+/// (i.e. after a bounded gRPC await that ran concurrently with the dump
+/// has returned). Waits only [`DUMP_JOIN_SLACK`].
+///
+/// At this point the dump task is in exactly one of:
+///   (a) **finished** — joins instantly;
+///   (b) **at a `blocking_send`/`tx.send`** — sees rx-drop, returns in ms;
+///   (c) **parked in `open(2)`/`read(2)`** — never progresses; no finite
+///       timeout helps it complete.
+///
+/// Nothing needs the gRPC budget (the dump already had that wall-clock
+/// concurrently); only the slack is meaningful. Re-waiting the budget
+/// here doubles the wedged-read hang — at `batch_timeout = 300s × 16`
+/// that exceeds `activeDeadlineSeconds` and the pod is SIGKILLed before
+/// the diagnostic ever reaches the CompletionReport.
+pub(crate) async fn await_dump_after_rx_drop<T>(
+    what: &'static str,
+    handle: tokio::task::JoinHandle<T>,
+) -> Result<T, tonic::Status> {
+    tokio::time::timeout(DUMP_JOIN_SLACK, handle)
+        .await
+        .map_err(|_| {
+            tonic::Status::deadline_exceeded(format!(
+                "{what} stuck {}s after rx dropped (disk read hung? FIFO in $out?)",
+                DUMP_JOIN_SLACK.as_secs()
             ))
         })?
         .map_err(|e| tonic::Status::internal(format!("{what} panicked: {e}")))

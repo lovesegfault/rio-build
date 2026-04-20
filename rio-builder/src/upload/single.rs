@@ -15,7 +15,7 @@ use rio_proto::validated::ValidatedPathInfo;
 use super::UploadError;
 use super::common::{
     MAX_UPLOAD_RETRIES, PreparedOutput, STREAM_CHANNEL_BUF, UPLOAD_BACKOFF,
-    attach_assignment_token, await_dump_bounded, spawn_dump_tee, trailer_mode_path_info,
+    attach_assignment_token, await_dump_after_rx_drop, spawn_dump_tee, trailer_mode_path_info,
     uploaded_info,
 };
 
@@ -284,15 +284,11 @@ async fn do_upload_streaming(
     //       BrokenPipe. Await that.
     //   (c) put_path timed out AND dump_task is parked in read()/open()
     //       → it never reaches blocking_send, never observes rx-drop.
-    //       `await_dump_bounded` fires after GRPC_STREAM_TIMEOUT + slack;
+    //       `await_dump_after_rx_drop` fires `DUMP_JOIN_SLACK` after rx
+    //       drops (the gRPC budget was already spent concurrently above);
     //       the blocking thread leaks (tokio limitation) but the worker
     //       regains control.
-    let dump_result = await_dump_bounded(
-        "dump task",
-        rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        dump_task,
-    )
-    .await?;
+    let dump_result = await_dump_after_rx_drop("dump task", dump_task).await?;
 
     // Error priority: if BOTH failed, surface the gRPC error (it's the
     // one the operator cares about — "store unreachable" is more useful
