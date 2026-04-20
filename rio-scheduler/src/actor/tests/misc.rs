@@ -1536,3 +1536,115 @@ async fn try_log_flush_silent_on_closed() {
         "Closed must not warn 'channel full'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// handle_watch_build / build_options_for_derivation regressions
+// ---------------------------------------------------------------------------
+
+/// `handle_watch_build` on a missing build with a tenant caller MUST
+/// return `BuildNotFound`, matching `handle_cancel_build` /
+/// `handle_query_build_status`. Pre-fix it collapsed lookup+tenant-
+/// check into one expression: `builds.get(b).map(|b| b.tenant_id) !=
+/// Some(caller)` is `true` when the lookup is `None`, so a tenant
+/// caller got `PermissionDenied` while an admin caller (`None`) got
+/// `BuildNotFound` for the SAME missing build.
+// r[verify sched.tenant.authz]
+#[tokio::test]
+async fn watch_build_missing_returns_not_found_for_tenant() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor(db.pool.clone());
+    let missing = Uuid::new_v4();
+    let tenant = Some(Uuid::new_v4());
+
+    let watch = actor.handle_watch_build(missing, tenant);
+    assert!(
+        matches!(watch, Err(ActorError::BuildNotFound(b)) if b == missing),
+        "tenant caller on missing build → BuildNotFound, got {:?}",
+        watch.as_ref().err()
+    );
+    // Sibling agreement: same input → same error variant.
+    let query = actor.handle_query_build_status(missing, tenant);
+    assert!(
+        matches!(query, Err(ActorError::BuildNotFound(_))),
+        "siblings already return BuildNotFound"
+    );
+    // Admin caller on missing build → BuildNotFound (unchanged).
+    assert!(matches!(
+        actor.handle_watch_build(missing, None),
+        Err(ActorError::BuildNotFound(_))
+    ));
+}
+
+/// `build_options_for_derivation` build_cores merge: per
+/// build_types.proto:307, `build_cores=0` means "all" — the MOST
+/// permissive value. Pre-fix `.max()` made `max(0,4)=4`, so a client
+/// requesting 0=all lost to any positive value, contradicting the
+/// "more permissive wins" comment.
+#[tokio::test]
+async fn build_options_merge_zero_cores_is_all() {
+    use crate::state::BuildInfo;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("h", None, "x86_64-linux", false);
+
+    let mut mk = |cores: u64| {
+        let bid = Uuid::new_v4();
+        let info = BuildInfo::new_pending(
+            bid,
+            None,
+            PriorityClass::Scheduled,
+            false,
+            BuildOptions {
+                build_cores: cores,
+                ..Default::default()
+            },
+            std::iter::once(DrvHash::from("h")).collect(),
+        );
+        actor.builds.insert(bid, info);
+        actor
+            .dag
+            .node_mut("h")
+            .unwrap()
+            .interested_builds
+            .insert(bid);
+    };
+    mk(4);
+    mk(0);
+
+    let opts = actor.build_options_for_derivation(&DrvHash::from("h"));
+    assert_eq!(
+        opts.build_cores, 0,
+        "0 = all = most permissive, sticky once any interested build sets it"
+    );
+
+    // Positive-only merge still picks max.
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("h2", None, "x86_64-linux", false);
+    let mut mk2 = |cores: u64| {
+        let bid = Uuid::new_v4();
+        actor.builds.insert(
+            bid,
+            BuildInfo::new_pending(
+                bid,
+                None,
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions {
+                    build_cores: cores,
+                    ..Default::default()
+                },
+                std::iter::once(DrvHash::from("h2")).collect(),
+            ),
+        );
+        actor
+            .dag
+            .node_mut("h2")
+            .unwrap()
+            .interested_builds
+            .insert(bid);
+    };
+    mk2(4);
+    mk2(8);
+    let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
+    assert_eq!(opts.build_cores, 8, "all-positive → max");
+}

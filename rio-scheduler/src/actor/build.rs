@@ -310,12 +310,17 @@ impl DagActor {
         build_id: Uuid,
         caller_tenant: Option<Uuid>,
     ) -> Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError> {
+        let build = self
+            .builds
+            .get(&build_id)
+            .ok_or(ActorError::BuildNotFound(build_id))?;
         // r[impl sched.tenant.authz]
-        if caller_tenant.is_some()
-            && self.builds.get(&build_id).map(|b| b.tenant_id) != Some(caller_tenant)
-        {
+        if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
         }
+        // builds and events.channels are removed together
+        // (handle_cleanup_terminal_build); the second lookup is
+        // defense-in-depth.
         let tx = self
             .events
             .channels
@@ -569,11 +574,14 @@ impl DagActor {
     ///
     /// Ordering is dry-run validate → DB write → in-memory mutate.
     /// A transient DB error therefore leaves in-memory unchanged
-    /// (`is_terminal()` stays false), so the next `check_build_completion`
-    /// retries cleanly. The previous order (in-mem first) self-defeated
-    /// retry: in-mem went terminal, the `?` propagated, every caller
-    /// swallowed with `error!()`, and re-calling on an already-terminal
-    /// build returns `Rejected` — gateway `WatchBuild` hung forever.
+    /// (`is_terminal()` stays false), so a re-call retries cleanly.
+    /// `tick_recheck_stuck_completions` is the retry DRIVER — every
+    /// other `check_build_completion` caller is event-driven, and after
+    /// the last derivation completes there are no more events. The
+    /// previous order (in-mem first) self-defeated retry: in-mem went
+    /// terminal, the `?` propagated, every caller swallowed with
+    /// `error!()`, and re-calling on an already-terminal build returns
+    /// `Rejected` — gateway `WatchBuild` hung forever.
     ///
     /// Callers (complete_build, transition_build_to_failed,
     /// handle_cancel_build) check the outcome and skip side effects on
@@ -732,7 +740,12 @@ impl DagActor {
 
         let mut max_silent_time: u64 = 0;
         let mut build_timeout: u64 = 0;
-        let mut build_cores: u64 = 0;
+        // Option distinguishes "unseen" from "saw 0". Per
+        // build_types.proto:307, build_cores=0 means "all" — the MOST
+        // permissive value. `.max()` would treat it as least-permissive
+        // (`max(0,4)=4` → a client requesting 0=all loses to any
+        // positive value), inverting the "more permissive wins" intent.
+        let mut build_cores: Option<u64> = None;
 
         // Helper: take the minimum of non-zero values; zero means "unset".
         fn min_nonzero(acc: u64, val: u64) -> u64 {
@@ -747,15 +760,20 @@ impl DagActor {
             if let Some(build) = self.builds.get(build_id) {
                 max_silent_time = min_nonzero(max_silent_time, build.options.max_silent_time);
                 build_timeout = min_nonzero(build_timeout, build.options.build_timeout);
-                // For cores, take the max (more cores is more permissive).
-                build_cores = build_cores.max(build.options.build_cores);
+                // 0 = "all cores" (proto:307) — most permissive, sticky
+                // once seen. Otherwise, max of positives.
+                build_cores = Some(match (build_cores, build.options.build_cores) {
+                    (None, v) => v,
+                    (Some(0), _) | (_, 0) => 0,
+                    (Some(a), v) => a.max(v),
+                });
             }
         }
 
         rio_proto::types::BuildOptions {
             max_silent_time,
             build_timeout,
-            build_cores,
+            build_cores: build_cores.unwrap_or(0),
         }
     }
 }
