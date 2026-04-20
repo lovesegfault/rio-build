@@ -78,6 +78,38 @@ let
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
+  # Static RIO_EXECUTOR_TOKEN for standalone workers. In k8s the
+  # scheduler signs ExecutorClaims{intent_id,expiry} per SpawnIntent and
+  # the controller injects it as a pod env var; standalone has no
+  # SpawnIntent flow, so mint one here with intent_id="" (matches the
+  # worker's empty Config.intent_id → heartbeat body check passes) and a
+  # far-future expiry. Signed with the SAME hmac.key the scheduler loads
+  # so require_executor() verifies. Written as a systemd EnvironmentFile
+  # (KEY=value) — NOT readFile-into-env, which would be IFD on the
+  # non-deterministic hmacKeys derivation. r[sec.executor.identity-token].
+  executorTokenEnv =
+    pkgs.runCommand "rio-executor-token-env"
+      {
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
+      ''
+        python3 - ${hmacKeys}/hmac.key > $out <<'EOF'
+        import base64, hashlib, hmac, json, sys
+        key = open(sys.argv[1], "rb").read()
+        # Mirror rio-auth load_key() trailing-newline trim.
+        for suf in (b"\r\n", b"\n"):
+            if key.endswith(suf):
+                key = key[: -len(suf)]
+                break
+        claims = json.dumps(
+            {"intent_id": "", "expiry_unix": 9999999999}, separators=(",", ":")
+        ).encode()
+        sig = hmac.new(key, claims, hashlib.sha256).digest()
+        b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        print(f"RIO_EXECUTOR_TOKEN={b64(claims)}.{b64(sig)}")
+        EOF
+      '';
+
   # ── OTel env ────────────────────────────────────────────────────────
   otelEnv = lib.optionalAttrs withOtel {
     RIO_OTEL_ENDPOINT = "http://localhost:4317";
@@ -191,17 +223,25 @@ let
 
   # ── Worker nodes ────────────────────────────────────────────────────
   # mapAttrs' renames to the worker's hostName while passing through
-  # the scenario's per-worker args + fixture-level OTel.
-  workerNodes = lib.mapAttrs (
-    name: args:
-    common.mkWorkerNode (
-      args
-      // {
-        hostName = name;
-        otelEndpoint = workerOtelEndpoint;
-      }
-    )
-  ) workers;
+  # the scenario's per-worker args + fixture-level OTel. When
+  # withHmac, also mount the static executor-token EnvironmentFile so
+  # rio-builder presents x-rio-executor-token (otherwise the
+  # scheduler's require_executor() rejects the BuildExecution stream
+  # and every heartbeat with Unauthenticated).
+  workerNodes = lib.mapAttrs (name: args: {
+    imports = [
+      (common.mkWorkerNode (
+        args
+        // {
+          hostName = name;
+          otelEndpoint = workerOtelEndpoint;
+        }
+      ))
+    ];
+    systemd.services.rio-builder.serviceConfig.EnvironmentFile = lib.mkIf withHmac [
+      "${executorTokenEnv}"
+    ];
+  }) workers;
 
 in
 {
