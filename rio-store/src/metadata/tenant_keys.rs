@@ -53,6 +53,49 @@ pub async fn get_active_signer(
     Ok(Some(Signer::from_seed(name, &seed)))
 }
 
+/// All unrevoked tenant signing keys as `name:base64(pubkey)` trusted-key
+/// entries (the same string format Nix's `trusted-public-keys` uses, what
+/// [`Signer::trusted_key_entry`] returns, and what
+/// [`crate::signing::any_sig_trusted`] consumes).
+///
+/// Unlike [`get_active_signer`] (newest only — for SIGNING), this returns
+/// EVERY `revoked_at IS NULL` row — for VERIFYING. Key rotation inserts a
+/// new row without revoking the old; paths signed under the old key stay
+/// verifiable until the operator explicitly revokes it. Parity with
+/// cluster-key history (`r[store.key.rotation-cluster-history]`).
+///
+/// Used by `sig_visibility_gate`'s trusted-set construction so a tenant
+/// always sees paths signed by ITS OWN key during the
+/// PutPath→`upsert_path_tenants` window (count=0, gate fires, tenant sig
+/// is the only sig). Without this, `r[store.tenant.sign-key]` +
+/// `r[store.substitute.tenant-sig-visibility]` compose into "tenant gets
+/// `NotFound` for the path it just built".
+pub async fn trusted_key_entries(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<Vec<String>, MetadataError> {
+    let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT key_name, ed25519_seed FROM tenant_keys \
+         WHERE tenant_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(name, seed)| {
+            let seed_len = seed.len();
+            let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
+                MetadataError::InvariantViolation(format!(
+                    "tenant_keys.ed25519_seed for tenant {tenant_id} key {name} is \
+                     {seed_len} bytes, expected 32"
+                ))
+            })?;
+            Ok(Signer::from_seed(name, &seed).trusted_key_entry())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +249,38 @@ mod tests {
             post, 0,
             "CASCADE should delete both keys (including revoked)"
         );
+    }
+
+    /// trusted_key_entries returns ALL unrevoked keys (rotation history),
+    /// not just the newest. Revoked keys are excluded.
+    #[tokio::test]
+    async fn trusted_key_entries_all_unrevoked() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "tk-entries").await;
+
+        seed_key(&db.pool, tid, "tenant-e-1", &[0x01u8; 32]).await;
+        seed_key(&db.pool, tid, "tenant-e-2", &[0x02u8; 32]).await;
+        seed_key(&db.pool, tid, "tenant-e-revoked", &[0x03u8; 32]).await;
+        sqlx::query(
+            "UPDATE tenant_keys SET revoked_at = now() \
+             WHERE tenant_id = $1 AND key_name = 'tenant-e-revoked'",
+        )
+        .bind(tid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let mut entries = trusted_key_entries(&db.pool, tid).await.unwrap();
+        entries.sort();
+        assert_eq!(entries.len(), 2, "two unrevoked keys, revoked excluded");
+        // Entries are name:base64(pubkey) — derive expected from the
+        // seeds to prove we got the PUBKEY, not the seed.
+        let mut expected = vec![
+            Signer::from_seed("tenant-e-1", &[0x01u8; 32]).trusted_key_entry(),
+            Signer::from_seed("tenant-e-2", &[0x02u8; 32]).trusted_key_entry(),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
     }
 
     /// Corruption: wrong-length seed → InvariantViolation, NOT a

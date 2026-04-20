@@ -1,20 +1,17 @@
-//! CA data model end-to-end: register a realisation via the Nix wire
-//! protocol, query it back via the wire AND via gRPC.
+//! CA data model end-to-end: query a realisation via the Nix wire
+//! protocol AND via gRPC.
 // r[verify gw.opcode.mandatory-set]
-//!
-//! This is the Phase 2c CA cache-hit path BEFORE Phase 5 early cutoff:
-//! a CA build completes → output uploaded to store → realisation
-//! registered → NEXT build with the same modular drv_hash finds the
-//! realisation.
 //!
 //! Flow under test:
 //!   1. Upload a path (the CA build output). Known nar_hash.
-//!   2. wopRegisterDrvOutput with a Realisation JSON pointing at that
-//!      path — gateway → store_client.register_realisation.
-//!   3. wopQueryRealisation with the same DrvOutput id — gets outPath
-//!      back. This is the cache-hit lookup.
-//!   4. QueryRealisation via gRPC directly — proves the store-side
-//!      record matches what the wire layer surfaces.
+//!   2. Seed a realisation directly in MockStore (in production: the
+//!      scheduler writes via direct-PG `insert_realisation_batch` at
+//!      build-completion — `wopRegisterDrvOutput` is rejected, see
+//!      `r[store.realisation.register]`).
+//!   3. wopQueryRealisation — gets outPath back. This is the
+//!      cache-hit lookup.
+//!   4. QueryRealisation via gRPC — proves the store-side record
+//!      matches what the wire layer surfaces.
 //!
 //! All against MockStore (in-memory). The wire protocol path is real
 //! (gateway session with DuplexStream); the store is mocked to keep
@@ -27,9 +24,11 @@ use rio_test_support::fixtures::{make_nar, make_path_info};
 use rio_test_support::wire::{do_handshake, drain_stderr_until_last, send_set_options};
 use rio_test_support::wire_send;
 
-/// The full roundtrip: write via wopRegisterDrvOutput, read via
-/// wopQueryRealisation, cross-check via the gRPC QueryRealisation. All
-/// three hops working together is what makes CA cache-hits real.
+/// Read-side roundtrip: store-seeded realisation → wopQueryRealisation
+/// → gRPC QueryRealisation. The write-side (`wopRegisterDrvOutput`) is
+/// rejected at the gateway (covered by
+/// `wire_opcodes::test_register_drv_output_rejected`); production
+/// writes go via the scheduler's direct-PG path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     common::init_test_logging();
@@ -55,45 +54,23 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     do_handshake(s).await?;
     send_set_options(s).await?;
 
-    // --- Step 2: wopRegisterDrvOutput ---
-    // Nix sends this after every CA build. The id is the DrvOutput:
-    // `sha256:<modular-drv-hash-hex>!<output-name>`. The modular hash
-    // depends ONLY on the derivation's fixed attributes — two builds
-    // with identical inputs produce the same hash even with different
-    // output paths. That's what makes this useful.
+    // --- Step 2: seed realisation in MockStore (scheduler-side write) ---
+    // wopRegisterDrvOutput is rejected at the gateway (no trusted-user
+    // in rio); production realisations are scheduler-written via
+    // direct-PG. Seed MockStore directly to model that.
     let drv_hash_hex = "ab".repeat(32); // 64-hex-char modular drv hash
     let drv_output_id = format!("sha256:{drv_hash_hex}!out");
-    let realisation_json = serde_json::json!({
-        "id": drv_output_id,
-        "outPath": output_basename,  // wire format: basename, NOT /nix/store/...
-        "signatures": ["test-key:fake-sig-base64"],
-        "dependentRealisations": {}
-    })
-    .to_string();
-
-    wire_send!(s;
-        u64: 42,                        // wopRegisterDrvOutput
-        string: &realisation_json,
-    );
-    drain_stderr_until_last(s).await?;
-    // No result data after STDERR_LAST for RegisterDrvOutput.
-
-    // Verify MockStore recorded it (shows the gRPC call went through,
-    // not just the wire parse). Gateway parsed JSON → gRPC → store.
     let drv_hash_bytes = hex::decode(&drv_hash_hex)?;
-    {
-        let realisations = sess.store.state.realisations.read().unwrap();
-        let stored = realisations
-            .get(&(drv_hash_bytes.clone(), "out".into()))
-            .expect("realisation should be stored via gRPC");
-        // Sent basename on the wire; gateway prepended /nix/store/ before
-        // the gRPC call. This is the Step-1 (register-direction) assertion.
-        assert_eq!(
-            stored.output_path, output_path,
-            "gateway should prepend STORE_PREFIX"
-        );
-        assert_eq!(stored.signatures, vec!["test-key:fake-sig-base64"]);
-    }
+    sess.store.state.realisations.write().unwrap().insert(
+        (drv_hash_bytes.clone(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: drv_hash_bytes.clone(),
+            output_name: "out".into(),
+            output_path: output_path.into(),
+            output_hash: nar_hash.to_vec(),
+            signatures: vec!["test-key:fake-sig-base64".into()],
+        },
+    );
 
     // --- Step 3: wopQueryRealisation ---
     // The NEXT build sends this with the same drv_hash. If it gets

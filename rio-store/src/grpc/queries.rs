@@ -59,7 +59,7 @@ impl StoreServiceImpl {
 
         let info = match local {
             Some(i) => {
-                // r[impl store.substitute.tenant-sig-visibility]
+                // r[impl store.substitute.tenant-sig-visibility+2]
                 // Local hit — but is it visible to THIS tenant? A path
                 // substituted by tenant A with sig_mode=keep is
                 // invisible to tenant B unless B trusts A's upstream
@@ -101,14 +101,16 @@ impl StoreServiceImpl {
     /// I-110: builder closure-BFS path. Local-only — NO upstream
     /// substitution and NO sig-visibility gate (both add per-path
     /// round-trips, defeating the batch). Callers needing those use
-    /// `query_path_info`. The builder (the only current caller) sends
-    /// no tenant token, so neither would apply anyway.
-    // r[impl store.api.batch-query]
+    /// `query_path_info`. End-user tenant tokens are rejected
+    /// (`reject_end_user_tenant`) so the gate-skip can't be used as
+    /// a bypass.
+    // r[impl store.api.batch-query+2]
     pub(super) async fn batch_query_path_info_impl(
         &self,
         request: Request<BatchQueryPathInfoRequest>,
     ) -> Result<Response<BatchQueryPathInfoResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.reject_end_user_tenant(&request, "BatchQueryPathInfo")?;
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;
@@ -130,13 +132,14 @@ impl StoreServiceImpl {
     ///
     /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
     /// `batch_query_path_info` (no upstream substitution, no
-    /// sig-visibility gate).
-    // r[impl store.api.batch-manifest]
+    /// sig-visibility gate; end-user tenant tokens rejected).
+    // r[impl store.api.batch-manifest+2]
     pub(super) async fn batch_get_manifest_impl(
         &self,
         request: Request<BatchGetManifestRequest>,
     ) -> Result<Response<BatchGetManifestResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.reject_end_user_tenant(&request, "BatchGetManifest")?;
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;
@@ -186,9 +189,32 @@ impl StoreServiceImpl {
 
         self.validate_path_batch(&req.store_paths)?;
 
-        let missing = metadata::find_missing_paths(&self.pool, &req.store_paths)
+        let mut missing = metadata::find_missing_paths(&self.pool, &req.store_paths)
             .await
             .map_err(|e| metadata_status("FindMissingPaths: find_missing_paths", e))?;
+
+        // r[impl store.substitute.find-missing-gated]
+        // Gate the locally-PRESENT paths: a substitution-only path
+        // (zero `path_tenants` rows, no trusted sig) must be reported
+        // as missing or the scheduler's `check_cached_outputs` →
+        // `upsert_path_tenants_for_batch` launders it into "built" and
+        // permanently defeats the gate for every tenant. Anonymous /
+        // no-substituter requests pass through (gate_batch returns the
+        // full set).
+        let missing_set: std::collections::HashSet<&str> =
+            missing.iter().map(String::as_str).collect();
+        let present: Vec<String> = req
+            .store_paths
+            .iter()
+            .filter(|p| !missing_set.contains(p.as_str()))
+            .cloned()
+            .collect();
+        let visible = self.sig_visibility_gate_batch(tenant_id, &present).await?;
+        for p in present {
+            if !visible.contains(&p) {
+                missing.push(p);
+            }
+        }
 
         // HEAD-probe each missing path against the tenant's upstreams.
         // Fails-open on probe errors (a down upstream shouldn't hide
@@ -221,12 +247,13 @@ impl StoreServiceImpl {
     }
 
     /// Resolve a store path from its 32-char nixbase32 hash part.
-    // r[impl store.api.hash-part]
+    // r[impl store.api.hash-part+2]
     pub(super) async fn query_path_from_hash_part_impl(
         &self,
         request: Request<QueryPathFromHashPartRequest>,
     ) -> Result<Response<PathInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
         // Validate BEFORE touching PG. The hash-part flows into a LIKE
@@ -261,6 +288,17 @@ impl StoreServiceImpl {
             .ok_or_else(|| {
                 Status::not_found(format!("no path with hash part: {}", req.hash_part))
             })?;
+
+        // r[impl store.substitute.tenant-sig-visibility+2]
+        // Same gate as QueryPathInfo. Hash-part lookup is local-only
+        // (no upstream knows our hash space), so on gate failure
+        // there's no try_substitute_on_miss fallback — just NotFound.
+        if !self.sig_visibility_gate(tenant_id, &info).await? {
+            return Err(Status::not_found(format!(
+                "no path with hash part: {}",
+                req.hash_part
+            )));
+        }
 
         Ok(Response::new(info.into()))
     }
@@ -306,12 +344,31 @@ impl StoreServiceImpl {
     }
 
     /// Register a CA derivation realisation.
-    // r[impl store.realisation.register]
+    ///
+    /// Service-caller-only: the `realisations` table is a global
+    /// namespace with no `tenant_id` column; an unauthenticated write
+    /// is cross-tenant CA supply-chain injection (pre-register
+    /// `(public_nixpkgs_hash → /nix/store/EVIL)`, every other tenant's
+    /// resolve picks it up). The gateway no longer dispatches
+    /// `wopRegisterDrvOutput` (rio has no trusted-user concept;
+    /// realisations are scheduler-written at build-completion via
+    /// `insert_realisation_batch`), so this gate is defense-in-depth
+    /// for direct gRPC + Cilium misconfig.
+    // r[impl store.realisation.register+2]
     pub(super) async fn register_realisation_impl(
         &self,
         request: Request<RegisterRealisationRequest>,
     ) -> Result<Response<RegisterRealisationResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Dev-mode pass-through (`service_verifier=None`) matches the
+        // `hmac_verifier=None` semantics elsewhere — production always
+        // configures both.
+        if self.service_verifier.is_some() && self.verified_service_caller(&request).is_none() {
+            return Err(Status::permission_denied(
+                "RegisterRealisation requires a service token; \
+                 realisations are scheduler-managed",
+            ));
+        }
         let proto = request
             .into_inner()
             .realisation
@@ -349,6 +406,14 @@ impl StoreServiceImpl {
             rio_common::limits::MAX_SIGNATURES,
         )?;
 
+        // TODO: realisation signature verification once the scheduler's
+        // insert_realisation_batch path signs (store.md:237 — signed
+        // tuple is (drv_hash, output_name, output_path, nar_hash)).
+        // Adding sig-verify here without a signer would reject all
+        // writes; the service-caller gate above + gateway opcode
+        // rejection + RealisationConflict detection close the attack
+        // without it.
+
         let r = realisations::Realisation {
             drv_hash,
             output_name: proto.output_name,
@@ -357,9 +422,19 @@ impl StoreServiceImpl {
             signatures: proto.signatures,
         };
 
-        realisations::insert(&self.pool, &r)
-            .await
-            .map_err(|e| metadata_status("RegisterRealisation: insert", e))?;
+        realisations::insert(&self.pool, &r).await.map_err(|e| {
+            if matches!(
+                e,
+                crate::metadata::MetadataError::RealisationConflict { .. }
+            ) {
+                // Loud: this is either a determinism bug or attempted
+                // poison. WARN both paths so it surfaces in alerts.
+                warn!(error = %e, "realisation conflict");
+                Status::already_exists(e.to_string())
+            } else {
+                metadata_status("RegisterRealisation: insert", e)
+            }
+        })?;
 
         Ok(Response::new(RegisterRealisationResponse {}))
     }

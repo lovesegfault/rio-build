@@ -497,19 +497,47 @@ fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
     Some((drv_hash, output_name.to_string()))
 }
 
-/// wopRegisterDrvOutput (42): Register a CA derivation output mapping.
+/// wopRegisterDrvOutput (42): rejected.
 ///
-/// Wire: ONE string = Realisation JSON. The JSON has four fields we care
-/// about: `id` (DrvOutput string), `outPath`, `signatures`,
-/// `dependentRealisations` (ignored — phase 5's early cutoff uses it, not
-/// us). Response: nothing after STDERR_LAST (no result data).
+/// Wire: ONE string = Realisation JSON. We MUST read it (stream sync),
+/// then `STDERR_ERROR` — CppNix gates this opcode on `trusted-user`;
+/// rio has no trusted-user concept. The `realisations` table is a
+/// global namespace with no per-tenant column; letting any ssh-ng
+/// client write to it is cross-tenant CA supply-chain injection
+/// (pre-register `(public_nixpkgs_hash → /nix/store/EVIL)`, every
+/// other tenant's resolve picks it up).
 ///
-/// Soft-fail on malformed JSON/id: log + return success. Hard-failing
-/// here would break buggy clients; a bad registration just means the
-/// cache-hit doesn't happen — degraded, not broken.
+/// rio realisations are scheduler-written at build-completion via the
+/// direct-PG `insert_realisation_batch` path — this opcode was never
+/// load-bearing. The store-side `RegisterRealisation` RPC additionally
+/// gates on `verified_service_caller` as defense-in-depth.
 // r[impl gw.opcode.mandatory-set]
-#[instrument(skip_all, fields(id = tracing::field::Empty))]
+// r[impl store.realisation.register+2]
+#[instrument(skip_all)]
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    _ctx: &mut SessionContext,
+) -> anyhow::Result<()> {
+    // Drain the payload so the stream stays in sync for the next opcode
+    // (the session may continue after STDERR_ERROR if the client
+    // catches it).
+    let json = wire::read_string(reader).await?;
+    debug!(json_len = json.len(), "wopRegisterDrvOutput (rejected)");
+    stderr_err!(
+        stderr,
+        "wopRegisterDrvOutput requires trusted-user; rio realisations are scheduler-managed"
+    );
+}
+
+/// Dead: previous wopRegisterDrvOutput body. Kept (unwired) for the
+/// JSON-parse + basename-prepend reference until the scheduler's
+/// `insert_realisation_batch` is verified to cover every shape this
+/// handled. Delete once `r[store.realisation.register]` sig-verify
+/// lands.
+#[allow(dead_code)]
+#[instrument(skip_all, fields(id = tracing::field::Empty))]
+async fn handle_register_drv_output_legacy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,

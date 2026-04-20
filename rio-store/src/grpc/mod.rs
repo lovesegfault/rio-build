@@ -132,6 +132,13 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
     match e {
         M::NotFound => Status::not_found("not found"),
         M::Conflict(_) => Status::already_exists("conflict: path already exists"),
+        M::RealisationConflict {
+            existing,
+            attempted,
+            ..
+        } => Status::already_exists(format!(
+            "realisation conflict: existing {existing}, attempted {attempted}"
+        )),
         M::Connection(_) => Status::unavailable("database connection failed; retry"),
         M::Serialization => Status::aborted("transaction serialization failure; retry"),
         M::Deadlock(_) => Status::aborted("transaction deadlock detected; retry"),
@@ -213,7 +220,8 @@ pub struct StoreServiceImpl {
     /// Transport-agnostic — see [`rio_auth::hmac::ServiceClaims`].
     service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// Service-token callers that may skip the assignment-token check
-    /// via a valid `x-rio-service-token`. Default `["rio-gateway"]`.
+    /// via a valid `x-rio-service-token`. Default
+    /// `["rio-gateway", "rio-scheduler"]`.
     service_bypass_callers: Vec<String>,
     /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
     /// handlers. Each handler acquires `chunk.len()` permits before extending
@@ -311,7 +319,8 @@ impl StoreServiceImpl {
     }
 
     /// Set the `ServiceClaims.caller` allowlist for service-token
-    /// bypass. Replaces the constructor default (`["rio-gateway"]`).
+    /// bypass. Replaces the constructor default
+    /// (`["rio-gateway", "rio-scheduler"]`).
     pub fn with_service_bypass_callers(mut self, callers: Vec<String>) -> Self {
         self.service_bypass_callers = callers;
         self
@@ -418,6 +427,38 @@ impl StoreServiceImpl {
             return hdr.parse().ok();
         }
         None
+    }
+
+    // r[impl store.api.batch-query+2]
+    // r[impl store.api.batch-manifest+2]
+    /// Reject gateway-forwarded end-user tenant tokens on the
+    /// builder-internal batch RPCs (`BatchQueryPathInfo`,
+    /// `BatchGetManifest`). These intentionally skip
+    /// `r[store.substitute.tenant-sig-visibility]` (the gate would add
+    /// per-path PG hits and defeat I-110); turning the documented
+    /// "builder is the only caller, sends no token" into an enforced
+    /// invariant means the skip can't be exploited as a tenant-side
+    /// gate bypass.
+    ///
+    /// Anonymous (builder, no token) and service-token-with-probe
+    /// (scheduler) pass through — only the JWT-interceptor extension
+    /// (an `x-rio-tenant-token` the gateway forwarded from an ssh-ng
+    /// client) is rejected. Zero PG cost.
+    fn reject_end_user_tenant<T>(
+        &self,
+        request: &Request<T>,
+        rpc: &'static str,
+    ) -> Result<(), Status> {
+        if request
+            .extensions()
+            .get::<rio_auth::jwt::TenantClaims>()
+            .is_some()
+        {
+            return Err(Status::permission_denied(format!(
+                "{rpc} is builder-internal; use the per-path RPC for tenant-scoped reads"
+            )));
+        }
+        Ok(())
     }
 
     // r[impl store.substitute.upstream]

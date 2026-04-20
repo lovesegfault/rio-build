@@ -324,10 +324,14 @@ in
   # r[verify store.substitute.sig-mode]
   #   substitute-sig-mode-add: sig_mode=add → BOTH upstream AND rio
   #   sigs in narinfo.signatures.
-  # r[verify store.substitute.tenant-sig-visibility]
+  # r[verify store.substitute.tenant-sig-visibility+2]
+  # r[verify store.substitute.find-missing-gated]
+  # r[verify store.api.batch-manifest+2]
   #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
-  #   on A-substituted path; tenant B (trusts same key) → visible.
-  #   Dynamic re-trust proves per-request trusted_keys read.
+  #   on A-substituted path via QueryPathInfo/GetPath/FindMissingPaths;
+  #   PermissionDenied via BatchGetManifest (builder-internal). Tenant
+  #   B (trusts same key) → visible. Dynamic re-trust proves per-request
+  #   trusted_keys read.
   # r[verify gw.opcode.query-missing]
   # r[verify gw.opcode.query-path-info]
   # r[verify store.tenant.narinfo-filter]

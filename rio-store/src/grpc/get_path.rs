@@ -85,6 +85,29 @@ fn hint_into_manifest(
     let info = rio_proto::validated::ValidatedPathInfo::try_from(raw_info)
         .status_invalid("manifest_hint.info malformed")?;
 
+    // r[impl store.get.manifest-hint+2]
+    // Bound the client-supplied hint at the trust boundary. The PG
+    // path's `Manifest::deserialize` enforces MAX_CHUNKS; the hint
+    // path bypasses that. nar_size on the hint path is also client-
+    // controlled (the PG path's is server-written) — bound it so a
+    // hostile worker can't allocate 200k Vec entries or claim a 28 PB
+    // NAR. Same INVALID_ARGUMENT shape as the per-chunk hash-length
+    // check below.
+    if info.nar_size > rio_common::limits::MAX_NAR_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "manifest_hint.info.nar_size {} exceeds MAX_NAR_SIZE {}",
+            info.nar_size,
+            rio_common::limits::MAX_NAR_SIZE
+        )));
+    }
+    if hint.chunks.len() > crate::manifest::MAX_CHUNKS {
+        return Err(Status::invalid_argument(format!(
+            "manifest_hint has {} chunks, exceeds MAX_CHUNKS {}",
+            hint.chunks.len(),
+            crate::manifest::MAX_CHUNKS
+        )));
+    }
+
     let manifest = if hint.chunks.is_empty() {
         ManifestKind::Inline(Bytes::from(hint.inline_blob))
     } else {
@@ -117,7 +140,7 @@ impl StoreServiceImpl {
 
         validate_store_path(&req.store_path)?;
 
-        // r[impl store.get.manifest-hint]
+        // r[impl store.get.manifest-hint+2]
         // I-110c: client-supplied (PathInfo, manifest) — skip both PG
         // lookups. The whole-NAR SHA-256 verify (step 4) checks the
         // reassembled bytes against `hint.info.nar_hash`, so a
@@ -126,6 +149,12 @@ impl StoreServiceImpl {
         // addressed (BLAKE3-verified in `get_verified`), so a hint
         // can't read chunks the client doesn't already know the hash
         // of. Falls through to PG on `info=None` or a malformed hint.
+        //
+        // NOT sig-visibility-gated: BLAKE3 chunk hashes are capability
+        // tokens — possessing them means the caller already had access.
+        // The chokepoint that protects this is `BatchGetManifest`'s
+        // `reject_end_user_tenant`: end-user tenants can't obtain
+        // chunk hashes for paths the gate would hide.
         if let Some(hint) = req.manifest_hint
             && let Some((info, manifest)) = hint_into_manifest(&req.store_path, hint)?
         {
@@ -142,7 +171,26 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("GetPath: query_path_info", e))?;
         let info = match local {
-            Some(i) => i,
+            Some(i) => {
+                // r[impl store.substitute.tenant-sig-visibility+2]
+                // Same gate as QueryPathInfo: hide-as-NotFound on
+                // failure, fall through to try_substitute_on_miss
+                // (the requesting tenant's upstreams may also have
+                // it, which would append a trusted sig).
+                if self.sig_visibility_gate(tenant_id, &i).await? {
+                    i
+                } else if let Some(sub) = self
+                    .try_substitute_on_miss(tenant_id, &req.store_path)
+                    .await?
+                {
+                    sub
+                } else {
+                    return Err(Status::not_found(format!(
+                        "path not found: {}",
+                        req.store_path
+                    )));
+                }
+            }
             None => self
                 .try_substitute_on_miss(tenant_id, &req.store_path)
                 .await?
@@ -199,8 +247,6 @@ impl StoreServiceImpl {
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
         let start = std::time::Instant::now();
-        // r[impl obs.metric.transfer-volume]
-        metrics::counter!("rio_store_get_path_bytes_total").increment(expected_size);
         // Clone for the spawned task. Arc-clone is cheap; the cache
         // itself (moka + DashMap) is shared.
         let cache = self.chunk_cache.clone();
@@ -309,6 +355,12 @@ impl StoreServiceImpl {
                         )))
                         .await;
                 } else {
+                    // r[impl obs.metric.transfer-volume]
+                    // Incremented post-stream (not pre-stream) so a
+                    // bogus-hash hint or DATA_LOSS mid-stream doesn't
+                    // inflate the counter by claimed nar_size before
+                    // any byte was actually transferred.
+                    metrics::counter!("rio_store_get_path_bytes_total").increment(total_bytes);
                     metrics::counter!("rio_store_get_path_total").increment(1);
                     metrics::histogram!("rio_store_get_path_duration_seconds")
                         .record(start.elapsed().as_secs_f64());
@@ -332,5 +384,65 @@ impl StoreServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_proto::types::ChunkRef;
+    use rio_test_support::fixtures::{make_nar, make_path_info, test_store_path};
+
+    fn hint_with_chunks(path: &str, n_chunks: usize, nar_size: u64) -> ManifestHint {
+        let (nar, nar_hash) = make_nar(b"hint");
+        let mut info: PathInfo = make_path_info(path, &nar, nar_hash).into();
+        info.nar_size = nar_size;
+        ManifestHint {
+            info: Some(info),
+            chunks: vec![
+                ChunkRef {
+                    hash: vec![0u8; 32],
+                    size: 1,
+                };
+                n_chunks
+            ],
+            inline_blob: vec![],
+        }
+    }
+
+    // r[verify store.get.manifest-hint+2]
+    /// Client-supplied hints are bounded by MAX_CHUNKS — same bound the
+    /// PG path's `Manifest::deserialize` enforces. Pre-fix: hint path
+    /// bypassed it (200_001-entry Vec allocated unconditionally).
+    #[test]
+    fn hint_into_manifest_rejects_over_max_chunks() {
+        let path = test_store_path("hint-chunks");
+        let hint = hint_with_chunks(&path, crate::manifest::MAX_CHUNKS + 1, 100);
+        let err = hint_into_manifest(&path, hint).expect_err("over MAX_CHUNKS → InvalidArgument");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("MAX_CHUNKS"),
+            "msg: {}",
+            err.message()
+        );
+
+        // Boundary: exactly MAX_CHUNKS is accepted (`>` not `>=`).
+        let ok = hint_with_chunks(&path, crate::manifest::MAX_CHUNKS, 100);
+        assert!(hint_into_manifest(&path, ok).is_ok());
+    }
+
+    // r[verify store.get.manifest-hint+2]
+    /// nar_size on the hint path is client-controlled — bound it.
+    #[test]
+    fn hint_into_manifest_rejects_oversize_nar() {
+        let path = test_store_path("hint-narsize");
+        let hint = hint_with_chunks(&path, 1, rio_common::limits::MAX_NAR_SIZE + 1);
+        let err = hint_into_manifest(&path, hint).expect_err("over MAX_NAR_SIZE → InvalidArgument");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("MAX_NAR_SIZE"),
+            "msg: {}",
+            err.message()
+        );
     }
 }

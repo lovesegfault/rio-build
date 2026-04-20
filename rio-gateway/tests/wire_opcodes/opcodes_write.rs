@@ -482,21 +482,18 @@ async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RegisterDrvOutput with valid Realisation JSON: parses, calls store,
-/// MockStore records it.
+// r[verify store.realisation.register+2]
+/// RegisterDrvOutput is rejected with STDERR_ERROR (CppNix-parity:
+/// gated on trusted-user; rio has no trusted-user). The payload is
+/// drained so the stream stays in sync. MockStore is NOT touched —
+/// realisations are scheduler-written, never via this opcode.
 #[tokio::test]
-async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
+async fn test_register_drv_output_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
-    // 64-char hex = 32-byte SHA-256. All-AA for test determinism.
     let drv_hash_hex = "aa".repeat(32);
-    // Wire repr (basename) vs internal repr (full path). Real nix clients
-    // send the basename — CppNix StorePath::to_string() omits /nix/store/.
-    // Gateway prepends it before the gRPC call.
-    let out_path_wire = "00000000000000000000000000000000-ca-test-out";
-    let out_path_full = "/nix/store/00000000000000000000000000000000-ca-test-out";
     let realisation_json = format!(
-        r#"{{"id":"sha256:{drv_hash_hex}!out","outPath":"{out_path_wire}","signatures":["sig:test"],"dependentRealisations":{{}}}}"#
+        r#"{{"id":"sha256:{drv_hash_hex}!out","outPath":"00000000000000000000000000000000-ca-test-out","signatures":["sig:test"],"dependentRealisations":{{}}}}"#
     );
 
     wire_send!(&mut h.stream;
@@ -504,36 +501,27 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
         string: &realisation_json,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
-    // No result data after STDERR_LAST.
-
-    // Verify MockStore recorded it (not just the wire parse).
-    let drv_hash = hex::decode(&drv_hash_hex)?;
-    let key = (drv_hash, "out".to_string());
-    let stored = h
-        .store
-        .state
-        .realisations
-        .read()
-        .unwrap()
-        .get(&key)
-        .cloned();
-    let stored = stored.expect("MockStore should have the realisation");
-    // Sent basename, MockStore got full path — gateway's prepend is working.
-    assert_eq!(
-        stored.output_path, out_path_full,
-        "gateway should prepend STORE_PREFIX"
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("trusted-user"),
+        "expected trusted-user message, got: {}",
+        err.message
     );
-    assert_eq!(stored.signatures, vec!["sig:test"]);
 
-    h.finish().await;
+    // MockStore NOT touched — opcode never reaches gRPC.
+    assert!(
+        h.store.state.realisations.read().unwrap().is_empty(),
+        "rejected opcode must not write to store"
+    );
+
     Ok(())
 }
 
-/// Malformed JSON: soft-fail (accept + discard, log). Hard-failing would
-/// regress buggy clients.
+/// Payload is drained even when rejected — malformed JSON doesn't matter
+/// (we never parse it), but the wire string MUST be read or the next
+/// opcode would desync.
 #[tokio::test]
-async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<()> {
+async fn test_register_drv_output_drains_payload() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
@@ -541,33 +529,10 @@ async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<
         string: "not valid json {",
     );
 
-    // STDERR_LAST, no error. Session continues.
-    drain_stderr_until_last(&mut h.stream).await?;
-    assert!(
-        h.store.state.realisations.read().unwrap().is_empty(),
-        "malformed JSON should not reach MockStore"
-    );
-
-    h.finish().await;
-    Ok(())
-}
-
-/// Malformed DrvOutput id (wrong prefix, bad hex, no !, etc): soft-fail.
-#[tokio::test]
-async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-
-    // "abc" is 3 hex chars — not 64, so hex::decode → wrong length.
-    let bad_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
-    wire_send!(&mut h.stream;
-        u64: 42,
-        string: bad_json,
-    );
-
-    drain_stderr_until_last(&mut h.stream).await?;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(err.message.contains("trusted-user"));
     assert!(h.store.state.realisations.read().unwrap().is_empty());
 
-    h.finish().await;
     Ok(())
 }
 

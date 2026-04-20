@@ -57,7 +57,7 @@ pub(crate) fn parse_trusted_key_entry(entry: &str) -> Result<(&str, VerifyingKey
         .map_err(|_| "pubkey is not a valid ed25519 point")
 }
 
-// r[impl store.substitute.tenant-sig-visibility]
+// r[impl store.substitute.tenant-sig-visibility+2]
 /// Check if any of `sigs` (narinfo `Sig:` format: `name:base64(sig)`)
 /// verifies against any of `trusted_keys` (`name:base64(pubkey)`) for
 /// the given `fingerprint`. Returns the matching key name or `None`.
@@ -871,7 +871,7 @@ mod tests {
     // any_sig_trusted — cross-tenant sig-visibility gate
     // ------------------------------------------------------------------------
 
-    // r[verify store.substitute.tenant-sig-visibility]
+    // r[verify store.substitute.tenant-sig-visibility+2]
     #[test]
     fn any_sig_trusted_accepts_matching() {
         let seed = [0x11u8; 32];

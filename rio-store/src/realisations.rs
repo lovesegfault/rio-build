@@ -39,17 +39,22 @@ pub struct Realisation {
     pub signatures: Vec<String>,
 }
 
-/// Insert a realisation. Idempotent: ON CONFLICT DO NOTHING.
+/// Insert a realisation. Idempotent on identical re-insert; loud on
+/// conflicting re-insert.
 ///
 /// CA derivations are deterministic — same `(drv_hash, output_name)`
-/// always produces the same `output_path`. So a duplicate insert means
-/// "yes, we already knew that", not a conflict. ON CONFLICT DO NOTHING
-/// is correct, not just convenient.
+/// always produces the same `output_path`. So a duplicate insert with
+/// the SAME `output_path` means "yes, we already knew that" (returns
+/// `Ok(false)`). A duplicate with a DIFFERENT `output_path` is either a
+/// determinism bug or an attempted poison — `ON CONFLICT DO NOTHING`
+/// stays (first-write-wins is the right resolution; the existing row
+/// was written by the scheduler at build-completion), but the silent
+/// no-op is replaced with [`MetadataError::RealisationConflict`] so the
+/// caller WARNs both paths.
 ///
-/// Returns `true` if a row was inserted, `false` if it already existed.
-/// The caller doesn't usually care — both are success — but tests can
-/// use the distinction.
-// r[impl store.realisation.register]
+/// Returns `true` if a row was inserted, `false` if an identical row
+/// already existed.
+// r[impl store.realisation.register+2]
 #[instrument(skip(pool, r), fields(drv_hash = hex::encode(r.drv_hash), output = %r.output_name))]
 pub async fn insert(pool: &PgPool, r: &Realisation) -> Result<bool, MetadataError> {
     let result = sqlx::query(
@@ -69,7 +74,33 @@ pub async fn insert(pool: &PgPool, r: &Realisation) -> Result<bool, MetadataErro
 
     let inserted = result.rows_affected() > 0;
     debug!(inserted, "realisation insert");
-    Ok(inserted)
+    if inserted {
+        return Ok(true);
+    }
+
+    // ON CONFLICT no-op — re-query to distinguish "identical re-insert"
+    // (idempotent success) from "different output_path" (conflict).
+    // Best-effort: if the row vanished between INSERT and SELECT (GC
+    // sweep), treat as idempotent — caller can retry; the table is
+    // global, not per-tenant, so the race window is the GC tick.
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = $2",
+    )
+    .bind(r.drv_hash.as_slice())
+    .bind(&r.output_name)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(existing) = existing
+        && existing != r.output_path
+    {
+        return Err(MetadataError::RealisationConflict {
+            drv_hash: hex::encode(r.drv_hash),
+            output_name: r.output_name.clone(),
+            existing,
+            attempted: r.output_path.clone(),
+        });
+    }
+    Ok(false)
 }
 
 /// Look up a realisation by (drv_hash, output_name).
@@ -228,6 +259,42 @@ mod tests {
         // somehow delete or corrupt the existing row.
         let found = query(&db.pool, &r.drv_hash, &r.output_name).await?;
         assert!(found.is_some());
+        Ok(())
+    }
+
+    // r[verify store.realisation.register+2]
+    /// Conflicting re-insert (same key, DIFFERENT output_path) is loud:
+    /// `RealisationConflict`, not silent ON CONFLICT DO NOTHING. The
+    /// existing row stays (first-write-wins — scheduler-written rows
+    /// can't be displaced).
+    #[tokio::test]
+    async fn conflicting_insert_is_loud() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let r = sample();
+        insert(&db.pool, &r).await?;
+
+        let evil = Realisation {
+            output_path: rio_test_support::fixtures::test_store_path("ca-EVIL"),
+            ..sample()
+        };
+        let err = insert(&db.pool, &evil)
+            .await
+            .expect_err("different output_path → RealisationConflict");
+        match err {
+            MetadataError::RealisationConflict {
+                existing,
+                attempted,
+                ..
+            } => {
+                assert_eq!(existing, r.output_path);
+                assert_eq!(attempted, evil.output_path);
+            }
+            other => panic!("expected RealisationConflict, got {other:?}"),
+        }
+
+        // Existing row unchanged — first-write-wins.
+        let found = query(&db.pool, &r.drv_hash, &r.output_name).await?.unwrap();
+        assert_eq!(found.output_path, r.output_path, "existing row preserved");
         Ok(())
     }
 

@@ -43,7 +43,7 @@ mod chunked;
 mod cluster_key_history;
 mod inline;
 mod queries;
-mod tenant_keys;
+pub mod tenant_keys;
 pub mod upstreams;
 
 // Public API — explicit re-exports so all external callers in grpc/,
@@ -541,6 +541,15 @@ mod tests {
                 MetadataError::ResourceExhausted("quota".into()),
                 Code::ResourceExhausted,
             ),
+            (
+                MetadataError::RealisationConflict {
+                    drv_hash: "ab".into(),
+                    output_name: "out".into(),
+                    existing: "/nix/store/a".into(),
+                    attempted: "/nix/store/b".into(),
+                },
+                Code::AlreadyExists,
+            ),
         ];
         for (err, expected_code) in cases {
             // MetadataError isn't Clone; reconstruct for the call.
@@ -637,6 +646,17 @@ mod tests {
             ),
             MetadataError::ResourceExhausted(s) => MetadataError::ResourceExhausted(s.clone()),
             MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
+            MetadataError::RealisationConflict {
+                drv_hash,
+                output_name,
+                existing,
+                attempted,
+            } => MetadataError::RealisationConflict {
+                drv_hash: drv_hash.clone(),
+                output_name: output_name.clone(),
+                existing: existing.clone(),
+                attempted: attempted.clone(),
+            },
         }
     }
 }

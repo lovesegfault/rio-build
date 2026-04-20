@@ -349,6 +349,47 @@ pkgs.testers.runNixOSTest {
             f"path — gate over-broad if blocked:\n{out}"
         )
 
+        # ── Gate covers ALL tenant-facing read RPCs, not just
+        #    QueryPathInfo. Pre-fix: 5/6 leaked. ───────────────────────
+        # FindMissingPaths: gate-failed → reported missing (else
+        # scheduler launders into path_tenants).
+        rc, out = ${gatewayHost}.execute(
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-tenant-token: {jwt_c}' "
+            f'-d \'{{"store_paths":["{sub_path}"]}}\' '
+            "localhost:9002 rio.store.StoreService/FindMissingPaths 2>&1"
+        )
+        assert rc == 0, f"FindMissingPaths rpc failed:\n{out}"
+        assert sub_path in out, (
+            f"FindMissingPaths: gate-failed path must be in "
+            f"missing_paths for tenant C:\n{out}"
+        )
+        # BatchGetManifest: end-user tenant token → PermissionDenied.
+        rc, out = ${gatewayHost}.execute(
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-tenant-token: {jwt_c}' "
+            f'-d \'{{"store_paths":["{sub_path}"]}}\' '
+            "localhost:9002 rio.store.StoreService/BatchGetManifest 2>&1"
+        )
+        assert rc != 0 and "PermissionDenied" in out, (
+            f"BatchGetManifest: end-user tenant token should be "
+            f"rejected:\n{out}"
+        )
+        # GetPath: same gate as QueryPathInfo → NotFound.
+        rc, out = ${gatewayHost}.execute(
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-tenant-token: {jwt_c}' "
+            f'-d \'{{"store_path":"{sub_path}"}}\' '
+            "localhost:9002 rio.store.StoreService/GetPath 2>&1"
+        )
+        assert rc != 0 and ("NotFound" in out or "not found" in out.lower()), (
+            f"GetPath: tenant C should get NotFound:\n{out}"
+        )
+        print("cross-tenant gate PASS: all read RPCs gated for C")
+
         # Dynamic re-trust: add test-cache-1 to C's upstream → C sees it.
         # Proves the gate re-reads tenant_trusted_keys per-request (no
         # stale cache).

@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use tonic::transport::{Channel, Server};
 
-use rio_proto::types::{AddUpstreamRequest, QueryPathInfoRequest};
+use rio_proto::types::{
+    AddUpstreamRequest, BatchGetManifestRequest, BatchQueryPathInfoRequest,
+    FindMissingPathsRequest, GetPathRequest, QueryPathFromHashPartRequest, QueryPathInfoRequest,
+};
 use rio_proto::{
     StoreAdminServiceClient, StoreAdminServiceServer, StoreServiceClient, StoreServiceServer,
 };
@@ -67,7 +70,7 @@ impl SwitchableTenant {
     }
 }
 
-// r[verify store.substitute.tenant-sig-visibility]
+// r[verify store.substitute.tenant-sig-visibility+2]
 /// End-to-end through `QueryPathInfo` gRPC:
 ///   1. Tenant A substitutes path P (signed by K1) from a fake upstream.
 ///   2. Tenant B (also trusts K1) queries P → `Ok(Some)`.
@@ -202,7 +205,12 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
         "tenant B trusts K1 → substituted path visible"
     );
 
-    // ── C trusts only K2 → NotFound ────────────────────────────────────
+    // ── C trusts only K2 → NotFound on EVERY tenant-facing read RPC ────
+    // r[verify store.api.hash-part+2]
+    // r[verify store.api.batch-query+2]
+    // r[verify store.api.batch-manifest+2]
+    // r[verify store.substitute.find-missing-gated]
+    // Pre-fix: only QueryPathInfo was gated; the other five leaked.
     switch.set(Some(tid_c));
     let err = client
         .query_path_info(req())
@@ -214,10 +222,109 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
         "expected NotFound, got {err:?}"
     );
 
+    // GetPath: same gate as QueryPathInfo.
+    let err = client
+        .get_path(GetPathRequest {
+            store_path: path.clone(),
+            manifest_hint: None,
+        })
+        .await
+        .expect_err("GetPath: C doesn't trust K1 → NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound, "GetPath: {err:?}");
+
+    // QueryPathFromHashPart: same gate, no substitute fallback.
+    let hash_part = path
+        .strip_prefix("/nix/store/")
+        .unwrap()
+        .split('-')
+        .next()
+        .unwrap()
+        .to_string();
+    let err = client
+        .query_path_from_hash_part(QueryPathFromHashPartRequest {
+            hash_part: hash_part.clone(),
+        })
+        .await
+        .expect_err("HashPart: C doesn't trust K1 → NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound, "HashPart: {err:?}");
+
+    // FindMissingPaths: gate-failed paths reported as missing (NOT
+    // present — would launder into path_tenants via scheduler).
+    let resp = client
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner();
+    assert!(
+        resp.missing_paths.contains(&path),
+        "FindMissingPaths: gate-failed path must be in missing_paths, got {:?}",
+        resp.missing_paths
+    );
+
+    // BatchQueryPathInfo / BatchGetManifest: builder-internal —
+    // end-user tenant token rejected outright.
+    let err = client
+        .batch_query_path_info(BatchQueryPathInfoRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await
+        .expect_err("BatchQueryPathInfo: end-user tenant token → PermissionDenied");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "BatchQueryPathInfo: {err:?}"
+    );
+    let err = client
+        .batch_get_manifest(BatchGetManifestRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await
+        .expect_err("BatchGetManifest: end-user tenant token → PermissionDenied");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "BatchGetManifest: {err:?}"
+    );
+
+    // ── B trusts K1 → present via FindMissingPaths + HashPart ──────────
+    // Positive control for the new gates (over-broad gate would block B).
+    switch.set(Some(tid_b));
+    let resp = client
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner();
+    assert!(
+        !resp.missing_paths.contains(&path),
+        "FindMissingPaths: B trusts K1 → path present (NOT missing)"
+    );
+    let resp = client
+        .query_path_from_hash_part(QueryPathFromHashPartRequest { hash_part })
+        .await?
+        .into_inner();
+    assert_eq!(resp.store_path, path, "HashPart: B trusts K1 → visible");
+
+    // ── Anonymous → batch RPCs pass through (builder, no token) ────────
+    switch.set(None);
+    let resp = client
+        .batch_query_path_info(BatchQueryPathInfoRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.entries.len(),
+        1,
+        "anonymous BatchQueryPathInfo unfiltered"
+    );
+
     // ── Add K1 to C → re-query → now visible ───────────────────────────
     // Proves the gate re-reads tenant_trusted_keys per-request (no
     // stale in-process cache). Second upstream for C with a distinct
     // URL (AddUpstream is upsert-by-url; same URL would replace K2).
+    switch.set(Some(tid_c));
     admin
         .add_upstream(AddUpstreamRequest {
             tenant_id: tid_c.to_string(),
@@ -243,7 +350,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     Ok(())
 }
 
-// r[verify store.substitute.tenant-sig-visibility]
+// r[verify store.substitute.tenant-sig-visibility+2]
 /// PutPath→scheduler timing-window regression: a freshly-built,
 /// rio-signed path with zero `path_tenants` rows must be visible to
 /// its owning tenant via the cluster-key union.
@@ -394,6 +501,113 @@ async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
         resp.store_path, path,
         "cluster-signed path must be visible during PutPath→scheduler window \
          (cluster key unioned into trusted set)"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+// r[verify store.tenant.sign-key]
+// r[verify store.substitute.tenant-sig-visibility+2]
+/// Clone of `sig_visibility_gate_cluster_key_timing_window` but with a
+/// `tenant_keys` row seeded — `maybe_sign` then signs with the TENANT
+/// key (not cluster). Pre-fix: trusted set = upstream ∪ cluster only →
+/// the tenant's own sig fails to verify → `NotFound` to its own tenant.
+#[tokio::test]
+async fn sig_visibility_gate_tenant_key_timing_window() -> TestResult {
+    use base64::Engine;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let tid = seed_tenant(&db.pool, "tenant-key-window").await;
+
+    // Tenant has its own signing key (per-tenant sign-key spec).
+    let tenant_seed = [0x99u8; 32];
+    sqlx::query(
+        "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
+         VALUES ($1, 'tenant-own-1', $2)",
+    )
+    .bind(tid)
+    .bind(&tenant_seed[..])
+    .execute(&db.pool)
+    .await?;
+    let tenant_signer = Signer::from_seed("tenant-own-1", &tenant_seed);
+
+    // Cluster signer DIFFERENT from tenant key (proves it's the
+    // tenant_keys union doing the work, not cluster).
+    let cluster = Signer::from_seed("rio-cluster", &[0xCCu8; 32]);
+    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let ts = TenantSigner::new(cluster, db.pool.clone());
+    let store_svc = StoreServiceImpl::new(db.pool.clone())
+        .with_substituter(sub)
+        .with_signer(ts);
+    let admin_svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+    let switch = SwitchableTenant::new();
+    let router = Server::builder()
+        .layer(tonic::service::InterceptorLayer::new(switch.interceptor()))
+        .add_service(StoreServiceServer::new(store_svc))
+        .add_service(StoreAdminServiceServer::new(admin_svc));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = StoreServiceClient::new(channel.clone());
+    let mut admin = StoreAdminServiceClient::new(channel);
+
+    // Tenant trusts ONLY an unrelated upstream key.
+    let upstream_seed = [0x66u8; 32];
+    let pk = ed25519_dalek::SigningKey::from_bytes(&upstream_seed).verifying_key();
+    let trusted_upstream = format!(
+        "key-upstream:{}",
+        base64::engine::general_purpose::STANDARD.encode(pk.as_bytes())
+    );
+    admin
+        .add_upstream(AddUpstreamRequest {
+            tenant_id: tid.to_string(),
+            url: "https://cache-tk.example".into(),
+            priority: 50,
+            trusted_keys: vec![trusted_upstream],
+            sig_mode: "keep".into(),
+        })
+        .await?;
+
+    // Seed path signed ONLY by the tenant key. Zero path_tenants rows.
+    let path = test_store_path("tenant-key-window-p");
+    let (nar, nar_hash) = make_nar(b"tenant-key-payload");
+    let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+    let sig_tenant = tenant_signer.sign(&fp);
+    let path_hash = sha256(&path);
+    sqlx::query(
+        "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, signatures) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&path_hash[..])
+    .bind(&path)
+    .bind(&nar_hash[..])
+    .bind(nar.len() as i64)
+    .bind(&[sig_tenant][..])
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status, inline_blob) VALUES ($1, 'complete', $2)",
+    )
+    .bind(&path_hash[..])
+    .bind(&nar[..])
+    .execute(&db.pool)
+    .await?;
+
+    // THE assertion: tenant sees its own tenant-key-signed path.
+    switch.set(Some(tid));
+    let resp = client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: path.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.store_path, path,
+        "tenant-key-signed path must be visible to its own tenant during \
+         path_tenants count=0 window (tenant_keys unioned into trusted set)"
     );
 
     server.abort();

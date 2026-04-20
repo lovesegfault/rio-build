@@ -28,6 +28,23 @@ pub enum MetadataError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// `realisations` insert hit `(drv_hash, output_name)` PK with a
+    /// DIFFERENT `output_path` than the existing row. CA derivations are
+    /// deterministic — same key, same output — so this means either a
+    /// determinism bug or an attempted poison (pre-register
+    /// `(public_hash → /nix/store/EVIL)`). NOT silently swallowed by
+    /// `ON CONFLICT DO NOTHING`. Maps to `already_exists` + WARN.
+    #[error(
+        "realisation conflict: ({drv_hash}, {output_name}) already maps to {existing}, \
+         attempted {attempted}"
+    )]
+    RealisationConflict {
+        drv_hash: String,
+        output_name: String,
+        existing: String,
+        attempted: String,
+    },
+
     /// Connection-level failure: pool exhausted, TCP reset, TLS error.
     /// Retriable — the operation never reached PG. Maps to `unavailable`.
     #[error("connection error: {0}")]
