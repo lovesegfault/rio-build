@@ -135,7 +135,7 @@ impl HmacClaims for ServiceClaims {
 /// both are scheduler-minted, scheduler-verified; the serde shape
 /// (`intent_id` vs `drv_hash`/`expected_outputs`) provides the
 /// cross-type isolation (`deny_unknown_fields`).
-// r[impl sec.executor.identity-token]
+// r[impl sec.executor.identity-token+2]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorClaims {
@@ -143,6 +143,17 @@ pub struct ExecutorClaims {
     /// Checked against `HeartbeatRequest.intent_id` and the actor's
     /// `ExecutorState.intent_id` on reconnect.
     pub intent_id: String,
+    /// `SpawnIntent.kind` (proto `ExecutorKind` wire i32: 0=Builder,
+    /// 1=Fetcher) the token authorizes. Checked against
+    /// `HeartbeatRequest.kind` — `kind` decides the FOD/non-FOD
+    /// airgap routing, and the worker is NOT trusted (a compromised
+    /// open-egress Fetcher heartbeating `kind=Builder` would
+    /// otherwise receive non-FOD builds with secret inputs).
+    ///
+    /// Stored as the wire i32 (not the proto enum) because rio-auth
+    /// is dependency-minimal and the proto enum doesn't derive serde;
+    /// callers convert via `ExecutorKind::try_from(claims.kind)`.
+    pub kind: i32,
     /// Unix seconds. Scheduler sets `now + deadline_secs + grace`;
     /// pod outliving its `activeDeadlineSeconds` is a bug, so the
     /// token outliving the pod is fine.

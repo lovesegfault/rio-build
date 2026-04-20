@@ -156,7 +156,7 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
             )
             .await;
 
-            // r[impl sec.executor.identity-token]
+            // r[impl sec.executor.identity-token+2]
             // Attach the scheduler-signed token so the heartbeat's
             // body `intent_id` is bound to the HMAC-attested one.
             // Empty in dev mode → header omitted → scheduler

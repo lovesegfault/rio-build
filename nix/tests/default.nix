@@ -496,6 +496,7 @@ in
   # r[verify gw.reject.nochroot]
   # r[verify gw.rate.per-tenant]
   # r[verify store.gc.tenant-quota-enforce]
+  # r[verify sec.executor.identity-token+2]
   #   Single-test scenario (no subtests list). Markers at the wiring
   #   point per P0341 convention — scenario header prose explains which
   #   subtest proves each rule.

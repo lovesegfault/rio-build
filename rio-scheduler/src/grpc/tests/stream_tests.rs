@@ -383,14 +383,18 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Regression: `LogBuffers.sealed` must not grow unboundedly. Before
-/// the fix, `seal()` was called on every completion but `unseal()` /
-/// `discard()` had no production callers — one leaked String per
-/// completed derivation, forever. The recv task now `unseal()`s every
-/// drv it pushed when the stream closes.
+/// merged_bug_039 (TOCTOU): the recv task MUST NOT discard a buffer at
+/// stream-exit just because `is_sealed` is false at that instant —
+/// `send_unchecked(ProcessCompletion)` returns on enqueue, not on the
+/// actor's `seal()`, so under any actor backlog the recv task observed
+/// `is_sealed=false` and discarded a completed build's buffer before
+/// the flusher drained it. With cleanup moved into the actor's
+/// epoch-gated `ExecutorDisconnected` handler, the recv task no longer
+/// touches `LogBuffers` on exit — the buffer survives stream-close
+/// regardless of seal timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_log_buffers_sealed_reaped_on_stream_close() -> anyhow::Result<()> {
-    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+async fn test_log_buffer_survives_stream_close_before_actor_seal() -> anyhow::Result<()> {
+    let (_db, grpc, handle, _actor_task) = setup_grpc().await;
     let log_buffers = grpc.log_buffers();
     let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
     let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
@@ -426,30 +430,34 @@ async fn test_log_buffers_sealed_reaped_on_stream_close() -> anyhow::Result<()> 
             )),
         })
         .await?;
-
-    // Seal directly (what the actor's completion handler does). No
-    // flusher in this setup, so this is the only seal source — and the
-    // only unseal is the recv task's stream-exit cleanup under test.
-    log_buffers.seal(&drv_path);
-    assert_eq!(log_buffers.sealed_count(), 1);
-
-    // Close the stream → recv task exits → unseals seen_drvs.
-    drop(stream_tx);
-
-    // Recv task runs on a worker thread; poll until unseal lands.
-    // barrier() doesn't help here (recv task isn't actor-mediated).
+    // Wait until the push landed (recv task is on a worker thread).
     tokio::time::timeout(Duration::from_secs(2), async {
-        while log_buffers.sealed_count() != 0 {
+        while log_buffers.read_since(&drv_path, 0).is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("sealed_count should reach 0 after stream close");
+    .expect("LogBatch push should land in log_buffers");
 
-    assert_eq!(log_buffers.sealed_count(), 0);
-    // inbound should now close (recv task dropped output_tx).
+    // NOT sealed (the TOCTOU window: completion enqueued but actor
+    // hasn't processed it yet). Close the stream immediately.
+    assert!(!log_buffers.is_sealed(&drv_path));
+    drop(stream_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
+    crate::actor::tests::barrier(&handle).await;
 
+    // Buffer survives. Pre-fix: `is_sealed=false → discard()` wiped it.
+    // The actor's disconnect-cleanup also leaves it alone — the gRPC
+    // and actor `log_buffers` Arcs aren't shared in this setup, but
+    // even if they were, the path is DAG-unknown ONLY because no merge
+    // happened; the actor-level
+    // `test_disconnect_discards_only_unknown_drvs` covers that branch.
+    assert!(
+        log_buffers
+            .read_since(&drv_path, 0)
+            .is_some_and(|v| !v.is_empty()),
+        "stream-close MUST NOT discard a buffer based on un-synchronized is_sealed"
+    );
     Ok(())
 }
 
@@ -511,16 +519,13 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
         "MAX_DRVS_PER_STREAM caps distinct buffer keys per stream"
     );
 
-    // Close stream → not-sealed entries discarded.
+    // Stream-exit cleanup is now actor-side (epoch-gated +
+    // ownership-aware via `ExecutorDisconnected.seen_drvs`); this
+    // test's actor doesn't share the gRPC's `log_buffers` Arc, so the
+    // discard is asserted by the actor-level
+    // `test_disconnect_discards_only_unknown_drvs` instead. Here we
+    // only assert the per-stream CAP held.
     drop(stream_tx);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while log_buffers.active_count() != 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("un-sealed entries discarded on stream close");
-    assert_eq!(log_buffers.active_count(), 0);
     let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
     Ok(())
 }
@@ -529,7 +534,7 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
 /// configured, `BuildExecution` rejects without a valid
 /// `x-rio-executor-token`, and `Heartbeat` rejects when the body
 /// `intent_id` doesn't match the token's.
-// r[verify sec.executor.identity-token]
+// r[verify sec.executor.identity-token+2]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::Result<()> {
     use rio_auth::hmac::{ExecutorClaims, HmacKey};
@@ -567,6 +572,7 @@ async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::
         .as_secs();
     let token_a = key.sign(&ExecutorClaims {
         intent_id: "intent-A".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
         expiry_unix: now + 600,
     });
     let mut hb = tonic::Request::new(rio_proto::types::HeartbeatRequest {
@@ -583,9 +589,10 @@ async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::
         .expect_err("mismatched-intent heartbeat should be rejected");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
-    // 3. Heartbeat with matching intent → accepted.
+    // 3. Heartbeat with matching intent + kind → accepted.
     let token_b = key.sign(&ExecutorClaims {
         intent_id: "intent-B".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
         expiry_unix: now + 600,
     });
     let mut hb_ok = tonic::Request::new(rio_proto::types::HeartbeatRequest {
@@ -601,6 +608,106 @@ async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::
         .heartbeat(hb_ok)
         .await
         .expect("matching-intent heartbeat accepted");
+
+    // 4. bug_038: Heartbeat with token kind=Fetcher, body kind=Builder
+    //    → Unauthenticated. A compromised Fetcher (open-egress CNP)
+    //    self-promoting to Builder would otherwise receive non-FOD
+    //    builds with secret inputs on an open-egress pod.
+    let token_fetcher = key.sign(&ExecutorClaims {
+        intent_id: "intent-C".into(),
+        kind: rio_proto::types::ExecutorKind::Fetcher as i32,
+        expiry_unix: now + 600,
+    });
+    let mut hb_kind = tonic::Request::new(rio_proto::types::HeartbeatRequest {
+        executor_id: "fetch-spoof".into(),
+        intent_id: "intent-C".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        systems: vec!["x86_64-linux".into()],
+        ..Default::default()
+    });
+    hb_kind
+        .metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token_fetcher.parse()?);
+    let err = worker_client
+        .heartbeat(hb_kind)
+        .await
+        .expect_err("kind-mismatch heartbeat should be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(
+        err.message().contains("kind"),
+        "should name the mismatched field: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+/// bug_081 / `r[sec.executor.identity-token]`: `BuildExecution` MUST
+/// learn the actor's accept/reject decision BEFORE spawning the
+/// `worker-stream-reader`. A spoofed `Register{executor_id=E_victim}`
+/// while E_victim's stream is live is rejected by the actor's
+/// live-stream guard; without the accept-gate, the reader would still
+/// be spawned and forward `ProcessCompletion{E_victim, D}` — forging a
+/// terminal result for E_victim's in-flight build. With the gate, the
+/// gRPC handler returns `PermissionDenied` and the reader never spawns.
+// r[verify sec.executor.identity-token+2]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_execution_accept_gate_rejects_spoofed_executor_id() -> anyhow::Result<()> {
+    let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    // Victim: legit BuildExecution stream as "victim".
+    let (vtx, vrx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
+    vtx.send(rio_proto::types::ExecutorMessage {
+        msg: Some(rio_proto::types::executor_message::Msg::Register(
+            rio_proto::types::ExecutorRegister {
+                executor_id: "victim".into(),
+            },
+        )),
+    })
+    .await?;
+    let mut victim_inbound = worker_client
+        .build_execution(tokio_stream::wrappers::ReceiverStream::new(vrx))
+        .await?
+        .into_inner();
+    crate::actor::tests::barrier(&handle).await;
+
+    // Attacker: open a SECOND stream with the SAME executor_id while
+    // the victim's stream is live. Dev mode (no HMAC key in
+    // setup_worker_svc) so the token bind is None — the actor's
+    // live-stream guard is what rejects.
+    let (atx, arx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
+    atx.send(rio_proto::types::ExecutorMessage {
+        msg: Some(rio_proto::types::executor_message::Msg::Register(
+            rio_proto::types::ExecutorRegister {
+                executor_id: "victim".into(),
+            },
+        )),
+    })
+    .await?;
+    let err = worker_client
+        .build_execution(tokio_stream::wrappers::ReceiverStream::new(arx))
+        .await
+        .expect_err("spoofed executor_id with live victim stream → PermissionDenied");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("live stream"),
+        "actor's reject reason surfaced: {}",
+        err.message()
+    );
+
+    // Reader was never spawned: attacker's request half is dropped
+    // (handler returned Err before consuming `stream`). Anything sent
+    // on `atx` goes nowhere — but more importantly, the victim's
+    // stream is intact and the actor never saw a forged completion.
+    drop(atx);
+
+    // Victim's stream is intact: still open, no spurious close.
+    let poll = tokio::time::timeout(Duration::from_millis(200), victim_inbound.next()).await;
+    assert!(
+        poll.is_err() || poll.as_ref().is_ok_and(|m| m.is_some()),
+        "victim stream stayed open (timeout or got a message, not None)"
+    );
+    drop(vtx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), victim_inbound.next()).await;
     Ok(())
 }
 

@@ -553,6 +553,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
             stream_tx,
             stream_epoch: crate::actor::tests::next_stream_epoch_for("stream-only"),
             auth_intent: None,
+            reply: crate::actor::tests::noop_connect_reply(),
         })
         .await?;
 

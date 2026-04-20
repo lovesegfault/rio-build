@@ -16,6 +16,13 @@ static STREAM_EPOCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static STREAM_EPOCHS: std::sync::LazyLock<dashmap::DashMap<String, u64>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// Throwaway `ExecutorConnected.reply` for test sites that don't care
+/// about the accept/reject result. The receiver is dropped immediately;
+/// the actor's `let _ = reply.send(..)` ignores send failure.
+pub(crate) fn noop_connect_reply() -> oneshot::Sender<Result<(), &'static str>> {
+    oneshot::channel().0
+}
+
 /// Allocate a fresh stream epoch for `executor_id` and record it.
 /// Call at every `ExecutorConnected{..}` construction site (helper or
 /// inline).
@@ -389,6 +396,7 @@ pub(crate) async fn connect_executor_with(
             stream_tx,
             stream_epoch: next_stream_epoch_for(executor_id),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat_with(handle, executor_id, system, f).await?;
@@ -783,6 +791,7 @@ pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: id.into(),
             stream_epoch: stream_epoch_for(id),
+            seen_drvs: vec![],
         })
         .await?;
     barrier(handle).await;

@@ -10,6 +10,9 @@
 { fixture }:
 let
   inherit (fixture) gatewayHost;
+  # rio servers don't register tonic-reflection; grpcurl needs the
+  # compiled protoset for the executor-kind-spoof Heartbeat probe.
+  protoset = import ../../lib/protoset.nix { inherit pkgs; };
 
   # ── Test derivations ────────────────────────────────────────────────
   # Distinct markers so each build creates a fresh `builds` row instead
@@ -186,6 +189,44 @@ pkgs.testers.runNixOSTest {
             f"before={pp_before}, after={pp_after}"
         )
         print(f"hmac-positive PASS: build with HMAC token succeeded, output {out_hmac}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Section: executor-identity kind bind (r[sec.executor.identity-token])
+    # ══════════════════════════════════════════════════════════════════
+    # The standalone fixture mints a static x-rio-executor-token with
+    # kind=0 (Builder). A heartbeat presenting that token but body
+    # kind=1 (Fetcher) MUST be rejected UNAUTHENTICATED — kind decides
+    # the FOD/non-FOD airgap routing and the worker is NOT trusted.
+
+    with subtest("executor-kind-spoof: heartbeat kind != token kind rejected"):
+        # Read the static token from the worker's EnvironmentFile (a
+        # Nix store path written by the fixture). The fixture signed
+        # kind=0 (Builder).
+        envfile = worker.succeed(
+            "systemctl show -p EnvironmentFiles --value rio-builder | head -1"
+        ).strip().split(" ")[0]
+        token = worker.succeed(
+            f"grep '^RIO_EXECUTOR_TOKEN=' {envfile} | cut -d= -f2-"
+        ).strip()
+        assert token, "precondition: worker has a static executor token"
+
+        # grpcurl Heartbeat with body kind=EXECUTOR_KIND_FETCHER.
+        # intent_id="" to match the token. -protoset: rio servers do
+        # not register tonic-reflection. The scheduler listens on
+        # control:9001 (plaintext gRPC in standalone).
+        out = ${gatewayHost}.fail(
+            "grpcurl -plaintext -max-time 10 "
+            "-protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-executor-token: {token}' "
+            "-d "
+            """'{"executor_id":"spoof","intent_id":"","kind":"EXECUTOR_KIND_FETCHER","systems":["x86_64-linux"]}' """
+            "localhost:9001 rio.builder.ExecutorService/Heartbeat 2>&1"
+        )
+        assert "Unauthenticated" in out and "kind" in out, (
+            f"kind-mismatch heartbeat must be UNAUTHENTICATED with "
+            f"reason naming kind: {out[:400]}"
+        )
+        print("executor-kind-spoof PASS: body kind != token kind rejected")
 
     # ══════════════════════════════════════════════════════════════════
     # Section: tenant resolution (phase4 Section A)

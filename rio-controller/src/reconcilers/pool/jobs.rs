@@ -500,7 +500,7 @@ pub(super) fn build_job(
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
     apply_intent_resources(&mut pod_spec, pool, intent);
-    // r[impl sec.executor.identity-token]
+    // r[impl sec.executor.identity-token+2]
     // Pass the scheduler-signed token through verbatim so the builder
     // presents it on `BuildExecution` / `Heartbeat`. Per-intent (not
     // per-Pool), so it's appended here rather than in the static

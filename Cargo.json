@@ -21079,6 +21079,10 @@
           "packageId": "statrs"
         },
         {
+          "name": "strum",
+          "packageId": "strum"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },
@@ -25399,6 +25403,64 @@
       "authors": [
         "Danny Guo <danny@dannyguo.com>",
         "maxbachmann <oss@maxbachmann.de>"
+      ]
+    },
+    "strum": {
+      "crateName": "strum",
+      "version": "0.27.2",
+      "edition": "2021",
+      "sha256": "1ksb9jssw4bg9kmv9nlgp2jqa4vnsa3y4q9zkppvl952q7vdc8xg",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "strum_macros",
+          "packageId": "strum_macros"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "derive",
+        "std",
+        "strum_macros"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Peter Glotfelty <peter.glotfelty@microsoft.com>"
+      ]
+    },
+    "strum_macros": {
+      "crateName": "strum_macros",
+      "version": "0.27.2",
+      "edition": "2021",
+      "sha256": "19xwikxma0yi70fxkcy1yxcv0ica8gf3jnh5gj936jza8lwcx5bn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "heck",
+          "packageId": "heck"
+        },
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Peter Glotfelty <peter.glotfelty@microsoft.com>"
       ]
     },
     "subtle": {

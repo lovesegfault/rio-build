@@ -221,7 +221,7 @@ impl DagActor {
             .builds
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
-        // r[impl sched.tenant.authz]
+        // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
         }
@@ -278,7 +278,7 @@ impl DagActor {
             .builds
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
-        // r[impl sched.tenant.authz]
+        // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
         }
@@ -314,7 +314,7 @@ impl DagActor {
             .builds
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
-        // r[impl sched.tenant.authz]
+        // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
             return Err(ActorError::PermissionDenied { build_id });
         }

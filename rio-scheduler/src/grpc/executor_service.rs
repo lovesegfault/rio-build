@@ -51,14 +51,14 @@ impl ExecutorService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sec.executor.identity-token]
+        // r[impl sec.executor.identity-token+2]
         // Bind this stream to the HMAC-attested intent the pod was
         // spawned for. A compromised builder cannot mint a token for
         // another pod's intent → cannot hijack its `stream_tx` (the
         // actor rejects on `auth_intent` mismatch) → cannot receive
         // its `WorkAssignment.assignment_token` → cannot poison its
         // outputs. `None` in dev mode (no HMAC key configured).
-        let auth_intent = self.require_executor(&request)?;
+        let auth_intent = self.require_executor(&request)?.map(|c| c.intent_id);
         let mut stream = request.into_inner();
 
         // The first message MUST be a ExecutorRegister with the executor_id.
@@ -97,15 +97,36 @@ impl ExecutorService for SchedulerGrpc {
         let stream_epoch = STREAM_EPOCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Register the worker stream with the actor (blocking send — must not drop).
+        // r[impl sec.executor.identity-token+2]
+        // Accept-gate: `executor_id` is body-supplied (`ExecutorClaims`
+        // can't carry it — the scheduler signs at SpawnIntent emission,
+        // before the controller picks a pod name). The actor binds
+        // `auth_intent ↔ executor_id` and rejects on live-stream /
+        // intent-mismatch; we MUST learn that decision BEFORE spawning
+        // the bridge + reader below. Without this gate, a spoofed
+        // `Register{executor_id=E_victim}` is rejected actor-side but
+        // the reader keeps forwarding `ProcessCompletion{E_victim,
+        // D_victim}` — `handle_completion`'s stale-report guard checks
+        // `assigned_executor == executor_id`, which the attacker
+        // spoofed exactly → forged terminal result for another
+        // tenant's build.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.actor
             .send_unchecked(ActorCommand::ExecutorConnected {
                 executor_id: executor_id.as_str().into(),
                 stream_tx: actor_tx,
                 stream_epoch,
                 auth_intent,
+                reply: reply_tx,
             })
             .await
             .map_err(Self::actor_error_to_status)?;
+        reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped ExecutorConnected reply"))?
+            .map_err(|reason| {
+                Status::permission_denied(format!("ExecutorConnected rejected: {reason}"))
+            })?;
 
         // Bridge actor_rx -> output_tx, wrapping in Ok()
         rio_common::task::spawn_monitored("build-exec-bridge", async move {
@@ -308,32 +329,20 @@ impl ExecutorService for SchedulerGrpc {
                 }
             }
 
-            // The seal's job (block late batches between CompletionReport
-            // and flusher drain) is done once this stream is closed — no
-            // more batches CAN arrive. Branch on whether a completion
-            // landed: sealed → unseal (leave the buffer for the flusher's
-            // drain — discard would race it and lose the log); NOT sealed
-            // → discard (no completion → fake path or aborted build →
-            // reap the entry so periodic-flush stops iterating it). A
-            // legitimate in-flight drv whose worker disconnected
-            // mid-build loses its in-memory tail; periodic-flush already
-            // snapshotted to S3 and the next assignment's logs replace
-            // it from scratch anyway.
-            for drv in &seen_drvs {
-                if log_buffers.is_sealed(drv) {
-                    log_buffers.unseal(drv);
-                } else {
-                    log_buffers.discard(drv);
-                }
-            }
-
             // Stream closed: worker disconnected. Use blocking send — if this
             // is dropped due to backpressure, running derivations won't be
-            // reassigned and will hang forever.
+            // reassigned and will hang forever. `seen_drvs` is forwarded
+            // so the actor can do the log-buffer cleanup AFTER the epoch
+            // check and with DAG-ownership awareness — doing it here
+            // (pre-epoch-gate, branching on `is_sealed`) raced the
+            // actor's seal (TOCTOU), let a stale reader wipe a
+            // reconnected stream's fresh buffer, and let a compromised
+            // worker discard a victim's buffer.
             if actor_for_recv
                 .send_unchecked(ActorCommand::ExecutorDisconnected {
                     executor_id: executor_id_for_recv.into(),
                     stream_epoch,
+                    seen_drvs: seen_drvs.into_iter().collect(),
                 })
                 .await
                 .is_err()
@@ -353,26 +362,33 @@ impl ExecutorService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sec.executor.identity-token]
-        let auth_intent = self.require_executor(&request)?;
+        // r[impl sec.executor.identity-token+2]
+        let auth_claims = self.require_executor(&request)?;
         let req = request.into_inner();
 
         if req.executor_id.is_empty() {
             return Err(Status::invalid_argument("executor_id is required"));
         }
-        // Body `intent_id` MUST equal the token's. The actor's
-        // `worker.intent_id` (set from this body field) is what
-        // dispatch matches and what `handle_worker_connected` checks
-        // on reconnect — binding it here means it's
-        // cryptographically attested. A spoofed
-        // `Heartbeat{draining:true}` for another executor needs that
-        // executor's intent_id, which the attacker has no token for.
-        if let Some(ref ai) = auth_intent
-            && req.intent_id != *ai
-        {
-            return Err(Status::unauthenticated(
-                "heartbeat intent_id does not match x-rio-executor-token",
-            ));
+        // Body `intent_id` and `kind` MUST equal the token's. The
+        // actor's `worker.intent_id` (set from this body field) is
+        // what dispatch matches and what `handle_worker_connected`
+        // checks on reconnect; `worker.kind` is what `hard_filter`
+        // reads for the FOD/non-FOD airgap split. Binding both here
+        // means they're cryptographically attested — a compromised
+        // open-egress Fetcher cannot heartbeat `kind=Builder` and
+        // receive non-FOD builds with secret inputs (its CNP stays
+        // wide open; only the work routed to it would change).
+        if let Some(ref c) = auth_claims {
+            if req.intent_id != c.intent_id {
+                return Err(Status::unauthenticated(
+                    "heartbeat intent_id does not match x-rio-executor-token",
+                ));
+            }
+            if req.kind != c.kind {
+                return Err(Status::unauthenticated(
+                    "heartbeat kind does not match x-rio-executor-token",
+                ));
+            }
         }
 
         // Bound heartbeat payload sizes. Heartbeats bypass backpressure
@@ -401,9 +417,13 @@ impl ExecutorService for SchedulerGrpc {
         // Unknown value (future proto version) → Builder (safe default:
         // an unrecognized-kind executor won't receive FODs, so no
         // airgap violation). 0 = Builder (wire default for pre-ADR-019
-        // executors that don't send this field).
-        let kind = rio_proto::types::ExecutorKind::try_from(req.kind)
-            .unwrap_or(rio_proto::types::ExecutorKind::Builder);
+        // executors that don't send this field). In HMAC mode, prefer
+        // the attested `claims.kind` over the body so there is nothing
+        // to lie about; the bind above already rejected a mismatch.
+        let kind = rio_proto::types::ExecutorKind::try_from(
+            auth_claims.as_ref().map_or(req.kind, |c| c.kind),
+        )
+        .unwrap_or(rio_proto::types::ExecutorKind::Builder);
 
         let cmd = ActorCommand::Heartbeat(HeartbeatPayload {
             executor_id: req.executor_id.into(),

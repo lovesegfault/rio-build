@@ -266,10 +266,11 @@ impl LogBuffers {
     }
 
     /// Whether `drv_path` is currently sealed (a completion landed and
-    /// the flusher owns drain). The recv task's stream-exit cleanup
-    /// branches on this: sealed → [`Self::unseal`] (leave the buffer
-    /// for the flusher); not sealed → [`Self::discard`] (no completion
-    /// → fake or aborted → reap so periodic-flush stops iterating it).
+    /// the flusher owns drain). Retained for the flusher contract +
+    /// tests; the stream-exit cleanup no longer branches on this — it
+    /// was moved into the actor's epoch-gated `ExecutorDisconnected`
+    /// handler (the unsynchronized `is_sealed` branch here raced the
+    /// actor's `seal()` under load).
     pub fn is_sealed(&self, drv_path: &str) -> bool {
         self.sealed.contains(drv_path)
     }

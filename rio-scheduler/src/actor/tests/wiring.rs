@@ -108,6 +108,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "test-worker".into(),
             stream_epoch: stream_epoch_for("test-worker"),
+            seen_drvs: vec![],
         })
         .await?;
 

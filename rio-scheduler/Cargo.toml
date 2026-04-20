@@ -59,6 +59,11 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# EnumCount derive on ActorError so guards_tests.rs's `cases.len()`
+# assertion can't be left stale when a variant is added (it has been,
+# twice). Compile-time pin (`_actor_error_exhaustive`) only catches
+# the match arm; this catches the test-row.
+strum = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rio-nix = { workspace = true }

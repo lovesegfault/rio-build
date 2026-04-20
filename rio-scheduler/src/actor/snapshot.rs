@@ -248,7 +248,7 @@ impl DagActor {
                 .get(drv_hash)
                 .map(|e| crate::sla::cost::selector_for(e.0, e.1))
                 .unwrap_or(intent.node_selector);
-            // r[impl sec.executor.identity-token]
+            // r[impl sec.executor.identity-token+2]
             // Sign per-intent so the spawned pod can prove on
             // BuildExecution/Heartbeat that it was spawned for THIS
             // intent. Expiry: deadline + 5-min grace (the pod's
@@ -265,6 +265,7 @@ impl DagActor {
                         .unwrap_or(0);
                     s.sign(&rio_auth::hmac::ExecutorClaims {
                         intent_id: drv_hash.to_string(),
+                        kind: kind.into(),
                         expiry_unix: now
                             .saturating_add(u64::from(intent.deadline_secs))
                             .saturating_add(300),
@@ -730,6 +731,7 @@ impl DagActor {
                 running_build: w.running_build.as_ref().map(|h| h.to_string()),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
+                intent_id: w.intent_id.clone(),
             })
             .collect()
     }

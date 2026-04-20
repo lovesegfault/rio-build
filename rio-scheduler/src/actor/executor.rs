@@ -106,21 +106,27 @@ impl DagActor {
     // Worker management
     // -----------------------------------------------------------------------
 
+    /// Returns `Ok(())` when the stream is accepted, `Err(reason)` when
+    /// the live-stream / intent-mismatch hijack guards reject. The gRPC
+    /// handler awaits this via the `ExecutorConnected.reply` oneshot
+    /// BEFORE spawning the `worker-stream-reader` task — on `Err`, the
+    /// reader is never spawned with a body-supplied `executor_id`, so a
+    /// spoofed `Register{executor_id=E_victim}` cannot forward
+    /// `ProcessCompletion{E_victim}`.
     pub(super) fn handle_worker_connected(
         &mut self,
         executor_id: &ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
         stream_epoch: u64,
         auth_intent: Option<String>,
-    ) {
+    ) -> Result<(), &'static str> {
         info!(executor_id = %executor_id, stream_epoch, "worker stream connected");
 
         let entry = self.executors.entry(executor_id.clone());
         let is_reconnect = matches!(entry, std::collections::hash_map::Entry::Occupied(_));
         let worker = entry.or_insert_with(|| ExecutorState::new(executor_id.clone()));
-        worker.stream_epoch = stream_epoch;
 
-        // r[impl sec.executor.identity-token]
+        // r[impl sec.executor.identity-token+2]
         // Two reconnect rejections that together prevent stream hijack:
         //
         // 1. Existing stream still live → drop the NEW one. A
@@ -148,7 +154,7 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
                                   "reason" => "live_stream")
                 .increment(1);
-                return;
+                return Err("live stream");
             }
             if auth_intent.is_some()
                 && worker.intent_id.is_some()
@@ -163,9 +169,16 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
                                   "reason" => "intent_mismatch")
                 .increment(1);
-                return;
+                return Err("intent mismatch");
             }
         }
+        // Accept path: stamp `stream_epoch` HERE, not above the reject
+        // guards. A rejected (spoofed) reconnect would otherwise
+        // overwrite the legit stream's epoch, causing its eventual
+        // `ExecutorDisconnected` to be dropped as stale (I-056a check
+        // in `handle_executor_disconnected`) — entry never cleaned,
+        // `running_build` never reassigned.
+        worker.stream_epoch = stream_epoch;
         // Stamp the attested intent immediately so dispatch can match
         // before the first heartbeat lands, and so a later reconnect
         // attempt with a different intent fails check (2) above.
@@ -214,6 +227,7 @@ impl DagActor {
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
             self.on_worker_registered(executor_id);
         }
+        Ok(())
     }
 
     /// Flip `warm=true` on PrefetchComplete ACK. See
@@ -318,6 +332,7 @@ impl DagActor {
         &mut self,
         executor_id: &ExecutorId,
         stream_epoch: u64,
+        seen_drvs: Vec<String>,
     ) {
         let Some(worker) = self.executors.get(executor_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
@@ -385,6 +400,29 @@ impl DagActor {
             metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
         }
         metrics::counter!("rio_scheduler_worker_disconnects_total").increment(1);
+
+        // Log-buffer cleanup, AFTER the epoch check above (a stale
+        // reader's `seen_drvs` reaches here only when the epoch
+        // matched) and with ownership awareness. Discard ONLY paths
+        // the DAG has never heard of — fabricated by an untrusted
+        // worker (the `MAX_DRVS_PER_STREAM` cap bounds count, not
+        // which paths) or post-cleanup. Real drvs are reaped by the
+        // existing machinery: `seal()` on completion, `discard()` on
+        // next `assign_to_worker`, `discard()` in
+        // `handle_cleanup_terminal_build`. This was previously in the
+        // reader task, branching on `is_sealed`; that raced the
+        // actor's `seal()` (TOCTOU under load → completed build's
+        // buffer discarded before flusher drained it) and had no
+        // ownership check (compromised worker → discard a victim's
+        // buffer by sending one `LogBatch{derivation_path=D_victim}`
+        // then disconnecting).
+        if let Some(bufs) = &self.log_buffers {
+            for drv in seen_drvs {
+                if self.dag.hash_for_path(&drv).is_none() {
+                    bufs.discard(&drv);
+                }
+            }
+        }
     }
 
     /// Reset a set of derivations to Ready and re-enqueue.
@@ -870,6 +908,37 @@ impl DagActor {
                 "heartbeat for unknown executor; dropping \
                  (stream not yet connected — scheduler restart race?)"
             );
+            return (Vec::new(), false);
+        }
+        // r[impl sec.executor.identity-token+2]
+        // Defence-in-depth: once `executor_id` is bound to an attested
+        // `intent_id` (by `handle_worker_connected` on accept, or a
+        // prior token-gated heartbeat), a heartbeat for that
+        // `executor_id` with a DIFFERENT non-empty `intent_id` is a
+        // spoof — the gRPC bind only proves the body matches the
+        // CALLER's token, not that `executor_id` belongs to that
+        // caller. Without this, a worker holding a token for `I_self`
+        // can heartbeat `{executor_id: E_victim, intent_id: I_self}`,
+        // pass the gRPC bind, and overwrite
+        // `executors[E_victim].intent_id` / `kind` — poisoning
+        // E_victim's dispatch match. Mirrors the reconnect
+        // intent-mismatch guard in `handle_worker_connected` (both-Some
+        // and differ; `hb.intent_id = None` is unreachable in HMAC mode
+        // for a bound executor — the gRPC bind rejects "" ≠ stored).
+        if let Some(w) = self.executors.get(executor_id.as_str())
+            && let Some(stored) = w.intent_id.as_ref()
+            && let Some(presented) = hb.intent_id.as_ref()
+            && presented != stored
+        {
+            warn!(
+                executor_id = %executor_id,
+                stored = %stored,
+                presented = %presented,
+                "heartbeat intent_id differs from bound intent; dropping (spoof?)"
+            );
+            metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
+                              "reason" => "heartbeat_intent_mismatch")
+            .increment(1);
             return (Vec::new(), false);
         }
 

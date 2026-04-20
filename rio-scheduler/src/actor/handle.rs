@@ -42,6 +42,11 @@ pub struct DebugExecutorInfo {
     /// surviving reconnect was the actual FOD-stuck-22min root.
     pub draining: bool,
     pub store_degraded: bool,
+    /// `r[sec.executor.identity-token]`: HMAC-attested SpawnIntent id
+    /// the executor is bound to. `None` for static-mode pods or after
+    /// the not-Ready→None downgrade. Exposed for the heartbeat-spoof
+    /// guard's regression test.
+    pub intent_id: Option<String>,
 }
 
 /// Test-only: snapshot of derivation state for assertions. Mirrors the

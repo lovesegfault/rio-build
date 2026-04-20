@@ -79,14 +79,17 @@ let
   };
 
   # Static RIO_EXECUTOR_TOKEN for standalone workers. In k8s the
-  # scheduler signs ExecutorClaims{intent_id,expiry} per SpawnIntent and
-  # the controller injects it as a pod env var; standalone has no
-  # SpawnIntent flow, so mint one here with intent_id="" (matches the
-  # worker's empty Config.intent_id → heartbeat body check passes) and a
-  # far-future expiry. Signed with the SAME hmac.key the scheduler loads
-  # so require_executor() verifies. Written as a systemd EnvironmentFile
-  # (KEY=value) — NOT readFile-into-env, which would be IFD on the
-  # non-deterministic hmacKeys derivation. r[sec.executor.identity-token].
+  # scheduler signs ExecutorClaims{intent_id,kind,expiry} per
+  # SpawnIntent and the controller injects it as a pod env var;
+  # standalone has no SpawnIntent flow, so mint one here with
+  # intent_id="" (matches the worker's empty Config.intent_id →
+  # heartbeat body check passes), kind=0 (Builder — standalone workers
+  # heartbeat the proto default; deny_unknown_fields means the field
+  # MUST be present), and a far-future expiry. Signed with the SAME
+  # hmac.key the scheduler loads so require_executor() verifies.
+  # Written as a systemd EnvironmentFile (KEY=value) — NOT
+  # readFile-into-env, which would be IFD on the non-deterministic
+  # hmacKeys derivation. r[sec.executor.identity-token].
   executorTokenEnv =
     pkgs.runCommand "rio-executor-token-env"
       {
@@ -102,7 +105,8 @@ let
                 key = key[: -len(suf)]
                 break
         claims = json.dumps(
-            {"intent_id": "", "expiry_unix": 9999999999}, separators=(",", ":")
+            {"intent_id": "", "kind": 0, "expiry_unix": 9999999999},
+            separators=(",", ":"),
         ).encode()
         sig = hmac.new(key, claims, hashlib.sha256).digest()
         b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()

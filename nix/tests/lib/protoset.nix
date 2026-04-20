@@ -17,5 +17,5 @@ pkgs.runCommand "rio-protoset" { buildInputs = [ pkgs.protobuf ]; } ''
     --proto_path=${../../../rio-proto/proto} \
     --descriptor_set_out=$out/rio.protoset \
     --include_imports \
-    admin.proto scheduler.proto store.proto types.proto
+    admin.proto scheduler.proto store.proto builder.proto types.proto
 ''

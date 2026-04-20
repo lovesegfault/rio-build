@@ -303,6 +303,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("tight-worker"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat(&handle, "tight-worker", "x86_64-linux").await?;
@@ -336,6 +337,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "tight-worker".into(),
             stream_epoch: stream_epoch_for("tight-worker"),
+            seen_drvs: vec![],
         })
         .await?;
 

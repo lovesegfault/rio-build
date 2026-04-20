@@ -230,6 +230,9 @@ hex = "0.4"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+# strum::EnumCount: pin variant counts so test arrays can't drift
+# silently from `_exhaustive` match arms (guards_tests.rs).
+strum = { version = "0.27", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

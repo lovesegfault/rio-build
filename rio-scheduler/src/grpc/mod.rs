@@ -199,20 +199,53 @@ impl SchedulerGrpc {
         s.parse().status_invalid("invalid build_id UUID")
     }
 
-    // r[impl sched.tenant.authz]
+    // r[impl sched.tenant.authz+2]
+    // r[impl gw.jwt.verify]
     /// Single chokepoint reconciling the permissive interceptor's third
     /// state ("header absent → no Claims attached, request passes") with
-    /// per-RPC tenant authorization.
+    /// per-RPC tenant authorization AND jti revocation.
     ///
-    /// Returns the interceptor-attached `TenantClaims.sub` when present.
-    /// When `jwt_mode` is set and no Claims are attached, returns
-    /// `Unauthenticated` — closes the gap that lets an untrusted builder
-    /// (which reaches :9001 for ExecutorService and never sets
+    /// Returns the interceptor-attached `(TenantClaims.sub, jti)` when
+    /// present. When `jwt_mode` is set and no Claims are attached,
+    /// returns `Unauthenticated` — closes the gap that lets an untrusted
+    /// builder (which reaches :9001 for ExecutorService and never sets
     /// `x-rio-tenant-token`) call SchedulerService RPCs token-less.
     /// `Ok(None)` only in dev mode (no pubkey configured).
-    pub(super) fn require_tenant<T>(&self, req: &Request<T>) -> Result<Option<Uuid>, Status> {
+    ///
+    /// **jti revocation** (`r[gw.jwt.verify]`): when Claims ARE present,
+    /// `claims.jti` is checked against `jwt_revoked` and a hit returns
+    /// `Unauthenticated("token revoked")`. This is the scheduler-level
+    /// revocation invariant — the gateway interceptor stays PG-free
+    /// (stateless N-replica HA), and the store does NOT duplicate it
+    /// (SubmitBuild is the ingress choke point for builds; everything
+    /// downstream of an accepted submission inherits its validation).
+    /// Hoisted from a SubmitBuild-only inline block: `CancelBuild` /
+    /// `WatchBuild` / `QueryBuildStatus` are independent client-facing
+    /// ingress points reachable directly with a leaked token.
+    pub(super) async fn require_tenant<T>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<Option<(Uuid, String)>, Status> {
         match req.extensions().get::<rio_auth::jwt::TenantClaims>() {
-            Some(claims) => Ok(Some(claims.sub)),
+            Some(claims) => {
+                // Same db-presence gate as tenant resolve. If db is
+                // None AND Claims are Some, something is misconfigured
+                // (JWT mode requires PG for revocation); fail loud.
+                let db = self.db.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "jti revocation check requires database connection \
+                         (JWT mode enabled but scheduler pool is None)",
+                    )
+                })?;
+                if db
+                    .is_jwt_revoked(&claims.jti)
+                    .await
+                    .status_internal("jti revocation lookup failed")?
+                {
+                    return Err(Status::unauthenticated("token revoked"));
+                }
+                Ok(Some((claims.sub, claims.jti.clone())))
+            }
             None if self.jwt_mode => Err(Status::unauthenticated(
                 "SchedulerService requires x-rio-tenant-token in JWT mode",
             )),
@@ -220,18 +253,24 @@ impl SchedulerGrpc {
         }
     }
 
-    // r[impl sec.executor.identity-token]
-    /// Extract and verify `x-rio-executor-token`, returning the
-    /// HMAC-attested `intent_id`. Mirrors [`Self::require_tenant`] for
-    /// the worker-facing service: when an HMAC key is configured, a
-    /// missing or invalid token is `Unauthenticated`; when no key is
-    /// configured (dev mode), `Ok(None)`.
+    // r[impl sec.executor.identity-token+2]
+    /// Extract and verify `x-rio-executor-token`, returning the full
+    /// HMAC-attested [`ExecutorClaims`]. Mirrors
+    /// [`Self::require_tenant`] for the worker-facing service: when an
+    /// HMAC key is configured, a missing or invalid token is
+    /// `Unauthenticated`; when no key is configured (dev mode),
+    /// `Ok(None)`.
     ///
     /// Called by `build_execution` (binds the stream to the intent the
     /// pod was spawned for) and `heartbeat` (binds the body's
-    /// `intent_id` to the token's). A compromised builder holds a token
-    /// for ITS OWN intent only — it cannot mint one for another pod's.
-    pub(super) fn require_executor<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
+    /// `intent_id` AND `kind` to the token's). A compromised builder
+    /// holds a token for ITS OWN intent+kind only — it cannot mint one
+    /// for another pod's, and cannot self-promote `kind` to receive
+    /// work routed past its CNP airgap boundary.
+    pub(super) fn require_executor<T>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<Option<ExecutorClaims>, Status> {
         let Some(key) = &self.hmac_key else {
             return Ok(None);
         };
@@ -248,7 +287,7 @@ impl SchedulerGrpc {
         let claims: ExecutorClaims = key.verify(token).map_err(|e| {
             Status::unauthenticated(format!("x-rio-executor-token verification failed: {e}"))
         })?;
-        Ok(Some(claims.intent_id))
+        Ok(Some(claims))
     }
 }
 
@@ -407,11 +446,26 @@ pub(crate) fn bridge_build_events(
         loop {
             match bcast.recv().await {
                 Ok(event) => {
+                    use rio_proto::types::build_event::Event;
                     // Dedup: PG already delivered seq ≤ watermark.
                     // The broadcast ring (1024 cap) holds recent
                     // events — some were emitted BEFORE subscribe
                     // and have seq ≤ last_seq. Skip those.
-                    if event.sequence <= dedup_watermark {
+                    //
+                    // Log is EXEMPT: it is never persisted to PG
+                    // (event.rs filters it from the persister) AND
+                    // reuses the last persisted seq without bumping
+                    // (event.rs Log arm). After a reconnect-with-
+                    // replay, `dedup_watermark = last_seq` and every
+                    // live Log line arrives at `seq = last_seq` →
+                    // would be dropped here until the next non-Log
+                    // event bumps the counter — an unbounded live-log
+                    // blackout for a single long-running drv. Log
+                    // can never be a Phase-1 duplicate (PG never had
+                    // it), so skipping the check is safe.
+                    if event.sequence <= dedup_watermark
+                        && !matches!(event.event, Some(Event::Log(_)))
+                    {
                         continue;
                     }
                     if tx.send(Ok(event)).await.is_err() {

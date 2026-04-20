@@ -125,7 +125,7 @@ async fn test_submit_build_resolves_known_tenant() {
     assert_eq!(db_tenant, Some(tenant_uuid));
 }
 
-// r[verify sched.tenant.authz]
+// r[verify sched.tenant.authz+2]
 /// merged_bug_057: in JWT mode, SchedulerService rejects token-less
 /// calls (the permissive interceptor's third state would otherwise let
 /// a builder reach SubmitBuild/CancelBuild/WatchBuild unauthenticated).
@@ -152,7 +152,7 @@ async fn test_submit_build_jwt_mode_rejects_tokenless() {
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 }
 
-// r[verify sched.tenant.authz]
+// r[verify sched.tenant.authz+2]
 /// merged_bug_057: `claims.sub` is the authoritative tenant identity.
 /// A caller holding tenant-A's claims with body `tenant_name="B"`
 /// MUST be attributed to A, not B.
@@ -189,7 +189,7 @@ async fn test_submit_build_claims_sub_overrides_body_tenant_name() {
     );
 }
 
-// r[verify sched.tenant.authz]
+// r[verify sched.tenant.authz+2]
 /// merged_bug_057: cross-tenant Cancel/Watch is rejected with
 /// PERMISSION_DENIED. Submit as A, attempt cancel/watch as B.
 #[tokio::test]
@@ -684,4 +684,71 @@ async fn no_claims_skips_revocation_check() {
         "no-Claims path must not fail — this is every key-unset deploy: {:?}",
         result.err()
     );
+}
+
+/// bug_124 / `r[gw.jwt.verify]`: jti revocation MUST cover every
+/// SchedulerService ingress RPC, not just SubmitBuild. A revoked-but-
+/// unexpired token (≤8h window per `r[gw.jwt.claims]`) reaching
+/// `cancel_build` / `watch_build` / `query_build_status` previously
+/// passed `require_tenant` (synchronous, never touched PG) and could
+/// cancel the tenant's builds + stream their log output until natural
+/// expiry. Hoisting the lookup into `require_tenant` closes all four.
+// r[verify gw.jwt.verify]
+// r[verify sched.tenant.authz+2]
+#[tokio::test]
+async fn revoked_jti_rejected_by_cancel_watch_query() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_jti_tenant(&db.pool).await;
+
+    let jti = "revoked-session-cwq";
+    let inserted = sqlx::query("INSERT INTO jwt_revoked (jti, reason) VALUES ($1, 'test')")
+        .bind(jti)
+        .execute(&db.pool)
+        .await
+        .expect("insert into jwt_revoked");
+    assert_eq!(
+        inserted.rows_affected(),
+        1,
+        "self-precondition: jti revoked"
+    );
+
+    let build_id = uuid::Uuid::new_v4().to_string();
+
+    // CancelBuild — destructive. Pre-fix: reached the actor's
+    // tenant-ownership check (which would PASS for the token's own
+    // tenant — the leak scenario).
+    let mut cancel = Request::new(rio_proto::types::CancelBuildRequest {
+        build_id: build_id.clone(),
+        reason: "evil".into(),
+    });
+    cancel.extensions_mut().insert(claims_with_jti(jti));
+    let s = grpc
+        .cancel_build(cancel)
+        .await
+        .expect_err("revoked jti → cancel_build must fail");
+    assert_eq!(s.code(), tonic::Code::Unauthenticated);
+    assert!(s.message().contains("revoked"), "got: {}", s.message());
+
+    // WatchBuild — leaks build progress + log output.
+    let mut watch = Request::new(rio_proto::types::WatchBuildRequest {
+        build_id: build_id.clone(),
+        since_sequence: 0,
+    });
+    watch.extensions_mut().insert(claims_with_jti(jti));
+    let s = grpc
+        .watch_build(watch)
+        .await
+        .expect_err("revoked jti → watch_build must fail");
+    assert_eq!(s.code(), tonic::Code::Unauthenticated);
+    assert!(s.message().contains("revoked"), "got: {}", s.message());
+
+    // QueryBuildStatus — leaks build state.
+    let mut query = Request::new(rio_proto::types::QueryBuildRequest { build_id });
+    query.extensions_mut().insert(claims_with_jti(jti));
+    let s = grpc
+        .query_build_status(query)
+        .await
+        .expect_err("revoked jti → query_build_status must fail");
+    assert_eq!(s.code(), tonic::Code::Unauthenticated);
+    assert!(s.message().contains("revoked"), "got: {}", s.message());
 }

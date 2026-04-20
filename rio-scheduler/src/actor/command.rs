@@ -172,6 +172,15 @@ pub enum ActorCommand {
         /// doesn't match the stored `intent_id` (stream-hijack
         /// guard). `None` in dev mode (no HMAC key configured).
         auth_intent: Option<String>,
+        /// `r[sec.executor.identity-token]`: accept-gate. The gRPC
+        /// handler awaits this BEFORE spawning the
+        /// `worker-stream-reader` task; on `Err`, it returns
+        /// `PERMISSION_DENIED` and the reader is never spawned.
+        /// Without it, a spoofed `Register{executor_id=E_victim}` is
+        /// rejected by the actor (live-stream / intent-mismatch) but
+        /// the reader keeps forwarding `ProcessCompletion{E_victim}`
+        /// — forging terminal results for another tenant's build.
+        reply: oneshot::Sender<Result<(), &'static str>>,
     },
 
     /// A worker's BuildExecution stream closed.
@@ -181,6 +190,19 @@ pub enum ActorCommand {
         /// `ExecutorState::stream_epoch`; mismatch → stale disconnect
         /// from a prior stream → no-op.
         stream_epoch: u64,
+        /// `derivation_path` keys this stream pushed into
+        /// `LogBuffers`. The actor — AFTER the epoch check — discards
+        /// only those the DAG has never heard of (fabricated by an
+        /// untrusted worker, or post-cleanup). Real drvs are reaped by
+        /// the existing machinery: `seal()` on completion, `discard()`
+        /// on next `assign_to_worker`, `discard()` in
+        /// `handle_cleanup_terminal_build`. Moved out of the reader
+        /// task: branching on `is_sealed` there raced the actor's
+        /// `seal()` (TOCTOU under load), wasn't epoch-gated (stale
+        /// reader wiped the reconnected stream's fresh buffer), and
+        /// had no ownership check (compromised worker → discard a
+        /// victim's buffer).
+        seen_drvs: Vec<String>,
     },
 
     /// Controller observed a builder/fetcher Pod's container terminate
@@ -739,7 +761,7 @@ pub struct ClusterSnapshot {
 }
 
 /// Errors from the actor.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, strum::EnumCount)]
 pub enum ActorError {
     #[error("build not found: {0}")]
     BuildNotFound(Uuid),

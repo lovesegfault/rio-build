@@ -1924,6 +1924,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
             .send_unchecked(ActorCommand::ExecutorDisconnected {
                 executor_id: format!("w{w}").into(),
                 stream_epoch: stream_epoch_for(&format!("w{w}")),
+                seen_drvs: vec![],
             })
             .await?;
     }
@@ -2442,7 +2443,10 @@ async fn test_reprobe_unlocked_deferred_past_stale_reset() -> TestResult {
         &handle,
         b1,
         vec![d.clone(), x.clone(), y.clone()],
-        vec![make_test_edge("ro-d", "ro-x"), make_test_edge("ro-d", "ro-y")],
+        vec![
+            make_test_edge("ro-d", "ro-x"),
+            make_test_edge("ro-d", "ro-y"),
+        ],
         false,
     )
     .await?;
@@ -2480,7 +2484,10 @@ async fn test_reprobe_unlocked_deferred_past_stale_reset() -> TestResult {
         &handle,
         b2,
         vec![d, x, y, z],
-        vec![make_test_edge("ro-d", "ro-x"), make_test_edge("ro-d", "ro-y")],
+        vec![
+            make_test_edge("ro-d", "ro-x"),
+            make_test_edge("ro-d", "ro-y"),
+        ],
         false,
     )
     .await?;
@@ -2489,7 +2496,10 @@ async fn test_reprobe_unlocked_deferred_past_stale_reset() -> TestResult {
     // Y was reset (stale Completed → Ready/Queued; output_paths cleared).
     let ys = expect_drv(&handle, "ro-y").await;
     assert!(
-        matches!(ys.status, DerivationStatus::Ready | DerivationStatus::Queued),
+        matches!(
+            ys.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
         "6c reset stale-Completed Y; got {:?}",
         ys.status
     );
@@ -2602,7 +2612,10 @@ async fn test_seed_ignores_reprobe_pending_substitute_dep() -> TestResult {
     );
     let as2 = expect_drv(&handle, "rs-a").await;
     assert!(
-        matches!(as2.status, DerivationStatus::Ready | DerivationStatus::Queued),
+        matches!(
+            as2.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
         "after B completes via substitute, A promotes; got {:?}",
         as2.status
     );

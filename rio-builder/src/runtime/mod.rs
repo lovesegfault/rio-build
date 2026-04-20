@@ -567,7 +567,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             })
             .await?;
 
-        // r[impl sec.executor.identity-token]
+        // r[impl sec.executor.identity-token+2]
         let mut be_req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(grpc_rx));
         if !rt.executor_token.is_empty() {
             let _ = rio_common::grpc::inject_metadata(

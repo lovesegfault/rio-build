@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         info!("HMAC assignment token signing enabled");
     }
     // Same key, second handle: the gRPC layer verifies executor-identity
-    // tokens (r[sec.executor.identity-token]) the actor signed per
+    // tokens (r[sec.executor.identity-token+2]) the actor signed per
     // SpawnIntent. `HmacKey` has both sign+verify; the role aliases
     // (`HmacSigner`/`HmacVerifier`) are documentation only.
     let hmac_for_grpc = hmac_signer.clone();

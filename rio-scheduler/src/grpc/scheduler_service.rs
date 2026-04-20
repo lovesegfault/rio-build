@@ -42,30 +42,20 @@ impl SchedulerService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
-        // r[impl sched.tenant.authz]
+        // r[impl sched.tenant.authz+2]
         // Tenant authorization chokepoint. In JWT mode this rejects
         // token-less calls with UNAUTHENTICATED — the permissive
         // interceptor lets builders (which reach :9001 for
         // ExecutorService and never set `x-rio-tenant-token`) call
         // SchedulerService too; this closes that. `caller_tenant` is
         // the cryptographically-attested `claims.sub` and is the
-        // authoritative tenant identity below.
-        let caller_tenant = self.require_tenant(&request)?;
-
-        // Grab JWT Claims BEFORE into_inner() consumes the request.
-        // Extensions are part of the Request wrapper, not the proto
-        // body — into_inner() drops them. Clone is cheap: Claims is
-        // 4 fields (Uuid + 2×i64 + short String).
-        //
-        // `None` only in dev mode (no pubkey configured) or VM tests
-        // (no interceptor in test harness) — `require_tenant` above
-        // already rejected the JWT-mode-but-absent case. `Some` means
-        // we have a cryptographically attested jti to check against
-        // the revocation table.
-        let jwt_claims = request
-            .extensions()
-            .get::<rio_auth::jwt::TenantClaims>()
-            .cloned();
+        // authoritative tenant identity below. `jti` is the
+        // revocation-checked token id, kept for the `builds.jwt_jti`
+        // audit insert (`r[gw.jwt.issue]`).
+        let (caller_tenant, jti) = match self.require_tenant(&request).await? {
+            Some((sub, jti)) => (Some(sub), Some(jti)),
+            None => (None, None),
+        };
 
         // Also grab the RAW token string for re-inject on downstream
         // store calls (merge-time FindMissingPaths). Claims are the
@@ -199,48 +189,6 @@ impl SchedulerService for SchedulerGrpc {
             }
         };
 
-        // r[impl gw.jwt.verify] — scheduler-side jti revocation check.
-        //
-        // Gateway stays PG-free (stateless N-replica HA); the scheduler
-        // already has the pool open for tenant resolve above, so the
-        // revocation lookup piggybacks here. Store does NOT duplicate
-        // this — SubmitBuild is the ingress choke point for builds;
-        // everything downstream trusts that the scheduler validated.
-        //
-        // `jti` is read from the interceptor-attached Claims extension,
-        // NOT from a proto body field. The gateway never constructs
-        // `SubmitBuildRequest.jwt_jti` — that field does not exist.
-        // Zero wire redundancy: the jti travels once (inside the JWT),
-        // is parsed once (by the interceptor), and is read once (here).
-        // See r[gw.jwt.issue] for the mint-side story.
-        //
-        // Revoked → UNAUTHENTICATED, same code as a bad signature or
-        // expired token. From the client's perspective "your token is
-        // no longer valid" is one failure mode regardless of WHY.
-        //
-        // No-Claims (dev mode) → skip. Can't revoke what wasn't
-        // presented. In JWT mode, Claims are present by the time we
-        // get here: `require_tenant` already returned UNAUTHENTICATED
-        // for the absent-header case.
-        if let Some(claims) = &jwt_claims {
-            // Same db-presence gate as tenant resolve. If db is
-            // None AND Claims are Some, something is misconfigured
-            // (JWT mode requires PG for revocation); fail loud.
-            let db = self.db.as_ref().ok_or_else(|| {
-                Status::failed_precondition(
-                    "jti revocation check requires database connection \
-                     (JWT mode enabled but scheduler pool is None)",
-                )
-            })?;
-            let revoked = db
-                .is_jwt_revoked(&claims.jti)
-                .await
-                .status_internal("jti revocation lookup failed")?;
-            if revoked {
-                return Err(Status::unauthenticated("token revoked"));
-            }
-        }
-
         // Capture the current span's traceparent BEFORE sending to the
         // actor. Span context does not cross the mpsc channel boundary;
         // the actor task's `handle_merge_dag` #[instrument] span is a
@@ -262,7 +210,7 @@ impl SchedulerService for SchedulerGrpc {
             options,
             keep_going: req.keep_going,
             traceparent,
-            jti: jwt_claims.as_ref().map(|c| c.jti.clone()),
+            jti,
             jwt_token,
         };
         let cmd = ActorCommand::MergeDag {
@@ -329,8 +277,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz]
-        let caller_tenant = self.require_tenant(&request)?;
+        // r[impl sched.tenant.authz+2]
+        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -394,8 +342,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz]
-        let caller_tenant = self.require_tenant(&request)?;
+        // r[impl sched.tenant.authz+2]
+        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -419,8 +367,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sched.tenant.authz]
-        let caller_tenant = self.require_tenant(&request)?;
+        // r[impl sched.tenant.authz+2]
+        let caller_tenant = self.require_tenant(&request).await?.map(|(sub, _)| sub);
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 

@@ -164,6 +164,23 @@ fn mk_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
     }
 }
 
+/// `Event::Log` at the given seq. Log reuses the last persisted seq
+/// (event.rs) — the dedup must NOT drop it (it's never in PG).
+fn mk_log_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
+    use rio_proto::types::build_event::Event;
+    rio_proto::types::BuildEvent {
+        build_id: build_id.to_string(),
+        sequence: seq,
+        timestamp: None,
+        event: Some(Event::Log(rio_proto::types::BuildLogBatch {
+            derivation_path: "/nix/store/x".into(),
+            lines: vec![b"log-line".to_vec()],
+            first_line_number: 0,
+            executor_id: String::new(),
+        })),
+    }
+}
+
 /// Insert one event into PG directly (bypassing the persister).
 /// Tests control exact PG state to assert replay behavior.
 async fn insert_event(pool: &sqlx::PgPool, build_id: Uuid, seq: u64) -> anyhow::Result<()> {
@@ -246,6 +263,76 @@ async fn test_bridge_replays_from_pg_and_dedups_broadcast() -> anyhow::Result<()
     assert!(
         extra.is_err(),
         "no 4th event — broadcast's 1..5 all deduped. Got: {extra:?}"
+    );
+
+    Ok(())
+}
+
+/// bug_125: `Event::Log` reuses the last persisted seq (event.rs Log
+/// arm) and is never written to PG. After a reconnect-with-replay,
+/// `dedup_watermark = last_seq` and a fresh Log arrives at `seq =
+/// last_seq` — the dedup MUST NOT drop it (it's not a Phase-1
+/// duplicate; PG never had it). Without the Log exemption, every live
+/// log line is silently dropped until the next non-Log event bumps the
+/// counter — for a single long-running drv that's the rest of its
+/// stdout/stderr.
+#[tokio::test]
+async fn test_bridge_log_event_at_watermark_seq_not_deduped() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+
+    // PG: seq 1..3 persisted (DerivationStarted/Completed/etc.).
+    for seq in 1..=3 {
+        insert_event(&db.pool, build_id, seq).await?;
+    }
+
+    // Broadcast: the same 3 persisted events (still in ring) PLUS a
+    // Log at seq=3 — emit() reuses the last persisted seq for Log.
+    // The persisted seq=3 is a real Phase-1 duplicate (dedup it); the
+    // Log at seq=3 is NOT (it's a fresh post-subscribe event).
+    let (bcast_tx, bcast_rx) = broadcast::channel(16);
+    for seq in 1..=3 {
+        bcast_tx.send(mk_event(build_id, seq))?;
+    }
+    bcast_tx.send(mk_log_event(build_id, 3))?;
+
+    // Gateway reconnects: saw nothing (since=0), actor's watermark is 3.
+    let mut stream = bridge_build_events(
+        "test-log-dedup",
+        bcast_rx,
+        Some(EventReplay {
+            pool: db.pool.clone(),
+            build_id,
+            since: 0,
+            last_seq: 3,
+        }),
+    );
+
+    // Phase 1: PG replay yields seq 1,2,3 (Cancelled events). Phase 2:
+    // broadcast's persisted 1..3 are deduped (seq ≤ 3 AND not Log);
+    // the Log at seq=3 passes. 4 events total.
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stream ended early"))??;
+        events.push(ev);
+    }
+    assert_eq!(
+        events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![1, 2, 3, 3],
+        "PG replay 1..3 then Log@3 from broadcast"
+    );
+    use rio_proto::types::build_event::Event;
+    assert!(
+        matches!(events[3].event, Some(Event::Log(_))),
+        "4th event is the Log (not a deduped duplicate of the persisted seq=3)"
+    );
+    // The 3 persisted broadcast duplicates were skipped — no 5th event.
+    let extra = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
+    assert!(
+        extra.is_err(),
+        "persisted-event broadcast duplicates still deduped: {extra:?}"
     );
 
     Ok(())

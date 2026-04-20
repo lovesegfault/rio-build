@@ -883,6 +883,7 @@ async fn test_reconcile_defers_stream_connected_unregistered_worker() -> TestRes
             stream_tx,
             stream_epoch: next_stream_epoch_for("defer-w1"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     barrier(&handle).await;

@@ -136,7 +136,7 @@ pub struct Config {
     /// in every heartbeat so the scheduler can match this pod to its
     /// pre-computed assignment. Empty = Static-sized pod (no intent).
     pub intent_id: String,
-    /// HMAC-signed `ExecutorClaims{intent_id, expiry}` from the
+    /// HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the
     /// controller's `RIO_EXECUTOR_TOKEN` env var (passed through from
     /// `SpawnIntent.executor_token`). Presented as
     /// `x-rio-executor-token` on `BuildExecution` open and every

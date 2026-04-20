@@ -305,8 +305,11 @@ impl DagActor {
             warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
                   "worker heartbeat timeout; disconnecting");
             // Current epoch — this is the actor itself deciding the
-            // worker is dead, not a late reader-task signal.
-            self.handle_executor_disconnected(&executor_id, stream_epoch)
+            // worker is dead, not a late reader-task signal. No
+            // `seen_drvs`: heartbeat-timeout has no reader-task
+            // context; any buffer leak is bounded by
+            // `handle_cleanup_terminal_build`'s discard on DAG reap.
+            self.handle_executor_disconnected(&executor_id, stream_epoch, Vec::new())
                 .await;
         }
     }

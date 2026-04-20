@@ -58,6 +58,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("drain-auth"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
 
@@ -155,6 +156,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
             stream_tx: stream_tx_a,
             stream_epoch: next_stream_epoch_for("i066-a"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat_with(&handle, "i066-a", "x86_64-linux", |hb| {
@@ -1968,6 +1970,7 @@ async fn test_worker_disconnect_unknown_noop() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "ghost".into(),
             stream_epoch: 0,
+            seen_drvs: vec![],
         })
         .await?;
 
@@ -2014,6 +2017,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("hb-worker"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
 
@@ -2919,6 +2923,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("fail-worker"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat_with(&handle, "fail-worker", "x86_64-linux", |_| {}).await?;
@@ -3278,6 +3283,7 @@ async fn test_prefetch_complete_burst_capped() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "pfc-boot".into(),
             stream_epoch: stream_epoch_for("pfc-boot"),
+            seen_drvs: vec![],
         })
         .await?;
     drop(boot_rx);
@@ -3590,7 +3596,14 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
 
     // Reconnect WITHOUT sending the disconnect first (entry persists,
     // epoch overwritten). This is the connect-before-disconnect
-    // ordering observed live.
+    // ordering observed live: the OLD bridge task has exited (output
+    // half dropped → stream_tx.is_closed()) so the reconnect is
+    // ACCEPTED, but the OLD reader task is still draining and will
+    // send ExecutorDisconnected{epoch1} late. Dropping rx1 here
+    // models the bridge exit; the reconnect would otherwise be
+    // rejected by the live-stream guard (which is the
+    // hijack-prevention path, not the I-056a path).
+    drop(rx1);
     let _rx2 = connect_executor(&handle, "epoch-w", "x86_64-linux").await?;
     let epoch2 = stream_epoch_for("epoch-w");
     assert_ne!(epoch1, epoch2);
@@ -3601,6 +3614,7 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-w".into(),
             stream_epoch: epoch1,
+            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -3630,6 +3644,7 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "epoch-w".into(),
             stream_epoch: epoch2,
+            seen_drvs: vec![],
         })
         .await?;
     barrier(&handle).await;
@@ -3651,7 +3666,7 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
 /// `ExecutorConnected` for the same id while the first stream is still
 /// live must NOT replace `stream_tx`. Asserted via: first rx still
 /// receives dispatch; second rx is dropped (closed) by the actor.
-// r[verify sec.executor.identity-token]
+// r[verify sec.executor.identity-token+2]
 #[tokio::test]
 async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3664,6 +3679,7 @@ async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<(
             stream_tx: tx1,
             stream_epoch: next_stream_epoch_for("victim"),
             auth_intent: Some("intent-A".into()),
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat_with(&handle, "victim", "x86_64-linux", |_| {}).await?;
@@ -3683,6 +3699,7 @@ async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<(
             stream_tx: tx2,
             stream_epoch: next_stream_epoch_for("victim"),
             auth_intent: Some("intent-X".into()),
+            reply: noop_connect_reply(),
         })
         .await?;
     barrier(&handle).await;
@@ -3724,6 +3741,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx1,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-A".into()),
+            reply: noop_connect_reply(),
         })
         .await?;
     barrier(&handle).await;
@@ -3738,6 +3756,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx2,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-X".into()),
+            reply: noop_connect_reply(),
         })
         .await?;
     barrier(&handle).await;
@@ -3754,6 +3773,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx3,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-A".into()),
+            reply: noop_connect_reply(),
         })
         .await?;
     barrier(&handle).await;
@@ -3761,6 +3781,161 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
     assert!(
         workers.iter().any(|w| w.executor_id == "w" && w.has_stream),
         "matching-intent reconnect accepted"
+    );
+    Ok(())
+}
+
+/// `r[sec.executor.identity-token]` defence-in-depth: a heartbeat for
+/// `executor_id=E` with `intent_id=I_other` while `E` is bound to
+/// `I_self` is dropped (does NOT overwrite `executors[E].intent_id` /
+/// `kind`). The gRPC bind only proves the body matches the CALLER's
+/// token, not that `executor_id` belongs to that caller — without this
+/// guard, a worker holding a token for I_other can poison E's dispatch
+/// match by heartbeating with E's id.
+// r[verify sec.executor.identity-token+2]
+#[tokio::test]
+async fn test_heartbeat_intent_id_change_rejected() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    // Connect E with auth_intent=I_self → executors[E].intent_id=I_self.
+    let (tx, _rx) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "E".into(),
+            stream_tx: tx,
+            stream_epoch: next_stream_epoch_for("E"),
+            auth_intent: Some("I_self".into()),
+            reply: noop_connect_reply(),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Spoofer heartbeats {executor_id=E, intent_id=I_other,
+    // kind=Fetcher}. The gRPC layer would accept this (intent_id
+    // matches the SPOOFER's token); the actor must drop it.
+    send_heartbeat_with(&handle, "E", "x86_64-linux", |hb| {
+        hb.intent_id = Some("I_other".into());
+        hb.kind = rio_proto::types::ExecutorKind::Fetcher;
+    })
+    .await?;
+    barrier(&handle).await;
+
+    let w = expect_worker(&handle, "E").await;
+    assert_eq!(
+        w.intent_id.as_deref(),
+        Some("I_self"),
+        "bound intent_id MUST NOT be overwritten by a mismatched heartbeat"
+    );
+    assert_eq!(
+        w.kind,
+        rio_proto::types::ExecutorKind::Builder,
+        "kind MUST NOT be overwritten (heartbeat dropped before field updates)"
+    );
+
+    // Positive control: matching intent_id IS accepted (kind written).
+    send_heartbeat_with(&handle, "E", "x86_64-linux", |hb| {
+        hb.intent_id = Some("I_self".into());
+        hb.kind = rio_proto::types::ExecutorKind::Fetcher;
+    })
+    .await?;
+    barrier(&handle).await;
+    let w = expect_worker(&handle, "E").await;
+    assert_eq!(w.kind, rio_proto::types::ExecutorKind::Fetcher);
+    Ok(())
+}
+
+/// merged_bug_039 / C2: `ExecutorDisconnected.seen_drvs` cleanup is
+/// epoch-gated, actor-serialized, and ownership-aware. Only paths the
+/// DAG has never heard of are discarded; real drvs (whose buffer the
+/// actor's seal/flusher machinery owns) are left alone — preventing a
+/// compromised worker from wiping a victim's in-memory log tail by
+/// sending one `LogBatch{derivation_path=D_victim}` then disconnecting.
+#[tokio::test]
+async fn test_disconnect_discards_only_unknown_drvs() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.log_buffers = Some(bufs_for_actor);
+    });
+
+    // One real drv "lbdisc" in the DAG; one fabricated path.
+    let real_path = test_drv_path("lbdisc");
+    let fake_path = test_drv_path("never-merged");
+    let _rx = connect_executor(&handle, "lb-w", "x86_64-linux").await?;
+    merge_single_node(&handle, Uuid::new_v4(), "lbdisc", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    // Seed both buffers (as the reader task's push() would).
+    for p in [&real_path, &fake_path] {
+        log_buffers.push(&rio_proto::types::BuildLogBatch {
+            derivation_path: p.clone(),
+            lines: vec![b"line".to_vec()],
+            first_line_number: 0,
+            executor_id: "lb-w".into(),
+        });
+    }
+    assert!(log_buffers.read_since(&real_path, 0).is_some());
+    assert!(log_buffers.read_since(&fake_path, 0).is_some());
+
+    // Disconnect with both in seen_drvs. Epoch matches → cleanup runs.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "lb-w".into(),
+            stream_epoch: stream_epoch_for("lb-w"),
+            seen_drvs: vec![real_path.clone(), fake_path.clone()],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        log_buffers.read_since(&fake_path, 0).is_none(),
+        "fabricated path (DAG-unknown) discarded"
+    );
+    assert!(
+        log_buffers.read_since(&real_path, 0).is_some(),
+        "real DAG drv's buffer preserved — owned by seal/flusher, not \
+         the (untrusted) stream's seen_drvs"
+    );
+    Ok(())
+}
+
+/// merged_bug_039 / C2: a stale-epoch `ExecutorDisconnected` (I-056a
+/// late-disconnect from a prior stream) MUST NOT discard ANY buffer —
+/// the cleanup runs AFTER the epoch check.
+#[tokio::test]
+async fn test_stale_epoch_disconnect_preserves_buffer() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let log_buffers = std::sync::Arc::new(crate::logs::LogBuffers::new());
+    let bufs_for_actor = std::sync::Arc::clone(&log_buffers);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.log_buffers = Some(bufs_for_actor);
+    });
+
+    let _rx = connect_executor(&handle, "stale-lb", "x86_64-linux").await?;
+    let fake_path = test_drv_path("stale-fake");
+    log_buffers.push(&rio_proto::types::BuildLogBatch {
+        derivation_path: fake_path.clone(),
+        lines: vec![b"line".to_vec()],
+        first_line_number: 0,
+        executor_id: "stale-lb".into(),
+    });
+
+    // Stale epoch (≠ the connected stream's) → early-return BEFORE
+    // cleanup. Even a DAG-unknown path survives.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "stale-lb".into(),
+            stream_epoch: 0, // never matches (epochs start at 1)
+            seen_drvs: vec![fake_path.clone()],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        log_buffers.read_since(&fake_path, 0).is_some(),
+        "stale-epoch disconnect is a no-op — nothing discarded"
     );
     Ok(())
 }

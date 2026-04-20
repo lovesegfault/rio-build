@@ -66,10 +66,25 @@ fn test_actor_error_to_status_all_arms() {
             Code::Unavailable,
             "store service is unreachable",
         ),
+        (
+            ActorError::PermissionDenied {
+                build_id: Uuid::nil(),
+            },
+            Code::PermissionDenied,
+            "permission denied",
+        ),
     ];
-    // Count pinned to `_actor_error_exhaustive`: when that match stops
-    // compiling on a new variant, bump this and add a row above.
-    assert_eq!(cases.len(), 7, "add new ActorError variant to `cases`");
+    // Count derived from the enum (strum::EnumCount), not a hardcoded
+    // literal. The `_actor_error_exhaustive` pin only catches a missing
+    // MATCH ARM; a missing test-row with a stale literal here drifted
+    // twice (StoreUnavailable, then PermissionDenied). With COUNT, the
+    // assertion fails until the row is added.
+    use strum::EnumCount;
+    assert_eq!(
+        cases.len(),
+        ActorError::COUNT,
+        "add new ActorError variant to `cases`"
+    );
     for (err, expected_code, expected_substr) in cases {
         let status = SchedulerGrpc::actor_error_to_status(err);
         assert_eq!(status.code(), expected_code);

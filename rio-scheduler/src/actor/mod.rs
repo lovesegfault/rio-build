@@ -678,19 +678,22 @@ impl DagActor {
                     stream_tx,
                     stream_epoch,
                     auth_intent,
+                    reply,
                 } => {
-                    self.handle_worker_connected(
+                    let result = self.handle_worker_connected(
                         &executor_id,
                         stream_tx,
                         stream_epoch,
                         auth_intent,
                     );
+                    let _ = reply.send(result);
                 }
                 ActorCommand::ExecutorDisconnected {
                     executor_id,
                     stream_epoch,
+                    seen_drvs,
                 } => {
-                    self.handle_executor_disconnected(&executor_id, stream_epoch)
+                    self.handle_executor_disconnected(&executor_id, stream_epoch, seen_drvs)
                         .await;
                 }
                 ActorCommand::ReportExecutorTermination {

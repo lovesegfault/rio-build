@@ -311,6 +311,7 @@ async fn test_leader_lost_workers_active_stays_nonneg() -> TestResult {
             .send_unchecked(ActorCommand::ExecutorDisconnected {
                 executor_id: w.into(),
                 stream_epoch: stream_epoch_for(w),
+                seen_drvs: vec![],
             })
             .await?;
     }
@@ -1274,6 +1275,7 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "w-idiag".into(),
             stream_epoch: stream_epoch_for("w-idiag"),
+            seen_drvs: vec![],
         })
         .await?;
     let (_, live_after) = handle
@@ -1470,6 +1472,7 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
             stream_tx: tx,
             stream_epoch: next_stream_epoch_for("w0"),
             auth_intent: None,
+            reply: noop_connect_reply(),
         })
         .await?;
     send_heartbeat_with(&handle, "w0", "x86_64-linux", |_| {}).await?;
