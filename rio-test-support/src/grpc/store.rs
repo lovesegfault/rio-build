@@ -1,6 +1,6 @@
 //! In-memory [`StoreService`] + [`ChunkService`] mock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -129,6 +129,14 @@ pub struct MockStoreFaults {
     /// non-NotFound store errors surface as STDERR_ERROR rather than
     /// being swallowed as "no realisation".
     pub fail_query_realisation: Arc<AtomicBool>,
+    /// Paths for which `put_path` returns `Ok(created:false)`
+    /// IMMEDIATELY after reading Metadata, WITHOUT draining NarChunks.
+    /// Mimics the real store's `AlreadyComplete` / Concurrent-race
+    /// branches (`put_path/mod.rs`) when `drain_stream`'s 30s timeout
+    /// expires. For gateway `grpc_put_path_streaming` wire-positioning
+    /// tests: a `>16 MiB` entry that early-Ok's must leave the framed
+    /// reader at exactly `nar_size` so the next entry's header parses.
+    pub put_path_early_ok_paths: Arc<RwLock<HashSet<String>>>,
 }
 
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
@@ -282,6 +290,21 @@ impl StoreService for MockStore {
         };
         let _ = rio_nix::store_path::StorePath::parse(&info.store_path)
             .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
+        // Early-Ok injection: real store returns Ok(created:false)
+        // without draining when `claim_placeholder` → AlreadyComplete
+        // and `drain_stream` times out. Record the call (gateway tests
+        // assert on put_calls.len()) then return — chunks/trailer left
+        // unread on the wire.
+        if self
+            .faults
+            .put_path_early_ok_paths
+            .read()
+            .unwrap()
+            .contains(&info.store_path)
+        {
+            self.calls.put_calls.write().unwrap().push(info.clone());
+            return Ok(Response::new(types::PutPathResponse { created: false }));
+        }
         // r[impl ts.mock.store-put-validate]
         // Mirror real store (put_path.rs:206-211): hash-upfront was removed
         // pre-phase3a. A non-empty metadata.nar_hash means an un-updated

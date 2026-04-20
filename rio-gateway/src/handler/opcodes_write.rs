@@ -541,9 +541,13 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
 ///   [framed stream (chunked, terminated by 0-length chunk):
 ///     num_paths: u64      ← count prefix INSIDE the framed stream
 ///     for i in 0..num_paths:
-///       ValidPathInfo (9 fields — see stream_one_entry)
+///       ValidPathInfo (9 fields — see read_entry_head)
 ///       NAR data (narSize plain bytes, NOT nested-framed)
 ///   ]
+///
+/// Per-entry routing is by `nar_size <= ADD_MULTIPLE_PIPELINE_BUFFER`
+/// (16 MiB): small entries buffer-then-spawn (pipelined PutPath), large
+/// entries drain in-flight then `grpc_put_path_streaming` synchronously.
 // r[impl gw.opcode.add-multiple.batch+2]
 // r[impl gw.opcode.add-multiple.unaligned-frames]
 // r[impl gw.opcode.add-multiple.dont-check-sigs-ignored]

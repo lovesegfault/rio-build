@@ -309,19 +309,25 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mixed batch: one `.drv` entry (buffered, cached) + one non-`.drv` entry
-/// (streamed). Both must reach the store. Verifies the `.drv`-branch in
-/// `stream_one_entry` doesn't break batch processing.
+/// Mixed batch: one small `.drv` entry (buffered, pipelined, cached) +
+/// one >16 MiB non-`.drv` entry (drains in-flight then
+/// `grpc_put_path_streaming` synchronously). Both must reach the store.
+/// Exercises BOTH arms of the size-threshold branch at handler line
+/// `head.nar_size <= ADD_MULTIPLE_PIPELINE_BUFFER` — the streaming arm
+/// previously had ZERO wire-opcode coverage (the old test used two
+/// ~200-byte NARs, both buffered).
 #[tokio::test]
-async fn test_add_multiple_to_store_mixed_drv_and_streaming() -> anyhow::Result<()> {
+async fn test_add_multiple_to_store_mixed_buffered_and_streaming() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar_a, hash_a) = make_nar(b"regular-path-streamed");
+    // >16 MiB → forces the streaming branch.
+    let big = vec![0xABu8; 17 * 1024 * 1024];
+    let (nar_a, hash_a) = make_nar(&big);
     let (nar_drv, hash_drv) = make_nar(b"Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])");
 
     let test_path_drv = "/nix/store/33333333333333333333333333333333-test.drv";
     let inner = wire_bytes![
         u64: 2,
-        // Entry 1: .drv (buffered path)
+        // Entry 1: .drv — small → buffered branch (pipelined PutPath).
         string: test_path_drv,
         string: "",
         string: &hex::encode(hash_drv),
@@ -332,7 +338,8 @@ async fn test_add_multiple_to_store_mixed_drv_and_streaming() -> anyhow::Result<
         strings: wire::NO_STRINGS,
         string: "",
         raw: &nar_drv,
-        // Entry 2: non-.drv (streaming path)
+        // Entry 2: non-.drv — >16 MiB → streaming branch
+        // (drain_put_tasks then grpc_put_path_streaming).
         string: TEST_PATH_A,
         string: "",
         string: &hex::encode(hash_a),
@@ -369,6 +376,135 @@ async fn test_add_multiple_to_store_mixed_drv_and_streaming() -> anyhow::Result<
     for call in &calls {
         assert_eq!(call.nar_hash.len(), 32, "nar_hash should be 32 bytes");
     }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Streaming PutPath returns `Ok(created:false)` early WITHOUT draining
+/// chunks → `grpc_put_path_streaming` must still consume exactly
+/// `nar_size` from the framed reader so entry i+1's header parses.
+///
+/// Regression for the "rx dropped → return Ok(())" pump arm: store
+/// `AlreadyComplete` after `drain_stream` timeout drops rx with the
+/// reader mid-NAR; pre-fix the next `read_entry_head` parsed NAR bytes
+/// as a path string → garbage error against the wrong entry.
+#[tokio::test]
+async fn test_add_multiple_streaming_early_ok_preserves_wire_position() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Entry 1: >16 MiB → streaming. MockStore early-Ok's it after
+    // reading Metadata only — chunks left unread on the gRPC stream.
+    let big = vec![0xCDu8; 17 * 1024 * 1024];
+    let (nar_big, hash_big) = make_nar(&big);
+    let path_big = "/nix/store/44444444444444444444444444444444-big-early-ok";
+    h.store
+        .faults
+        .put_path_early_ok_paths
+        .write()
+        .unwrap()
+        .insert(path_big.into());
+
+    // Entries 2+3: small → buffered. Their headers must parse correctly
+    // — proves entry 1's NAR was fully drained from the wire.
+    let (nar_b, hash_b) = make_nar(b"after-early-ok-b");
+    let path_b = "/nix/store/55555555555555555555555555555555-after-b";
+    let (nar_c, hash_c) = make_nar(b"after-early-ok-c");
+    let path_c = "/nix/store/66666666666666666666666666666666-after-c";
+
+    let inner = wire_bytes![
+        u64: 3,
+        string: path_big,
+        string: "",
+        string: &hex::encode(hash_big),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_big.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_big,
+        string: path_b,
+        string: "",
+        string: &hex::encode(hash_b),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_b.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_b,
+        string: path_c,
+        string: "",
+        string: &hex::encode(hash_c),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_c.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_c,
+    ];
+
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    // Pre-fix: STDERR_ERROR with garbage path / CollectionTooLarge
+    // misattributed to entry 2. Post-fix: STDERR_LAST.
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
+    assert_eq!(calls.len(), 3, "all three entries reach the store");
+    let paths: Vec<&str> = calls.iter().map(|c| c.store_path.as_str()).collect();
+    assert!(
+        paths.contains(&path_b),
+        "entry 2 path must match exactly — proves wire was positioned at entry 2's header"
+    );
+    assert!(paths.contains(&path_c), "entry 3 path must match exactly");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// `wopAddToStoreNar` (opcode 39) sibling of the early-Ok test. The
+/// streaming branch's caller has a sentinel probe that surfaced
+/// "trailing data" pre-fix; post-fix the drain consumes the NAR and the
+/// probe sees the sentinel cleanly.
+#[tokio::test]
+async fn test_add_to_store_nar_streaming_early_ok() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let big = vec![0xEFu8; 17 * 1024 * 1024];
+    let (nar, hash) = make_nar(&big);
+    h.store
+        .faults
+        .put_path_early_ok_paths
+        .write()
+        .unwrap()
+        .insert(TEST_PATH_A.into());
+
+    wire_send!(&mut h.stream;
+        u64: 39,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        bool: false, bool: true,
+        framed: &nar,
+    );
+
+    // Pre-fix: STDERR_ERROR "trailing data after NAR" (sentinel probe
+    // reads leftover NAR bytes). Post-fix: STDERR_LAST.
+    drain_stderr_until_last(&mut h.stream).await?;
 
     h.finish().await;
     Ok(())

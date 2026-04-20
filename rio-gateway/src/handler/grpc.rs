@@ -295,8 +295,11 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // Backpressure: tx.send blocks when rpc isn't pulling. On a short read
     // we still drop tx and await rpc so the spawned task completes before
     // we return. A closed channel is NOT a pump error: it means the rpc
-    // task has already completed (dropping rx), so the rpc result is the
-    // root cause and the pump just stops early.
+    // task has already completed (dropping rx) — but the rpc may have
+    // returned Ok(created:false) early (store-side AlreadyComplete /
+    // Concurrent-race after `drain_stream` timed out), so the pump must
+    // STILL consume nar_size to honor the "reads exactly nar_size bytes"
+    // contract callers depend on for wire positioning.
     let pump_result: anyhow::Result<()> = async {
         let mut remaining = nar_size;
         let mut chunk = vec![0u8; NAR_CHUNK_SIZE];
@@ -309,6 +312,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
                     context: format!("at {} of {nar_size}", nar_size - remaining),
                     source: e,
                 })?;
+            remaining -= n as u64;
             if tx
                 .send(types::PutPathRequest {
                     msg: Some(types::put_path_request::Msg::NarChunk(chunk[..n].to_vec())),
@@ -316,11 +320,23 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
                 .await
                 .is_err()
             {
-                // rx dropped → rpc task already finished; rpc_result has
-                // the real Status. Stop pumping; let rpc_result? surface it.
+                // rx dropped → rpc task already finished. It MAY have
+                // returned Ok(created:false) early, so drain nar_reader
+                // to nar_size before returning Ok — otherwise the
+                // caller's framed reader is left mid-NAR and the next
+                // entry's header parses garbage. If rpc_result is Err,
+                // that surfaces via rpc_result? below regardless.
+                tokio::io::copy(
+                    &mut (&mut *nar_reader).take(remaining),
+                    &mut tokio::io::sink(),
+                )
+                .await
+                .map_err(|e| GatewayError::NarRead {
+                    context: format!("draining {remaining} of {nar_size} after store early-Ok"),
+                    source: e,
+                })?;
                 return Ok(());
             }
-            remaining -= n as u64;
         }
 
         // Trailer: client-declared hash. Store validates independently.
