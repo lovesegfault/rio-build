@@ -228,7 +228,7 @@ pub(crate) async fn run(
                 println!(
                     "Mem:       {} p90={}",
                     resp.mem_kind,
-                    fmt_bytes(resp.mem_p90_bytes as i64)
+                    fmt_bytes_u(resp.mem_p90_bytes)
                 );
                 println!(
                     "Stats:     n_eff={:.1} span={:.1} σ={:.3} tier={} prior={}",
@@ -413,6 +413,18 @@ mod tests {
         assert_eq!(parse_bytes("512Mi").unwrap(), 512 << 20);
         assert_eq!(parse_bytes("4096").unwrap(), 4096);
         assert!(parse_bytes("foo").is_err());
+    }
+    #[test]
+    fn fmt_bytes_u_clamps_u64_max() {
+        // Server uses u64::MAX as "unbounded" sentinel for
+        // Amdahl/Probe+Coupled. fmt_bytes_u clamps before the i64
+        // cast; raw `as i64` wraps to -1 and fmt_bytes(-1) prints
+        // "-1" — the bug at sla.rs status p90.
+        assert!(fmt_bytes_u(u64::MAX).ends_with("Gi"));
+        assert!(!fmt_bytes_u(u64::MAX).starts_with('-'));
+        // Tripwire documenting WHY direct cast is wrong.
+        assert_eq!(fmt_bytes(u64::MAX as i64), "-1");
+        assert_eq!(fmt_bytes(-1), "-1");
     }
     #[test]
     fn parse_ttl_suffixes() {
