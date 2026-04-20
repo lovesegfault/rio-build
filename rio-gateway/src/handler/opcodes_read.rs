@@ -282,7 +282,8 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let max_build_jobs = wire::read_u64(reader).await?;
     let max_silent_time = wire::read_u64(reader).await?;
     let _obsolete_use_build_hook = wire::read_u64(reader).await?;
-    let _verbose_build = wire::read_bool(reader).await?;
+    // Verbosity level (0=true, 7=false in Nix's decode), NOT a bool.
+    let _verbose_build = wire::read_u64(reader).await?;
     let _obsolete_log_type = wire::read_u64(reader).await?;
     let _obsolete_print_build_trace = wire::read_u64(reader).await?;
     let build_cores = wire::read_u64(reader).await?;

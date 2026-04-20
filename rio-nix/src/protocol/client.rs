@@ -307,8 +307,10 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     wire::write_u64(writer, max_silent_time).await?;
     // obsolete_useBuildHook (always 1)
     wire::write_u64(writer, 1).await?;
-    // verboseBuild
-    wire::write_bool(writer, false).await?;
+    // verboseBuild — encoded as a Verbosity level, NOT a bool. Nix
+    // daemon.cc decodes via `lvlError == readInt()`, so 0=true, 7=false.
+    // Ref client encodes `(verboseBuild ? lvlError : lvlVomit)`.
+    wire::write_u64(writer, super::stderr::verbosity::VOMIT).await?;
     // obsolete_logType, obsolete_printBuildTrace
     wire::write_u64(writer, 0).await?;
     wire::write_u64(writer, 0).await?;
@@ -806,6 +808,7 @@ mod tests {
 
     /// client_set_options wire layout round-trip. Field order and values
     /// per Nix src/libstore/daemon.cc case SetOptions.
+    // r[verify nix.client.set-options]
     #[tokio::test]
     async fn test_client_set_options_roundtrip() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);
@@ -828,8 +831,9 @@ mod tests {
             assert_eq!(max_silent_time, 0, "zero → unbounded (daemon default)");
             let obsolete_use_build_hook = wire::read_u64(&mut sr).await?;
             assert_eq!(obsolete_use_build_hook, 1);
-            let verbose_build = wire::read_bool(&mut sr).await?;
-            assert!(!verbose_build);
+            // Nix decodes via `lvlError == readInt()`; 7 (lvlVomit) = false.
+            let verbose_build = wire::read_u64(&mut sr).await?;
+            assert_eq!(verbose_build, super::super::stderr::verbosity::VOMIT);
             let _obsolete_log_type = wire::read_u64(&mut sr).await?;
             let _obsolete_print_build_trace = wire::read_u64(&mut sr).await?;
             let build_cores = wire::read_u64(&mut sr).await?;
@@ -874,7 +878,7 @@ mod tests {
             assert_eq!(mst, 3600, "max_silent_time must reach the wire");
             // useBuildHook, verboseBuild, logType, printBuildTrace
             wire::read_u64(&mut sr).await?;
-            wire::read_bool(&mut sr).await?;
+            wire::read_u64(&mut sr).await?;
             wire::read_u64(&mut sr).await?;
             wire::read_u64(&mut sr).await?;
             // buildCores — position 11

@@ -51,7 +51,7 @@ The fields are sent in order, all as `u64` unless noted. The **daemon-protocol**
 5. `maxBuildJobs` (u64)
 6. `maxSilentTime` (u64)
 7. `obsolete_useBuildHook` (u64: always 1)
-8. `verboseBuild` (u64)
+8. `verboseBuild` (u64 --- Verbosity level: `lvlError`=0 means true, `lvlVomit`=7 means false; daemon decodes via `lvlError == readInt()`)
 9. `obsolete_logType` (u64: 0)
 10. `obsolete_printBuildTrace` (u64: 0)
 11. `buildCores` (u64)
