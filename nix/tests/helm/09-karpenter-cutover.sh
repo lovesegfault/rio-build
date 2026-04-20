@@ -62,7 +62,7 @@ helm template rio . --set global.image.tag=test >"$default"
 # NodeOverlay is GONE — its capacity is simulation-only (Karpenter docs
 # explicit) so nothing wrote Node.status.capacity and kube-scheduler
 # couldn't bind pods requesting it. Guard against it returning.
-! yq 'select(.kind=="NodeOverlay") | .metadata.name' "$karp" | grep -q . || {
+! yq 'select(.kind=="NodeOverlay") | .metadata.name' "$karp" | grep . >/dev/null || {
   echo "FAIL: NodeOverlay rendered — rio.build/{fuse,kvm} extended resource was dropped" >&2
   exit 1
 }

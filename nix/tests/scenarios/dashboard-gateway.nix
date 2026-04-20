@@ -3,8 +3,8 @@
 # Proves the dashboard's gRPC-Web path works through Cilium's per-
 # Gateway envoy. gRPC-Web translation is in-process at rio-scheduler
 # (tonic-web layer, D3) — the Gateway is plain HTTP/2 routing. Two
-# curl assertions (r[verify dash.envoy.grpc-web-translate] at
-# default.nix:vm-dashboard-gateway-k3s):
+# curl assertions direct-to-scheduler (r[verify dash.envoy.grpc-web-
+# translate] at default.nix:vm-dashboard-gateway-k3s):
 #
 #   1. Unary ClusterStatus: DATA frame starts 0x00 (compression flag 0)
 #   2. Server-streaming GetBuildLogs: trailer frame has 0x80 byte
@@ -12,6 +12,10 @@
 # The 0x80 byte is the load-bearing assertion — proves tonic-web emits
 # trailers as a separate LENGTH-PREFIXED-MESSAGE with flag=0x80 per the
 # gRPC-Web spec (browsers can't read HTTP/2 trailers).
+#
+# Method-gate (r[verify dash.auth.method-gate]) is asserted at the
+# routing layer: the rio-scheduler-mutating HTTPRoute MUST NOT exist
+# (helm fail-closed → operator never reconciles a path to ClearPoison).
 #
 # k3s-full fixture with gatewayEnabled=true: vendors Gateway API CRDs,
 # enables gatewayAPI in cilium-render.nix (embedded envoy — no separate
@@ -136,6 +140,19 @@ pkgs.testers.runNixOSTest {
                 "-H 'content-type: application/grpc-web+proto' "
                 "-H 'x-grpc-web: 1' --data-binary @- "
                 "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+                timeout=60,
+            )
+            # Server-streaming: GetBuildLogs{derivation_path:"nonexist"}
+            # → 0 log lines + trailer-as-body-frame (flag 0x80). Same
+            # encoding as dashboard.nix (field 2 wire-type 2, len 8).
+            # Proves tonic-web's stream-trailer-to-0x80-frame, the
+            # browser-readable bit; absent under native gRPC.
+            k3s_server.wait_until_succeeds(
+                "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
+                "curl -sf -X POST http://localhost:19001/rio.admin.AdminService/GetBuildLogs "
+                "-H 'content-type: application/grpc-web+proto' "
+                "-H 'x-grpc-web: 1' --data-binary @- "
+                "| ${pkgs.xxd}/bin/xxd | grep ' 80' >/dev/null",
                 timeout=60,
             )
         except Exception:

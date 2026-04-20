@@ -77,7 +77,8 @@ let
       name = "synth-amdahl-${toString n}";
       extraAttrs.pname = "synth-amdahl";
       script = ''
-        echo synth-amdahl-fixture-miss-ran-real-build > $out
+        echo synth-amdahl-fixture-miss-ran-real-build >&2
+        echo ok > $out
       '';
     };
   amdahlDrvs = builtins.map amdahlDrv [
@@ -94,7 +95,8 @@ let
     name = "synth-cost-0";
     extraAttrs.pname = "synth-cost";
     script = ''
-      echo synth-cost-fixture-miss-ran-real-build > $out
+      echo synth-cost-fixture-miss-ran-real-build >&2
+      echo ok > $out
     '';
   };
 
@@ -129,14 +131,17 @@ let
 
     def wait_estimator_tick() -> None:
         # ESTIMATOR_REFRESH_EVERY=6 ticks x tickIntervalSecs=2 = 12s
-        # cadence; gate on the refresh-counter advancing rather than
-        # sleeping a fixed amount (TCG variance).
+        # cadence. housekeeping.rs:85-87 increments refit_total BEFORE
+        # awaiting refresh(), so +1 only proves a refresh STARTED; +2
+        # proves the prior refresh COMPLETED (when counter reads
+        # base+2, refresh base+1 has returned). Fixtures must poll for
+        # "≥2 ticks since INSERT" per housekeeping.rs:85-86.
         base = metric_value(scrape_metrics(${gatewayHost}, 9091),
             "rio_scheduler_sla_refit_total") or 0.0
         ${gatewayHost}.wait_until_succeeds(
             "curl -fsS localhost:9091/metrics | "
-            f"awk '/^rio_scheduler_sla_refit_total / {{exit !($2>{base})}}'",
-            timeout=30,
+            f"awk '/^rio_scheduler_sla_refit_total / {{exit !($2>{base+1})}}'",
+            timeout=45,
         )
 
   '';
@@ -179,13 +184,16 @@ let
               "\"SELECT COUNT(*) FROM build_samples WHERE pname='synth-amdahl'\") -ge 3",
               timeout=30,
           )
-          n = int(psql(${gatewayHost},
-              "SELECT COUNT(DISTINCT cpu_limit_cores) FROM build_samples "
-              "WHERE pname='synth-amdahl' AND NOT outlier_excluded"
-          ))
-          assert n >= 1, f"distinct cpu_limit_cores={n}; fixture intercept did not fire?"
-          # cpu_seconds_total / duration_secs / cpu_limit > 0.4 →
-          # saturated bit set on the ExploreState.
+          # (former `COUNT(DISTINCT cpu_limit_cores) >= 1` dropped: it's
+          # tautologically true after COUNT(*)>=3 above. Under fixture
+          # intercept, explore may legitimately keep cores constant
+          # across 3 submits, so >=2 is not assertable here either.)
+          # PRECONDITION (not gate-fired proof): cpu_seconds_total /
+          # duration_secs / cpu_limit > 0.4 → saturated bit set on the
+          # ExploreState. The explore-{x4-first-bump,saturation-gate,
+          # freeze} properties themselves are r[verify]'d at unit level
+          # (sla/explore.rs:182,193,205); this subtest only proves the
+          # build_samples plumbing feeds the estimator.
           util = float(psql(${gatewayHost},
               "SELECT cpu_seconds_total/duration_secs/cpu_limit_cores "
               "FROM build_samples WHERE pname='synth-amdahl' "
@@ -415,7 +423,11 @@ let
                   {"hwClass": hw, "kind": "exposure", "value": 1})
           n_int = int(psql(${gatewayHost},
               "SELECT COUNT(*) FROM interrupt_samples"))
-          assert n_int >= 6, f"interrupt_samples rows={n_int}; RPC dropped?"
+          # cost-solve (chained before this subtest) inserts 3x2=6 rows;
+          # ice-backoff inserts 3x2=6 more above. Floor is 12.
+          assert n_int >= 12, (
+              f"ice-backoff inserted {n_int-6}/6 interrupt_samples; RPC dropped?"
+          )
           wait_estimator_tick()
           # synth-cost is still queued (worker stopped); its SpawnIntent
           # is recomputed every snapshot.

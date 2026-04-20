@@ -64,7 +64,7 @@ scope: with scope; ''
       # is present AND ≥1.
       worker2.wait_until_succeeds(
           "! curl -sf localhost:9093/metrics 2>/dev/null | "
-          "grep -qE '^rio_builder_builds_active\\{role=\"builder\"\\} [1-9]'",
+          "grep -E '^rio_builder_builds_active\\{role=\"builder\"\\} [1-9]' >/dev/null",
           timeout=60,
       )
 

@@ -12,10 +12,11 @@
 #   3. Unary gRPC-Web THROUGH nginx — 0x00 DATA frame prefix
 #   4. Server-streaming THROUGH nginx — 0x80 trailer byte
 #
-# (4) is the load-bearing proxy_buffering-off proof: if nginx buffered
-# the stream (the default), curl would receive nothing until the stream
-# closed — no incremental 0x80 frame at the tail. dashboard-gateway.nix
-# can't prove this; it port-forwards directly to envoy, bypassing nginx.
+# (4) is the streaming-through-nginx proof. proxy_buffering-off itself
+# is guarded by checks.dashboard-nginx-conf-guard (misc-checks.nix) — a
+# short NotFound stream would still produce 0x80 even if buffered, so
+# (4) alone can't distinguish. dashboard-gateway.nix can't prove the
+# nginx leg either; it port-forwards directly to scheduler.
 #
 # Same k3s fixture as vm-dashboard-gateway-k3s (gatewayEnabled=true
 # preloads the rio-dashboard image AND cilium-envoy). ~6min — ~4min
@@ -128,8 +129,8 @@ pkgs.testers.runNixOSTest {
     # GetBuildLogs) where nothing arrives until completion. We can't
     # easily probe that here without a real build; the 0x80-at-tail
     # grep combined with the nginx config assertion (proxy_buffering
-    # off is hardcoded at docker.nix:234 and asserted by helm-lint)
-    # is the practical gate.
+    # off is hardcoded at docker.nix:357 and asserted by
+    # checks.dashboard-nginx-conf-guard) is the practical gate.
     #
     # Request body: GetBuildLogsRequest{derivation_path:"nonexist"} =
     #   0x12 (field 2 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes

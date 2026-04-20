@@ -75,13 +75,13 @@ scope: with scope; ''
       # after recovery races with the build finishing (worker
       # reconnects → reports → status='completed' before the assert).
       # Same TERMINAL_STATUSES filter as load_nonterminal_derivations
-      # (db.rs:625).
+      # (db/mod.rs:58 TERMINAL_STATUS_SQL).
       #
       # psql_k8s (NOT psql): bitnami PG runs in a pod, not systemd.
       nonterminal = int(psql_k8s(k3s_server,
           "SELECT COUNT(*) FROM derivations "
           "WHERE status NOT IN "
-          "('completed','poisoned','dependency_failed','cancelled')"
+          "('completed','poisoned','dependency_failed','cancelled','skipped')"
       ))
       assert nonterminal >= 1, (
           f"PG snapshot at kill time should have >=1 non-terminal drv "

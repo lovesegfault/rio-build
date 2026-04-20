@@ -107,8 +107,8 @@ rec {
   #   { before = "a"; after = "b"; msg = "..."; }  → a must precede b
   #   { name = "x"; last = true; msg = "..."; }    → x must be last
   # Skipped if the constrained subtest (`after` or `name`) is not in
-  # `subtests` — subset runs don't trip the chain. Leader-election has
-  # no chains (empty list → `all` returns true).
+  # `subtests` — subset runs don't trip the chain. An empty chains list
+  # → `all` returns true.
   #
   # lib.assertMsg throws with the message on failure, so the first
   # violated chain's message surfaces as the eval error. `last` is

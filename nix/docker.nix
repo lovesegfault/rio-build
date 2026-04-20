@@ -445,6 +445,9 @@ rec {
     map (m: "/rio.admin.AdminService/${m}") dashboardReadonlyAdmin
     ++ map (m: "/rio.scheduler.SchedulerService/${m}") dashboardReadonlyScheduler;
 
+  # Exported for checks.dashboard-nginx-conf-guard (misc-checks.nix).
+  inherit dashboardNginxConf;
+
   gateway = mkImage {
     name = "gateway";
     bins = [ rio-crates.rio-gateway ];

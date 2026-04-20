@@ -243,25 +243,43 @@ pkgs.testers.runNixOSTest {
             "get componentscaler store -o jsonpath='{.status.learnedRatio}'",
             ns="${nsStore}",
         ).strip()
+        # .status persists in etcd across controller pod death — `test
+        # -n "$r"` returns instantly on the OLD value. To prove the
+        # NEW controller has reconciled: capture old pod name, delete
+        # with --wait=true (so kubectl wait below can't match the dying
+        # old pod), wait for NEW pod Ready, then poll RV.
+        old_pod = kubectl(
+            "get pod -l app.kubernetes.io/name=rio-controller "
+            "-o jsonpath='{.items[0].metadata.name}'",
+        ).strip()
+        rv_before = int(kubectl(
+            "get componentscaler store -o jsonpath='{.metadata.resourceVersion}'",
+            ns="${nsStore}",
+        ).strip())
 
-        kubectl("delete pod -l app.kubernetes.io/name=rio-controller --wait=false")
+        kubectl(f"delete pod {old_pod} --wait=true")
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} wait --for=condition=Ready "
             "pod -l app.kubernetes.io/name=rio-controller --timeout=120s",
             timeout=130,
         )
 
-        # Next reconcile (≤10s after Ready) rewrites status. We
-        # compare the float — equality within a small tolerance (the
-        # ratio MAY have decayed/grown by one tick between reads,
-        # but it MUST NOT have reset to seedRatio=10 if it had
-        # drifted, and MUST NOT be empty).
-        k3s_server.wait_until_succeeds(
-            "r=$(k3s kubectl -n ${nsStore} get componentscaler store "
-            "  -o jsonpath='{.status.learnedRatio}') && "
-            'test -n "$r"',
-            timeout=60,
-        )
+        # The reconciler skips status writes when computed values are
+        # unchanged (status_changed(), componentscaler/mod.rs:228). A
+        # PRESERVED ratio → no write → RV stays. A RESET-TO-SEED bug
+        # → status changes → RV bumps. Poll RV for one reconcile
+        # period; if it bumps, read the post-write value; if not,
+        # status_changed()==false IS the preserve proof and `before`
+        # is still current. Either way the 10% band holds.
+        for _ in range(30):
+            rv_now = int(kubectl(
+                "get componentscaler store -o "
+                "jsonpath='{.metadata.resourceVersion}'",
+                ns="${nsStore}",
+            ).strip())
+            if rv_now > rv_before:
+                break
+            k3s_server.sleep(1)
         after = kubectl(
             "get componentscaler store -o jsonpath='{.status.learnedRatio}'",
             ns="${nsStore}",

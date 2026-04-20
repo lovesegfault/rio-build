@@ -214,6 +214,20 @@ in
         touch $out
       '';
 
+  # proxy_buffering off in dashboardNginxConf is LOAD-BEARING
+  # (docker.nix:349): nginx default-buffers upstream → WatchBuild /
+  # GetBuildLogs streams arrive as one blob at close. The config is a
+  # writeText baked into the dashboard image, invisible to helm-lint.
+  # vm-dashboard-k3s's 0x80-at-tail grep can't distinguish (NotFound is
+  # tiny either way) — this is the structural backstop.
+  dashboard-nginx-conf-guard = pkgs.runCommand "rio-dashboard-nginx-conf-guard" { } ''
+    grep -F 'proxy_buffering off;' ${dockerImages.dashboardNginxConf} >/dev/null || {
+      echo "FAIL: dashboardNginxConf lost 'proxy_buffering off;' — gRPC-Web streams will buffer" >&2
+      exit 1
+    }
+    touch $out
+  '';
+
   # CRD drift: crdgen output (split per-CRD) must equal the
   # committed infra/helm/crds/. Catches the "Rust CRD struct
   # changed but nobody ran cargo xtask regen crds" drift — the committed

@@ -384,9 +384,9 @@ in
       {
         name = "default";
         subtests = [
-          # r[verify sched.sla.explore-x4-first-bump]
-          # r[verify sched.sla.explore-saturation-gate]
-          # r[verify sched.sla.explore-freeze]
+          # convergence proves build_samples plumbing only; the
+          # explore-{x4-first-bump,saturation-gate,freeze} rules are
+          # verified at unit level (sla/explore.rs).
           "convergence"
           # r[verify sched.sla.outlier-mad-reject]
           "outlier"
@@ -738,13 +738,10 @@ in
   #   Gateway reconcile). No separate Envoy Gateway operator —
   #   Cilium's embedded envoy handles the GRPCRoute.
   # r[verify dash.auth.method-gate+2]
-  #   Same curl shape against ClearPoison → expects 404. The fixture
-  #   doesn't set dashboard.enableMutatingMethods so the mutating
-  #   GRPCRoute is absent. Proves the helm-template fail-closed holds
-  #   at runtime through the operator's xDS reconcile. Positive
-  #   controls: ClusterStatus + ListExecutors on the readonly route
-  #   return 200; ListExecutors specifically guards the proto-rename
-  #   class of bug (helm method literal drifting from admin.proto).
+  #   The fixture doesn't set dashboard.enableMutatingMethods so the
+  #   rio-scheduler-mutating HTTPRoute is absent — `kubectl get
+  #   httproute rio-scheduler-mutating` fails. Proves the helm-template
+  #   fail-closed holds at runtime through the operator's reconcile.
   # r[verify dash.journey.build-to-logs]
   #   The GetBuildLogs 0x80 trailer assertion proves server-streaming
   #   works through the nginx→Cilium Gateway→scheduler chain. Handler

@@ -41,7 +41,7 @@
 # worker.cgroup.kill-on-teardown — verify marker at default.nix:subtests[build-timeout]
 # worker.timeout.no-reassign — verify marker at default.nix:subtests[build-timeout]
 #   build-timeout submits via gRPC SubmitBuild with buildTimeout=45 against
-#   a 30s sleep. The timeout fires mid-build → run_daemon_build returns
+#   a 90s sleep. The timeout fires mid-build → run_daemon_build returns
 #   → executor/mod.rs:764 build_cgroup.kill() fires unconditionally →
 #   drain → Drop rmdirs. Asserts cgroup GONE (kernel rejects rmdir on
 #   non-empty, so gone ⇒ builder killed ⇒ kill-on-teardown ran) + a

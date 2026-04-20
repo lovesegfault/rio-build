@@ -521,8 +521,10 @@ let
           '';
           # HMAC keys. Applied before 02-workloads so pods' Secret
           # volume mounts resolve on first start (no Pending →
-          # ContainerCreating churn waiting for the Secret).
-          "01-rio-hmac-secrets".source = hmacSecretsManifest;
+          # ContainerCreating churn waiting for the Secret). 01z- not
+          # 01-: byte-sort places this AFTER 01-rio-rbac (which creates
+          # the ${ns} Namespace) and BEFORE 02-rio-workloads.
+          "01z-rio-hmac-secrets".source = hmacSecretsManifest;
         };
         extraFlags = [
           # Cilium IS the CNI — disable k3s's bundled flannel + kube-router

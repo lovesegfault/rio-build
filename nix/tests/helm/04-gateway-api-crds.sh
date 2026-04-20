@@ -29,7 +29,7 @@ done
 
 # Controller name must be Cilium's.
 yq 'select(.kind=="GatewayClass") | .spec.controllerName' "$out" |
-  grep -qx 'io.cilium/gateway-controller' || {
+  grep -x 'io.cilium/gateway-controller' >/dev/null || {
   echo "FAIL: GatewayClass.spec.controllerName is not io.cilium/gateway-controller" >&2
   exit 1
 }

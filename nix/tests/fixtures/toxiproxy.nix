@@ -25,13 +25,12 @@
 #
 # WHY on control and not a separate toxiproxy VM:
 #
-#   connect_store() at scheduler startup (main.rs:225) is a real TCP
-#   connect — not lazy. If the proxy isn't listening yet, the connect
-#   fails → store_client = None → the cache-check breaker (merge.rs:519)
-#   is never exercised (the let-else early-returns empty). A separate VM
-#   means a cross-VM boot race that no amount of wait_for_* fixes cleanly
-#   (scheduler has already started and cached store_client = None by the
-#   time the testScript runs).
+#   The scheduler uses connect_store_lazy (main.rs:51) — store_client is
+#   only None on a malformed addr/TLS config, never on a TCP race. So
+#   systemd ordering is no longer load-bearing for store_client itself.
+#   toxiproxy stays on control for the WORKER-side proxy (worker_store →
+#   control:29002 must be listening before the worker connects) and for
+#   admin-API locality (toxiproxy-cli on control via a single .succeed).
 #
 #   On control, systemd After=/Before= gives deterministic ordering:
 #   store → toxiproxy → scheduler. The proxy is transparent at boot (no
@@ -170,10 +169,8 @@ _: {
   # Boot sequence mirrors standalone.waitReady, plus the proxy checks
   # slotted between store-ready and scheduler-ready (same order as the
   # systemd After=/Before= chain). Verifying 19002/29002 open BEFORE
-  # asserting scheduler-ready proves the ordering held: if scheduler
-  # somehow started before toxiproxy, it would have logged "scheduler-
-  # side cache check disabled" and the chaos scenarios' breaker
-  # assertions would fail confusingly later. Fail here instead.
+  # asserting scheduler-ready proves the worker_store proxy is listening
+  # before the worker connects.
   waitReady = ''
     control.wait_for_unit("postgresql.service")
     control.wait_for_unit("rio-store.service")
@@ -184,14 +181,10 @@ _: {
     control.wait_for_open_port(29002)  # worker_store proxy
     control.wait_for_unit("rio-scheduler.service")
     control.wait_for_open_port(9001)
-    # Hard check: scheduler's store_client is Some, not None. If
-    # systemd ordering broke and scheduler raced ahead of toxiproxy,
-    # connect_store() failed and logged the warning at main.rs:234.
-    # Absence of that log line = connect succeeded = breaker is live.
-    control.fail(
-        "journalctl -u rio-scheduler --no-pager | "
-        "grep -q 'scheduler-side cache check disabled'"
-    )
+    # No store_client=None hard-check: connect_store_lazy (main.rs:51)
+    # only returns None on malformed addr/TLS — the boot-race this once
+    # guarded against cannot happen under lazy connect. The breaker is
+    # always live for chaos scenarios.
     worker.wait_for_unit("rio-builder.service")
     control.wait_until_succeeds(
         "curl -sf http://localhost:9091/metrics | "

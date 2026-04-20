@@ -33,9 +33,14 @@ scope: with scope; ''
       promo_before = metric_value(disc_before,
           "rio_scheduler_resource_floor_bumps_total") or 0.0
 
-      # Start the slow build in a background thread. Thread-safe:
-      # the NixOS test driver's Machine.succeed() can overlap across
-      # threads (each is a separate SSH exec).
+      # Start the slow build in a background thread. Safe ONLY because
+      # the bg thread touches `client` while the poll loop below touches
+      # `all_workers` — different Machines. Machine.succeed() is NOT
+      # thread-safe in general (single backdoor-shell socket; see
+      # leader-election.nix:235 + ci-failure-patterns.md). The
+      # bg["err"] check at the top of the poll loop surfaces a build
+      # failure before dump_all_logs() (called inside build()) could
+      # race the poll's all_workers.succeed().
       bg = {}
       def _bg():
           try:
@@ -51,6 +56,8 @@ scope: with scope; ''
       # restart cycle + heartbeat + dispatch tick.
       assigned = None
       for _ in range(60):
+          if "err" in bg:
+              raise bg["err"]
           for w in all_workers:
               c = w.succeed(
                   "journalctl -u rio-builder --no-pager | "

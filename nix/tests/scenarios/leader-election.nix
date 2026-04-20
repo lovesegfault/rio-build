@@ -600,6 +600,15 @@ let
           )
           print(f"sigkill: leader={old_leader} on {node_name}, "
                 f"host-pid={host_pid}, tx={tx_before}, rc={rc_before}")
+          # Anchor: capture renewTime BEFORE the kill. The freshness
+          # check below must observe a write that POST-DATES the kill;
+          # with RENEW_INTERVAL=5s, the dead leader's last renew is
+          # ≤5s old at kill time, so a bare age<10 check would pass on
+          # the stale write before any live process renews.
+          renew_before = k3s_server.succeed(
+              "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.renewTime}'"
+          ).strip()
           host_vm.succeed(f"kill -9 {host_pid}")
 
           # ── kubelet restarted the container in-place ──────────────────
@@ -625,11 +634,15 @@ let
               'test -n "$h"',
               timeout=90,
           )
-          # And renewing (not just a stale holder string).
-          for _ in range(6):
-              if renew_age_secs() < 10:
-                  break
-              k3s_server.sleep(5)
+          # And renewing (not just a stale holder string). renewTime
+          # advancing past renew_before proves a LIVE process wrote
+          # post-kill; THEN age<10 proves it's fresh.
+          k3s_server.wait_until_succeeds(
+              "test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.renewTime}')\" "
+              f"!= '{renew_before}'",
+              timeout=30,
+          )
           age = renew_age_secs()
           assert age < 10, (
               f"renewTime is {age}s old after SIGKILL+restart. "
@@ -684,12 +697,21 @@ let
   # graceful-release and failover both kill the leader. graceful-release
   # leaves the cluster at 2/2 (waits for replacement); failover doesn't.
   # If build-during-failover follows failover, its own buildprep handles
-  # the stabilization wait. No ordering assertion needed — fragments are
-  # independent at the Python level. chains=[] (default).
+  # the stabilization wait. sigkill-mid-build DEPENDS on
+  # build-during-failover's `import threading` + sshKeySetup/seedBusybox
+  # (:396-399, :521-523) — chained below so mkAssertChains catches a
+  # mis-ordering at eval time.
   mkTest = common.mkFragmentTest {
     scenario = "leader-election";
     inherit prelude fragments fixture;
     defaultTimeout = 900;
+    chains = [
+      {
+        before = "build-during-failover";
+        after = "sigkill-mid-build";
+        msg = "sigkill-mid-build reuses build-during-failover's import threading + sshKeySetup (:396-399, :521-523)";
+      }
+    ];
   };
 in
 {

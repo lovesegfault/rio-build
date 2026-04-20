@@ -194,7 +194,7 @@ pkgs.testers.runNixOSTest {
         # metadata-fetch through, the upload-retry path fires instead.
         worker.wait_until_succeeds(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -qE 'upload attempt failed|input metadata fetch failed'",
+            "grep -E 'upload attempt failed|input metadata fetch failed' >/dev/null",
             timeout=30,
         )
 
@@ -234,7 +234,7 @@ pkgs.testers.runNixOSTest {
         # Either proves the retry mechanism iterated after the RST.
         worker.succeed(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -q 'retrying upload' || "
+            "grep 'retrying upload' >/dev/null || "
             f"[ $(journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep -c 'received work assignment.*chaos-reset') -ge 2 ]"
         )

@@ -336,13 +336,16 @@ pkgs.testers.runNixOSTest {
         # Drop-in: figment's env layer reads RIO_RATE_LIMIT__PER_MINUTE
         # → rate_limit.per_minute. Both fields must be set (no
         # compiled-in default — r[gw.rate.per-tenant] says
-        # workload-dependent). per_minute=2 → one token every 30s;
-        # with burst=3, 3 rapid builds drain the bucket and the 4th
-        # needs ~30s before the next token — well outside the test's
-        # submit loop.
+        # workload-dependent). per_minute=1 → one token every 60s
+        # (GCRA T=60s); with burst=3, 3 rapid builds drain the bucket
+        # and the 4th needs ~60s before the next token. The 3 builds
+        # below run synchronously (~1-3s each under KVM, more under
+        # coverage/TCG); 60s gives 2x headroom over coverage worst
+        # case so the 4th probe lands inside the no-refill window.
+        mark = ${gatewayHost}.succeed("date +%s").strip()
         ${gatewayHost}.succeed(
             "mkdir -p /run/systemd/system/rio-gateway.service.d && "
-            "printf '[Service]\\nEnvironment=RIO_RATE_LIMIT__PER_MINUTE=2\\nEnvironment=RIO_RATE_LIMIT__BURST=3\\n' "
+            "printf '[Service]\\nEnvironment=RIO_RATE_LIMIT__PER_MINUTE=1\\nEnvironment=RIO_RATE_LIMIT__BURST=3\\n' "
             "> /run/systemd/system/rio-gateway.service.d/ratelimit.conf && "
             "systemctl daemon-reload && systemctl restart rio-gateway"
         )
@@ -353,10 +356,13 @@ pkgs.testers.runNixOSTest {
         # disabled by a config parse miss). The "per-tenant rate
         # limiting enabled" info log from main.rs is the discriminator
         # — without it, the test's 3 successes below prove nothing
-        # (disabled limiter also passes).
+        # (disabled limiter also passes). Fixed anchor (--since=@mark)
+        # not a sliding window: the line is one-shot at startup, and
+        # under coverage/CI contention the first poll can land >10s
+        # after restart.
         ${gatewayHost}.wait_until_succeeds(
-            "journalctl -u rio-gateway --since '-10s' | "
-            "grep -q 'per-tenant rate limiting enabled'"
+            f"journalctl -u rio-gateway --since=@{mark} | "
+            "grep 'per-tenant rate limiting enabled' >/dev/null"
         )
 
         count_before = build_count()
@@ -385,8 +391,8 @@ pkgs.testers.runNixOSTest {
             )
             ${gatewayHost}.log(f"rate-limit: build #{i} submitted (within burst)")
 
-        # 4th build — should be rejected. burst=3 drained, per_minute=2
-        # means the next token is ~30s away. The nix-build will fail
+        # 4th build — should be rejected. burst=3 drained, per_minute=1
+        # means the next token is ~60s away. The nix-build will fail
         # with the gateway's STDERR_ERROR containing "rate limit".
         out = client.fail(
             "nix-build --no-out-link "

@@ -188,7 +188,7 @@ let
         # --no-trust skips signature checks; --no-contents skips NAR
         # hash recomputation. What's left: wopIsValidPath for the path.
         client.succeed(
-            f"nix store verify --no-trust --store '{store_url}' ${common.busybox}"
+            f"nix store verify --no-trust --no-contents --store '{store_url}' ${common.busybox}"
         )
 
     # ── phase1a: negative path ───────────────────────────────────────

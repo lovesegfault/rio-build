@@ -361,6 +361,20 @@ pkgs.testers.runNixOSTest {
     # ns-agnostically: a misplaced builder is STILL airgapped (egress
     # to apiserver blocked) AND can reach store (label-match ingress).
     with subtest("netpol-cross-ns: misplaced builder Pool is airgapped"):
+        # Precondition: no other Pool may serve crossNsDrv. The chart-
+        # default `x86-64` pool also matches {kind=Builder, x86_64-linux,
+        # features=∅}; if its independent tick lands before `misplaced`
+        # spawns+registers, crossNsDrv leaves Ready and the misplaced-
+        # pod wait below times out. Same race + mitigation as
+        # lifecycle/ephemeral-pool.nix:20-27. Deleting the Pool CR is
+        # sufficient — the controller stops spawning NEW Jobs; the
+        # existing one-shot warmup worker (single-build-per-pod) has
+        # already exited or is terminating. cross-ns is the LAST
+        # subtest in this scenario, so no restoration needed.
+        kubectl(
+            "delete pool x86-64 --ignore-not-found --wait=true",
+            ns="${nsBuilders}",
+        )
         # Spawn a builder Pool in the FETCHER namespace. Builder pods
         # set serviceAccountName=rio-builder, which the chart creates
         # only in rio-builders; create it here so the Job's pod admits.
