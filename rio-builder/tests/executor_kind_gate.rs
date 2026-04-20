@@ -39,23 +39,24 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     }
 }
 
-fn make_assignment(drv_content: &[u8], is_fod: bool) -> WorkAssignment {
+/// `assignment_flag` is what the SCHEDULER claims (`is_fixed_output`).
+/// The gate must ignore this and re-derive from `drv_content` — the
+/// `*_ignores_lying_scheduler_flag_*` tests below pass a flag that LIES
+/// to prove that.
+fn make_assignment(drv_content: &[u8], assignment_flag: bool) -> WorkAssignment {
     WorkAssignment {
         drv_path: rio_test_support::fixtures::test_drv_path("kind-gate"),
         drv_content: drv_content.to_vec(),
-        // Intentionally set the assignment flag to MATCH the drv — the
-        // gate uses the re-derived `is_fod`, not this. A mismatch here
-        // would trigger the warn! but not change the gate outcome.
-        is_fixed_output: is_fod,
+        is_fixed_output: assignment_flag,
         assignment_token: "tok".into(),
         ..Default::default()
     }
 }
 
-async fn run(kind: ExecutorKind, drv: &[u8], is_fod: bool) -> Result<(), ExecutorError> {
+async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<(), ExecutorError> {
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(kind, dir.path());
-    let assignment = make_assignment(drv, is_fod);
+    let assignment = make_assignment(drv, assignment_flag);
     // dead_channel: never dials — the gate fires before any gRPC call.
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -114,4 +115,52 @@ async fn wrong_kind_gate_passes_on_match() {
             panic!("matching kind {kind:?} should pass the gate");
         }
     }
+}
+
+/// wkr-fod-flag-trust: gate uses drv-derived is_fod, NOT the
+/// scheduler-sent flag. Scheduler mislabels non-FOD as
+/// `is_fixed_output=true` → Fetcher must STILL refuse (drv says non-FOD).
+///
+/// Kills the mutation `let is_fod = assignment.is_fixed_output`: under
+/// it, `is_fod=true`, gate `true!=true` passes → `expect_err` fails.
+// r[verify builder.executor.kind-gate]
+#[tokio::test]
+async fn wrong_kind_gate_ignores_lying_scheduler_flag_fetcher() {
+    let err = run(
+        ExecutorKind::Fetcher,
+        NON_FOD_DRV,
+        /*assignment_flag=*/ true,
+    )
+    .await
+    .expect_err("fetcher must refuse non-FOD regardless of scheduler flag");
+    let ExecutorError::WrongKind { is_fod, .. } = err else {
+        panic!("expected WrongKind, got {err:?}")
+    };
+    assert!(
+        !is_fod,
+        "gate must report drv-derived is_fod=false, not scheduler's true"
+    );
+}
+
+/// Mirror: scheduler mislabels FOD as `is_fixed_output=false` → Builder
+/// must STILL refuse (drv says FOD; airgap boundary).
+///
+/// Kills the mutation `let is_fod = assignment.is_fixed_output`: under
+/// it, `is_fod=false`, gate `false!=false` passes → `expect_err` fails.
+#[tokio::test]
+async fn wrong_kind_gate_ignores_lying_scheduler_flag_builder() {
+    let err = run(
+        ExecutorKind::Builder,
+        FOD_DRV,
+        /*assignment_flag=*/ false,
+    )
+    .await
+    .expect_err("builder must refuse FOD regardless of scheduler flag");
+    let ExecutorError::WrongKind { is_fod, .. } = err else {
+        panic!("expected WrongKind, got {err:?}")
+    };
+    assert!(
+        is_fod,
+        "gate must report drv-derived is_fod=true, not scheduler's false"
+    );
 }
