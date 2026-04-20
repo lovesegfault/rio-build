@@ -143,9 +143,8 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // Bound extra_roots BEFORE spawning. A 10M-element array stalls
         // the mark CTE on unnest() — GC no longer blocks PutPath
         // (I-192), but a multi-minute mark still ties up GC_LOCK_ID and
-        // skews `paths_resurrected`. Separate from
-        // DEFAULT_MAX_BATCH_PATHS (1M, sized for client closures) —
-        // GcRoots actor sends ~tens, 100k is already implausible here.
+        // skews `paths_resurrected`. Bound sized to the real producer
+        // — see MAX_GC_EXTRA_ROOTS doc.
         rio_common::grpc::check_bound("extra_roots", req.extra_roots.len(), MAX_GC_EXTRA_ROOTS)?;
         // Syntactically valid store paths only. Not-in-narinfo is fine
         // (in-flight outputs, mark's seed-d handles it); garbage strings
@@ -686,10 +685,9 @@ mod tests {
     async fn trigger_gc_rejects_oversized_extra_roots() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-        // Syntactically valid paths (validate_store_path passes each).
-        let roots: Vec<String> = (0..super::MAX_GC_EXTRA_ROOTS + 1)
-            .map(|i| rio_test_support::fixtures::test_store_path(&format!("r{i}")))
-            .collect();
+        // check_bound fires on .len() before per-root validation, so
+        // contents are irrelevant — empty strings suffice.
+        let roots = vec![String::new(); super::MAX_GC_EXTRA_ROOTS + 1];
         let err = svc
             .trigger_gc(Request::new(GcRequest {
                 extra_roots: roots,
@@ -912,9 +910,15 @@ mod tests {
         // deleted=true in PG → MUST be skipped (it's awaiting drain;
         // backend state is undefined). Tag 0x05 sorts before 0x10 so
         // a buggy WHERE that ignores `deleted` would scan it first.
+        // `.uploaded()` so this row is excluded ONLY by `deleted=FALSE`
+        // — isolates that predicate (drop it → scanned=3 → test fails).
         // ChunkSeed synthesizes hash as [tag, 0, 0, ...] — bind the
         // returned hash, not a literal.
-        let h_deleted = ChunkSeed::new(0x05).with_refcount(0).seed(&db.pool).await;
+        let h_deleted = ChunkSeed::new(0x05)
+            .with_refcount(0)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
         sqlx::query("UPDATE chunks SET deleted = TRUE WHERE blake3_hash = $1")
             .bind(h_deleted.as_slice())
             .execute(&db.pool)

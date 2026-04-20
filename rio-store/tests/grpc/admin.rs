@@ -32,12 +32,13 @@ async fn spawn_admin(
     Ok((client, server))
 }
 
-/// `MAX_GC_EXTRA_ROOTS` (100k) is application-bounded at ~8 MB of path
-/// strings. tonic's default `max_decoding_message_size` is 4 MiB —
-/// without the explicit limit on `StoreAdminServiceServer` (main.rs),
-/// transport rejects ~50k paths with `OutOfRange` before `check_bound`
-/// ever runs. After: 80k paths reach the handler, which rejects on
-/// `validate_store_path` (InvalidArgument naming the path).
+/// `MAX_GC_EXTRA_ROOTS` (`MAX_DAG_NODES * 4` ≈ 4M) is application-
+/// bounded at ~250 MB of path strings. tonic's default
+/// `max_decoding_message_size` is 4 MiB — without the explicit limit on
+/// `StoreAdminServiceServer` (main.rs), transport rejects ~50k paths
+/// with `OutOfRange` before `check_bound` ever runs. After: 80k paths
+/// reach the handler, which rejects on `validate_store_path`
+/// (InvalidArgument naming the path).
 ///
 /// Asserts `InvalidArgument` (handler reached), NOT `OutOfRange` /
 /// `ResourceExhausted` (transport reject).
