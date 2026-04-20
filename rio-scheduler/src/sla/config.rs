@@ -209,9 +209,7 @@ impl SlaConfig {
     pub fn solve_tiers(&self) -> Vec<Tier> {
         let mut tiers = self.tiers.clone();
         tiers.sort_by_key(|t| {
-            t.p50
-                .or(t.p90)
-                .or(t.p99)
+            t.binding_bound()
                 .map(|d| (d * 1000.0) as u64)
                 .unwrap_or(u64::MAX)
         });

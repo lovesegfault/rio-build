@@ -50,7 +50,6 @@ fn mk_fit(s: f64, p: f64, q: f64, sigma: f64) -> FittedParams {
             distinct_c: 3,
             min_c: RawCores(4.0),
             max_c: RawCores(32.0),
-            frozen: false,
             saturated: false,
             last_wall: WallSeconds(0.0),
         },

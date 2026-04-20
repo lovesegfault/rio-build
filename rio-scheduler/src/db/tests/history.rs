@@ -488,7 +488,6 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
             distinct_c: 5,
             min_c: RawCores(2.0),
             max_c: RawCores(32.0),
-            frozen: true,
             saturated: true,
             last_wall: WallSeconds(100.0),
         },

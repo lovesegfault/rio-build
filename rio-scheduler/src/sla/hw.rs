@@ -39,9 +39,9 @@ const HW_FACTOR_SANITY_CEIL: f64 = 4.0;
 #[derive(Debug, Clone, Default)]
 pub struct HwTable {
     factors: HashMap<String, f64>,
-    /// Slowest admitted hw_class — `factor` closest to 1.0 from below.
-    /// Informational (SlaExplain); the normalization itself doesn't
-    /// special-case it.
+    /// Admitted hw_class whose `factor` is closest to 1.0 (the
+    /// calibration target). Ties broken lexicographically. Informational
+    /// (SlaExplain); the normalization itself doesn't special-case it.
     pub reference: String,
 }
 

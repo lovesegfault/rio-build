@@ -231,7 +231,6 @@ mod tests {
                 distinct_c: 3,
                 min_c: RawCores(4.0),
                 max_c: RawCores(32.0),
-                frozen: false,
                 saturated: false,
                 last_wall: WallSeconds(0.0),
             },

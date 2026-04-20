@@ -96,7 +96,6 @@ pub struct ExploreState {
     pub distinct_c: u8,
     pub min_c: RawCores,
     pub max_c: RawCores,
-    pub frozen: bool,
     pub saturated: bool,
     pub last_wall: WallSeconds,
 }

@@ -160,11 +160,11 @@ pub fn prior_for(key: &ModelKey, src: &PriorSources) -> (FitParams, PriorSource)
 /// `b = 1` (linear M(c) in log-log is slope 1 only at one point, but
 /// b=1 is the closest power-law to "linear in c"); `a = ln(M(1))`;
 /// `P = (p90/2)·cpu` (the parallel half scaled to 1 core);
-/// `S = (p90/2)·(1 − 1/cpu)`; `Q = 0`.
+/// `S = p90/2`; `Q = 0`. Then `T(probe.cpu) = S + P/cpu = p90`.
 pub fn operator_to_spq(probe: &ProbeShape, tier_p90: f64) -> FitParams {
     let half = tier_p90 / 2.0;
     FitParams {
-        s: half * (1.0 - 1.0 / probe.cpu),
+        s: half,
         p: half * probe.cpu,
         q: 0.0,
         a: ((probe.mem_base + probe.mem_per_core) as f64).ln(),
@@ -202,11 +202,11 @@ pub fn partial_pool(
 fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_p90: f64) -> FitParams {
     let basis = operator_to_spq(op, tier_p90);
     FitParams {
-        s: clamp_field(fleet.s, basis.s, "s"),
-        p: clamp_field(fleet.p, basis.p, "p"),
-        q: clamp_field(fleet.q, basis.q, "q"),
-        a: clamp_field(fleet.a, basis.a, "a"),
-        b: clamp_field(fleet.b, basis.b, "b"),
+        s: clamp_field(fleet.s, basis.s, "s", false),
+        p: clamp_field(fleet.p, basis.p, "p", false),
+        q: clamp_field(fleet.q, basis.q, "q", false),
+        a: clamp_field(fleet.a, basis.a, "a", true),
+        b: clamp_field(fleet.b, basis.b, "b", false),
     }
 }
 
@@ -255,7 +255,12 @@ fn median_fitparams(v: &[&FitParams]) -> FitParams {
     }
 }
 
-fn clamp_field(fleet: f64, op: f64, param: &'static str) -> f64 {
+/// `log_domain`: `a = ln(M(1))` is in log-space, so a "2× drift" guard
+/// is additive `[op − ln 2, op + ln 2]` (= `[M_op/2, 2·M_op]` in bytes),
+/// not multiplicative `[0.5·op, 2·op]` (= `[√M_op, M_op²]`). The
+/// divergence ratio is reported as `exp(fleet − op)` so the alert
+/// threshold (`> 2 ∨ < 0.5`) keeps its meaning across both domains.
+fn clamp_field(fleet: f64, op: f64, param: &'static str, log_domain: bool) -> f64 {
     let g = ::metrics::gauge!("rio_scheduler_sla_prior_divergence", "param" => param);
     if op.abs() < f64::EPSILON {
         // Degenerate band (operator basis 0, e.g. q): pass fleet
@@ -264,15 +269,18 @@ fn clamp_field(fleet: f64, op: f64, param: &'static str) -> f64 {
         g.set(1.0);
         return fleet;
     }
-    let (lo, hi) = if op > 0.0 {
-        (0.5 * op, 2.0 * op)
+    let (lo, hi, ratio) = if log_domain {
+        let ln2 = std::f64::consts::LN_2;
+        (op - ln2, op + ln2, (fleet - op).exp())
+    } else if op > 0.0 {
+        (0.5 * op, 2.0 * op, fleet / op)
     } else {
-        (2.0 * op, 0.5 * op)
+        (2.0 * op, 0.5 * op, fleet / op)
     };
     // Unconditional: in-band → ratio ∈ [0.5, 2.0] and the alert
     // (`> 2 ∨ < 0.5`) auto-clears when fleet converges. Gating on
     // `clamped != fleet` left the last out-of-band ratio stale forever.
-    g.set(fleet / op);
+    g.set(ratio);
     fleet.clamp(lo, hi)
 }
 
@@ -331,9 +339,11 @@ mod tests {
     #[test]
     fn operator_probe_maps_to_spq_basis() {
         let fp = operator_to_spq(&probe(), 300.0);
-        // half=150; P=150·4=600; S=150·(1−1/4)=112.5
+        // half=150; P=150·4=600; S=150
         assert!((fp.p - 600.0).abs() < 1e-9);
-        assert!((fp.s - 112.5).abs() < 1e-9);
+        assert!((fp.s - 150.0).abs() < 1e-9);
+        // Invariant: T(probe.cpu) = S + P/cpu = p90.
+        assert!((fp.s + fp.p / 4.0 - 300.0).abs() < 1e-9);
         assert_eq!(fp.q, 0.0);
         assert_eq!(fp.b, 1.0);
         assert!((fp.a - ((6 * GIB) as f64).ln()).abs() < 1e-9);
@@ -388,7 +398,7 @@ mod tests {
 
     #[test]
     fn clamp_to_operator_band() {
-        let basis = operator_to_spq(&probe(), 300.0); // s=112.5, p=600, q=0, a=ln(6Gi), b=1
+        let basis = operator_to_spq(&probe(), 300.0); // s=150, p=600, q=0, a=ln(6Gi), b=1
         // p=2000 > 2×600 → clamps to 1200; b=0.2 < 0.5×1 → clamps to 0.5
         let fleet = FitParams {
             s: 100.0,
@@ -400,7 +410,7 @@ mod tests {
         let clamped = clamp_to_operator(&fleet, &probe(), 300.0);
         assert!((clamped.p - 1200.0).abs() < 1e-9);
         assert!((clamped.b - 0.5).abs() < 1e-9);
-        // s=100 is within [56.25, 225] → unchanged
+        // s=100 is within [75, 300] → unchanged
         assert!((clamped.s - 100.0).abs() < 1e-9);
         // q: operator basis is 0 → passed through
         assert!((clamped.q - 0.3).abs() < 1e-9);
@@ -414,13 +424,13 @@ mod tests {
         let key = "rio_scheduler_sla_prior_divergence{param=p}";
         // Out-of-band: 10/3 ≈ 3.33 > 2.
         ::metrics::with_local_recorder(&rec, || {
-            clamp_field(10.0, 3.0, "p");
+            clamp_field(10.0, 3.0, "p", false);
         });
         let v = rec.gauge_value(key).expect("set out-of-band");
         assert!((v - 10.0 / 3.0).abs() < 1e-9, "got {v}");
         // In-band: 3.3/3 = 1.1. Gauge must follow, not stick at 3.33.
         ::metrics::with_local_recorder(&rec, || {
-            clamp_field(3.3, 3.0, "p");
+            clamp_field(3.3, 3.0, "p", false);
         });
         let v = rec.gauge_value(key).expect("still set");
         assert!(
@@ -429,7 +439,7 @@ mod tests {
         );
         // Degenerate band (op≈0) → reports 1.0, not stale.
         ::metrics::with_local_recorder(&rec, || {
-            clamp_field(10.0, 0.0, "p");
+            clamp_field(10.0, 0.0, "p", false);
         });
         let v = rec.gauge_value(key).unwrap();
         assert!((v - 1.0).abs() < 1e-9, "op≈0 clears to 1.0 (got {v})");
@@ -563,16 +573,71 @@ mod tests {
         // p=600 → clamps to 1200. The divergence gauge is emitted as a
         // side effect (not asserted here — no recorder); we assert the
         // clamp itself, which is the gate that triggers emission.
+        let a_op = ((6 * GIB) as f64).ln();
+        let a_13gi = ((13 * GIB) as f64).ln();
         let src = PriorSources {
             seed: HashMap::new(),
-            fleet: Some(fp(112.5, 5000.0, 0.0, 22.0, 1.0)),
+            fleet: Some(fp(150.0, 5000.0, 0.0, a_13gi, 1.0)),
             operator: probe(),
             default_tier_p90: 300.0,
         };
         let (got, prov) = prior_for(&key("anything"), &src);
         assert_eq!(prov, PriorSource::Fleet);
         assert!((got.p - 1200.0).abs() < 1e-9, "p clamped to 2×600");
-        // a=22 is within [0.5×ln(6Gi), 2×ln(6Gi)] ≈ [11.3, 45.2] → pass
-        assert!((got.a - 22.0).abs() < 1e-9);
+        // a: log-domain band is [ln(6Gi)−ln2, ln(6Gi)+ln2] = [ln(3Gi),
+        // ln(12Gi)]. ln(13Gi) is above → clamps to ln(12Gi). The old
+        // multiplicative band [11.3, 45.2] (= [√M_op, M_op²] in bytes)
+        // would have passed it through.
+        assert!(
+            (got.a - (a_op + std::f64::consts::LN_2)).abs() < 1e-9,
+            "a clamped to ln(12Gi) (got {})",
+            got.a
+        );
+    }
+
+    // r[verify sched.sla.prior-partial-pool]
+    #[test]
+    fn operator_probe_invariant_t_at_cpu_equals_p90() {
+        for cpu in [1.0, 2.0, 4.0, 16.0] {
+            let p = ProbeShape { cpu, ..probe() };
+            let fp = operator_to_spq(&p, 300.0);
+            assert!(
+                (fp.s + fp.p / cpu - 300.0).abs() < 1e-9,
+                "cpu={cpu}: T(cpu)={} ≠ 300",
+                fp.s + fp.p / cpu
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_field_log_domain_a_is_additive() {
+        let a_op = ((6 * GIB) as f64).ln();
+        // 1 TiB ≫ 12 GiB → clamps to op + ln2 (= ln(12 GiB)).
+        let got = clamp_field(((1_u64 << 40) as f64).ln(), a_op, "a", true);
+        assert!(
+            (got - (a_op + std::f64::consts::LN_2)).abs() < 1e-9,
+            "1 TiB clamps to ln(12Gi); got {got}"
+        );
+        // 4 GiB ∈ [3Gi, 12Gi] → unchanged.
+        let in_band = ((4 * GIB) as f64).ln();
+        assert!((clamp_field(in_band, a_op, "a", true) - in_band).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clamp_field_s_not_bypassed_at_cpu_1() {
+        // probe.cpu=1 → basis.s = p90/2 = 150 (was 0, which tripped the
+        // op≈0 bypass and left fleet.s unclamped).
+        let p1 = ProbeShape {
+            cpu: 1.0,
+            ..probe()
+        };
+        let basis = operator_to_spq(&p1, 300.0);
+        assert!((basis.s - 150.0).abs() < 1e-9);
+        let clamped = clamp_to_operator(&fp(500.0, 100.0, 0.0, basis.a, 1.0), &p1, 300.0);
+        assert!(
+            (clamped.s - 300.0).abs() < 1e-9,
+            "s=500 clamps to 2×150=300; got {}",
+            clamped.s
+        );
     }
 }

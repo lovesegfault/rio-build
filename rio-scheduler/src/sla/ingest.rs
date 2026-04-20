@@ -209,14 +209,23 @@ pub fn refit(
             .zip(&w_f)
             .map(|((&c, &t), &w)| WeightedSample { c, t, w })
             .collect();
-        (t_min_ci(&ws, BOOTSTRAP_REPS, fit.p_bar().0), Some(now))
+        let unfreeze_q = matches!(fit, DurationFit::Usl { .. });
+        (
+            t_min_ci(&ws, BOOTSTRAP_REPS, fit.p_bar().0, unfreeze_q),
+            Some(now),
+        )
     } else {
         (
             prev.and_then(|p| p.t_min_ci),
             prev.and_then(|p| p.ci_computed_at),
         )
     };
-    let tier = reassign_tier(prev.and_then(|p| p.tier.as_deref()), ci, tiers);
+    let tier = reassign_tier(
+        prev.and_then(|p| p.tier.as_deref()),
+        ci,
+        hw.min_factor(),
+        tiers,
+    );
 
     FittedParams {
         key: key.clone(),
@@ -346,7 +355,13 @@ pub fn is_outlier(
     if !predicted.is_finite() || predicted <= 0.0 || ref_t <= 0.0 {
         return false;
     }
-    let log_resid = (ref_t / predicted).ln().abs();
+    // Center on the residual median: `log_residuals` are computed
+    // against the post-pooled fit, so a divergent prior puts a
+    // systematic offset on every residual. MAD cancels it; the test
+    // value must too, or on-curve samples get flagged when n_eff is in
+    // the partial-pool window.
+    let med = median(&fit.log_residuals);
+    let log_resid = ((ref_t / predicted).ln() - med).abs();
     let mad = median_abs_dev(&fit.log_residuals);
     let floor = (fit.sigma_resid / 1.4826).max(dt_poll / wall_t);
     log_resid > 3.0 * 1.4826 * mad.max(floor)
@@ -431,14 +446,17 @@ pub(super) fn should_recompute_ci(
     halflife_secs: f64,
 ) -> bool {
     let Some(prev) = prev else { return true };
-    let Some((plo, phi)) = prev.t_min_ci else {
-        return true;
-    };
+    // Floor first — it's unconditional, and `ci_computed_at` is set
+    // even when bootstrap returned `None` (rank-deficient resamples), so
+    // a None-CI key still rate-limits to once per 30s.
     if let Some(at) = prev.ci_computed_at
         && now - at < 30.0_f64.min(halflife_secs / 10.0)
     {
         return false;
     }
+    let Some((plo, phi)) = prev.t_min_ci else {
+        return true;
+    };
     if prev.n_eff > 0.0 && (prev.n_eff - new_n_eff).abs() / prev.n_eff > 0.5 {
         return true;
     }
@@ -447,29 +465,35 @@ pub(super) fn should_recompute_ci(
 }
 
 /// Schmitt-trigger tier reassignment with a 0.85/1.05 deadband on
-/// `binding_bound` (= p90 if set, else p50, else p99). `tiers` must be
-/// sorted tightest-first. Returns the new tier name, or `prev` unchanged
-/// when there is no CI or no bounded tiers.
+/// [`Tier::binding_bound`]. `tiers` must be sorted tightest-first.
+/// Returns the new tier name, or `prev` unchanged when there is no CI or
+/// no bounded tiers.
+///
+/// `min_factor`: ref→wall denorm at the slowest admitted hw_class,
+/// mirroring `solve_intent_for`'s deadline path ([`HwTable::min_factor`]).
+/// `ci` is in reference-seconds; tier bounds are operator-facing wall-
+/// seconds, so the comparison uses `hi_wall = ci.hi / min_factor`.
 ///
 /// Starting position is `prev`'s index in the bounded-tier list (or
 /// loosest if `prev` is None / unbounded / unknown). From there,
-/// **promote** while `ci.hi < 0.85 · tighter.binding_bound`, **demote**
-/// while `ci.hi > 1.05 · current.binding_bound`. The 20-point deadband
+/// **promote** while `hi_wall < 0.85 · tighter.binding_bound`, **demote**
+/// while `hi_wall > 1.05 · current.binding_bound`. The 20-point deadband
 /// means a key oscillating around a tier boundary stays put instead of
 /// flapping on every refit.
 // r[impl sched.sla.reassign-schmitt]
 pub(super) fn reassign_tier(
     prev: Option<&str>,
     ci: Option<(RefSeconds, RefSeconds)>,
+    min_factor: f64,
     tiers: &[Tier],
 ) -> Option<String> {
     let Some((_, hi)) = ci else {
         return prev.map(String::from);
     };
-    let binding = |t: &Tier| t.p90.or(t.p50).or(t.p99);
+    let hi_wall = hi.0 / min_factor;
     let bounded: Vec<(&str, f64)> = tiers
         .iter()
-        .filter_map(|t| binding(t).map(|b| (t.name.as_str(), b)))
+        .filter_map(|t| t.binding_bound().map(|b| (t.name.as_str(), b)))
         .collect();
     if bounded.is_empty() {
         return prev.map(String::from);
@@ -478,9 +502,9 @@ pub(super) fn reassign_tier(
         .and_then(|p| bounded.iter().position(|(n, _)| *n == p))
         .unwrap_or(bounded.len() - 1);
     loop {
-        if i > 0 && hi.0 < 0.85 * bounded[i - 1].1 {
+        if i > 0 && hi_wall < 0.85 * bounded[i - 1].1 {
             i -= 1;
-        } else if i + 1 < bounded.len() && hi.0 > 1.05 * bounded[i].1 {
+        } else if i + 1 < bounded.len() && hi_wall > 1.05 * bounded[i].1 {
             i += 1;
         } else {
             break;
@@ -514,13 +538,10 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
     }
 }
 
-/// Reconstruct [`ExploreState`] from observed current-version cpu_limits.
-/// `frozen` mirrors [`super::explore::frozen`] (span≥4 ∨ max_c at
-/// ceiling ∨ min_c at floor) so `intent_for`'s `f.explore.frozen` and
-/// `explore::frozen(&f.explore, …)` agree even when the actor's
-/// `max_cores` differs from the in-ladder one — `frozen` here uses
-/// span/floor only (the ceiling check needs config the refit doesn't
-/// have; `intent_for` re-checks against `ceil.max_cores`).
+/// Reconstruct [`ExploreState`] inputs (min_c/max_c/distinct/saturated/
+/// last_wall) from observed current-version cpu_limits. The freeze
+/// predicate is evaluated by callers via [`super::explore::frozen`] —
+/// refit doesn't have the config-side `max_cores` so cannot precompute it.
 fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> ExploreState {
     let distinct: HashSet<u64> = cur_cs.iter().map(|c| c.to_bits()).collect();
     let (min_c, max_c) = cur_cs
@@ -539,12 +560,10 @@ fn derive_explore_state(cur_cs: &[f64], last: Option<&BuildSampleRow>) -> Explor
                 .map(|(secs, lim)| secs / r.duration_secs / lim > 0.4)
         })
         .unwrap_or(false);
-    let span = if min_c > 0.0 { max_c / min_c } else { 1.0 };
     ExploreState {
         distinct_c: distinct.len() as u8,
         min_c: RawCores(min_c),
         max_c: RawCores(max_c),
-        frozen: max_c > 0.0 && (span >= 4.0 || min_c <= 1.0),
         saturated,
         last_wall: WallSeconds(last.map(|r| r.duration_secs).unwrap_or(0.0)),
     }
@@ -597,6 +616,18 @@ mod tests {
 
     fn r_hw(rows: &[BuildSampleRow], hw: &HwTable) -> FittedParams {
         refit(&key(), rows, 7.0 * 86400.0, None, &[], hw, None)
+    }
+
+    fn r_prior(rows: &[BuildSampleRow], priors: &PriorSources) -> FittedParams {
+        refit(
+            &key(),
+            rows,
+            7.0 * 86400.0,
+            None,
+            &[],
+            &HwTable::default(),
+            Some(priors),
+        )
     }
 
     /// Like `row` but with explicit peak_cpu and avg_cores so Capped-stage
@@ -819,6 +850,7 @@ mod tests {
             reassign_tier(
                 Some("normal"),
                 Some((RefSeconds(200.0), RefSeconds(250.0))),
+                1.0,
                 &tiers
             ),
             Some("fast".into())
@@ -829,6 +861,7 @@ mod tests {
             reassign_tier(
                 Some("normal"),
                 Some((RefSeconds(200.0), RefSeconds(260.0))),
+                1.0,
                 &tiers
             ),
             Some("normal".into())
@@ -838,6 +871,7 @@ mod tests {
             reassign_tier(
                 Some("fast"),
                 Some((RefSeconds(10.0), RefSeconds(50.0))),
+                1.0,
                 &tiers
             ),
             Some("fast".into())
@@ -852,6 +886,7 @@ mod tests {
             reassign_tier(
                 Some("normal"),
                 Some((RefSeconds(900.0), RefSeconds(1300.0))),
+                1.0,
                 &tiers
             ),
             Some("slow".into())
@@ -862,6 +897,7 @@ mod tests {
             reassign_tier(
                 Some("normal"),
                 Some((RefSeconds(900.0), RefSeconds(1250.0))),
+                1.0,
                 &tiers
             ),
             Some("normal".into())
@@ -871,6 +907,7 @@ mod tests {
             reassign_tier(
                 Some("slow"),
                 Some((RefSeconds(5000.0), RefSeconds(9000.0))),
+                1.0,
                 &tiers
             ),
             Some("slow".into())
@@ -881,13 +918,18 @@ mod tests {
     fn schmitt_no_ci_keeps_prev() {
         let tiers = ladder();
         assert_eq!(
-            reassign_tier(Some("normal"), None, &tiers),
+            reassign_tier(Some("normal"), None, 1.0, &tiers),
             Some("normal".into())
         );
-        assert_eq!(reassign_tier(None, None, &tiers), None);
+        assert_eq!(reassign_tier(None, None, 1.0, &tiers), None);
         // Empty tier list → keeps prev.
         assert_eq!(
-            reassign_tier(Some("x"), Some((RefSeconds(1.0), RefSeconds(2.0))), &[]),
+            reassign_tier(
+                Some("x"),
+                Some((RefSeconds(1.0), RefSeconds(2.0))),
+                1.0,
+                &[]
+            ),
             Some("x".into())
         );
     }
@@ -898,14 +940,86 @@ mod tests {
         // No prev, ci.hi=250 → start at slow, promote to normal (250<0.85·1200),
         // promote to fast (250<0.85·300).
         assert_eq!(
-            reassign_tier(None, Some((RefSeconds(200.0), RefSeconds(250.0))), &tiers),
+            reassign_tier(
+                None,
+                Some((RefSeconds(200.0), RefSeconds(250.0))),
+                1.0,
+                &tiers
+            ),
             Some("fast".into())
         );
         // No prev, ci.hi=2000 → start at slow, 2000>0.85·1200 (no promote),
         // 2000<1.05·3600 (no demote) → slow.
         assert_eq!(
-            reassign_tier(None, Some((RefSeconds(1000.0), RefSeconds(2000.0))), &tiers),
+            reassign_tier(
+                None,
+                Some((RefSeconds(1000.0), RefSeconds(2000.0))),
+                1.0,
+                &tiers
+            ),
             Some("slow".into())
+        );
+    }
+
+    // r[verify sched.sla.reassign-schmitt]
+    #[test]
+    fn schmitt_monotone_with_mixed_percentile_tiers() {
+        // solve_tiers() and reassign_tier() must agree on which percentile
+        // is binding. With mixed p50/p90, fast.binding_bound=600 and
+        // normal.binding_bound=300 → sorts [normal, fast].
+        let mut solved = vec![
+            Tier {
+                name: "fast".into(),
+                p50: Some(60.0),
+                p90: Some(600.0),
+                p99: None,
+            },
+            Tier {
+                name: "normal".into(),
+                p50: Some(120.0),
+                p90: Some(300.0),
+                p99: None,
+            },
+        ];
+        // SlaConfig::solve_tiers() sort, inlined (SlaConfig isn't Default).
+        solved.sort_by_key(|t| {
+            t.binding_bound()
+                .map(|d| (d * 1000.0) as u64)
+                .unwrap_or(u64::MAX)
+        });
+        assert_eq!(solved[0].name, "normal", "tightest binding_bound first");
+        // ci.hi=640 > 1.05·600 → demote off fast. But the only looser
+        // bounded tier is normal (bound=300 < 640) — the walk would
+        // mis-land there if sort-key (p50) ≠ binding-key (p90). With both
+        // on binding_bound(), bounded=[normal:300, fast:600], start at
+        // fast (idx 1), 640>1.05·600 → can't demote past end → stays fast.
+        let got = reassign_tier(
+            Some("fast"),
+            Some((RefSeconds(500.0), RefSeconds(640.0))),
+            1.0,
+            &solved,
+        );
+        assert_ne!(
+            got,
+            Some("normal".into()),
+            "must not demote into a TIGHTER bound"
+        );
+    }
+
+    #[test]
+    fn schmitt_denormalizes_ref_to_wall() {
+        let tiers = ladder();
+        // min_factor=2.0 (slowest hw is 2× reference): ci.hi=500 ref-sec
+        // → 250 wall-sec on the slowest band; 250 < 0.85·300 → promote.
+        // Without denorm, 500 > 255 → would stay normal.
+        assert_eq!(
+            reassign_tier(
+                Some("normal"),
+                Some((RefSeconds(400.0), RefSeconds(500.0))),
+                2.0,
+                &tiers
+            ),
+            Some("fast".into())
         );
     }
 
@@ -926,7 +1040,6 @@ mod tests {
                 distinct_c: 3,
                 min_c: RawCores(1.0),
                 max_c: RawCores(32.0),
-                frozen: false,
                 saturated: false,
                 last_wall: WallSeconds(0.0),
             },
@@ -1067,7 +1180,7 @@ mod tests {
     fn mad_floor_is_hw_invariant() {
         // The dt_poll floor is a wall-second ÷ wall-second ratio, so the
         // outlier verdict must be identical for any hw_factor. Perfect
-        // fit (zero σ/MAD), wall_t=5s, dt_poll=1s → floor=0.2, gate≈0.89.
+        // fit (zero σ/MAD), dt_poll=1s.
         let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
             .into_iter()
             .map(|c| row(c, 30.0 + 2000.0 / c))
@@ -1075,23 +1188,23 @@ mod tests {
         let fit = r(&rows);
         assert!(fit.sigma_resid < 1e-3, "perfect fit");
         let pred = fit.fit.t_at(RawCores(8.0)).0;
-        let wall_t = 5.0;
-        let dt_poll = 1.0;
-        for factor in [1.0, 3.0, 0.5] {
-            // Residual fixed at ln(1.5)≈0.405 / ln(3)≈1.10; floor sees
-            // wall_t directly so the verdict is the same for any
-            // hw_factor the caller used to derive ref_t. Under the
-            // c6163485 residual (dt_poll ÷ ref_t) the floor was off by
-            // `factor×` and the 1.5× sample flipped at factor>2.
-            assert!(
-                !is_outlier(pred * 1.5, wall_t, 8.0, &fit, dt_poll),
-                "factor={factor}: ln(1.5)≈0.405 < gate≈0.89 → kept"
-            );
-            assert!(
-                is_outlier(pred * 3.0, wall_t, 8.0, &fit, dt_poll),
-                "factor={factor}: ln(3)≈1.10 > gate≈0.89 → flagged"
-            );
-        }
+        // wall_t=5, dt_poll=1 → floor=0.2, gate≈0.89.
+        assert!(
+            !is_outlier(pred * 1.5, 5.0, 8.0, &fit, 1.0),
+            "ln(1.5)≈0.405 < 0.89"
+        );
+        assert!(
+            is_outlier(pred * 3.0, 5.0, 8.0, &fit, 1.0),
+            "ln(3)≈1.10 > 0.89"
+        );
+        // factor-3 hw observing the SAME ref_t residual: wall_t=5/3≈1.67
+        // → floor=0.6, gate≈2.67. The 1.5× residual is still kept —
+        // pre-6956f6ea passed ref_t (≈420) for wall_t, giving floor≈0.0024
+        // and gate≈0.011, which WOULD have flagged it.
+        assert!(
+            !is_outlier(pred * 1.5, 5.0 / 3.0, 8.0, &fit, 1.0),
+            "wall_t=1.67 → floor=0.6, gate≈2.67; ln(1.5)≈0.405 still kept"
+        );
     }
 
     #[test]
@@ -1109,9 +1222,10 @@ mod tests {
             p: RefSeconds(0.0),
         };
         assert!(should_recompute_ci(None, &f, 5.0, 1000.0, 7.0 * 86400.0));
-        // prev exists but has no CI → recompute.
+        // prev exists but bootstrap has never run → recompute.
         let mut prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
         prev.t_min_ci = None;
+        prev.ci_computed_at = None;
         assert!(should_recompute_ci(
             Some(&prev),
             &f,
@@ -1119,5 +1233,69 @@ mod tests {
             1000.0,
             7.0 * 86400.0
         ));
+    }
+
+    #[test]
+    fn recompute_ci_floor_gates_none_ci() {
+        // Bootstrap ran (ci_computed_at=Some) but returned None
+        // (rank-deficient resamples). The 30s floor must still apply —
+        // not refit-storm 500×NNLS every tick.
+        let f = DurationFit::Amdahl {
+            s: RefSeconds(100.0),
+            p: RefSeconds(0.0),
+        };
+        let mut prev = prev_with_ci(100.0, 50.0, 150.0, 6.0, 100.0);
+        prev.t_min_ci = None;
+        assert!(
+            !should_recompute_ci(Some(&prev), &f, 6.0, 101.0, 600.0),
+            "within 30s floor"
+        );
+        assert!(
+            should_recompute_ci(Some(&prev), &f, 6.0, 200.0, 600.0),
+            "past floor"
+        );
+    }
+
+    // r[verify sched.sla.outlier-mad-reject]
+    #[test]
+    fn mad_robust_to_divergent_prior() {
+        // True curve T(c)=30+2000/c; prior says P=500 (4× too small).
+        // Partial pooling drags the fitted curve toward the prior, so
+        // every log_residual carries a systematic positive offset. The
+        // MAD test value must be centered on that median offset — an
+        // on-curve sample is NOT an outlier.
+        let rows: Vec<_> = [4.0, 8.0, 12.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .map(|c| row(c, 30.0 + 2000.0 / c))
+            .collect();
+        let priors = PriorSources {
+            seed: HashMap::new(),
+            fleet: Some(FitParams {
+                s: 30.0,
+                p: 500.0,
+                q: 0.0,
+                a: ((256_u64 << 20) as f64).ln(),
+                b: 1.0,
+            }),
+            operator: super::super::config::ProbeShape {
+                cpu: 4.0,
+                mem_per_core: 1 << 30,
+                mem_base: 1 << 30,
+                deadline_secs: 3600,
+            },
+            default_tier_p90: 300.0,
+        };
+        let fit = r_prior(&rows, &priors);
+        assert!(fit.n_eff >= 5.0);
+        let med = median(&fit.log_residuals);
+        assert!(
+            med.abs() > 0.05,
+            "precondition: prior shifted residuals (med={med})"
+        );
+        // On-curve at c=8 → T=280. Must NOT be flagged.
+        assert!(
+            !is_outlier(280.0, 280.0, 8.0, &fit, 1.0),
+            "on-curve sample survives a divergent prior"
+        );
     }
 }

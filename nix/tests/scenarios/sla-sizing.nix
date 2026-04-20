@@ -134,13 +134,15 @@ let
         # cadence. housekeeping.rs:85-87 increments refit_total BEFORE
         # awaiting refresh(), so +1 only proves a refresh STARTED; +2
         # proves the prior refresh COMPLETED (when counter reads
-        # base+2, refresh base+1 has returned). Fixtures must poll for
-        # "≥2 ticks since INSERT" per housekeeping.rs:85-86.
+        # base+2, refresh base+1 has returned). awk seeds hit=0 so a
+        # not-yet-emitted counter (no refit since boot) FAILS the gate
+        # instead of default-exit-0 passing vacuously.
         base = metric_value(scrape_metrics(${gatewayHost}, 9091),
             "rio_scheduler_sla_refit_total") or 0.0
         ${gatewayHost}.wait_until_succeeds(
             "curl -fsS localhost:9091/metrics | "
-            f"awk '/^rio_scheduler_sla_refit_total / {{exit !($2>{base+1})}}'",
+            f"awk 'BEGIN{{hit=0}} /^rio_scheduler_sla_refit_total / "
+            f"{{hit=($2>{base+1})}} END{{exit !hit}}'",
             timeout=45,
         )
 

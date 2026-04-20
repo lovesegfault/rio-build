@@ -29,6 +29,18 @@ pub struct Tier {
     pub p99: Option<f64>,
 }
 
+impl Tier {
+    /// The single percentile this tier is bounded by, in canonical
+    /// precedence p90→p50→p99 (`r[sched.sla.reassign-schmitt]`). All
+    /// consumers that need "the tier's bound" — `solve_tiers()` sort
+    /// order, `reassign_tier()` Schmitt walk — go through this so they
+    /// agree on which percentile is binding. Returns wall-seconds (tier
+    /// targets are operator-facing, not reference-seconds).
+    pub fn binding_bound(&self) -> Option<f64> {
+        self.p90.or(self.p50).or(self.p99)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Ceilings {
     pub max_cores: f64,
@@ -579,7 +591,6 @@ mod tests {
                 distinct_c: 3,
                 min_c: RawCores(4.0),
                 max_c: RawCores(32.0),
-                frozen: false,
                 saturated: false,
                 last_wall: WallSeconds(0.0),
             },
