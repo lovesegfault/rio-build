@@ -32,10 +32,6 @@ pub fn describe_all() {
          (band, cap) cells at the terminal tier)"
     );
     describe_counter!(
-        "rio_scheduler_sla_resize_retry_total",
-        "OOM/ENOSPC penalty-bump retries (labeled kind=oom|enospc)"
-    );
-    describe_counter!(
         "rio_scheduler_sla_suspicious_scaling_total",
         "exploration froze at maxCores still saturated (labeled tenant). \
          The build wants more cores than the cluster offers."

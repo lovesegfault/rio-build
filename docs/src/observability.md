@@ -148,7 +148,6 @@ r[obs.metric.scheduler]
 | `rio_scheduler_sla_prediction_ratio` | Histogram | ADR-023: actual/predicted, labeled `dim`=`wall`\|`mem`. 1.0=perfect; >1.0=under-predicted. |
 | `rio_scheduler_sla_envelope_result_total` | Counter | ADR-023: SLA envelope hit/miss per tier (labeled `tier`, `result`=`hit`\|`miss`). |
 | `rio_scheduler_sla_infeasible_total` | Counter | ADR-023: infeasible-at-any-tier (labeled `reason`=`ceiling_exhausted`\|`capacity_exhausted`). `ceiling_exhausted`: solve returned `BestEffort` because `c*` exceeded ceilings on every bounded tier. `capacity_exhausted`: the ICE-backoff ladder exhausted all 6 `(band, cap)` cells at the terminal tier. |
-| `rio_scheduler_sla_resize_retry_total` | Counter | ADR-023: OOM/ENOSPC penalty-bump retries (labeled `kind`=`oom`\|`enospc`). |
 | `rio_scheduler_sla_suspicious_scaling_total` | Counter | ADR-023: exploration froze at `max_cores` still saturated (labeled `tenant`). The build wants more cores than the cluster offers. |
 | `rio_scheduler_sla_outlier_rejected_total` | Counter | ADR-023: MAD-rejected `build_samples` rows (labeled `tenant`). Row stays in PG (`outlier_excluded=TRUE`) for forensics; refit excludes it (`r[sched.sla.outlier-mad-reject]`). |
 | `rio_scheduler_sla_mem_fit_weak_total` | Counter | ADR-023: `M(c)` Koenker-Machado pseudo-R¹ < 0.7 → fell back to independent recency-weighted p90 (labeled `tenant`). |
