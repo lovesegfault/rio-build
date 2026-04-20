@@ -17,13 +17,14 @@
 #     reconciler's default nodeSelector matches (also exercises
 #     fetcher.node.dedicated — fetcher lands on agent, builder on server)
 #
-# Egress-open proof — fetcher-egress allows 0.0.0.0/0:80 minus RFC1918/
-# link-local/loopback. In an airgap VM there's no real public IP. The
-# scenario fakes one: k3s-server gets 203.0.113.1/24 (TEST-NET-3, RFC5737
-# — NOT in the `except` list) on eth1, python http.server on :80. Both
-# other nodes get a static route. Then:
-#   builder netns → curl 203.0.113.1:80 → rc≠0 (not in builder-egress allow)
-#   fetcher netns → curl 203.0.113.1:80 → rc==0 (0.0.0.0/0:80 allow fires)
+# Egress-open proof — fetcher-egress allows toEntities:[world] on 80/443.
+# In an airgap VM there's no real public IP. The scenario uses the
+# fixture's `upstream-v4` node (v4-only http.server) reached from v6-only
+# pods via DNS64+NAT64 — exactly the prod path. The 64:ff9b::/96
+# synthesised address is outside any cluster identity → Cilium classifies
+# it as `world`. Then:
+#   builder netns → curl [64:ff9b::<v4>]:80 → rc≠0 (no world rule)
+#   fetcher netns → curl [64:ff9b::<v4>]:80 → rc==0 (world:80 allow fires)
 # This is the non-vacuous differentiator; the IMDS probe stays WEAK
 # (same caveat as netpol.nix — no IMDS listener in QEMU).
 #
@@ -51,12 +52,6 @@ let
   py3 = "${pkgs.python3}/bin/python3";
 
   inherit (fixture) nsBuilders nsFetchers ns;
-
-  # TEST-NET-3 "public" origin. RFC5737 reserves 203.0.113.0/24 for
-  # documentation — guaranteed never routed on the real internet.
-  # Importantly NOT in RFC1918/link-local/loopback → passes the
-  # fetcher-egress ipBlock except-clause.
-  originIP = "203.0.113.1";
 
   # Ephemeral workers: pod names are Job-generated, not STS ordinals.
   # Resolved at runtime via wait_worker_pod() after the build is
@@ -111,14 +106,20 @@ pkgs.testers.runNixOSTest {
     # nodes.
     kubectl("label node k3s-agent rio.build/node-role=fetcher --overwrite", ns="kube-system")
 
-    # ── TEST-NET-3 "public" origin on k3s-server:80 ───────────────────
-    # 203.0.113.0/24 is RFC5737 TEST-NET-3 — non-RFC1918, non-link-
-    # local → matches fetcher-egress 0.0.0.0/0:80 allow. All three
-    # nodes share eth1 L2; static routes on agent+client point the /24
-    # at the bridge so ARP resolves to k3s-server. Firewall port 80
-    # opened via iptables (NixOS firewall config is eval-time only).
-    k3s_server.succeed(
-        "ip addr add ${originIP}/24 dev eth1 && "
+    # ── "public" origin on upstream-v4:80 ─────────────────────────────
+    # The v6-only fixture's upstream-v4 node is the prod-path egress
+    # target: pod resolves `upstream-v4` via CoreDNS dns64 →
+    # 64:ff9b::<v4> AAAA → host's 64:ff9b::/96 route → edge Jool →
+    # v4. The synthesised prefix is outside any Cilium cluster
+    # identity → classified `world` → matches fetcher-egress's
+    # world:80 allow. mkUpstreamNode runs http.server on :8080 only;
+    # fetcher-egress allows world:{80,443} only — replace it with the
+    # slow server on :80 here. Firewall port 80 opened at runtime
+    # (NixOS firewall config is eval-time only); upstream-v4 is
+    # v4-only so iptables (not ip6tables) is correct — Jool delivers
+    # post-translation v4 packets.
+    upstream_v4.succeed(
+        "systemctl stop upstream-http.service && "
         "iptables -I nixos-fw -p tcp --dport 80 -j ACCEPT && "
         "mkdir -p /srv/sha256 && "
         "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
@@ -129,7 +130,8 @@ pkgs.testers.runNixOSTest {
     # long enough for the netns probe below. /ok and / serve immediately
     # (the netpol probes use those, not /busybox). systemd-run detaches
     # cleanly — nohup+& can leave the driver's pipe open → succeed() hangs.
-    k3s_server.succeed(
+    # Bind on the empty host (all families); upstream-v4's eth1 is v4-only.
+    upstream_v4.succeed(
         "cat >/srv/slow.py <<'PY'\n"
         "import http.server, time, os\n"
         "os.chdir('/srv')\n"
@@ -137,14 +139,25 @@ pkgs.testers.runNixOSTest {
         "    def do_GET(self):\n"
         "        if self.path == '/busybox': time.sleep(30)\n"
         "        super().do_GET()\n"
-        "http.server.ThreadingHTTPServer(('0.0.0.0', 80), H).serve_forever()\n"
+        "http.server.ThreadingHTTPServer((''', 80), H).serve_forever()\n"
         "PY"
     )
-    k3s_server.succeed(
+    upstream_v4.succeed(
         "systemd-run --unit=test-origin ${py3} /srv/slow.py"
     )
-    for n in [k3s_agent, client]:
-        n.succeed("ip route add 203.0.113.0/24 dev eth1 || true")
+    upstream_v4.wait_for_open_port(80)
+
+    # nsenter -n keeps host mountns → host /etc/resolv.conf → no CoreDNS
+    # dns64. Compute the RFC 6052 v4-embedded literal here so the netns
+    # probes below stay raw-IP (matches the existing nsenter pattern;
+    # same approach as ingress-v4v6.nix). The FOD URLs use the hostname
+    # — those run inside the pod with pod DNS.
+    upstream_v4_ip = upstream_v4.succeed(
+        "ip -4 -o addr show dev eth1 | "
+        "${pkgs.gawk}/bin/awk '{split($4,a,\"/\"); print a[1]}'"
+    ).strip()
+    origin_v6 = f"64:ff9b::{upstream_v4_ip}"
+    print(f"upstream-v4 = {upstream_v4_ip}, NAT64 literal = {origin_v6}")
 
     # ── NetworkPolicies rendered + applied ────────────────────────────
     # networkPolicy.enabled=true in extraValues → helm-render puts
@@ -180,7 +193,7 @@ pkgs.testers.runNixOSTest {
     client.succeed(
         "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
         "--arg busybox '(builtins.storePath ${common.busybox})' "
-        "--argstr url http://${originIP}/busybox "
+        "--argstr url http://upstream-v4/busybox "
         "--arg sleepSecs 30 "
         "${drvs.fodConsumer} >/tmp/split-build.log 2>&1 &"
     )
@@ -234,11 +247,12 @@ pkgs.testers.runNixOSTest {
     ).strip()
 
     # ══════════════════════════════════════════════════════════════════
-    # fetcher-egress — fetcher REACHES TEST-NET-3 origin
+    # fetcher-egress — fetcher REACHES upstream-v4 via NAT64
     # ══════════════════════════════════════════════════════════════════
     # THE non-vacuous differentiator vs builder. Same origin, same
-    # port — fetcher-egress's 0.0.0.0/0:80 allow (minus RFC1918/
-    # link-local/loopback) fires; builder-egress has no such rule.
+    # port — fetcher-egress's toEntities:[world]:80 allow fires (the
+    # 64:ff9b::/96 prefix is outside any cluster identity → world);
+    # builder-egress has no world rule.
     with subtest("fetcher-egress: fetcher reaches 'public' origin"):
         rc, out = fetcher_exec(f"${nc} -z -w5 {sched_ip} 9001")
         assert rc == 0, (
@@ -248,34 +262,35 @@ pkgs.testers.runNixOSTest {
 
         rc, out = fetcher_exec(
             "${curl} --max-time 5 -sS -o /dev/null -w '%{http_code}' "
-            "http://${originIP}/ok"
+            f"'http://[{origin_v6}]/ok'"
         )
         assert rc == 0, (
-            f"fetcher BLOCKED from ${originIP}:80 (rc={rc}) — "
-            f"fetcher-egress 0.0.0.0/0:80 allow NOT firing. ${originIP} "
-            f"is TEST-NET-3 (non-RFC1918), should pass except-clause.\n{out}"
+            f"fetcher BLOCKED from [{origin_v6}]:80 (rc={rc}) — "
+            f"fetcher-egress toEntities:[world]:80 allow NOT firing. "
+            f"64:ff9b::/96 is outside cluster identities → world.\n{out}"
         )
         assert out.strip() == "200", f"origin returned {out!r}, expected 200"
-        print(f"fetcher-egress PASS: ${originIP}:80 reachable (http {out.strip()})")
+        print(f"fetcher-egress PASS: [{origin_v6}]:80 reachable (http {out.strip()})")
 
     # ══════════════════════════════════════════════════════════════════
-    # fetcher-imds-blocked — link-local deny inherited
+    # fetcher-imds-blocked — host entity not in world
     # ══════════════════════════════════════════════════════════════════
-    # WEAK-in-VM (same caveat as netpol.nix:176): no IMDS listener in
+    # WEAK-in-VM (same caveat as netpol.nix): no IMDS listener in
     # QEMU. The fetcher-egress subtest above is the non-vacuous gate;
-    # this proves the except-clause covers 169.254.0.0/16.
-    with subtest("fetcher-imds-blocked: 169.254.169.254 blocked"):
+    # this proves the v6 IMDS endpoint (Cilium `host` entity, NOT
+    # `world`) is denied.
+    with subtest("fetcher-imds-blocked: fd00:ec2::254 blocked"):
         rc, _ = fetcher_exec(
-            "${curl} --max-time 5 -sS http://169.254.169.254/latest/meta-data/"
+            "${curl} --max-time 5 -sS 'http://[fd00:ec2::254]/latest/meta-data/'"
         )
         assert rc != 0, (
-            "fetcher reached IMDS (rc=0) — fetcher-egress except-clause "
-            "for 169.254.0.0/16 NOT enforcing."
+            "fetcher reached IMDS (rc=0) — fetcher-egress world rule "
+            "should NOT match the host entity (fd00:ec2::254)."
         )
         print(f"fetcher-imds PASS: blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
-    # builder-airgap — builder BLOCKED from TEST-NET-3 origin
+    # builder-airgap — builder BLOCKED from upstream-v4 via NAT64
     # ══════════════════════════════════════════════════════════════════
     # Builder pod appears once the FOD completes; sleepSecs=30 in the
     # consumer drv keeps it alive for these probes. Positive control
@@ -295,13 +310,13 @@ pkgs.testers.runNixOSTest {
         )
 
         rc, out = builder_exec(
-            "${curl} --max-time 5 -sS http://${originIP}/"
+            f"${curl} --max-time 5 -sS 'http://[{origin_v6}]/'"
         )
         assert rc != 0, (
-            f"builder reached ${originIP}:80 (rc=0) — builder-egress NOT "
-            f"enforcing. ADR-019 airgap: no 0.0.0.0/0 allow-rule.\n{out}"
+            f"builder reached [{origin_v6}]:80 (rc=0) — builder-egress NOT "
+            f"enforcing. ADR-019 airgap: no world allow-rule.\n{out}"
         )
-        print(f"builder-airgap PASS: ${originIP}:80 blocked (rc={rc})")
+        print(f"builder-airgap PASS: [{origin_v6}]:80 blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
     # fetcher-node-dedicated — toleration + nodeSelector wired
@@ -349,21 +364,21 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # fod-dead-origin — hashed-mirrors fallback for flat-hash FODs
     # ══════════════════════════════════════════════════════════════════
-    # Origin URL is a 404 path on the TEST-NET-3 server; the ONLY way
-    # this build succeeds is via {mirror}/sha256/{hex}. CppNix
-    # builtin:fetchurl tries hashed-mirrors first for FileIngestion
-    # Method::Flat, then falls back to mainUrl. nixConf.hashedMirrors
-    # = http://203.0.113.1/ via extraValues (default.nix) → rio-nix-
-    # conf ConfigMap → fetcher pod's nix.conf. A regression (typo'd
-    # setting, ConfigMap not mounted, wrong URL format) → mirror not
-    # tried → origin 404 → build fails here.
+    # Origin URL is a 404 path on upstream-v4; the ONLY way this build
+    # succeeds is via {mirror}/sha256/{hex}. CppNix builtin:fetchurl
+    # tries hashed-mirrors first for FileIngestionMethod::Flat, then
+    # falls back to mainUrl. nixConf.hashedMirrors = http://upstream-v4/
+    # via extraValues (default.nix) → rio-nix-conf ConfigMap → fetcher
+    # pod's nix.conf. A regression (typo'd setting, ConfigMap not
+    # mounted, wrong URL format) → mirror not tried → origin 404 →
+    # build fails here.
     with subtest("fod-dead-origin: flat FOD succeeds via hashed-mirrors"):
         rc, out = client.execute(
             "timeout 180 nix-build --no-out-link --store ssh-ng://k3s-server "
             "${drvs.fodDeadOrigin} 2>&1"
         )
         if rc != 0:
-            print(k3s_server.execute(
+            print(upstream_v4.execute(
                 "journalctl -u test-origin --no-pager -n 40 2>&1"
             )[1])
             raise AssertionError(

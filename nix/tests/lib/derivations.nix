@@ -52,9 +52,10 @@ rec {
   coldBootstrap = "${dir}/cold-bootstrap.nix";
 
   # builtin:fetchurl FOD + raw consumer for the fetcher-split scenario.
-  # Same shape as coldBootstrap; url defaults to the scenario's
-  # TEST-NET-3 origin (203.0.113.1:80 — passes fetcher-egress, fails
-  # builder-egress). One nix-build exercises both dispatch roles.
+  # Same shape as coldBootstrap; url defaults to the fixture's
+  # upstream-v4 node (reached via DNS64+NAT64 — passes fetcher-egress
+  # world:80, fails builder-egress). One nix-build exercises both
+  # dispatch roles.
   fodConsumer = "${dir}/fod-consumer.nix";
 
   # Flat-hash FOD with a dead origin URL. Succeeds only via the

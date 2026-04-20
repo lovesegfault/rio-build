@@ -2,8 +2,10 @@
 #
 # Same shape as cold-bootstrap.nix (builtin:fetchurl FOD → raw-derivation
 # consumer), but parameterized for the fetcher-split VM test: url defaults
-# to the TEST-NET-3 "public" origin the scenario sets up (203.0.113.1:80,
-# outside RFC1918 → passes fetcher-egress NetPol, fails builder-egress).
+# to the fixture's `upstream-v4` node — reached from a v6-only fetcher pod
+# via CoreDNS dns64 + Jool NAT64. The 64:ff9b::/96 synthesised address is
+# outside any Cilium cluster identity → passes fetcher-egress's world:80
+# allow, fails builder-egress (no world rule).
 #
 # One nix-build pulls BOTH through the scheduler — the FOD routes to a
 # kind=Fetcher pod (hard_filter at assignment.rs gates on is_fixed_output
@@ -14,12 +16,12 @@
 {
   tag ? "split",
   sleepSecs ? 2,
-  # Scenario sets up `python3 -m http.server 80` on 203.0.113.1 serving
-  # the pre-fetched busybox at /busybox. TEST-NET-3 (RFC5737) is NOT in
-  # the fetcher-egress NetPol's `except` list (RFC1918 + link-local +
-  # loopback only) — so the 0.0.0.0/0:80 allow fires. Builder-egress has
-  # NO such allow → a misrouted FOD on a builder pod fails the fetch.
-  url ? "http://203.0.113.1/busybox",
+  # Scenario serves the pre-fetched busybox at upstream-v4:/busybox.
+  # Fetcher pod resolves `upstream-v4` via CoreDNS dns64 → 64:ff9b::<v4>
+  # → routes via host's 64:ff9b::/96 → edge Jool. fetcher-egress
+  # toEntities:[world]:80 fires; builder-egress has NO world rule → a
+  # misrouted FOD on a builder pod fails the fetch.
+  url ? "http://upstream-v4/busybox",
 }:
 let
   busybox = builtins.derivation {

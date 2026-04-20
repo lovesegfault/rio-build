@@ -327,7 +327,7 @@ Lease permissions (`coordination.k8s.io/leases`: get, create, update) are grante
 
 NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/templates/networkpolicy.yaml`, gated on `networkPolicy.enabled`), not controller-managed. The controller has no `networking.k8s.io` RBAC permissions. Intended policies:
 
-- **Executors**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
+- **Executors**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`fd00:ec2::254` / `169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
 - **Scheduler**: egress to PostgreSQL. DNS egress to kube-system.
 - **Store**: egress to PostgreSQL and S3. DNS egress to kube-system.

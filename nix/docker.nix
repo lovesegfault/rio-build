@@ -343,7 +343,11 @@ let
       server {
         # 8080 not 80: runAsNonRoot means no CAP_NET_BIND_SERVICE →
         # can't bind <1024. The k8s Service maps :80 → targetPort:8080.
-        listen 8080;
+        # [::] not bare 8080: bare `listen PORT` binds 0.0.0.0 only;
+        # in a v6-only pod the kubelet httpGet probe targets the pod's
+        # v6 IP and never connects. With Linux bindv6only=0 (default)
+        # [::] dual-binds, so v4 lo still works for port-forward.
+        listen [::]:8080;
 
         # SPA: all unknown routes serve index.html, the client-side
         # router (svelte-routing / whatever P0274 picked) handles the

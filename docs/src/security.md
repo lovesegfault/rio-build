@@ -135,7 +135,7 @@ Executor pods MAY be configured with a Localhost seccomp profile (`PoolSpec.secc
 | **Signing key protection** | K8s Secret (minimum); recommend KMS/Vault for production | Designed |
 | **S3 credential management** | IRSA (IAM Roles for Service Accounts) on EKS | Recommended |
 | **Executor isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
-| **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
+| **Metadata service blocking** | NetworkPolicy egress deny `fd00:ec2::254` / `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
 | **Inter-component encryption** | Cilium WireGuard transparent encryption (overlay-level) | Implemented — `encryption.type: wireguard` in Cilium helm values |
 | **Inter-component reachability** | CiliumNetworkPolicy (label-based identity) | Implemented — `infra/helm/rio-build/templates/networkpolicy.yaml` |
 | **Multi-tenant data isolation** | Per-tenant narinfo visibility filtering + per-tenant signing keys; shared executors with per-build overlay isolation | Implemented |
@@ -215,7 +215,7 @@ A gateway-generated SSH host private key MUST be written with mode `0600` (owner
 - **Threat**: FOD builds require internet egress. A compromised build could exfiltrate secrets or call home; a compromised upstream could serve tampered content.
 - **Design**: Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Network isolation, builds and fetches run on separate executor kinds with opposite network policies:
   - **Builders** (`rio-builders` namespace) are airgapped — egress to CoreDNS, rio-scheduler, rio-store only. No internet, no proxy. See `r[builder.netpol.airgap]`.
-  - **Fetchers** (`rio-fetchers` namespace) get egress to `0.0.0.0/0` on ports 80/443, **minus** RFC1918, link-local, and loopback. See `r[fetcher.netpol.egress-open]`.
+  - **Fetchers** (`rio-fetchers` namespace) get egress via Cilium `toEntities: [world]` on ports 80/443 — address-family-agnostic, and inherently excludes cluster, node, and host identities. See `r[fetcher.netpol.egress-open]`.
   - The FOD hash check (`r[builder.fod.verify-hash]`) is the integrity backstop: tampered content fails `verify_fod_hashes()` before upload.
   - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure (`r[sched.dispatch.fod-to-fetcher]`).
 - **Formerly:** the Squid `fod-proxy` with domain allowlisting. Deleted in ADR-019 — the hash check is sufficient; a domain allowlist adds operational friction for marginal gain.

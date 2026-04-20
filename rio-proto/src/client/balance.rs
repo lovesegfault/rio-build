@@ -118,10 +118,9 @@ async fn tick(
     tx: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
 ) -> HashSet<SocketAddr> {
     // DNS resolve. For a headless Service, CoreDNS returns ALL pod
-    // IPs as A and/or AAAA records (TTL 5s by default; AAAA on
-    // dual-stack — ipFamilyPolicy on the headless Service, P0542).
-    // `lookup_host` resolves via the system resolver and returns
-    // both families --- no extra deps. The port argument is required
+    // IPs as AAAA records (TTL 5s by default; rio Services are
+    // SingleStack IPv6). `lookup_host` resolves via the system
+    // resolver --- no extra deps. The port argument is required
     // by `ToSocketAddrs`; the returned SocketAddrs carry it.
     // build_endpoint() brackets v6 addrs for the URI authority.
     let resolved: HashSet<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
@@ -365,6 +364,12 @@ mod tests {
         let v6: SocketAddr = "[::1]:9001".parse().unwrap();
         let ep = build_endpoint(v6).unwrap();
         assert_eq!(ep.uri().to_string(), "http://[::1]:9001/");
+
+        // Non-loopback v6 — the bracket-wrapping path BalancedChannel uses
+        // for v6 pod IPs in a v6-only cluster.
+        let v6_pod: SocketAddr = "[2001:db8::1]:9001".parse().unwrap();
+        let ep = build_endpoint(v6_pod).unwrap();
+        assert_eq!(ep.uri().to_string(), "http://[2001:db8::1]:9001/");
     }
 
     /// Smoke: probe against a dead address returns false fast

@@ -246,7 +246,7 @@ spec:
         - ports:
             - {port: "9092", protocol: TCP}
 ---
-# r[impl store.netpol.egress]
+# r[impl store.netpol.egress+2]
 #
 # Store egress: DNS + postgres + S3 VPC endpoint. The store holds S3
 # creds + postgres creds — a compromised store should NOT reach IMDS

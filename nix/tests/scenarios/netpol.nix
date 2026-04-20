@@ -16,14 +16,15 @@
 # the builder pod gives the right PID.
 #
 # "Proves nothing" guard (review pattern — test asserts its own
-# precondition): rc≠0 to 169.254.169.254 / 1.1.1.1 is vacuous in an
-# airgapped VM (unreachable regardless of NetPol). Positive control
+# precondition): rc≠0 to fd00:ec2::254 / 2606:4700:4700::1111 is vacuous
+# in an airgapped VM (unreachable regardless of NetPol). Positive control
 # first: nc -z to rio-scheduler's ClusterIP:9001 MUST succeed (NetPol
 # explicitly allows it). If THAT is blocked, the policy is over-broad
 # or Cilium hasn't synced the endpoint policy → rc≠0 asserts below are
 # worthless.
-# Then probe the k8s API ClusterIP (10.43.0.1:443 — P0220's proven
-# in-cluster differentiator): reachable without NetPol, blocked with.
+# Then probe the k8s API ClusterIP (the `kubernetes` Service VIP —
+# P0220's proven in-cluster differentiator): reachable without NetPol,
+# blocked with.
 #
 # Ingress policy: SKIPPED (Phase 5). FOD proxy egress allowlist: P0243.
 {
@@ -179,14 +180,14 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # netpol-kubeapi — k8s API ClusterIP BLOCKED (P0220 differentiator)
     # ══════════════════════════════════════════════════════════════════
-    # P0220 empirically validated this exact probe: 10.43.0.1:443 (the
-    # `kubernetes` Service in default ns, k3s's fixed apiserver VIP) is
+    # P0220 empirically validated this exact probe: the `kubernetes`
+    # Service ClusterIP (default ns, k3s's fixed apiserver VIP) is
     # REACHABLE from pods without NetPol, BLOCKED with deny-all-egress.
     # rio-builder-egress doesn't list the apiserver in its allow-rules
     # (deliberate — a sandbox escapee shouldn't get a k8s API token
     # AND be able to use it). Cilium drops → nc hangs until -w5.
     #
-    # Stronger than the IMDS/1.1.1.1 probes below: those fail in an
+    # Stronger than the IMDS/public probes below: those fail in an
     # airgapped VM regardless. THIS one would succeed if NetPol were
     # off (P0220 proved it).
     with subtest("netpol-kubeapi: k8s API ClusterIP blocked"):
@@ -209,8 +210,9 @@ pkgs.testers.runNixOSTest {
     # netpol-imds — IMDS egress blocked (exit criterion)
     # ══════════════════════════════════════════════════════════════════
     # IMDS is the prime threat — a sandbox escapee shouldn't get AWS
-    # creds. 169.254.169.254 is link-local; not in any rio-builder-egress
-    # allow-rule → default-deny. Cilium drops → curl times out.
+    # creds. fd00:ec2::254 (the v6 IMDS endpoint) is the Cilium `host`
+    # entity, not in any rio-builder-egress allow-rule → default-deny.
+    # Cilium drops → curl times out.
     #
     # WEAK in VM context: no IMDS listener exists in a NixOS QEMU VM
     # anyway (not an EC2 instance). rc≠0 would happen regardless. The
@@ -218,11 +220,11 @@ pkgs.testers.runNixOSTest {
     # the plan's exit criterion and matches production's threat model.
     with subtest("netpol-imds: IMDS egress blocked"):
         rc, out = netns_exec(
-            "${curl} --max-time 5 -sS http://169.254.169.254/latest/meta-data/"
+            "${curl} --max-time 5 -sS 'http://[fd00:ec2::254]/latest/meta-data/'"
         )
         assert rc != 0, (
             "IMDS curl succeeded (rc=0) — NetPol NOT enforcing. "
-            "169.254.169.254 is link-local, not in any allow-rule; "
+            "fd00:ec2::254 is the host entity, not in any allow-rule; "
             f"Cilium should DROP.\n{out}"
         )
         print(f"netpol-imds PASS: IMDS blocked (curl rc={rc})")
@@ -230,17 +232,18 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # netpol-internet — public egress blocked (exit criterion)
     # ══════════════════════════════════════════════════════════════════
-    # Same WEAK-in-VM caveat: airgapped VM has no route to 1.1.1.1.
+    # Same WEAK-in-VM caveat: airgapped VM has no route to public v6.
     # Plan exit criterion; netpol-kubeapi above carries the proof.
     with subtest("netpol-internet: public egress blocked"):
         rc, out = netns_exec(
-            "${curl} --max-time 5 -sS http://1.1.1.1/"
+            "${curl} --max-time 5 -sS 'http://[2606:4700:4700::1111]/'"
         )
         assert rc != 0, (
-            "public egress to 1.1.1.1 succeeded (rc=0) — NetPol NOT "
-            "enforcing. 0.0.0.0/0 not in rio-builder-egress allow-rules."
+            "public egress to 2606:4700:4700::1111 succeeded (rc=0) — "
+            "NetPol NOT enforcing. world not in rio-builder-egress "
+            "allow-rules."
         )
-        print(f"netpol-internet PASS: 1.1.1.1 blocked (curl rc={rc})")
+        print(f"netpol-internet PASS: 2606:4700:4700::1111 blocked (curl rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
     # netpol-dns-tcp — DNS over TCP/53 allowed (T3 fix)
@@ -260,7 +263,7 @@ pkgs.testers.runNixOSTest {
         # per-try timeout. Resolving rio-scheduler's cluster-local name
         # — no external network needed, pure in-cluster CoreDNS probe.
         rc, out = netns_exec(
-            f"${dig} +tcp +short +time=5 "
+            f"${dig} +tcp +short +time=5 AAAA "
             f"rio-scheduler.rio-system.svc.cluster.local @{coredns_ip}"
         )
         assert rc == 0 and out.strip(), (
@@ -275,8 +278,8 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # netpol-store-egress — store pod IMDS blocked, postgres allowed
     # ══════════════════════════════════════════════════════════════════
-    # store-egress NetworkPolicy (T2): DNS + postgres:5432/RFC1918 +
-    # optional S3:443. NOT IMDS, NOT k8s API, NOT public IPs. The store
+    # store-egress NetworkPolicy (T2): DNS + postgres:5432 + optional
+    # S3:443. NOT IMDS, NOT k8s API, NOT public IPs. The store
     # holds S3 + postgres creds — a compromised store MUST NOT reach
     # IMDS for role escalation.
     #
@@ -315,13 +318,13 @@ pkgs.testers.runNixOSTest {
                 f"nsenter -t {store_pid} -n -- {cmd}"
             )
 
-        # Positive control: store-egress ALLOWS postgres:5432 on
-        # RFC1918. The bitnami rio-postgresql Service lives in
-        # rio-system (NOT rio-store — it's a control-plane dependency)
-        # with a 10.43.x.x ClusterIP (k3s Service CIDR, RFC1918). The
-        # policy matches by ipBlock CIDR, not namespace, so cross-ns
-        # is fine. If this nc -z fails, the policy is over-broad or
-        # Cilium hasn't synced → the IMDS rc≠0 assert below is
+        # Positive control: store-egress ALLOWS postgres:5432. The
+        # bitnami rio-postgresql Service lives in rio-system (NOT
+        # rio-store — it's a control-plane dependency). In-cluster PG
+        # is matched by `toEndpoints` (label-based identity), NOT the
+        # templated postgresCidr toCIDRSet (that path is for out-of-
+        # cluster RDS). If this nc -z fails, the policy is over-broad
+        # or Cilium hasn't synced → the IMDS rc≠0 assert below is
         # VACUOUS.
         pg_ip = kubectl(
             "get svc rio-postgresql -o jsonpath='{.spec.clusterIP}'"
@@ -330,8 +333,8 @@ pkgs.testers.runNixOSTest {
         rc, out = store_netns(f"${nc} -z -w5 {pg_ip} 5432")
         assert rc == 0, (
             f"nc -z to postgres {pg_ip}:5432 FAILED (rc={rc}). "
-            "store-egress ALLOWS RFC1918:5432 — if blocked, policy "
-            f"over-broad or Cilium not synced.\n{out}"
+            "store-egress ALLOWS postgres via toEndpoints — if "
+            f"blocked, policy over-broad or Cilium not synced.\n{out}"
         )
         print(f"netpol-store positive PASS: postgres {pg_ip}:5432 "
               "reachable from store netns")
@@ -342,12 +345,12 @@ pkgs.testers.runNixOSTest {
         # loaded and selective.
         rc, out = store_netns(
             "${curl} --max-time 5 -sS "
-            "http://169.254.169.254/latest/meta-data/"
+            "'http://[fd00:ec2::254]/latest/meta-data/'"
         )
         assert rc != 0, (
             "IMDS curl from store netns succeeded (rc=0) — store-egress "
-            "NOT enforcing. 169.254.0.0/16 is not in any allow-rule; "
-            f"Cilium should DROP.\n{out}"
+            "NOT enforcing. fd00:ec2::254 is the host entity, not in "
+            f"any allow-rule; Cilium should DROP.\n{out}"
         )
         print(f"netpol-store IMDS PASS: blocked (curl rc={rc})")
 

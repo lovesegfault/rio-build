@@ -12,7 +12,7 @@
 #
 # Evaluated IN THE VM via nix-build. Do not reference host-eval paths.
 {
-  url ? "http://203.0.113.1/nonexistent",
+  url ? "http://upstream-v4/nonexistent",
 }:
 builtins.derivation {
   name = "rio-fod-fail";

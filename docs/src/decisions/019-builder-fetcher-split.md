@@ -73,9 +73,8 @@ r[builder.netpol.airgap]
 r[fetcher.netpol.egress-open+2]
 `fetcher-egress` CiliumClusterwideNetworkPolicy (in `rio-fetchers`) allows the same three in-cluster targets as builders, plus `toEntities: [world]` on ports 80/443. The `world` entity matches any address Cilium does not recognise as a cluster identity — it is address-family-agnostic and inherently excludes pod, node, service, and host-local ranges (so the IMDS endpoint at `fd00:ec2::254` / `169.254.169.254` is denied without an explicit carve-out). With DNS64 enabled at the resolver, IPv4-only upstreams are reached via the `64:ff9b::/96` synthesised prefix, which `world` matches.
 
-r[store.netpol.egress]
-
-`store-egress` NetworkPolicy (in `rio-store`) allows: CoreDNS:53 (UDP+TCP), postgres:5432 on RFC1918, optionally S3 VPC endpoint:443. Nothing else. The store pod holds S3 and postgres credentials; a compromised store MUST NOT reach IMDS (`169.254.169.254`) for role escalation or arbitrary public IPs for exfiltration. Default-deny egress is the same defense-in-depth posture as `builder-egress`.
+r[store.netpol.egress+2]
+`store-egress` CiliumNetworkPolicy (in `rio-store`) allows: CoreDNS:53 (UDP+TCP), postgres:5432 (in-cluster via `toEndpoints` label match; out-of-cluster via `toCIDRSet` on the deployment's `postgresCidr` — the VPC IPv6 block in EKS), optionally S3 VPC endpoint:443. Nothing else. The store pod holds S3 and postgres credentials; a compromised store MUST NOT reach IMDS (`fd00:ec2::254` / `169.254.169.254`) for role escalation or arbitrary public IPs for exfiltration. Default-deny egress is the same defense-in-depth posture as `builder-egress`.
 
 The Squid `fod-proxy` is deleted. The FOD hash check is the integrity boundary; a domain allowlist adds operational friction for marginal gain.
 

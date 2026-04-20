@@ -492,8 +492,8 @@ in
           ];
           script = ''
             set -uo pipefail
-            imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
-            TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+            imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://[fd00:ec2::254]/latest/meta-data/$1"; }
+            TOKEN=$(curl -sf -X PUT 'http://[fd00:ec2::254]/latest/api/token' \
               -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
             MAC=$(imds mac)
             ENI=$(imds "network/interfaces/macs/$MAC/interface-id")

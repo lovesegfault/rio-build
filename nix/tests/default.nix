@@ -768,7 +768,7 @@ in
   # Cilium enforces (eBPF) — k3s's bundled kube-router netpol controller
   # is disabled (--disable-network-policy in k3s-full.nix).
   #
-  # r[verify store.netpol.egress]
+  # r[verify store.netpol.egress+2]
   #   store-egress IMDS-deny + postgres-allow probe via nsenter into
   #   rio-store pod netns (netpol-store-egress subtest).
   # r[verify builder.netpol.airgap]
@@ -828,9 +828,9 @@ in
   #   fetcher pod, consumer routes to builder pod. Wrong routing →
   #   queue-forever → timeout. kubectl-logs grep confirms placement.
   # r[verify builder.netpol.airgap]
-  #   builder-airgap subtest: builder netns curl to TEST-NET-3 origin
-  #   (203.0.113.1:80) → rc≠0. Positive control: scheduler ClusterIP
-  #   connects (NetPol allow fires).
+  #   builder-airgap subtest: builder netns curl to upstream-v4 via
+  #   NAT64 (64:ff9b::<v4>:80) → rc≠0. Positive control: scheduler
+  #   ClusterIP connects (NetPol allow fires).
   # r[verify fetcher.netpol.egress-open+2]
   #   fetcher-egress + fetcher-imds-blocked subtests: SAME origin,
   #   fetcher netns → rc==0 (toEntities:[world]:80 allow fires). Then
@@ -845,8 +845,8 @@ in
   # r[verify fetcher.nixconf.hashed-mirrors]
   #   fod-dead-origin subtest: flat-hash FOD with a 404 origin URL
   #   builds via {mirror}/sha256/{hex}. nixConf.hashedMirrors below
-  #   points the rio-nix-conf ConfigMap at the in-VM TEST-NET-3
-  #   server (only "public" IP the fetcher netpol passes).
+  #   points the rio-nix-conf ConfigMap at the in-VM upstream-v4 node
+  #   (reached via DNS64+NAT64 from the v6-only fetcher pod).
   # r[verify builder.fod.verify-hash]
   #   fod-dir subtest: recursive-hash FOD with directory output
   #   (`mkdir $out`). Regression: a whiteout at the output path
@@ -860,7 +860,7 @@ in
     fixture = k3sFull {
       extraValues = {
         "networkPolicy.enabled" = "true";
-        "nixConf.hashedMirrors" = "http://203.0.113.1/";
+        "nixConf.hashedMirrors" = "http://upstream-v4/";
       };
       # pools via values file (not --set-string) so types stay correct.
       extraValuesFiles = [

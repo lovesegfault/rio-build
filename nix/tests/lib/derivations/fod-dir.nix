@@ -13,7 +13,7 @@
 #
 # Evaluated IN THE VM via nix-build. Do not reference host-eval paths.
 {
-  url ? "http://203.0.113.1/busybox",
+  url ? "http://upstream-v4/busybox",
 }:
 let
   busybox = builtins.derivation {

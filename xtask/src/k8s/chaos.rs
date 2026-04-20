@@ -301,22 +301,24 @@ async fn node_of(client: &k::Client, ns: &str, pod_name: &str) -> Result<String>
 ///      step a no-op if a prior step already cleaned (e.g., concurrent
 ///      remediation pod from [`remediate`]).
 fn chaos_script(target_ip: &str, dur_secs: u64) -> String {
-    // Single-quote-safe: target_ip is a podIP (digits + dots), CHAIN
-    // is a const literal, dur_secs is a u64. No injection surface.
+    // Single-quote-safe: target_ip is a podIP (hex + colons in a
+    // v6-only cluster), CHAIN is a const literal, dur_secs is a u64.
+    // No injection surface. ip6tables — pod IPs are v6; the alpine
+    // `iptables` package provides both binaries.
     format!(
         r#"set -eu
 apk add --no-cache iptables 2>&1 | tail -1
 cleanup() {{
-  iptables -F {CHAIN} 2>/dev/null
-  iptables -D FORWARD -j {CHAIN} 2>/dev/null
-  iptables -X {CHAIN} 2>/dev/null
+  ip6tables -F {CHAIN} 2>/dev/null
+  ip6tables -D FORWARD -j {CHAIN} 2>/dev/null
+  ip6tables -X {CHAIN} 2>/dev/null
   echo CLEANED
 }}
 trap cleanup TERM EXIT
-iptables -N {CHAIN} 2>/dev/null || iptables -F {CHAIN}
-iptables -C FORWARD -j {CHAIN} 2>/dev/null || iptables -I FORWARD -j {CHAIN}
-iptables -A {CHAIN} -s {target_ip} -j DROP
-iptables -A {CHAIN} -d {target_ip} -j DROP
+ip6tables -N {CHAIN} 2>/dev/null || ip6tables -F {CHAIN}
+ip6tables -C FORWARD -j {CHAIN} 2>/dev/null || ip6tables -I FORWARD -j {CHAIN}
+ip6tables -A {CHAIN} -s {target_ip} -j DROP
+ip6tables -A {CHAIN} -d {target_ip} -j DROP
 echo "blackhole active: {target_ip} via chain {CHAIN}"
 sleep {dur_secs} &
 wait $!
@@ -340,9 +342,9 @@ fn session_nonce() -> i64 {
 fn remediation_script() -> String {
     format!(
         r#"apk add --no-cache iptables 2>&1 | tail -1
-iptables -F {CHAIN} 2>/dev/null
-iptables -D FORWARD -j {CHAIN} 2>/dev/null
-iptables -X {CHAIN} 2>/dev/null
+ip6tables -F {CHAIN} 2>/dev/null
+ip6tables -D FORWARD -j {CHAIN} 2>/dev/null
+ip6tables -X {CHAIN} 2>/dev/null
 echo REMEDIATED
 "#
     )
@@ -723,13 +725,13 @@ mod tests {
                 ChaosEntry {
                     node: "ip-10-42-1-219.us-east-2.compute.internal".into(),
                     pod_name: "rio-chaos-1700000000-0".into(),
-                    target_ip: "10.42.1.99".into(),
+                    target_ip: "fd42::1:99".into(),
                     chain: "RIO-CHAOS".into(),
                 },
                 ChaosEntry {
                     node: "ip-10-42-2-88.us-east-2.compute.internal".into(),
                     pod_name: "rio-chaos-1700000000-1".into(),
-                    target_ip: "10.42.1.99".into(),
+                    target_ip: "fd42::1:99".into(),
                     chain: "RIO-CHAOS".into(),
                 },
             ],
@@ -752,17 +754,19 @@ mod tests {
 
     #[test]
     fn chaos_script_shape() {
-        let s = chaos_script("10.42.1.99", 60);
+        let s = chaos_script("fd42::1:99", 60);
         // Chain create/flush idempotency.
-        assert!(s.contains("iptables -N RIO-CHAOS 2>/dev/null || iptables -F RIO-CHAOS"));
+        assert!(s.contains("ip6tables -N RIO-CHAOS 2>/dev/null || ip6tables -F RIO-CHAOS"));
         // Link-if-not-linked.
-        assert!(s.contains("iptables -C FORWARD -j RIO-CHAOS 2>/dev/null || iptables -I FORWARD"));
+        assert!(
+            s.contains("ip6tables -C FORWARD -j RIO-CHAOS 2>/dev/null || ip6tables -I FORWARD")
+        );
         // Both directions dropped.
-        assert!(s.contains("-s 10.42.1.99 -j DROP"));
-        assert!(s.contains("-d 10.42.1.99 -j DROP"));
+        assert!(s.contains("-s fd42::1:99 -j DROP"));
+        assert!(s.contains("-d fd42::1:99 -j DROP"));
         // Trap cleanup.
         assert!(s.contains("trap cleanup TERM EXIT"));
-        assert!(s.contains("iptables -X RIO-CHAOS"));
+        assert!(s.contains("ip6tables -X RIO-CHAOS"));
         // Duration interpolated; sleep MUST be backgrounded + wait so
         // the TERM trap fires immediately (POSIX sh defers traps until
         // the foreground utility exits — a foreground `sleep 60` with
@@ -779,11 +783,11 @@ mod tests {
     #[test]
     fn remediation_script_idempotent() {
         let s = remediation_script();
-        // Every iptables call must be 2>/dev/null'd — missing chain
+        // Every ip6tables call must be 2>/dev/null'd — missing chain
         // is the expected case (chaos pod's trap already cleaned).
-        assert!(s.contains("iptables -F RIO-CHAOS 2>/dev/null"));
-        assert!(s.contains("iptables -D FORWARD -j RIO-CHAOS 2>/dev/null"));
-        assert!(s.contains("iptables -X RIO-CHAOS 2>/dev/null"));
+        assert!(s.contains("ip6tables -F RIO-CHAOS 2>/dev/null"));
+        assert!(s.contains("ip6tables -D FORWARD -j RIO-CHAOS 2>/dev/null"));
+        assert!(s.contains("ip6tables -X RIO-CHAOS 2>/dev/null"));
         // No trap, no sleep — one-shot.
         assert!(!s.contains("trap"));
         assert!(!s.contains("sleep"));

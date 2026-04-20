@@ -17,7 +17,7 @@ See [ADR-019](../decisions/019-builder-fetcher-split.md) for the full rationale 
 | Aspect | Builder | Fetcher |
 |---|---|---|
 | Workload | Regular derivations | Fixed-output derivations only |
-| Network | Airgapped (`r[builder.netpol.airgap]`) | Egress open minus RFC1918 (`r[fetcher.netpol.egress-open]`) |
+| Network | Airgapped (`r[builder.netpol.airgap]`) | Egress open via Cilium `world` entity (`r[fetcher.netpol.egress-open]`) |
 | Seccomp | Standard builder profile | Stricter (`r[fetcher.sandbox.strict-seccomp]`) |
 | Node pool | `rio.build/builder` taint | Dedicated `rio.build/fetcher` taint (`r[fetcher.node.dedicated]`) |
 | Rootfs | Writable | `readOnlyRootFilesystem: true` |
@@ -42,7 +42,7 @@ The fetcher's `nix.conf` MUST set `hashed-mirrors` (default `http://tarballs.nix
 
 The ADR-019–defined markers for this component live in [ADR-019](../decisions/019-builder-fetcher-split.md):
 
-- `r[fetcher.netpol.egress-open]` — NetworkPolicy: 0.0.0.0/0 on 80/443 minus RFC1918/link-local/loopback
+- `r[fetcher.netpol.egress-open]` — NetworkPolicy: `toEntities: [world]` on 80/443
 - `r[fetcher.sandbox.strict-seccomp]` — stricter seccomp (deny ptrace/bpf/setns/keyctl), readOnlyRootFilesystem
 - `r[fetcher.node.dedicated]` — dedicated Karpenter NodePool with `rio.build/fetcher` taint
 - `r[ctrl.pool.reconcile]` --- Pool CRD reconciler (kind=Fetcher arm)

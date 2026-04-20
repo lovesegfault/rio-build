@@ -416,7 +416,7 @@ Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the N
 **Recommended cluster configuration:**
 - Dedicated node pool with taint `rio.build/builder=true:NoSchedule` to isolate builder pods from other workloads.
 - `automountServiceAccountToken: false` --- builders communicate with the scheduler via gRPC, not the Kubernetes API.
-- NetworkPolicy restricting egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). See `r[builder.netpol.airgap]` in [ADR-019](../decisions/019-builder-fetcher-split.md).
+- NetworkPolicy restricting egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`fd00:ec2::254` / `169.254.169.254`). See `r[builder.netpol.airgap]` in [ADR-019](../decisions/019-builder-fetcher-split.md).
 - IMDSv2 with hop limit = 1 on builder nodes (defense-in-depth against metadata access from privileged pods).
 
 ## Device Access

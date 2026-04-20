@@ -574,7 +574,7 @@ mod tests {
     }
 
     fn default_listen() -> String {
-        "0.0.0.0:9000".into()
+        "[::]:9000".into()
     }
     fn default_port() -> u16 {
         8080
