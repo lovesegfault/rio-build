@@ -1099,7 +1099,7 @@ async fn enrich_build_result_with_outputs(
         drv,
         drv_path,
         &mut ctx.store_client,
-        ctx.jwt_token.as_deref(),
+        ctx.jwt.token(),
         &ctx.drv_cache,
         hash_cache,
     )

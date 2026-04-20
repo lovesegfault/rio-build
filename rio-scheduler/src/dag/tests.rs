@@ -1004,7 +1004,7 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
         2000,
         dag.remove_build_interest_and_reap(build_id)
     );
-    assert_eq!(reaped, N, "all sole-interest terminal nodes reaped");
+    assert_eq!(reaped.len(), N, "all sole-interest terminal nodes reaped");
     Ok(())
 }
 
@@ -1833,7 +1833,8 @@ fn test_reap_after_prior_remove_interest() -> anyhow::Result<()> {
 
     let reaped = dag.remove_build_interest_and_reap(b);
     assert_eq!(
-        reaped, 1,
+        reaped.len(),
+        1,
         "reap must be idempotent w.r.t. prior interest-strip"
     );
     assert!(!dag.nodes.contains_key("reap-h"));
@@ -1859,8 +1860,8 @@ fn test_reap_preserves_poisoned() -> anyhow::Result<()> {
     }
 
     let reaped = dag.remove_build_interest_and_reap(Uuid::new_v4());
-    assert_eq!(
-        reaped, 0,
+    assert!(
+        reaped.is_empty(),
         "Poisoned nodes are TTL-tracked, never reaped here"
     );
     assert!(dag.nodes.contains_key("poison-h"));
