@@ -525,6 +525,12 @@ pub async fn run(
 
     // Block. Either the timer fires (normal completion) or Ctrl-C
     // (early lift). Both paths fall through to cleanup below.
+    // `ctrl_c()` lazy-install (first poll, not call) is acceptable
+    // HERE: resources are k8s-side chaos pods (no local ProcessGuard);
+    // a SIGINT during the spawn/poll loop above leaks iptables chains
+    // on remote nodes, which the next-invocation `remediate` sweep
+    // already handles (see below). Contrast stress.rs/status.rs where
+    // the leaked resource is a local process holding a port.
     let lift_reason = tokio::select! {
         _ = tokio::time::sleep(duration) => "duration elapsed",
         _ = tokio::signal::ctrl_c() => "Ctrl-C",

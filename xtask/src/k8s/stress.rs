@@ -156,14 +156,19 @@ async fn cmd_run(
         );
     }
 
-    // Ctrl-C handler registered BEFORE spawning anything: default
-    // SIGINT disposition terminates the process abnormally (no Drop),
-    // so without this the ProcessGuard killpg never runs and tunnels
-    // (own process group via `process_group(0)`) leak. Covers both the
-    // spawn loop and the wait loop; the inner select! arms re-poll the
-    // same pinned future.
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // SIGINT handler registered BEFORE spawning anything: default
+    // disposition terminates abnormally (no Drop), so ProcessGuard's
+    // killpg never runs and tunnels (own process group via
+    // `process_group(0)`) leak — the I-158 orphan.
+    //
+    // `signal()`, NOT `ctrl_c()`: `ctrl_c()` is `async fn`, so the
+    // sigaction installs at first POLL (the select! below), not at
+    // call. tokio::pin! does not poll. The spawn loop awaits
+    // `p.tunnel(port)` (up to 150s NLB poll + banner wait) per port —
+    // Ctrl-C during that window would still hit the default
+    // disposition. `signal()` is a plain fn that registers the
+    // sigaction synchronously at call time.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     // Tunnels (ProcessGuard: killpg on drop) + builds (kill_on_drop).
     // Held in Vecs for the lifetime of the await below — Ctrl-C or `?`
@@ -221,7 +226,7 @@ async fn cmd_run(
     let mut ok = 0usize;
     tokio::select! {
         biased;
-        _ = &mut ctrl_c => anyhow::bail!("interrupted"),
+        _ = sigint.recv() => anyhow::bail!("interrupted"),
         r = async {
             if watch {
                 let client = crate::k8s::client::client().await?;
