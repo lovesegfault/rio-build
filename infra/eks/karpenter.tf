@@ -60,6 +60,28 @@ resource "aws_iam_policy" "karpenter_node_primary_ipv6" {
   })
 }
 
+# Karpenter NodePools (rio-build chart, templates/karpenter.yaml) allow
+# capacity-type=[spot, on-demand]. The first spot request in an account
+# makes EC2 auto-create AWSServiceRoleForEC2Spot via the CALLER's
+# iam:CreateServiceLinkedRole — the controller role above doesn't have
+# that (and shouldn't; keep runtime IAM minimal). Symptom: karpenter
+# logs AuthFailure.ServiceLinkedRoleCreationNotPermitted and silently
+# falls through to on-demand. Pre-create under apply-time credentials.
+#
+# SLRs are account-global singletons; aws_iam_service_linked_role fails
+# create if one already exists (prior manual spot request, another
+# stack). aws_iam_roles (plural) returns an empty set rather than
+# erroring on miss, so count=0 when present.
+data "aws_iam_roles" "spot_slr" {
+  name_regex  = "^AWSServiceRoleForEC2Spot$"
+  path_prefix = "/aws-service-role/spot.amazonaws.com/"
+}
+
+resource "aws_iam_service_linked_role" "spot" {
+  count            = length(data.aws_iam_roles.spot_slr.names) == 0 ? 1 : 0
+  aws_service_name = "spot.amazonaws.com"
+}
+
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
 # directory on `helm upgrade` — only on first install. A version bump
 # on helm_release.karpenter below would leave stale CRDs. The
