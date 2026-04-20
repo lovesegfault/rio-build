@@ -4,10 +4,10 @@
 //!      nix-support/image-info.json
 //!   2. `coldsnap upload <image>`      → EBS snapshot (EBS Direct API,
 //!      no S3 / VM-Import round-trip)
-//!   3. `aws ec2 register-image`       → AMI ID
-//!   4. `aws ec2 create-tags`          → `rio.build/ami=<tag>`,
-//!      `rio.build/git-sha=<sha>`, `kubernetes.io/arch=<arch>`,
-//!      `karpenter.sh/discovery=<cluster>`
+//!   3. `aws ec2 register-image` with `TagSpecification` → AMI ID,
+//!      tagged `rio.build/ami=<tag>`, `rio.build/git-sha=<sha>`,
+//!      `kubernetes.io/arch=<arch>`, `karpenter.sh/discovery=<cluster>`
+//!      atomically (no separate create-tags window)
 //!
 //! Idempotent (I-182): the `rio.build/ami` tag value is the first 12
 //! hex of `sha256(drvPath_x86_64 ++ drvPath_aarch64)` — content-
@@ -24,7 +24,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use aws_sdk_ec2::types::{
-    ArchitectureValues, BlockDeviceMapping, EbsBlockDevice, Filter, Image, Tag, VolumeType,
+    ArchitectureValues, BlockDeviceMapping, EbsBlockDevice, Filter, Image, ResourceType, Tag,
+    TagSpecification, VolumeType,
 };
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -146,20 +147,12 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let conf = crate::aws::config(Some(&region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);
 
-    // I-182 fast path: every requested target already registered for
-    // this content tag → write the handoff file and stop. No build,
-    // no coldsnap, no re-tag.
-    let mut all_present = true;
-    for t in arch.targets() {
-        if find_existing(&ec2, &ami_tag, t).await?.is_none() {
-            all_present = false;
-            break;
-        }
-    }
-    if all_present {
-        info!("AMIs for rio.build/ami={ami_tag} already registered — skipping build");
-        return Ok(());
-    }
+    // No `all_present` fast-path: the per-target path below already
+    // skips build+upload via `find_existing`, AND it re-stamps
+    // `ami-latest=true` + runs `untag_prior_latest`. The fast-path
+    // returned without re-tagging, so a flake.lock rollback (v1→v2→v1)
+    // left v1 AMIs without `ami-latest` (stripped by v2's untag) and
+    // `resolve_latest_tag()` silently kept deploying v2.
 
     // join_all (not try_join_all): both arches run to completion even
     // if one fails — don't cancel a ~4 GB coldsnap upload mid-flight
@@ -263,12 +256,7 @@ async fn build_and_register_one(
     .await?;
 
     let ami = ui::step(&format!("register-image ({attr})"), || {
-        register(ec2, &info, &snap, t.ec2_arch.clone(), ami_tag, attr)
-    })
-    .await?;
-
-    ui::step(&format!("tag {ami}"), || {
-        tag(ec2, &ami, ami_tag, sha, t, cluster)
+        register(ec2, &info, &snap, ami_tag, sha, t, cluster)
     })
     .await?;
     untag_prior_latest(ec2, &ami, t).await?;
@@ -400,20 +388,49 @@ fn image_identity(info: &ImageInfo, ami_tag: &str, attr: &str) -> (String, Strin
     (name, desc)
 }
 
+/// Full tag set for an AMI. Shared by `register()` (atomic via
+/// `TagSpecification`) and `tag()` (re-stamp existing). The
+/// idempotency key (`rio.build/ami`, what `find_existing` filters on)
+/// and the deploy-resolve key (`rio.build/ami-latest`, what
+/// `resolve_latest_tag` filters on) are BOTH here so they land in the
+/// same API call as the unique Name — an interrupt between register
+/// and a separate create-tags left an AMI invisible to `find_existing`
+/// AND `gc` while blocking re-register via `InvalidAMIName.Duplicate`.
+///
+/// rio.build/ami=<tag> is what the EC2NodeClass amiSelectorTerms
+/// match — content-addressed (I-182), pin to a value for reproducible
+/// rollback. rio.build/git-sha is traceability only (changes every
+/// commit; the content tag does not). rio.build/boot disambiguates the
+/// two amd64 variants for the rio-default vs rio-metal NodeClass
+/// selectors (I-205). karpenter.sh/discovery scopes the AMI to this
+/// cluster's selector (same key as subnets/SGs).
+fn ami_tags(ami_tag: &str, git_sha: &str, t: &Target, cluster: &str) -> Vec<Tag> {
+    vec![
+        mk_tag("rio.build/ami", ami_tag),
+        mk_tag("rio.build/git-sha", git_sha),
+        mk_tag("rio.build/ami-latest", "true"),
+        mk_tag("kubernetes.io/arch", t.k8s_arch),
+        mk_tag("rio.build/boot", t.boot),
+        mk_tag("karpenter.sh/discovery", cluster),
+        mk_tag("Name", &format!("rio-nixos-node-{ami_tag}-{}", t.attr)),
+    ]
+}
+
 async fn register(
     ec2: &aws_sdk_ec2::Client,
     info: &ImageInfo,
     snapshot_id: &str,
-    arch: ArchitectureValues,
     ami_tag: &str,
-    attr: &str,
+    git_sha: &str,
+    t: &Target,
+    cluster: &str,
 ) -> Result<String> {
-    let (name, desc) = image_identity(info, ami_tag, attr);
+    let (name, desc) = image_identity(info, ami_tag, t.attr);
     let resp = ec2
         .register_image()
         .name(&name)
         .description(desc)
-        .architecture(arch)
+        .architecture(t.ec2_arch.clone())
         .virtualization_type("hvm")
         .root_device_name("/dev/xvda")
         .ena_support(true)
@@ -430,6 +447,12 @@ async fn register(
                 )
                 .build(),
         )
+        .tag_specifications(
+            TagSpecification::builder()
+                .resource_type(ResourceType::Image)
+                .set_tags(Some(ami_tags(ami_tag, git_sha, t, cluster)))
+                .build(),
+        )
         .send()
         .await?;
     resp.image_id()
@@ -437,6 +460,9 @@ async fn register(
         .context("register-image returned no AMI ID")
 }
 
+/// Re-stamp [`ami_tags`] onto an already-registered AMI. Only used by
+/// the `find_existing` skip path — fresh registers tag atomically via
+/// `register()`'s `TagSpecification`.
 async fn tag(
     ec2: &aws_sdk_ec2::Client,
     ami: &str,
@@ -445,26 +471,9 @@ async fn tag(
     t: &Target,
     cluster: &str,
 ) -> Result<()> {
-    // rio.build/ami=<tag> is what the EC2NodeClass amiSelectorTerms
-    // match — content-addressed (I-182), pin to a value for
-    // reproducible rollback. rio.build/git-sha is traceability only
-    // (changes every commit; the content tag does not).
-    // rio.build/boot disambiguates the two amd64 variants for the
-    // rio-default vs rio-metal NodeClass selectors (I-205).
-    // karpenter.sh/discovery scopes the AMI to this cluster's selector
-    // (same key as subnets/SGs).
     ec2.create_tags()
         .resources(ami)
-        .tags(mk_tag("rio.build/ami", ami_tag))
-        .tags(mk_tag("rio.build/git-sha", git_sha))
-        .tags(mk_tag("rio.build/ami-latest", "true"))
-        .tags(mk_tag("kubernetes.io/arch", t.k8s_arch))
-        .tags(mk_tag("rio.build/boot", t.boot))
-        .tags(mk_tag("karpenter.sh/discovery", cluster))
-        .tags(mk_tag(
-            "Name",
-            &format!("rio-nixos-node-{ami_tag}-{}", t.attr),
-        ))
+        .set_tags(Some(ami_tags(ami_tag, git_sha, t, cluster)))
         .send()
         .await?;
     Ok(())
@@ -577,12 +586,18 @@ pub async fn gc(older_than_days: u64, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    for (id, _, snaps) in &victims {
+    for (id, _, _) in &victims {
         ui::step(&format!("deregister {id}"), || async {
-            ec2.deregister_image().image_id(id).send().await?;
-            for snap in snaps {
-                ec2.delete_snapshot().snapshot_id(snap).send().await?;
-            }
+            // Atomic deregister + snapshot delete: a failure between
+            // separate deregister-image and delete-snapshot calls
+            // orphans the snapshot permanently — `gc_candidates`
+            // derives snap IDs from `block_device_mappings()` of
+            // *registered* images only.
+            ec2.deregister_image()
+                .image_id(id)
+                .delete_associated_snapshots(true)
+                .send()
+                .await?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
@@ -642,6 +657,24 @@ mod tests {
         // variants (rio-default + rio-metal NodeClass coverage).
         let x86: Vec<_> = AmiArch::X86_64.targets().iter().map(|t| t.boot).collect();
         assert_eq!(x86, ["uefi", "legacy-bios"]);
+    }
+
+    /// The atomic-register tag set MUST contain both the idempotency
+    /// key (`rio.build/ami`, what `find_existing` filters on) and the
+    /// deploy-resolve key (`rio.build/ami-latest`, what
+    /// `resolve_latest_tag` filters on). When these were split across
+    /// register-image and a separate create-tags, an interrupt between
+    /// the two left an AMI that blocked re-register (Name unique) but
+    /// was invisible to find_existing AND gc.
+    #[test]
+    fn register_tags_include_idempotency_key() {
+        let t = &AmiArch::X86_64.targets()[0];
+        let tags = ami_tags("af8a6f093dcd", "abc1234", t, "rio-dev");
+        let keys: Vec<_> = tags.iter().filter_map(|t| t.key()).collect();
+        assert!(keys.contains(&"rio.build/ami"), "{keys:?}");
+        assert!(keys.contains(&"rio.build/ami-latest"), "{keys:?}");
+        assert!(keys.contains(&"kubernetes.io/arch"), "{keys:?}");
+        assert!(keys.contains(&"rio.build/boot"), "{keys:?}");
     }
 
     #[test]
