@@ -1171,20 +1171,19 @@
                   path = drv;
                 })
                 (
-                  # executorSeed/vmTestSeed are oci-archive (not docker-
-                  # archive) and go to AMI/k3s respectively, not ECR; the
-                  # parity attr is a check, not an image. push.rs walks
-                  # this linkFarm — all three would break its `skopeo
-                  # copy docker-archive:`.
-                  builtins.removeAttrs dockerImages [
-                    "executorSeed"
-                    "executorSeedLayerParity"
-                    # Non-image attrs exposed for misc-checks (parity diff,
-                    # idempotency mock harness).
-                    "dashboardReadonlyMethods"
-                    "bootstrapScript"
-                    "vmTestSeed"
-                  ]
+                  # push.rs walks this linkFarm and runs `skopeo copy
+                  # docker-archive:` on every entry. Structural filter:
+                  # only attrs produced by dockerTools.buildLayeredImage
+                  # (which sets passthru.imageTag) are pushable. This
+                  # excludes oci-archive seeds (executorSeed/vmTestSeed →
+                  # AMI/k3s, not ECR), parity checks, and non-image
+                  # passthrus exported for misc-checks (bootstrapScript,
+                  # dashboardReadonlyMethods, dashboardNginxConf). A
+                  # removeAttrs denylist here previously leaked
+                  # dashboardNginxConf → ECR rejected the camelCase repo
+                  # name; the imageTag gate makes that class of leak
+                  # unrepresentable.
+                  pkgs.lib.filterAttrs (_: v: pkgs.lib.isDerivation v && v ? imageTag) dockerImages
                 )
             );
 

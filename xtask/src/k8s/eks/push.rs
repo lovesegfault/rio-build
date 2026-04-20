@@ -14,7 +14,7 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{error, info};
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
@@ -163,7 +163,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let mut failed = vec![];
     while let Some(res) = joinset.join_next().await {
         if let Some((id, log)) = res?? {
-            ui::eprint(format_args!("  {id} FAILED:\n{}\n", indent(&log, "    ")));
+            error!("  {id} FAILED:\n{}", indent(&log, "    "));
             failed.push(id);
         }
     }
@@ -199,7 +199,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let mut failed = vec![];
     while let Some(res) = joinset.join_next().await {
         if let Err(e) = res? {
-            ui::eprint(format_args!("  {e:#}\n"));
+            error!("  {e:#}");
             failed.push(e);
         }
     }
