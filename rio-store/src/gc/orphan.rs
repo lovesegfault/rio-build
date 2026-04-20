@@ -317,7 +317,7 @@ mod tests {
             }],
         }
         .serialize();
-        crate::metadata::upgrade_manifest_to_chunked(
+        let _ = crate::metadata::upgrade_manifest_to_chunked(
             pool,
             hash,
             &chunk_list,

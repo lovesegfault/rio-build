@@ -14,6 +14,23 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use tracing::{debug, instrument};
 
+/// Opaque generation token for an `'uploading'` placeholder, captured
+/// at [`upgrade_manifest_to_chunked`] time and checked at
+/// [`delete_manifest_chunked_uploading`] time. If the orphan reaper
+/// reclaims the placeholder and a re-uploader inserts a fresh one, the
+/// fresh row's token differs — the stale uploader's late rollback
+/// bails instead of clobbering the re-uploader's state.
+///
+/// Encoded as `EXTRACT(EPOCH FROM updated_at)::float8` (PG float8 ↔
+/// Rust f64 is an exact IEEE-754 byte transfer; the codebase has no
+/// chrono/time dep). Compared by exact equality in PG. The
+/// post-upgrade heartbeat advances `updated_at`, so a rollback after a
+/// successful heartbeat sees a token mismatch on its OWN row — that's
+/// a deliberate false-negative (rollback no-ops, orphan scanner cleans
+/// up after `STALE_THRESHOLD`). Safe; the alternative (no token) lets
+/// a stale uploader clobber a fresh one mid-upload.
+pub type PlaceholderToken = f64;
+
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
 // ---------------------------------------------------------------------------
@@ -58,7 +75,7 @@ pub async fn upgrade_manifest_to_chunked(
     chunk_list: &[u8],        // serialized Manifest
     chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
     chunk_sizes: &[i64],      // parallel to chunk_hashes
-) -> Result<HashSet<Vec<u8>>> {
+) -> Result<(HashSet<Vec<u8>>, PlaceholderToken)> {
     let mut tx = pool.begin().await?;
 
     // Ownership lock: the manifests row MUST exist with status=
@@ -71,9 +88,14 @@ pub async fn upgrade_manifest_to_chunked(
     // `complete_manifest_chunked`) until this tx commits, so the
     // verdict holds for the whole tx. Same pattern as
     // `gc::orphan::reap_one`.
-    let still_ours: Option<(i32,)> = sqlx::query_as(
+    //
+    // The returned epoch is the [`PlaceholderToken`] — passed through
+    // to `delete_manifest_chunked_uploading` so a late rollback can
+    // distinguish "still my placeholder" from "reaper reclaimed mine
+    // and a re-uploader inserted a fresh one".
+    let token: Option<PlaceholderToken> = sqlx::query_scalar(
         r#"
-        SELECT 1 FROM manifests
+        SELECT EXTRACT(EPOCH FROM updated_at)::float8 FROM manifests
         WHERE store_path_hash = $1 AND status = 'uploading'
         FOR UPDATE
         "#,
@@ -81,11 +103,11 @@ pub async fn upgrade_manifest_to_chunked(
     .bind(store_path_hash)
     .fetch_optional(&mut *tx)
     .await?;
-    if still_ours.is_none() {
+    let Some(token) = token else {
         return Err(MetadataError::PlaceholderMissing {
             store_path: hex::encode(store_path_hash),
         });
-    }
+    };
 
     // manifest_data: the chunk list. No ON CONFLICT — the placeholder
     // from step 3 didn't write manifest_data, so this row shouldn't
@@ -188,7 +210,7 @@ pub async fn upgrade_manifest_to_chunked(
         .collect();
 
     tx.commit().await?;
-    Ok(needs_upload)
+    Ok((needs_upload, token))
 }
 
 /// Record that the given chunk hashes are now durably present in the
@@ -245,16 +267,20 @@ pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) 
 /// across the upload, so this invariant is easy to maintain.
 ///
 /// Safety: opens with `SELECT … FOR UPDATE` on the `'uploading'`
-/// placeholder and returns `Ok(())` if it's gone — so if the orphan
-/// reaper reclaimed our placeholder and a re-uploader has since
-/// completed, the refcount decrement and `manifest_data` DELETE below
-/// can't clobber the re-uploader's state. The `manifests`/`narinfo`
-/// deletes additionally carry `status='uploading'` / `nar_size=0`
-/// guards (defense-in-depth, same as the inline variant).
+/// placeholder gated on `token` (the [`PlaceholderToken`] captured at
+/// [`upgrade_manifest_to_chunked`] time) and returns `Ok(())` if it
+/// doesn't match — so if the orphan reaper reclaimed our placeholder
+/// and a re-uploader has since inserted a fresh one (whether
+/// `'uploading'` or `'complete'`), the refcount decrement and
+/// `manifest_data` DELETE below can't clobber the re-uploader's state.
+/// The `manifests`/`narinfo` deletes additionally carry
+/// `status='uploading'` / `nar_size=0` guards (defense-in-depth, same
+/// as the inline variant).
 #[instrument(skip(pool, chunk_hashes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
 pub async fn delete_manifest_chunked_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
+    token: PlaceholderToken,
     chunk_hashes: &[Vec<u8>],
 ) -> Result<()> {
     // r[impl store.chunk.refcount-txn]
@@ -262,7 +288,7 @@ pub async fn delete_manifest_chunked_uploading(
     // Sort-before-ANY() + single-retry-on-40P01 via the shared helper.
     // See with_sorted_retry doc for the deadlock-prevention rationale.
     with_sorted_retry(chunk_hashes.to_vec(), |hashes| async move {
-        delete_manifest_chunked_uploading_inner(pool, store_path_hash, &hashes).await
+        delete_manifest_chunked_uploading_inner(pool, store_path_hash, token, &hashes).await
     })
     .await
 }
@@ -272,6 +298,7 @@ pub async fn delete_manifest_chunked_uploading(
 async fn delete_manifest_chunked_uploading_inner(
     pool: &PgPool,
     store_path_hash: &[u8],
+    token: PlaceholderToken,
     hashes: &[Vec<u8>],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -279,26 +306,38 @@ async fn delete_manifest_chunked_uploading_inner(
     // Ownership lock: verify the `'uploading'` placeholder is still
     // ours and row-lock it for the rest of this txn. If A's PUT hangs
     // >15min → orphan reaper reclaims A's placeholder → B re-uploads
-    // the same path and completes → A's hung PUT errors → without this
-    // check, the unguarded refcount decrement + manifest_data DELETE
-    // below would zero B's refcounts and delete B's chunk_list,
-    // leaving B's `status='complete'` manifest unreadable + chunks
-    // GC-eligible. Mirrors `gc::orphan::reap_one`. The FOR UPDATE
-    // serializes against `reap_one` and `complete_manifest_chunked`
-    // for the rest of the tx.
+    // the same path → A's hung PUT errors → without this check, the
+    // unguarded refcount decrement + manifest_data DELETE below would
+    // clobber B's state (mid-upload OR complete). Mirrors
+    // `gc::orphan::reap_one`'s freshness re-check.
+    //
+    // `status='uploading'` alone is NOT sufficient: B's fresh row is
+    // ALSO `'uploading'` until B completes. The `updated_at` token
+    // (captured at A's `upgrade_manifest_to_chunked`) distinguishes
+    // A's generation from B's. A token mismatch means either (a) the
+    // reaper reclaimed + B inserted a fresh row, or (b) A's own
+    // heartbeat advanced `updated_at` — case (b) is a deliberate
+    // false-negative (orphan scanner cleans up A's leaked refcounts;
+    // see [`PlaceholderToken`] doc). The FOR UPDATE serializes against
+    // `reap_one` and `complete_manifest_chunked` for the rest of the tx.
     let still_ours: Option<(i32,)> = sqlx::query_as(
         r#"
         SELECT 1 FROM manifests
-        WHERE store_path_hash = $1 AND status = 'uploading'
+        WHERE store_path_hash = $1
+          AND status = 'uploading'
+          AND EXTRACT(EPOCH FROM updated_at)::float8 = $2
         FOR UPDATE
         "#,
     )
     .bind(store_path_hash)
+    .bind(token)
     .fetch_optional(&mut *tx)
     .await?;
     if still_ours.is_none() {
-        // Reaper already cleaned up, or a re-uploader completed.
+        // Reaper already cleaned up, or a re-uploader holds a fresh
+        // placeholder, or our own heartbeat advanced updated_at.
         // Nothing to do — the dependent rows are not ours to touch.
+        debug!("rollback: placeholder token mismatch — leaving for orphan scanner");
         return Ok(());
     }
 
@@ -427,7 +466,7 @@ mod tests {
         let chunk_hashes = vec![vec![0xDDu8; 32]];
         let chunk_sizes = vec![1024i64];
 
-        upgrade_manifest_to_chunked(
+        let _ = upgrade_manifest_to_chunked(
             &db.pool,
             &store_path_hash,
             b"dummy-chunk-list",
@@ -476,7 +515,7 @@ mod tests {
         // --- First upsert: {A, B} ---
         let sph1 = vec![0x11u8; 32];
         seed_placeholder(&db.pool, &sph1).await;
-        let need1 = upgrade_manifest_to_chunked(
+        let (need1, _) = upgrade_manifest_to_chunked(
             &db.pool,
             &sph1,
             b"manifest-1",
@@ -500,7 +539,7 @@ mod tests {
         // uploaded_at IS NOT NULL → NOT in needs_upload. C is fresh.
         let sph2 = vec![0x22u8; 32];
         seed_placeholder(&db.pool, &sph2).await;
-        let need2 = upgrade_manifest_to_chunked(
+        let (need2, _) = upgrade_manifest_to_chunked(
             &db.pool,
             &sph2,
             b"manifest-2",
@@ -565,7 +604,7 @@ mod tests {
         // Upsert resurrects: ON CONFLICT → refcount 0+1=1, deleted=false.
         let sph = vec![0xDDu8; 32];
         seed_placeholder(&db.pool, &sph).await;
-        let need = upgrade_manifest_to_chunked(
+        let (need, _) = upgrade_manifest_to_chunked(
             &db.pool,
             &sph,
             b"manifest-resurrect",
@@ -642,8 +681,8 @@ mod tests {
             upgrade_manifest_to_chunked(&db.pool, &sph_a, b"manifest-a", &hashes_a, &sizes_a),
             upgrade_manifest_to_chunked(&db.pool, &sph_b, b"manifest-b", &hashes_b, &sizes_b),
         );
-        let need_a = need_a.unwrap();
-        let need_b = need_b.unwrap();
+        let (need_a, _) = need_a.unwrap();
+        let (need_b, _) = need_b.unwrap();
 
         // Each side's unique chunk is always fresh.
         assert!(need_a.contains(&unique_a), "A's unique chunk needs upload");
@@ -713,9 +752,10 @@ mod tests {
         // --- Step 1: PutPath A's upsert, then SIGKILL ---
         let sph_a = vec![0xAAu8; 32];
         seed_placeholder(&db.pool, &sph_a).await;
-        let need_a = upgrade_manifest_to_chunked(&db.pool, &sph_a, &chunk_list, one_chunk, &[1024])
-            .await
-            .unwrap();
+        let (need_a, _) =
+            upgrade_manifest_to_chunked(&db.pool, &sph_a, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
         assert!(need_a.contains(&chunk_x), "A: fresh insert needs upload");
         // SIGKILL: drop here. PG state committed (rc=1, uploaded_at
         // NULL, manifest A status='uploading'), S3 has nothing.
@@ -723,9 +763,10 @@ mod tests {
         // --- Step 2+3: PutPath B sees needs_upload, uploads, marks ---
         let sph_b = vec![0xBBu8; 32];
         seed_placeholder(&db.pool, &sph_b).await;
-        let need_b = upgrade_manifest_to_chunked(&db.pool, &sph_b, &chunk_list, one_chunk, &[1024])
-            .await
-            .unwrap();
+        let (need_b, _) =
+            upgrade_manifest_to_chunked(&db.pool, &sph_b, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
         assert!(
             need_b.contains(&chunk_x),
             "B: rc=2 but uploaded_at NULL → needs upload \
@@ -747,9 +788,10 @@ mod tests {
         // --- Step 4: PutPath C dedups against B's confirmed upload ---
         let sph_c = vec![0xCCu8; 32];
         seed_placeholder(&db.pool, &sph_c).await;
-        let need_c = upgrade_manifest_to_chunked(&db.pool, &sph_c, &chunk_list, one_chunk, &[1024])
-            .await
-            .unwrap();
+        let (need_c, _) =
+            upgrade_manifest_to_chunked(&db.pool, &sph_c, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
         assert!(
             !need_c.contains(&chunk_x),
             "C: uploaded_at set → skip upload (dedup works post-commit)"
@@ -815,7 +857,7 @@ mod tests {
         let sizes: Vec<i64> = vec![1024; 100];
         let sph_a = vec![0xAAu8; 32];
         seed_placeholder(&db.pool, &sph_a).await;
-        upgrade_manifest_to_chunked(&db.pool, &sph_a, b"ml-a", &hashes, &sizes)
+        let (_, token_a) = upgrade_manifest_to_chunked(&db.pool, &sph_a, b"ml-a", &hashes, &sizes)
             .await
             .unwrap();
 
@@ -856,7 +898,7 @@ mod tests {
                 let pool_a = pool_a.clone();
                 let sph_a = sph_a.clone();
                 async move {
-                    delete_manifest_chunked_uploading_inner(&pool_a, &sph_a, &sorted).await
+                    delete_manifest_chunked_uploading_inner(&pool_a, &sph_a, token_a, &sorted).await
                 }
             })
             .await
@@ -941,9 +983,10 @@ mod tests {
         }
         .serialize();
         let one_chunk = std::slice::from_ref(&chunk);
-        let ins1 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
-            .await
-            .unwrap();
+        let (ins1, _) =
+            upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
+                .await
+                .unwrap();
         assert!(ins1.contains(&chunk), "step 1: chunk fresh → would upload");
         // Crash here: chunk MAY or may not have made it to S3. PG state
         // is committed (refcount=1).
@@ -970,9 +1013,10 @@ mod tests {
         crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
             .await
             .unwrap();
-        let need2 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
-            .await
-            .unwrap();
+        let (need2, _) =
+            upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
+                .await
+                .unwrap();
 
         // POST-M033: refcount went 1→2 (leak), but uploaded_at is
         // still NULL (step 1 never reached mark_chunks_uploaded) →
@@ -1052,9 +1096,10 @@ mod tests {
         crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
             .await
             .unwrap();
-        upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
-            .await
-            .unwrap();
+        let (_, token_a) =
+            upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
 
         // --- Reaper: reclaims A's stale placeholder (rc 1→0). ---
         let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
@@ -1067,7 +1112,7 @@ mod tests {
         crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
             .await
             .unwrap();
-        upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+        let _ = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
             .await
             .unwrap();
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
@@ -1076,7 +1121,7 @@ mod tests {
         complete_manifest_chunked(&db.pool, &info).await.unwrap();
 
         // --- A: hung PUT errors → late rollback fires. ---
-        delete_manifest_chunked_uploading(&db.pool, &sph, one_chunk)
+        delete_manifest_chunked_uploading(&db.pool, &sph, token_a, one_chunk)
             .await
             .unwrap();
 
@@ -1104,6 +1149,123 @@ mod tests {
             matches!(kind, Some(crate::metadata::ManifestKind::Chunked(_))),
             "get_manifest still resolves B's chunked manifest, got {kind:?}"
         );
+    }
+
+    // r[verify store.put.wal-manifest]
+    /// Residual-bypass coverage: reaper reclaims A → B inserts a FRESH
+    /// `'uploading'` placeholder with IDENTICAL chunks (deterministic
+    /// build) but does NOT complete yet → A's late rollback fires.
+    /// Without the [`PlaceholderToken`] freshness guard, A's
+    /// `status='uploading'` FOR UPDATE matches B's fresh row and
+    /// clobbers it (rc 1→0, manifest_data + placeholder deleted).
+    /// With the guard, A's stale token ≠ B's fresh `updated_at` →
+    /// rollback is a no-op.
+    #[tokio::test]
+    async fn rollback_after_reap_and_fresh_reupload_mid_upload_is_noop() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let path = rio_test_support::fixtures::test_store_path("reap-reupload-mid");
+        let sph = rio_nix::store_path::StorePath::parse(&path)
+            .unwrap()
+            .sha256_digest()
+            .to_vec();
+        let chunk = vec![0x9Bu8; 32];
+        let one_chunk = std::slice::from_ref(&chunk);
+        let chunk_list = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: chunk.as_slice().try_into().unwrap(),
+                size: 1024,
+            }],
+        }
+        .serialize();
+
+        // --- A: placeholder + upgrade. PUT hangs >15min. ---
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        let (_, token_a) =
+            upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
+        // Simulate staleness: backdate updated_at past STALE_THRESHOLD
+        // so token_a ≠ B's fresh updated_at deterministically
+        // (otherwise PG's timestamp granularity might collide).
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - interval '1 hour' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&sph)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // --- Reaper: reclaims A. ---
+        let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
+        assert!(
+            crate::gc::orphan::reap_one(&db.pool, &sph, None, no_backend)
+                .await
+                .unwrap()
+        );
+
+        // --- B: fresh placeholder + upgrade, SAME chunks. STILL
+        //     'uploading' (mid-upload). ---
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        let (_, token_b) =
+            upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[1024])
+                .await
+                .unwrap();
+        assert_ne!(token_a, token_b, "B's fresh row has a distinct token");
+
+        // --- A: hung PUT errors → late rollback with A's STALE token. ---
+        delete_manifest_chunked_uploading(&db.pool, &sph, token_a, one_chunk)
+            .await
+            .unwrap();
+
+        // B's mid-upload state MUST be intact: rc==1, manifest_data
+        // present, manifests row still 'uploading'.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "B's refcount untouched by A's late rollback");
+
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM manifests WHERE store_path_hash = $1")
+                .bind(&sph)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("uploading"),
+            "B's 'uploading' placeholder survives A's late rollback"
+        );
+
+        let md: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT chunk_list FROM manifest_data WHERE store_path_hash = $1")
+                .bind(&sph)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert!(md.is_some(), "B's manifest_data row survives");
+
+        // --- Sanity: B's OWN rollback (correct token) DOES tear down. ---
+        // This is the token-roundtrip happy path: float8 epoch
+        // round-trips PG↔Rust exactly so an uploader CAN clean up its
+        // own placeholder.
+        delete_manifest_chunked_uploading(&db.pool, &sph, token_b, one_chunk)
+            .await
+            .unwrap();
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM manifests WHERE store_path_hash = $1")
+                .bind(&sph)
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, None, "B's own rollback (matching token) tears down");
     }
 
     /// `upgrade_manifest_to_chunked` holds a FOR UPDATE lock on the
@@ -1144,7 +1306,7 @@ mod tests {
         // Wait until the competitor holds the lock, THEN start upgrade.
         locked_rx.await.unwrap();
         let started = std::time::Instant::now();
-        upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &[vec![0x99; 32]], &[1024])
+        let _ = upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &[vec![0x99; 32]], &[1024])
             .await
             .unwrap();
         let elapsed = started.elapsed();

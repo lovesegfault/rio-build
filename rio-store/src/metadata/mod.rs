@@ -51,8 +51,8 @@ pub mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub use chunked::{
-    complete_manifest_chunked, delete_manifest_chunked_uploading, mark_chunks_uploaded,
-    upgrade_manifest_to_chunked,
+    PlaceholderToken, complete_manifest_chunked, delete_manifest_chunked_uploading,
+    mark_chunks_uploaded, upgrade_manifest_to_chunked,
 };
 pub use cluster_key_history::load_cluster_key_history;
 pub use inline::{check_manifest_complete, complete_manifest_inline, insert_manifest_uploading};
@@ -564,7 +564,7 @@ mod tests {
                 size: 100,
             }],
         };
-        chunked::upgrade_manifest_to_chunked(
+        let _ = chunked::upgrade_manifest_to_chunked(
             &db.pool,
             &store_path_hash,
             &manifest.serialize(),

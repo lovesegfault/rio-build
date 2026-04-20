@@ -257,7 +257,7 @@ pub async fn stage_chunked(
     // PutPath has already CONFIRMED in S3 (via `mark_chunks_uploaded`)
     // is skipped; one that's merely refcounted (upload in flight or
     // interrupted) is re-uploaded — see M_033.
-    let needs_upload = metadata::upgrade_manifest_to_chunked(
+    let (needs_upload, token) = metadata::upgrade_manifest_to_chunked(
         pool,
         store_path_hash,
         &chunk_list_bytes,
@@ -282,7 +282,7 @@ pub async fn stage_chunked(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
-            rollback(pool, store_path_hash, &chunk_hashes).await;
+            rollback(pool, store_path_hash, token, &chunk_hashes).await;
             return Err(e);
         }
     };
@@ -295,7 +295,7 @@ pub async fn stage_chunked(
     let needs_upload: Vec<Vec<u8>> = needs_upload.into_iter().collect();
     if let Err(e) = metadata::mark_chunks_uploaded(pool, &needs_upload).await {
         warn!(error = %e, "mark_chunks_uploaded failed; rolling back");
-        rollback(pool, store_path_hash, &chunk_hashes).await;
+        rollback(pool, store_path_hash, token, &chunk_hashes).await;
         return Err(e.into());
     }
 
@@ -419,9 +419,15 @@ async fn do_upload(
 /// Best-effort rollback. Errors are logged, not propagated — the caller
 /// is already returning an error; a rollback failure shouldn't mask it.
 /// The orphan scanner (gc/orphan.rs) catches any leaked state.
-async fn rollback(pool: &PgPool, store_path_hash: &[u8], chunk_hashes: &[Vec<u8>]) {
+async fn rollback(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    token: metadata::PlaceholderToken,
+    chunk_hashes: &[Vec<u8>],
+) {
     if let Err(e) =
-        metadata::delete_manifest_chunked_uploading(pool, store_path_hash, chunk_hashes).await
+        metadata::delete_manifest_chunked_uploading(pool, store_path_hash, token, chunk_hashes)
+            .await
     {
         warn!(error = %e, "rollback of chunked upload failed; orphan scanner will clean up");
     }
