@@ -414,16 +414,22 @@ impl Handler for ConnectionHandler {
     /// DO NOT set `self.tenant_name` here. The client hasn't proven
     /// ownership yet (no signature). `auth_publickey` does the final
     /// match-and-set after russh verifies the signature.
-    ///
-    /// No `mark_real_connection()` — `auth_none` always fires first
-    /// for OpenSSH clients. A non-OpenSSH client that skips the `none`
-    /// probe and goes straight to publickey is covered by the
-    /// `auth_publickey` call that follows on accept.
+    // r[impl gw.conn.real-connection-marker]
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
         key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
+        // Receiving an offered key means KEX completed and a
+        // SSH_MSG_USERAUTH_REQUEST arrived — provably a real SSH
+        // client. RFC 4252 §5.2 makes the `none` probe optional, so a
+        // client that skips it and offers only unauthorized keys would
+        // otherwise leave `auth_attempted=false` and be logged as a TCP
+        // probe (invisible at INFO, no metrics, no `r[gw.conn.cap]`
+        // enforcement). Idempotent — the OpenSSH `auth_none` →
+        // `auth_publickey_offered` → `auth_publickey` path is unaffected.
+        self.mark_real_connection();
+        self.ensure_permit()?;
         let known = self
             .authorized_keys
             .load()
@@ -797,6 +803,53 @@ impl Handler for ConnectionHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // r[verify gw.conn.real-connection-marker]
+    /// `auth_publickey_offered` MUST set `auth_attempted` even on the
+    /// reject branch. RFC 4252 §5.2 makes the `none` probe optional, so
+    /// a non-OpenSSH client that skips it and offers only unauthorized
+    /// keys would otherwise leave `auth_attempted=false` → Drop logs it
+    /// as a TCP probe, no metrics, no `r[gw.conn.cap]` enforcement.
+    ///
+    /// Regression: at b62291b8 this assertion fails (auth_attempted
+    /// stays false — the only `auth_*` override that skipped
+    /// `mark_real_connection`).
+    #[tokio::test]
+    async fn auth_publickey_offered_marks_real_on_reject() -> anyhow::Result<()> {
+        use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
+        use russh::keys::{Algorithm, PrivateKey};
+        use russh::server::Server as _;
+
+        let (_s, store_addr, _sh) = spawn_mock_store().await?;
+        let (_d, sched_addr, _dh) = spawn_mock_scheduler().await?;
+        let store = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let sched = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+
+        // Server with ZERO authorized keys — every offer is rejected.
+        let mut server = super::super::GatewayServer::new(store, sched, vec![]);
+        let mut handler = server.new_client(None);
+
+        assert!(!handler.auth_attempted, "precondition: fresh handler");
+
+        let unknown = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let res = handler
+            .auth_publickey_offered("nix", unknown.public_key())
+            .await?;
+        assert!(
+            matches!(res, Auth::Reject { .. }),
+            "unknown key must be rejected at offer"
+        );
+        assert!(
+            handler.auth_attempted,
+            "auth_publickey_offered is an auth_* entry point — must mark_real_connection"
+        );
+        assert_eq!(
+            handler.stage.load(Ordering::Relaxed),
+            ConnStage::AuthAttempted as u8,
+            "stage must advance to auth-attempted"
+        );
+        Ok(())
+    }
 
     // -----------------------------------------------------------------------
     // normalize_key_comment — the extracted tenant-name normalization
