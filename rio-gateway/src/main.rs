@@ -29,11 +29,35 @@ async fn main() -> anyhow::Result<()> {
     // invasive for a value that IS process-wide.
     rio_gateway::drv_cache::init_max_transitive_inputs(cfg.max_transitive_inputs);
 
+    // gRPC health server. Dedicated tonic instance — the gateway's main
+    // protocol is SSH (russh), no existing tonic server to attach to.
+    //
+    // Bound BEFORE `connect_forever` so kubelet's livenessProbe (port
+    // 9190) sees an open socket while the retry loop runs. tonic-health
+    // defaults to NOT_SERVING, so readiness stays correctly gated until
+    // `set_serving` below — liveness="process responding",
+    // readiness="connected to upstreams". With the bind AFTER connect
+    // (the old ordering), a slow scheduler/store cold-start (>60s) let
+    // kubelet kill the pod via livenessProbe before the retry loop
+    // could finish — neutralizing `connect_forever`'s purpose.
+    //
+    // spawn_monitored: the SSH server's `.run().await` below blocks
+    // forever. Health must run concurrently. If the health server dies
+    // (port conflict, etc), spawn_monitored logs it — K8s readiness
+    // probe starts failing, pod restarts. Self-healing.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    rio_common::server::spawn_health_server(
+        health_service,
+        cfg.health_addr,
+        serve_shutdown.clone(),
+    );
+
     // Retry-until-connected via connect_forever (shutdown-aware,
     // exponential backoff). Cold-start race: all rio-* pods start in
     // parallel; this process can reach here before rio-store /
-    // rio-scheduler Services have endpoints. Pod stays not-Ready
-    // (health server below hasn't spawned yet) while retrying.
+    // rio-scheduler Services have endpoints. Pod stays NOT_SERVING
+    // (set_serving call is below) while retrying; health port is open
+    // (above) so liveness passes.
     //
     // r[impl gw.sched.balanced]
     // Both connects in ONE closure body: partial success (store OK,
@@ -59,19 +83,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // gRPC health server. Dedicated tonic instance — the gateway's main
-    // protocol is SSH (russh), no existing tonic server to attach to.
-    //
     // SERVING gate: retry loop above exited ⇒ both store + scheduler
     // are reachable. A gateway that can't reach the scheduler would
     // accept SSH and then hang every wopBuild* opcode — fail readiness
     // instead so K8s doesn't route here.
-    //
-    // spawn_monitored: the SSH server's `.run().await` below blocks
-    // forever. Health must run concurrently. If the health server dies
-    // (port conflict, etc), spawn_monitored logs it — K8s readiness
-    // probe starts failing, pod restarts. Self-healing.
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
     // Two-stage shutdown — see rio_common::server::spawn_drain_task
     // for the INDEPENDENT-token rationale. Both the health server AND
@@ -105,15 +120,6 @@ async fn main() -> anyhow::Result<()> {
             tonic_health::server::HealthService,
         >>()
         .await;
-    // Gateway has no tonic main-server (SSH accept loop instead). Health
-    // is always on a separate plaintext port. Same shared-reporter
-    // pattern applies: the SIGTERM drain loop above flips NOT_SERVING
-    // via this reporter.
-    rio_common::server::spawn_health_server(
-        health_service,
-        cfg.health_addr,
-        serve_shutdown.clone(),
-    );
 
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
     let authorized_keys = rio_gateway::load_authorized_keys(&cfg.authorized_keys)?;

@@ -105,16 +105,27 @@ spec:
               readOnly: true
             {{- end }}
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
-          # tonic-health server — SERVING after connect_scheduler succeeds.
+          # tonic-health server — SERVING after connect_forever succeeds.
           readinessProbe:
             grpc: {port: 9190}
             periodSeconds: 5
             failureThreshold: 3
-          # SSH port listening = process alive.
+          # Health port open = process alive. main.rs binds 9190
+          # BEFORE connect_forever, so liveness sees the socket while
+          # the cold-start retry loop runs. Probing the SSH port (2222)
+          # here would let kubelet kill the pod before scheduler/store
+          # came up — neutralizing connect_forever.
           livenessProbe:
-            tcpSocket: {port: 2222}
+            tcpSocket: {port: 9190}
             periodSeconds: 10
             failureThreshold: 6
+          # 30×10s = 5min cold-start budget. Suppresses livenessProbe
+          # until first success — belt-and-suspenders for the ordering
+          # fix above (matches scheduler.yaml).
+          startupProbe:
+            tcpSocket: {port: 9190}
+            periodSeconds: 10
+            failureThreshold: 30
           resources:
             {{- toYaml $g.resources | nindent 12 }}
       volumes:
