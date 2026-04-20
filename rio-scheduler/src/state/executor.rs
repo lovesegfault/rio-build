@@ -291,6 +291,17 @@ pub struct RetryPolicy {
     /// 99.7% despite being fine. With a window, the counter resets
     /// once the cluster self-heals (lock released, store recovered).
     pub infra_retry_window_secs: f64,
+    /// Maximum number of `exempt_from_cap` infra-retry attempts before
+    /// the derivation is poisoned. CONCURRENT_PUTPATH and
+    /// `floor_outcome.promoted` skip `infra_count++` entirely, so a
+    /// leaked store-side placeholder lock (the I-125a class) makes
+    /// every honest worker report the exempt message → infinite pod
+    /// churn at `info!` level only. This high-water cap is the
+    /// scheduler-side terminal: every other completion status has one
+    /// (`max_retries`, `max_infra_retries`, `max_timeout_retries`,
+    /// size-tier ladder); without this, the I-127 exemption was the
+    /// sole worker-reportable status with zero scheduler-side bound.
+    pub max_exempt_infra_retries: u32,
     /// Base backoff duration in seconds.
     pub backoff_base_secs: f64,
     /// Backoff multiplier.
@@ -335,6 +346,14 @@ impl Default for RetryPolicy {
             // (146 cycles / 6min ≈ 2.5s/cycle) still hits the cap
             // before the window resets it.
             infra_retry_window_secs: 300.0,
+            // I-127's observed benign ceiling is 4-in-a-row; 50 gives
+            // >10× headroom while still terminating a leaked-lock
+            // livelock within minutes (no backoff on the exempt path,
+            // so 50 immediate cycles ≈ seconds-to-low-minutes for fast
+            // builds). Separately bounds `floor_outcome.promoted` as
+            // defense-in-depth against a `bump_resource_floor` bug
+            // that always returns `promoted=true`.
+            max_exempt_infra_retries: 50,
             backoff_base_secs: 5.0,
             backoff_multiplier: 2.0,
             backoff_max_secs: 300.0,

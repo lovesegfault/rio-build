@@ -1213,6 +1213,25 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Contract pin: rio-scheduler `handle_infrastructure_failure`
+    /// matches `error_msg.contains(rio_proto::CGROUP_OOM_MSG)` to
+    /// trigger `r[sched.sla.reactive-floor]`. thiserror's `#[error]`
+    /// attr can't reference a `const` without const-format, so this
+    /// test is the cross-crate drift guard — rewording the Display
+    /// string at line ~179 fails HERE instead of silently disabling
+    /// the floor-bump in production.
+    #[test]
+    fn cgroup_oom_display_contains_proto_constant() {
+        assert!(
+            ExecutorError::CgroupOom
+                .to_string()
+                .contains(rio_proto::CGROUP_OOM_MSG),
+            "ExecutorError::CgroupOom Display ({:?}) must contain rio_proto::CGROUP_OOM_MSG ({:?})",
+            ExecutorError::CgroupOom.to_string(),
+            rio_proto::CGROUP_OOM_MSG,
+        );
+    }
+
     // r[verify builder.exec.build-id-sanitized]
     #[test]
     fn test_sanitize_build_id() {

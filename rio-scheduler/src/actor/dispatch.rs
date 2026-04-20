@@ -1191,29 +1191,40 @@ impl DagActor {
     }
 
     /// I-065: has `failed_builders` excluded EVERY currently-registered
-    /// statically-eligible worker (matching kind + system + features)?
+    /// statically-eligible **non-draining** worker (matching kind +
+    /// system + features)?
     ///
-    /// Live example: 2-builder cluster, `diffutils.drv` accumulates
-    /// `failed_builders=[b0,b1]`. `hard_filter`'s `!contains()` rejects
-    /// both → defer forever. `PoisonConfig.threshold=3` never reached.
-    /// The build hangs `[Active]` with no log signal.
+    /// Predicate is "every statically-eligible non-draining worker is
+    /// in the failed set", not `failed_builders.len() >= total`. The
+    /// latter over-counts stale IDs: b0 fails, b0 is replaced by b2,
+    /// b1 fails → set={b0,b1} len=2, total=2 → would poison, but b2
+    /// was never tried. The fleet filter MUST match the
+    /// static-eligibility subset of `rejection_reason` — a kind-only
+    /// filter let an x86 drv that failed on every x86 worker defer
+    /// forever in a multi-arch cluster because aarch64 workers (which
+    /// `find_executor` rejects on system-mismatch) kept the fleet
+    /// "non-exhausted".
     ///
-    /// Predicate is "every statically-eligible worker is in the failed
-    /// set", not `failed_builders.len() >= total`. The latter
-    /// over-counts stale IDs: b0 fails, b0 is replaced by b2, b1 fails
-    /// → set={b0,b1} len=2, total=2 → would poison, but b2 was never
-    /// tried. The fleet filter MUST match the static-eligibility subset
-    /// of `rejection_reason` — a kind-only filter let an x86 drv that
-    /// failed on every x86 worker defer forever in a multi-arch cluster
-    /// because aarch64 workers (which `find_executor` rejects on
-    /// system-mismatch) kept the fleet "non-exhausted".
+    /// Draining workers are excluded: under one-shot semantics
+    /// (I-188; the only mode), a just-failed worker is `draining=true`
+    /// but still in `self.executors` at completion-time. Counting it
+    /// meant `poolSize=1` poisoned on the FIRST transient failure
+    /// (fleet={E1}, failed={E1} → exhausted), bypassing `max_retries`
+    /// and `poison_config.threshold`. Excluding it lets the
+    /// empty-fleet guard below return `false` → re-queue → controller
+    /// spawns a fresh `executor_id ∉ failed_builders`. Under one-shot
+    /// this function therefore returns `false` in practice (failed
+    /// workers drain; fresh workers ∉ failed_builders); it remains as
+    /// defense-in-depth for any future path where a worker fails
+    /// without draining. Poison-on-repeated-failure flows through
+    /// `PoisonConfig::is_poisoned(threshold)` instead.
     ///
     /// Returns false (don't poison) when zero statically-eligible
-    /// workers are registered — that's "no pool connected for this
-    /// system/features", a transient that the freeze detector +
-    /// unroutable-system gauge + autoscaler handle. Poisoning then
-    /// would brick builds during a deployment rollout.
-    // r[impl sched.dispatch.fleet-exhaust]
+    /// non-draining workers are registered — that's "no pool connected
+    /// for this system/features", a transient that the freeze
+    /// detector, unroutable-system gauge, and autoscaler handle.
+    /// Poisoning then would brick builds during a deployment rollout.
+    // r[impl sched.dispatch.fleet-exhaust+2]
     pub(super) fn failed_builders_exhausts_fleet(&self, drv_hash: &DrvHash) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;
@@ -1224,7 +1235,7 @@ impl DagActor {
         let mut fleet = self
             .executors
             .values()
-            .filter(|w| crate::assignment::statically_eligible(w, state));
+            .filter(|w| !w.is_draining() && crate::assignment::statically_eligible(w, state));
         // `all()` on an empty iterator is vacuously true — peek first.
         let Some(first) = fleet.next() else {
             return false;

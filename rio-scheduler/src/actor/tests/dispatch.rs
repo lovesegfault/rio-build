@@ -1311,7 +1311,7 @@ async fn cgroup_oom_doubles_mem_floor(
         "w-1",
         tag,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
-        "cgroup OOM during build; bumping resource floor",
+        &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
     )
     .await?;
     tick(&handle).await?;
@@ -2216,27 +2216,28 @@ async fn connect_executor_with_intent(
 // I-065 fleet-exhaustion: system/feature awareness
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fleet-exhaust]
-/// I-065 on the system/features axis: when every statically-eligible
-/// worker is in `failed_builders`, poison — even if other-system or
-/// feature-lacking workers of the same kind exist.
+// r[verify sched.dispatch.fleet-exhaust+2]
+/// `failed_builders_exhausts_fleet` under one-shot (I-188) semantics:
+/// failed workers are draining and excluded from the fleet count, so
+/// the drv DEFERS (Ready) for the controller to spawn fresh workers,
+/// rather than poisoning. When a fresh statically-eligible worker
+/// connects, the drv dispatches to it.
 ///
-/// Pre-fix `failed_builders_exhausts_fleet` filtered the fleet by
-/// `kind && is_registered()` only. An x86 drv that transient-failed on
-/// both x86 builders deferred forever (find_executor: failed-on /
-/// system-mismatch → None; exhausts_fleet: aarch64 not in failed set
-/// → false; is_poisoned: 2 < threshold=3 → false; defer).
-#[rstest::rstest]
-#[case::system("aarch64-linux", &[])] // padding mismatched on system
-#[case::features("x86_64-linux", &[])] // padding mismatched on features (drv needs kvm)
+/// The original I-065 multi-arch silent-hang scenario (an x86 drv
+/// that failed on every x86 worker, with aarch64 padding keeping a
+/// kind-only fleet "non-exhausted") cannot occur under one-shot:
+/// fresh same-arch workers replace the failed ones, so
+/// `failed_builders` never contains a non-draining live worker. This
+/// test verifies that the function reaches the same defer-don't-
+/// poison verdict and that re-dispatch to a fresh worker succeeds.
+///
+/// bug_108 / `case::system` over-determination: previously the
+/// just-failed draining workers counted toward "the fleet", so 2/2
+/// failures on x86+kvm builders poisoned immediately (bypassing
+/// `poison_config.threshold=3`). Now they're excluded → empty
+/// non-draining fleet → `false` → Ready.
 #[tokio::test]
-async fn test_fleet_exhaustion_static_eligibility(
-    #[case] pad_system: &str,
-    #[case] pad_features: &[&str],
-) -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
+async fn test_fleet_exhaustion_defers_under_one_shot() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.poison = crate::PoisonConfig {
@@ -2244,6 +2245,8 @@ async fn test_fleet_exhaustion_static_eligibility(
             require_distinct_workers: true,
         };
         c.retry_policy.max_retries = 10;
+        // No backoff: the post-connect tick must dispatch immediately.
+        c.retry_policy.backoff_base_secs = 0.0;
     });
     let _db = db;
 
@@ -2256,26 +2259,13 @@ async fn test_fleet_exhaustion_static_eligibility(
         hb.supported_features = vec!["kvm".into()];
     })
     .await?;
-    // 2 padding builders that ARE kind-matching+registered but NOT
-    // statically-eligible: wrong system (case::system) or lacking kvm
-    // (case::features). Pre-fix these counted toward "the fleet" and
-    // kept exhausts_fleet false.
-    let pad_feats: Vec<String> = pad_features.iter().map(|s| s.to_string()).collect();
-    let _p1 = connect_executor_with(&handle, "pad1", pad_system, true, |hb| {
-        hb.supported_features = pad_feats.clone();
-    })
-    .await?;
-    let _p2 = connect_executor_with(&handle, "pad2", pad_system, true, |hb| {
-        hb.supported_features = pad_feats.clone();
-    })
-    .await?;
 
     // x86 drv requiring kvm.
     let mut node = make_node("fe-drv");
     node.required_features = vec!["kvm".into()];
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
-    // Fail on both eligible workers.
+    // Fail on both eligible workers (one-shot → both now draining).
     fail_on_workers(
         &handle,
         "fe-drv",
@@ -2288,21 +2278,32 @@ async fn test_fleet_exhaustion_static_eligibility(
     let info = expect_drv(&handle, "fe-drv").await;
     assert_eq!(
         info.status,
-        DerivationStatus::Poisoned,
-        "every statically-eligible (kind+system+features) worker in \
-         failed_builders → poison; pre-fix this stayed Ready forever \
-         because {pad_system}/{pad_features:?} padding kept the kind-only \
-         fleet non-exhausted"
+        DerivationStatus::Ready,
+        "all eligible workers failed BUT draining → fleet (non-draining) \
+         empty → defer, NOT poison (pre-fix: poisoned here on 2/2, \
+         bypassing threshold=3)"
     );
+    assert_eq!(info.retry.failed_builders.len(), 2);
+
+    // Fresh worker (controller-spawned replacement) connects → drv
+    // dispatches to it. b3 ∉ failed_builders so hard_filter accepts.
+    let mut b3 = connect_executor_with(&handle, "b3", "x86_64-linux", true, |hb| {
+        hb.supported_features = vec!["kvm".into()];
+    })
+    .await?;
+    tick(&handle).await?;
+    let asn = recv_assignment(&mut b3).await;
+    assert_eq!(asn.drv_path, test_drv_path("fe-drv"));
+    let info = expect_drv(&handle, "fe-drv").await;
     assert_eq!(
-        recorder.get("rio_scheduler_poison_fleet_exhausted_total{}"),
-        1,
-        "fleet-exhausted counter incremented once"
+        info.status,
+        DerivationStatus::Assigned,
+        "fresh worker ∉ failed_builders → dispatched"
     );
     Ok(())
 }
 
-// r[verify sched.dispatch.fleet-exhaust]
+// r[verify sched.dispatch.fleet-exhaust+2]
 /// Negative: a statically-eligible worker NOT in `failed_builders` keeps
 /// the fleet non-exhausted (defer, don't poison). Guards against the
 /// fix over-filtering.

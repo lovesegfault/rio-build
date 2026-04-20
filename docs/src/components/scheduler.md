@@ -83,6 +83,9 @@ r[sched.admin.snapshot-cached]
 r[sched.merge.toctou-serial]
 > **TOCTOU note on cache checks (steps 2--4):** The DAG merge and subsequent cache check MUST be performed inside the DAG actor (serialized), not by the gRPC handler before sending the merge command. A cache check performed by the gRPC handler races with concurrent merges --- another build may complete a shared derivation between the handler's cache check and the actor's merge, leading to duplicate work. By performing cache verification after merge inside the actor, the check reflects the latest state.
 
+r[sched.completion.output-membership]
+> **Completion report output membership:** `handle_completion` MUST drop any worker-supplied `BuiltOutput` whose `output_name` is not in the derivation's scheduler-trusted `output_names` (parsed from the `.drv` at DAG-merge time), and MUST drop duplicates by `output_name`. Builders are untrusted; without this filter a compromised worker reporting on its own assigned drv could write arbitrary worker-chosen paths to `path_tenants` (pinning them against GC) and stall the actor via the sequential `insert_realisation` loop. After filtering, `built_outputs.len() ≤ output_names.len()`. Dropped entries increment `rio_scheduler_undeclared_built_output_total`.
+
 r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by executor retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
@@ -125,8 +128,8 @@ dev deployments). The retry backoff curve is likewise a `[retry]`
 table. `failed_builders` persisted to PG; infrastructure retry count
 is in-memory only.
 
-r[sched.dispatch.fleet-exhaust]
-When `find_executor` returns `None` and every *statically-eligible* registered worker (matching kind, `system`, and `required_features`) is already in `failed_builders`, the derivation is poisoned immediately rather than deferring. The fleet filter MUST match the static-eligibility subset of `rejection_reason` (`r[sched.admin.inspect-dag]`); a narrower filter (e.g. kind-only) lets a drv defer forever in a multi-arch or feature-partitioned cluster with no INFO-level signal (the I-065 hang shape on the system/features axis).
+r[sched.dispatch.fleet-exhaust+2]
+When `find_executor` returns `None` and every *statically-eligible* **non-draining** registered worker (matching kind, `system`, and `required_features`) is already in `failed_builders`, the derivation is poisoned immediately rather than deferring. Draining workers MUST be excluded: under one-shot semantics (`r[sched.ephemeral.no-redispatch-after-completion]`), a just-failed worker is draining but still in the executor map at completion-time; counting it poisons a `poolSize=1` (or `required_features`-narrowed) derivation on the FIRST transient failure, bypassing `max_retries` and the poison threshold. Under one-shot the controller spawns fresh `executor_id`s ∉ `failed_builders`, so this check returns `false` in practice and poison-on-repeated-failure flows through `PoisonConfig::is_poisoned(threshold)`; the check remains as defense-in-depth for any future path where a worker fails without draining. The fleet filter MUST match the static-eligibility subset of `rejection_reason` (`r[sched.admin.inspect-dag]`); a narrower filter (e.g. kind-only) lets a drv defer forever in a multi-arch or feature-partitioned cluster with no INFO-level signal (the I-065 hang shape on the system/features axis).
 
 ```toml
 # scheduler.toml — poison + retry knobs. All fields optional; absent
@@ -138,11 +141,16 @@ require_distinct_workers = true    # HashSet: N DISTINCT executors must fail
 
 [retry]
 max_retries = 2                    # retries for transient failures
+max_exempt_infra_retries = 50      # high-water terminal for cap-exempt infra
+                                   # retries (CONCURRENT_PUTPATH, floor-promote)
 backoff_base_secs = 5.0            # first-attempt backoff
 backoff_multiplier = 2.0           # exponential growth
 backoff_max_secs = 300.0           # clamp (inf would panic from_secs_f64)
 jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ```
+
+r[sched.retry.exempt-infra-cap]
+The `exempt_from_cap` infra-retry path (CONCURRENT_PUTPATH, `floor_outcome.promoted`) skips `infra_count++` and the `max_infra_retries` poison check by design — but MUST still terminate. A separate `exempt_infra_count` increments on every exempt attempt and poisons at `max_exempt_infra_retries` (default 50, well above I-127's 4-in-a-row benign ceiling). Without this terminal, a leaked store-side placeholder lock makes every honest worker report CONCURRENT_PUTPATH → infinite ephemeral-pod churn at `info!` level only with no scheduler-side counter advancing. The cap converts a silent livelock into an actionable poison; recovery cost is one `ClearPoison` after the underlying condition is fixed.
 
 r[sched.admin.list-executors]
 `AdminService.ListExecutors` returns a point-in-time snapshot of all connected executors via an `ActorCommand::ListExecutors` (O(executors) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `ExecutorInfo` includes `executor_id`, `systems`, `supported_features`, `busy` (a build is in flight), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).

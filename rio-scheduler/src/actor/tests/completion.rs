@@ -553,21 +553,22 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 
 // r[verify sched.ca.cutoff-propagate+2]
 /// bug_009 regression: `verify_cutoff_candidates` matched prior
-/// outputs by string suffix (`p.ends_with("-{pname}")`). A prior
+/// outputs by string suffix (`p.ends_with("-{name}")`). A prior
 /// `…-python-requests` satisfied `.ends_with("-requests")`, so a
-/// candidate with `pname="requests"` cross-matched a DIFFERENT
+/// candidate with `name="requests"` cross-matched a DIFFERENT
 /// package, was Skipped, and a poisoned `(candidate_modular →
 /// wrong_path)` realisation row was written to PG.
 ///
-/// Setup: A→B and A→C (siblings). B's pname=`python-requests`,
-/// C's pname=`requests`. Seed prior realisations for A and B only;
-/// realisation_deps(B depends on A). C has NO prior realisation —
-/// it MUST NOT be Skipped, and PG MUST have no realisation row for
-/// C's modular_hash.
+/// Setup: A→B and A→C (siblings). B's drv_name=`python-requests`,
+/// C's drv_name=`requests`. Seed prior realisations for A and B
+/// only; realisation_deps(B depends on A). C has NO prior
+/// realisation — it MUST NOT be Skipped, and PG MUST have no
+/// realisation row for C's modular_hash.
 ///
-/// Mutation check: revert to `ends_with("-{pname}")` → C
+/// Mutation check: revert to `ends_with("-{name}")` → C
 /// cross-matches B's `…-python-requests` path → C goes Skipped →
-/// the `assert_ne` below fails.
+/// the `assert_ne` below fails. (Match key is `drv_name()` derived
+/// from the `.drv` store-path, not `pname` — see bug_006.)
 #[tokio::test]
 async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -582,22 +583,19 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
 
     let a_out = test_store_path("xmatch-a");
     // Load-bearing: b_out's name segment is `python-requests`, which
-    // ends with `-requests` (C's pname). With suffix matching, C
+    // ends with `-requests` (C's drv_name). With suffix matching, C
     // would cross-match this path.
     let b_out = test_store_path("python-requests");
 
     let mut node_a = make_node("xmatch-a");
     node_a.is_content_addressed = true;
     node_a.ca_modular_hash = a_modular.to_vec();
-    node_a.pname = "xmatch-a".into();
-    let mut node_b = make_node("xmatch-b");
+    let mut node_b = make_node("python-requests");
     node_b.is_content_addressed = true;
     node_b.ca_modular_hash = b_modular.to_vec();
-    node_b.pname = "python-requests".into();
-    let mut node_c = make_node("xmatch-c");
+    let mut node_c = make_node("requests");
     node_c.is_content_addressed = true;
     node_c.ca_modular_hash = c_modular.to_vec();
-    node_c.pname = "requests".into();
 
     let _rx = connect_executor(&handle, "xmatch-worker", "x86_64-linux").await?;
 
@@ -607,8 +605,8 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
         build_id,
         vec![node_a, node_b, node_c],
         vec![
-            make_test_edge("xmatch-b", "xmatch-a"),
-            make_test_edge("xmatch-c", "xmatch-a"),
+            make_test_edge("python-requests", "xmatch-a"),
+            make_test_edge("requests", "xmatch-a"),
         ],
         false,
     )
@@ -642,7 +640,7 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
     assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
 
     // B: Skipped, stamped with the CORRECT path (its own).
-    let info_b = expect_drv(&handle, "xmatch-b").await;
+    let info_b = expect_drv(&handle, "python-requests").await;
     assert_eq!(
         info_b.status,
         DerivationStatus::Skipped,
@@ -652,7 +650,7 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
 
     // C: NOT Skipped. With the suffix-match bug, C would cross-match
     // b_out (…-python-requests ends_with -requests) and go Skipped.
-    let info_c = expect_drv(&handle, "xmatch-c").await;
+    let info_c = expect_drv(&handle, "requests").await;
     assert_ne!(
         info_c.status,
         DerivationStatus::Skipped,
@@ -681,6 +679,175 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
         "no poisoned realisation row written for C's modular_hash"
     );
 
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate+2]
+/// bug_006 regression: `verify_cutoff_candidates` keyed
+/// `expected_name` on bare `pname` (`"hello"`), but store-path name
+/// segments are `"${name}"` = `"${pname}-${version}"` for stdenv
+/// (`"hello-2.10"`). The match never fired for any versioned
+/// package — the entire cascade was dead code for ~all of nixpkgs.
+///
+/// Setup: A→B with B's drv_name=`hello-2.10` (so a real stdenv path
+/// `…-hello-2.10` matches), `pname="hello"`, `version="2.10"`. Seed
+/// B's prior realisation at `…-hello-2.10`. Pre-fix: `expected_name
+/// = "hello"`, never matches `"hello-2.10"` → B stays Queued.
+/// Post-fix: `expected_name = drv_name() = "hello-2.10"` → Skipped.
+#[tokio::test]
+async fn cascade_matches_versioned_stdenv_name() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let pool = db.pool.clone();
+    let _db = db;
+
+    let a_modular: [u8; 32] = [0xA0; 32];
+    let b_modular: [u8; 32] = [0xB0; 32];
+    let a_prior: [u8; 32] = [0xA1; 32];
+    let b_prior: [u8; 32] = [0xB1; 32];
+
+    let a_out = test_store_path("stdenv-a");
+    // Load-bearing: store-path name segment is `hello-2.10`
+    // (`${pname}-${version}`), as for any real stdenv package.
+    let b_out = test_store_path("hello-2.10");
+
+    let mut node_a = make_node("stdenv-a");
+    node_a.is_content_addressed = true;
+    node_a.ca_modular_hash = a_modular.to_vec();
+    // drv_path = …-hello-2.10.drv → drv_name() = "hello-2.10".
+    // pname/version diverge from drv_name exactly as stdenv does;
+    // pre-fix the cascade keyed on pname="hello" and never matched.
+    let mut node_b = make_node("hello-2.10");
+    node_b.is_content_addressed = true;
+    node_b.ca_modular_hash = b_modular.to_vec();
+    node_b.pname = "hello".into();
+    node_b.version = Some("2.10".into());
+
+    let _rx = connect_executor(&handle, "stdenv-w", "x86_64-linux").await?;
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![node_a, node_b],
+        vec![make_test_edge("hello-2.10", "stdenv-a")],
+        false,
+    )
+    .await?;
+
+    seed_realisation(&pool, &a_prior, "out", &a_out, &[0xAA; 32]).await?;
+    seed_realisation(&pool, &b_prior, "out", &b_out, &[0xBB; 32]).await?;
+    sqlx::query(
+        "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+         VALUES ($1, 'out', $2, 'out')",
+    )
+    .bind(b_prior.as_slice())
+    .bind(a_prior.as_slice())
+    .execute(&pool)
+    .await?;
+    store.seed_with_content(&b_out, b"hello-content");
+
+    complete_ca(
+        &handle,
+        "stdenv-w",
+        &test_drv_path("stdenv-a"),
+        &[("out", &a_out, vec![0xAA; 32])],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let info_a = expect_drv(&handle, "stdenv-a").await;
+    assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
+
+    let info_b = expect_drv(&handle, "hello-2.10").await;
+    assert_eq!(
+        info_b.status,
+        DerivationStatus::Skipped,
+        "stdenv-shaped name (`{{pname}}-{{version}}`) MUST match prior \
+         realisation → Skipped (pre-fix: pname=\"hello\" != \"hello-2.10\" → \
+         stayed Queued, cascade dead for all of nixpkgs)"
+    );
+    assert_eq!(info_b.output_paths, vec![b_out]);
+    Ok(())
+}
+
+// r[verify sched.completion.output-membership]
+/// bug_071 regression: `handle_completion` validated worker-supplied
+/// `built_outputs` only by `StorePath::parse` format, never by
+/// membership in scheduler-trusted `output_names` or by cardinality.
+/// A compromised worker reporting on its own assigned 1-output drv
+/// could send ~30k fabricated entries (4MB tonic limit ÷ ~130B/entry),
+/// all reaching `state.output_paths` → `upsert_path_tenants`
+/// (arbitrary worker-chosen paths pinned against GC) and the
+/// sequential `insert_realisation` loop (~150s actor stall).
+///
+/// Post-fix: entries with `output_name ∉ output_names` are dropped
+/// AND duplicates by `output_name` are dropped, so
+/// `output_paths.len() ≤ output_names.len()` regardless of what the
+/// worker sends.
+#[tokio::test]
+async fn built_outputs_membership_filter() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task, _rx) = setup_with_worker("memb-w", "x86_64-linux").await?;
+    let drv_hash = "memb-drv";
+    let drv_path = test_drv_path(drv_hash);
+    // make_node → output_names = ["out"] (1 declared output).
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    assert!(handle.debug_force_assign(drv_hash, "memb-w").await?);
+
+    // 1 valid "out" + 100 fabricated names + 1 duplicate "out". All
+    // paths are well-formed (the format-filter passes); only the
+    // membership/dedup filter catches them.
+    let valid = test_store_path("memb-out");
+    let mut outs = vec![rio_proto::types::BuiltOutput {
+        output_name: "out".into(),
+        output_path: valid.clone(),
+        output_hash: vec![0u8; 32],
+    }];
+    for i in 0..100 {
+        outs.push(rio_proto::types::BuiltOutput {
+            output_name: format!("fake{i}"),
+            output_path: test_store_path(&format!("fake-{i}")),
+            output_hash: vec![0u8; 32],
+        });
+    }
+    outs.push(rio_proto::types::BuiltOutput {
+        output_name: "out".into(),
+        output_path: test_store_path("memb-dup"),
+        output_hash: vec![0u8; 32],
+    });
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "memb-w".into(),
+            drv_key: drv_path,
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: outs,
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_resources: None,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert_eq!(
+        info.output_paths,
+        vec![valid],
+        "only the declared `out` survives; 100 fabricated + 1 dup dropped \
+         (pre-fix: output_paths.len() == 102)"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_undeclared_built_output_total{}"),
+        100,
+        "one counter increment per undeclared output_name"
+    );
     Ok(())
 }
 
@@ -715,11 +882,11 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
     let mut node_a = make_node("ambig-a");
     node_a.is_content_addressed = true;
     node_a.ca_modular_hash = a_modular.to_vec();
-    node_a.pname = "ambig-a".into();
-    let mut node_b = make_node("ambig-b");
+    // drv_name = "ambig-pkg" (matches BOTH b_out_1 and b_out_2's
+    // name segment → triggers the >1-hit ambiguity guard).
+    let mut node_b = make_node("ambig-pkg");
     node_b.is_content_addressed = true;
     node_b.ca_modular_hash = b_modular.to_vec();
-    node_b.pname = "ambig-pkg".into();
 
     let _rx = connect_executor(&handle, "ambig-worker", "x86_64-linux").await?;
 
@@ -728,7 +895,7 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
         &handle,
         build_id,
         vec![node_a, node_b],
-        vec![make_test_edge("ambig-b", "ambig-a")],
+        vec![make_test_edge("ambig-pkg", "ambig-a")],
         false,
     )
     .await?;
@@ -763,7 +930,7 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
     let info_a = expect_drv(&handle, "ambig-a").await;
     assert!(info_a.ca.output_unchanged, "precondition: A matched prior");
 
-    let info_b = expect_drv(&handle, "ambig-b").await;
+    let info_b = expect_drv(&handle, "ambig-pkg").await;
     assert_ne!(
         info_b.status,
         DerivationStatus::Skipped,
@@ -1177,7 +1344,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             &format!("b-{c}"),
             &p,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
-            "cgroup OOM during build; bumping resource floor",
+            &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
         )
         .await?;
         let s = expect_drv(&handle, "ladder-drv").await;
@@ -1244,57 +1411,54 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     Ok(())
 }
 
-/// Distinct-worker poison-threshold matrix. N TransientFailures on
-/// distinct workers → Poisoned, via three branches:
+/// Distinct-worker poison-threshold matrix under one-shot (I-188)
+/// semantics. N TransientFailures on distinct workers:
 ///
 /// - **threshold**: 3 distinct of 4 workers → `failed_builders.len()
-///   ≥ POISON_THRESHOLD` → poison.
-/// - **clamp**: 2 distinct of 2 workers (below threshold=3) → poison
-///   via `worker_count` clamp `min(3,2)=2`. Without clamp, would
-///   starve Ready forever (best_executor excludes both).
-/// - **kind_aware** (I-065): 2 distinct builders + 1 fetcher present.
-///   Pre-fix `executors.keys().all(in failed_builders)` was false
-///   (fetcher not in set) → diffutils-3.12.drv stuck Ready forever.
-///   Fix: predicate is kind-aware.
+///   ≥ POISON_THRESHOLD` → Poisoned. Independent of fleet-exhaust.
+/// - **pool_2_no_premature_poison**: 2 distinct of 2 workers (below
+///   threshold=3) → Ready (re-queued for fresh workers), NOT
+///   Poisoned. Under one-shot, both failed workers are draining →
+///   `failed_builders_exhausts_fleet` excludes them → empty fleet →
+///   `false` → re-queue. The controller spawns fresh `executor_id`s
+///   ∉ `failed_builders`; poison flows ONLY through
+///   `is_poisoned(threshold)` once 3 distinct accumulate.
+/// - **pool_1_no_premature_poison** (bug_108 regression): poolSize=1,
+///   1 transient → Ready, NOT Poisoned. Pre-fix the just-failed
+///   draining worker counted toward "the fleet" → fleet={E1},
+///   failed={E1} → exhausted → poisoned on the FIRST failure,
+///   bypassing `max_retries` and `poison_config.threshold`.
+///
+/// The kind/system/features clauses of `statically_eligible` are
+/// independently pinned by the unit-level
+/// `assignment::statically_eligible_agrees_with_rejection_reason`;
+/// the actor-level `kind_aware` case (bug_160) is no longer
+/// reachable under one-shot (failed workers drain → excluded
+/// regardless of kind), so it's subsumed here.
 ///
 /// `max_retries=10` for ALL cases so the `retry_count>=max_retries`
-/// branch doesn't mask the threshold/clamp under test (default
+/// branch doesn't mask the threshold under test (default
 /// `max_retries=2` would trip on the same iteration as
 /// `is_poisoned(3≥3)` for the threshold case — vacuous coverage).
 #[rstest]
-#[case::threshold(true, 4, &["pt-w1", "pt-w2", "pt-w3"], false)]
-#[case::clamp(true, 2, &["pt-w1", "pt-w2"], false)]
-#[case::kind_aware(true, 2, &["pt-w1", "pt-w2"], true)]
+#[case::threshold(4, &["pt-w1", "pt-w2", "pt-w3"], DerivationStatus::Poisoned)]
+#[case::pool_2_no_premature_poison(2, &["pt-w1", "pt-w2"], DerivationStatus::Ready)]
+#[case::pool_1_no_premature_poison(1, &["pt-w1"], DerivationStatus::Ready)]
 #[tokio::test]
 async fn test_distinct_transient_poison_matrix(
-    #[case] raise_max_retries: bool,
     #[case] n_builders: usize,
     #[case] fail_on: &[&str],
-    #[case] add_fetcher: bool,
+    #[case] expected_status: DerivationStatus,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        if raise_max_retries {
-            c.retry_policy.max_retries = 10;
-        }
+        c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
     let mut _rxs = Vec::new();
     for i in 1..=n_builders {
         _rxs.push(connect_executor(&handle, &format!("pt-w{i}"), "x86_64-linux").await?);
-    }
-    if add_fetcher {
-        // Fetcher's presence is what broke pre-I-065: not in failed_builders.
-        _rxs.push(
-            connect_executor_no_ack_kind(
-                &handle,
-                "pt-fetcher",
-                "builtin",
-                rio_proto::types::ExecutorKind::Fetcher,
-            )
-            .await?,
-        );
     }
 
     let build_id = Uuid::new_v4();
@@ -1311,16 +1475,19 @@ async fn test_distinct_transient_poison_matrix(
     let info = expect_drv(&handle, "pt-drv").await;
     assert_eq!(
         info.status,
-        DerivationStatus::Poisoned,
-        "{} distinct TransientFailures → Poisoned (failed_builders={:?})",
+        expected_status,
+        "{} distinct TransientFailures on pool of {n_builders} → {expected_status:?} \
+         (failed_builders={:?})",
         fail_on.len(),
         info.retry.failed_builders
     );
     assert_eq!(info.retry.failed_builders.len(), fail_on.len());
-    assert_eq!(
-        query_status(&handle, build_id).await?.state,
-        rio_proto::types::BuildState::Failed as i32
-    );
+    if expected_status == DerivationStatus::Poisoned {
+        assert_eq!(
+            query_status(&handle, build_id).await?.state,
+            rio_proto::types::BuildState::Failed as i32
+        );
+    }
     Ok(())
 }
 
@@ -1750,7 +1917,80 @@ async fn i127_batch_concurrent_putpath_exempt() -> TestResult {
         after.retry.infra_count, 0,
         "batch-shape concurrent-PutPath must NOT increment infra_retry_count"
     );
+    assert_eq!(
+        after.retry.exempt_infra_count, 15,
+        "exempt attempts tracked separately (15 < default max_exempt_infra_retries=50)"
+    );
 
+    Ok(())
+}
+
+// r[verify sched.retry.exempt-infra-cap]
+/// `max_exempt_infra_retries` is the scheduler-side terminal for the
+/// I-127 CONCURRENT_PUTPATH cap-exemption. Without it, a leaked
+/// store-side placeholder lock (the I-125a class) makes every honest
+/// worker report the exempt message → infinite pod churn with
+/// `infra_count=0` and no `warn!`. With it, the drv poisons at the
+/// configured cap with a `warn!` signal so the operator investigates.
+#[tokio::test]
+async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_exempt_infra_retries = 5;
+    });
+    let _db = db;
+    let _rx = connect_executor(&handle, "leak-w", "x86_64-linux").await?;
+
+    let drv_hash = "leak-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    let leaked_msg = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
+    for attempt in 0..4 {
+        let ok = handle.debug_force_assign(drv_hash, "leak-w").await?;
+        assert!(ok, "force-assign at attempt {attempt}");
+        complete_failure(
+            &handle,
+            "leak-w",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            &leaked_msg,
+        )
+        .await?;
+        let s = expect_drv(&handle, drv_hash).await;
+        assert_eq!(s.retry.exempt_infra_count, attempt + 1);
+        assert_eq!(s.retry.infra_count, 0, "exempt → infra_count stays 0");
+        assert!(
+            matches!(
+                s.status,
+                DerivationStatus::Ready | DerivationStatus::Assigned
+            ),
+            "attempt {} (< cap=5): still re-queued, got {:?}",
+            attempt + 1,
+            s.status
+        );
+    }
+
+    // 5th attempt: exempt_infra_count 5 >= max=5 → poison.
+    let ok = handle.debug_force_assign(drv_hash, "leak-w").await?;
+    assert!(ok);
+    complete_failure(
+        &handle,
+        "leak-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        &leaked_msg,
+    )
+    .await?;
+    let s = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "exempt_infra_count=5 >= max_exempt_infra_retries=5 → poisoned \
+         (pre-fix: status stayed Ready forever, no terminal)"
+    );
+    assert_eq!(s.retry.exempt_infra_count, 5);
     Ok(())
 }
 
@@ -3002,7 +3242,7 @@ async fn test_unsolicited_cancelled_resets_to_ready() -> TestResult {
 /// Previously `bump_floor_or_count` incremented BEFORE the cap check
 /// for at-cap, so it poisoned one attempt earlier.
 #[rstest]
-#[case::at_cap_oom("cgroup OOM during build", true)]
+#[case::at_cap_oom(rio_proto::CGROUP_OOM_MSG, true)]
 #[case::fuse_eio("FUSE EIO on lower mount", false)]
 #[tokio::test]
 async fn test_infra_retry_cap_uniform_across_reasons(

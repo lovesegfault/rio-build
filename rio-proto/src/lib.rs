@@ -26,6 +26,15 @@ pub use rio_common::grpc::{
 /// can't drift again.
 pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 
+/// Substring carried in `ExecutorError::CgroupOom`'s Display impl and
+/// matched by rio-scheduler's `handle_infrastructure_failure` to trigger
+/// `r[sched.sla.reactive-floor]`. Single source of truth so the
+/// `#[error]` attr and the `.contains()` consumer can't drift. The
+/// `cgroup_oom_display_contains_proto_constant` test in rio-builder
+/// pins the Display side; the 8 scheduler test fixtures reference this
+/// constant so a rename forces all sites to update in lockstep.
+pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
+
 pub mod client;
 pub mod interceptor;
 pub mod status;

@@ -316,6 +316,15 @@ pub struct RetryState {
     /// 0 before the cap check — sparse failures over a long build
     /// don't accumulate toward poison.
     pub last_infra_failure_at: Option<Instant>,
+    /// Number of `exempt_from_cap` infra-retry attempts so far
+    /// (I-127's CONCURRENT_PUTPATH + D4's `floor_outcome.promoted`).
+    /// Increments even when `infra_count` does not — the high-water
+    /// terminal that keeps the cap-exemption from livelocking under a
+    /// leaked store-side placeholder lock (the I-125a class). Bounded
+    /// by `RetryPolicy::max_exempt_infra_retries`; no time-window
+    /// reset (a stuck lock that persists across the window is exactly
+    /// what this counter exists to catch).
+    pub exempt_infra_count: u32,
     /// Workers that have failed building this derivation. Drives
     /// `best_executor()` exclusion + poison threshold in distinct mode.
     /// Persisted.
@@ -356,6 +365,7 @@ impl RetryState {
         self.infra_count = 0;
         self.timeout_count = 0;
         self.last_infra_failure_at = None;
+        self.exempt_infra_count = 0;
         self.failed_builders.clear();
         self.failure_count = 0;
         self.poisoned_at = None;
@@ -856,6 +866,19 @@ impl DerivationState {
         &self.drv_path
     }
 
+    /// The derivation's `name` attribute, as encoded in the `.drv`
+    /// store path (`{hash}-{name}.drv` → `{name}`). This is what
+    /// Nix's `outputPathName` keys output-path name segments on —
+    /// NOT `pname` (which omits the version suffix; `pname="hello"`
+    /// vs `name="hello-2.10"`). Infallible: `drv_path` is a parsed
+    /// `StorePath` so `name()` always exists; the `.drv` suffix is
+    /// stripped if present (it always is for a real `.drv`, but
+    /// `unwrap_or_else` keeps the method panic-free).
+    pub fn drv_name(&self) -> &str {
+        let n = self.drv_path.name();
+        n.strip_suffix(".drv").unwrap_or(n)
+    }
+
     /// Tenant IDs of all interested builds. Base iterator for
     /// [`Self::attributed_tenant`] (min) and the path-tenant upsert
     /// (collect-all). `filter_map` drops `None` (single-tenant mode;
@@ -1061,6 +1084,25 @@ mod tests {
 
     fn dummy_node() -> crate::domain::DerivationNode {
         rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux").into()
+    }
+
+    /// `drv_name()` strips the `.drv` suffix from the store-path
+    /// name segment. For a stdenv package, this yields the full
+    /// `${pname}-${version}` (what `output_path_name` keys on), NOT
+    /// the bare `pname` — the distinction the CA-cutoff cascade gets
+    /// wrong if it keys on `pname` (bug_006).
+    #[test]
+    fn drv_name_strips_suffix_and_keeps_version() -> anyhow::Result<()> {
+        let node: crate::domain::DerivationNode =
+            rio_test_support::fixtures::make_derivation_node("hello-2.10", "x86_64-linux").into();
+        let state = DerivationState::try_from_node(&node)?;
+        assert_eq!(
+            state.drv_name(),
+            "hello-2.10",
+            "drv_name = {{hash}}-{{name}}.drv → {{name}}; for stdenv this is \
+             ${{pname}}-${{version}}, not bare pname"
+        );
+        Ok(())
     }
 
     // r[verify sched.ca.detect]

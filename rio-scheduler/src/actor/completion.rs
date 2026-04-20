@@ -381,17 +381,18 @@ impl DagActor {
             let Some(state) = self.dag.node(hash) else {
                 continue;
             };
-            let Some(pname) = &state.pname else {
-                // No pname → can't match by name → conservative exclude.
-                continue;
-            };
+            // Match on the derivation's `name` (encoded in
+            // `drv_path`), NOT `pname`: stdenv constructs `name =
+            // "${pname}-${version}"` and store-path name segments
+            // are built from `name`, so a `pname`-based comparison
+            // (`"hello" == "hello-2.10"`) never matches for ~all of
+            // nixpkgs. `drv_name()` is infallible (no recovered-node
+            // `version=None` regression that a `${pname}-${version}`
+            // reconstruction would have).
+            let drv_name = state.drv_name();
             let mut matched: Vec<CaCutoffVerified> = Vec::new();
             for out_name in &state.output_names {
-                let expected_name = if out_name == "out" {
-                    pname.clone()
-                } else {
-                    format!("{pname}-{out_name}")
-                };
+                let expected_name = rio_nix::store_path::output_path_name(drv_name, out_name);
                 // Linear scan over prior_outputs — bounded by
                 // MAX_CASCADE_NODES, so small-N. Count hits so the
                 // ambiguity guard below can fire.
@@ -718,6 +719,37 @@ impl DagActor {
             warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
             return;
         };
+        // r[impl sched.completion.output-membership]
+        // Threat-model boundary, part 2: now that `state` is available,
+        // bound `built_outputs` to the scheduler-trusted `output_names`
+        // (parsed from the .drv at DAG-merge time). The format-filter
+        // above runs before `state` is resolved and validates path
+        // SHAPE only — it does not check membership or cardinality. A
+        // compromised worker reporting on its own assigned drv could
+        // otherwise stuff ~30k fabricated entries (4MB tonic limit ÷
+        // ~130B/entry), all reaching `state.output_paths` →
+        // `upsert_path_tenants` (arbitrary worker-chosen paths pinned
+        // against GC) and, for CA drvs, the sequential
+        // `insert_realisation` loop (~150s actor stall — same I-139
+        // shape called out at the cascade-dispatch comment). After
+        // this retain, `built_outputs.len() ≤ output_names.len()`.
+        let declared = &state.output_names;
+        let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
+        result.built_outputs.retain(|o| {
+            if !declared.contains(&o.output_name) {
+                warn!(
+                    executor_id = %executor_id,
+                    drv_hash = %drv_hash,
+                    output_name = %o.output_name,
+                    "dropping worker-supplied output not declared by derivation"
+                );
+                metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
+                return false;
+            }
+            // Dedup by output_name (keep first). `insert` returns
+            // false on dup → drop.
+            seen.insert(o.output_name.clone())
+        });
         let current_status = state.status();
 
         // Idempotency: completed -> completed is a no-op
@@ -1900,23 +1932,25 @@ impl DagActor {
             .await;
 
         // r[impl sched.retry.per-executor-budget]
-        // Starvation guard: clamp effective threshold to the
-        // kind-matching fleet. If ALL registered workers of the
-        // matching kind are in failed_builders, best_executor returns
-        // None forever (hard_filter's failed_builders exclusion
-        // rejects everyone). Poison now so the operator gets a signal
-        // instead of a silent stuck derivation. The dispatch-time
-        // backstop (`failed_builders_exhausts_fleet`) catches the same
-        // condition for paths that bypass this handler
-        // (reassign_derivations, recovery reconcile); doing it here
-        // saves one dispatch cycle for the common explicit-failure
-        // path.
+        // Defense-in-depth: under one-shot semantics (I-188; the only
+        // mode), failed workers are draining and excluded from the
+        // fleet count, and the controller spawns fresh `executor_id`s
+        // that are never in `failed_builders` — so this returns
+        // `false` in practice and poison-on-repeated-failure flows
+        // through `PoisonConfig::is_poisoned(threshold)` (via
+        // `record_failure_and_check_poison` above). The check remains
+        // for any future path where a worker fails WITHOUT draining
+        // (which would otherwise let `best_executor` return None
+        // forever via hard_filter's `failed_builders` exclusion). The
+        // dispatch-time backstop catches the same condition for paths
+        // that bypass this handler (reassign_derivations, recovery
+        // reconcile).
         //
-        // I-065: the previous version checked `self.executors.keys()`
-        // (ALL kinds). With 2 builders + 2 fetchers, a drv that failed
-        // on both builders never tripped it — fetchers aren't in
-        // failed_builders. The kind-aware predicate is shared with the
-        // dispatch-time check.
+        // I-065: the predicate is kind/system/feature-aware AND
+        // excludes draining workers — see
+        // `failed_builders_exhausts_fleet`'s doc-comment for the
+        // poolSize=1 premature-poison scenario the draining-exclusion
+        // fixes.
         let exhausts_fleet = self.failed_builders_exhausts_fleet(drv_hash);
         let reached_poison = reached_poison || exhausts_fleet;
 
@@ -2045,8 +2079,11 @@ impl DagActor {
         // controller via `ReportExecutorTermination` instead.
         //
         // Substring match on the `ExecutorError::CgroupOom` Display
-        // impl ("cgroup OOM during build…").
-        let floor_outcome = if error_msg.contains("cgroup OOM") {
+        // impl; both reference `rio_proto::CGROUP_OOM_MSG` so the
+        // contract can't drift between the `#[error]` attr (pinned by
+        // rio-builder's `cgroup_oom_display_contains_proto_constant`
+        // test) and this consumer match site.
+        let floor_outcome = if error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
             self.bump_resource_floor(
                 drv_hash,
                 rio_proto::types::TerminationReason::OomKilled,
@@ -2087,6 +2124,39 @@ impl DagActor {
         // the two consumer match sites.
         let exempt_from_cap =
             floor_outcome.promoted || error_msg.contains(rio_proto::CONCURRENT_PUTPATH_MSG);
+
+        // r[impl sched.retry.exempt-infra-cap]
+        // High-water terminal for the cap-exemption: increments on
+        // EVERY exempt attempt (both CONCURRENT_PUTPATH and
+        // `promoted`) and poisons at a generous bound well above the
+        // I-127 4-in-a-row benign ceiling. Without this, a leaked
+        // store-side placeholder lock makes every honest worker report
+        // CONCURRENT_PUTPATH → infinite pod churn with no `warn!`
+        // signal and no counter advancing. The cap converts a silent
+        // livelock into an actionable poison; recovery cost is one
+        // `ClearPoison` after the store is fixed.
+        if exempt_from_cap {
+            state.retry.exempt_infra_count += 1;
+            if state.retry.exempt_infra_count >= self.retry_policy.max_exempt_infra_retries {
+                state.ensure_running();
+                let max = self.retry_policy.max_exempt_infra_retries;
+                let count = state.retry.exempt_infra_count;
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    exempt_infra_count = count,
+                    max,
+                    "exempt infra-retry cap exceeded; poisoning \
+                     (likely leaked store lock / stuck floor-promote)"
+                );
+                self.poison_and_cascade(
+                    drv_hash,
+                    &format!("max_exempt_infra_retries={max} exceeded: {error_msg}"),
+                )
+                .await;
+                return;
+            }
+        }
 
         // I-127 time-window reset: if the last counted infra failure
         // was longer ago than `infra_retry_window_secs`, treat this as
@@ -2469,15 +2539,9 @@ impl DagActor {
                 error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
             }
         } else {
-            // keepGoing: record sticky failure (failed_count is DAG-derived
-            // and resets to 0 if the poisoned node is later removed via
-            // ClearPoison/TTL), then check if all derivations are resolved.
-            build
-                .error_summary
-                .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
-            build
-                .failed_derivation
-                .get_or_insert_with(|| drv_hash.to_string());
+            // keepGoing: sticky failure already recorded above; failed_count
+            // is DAG-derived and resets to 0 if the poisoned node is later
+            // removed via ClearPoison/TTL. Check if all derivations resolved.
             self.check_build_completion(build_id).await;
         }
     }

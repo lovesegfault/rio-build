@@ -279,6 +279,11 @@ pub fn describe_metrics() {
          (dropped at handle_completion boundary); alert if rate > 0"
     );
     describe_counter!(
+        "rio_scheduler_undeclared_built_output_total",
+        "Worker-supplied BuiltOutput.output_name not in derivation's output_names \
+         (dropped at handle_completion membership filter); alert if rate > 0"
+    );
+    describe_counter!(
         "rio_scheduler_log_lines_forwarded_total",
         "Log lines forwarded via BuildEvent::Log (worker -> scheduler -> gateway broadcast)"
     );
