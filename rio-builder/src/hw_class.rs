@@ -57,7 +57,19 @@ pub(crate) async fn resolve_from(
                     return Some(s.to_owned());
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Downward-API volume creates the file at mount time
+                // (empty until the annotation lands). NotFound means
+                // the volume is NOT mounted — non-k8s deployment, or
+                // a pod template without the volume — so the file
+                // will never appear. Short-circuit instead of blocking
+                // setup() for POLL_BOUND; on standalone this stalled
+                // worker registration past the VM-test wait_until_
+                // succeeds timeout (vm-scheduling-core).
+                tracing::debug!(path = %path.display(),
+                    "hw_class: downward volume file absent; non-k8s, bench skipped");
+                return None;
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e,
                     "hw_class: read failed; treating as unset");
@@ -87,10 +99,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hw-class");
 
-        // Missing → expiry → None.
+        // Missing → immediate None (no downward volume; non-k8s).
+        let started = tokio::time::Instant::now();
         assert_eq!(
-            resolve_from(&path, Duration::from_millis(10), Duration::from_millis(50)).await,
+            resolve_from(&path, Duration::from_millis(10), Duration::from_secs(30)).await,
             None
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "NotFound must short-circuit, not poll"
         );
 
         // Empty → write after first poll → Some.
