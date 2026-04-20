@@ -18,6 +18,13 @@ let
   # Store-path interpolation pulls the binary into the VM closure.
   # rio-cli is a Rust binary, linked to glibc (which the NixOS VM has).
   rioCli = "${common.rio-workspace}/bin/rio-cli";
+  # G10 gated AdminService RPCs on x-rio-service-token. rio-cli mints
+  # the token via ServiceTokenInterceptor when RIO_SERVICE_HMAC_KEY_PATH
+  # is set; the key derivation is the same one the chart Secret was
+  # rendered from, so signer and verifier agree.
+  cliEnv =
+    "RIO_SCHEDULER_ADDR=localhost:19001 "
+    + "RIO_SERVICE_HMAC_KEY_PATH=${fixture.hmacKeys}/service-hmac.key ";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
@@ -45,7 +52,7 @@ pkgs.testers.runNixOSTest {
     def cli(args):
         return k3s_server.succeed(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             f"${rioCli} {args} 2>&1"
         )
 
@@ -105,7 +112,7 @@ pkgs.testers.runNixOSTest {
         print(f"cli workers output:\n{out}")
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             "${rioCli} workers --json "
             "| ${pkgs.jq}/bin/jq -e '.executors | type == \"array\"'"
         )
@@ -128,7 +135,7 @@ pkgs.testers.runNixOSTest {
         # --json: total_count=0, builds=[] is a valid object.
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             "${rioCli} builds --json "
             "| ${pkgs.jq}/bin/jq -e '.total_count == 0 and (.builds | length == 0)'"
         )
@@ -177,7 +184,7 @@ pkgs.testers.runNixOSTest {
         # --json: cleared=false
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             f"${rioCli} poison-clear {fake_hash} --json "
             "| ${pkgs.jq}/bin/jq -e '.cleared == false'"
         )
@@ -197,7 +204,7 @@ pkgs.testers.runNixOSTest {
     with subtest("cli logs: NotFound when no ring buffer + no build_id"):
         out = k3s_server.fail(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             "${rioCli} logs /nix/store/00000000000000000000000000000000-nothing.drv 2>&1"
         )
         print(f"cli logs (expected fail) output:\n{out}")
@@ -224,7 +231,7 @@ pkgs.testers.runNixOSTest {
         # first call; the PG-backed list above is the hard assertion.
         k3s_server.succeed(
             "${common.covShellEnv}"
-            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${cliEnv}"
             "${rioCli} sla list --pname=hello --json "
             "| ${pkgs.jq}/bin/jq -e '.overrides[0].tier == \"fast\"'"
         )

@@ -637,6 +637,7 @@ rec {
     nsBuilders
     nsFetchers
     helmRendered
+    hmacKeys
     ;
 
   nodes = {
