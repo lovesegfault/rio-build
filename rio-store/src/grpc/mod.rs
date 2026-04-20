@@ -644,7 +644,12 @@ impl StoreService for StoreServiceImpl {
     /// `hw_class` and `factor` remain body-supplied: a valid token
     /// holder can write its one row to a foreign `hw_class`, but
     /// that's one rank in that class's median, bounded by
-    /// `HW_FACTOR_SANITY_CEIL` in `HwTable`.
+    /// `HW_FACTOR_SANITY_CEIL` in `HwTable`. `hw_class` is bounded at
+    /// [`rio_common::limits::MAX_HW_CLASS_LEN`] chars of `[a-z0-9-]` —
+    /// the unique key is `(hw_class, pod_id)`, so without a format
+    /// bound a compromised builder could spam distinct multi-MB strings
+    /// and fill the table (M_041's "one row per pod start" assumed
+    /// honest callers).
     // r[impl sched.sla.hw-bench-append-only]
     // r[impl sec.boundary.grpc-hmac]
     #[instrument(skip(self, request), fields(rpc = "AppendHwPerfSample"))]
@@ -666,8 +671,17 @@ impl StoreService for StoreServiceImpl {
             }
         };
         let req = request.into_inner();
-        if req.hw_class.is_empty() || pod_id.is_empty() {
-            return Err(Status::invalid_argument("hw_class and pod_id required"));
+        if req.hw_class.is_empty()
+            || req.hw_class.len() > rio_common::limits::MAX_HW_CLASS_LEN
+            || !req
+                .hw_class
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || pod_id.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "hw_class must be 1-64 chars of [a-z0-9-]; pod_id required",
+            ));
         }
         if !req.factor.is_finite() || req.factor <= 0.0 {
             return Err(Status::invalid_argument("factor must be finite and > 0"));

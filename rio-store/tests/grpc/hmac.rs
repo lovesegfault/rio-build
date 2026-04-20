@@ -347,7 +347,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived]
+// r[verify sec.authz.ca-path-derived+2]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -365,7 +365,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived]
+// r[verify sec.authz.ca-path-derived+2]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -389,6 +389,85 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
+// r[verify sec.authz.ca-path-derived+2]
+/// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
+/// for is_ca tokens, so a compromised worker could open a PutPath stream
+/// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
+/// placeholder fresh — forcing legitimate uploaders into `Aborted` until
+/// token expiry. Post-fix, the placeholder is not claimed until the
+/// server-derived CA path is verified, so a held-open mismatched-path
+/// stream never inserts a placeholder and a concurrent legitimate
+/// uploader for that path is unaffected.
+#[tokio::test]
+async fn hmac_is_ca_wrong_path_leaves_no_placeholder() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut attacker = s.client.clone();
+    let mut victim = s.client.clone();
+
+    // Victim's IA path the attacker wants to squat.
+    let victim_path = test_store_path("victim-glibc-2.40");
+    let (victim_nar, _) = make_nar(b"legitimate glibc");
+    let victim_info = make_path_info_for_nar(&victim_path, &victim_nar);
+
+    // Attacker: is_ca token, opens a PutPath stream targeting
+    // victim_path with metadata + ONE chunk, NO trailer — held open.
+    let (atx, arx) = mpsc::channel(8);
+    let mut bogus_info: PathInfo =
+        make_path_info_for_nar(&victim_path, &make_nar(b"evil").0).into();
+    bogus_info.nar_hash = vec![];
+    bogus_info.nar_size = 0;
+    atx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(bogus_info),
+        })),
+    })
+    .await
+    .unwrap();
+    atx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(vec![0u8])),
+    })
+    .await
+    .unwrap();
+    // atx kept alive — stream held open. Spawn the call so it parks
+    // on `stream.message().await` server-side.
+    let mut areq = tonic::Request::new(ReceiverStream::new(arx));
+    let atoken = sign_claims_full("evil-worker", vec![String::new()], true, 60);
+    areq.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, atoken.parse().unwrap());
+    let attacker_call = tokio::spawn(async move { attacker.put_path(areq).await });
+
+    // Give the server a beat to read metadata + chunk and (pre-fix)
+    // insert the placeholder. Post-fix it's parked at
+    // `stream.message().await` with NO PG row.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM manifests WHERE store_path_hash = sha256($1::text::bytea)",
+    )
+    .bind(&victim_path)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(
+        n, 0,
+        "is_ca held-open stream to non-derived path must NOT insert placeholder"
+    );
+
+    // Victim's legitimate IA upload (token lists victim_path) MUST
+    // succeed — pre-fix it got `Aborted: concurrent PutPath`.
+    let vtoken = sign_claims(vec![victim_path.clone()], 60);
+    let created = put_path_with_token(&mut victim, victim_info, victim_nar, &vtoken)
+        .await
+        .context("victim upload while attacker stream held open")?;
+    assert!(created, "victim's legitimate PutPath must not be blocked");
+
+    // Close attacker stream → server reads EOF without trailer →
+    // InvalidArgument (no trailer) — NOT Aborted/PermissionDenied
+    // before that since no placeholder was ever claimed. The exact
+    // status doesn't matter for the squat; just clean up.
+    drop(atx);
+    let _ = attacker_call.await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -409,7 +488,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived]
+// r[verify sec.authz.ca-path-derived+2]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
@@ -520,6 +599,61 @@ async fn append_hw_perf_sample_forged_pod_id_ignored() -> TestResult {
         row.0, "real-pod",
         "pod_id from claims.executor_id, not body"
     );
+    Ok(())
+}
+
+/// `hw_class` length-bounded at MAX_HW_CLASS_LEN. Unique key is
+/// `(hw_class, pod_id)` — without a bound, one compromised builder with a
+/// legitimate token could loop distinct multi-MB strings and fill
+/// `hw_perf_samples` (M_041's "one row per pod start" assumed honest
+/// callers). 65 chars → InvalidArgument; nothing inserted.
+// r[verify sched.sla.hw-bench-append-only]
+#[tokio::test]
+async fn append_hw_perf_sample_oversized_hw_class_rejected() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    let token = sign_claims_full("real-pod", vec![String::new()], false, 60);
+    let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
+        hw_class: "a".repeat(rio_common::limits::MAX_HW_CLASS_LEN + 1),
+        pod_id: "ignored".into(),
+        factor: 1.5,
+    });
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+    let err = client
+        .append_hw_perf_sample(req)
+        .await
+        .expect_err("oversized hw_class → reject");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM hw_perf_samples")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(n, 0, "rejected request must not INSERT");
+    Ok(())
+}
+
+/// `hw_class` charset-bounded to `[a-z0-9-]` — the controller-stamped
+/// 4-segment format. Slash, uppercase, unicode → InvalidArgument.
+// r[verify sched.sla.hw-bench-append-only]
+#[tokio::test]
+async fn append_hw_perf_sample_bad_charset_rejected() -> TestResult {
+    let s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let mut client = s.client.clone();
+    let token = sign_claims_full("real-pod", vec![String::new()], false, 60);
+    for bad in ["aws/7/ebs", "AWS-7-ebs-hi", "aws-7-ébs-hi"] {
+        let mut req = tonic::Request::new(AppendHwPerfSampleRequest {
+            hw_class: bad.into(),
+            pod_id: "ignored".into(),
+            factor: 1.5,
+        });
+        req.metadata_mut()
+            .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+        let err = client
+            .append_hw_perf_sample(req)
+            .await
+            .expect_err("bad charset → reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "hw_class={bad:?}");
+    }
     Ok(())
 }
 

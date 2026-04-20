@@ -95,10 +95,19 @@ impl HwClass {
     /// `"{manufacturer}-{generation}-{storage}-{band}"`, e.g.
     /// `"aws-7-ebs-mid"`.
     pub fn as_string(&self) -> String {
-        format!(
+        let s = format!(
             "{}-{}-{}-{}",
             self.manufacturer, self.generation, self.storage, self.band
-        )
+        );
+        // rio-store rejects hw_class > MAX_HW_CLASS_LEN. Segments come
+        // from node labels (controller-stamped); a future change that
+        // produces longer strings would silently break the builder's
+        // AppendHwPerfSample. Fail fast in tests.
+        debug_assert!(
+            s.len() <= rio_common::limits::MAX_HW_CLASS_LEN,
+            "hw_class {s:?} exceeds MAX_HW_CLASS_LEN"
+        );
+        s
     }
 
     /// Extract from a Node's labels. Missing labels default to

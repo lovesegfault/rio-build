@@ -53,6 +53,35 @@ pub const MAX_SUBSTITUTE_CLOSURE: usize = 50_000;
 /// clients chunk at ≥4 KiB so the floor never applies on the hot path.
 pub const MIN_NAR_CHUNK_CHARGE: u32 = 256;
 
+/// Semaphore permits charged for one `NarChunk` against `nar_bytes_budget`.
+///
+/// Floored at [`MIN_NAR_CHUNK_CHARGE`]. Exposed so PutPath/PutPathBatch
+/// callers track their cumulative charge in the SAME unit the semaphore
+/// debits — `r[store.put.nar-bytes-budget]`'s "single batch can never
+/// self-deadlock on permits it holds" only holds when the per-handler
+/// `MAX_NAR_SIZE` cap is enforced in charged-permit units, not raw wire
+/// bytes (a 1-byte chunk charges 256, so a raw-byte cap undercounts 256×).
+pub const fn nar_chunk_charge(len: usize) -> u64 {
+    let len = len as u64;
+    if len < MIN_NAR_CHUNK_CHARGE as u64 {
+        MIN_NAR_CHUNK_CHARGE as u64
+    } else {
+        len
+    }
+}
+
+/// Maximum length of a `hw_class` string accepted by `AppendHwPerfSample`.
+///
+/// Real values are controller-stamped via downward-API as
+/// `"{manufacturer}-{generation}-{storage}-{band}"` (e.g. `"aws-7-ebs-mid"`;
+/// longest realistic `"unknown-unknown-unknown-unknown"` = 31 chars). The
+/// schema column is unbounded `TEXT` and the unique key is composite
+/// `(hw_class, pod_id)`, so without a length cap a compromised builder
+/// holding a legitimate token could loop with distinct multi-MB strings and
+/// fill `hw_perf_samples` indefinitely. 64 gives 2× headroom over the
+/// longest legitimate value.
+pub const MAX_HW_CLASS_LEN: usize = 64;
+
 /// Maximum number of outputs in a single PutPathBatch request.
 ///
 /// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,
@@ -92,3 +121,37 @@ pub const MAX_MISSED_HEARTBEATS: u32 = 3;
 /// after an arbitrary 30s. If you tune the interval, the timeout moves
 /// with it automatically.
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = MAX_MISSED_HEARTBEATS as u64 * HEARTBEAT_INTERVAL_SECS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nar_chunk_charge` floors at MIN_NAR_CHUNK_CHARGE for tiny chunks
+    /// and is identity for chunks at/above the floor. This is the unit
+    /// the per-handler MAX_NAR_SIZE cap MUST be tracked in — see
+    /// `r[store.put.nar-bytes-budget]`.
+    // r[verify store.put.nar-bytes-budget+3]
+    #[test]
+    fn nar_chunk_charge_floors_tiny_chunks() {
+        assert_eq!(nar_chunk_charge(0), MIN_NAR_CHUNK_CHARGE as u64);
+        assert_eq!(nar_chunk_charge(1), MIN_NAR_CHUNK_CHARGE as u64);
+        assert_eq!(
+            nar_chunk_charge(MIN_NAR_CHUNK_CHARGE as usize - 1),
+            MIN_NAR_CHUNK_CHARGE as u64
+        );
+        assert_eq!(
+            nar_chunk_charge(MIN_NAR_CHUNK_CHARGE as usize),
+            MIN_NAR_CHUNK_CHARGE as u64
+        );
+        assert_eq!(nar_chunk_charge(4096), 4096);
+        // Invariant the self-deadlock fix relies on: a handler that
+        // sends N tiny chunks is charged ≥ N × MIN_NAR_CHUNK_CHARGE,
+        // so the per-handler MAX_NAR_SIZE cap (in charged units) fires
+        // at ≤ MAX_NAR_SIZE / MIN_NAR_CHUNK_CHARGE chunks — never more
+        // than MAX_NAR_SIZE permits held → with budget ≥ MAX_NAR_SIZE
+        // (production: 8×), no self-deadlock possible.
+        let n = 1000u64;
+        let charged: u64 = (0..n).map(|_| nar_chunk_charge(1)).sum();
+        assert_eq!(charged, n * MIN_NAR_CHUNK_CHARGE as u64);
+    }
+}

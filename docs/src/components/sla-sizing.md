@@ -41,6 +41,10 @@ On a false→true leader edge, the cost-table poller MUST reload `sla_ema_state`
 r[sched.sla.ice-ladder-cap]
 A single derivation's ICE-backoff ladder MUST NOT exceed `ladder_cap = clamp(⌈max_tier_bound/hw_fallback_after/4⌉, 1, 8)` Pending-watch timeouts; on exhaustion the derivation MUST fall through to band-agnostic dispatch (`solve_intent_for` skips `solve_full`). The fleet-wide `IceBackoff::exhausted()` is unreachable from one build's serial probing because `ICE_TTL=60s < hw_fallback_after≈120s`. Attempted `(band, cap)` cells SHOULD be recorded for forensics.
 
+`hw_class` is bounded at `MAX_HW_CLASS_LEN` (64) chars of `[a-z0-9-]`
+(the controller-stamped 4-segment format); longer or out-of-charset
+values are rejected with `INVALID_ARGUMENT`.
+
 r[sched.sla.quantile-geo-lognormal]
 
 r[sched.sla.prior-partial-pool]
