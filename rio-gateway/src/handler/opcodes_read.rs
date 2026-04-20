@@ -30,6 +30,14 @@ use crate::drv_cache::resolve_derivation;
 ///
 /// Output paths (everything that isn't a `.drv`) keep tenant-scoped
 /// visibility — `r[store.tenant.narinfo-filter]` applies there.
+///
+/// The store-side `sig_visibility_gate` / `sig_visibility_gate_batch`
+/// now mirror this exemption (rio-store/src/grpc/sign.rs), so batch
+/// opcodes (`wopQueryValidPaths`, `wopQueryMissing`) that send mixed
+/// `.drv`/non-`.drv` paths with the raw JWT get consistent answers
+/// without partitioning here. This helper remains for the single-path
+/// opcodes as a layer-independent enforcement (and avoids the
+/// `path_tenants` round-trip for `.drv` lookups).
 // r[impl gw.jwt.anon-drv-lookup]
 fn jwt_unless_drv<'a>(jwt_token: Option<&'a str>, path: &StorePath) -> Option<&'a str> {
     if path.is_derivation() {

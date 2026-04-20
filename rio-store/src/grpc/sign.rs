@@ -63,6 +63,17 @@ impl StoreServiceImpl {
         if self.substituter.is_none() {
             return Ok(true);
         }
+        // r[impl gw.jwt.anon-drv-lookup]
+        // .drv files are build INPUTS, not tenant-owned outputs — exempt
+        // from tenant-scoped visibility. Gateway-side `jwt_unless_drv`
+        // already strips the JWT for single-path .drv lookups; this is
+        // the store-side mirror so the policy holds regardless of which
+        // caller (or which batch RPC) sends the path. Without it, a .drv
+        // with zero `path_tenants` rows falls through to sig-verify and
+        // is reported invisible (no upstream sigs on .drvs).
+        if info.store_path.is_derivation() {
+            return Ok(true);
+        }
 
         let path_hash = info.store_path.sha256_digest();
 
@@ -202,7 +213,13 @@ impl StoreServiceImpl {
         let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
         let mut subst_only: Vec<String> = Vec::new();
         for (p, h) in present.iter().zip(&hashes) {
-            if built_hashes.contains(h) {
+            // r[impl gw.jwt.anon-drv-lookup]
+            // .drv files are build inputs, not tenant-owned outputs —
+            // exempt per the same policy as the single-path gate above
+            // (mirrors gateway-side `jwt_unless_drv`). Without this,
+            // `wopQueryValidPaths` reports a .drv missing while
+            // `wopIsValidPath` reports it valid for the same path/JWT.
+            if built_hashes.contains(h) || p.ends_with(".drv") {
                 visible.insert(p.clone());
             } else {
                 subst_only.push(p.clone());
@@ -693,6 +710,95 @@ mod tests {
                 .await
                 .unwrap(),
             "other tenant doesn't trust this tenant's key → hidden"
+        );
+    }
+
+    // r[verify gw.jwt.anon-drv-lookup]
+    /// `.drv` paths are exempt from tenant-scoped visibility in BOTH
+    /// the single-path and batch gates. A `.drv` with zero
+    /// `path_tenants` rows and no signatures is visible to a tenant
+    /// with substituter configured; an output path in the same state
+    /// is NOT.
+    ///
+    /// Regression for the `wopQueryValidPaths` / `wopIsValidPath`
+    /// inconsistency: the four single-path gateway opcodes apply
+    /// `jwt_unless_drv` (anonymous lookup → gate's `tenant_id=None`
+    /// fast-path), but the batch opcode sends the raw JWT — without
+    /// the store-side exemption, the batch gate routed `.drv` to
+    /// `subst_only` → sig-verify failed (no upstream sigs) → reported
+    /// missing → every tenant-JWT `nix copy` re-uploaded every `.drv`.
+    #[tokio::test]
+    async fn sig_visibility_gate_exempts_drv_paths() {
+        use crate::test_helpers::seed_tenant;
+        use rio_test_support::TestDb;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
+
+        let tid = seed_tenant(&db.pool, "drv-exempt").await;
+        // Tenant trusts an upstream key (so the gate's "trusted set
+        // empty" fast-path doesn't fire) but neither path is signed.
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "https://cache.example",
+            50,
+            &["key-X:aaaa".into()],
+            crate::metadata::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Seed two paths into narinfo: one .drv, one regular output.
+        // BOTH have zero path_tenants rows and zero signatures —
+        // identical state except for the .drv suffix.
+        let drv_path = test_store_path("exempt.drv");
+        let out_path = test_store_path("exempt-out");
+        for p in [&drv_path, &out_path] {
+            let (nar, nar_hash) = rio_test_support::fixtures::make_nar(p.as_bytes());
+            let mut info = make_path_info(p, &nar, nar_hash);
+            let path_hash = info.store_path.sha256_digest();
+            info.store_path_hash = path_hash.to_vec();
+            metadata::insert_manifest_uploading(&db.pool, &path_hash, p, &[])
+                .await
+                .unwrap();
+            metadata::complete_manifest_inline(&db.pool, &info, nar.into())
+                .await
+                .unwrap();
+        }
+
+        // Single-path gate: .drv visible, output hidden.
+        let drv_info = metadata::query_path_info(&db.pool, &drv_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let out_info = metadata::query_path_info(&db.pool, &out_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            svc.sig_visibility_gate(Some(tid), &drv_info).await.unwrap(),
+            ".drv with no path_tenants/sigs must be visible (build input, not tenant output)"
+        );
+        assert!(
+            !svc.sig_visibility_gate(Some(tid), &out_info).await.unwrap(),
+            "non-.drv with no path_tenants/sigs must be hidden (substitution-only, untrusted)"
+        );
+
+        // Batch gate: same answers — proves wopQueryValidPaths agrees
+        // with wopIsValidPath for .drv paths under a tenant JWT.
+        let batch = svc
+            .sig_visibility_gate_batch(Some(tid), &[drv_path.clone(), out_path.clone()])
+            .await
+            .unwrap();
+        assert!(
+            batch.contains(&drv_path),
+            "batch gate must exempt .drv (was: routed to subst_only → sig-verify → invisible)"
+        );
+        assert!(
+            !batch.contains(&out_path),
+            "batch gate must still hide untrusted non-.drv"
         );
     }
 
