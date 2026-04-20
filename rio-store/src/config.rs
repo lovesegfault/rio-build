@@ -178,11 +178,12 @@ pub(crate) struct CliArgs {
 }
 
 impl rio_common::config::ValidateConfig for Config {
-    /// Only one check today (database_url) but creates the hook for
-    /// gc.*, chunk_backend.*, signing.* bounds as they become
-    /// operator-settable.
+    /// Reject operator-settable config that produces a silent hang or
+    /// degenerate state at startup, not at first use. Every field that
+    /// meets that bar is checked here.
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
+        use rio_common::limits::MIN_NAR_CHUNK_CHARGE;
         required(&self.database_url, "database_url", "store")?;
         // 0 → buffer_unordered(0) returns Pending forever (no waker):
         // every put_chunked silently hangs the data plane.
@@ -196,6 +197,27 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             self.s3_max_attempts >= 1,
             "s3_max_attempts must be >= 1; set RIO_S3_MAX_ATTEMPTS"
+        );
+        // < MIN_NAR_CHUNK_CHARGE → Semaphore::new(n<256); every PutPath
+        // acquire_many(chunk.len().max(256)) is Pending forever. There
+        // is no "unlimited" sentinel; unset for the 32 GiB default.
+        anyhow::ensure!(
+            self.nar_buffer_budget_bytes
+                .is_none_or(|b| b >= MIN_NAR_CHUNK_CHARGE as u64),
+            "nar_buffer_budget_bytes must be >= {MIN_NAR_CHUNK_CHARGE} \
+             (smaller hangs all uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
+             for the 32 GiB default — there is no 'unlimited' sentinel"
+        );
+        // 0 → PgPoolOptions max_connections(0) → PoolTimedOut after 30s
+        // with a misleading message.
+        anyhow::ensure!(
+            self.pg_max_connections >= 1,
+            "pg_max_connections must be >= 1; set RIO_PG_MAX_CONNECTIONS"
+        );
+        // 0 → every FindMissingPaths rejected with InvalidArgument.
+        anyhow::ensure!(
+            self.max_batch_paths >= 1,
+            "max_batch_paths must be >= 1; set RIO_MAX_BATCH_PATHS"
         );
         Ok(())
     }
@@ -320,6 +342,62 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("s3_max_attempts"), "got: {err}");
+    }
+
+    /// `nar_buffer_budget_bytes=Some(0)` → `Semaphore::new(0)` → every
+    /// PutPath `acquire_many(≥256)` Pending forever, store wedged
+    /// silently with green health checks.
+    #[test]
+    fn validate_rejects_zero_nar_budget() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            nar_buffer_budget_bytes: Some(0),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+    }
+
+    /// Any budget < MIN_NAR_CHUNK_CHARGE has identical Pending-forever
+    /// behavior because `acquire_many` floors at 256.
+    #[test]
+    fn validate_rejects_sub_min_nar_budget() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            nar_buffer_budget_bytes: Some(100),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        // None (unset) is fine — that's the 32 GiB default.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            nar_buffer_budget_bytes: None,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_pg_connections() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            pg_max_connections: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("pg_max_connections"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_batch_paths() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            max_batch_paths: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_batch_paths"), "got: {err}");
     }
 
     // r[verify store.cas.s3-retry]
