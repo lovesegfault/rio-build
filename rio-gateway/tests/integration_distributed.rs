@@ -300,9 +300,9 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     let mut ctx = SessionContext::new(
         store_client,
         scheduler_client,
-        None, // tenant
-        None, // jwt
-        None, // service_signer
+        None,                                     // tenant
+        rio_gateway::handler::SessionJwt::none(), // jwt
+        None,                                     // service_signer
         rio_gateway::TenantLimiter::disabled(),
         rio_gateway::QuotaCache::new(),
     );

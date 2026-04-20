@@ -4,7 +4,7 @@
 
 mod connection;
 mod keys;
-mod session_jwt;
+pub(crate) mod session_jwt;
 
 pub use connection::ConnectionHandler;
 pub use keys::{

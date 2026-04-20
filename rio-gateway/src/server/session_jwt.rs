@@ -12,12 +12,14 @@ use ed25519_dalek::SigningKey;
 use rio_auth::jwt;
 use tracing::{debug, warn};
 
-/// JWT `exp` = mint time + this. Upper-bounds a single SSH session's
-/// token lifetime at the SSH inactivity_timeout (3600s — see
-/// `build_ssh_config`) plus a 5-minute grace for in-flight gRPC calls
-/// that outlive the SSH close. A long build that exceeds 1h of SSH
-/// idle gets dropped by russh anyway; the JWT expiry is a second
-/// fence, not the primary one.
+/// JWT `exp` = mint time + this. `build_ssh_config` sets
+/// `keepalive_interval=30s`, so a long build's keepalive replies and
+/// stderr stream reset russh's `inactivity_timeout` indefinitely —
+/// JWT expiry is the PRIMARY fence on token lifetime, not the second
+/// one. A single channel can outlive this (chromium/llvm/ghc easily
+/// exceed 65min); [`SessionJwt::token`](crate::handler::SessionJwt::token)
+/// re-mints lazily on every access via [`refresh_session_jwt`] so a
+/// post-build `wopQueryPathInfo` never sends an expired token.
 ///
 /// Spec (`r[gw.jwt.claims]`) says "SSH session duration + grace" —
 /// but we don't know the session duration at mint time. This is the
@@ -61,7 +63,7 @@ const JWT_REFRESH_SLACK_SECS: i64 = 300;
 /// Returns `(token, claims)` so callers that want to log `jti`
 /// without re-parsing the token can read it directly. The token is
 /// opaque to the gateway after this — it's just a string to inject.
-pub(super) fn mint_session_jwt(
+pub(crate) fn mint_session_jwt(
     tenant_id: uuid::Uuid,
     signing_key: &SigningKey,
 ) -> Result<(String, jwt::TenantClaims), jwt::JwtError> {
@@ -79,27 +81,28 @@ pub(super) fn mint_session_jwt(
     Ok((token, claims))
 }
 
-// r[impl gw.jwt.refresh-on-expiry]
+// r[impl gw.jwt.refresh-on-expiry+2]
 /// Re-mint the cached session JWT if it is within
 /// `JWT_REFRESH_SLACK_SECS` of expiry. Returns a borrow of the
 /// (possibly-refreshed) token string, or `None` if no token is cached
 /// (dual-mode fallback / single-tenant).
 ///
-/// Called from `ConnectionHandler::ensure_fresh_jwt` on every
-/// `exec_request` — i.e., every new SSH channel on a mux'd connection.
-/// SSH `ControlMaster` keeps one TCP connection alive indefinitely;
-/// without this, a channel opened past `JWT_SESSION_TTL_SECS` would
-/// inject an expired token and get `ExpiredSignature` from the store
-/// (I-129). Re-mint is purely local: `tenant_id` is `claims.sub` from
-/// the cached token, `signing_key` is already on the handler — no
-/// `ResolveTenant` round-trip.
+/// Called from [`SessionJwt::token`](crate::handler::SessionJwt::token)
+/// on every token access (per outbound gRPC call) and from
+/// `exec_request` for the per-channel snapshot. SSH `ControlMaster`
+/// keeps one TCP connection alive indefinitely (I-129) AND a single
+/// channel can outlive `JWT_SESSION_TTL_SECS` (keepalive resets the
+/// inactivity timer, so a >65min build never trips it). Re-mint is
+/// purely local: `tenant_id` is `claims.sub` from the cached token,
+/// `signing_key` is already on hand — no `ResolveTenant` round-trip.
+/// Cheap when fresh: one `SystemTime::now()` + i64 compare.
 ///
 /// On re-mint failure (only possible if the signing key is corrupt —
 /// the same key minted the original), the stale token is returned
 /// unchanged and a warning logged. The store will reject it with a
 /// clear `ExpiredSignature`; that surfaces the problem instead of
 /// silently degrading to the `tenant_name` fallback mid-connection.
-pub(super) fn refresh_session_jwt<'a>(
+pub(crate) fn refresh_session_jwt<'a>(
     cached: &'a mut Option<(String, jwt::TenantClaims)>,
     signing_key: Option<&SigningKey>,
 ) -> Option<&'a str> {
@@ -240,7 +243,7 @@ mod jwt_issuance_tests {
         );
     }
 
-    // r[verify gw.jwt.refresh-on-expiry]
+    // r[verify gw.jwt.refresh-on-expiry+2]
     /// A token within `JWT_REFRESH_SLACK_SECS` of expiry is re-minted
     /// on the next `refresh_session_jwt` call. Exercises the I-129
     /// path: ControlMaster mux'd connection, channel opened past the
@@ -300,6 +303,53 @@ mod jwt_issuance_tests {
             original_jti,
             "no re-mint → jti unchanged"
         );
+    }
+
+    // r[verify gw.jwt.refresh-on-expiry+2]
+    /// `SessionJwt::token()` is the ONLY public read path and ALWAYS
+    /// goes through `refresh_session_jwt`. A `SessionJwt` constructed
+    /// with an already-expired token returns a fresh one on first
+    /// access; second access returns the SAME (now-fresh) string with
+    /// no churn. Regression: at b62291b8 the token was a bare
+    /// `Option<String>` snapshotted once at `exec_request` — a single
+    /// channel running a >65min build would send the stale token on
+    /// the post-build `wopQueryPathInfo`.
+    #[test]
+    fn session_jwt_token_refreshes_per_access() {
+        use crate::handler::SessionJwt;
+        use std::sync::Arc;
+
+        let tenant_id = uuid::Uuid::from_u128(0xCAFE);
+        let key = test_key(0xAA);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Already-expired cached token — simulates a channel that has
+        // been running a long build past JWT_SESSION_TTL_SECS.
+        let stale_claims = jwt::TenantClaims {
+            sub: tenant_id,
+            iat: now - JWT_SESSION_TTL_SECS - 10,
+            exp: now - 10,
+            jti: "stale-jti".to_string(),
+        };
+        let mut sj = SessionJwt::new(
+            Some(("stale-token".to_string(), stale_claims)),
+            Some(Arc::new(key)),
+        );
+
+        let first = sj.token().expect("token present").to_owned();
+        assert_ne!(first, "stale-token", "first access must re-mint");
+
+        let second = sj.token().expect("token present");
+        assert_eq!(
+            second, first,
+            "second access on a now-fresh token must NOT re-mint (no jti churn)"
+        );
+
+        // Dual-mode: none() always yields None.
+        assert!(SessionJwt::none().token().is_none());
     }
 
     /// `None` cached → `None` out, regardless of key. Dual-mode

@@ -123,7 +123,7 @@ pub async fn run_protocol<R, W>(
     store_client: &mut StoreServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: Option<NormalizedName>,
-    jwt_token: Option<String>,
+    jwt: crate::handler::SessionJwt,
     service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     // Per-tenant rate limiter, shared across all sessions via
     // `Arc`-inside-`TenantLimiter`. Checked in the build handlers
@@ -148,7 +148,7 @@ where
         store_client.clone(),
         scheduler_client.clone(),
         tenant_name,
-        jwt_token,
+        jwt,
         service_signer,
         limiter,
         quota_cache,

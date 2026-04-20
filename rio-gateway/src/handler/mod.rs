@@ -8,7 +8,10 @@
 //! build operations delegate to rio-scheduler via `SchedulerServiceClient`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
+use rio_auth::jwt;
 use rio_nix::derivation::Derivation;
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
@@ -233,6 +236,70 @@ pub(crate) async fn read_store_path<R: AsyncRead + Unpin>(
     Ok((path_str, path))
 }
 
+// r[impl gw.jwt.refresh-on-expiry+2]
+/// Self-refreshing session-JWT accessor. Replaces the bare
+/// `Option<String>` snapshot that was moved into `SessionContext` once
+/// per channel and never refreshed: a single channel running a >65min
+/// build (chromium, llvm, ghc) outlives `JWT_SESSION_TTL_SECS`, and the
+/// post-build `wopQueryPathInfo` would send an expired token →
+/// `ExpiredSignature` AFTER the build already succeeded.
+///
+/// [`token`](Self::token) is the ONLY public read path; it always
+/// passes through `server::session_jwt::refresh_session_jwt` (cheap
+/// when fresh: one `SystemTime::now()` + i64 compare; re-mint is
+/// ~50µs Ed25519 sign only when within 5min of expiry). The type makes
+/// the "snapshot once, never refresh" bug unrepresentable — there is no
+/// way to read the cached string without going through the refresh hook.
+pub struct SessionJwt {
+    cached: Option<(String, jwt::TenantClaims)>,
+    signing_key: Option<Arc<SigningKey>>,
+}
+
+impl SessionJwt {
+    /// Dual-mode fallback / single-tenant — no JWT minted, [`token`](Self::token)
+    /// always returns `None`, downstream reads `tenant_name` from the
+    /// proto body instead.
+    pub fn none() -> Self {
+        Self {
+            cached: None,
+            signing_key: None,
+        }
+    }
+
+    /// Construct from the `(token, claims)` pair minted at
+    /// `auth_publickey` plus the signing key needed to re-mint. Both
+    /// are already on `ConnectionHandler`; `exec_request` clones them
+    /// into the spawned protocol task.
+    pub fn new(
+        cached: Option<(String, jwt::TenantClaims)>,
+        signing_key: Option<Arc<SigningKey>>,
+    ) -> Self {
+        Self {
+            cached,
+            signing_key,
+        }
+    }
+
+    /// Lazily-refreshed token. Re-mints if within 5min of `exp`; cheap
+    /// no-op otherwise. `None` → dual-mode fallback (no JWT configured).
+    pub fn token(&mut self) -> Option<&str> {
+        crate::server::session_jwt::refresh_session_jwt(
+            &mut self.cached,
+            self.signing_key.as_deref(),
+        )
+    }
+
+    /// Owned snapshot of the (possibly-refreshed) token, for moving
+    /// into spawned tasks that outlive the `&mut self` borrow. The
+    /// snapshot is fresh AT THE CALL — the spawned task is responsible
+    /// for not holding it past `JWT_SESSION_TTL_SECS` (in practice:
+    /// `handle_add_multiple_to_store`'s pipeline tasks are bounded by
+    /// the per-entry NAR upload, well under 65min).
+    pub fn token_owned(&mut self) -> Option<String> {
+        self.token().map(str::to_owned)
+    }
+}
+
 /// Per-session mutable state, threaded through all opcode handlers.
 ///
 /// Holds the gRPC clients and protocol-session-scoped state (options,
@@ -254,11 +321,14 @@ pub struct SessionContext {
     /// and whitespace-free — no downstream `.trim()` needed.
     pub tenant_name: Option<NormalizedName>,
     /// Per-session JWT minted at SSH auth time. Injected as
-    /// `x-rio-tenant-token` on outbound gRPC calls. `None` when
-    /// the gateway's signing key is unconfigured → dual-mode
-    /// fallback (downstream reads `tenant_name` from the proto
-    /// body instead). See `r[gw.jwt.issue]` / `r[gw.jwt.dual-mode]`.
-    pub jwt_token: Option<String>,
+    /// `x-rio-tenant-token` on outbound gRPC calls. Read via
+    /// [`SessionJwt::token`] — the accessor lazily re-mints when near
+    /// expiry, so a single channel that outlives `JWT_SESSION_TTL_SECS`
+    /// (long build) never sends a stale token. `.token() == None` when
+    /// the gateway's signing key is unconfigured → dual-mode fallback
+    /// (downstream reads `tenant_name` from the proto body instead).
+    /// See `r[gw.jwt.issue]` / `r[gw.jwt.dual-mode]`.
+    pub jwt: SessionJwt,
     /// Service-identity HMAC signer keyed with
     /// `RIO_SERVICE_HMAC_KEY_PATH`. Attached as `x-rio-service-token`
     /// on store `PutPath` calls so the store grants HMAC bypass
@@ -290,7 +360,7 @@ impl SessionContext {
         store_client: StoreServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: Option<NormalizedName>,
-        jwt_token: Option<String>,
+        jwt: SessionJwt,
         service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         limiter: TenantLimiter,
         quota_cache: QuotaCache,
@@ -302,7 +372,7 @@ impl SessionContext {
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
             tenant_name,
-            jwt_token,
+            jwt,
             service_signer,
             limiter,
             quota_cache,

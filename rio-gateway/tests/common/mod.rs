@@ -38,7 +38,7 @@ pub fn spawn_session_task(
             &mut store_client,
             &mut sched_client,
             tenant,
-            None,
+            rio_gateway::handler::SessionJwt::none(),
             None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),

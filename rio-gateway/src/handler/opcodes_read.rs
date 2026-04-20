@@ -48,7 +48,7 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopIsValidPath");
@@ -81,7 +81,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopEnsurePath");
@@ -121,7 +121,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     // handler → tenant-scoped narinfo visibility gate. Without this,
     // the store sees anonymous → gate short-circuits → path invisible
     // even if the tenant's trusted_keys would admit it.
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopQueryPathInfo");
@@ -182,7 +182,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let path_strs = wire::read_strings(reader).await?;
     let _substitute = wire::read_bool(reader).await?;
     tracing::Span::current().record("count", path_strs.len());
@@ -322,7 +322,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let (path_str, path) = match read_store_path(reader).await {
         Ok(v) => v,
         Err(e) => stderr_err!(stderr, "{e}"),
@@ -397,7 +397,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let hash_part = wire::read_string(reader).await?;
     tracing::Span::current().record("hash_part", hash_part.as_str());
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
@@ -443,7 +443,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let path_str = wire::read_string(reader).await?;
     let sigs = wire::read_strings(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -515,7 +515,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let json = wire::read_string(reader).await?;
     debug!(json_len = json.len(), "wopRegisterDrvOutput");
 
@@ -678,7 +678,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let id = wire::read_string(reader).await?;
     tracing::Span::current().record("id", id.as_str());
 
@@ -777,7 +777,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     // → substitute short-circuits at rio-store/src/grpc/mod.rs
     // tenant_id_or_skip → client is told to BUILD what it could FETCH.
     // This was the P0465 blocker for `cargo xtask k8s -p kind rsb`.
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let drv_cache = &mut ctx.drv_cache;
     let raw_paths = wire::read_strings(reader).await?;
     tracing::Span::current().record("count", raw_paths.len());
@@ -971,7 +971,7 @@ pub(super) async fn handle_query_derivation_output_map<
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let drv_cache = &mut ctx.drv_cache;
     let (drv_path_str, drv_path) = match read_store_path(reader).await {
         Ok(v) => v,

@@ -84,7 +84,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let EntryHead {
@@ -292,7 +292,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
@@ -425,7 +425,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
@@ -555,7 +555,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
 ) -> anyhow::Result<()> {
     let service_signer = ctx.service_signer.clone();
     let store_client = &mut ctx.store_client;
-    let jwt_token = ctx.jwt_token.as_deref();
+    let jwt_token = ctx.jwt.token();
     let drv_cache = &mut ctx.drv_cache;
     let _repair = wire::read_bool(reader).await?;
     let _dont_check_sigs = wire::read_bool(reader).await?;

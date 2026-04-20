@@ -28,6 +28,7 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 
 use super::AuthorizedKeys;
 use super::session_jwt::{mint_session_jwt, refresh_session_jwt};
+use crate::handler::SessionJwt;
 use crate::quota::QuotaCache;
 use crate::ratelimit::TenantLimiter;
 use crate::session::run_protocol;
@@ -172,8 +173,8 @@ pub struct ConnectionHandler {
     /// string is cloned into every `SessionContext` spawned from this
     /// connection (multiple SSH channels share one token — they're the
     /// same authenticated session). The claims are kept so
-    /// [`ensure_fresh_jwt`](Self::ensure_fresh_jwt) can read
-    /// `sub`/`exp` to re-mint without re-parsing the token or
+    /// [`session_jwt`](Self::session_jwt) / [`SessionJwt::token`] can
+    /// read `sub`/`exp` to re-mint without re-parsing the token or
     /// re-resolving the tenant. `None` → header injection skipped →
     /// dual-mode fallback.
     pub(super) jwt_token: Option<(String, jwt::TenantClaims)>,
@@ -297,11 +298,16 @@ impl ConnectionHandler {
         Ok((token, claims))
     }
 
-    /// Thin wrapper over [`refresh_session_jwt`] using this handler's
-    /// cached token + signing key. Called from `exec_request` for
-    /// every new channel.
-    fn ensure_fresh_jwt(&mut self) -> Option<&str> {
-        refresh_session_jwt(&mut self.jwt_token, self.jwt_signing_key.as_deref())
+    /// Construct a [`SessionJwt`] for a freshly-spawned protocol task.
+    /// Refreshes the connection-level cached token first (so all
+    /// channels on a ControlMaster mux see a fresh token at open —
+    /// I-129) then hands a clone of `(cached, signing_key)` to the
+    /// task. The task's [`SessionJwt::token`] re-mints lazily on every
+    /// access, so a single channel that outlives `JWT_SESSION_TTL_SECS`
+    /// (long build) never sends a stale token.
+    fn session_jwt(&mut self) -> SessionJwt {
+        refresh_session_jwt(&mut self.jwt_token, self.jwt_signing_key.as_deref());
+        SessionJwt::new(self.jwt_token.clone(), self.jwt_signing_key.clone())
     }
 
     /// Enforce `r[gw.conn.cap]`: if `new_client` hit the cap
@@ -677,10 +683,14 @@ impl Handler for ConnectionHandler {
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
         // One token per SSH connection, shared across all channels.
-        // Re-mint if near expiry (I-129: ControlMaster mux keeps the
-        // connection alive past JWT_SESSION_TTL_SECS). Then clone the
-        // ~200-byte string into the spawned task.
-        let jwt_token = self.ensure_fresh_jwt().map(str::to_owned);
+        // The spawned task gets a `SessionJwt` (cached + signing_key)
+        // and refreshes lazily on every `.token()` access — covers
+        // BOTH I-129 (ControlMaster mux opens a new channel past
+        // `JWT_SESSION_TTL_SECS`) AND a single channel outliving the
+        // TTL (keepalive resets `inactivity_timeout`, so a >65min
+        // build never trips it; the post-build `wopQueryPathInfo`
+        // would otherwise send an expired token).
+        let jwt = self.session_jwt();
         // Shared-state clone: all channels on all connections drain
         // the same per-tenant bucket.
         let service_signer = self.service_signer.clone();
@@ -705,7 +715,7 @@ impl Handler for ConnectionHandler {
                     &mut store_client,
                     &mut scheduler_client,
                     tenant_name,
-                    jwt_token,
+                    jwt,
                     service_signer,
                     limiter,
                     quota_cache,

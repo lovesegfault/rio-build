@@ -894,7 +894,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         has_seen_build_paths_with_results,
         active_build_ids,
         tenant_name,
-        jwt_token,
+        jwt,
         limiter,
         quota_cache,
         ..
@@ -1015,7 +1015,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         scheduler_client,
         request,
         active_build_ids,
-        jwt_token.as_deref(),
+        jwt.token(),
     )
     .await
     {
@@ -1174,7 +1174,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         drv_cache,
         active_build_ids,
         tenant_name,
-        jwt_token,
+        jwt,
         limiter,
         quota_cache,
         ..
@@ -1202,7 +1202,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         scheduler_client,
         request,
         active_build_ids,
-        jwt_token.as_deref(),
+        jwt.token(),
     )
     .await?;
     Ok(DagSubmitOutcome::Built(result))
@@ -1260,9 +1260,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt_token.as_deref(), path)
-                    .await
-                {
+                match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt.token(), path).await {
                     Ok(true) => { /* exists, fine */ }
                     Ok(false) => {
                         stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
@@ -1350,9 +1348,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         match &dp {
             DerivedPath::Opaque(path) => {
                 let result =
-                    match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt_token.as_deref(), path)
-                        .await
-                    {
+                    match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt.token(), path).await {
                         Ok(true) => BuildResult {
                             status: BuildStatus::AlreadyValid,
                             ..Default::default()
