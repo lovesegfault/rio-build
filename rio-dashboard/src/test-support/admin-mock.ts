@@ -56,6 +56,7 @@ export const adminMock = {
   getBuildLogs: vi.fn(emptyStream) as Mock,
   triggerGC: vi.fn(emptyStream) as Mock,
   drainExecutor: vi.fn(),
+  cancelBuild: vi.fn(),
   clearPoison: vi.fn(),
   listPoisoned: vi.fn(),
   inspectBuildDag: vi.fn(),
