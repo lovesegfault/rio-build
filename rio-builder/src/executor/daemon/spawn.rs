@@ -66,7 +66,7 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     overlay_mount: &overlay::OverlayMount,
 ) -> Result<tokio::process::Child, ExecutorError> {
     // r[impl builder.netpol.airgap]
-    // r[impl fetcher.netpol.egress-open]
+    // r[impl fetcher.netpol.egress-open+2]
     // fod_proxy param removed per ADR-019: builders are airgapped
     // (no proxy needed — no internet); fetchers have direct egress
     // (no proxy needed — hash check is the integrity boundary). The

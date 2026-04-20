@@ -831,11 +831,11 @@ in
   #   builder-airgap subtest: builder netns curl to TEST-NET-3 origin
   #   (203.0.113.1:80) → rc≠0. Positive control: scheduler ClusterIP
   #   connects (NetPol allow fires).
-  # r[verify fetcher.netpol.egress-open]
+  # r[verify fetcher.netpol.egress-open+2]
   #   fetcher-egress + fetcher-imds-blocked subtests: SAME origin,
-  #   fetcher netns → rc==0 (0.0.0.0/0:80 allow fires). Then IMDS
-  #   → rc≠0 (169.254.0.0/16 except-clause). The origin probe is the
-  #   non-vacuous differentiator vs builder.
+  #   fetcher netns → rc==0 (toEntities:[world]:80 allow fires). Then
+  #   IMDS → rc≠0 (host entity, NOT world → denied). The origin probe
+  #   is the non-vacuous differentiator vs builder.
   # r[verify fetcher.node.dedicated]
   #   fetcher-node-dedicated subtest: pod spec has the rio.build/
   #   fetcher toleration + nodeSelector (reconciler defaults), and

@@ -5,21 +5,15 @@
 # Airgapped: all images preloaded via services.k3s.images. NodePort
 # gateway (no cloud LB). Inline chunk backend (no S3).
 
-dualStack:
-  # k3s-full.nix runs IPv6 single-stack (7-node v6-only topology with
-  # external NAT64 — mirrors EKS private_subnet_ipv6_native).
-  # PreferDualStack with [IPv6,IPv4] is rejected by a v6-only apiserver:
-  # spec.ipFamilies[1] "IPv4" not configured. The chart-wide
-  # rio.ipFamily helper still reads .Values.dualStack; once it
-  # hardcodes SingleStack/[IPv6] this block goes away.
-  policy: SingleStack
-  ipFamilies: [IPv6]
-
 global:
   image:
     tag: dev
     pullPolicy: IfNotPresent
   logLevel: debug
+  # k3s-full.nix test vlan eth1. The in-cluster bitnami PG pod is matched
+  # by the toEndpoints rule (not this toCIDRSet); this value exercises
+  # the same chart path EKS uses for out-of-cluster RDS.
+  postgresCidr: "2001:db8:1::/64"
 
 namespaces:
   create: true

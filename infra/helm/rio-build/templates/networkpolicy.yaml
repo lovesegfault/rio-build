@@ -81,7 +81,7 @@ spec:
       toPorts: [{ports: [{port: "443", protocol: TCP}]}]
     {{- end }}
 ---
-# r[impl fetcher.netpol.egress-open]
+# r[impl fetcher.netpol.egress-open+2]
 #
 # Fetcher egress: same three as builder PLUS world:80,443. Fetchers run
 # FODs only (scheduler hard_filter routes by ExecutorKind); the FOD
@@ -296,13 +296,11 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: postgresql
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
-    # External postgres (RDS / CloudSQL) — RFC1918 + ULA. These are
-    # outside the cluster so toCIDRSet matches as `world` subspace.
+    # External postgres (RDS / CloudSQL) — outside the cluster, so
+    # toCIDRSet matches as `world` subspace. rio is v6-only; the CIDR is
+    # the deployment's VPC IPv6 block (or ULA range for self-hosted).
     - toCIDRSet:
-        - {cidr: 10.0.0.0/8}
-        - {cidr: 172.16.0.0/12}
-        - {cidr: 192.168.0.0/16}
-        - {cidr: fc00::/7}
+        - {cidr: {{ .Values.global.postgresCidr | quote }}}
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- with .Values.networkPolicy.storeS3Cidr }}
     # S3 VPC endpoint CIDR — store writes chunks directly.

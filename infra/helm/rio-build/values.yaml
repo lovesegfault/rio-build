@@ -25,6 +25,12 @@ global:
   # Builder pods inherit the controller's RUST_LOG verbatim (builders.rs
   # reads its own env and passes it through), so one knob covers all.
   logLevel: "info"
+  # IPv6 CIDR containing the postgres endpoint, for the store-egress
+  # CiliumNetworkPolicy toCIDRSet rule. EKS: vpc_ipv6_cidr_block
+  # (terraform output, set via xtask deploy --set). vmtest-full: the
+  # test vlan /64. Default fc00::/7 (ULA) covers a self-hosted PG on a
+  # private-range address.
+  postgresCidr: "fc00::/7"
 
 # ADR-019 four-namespace split: privileged PSA narrows to the two
 # namespaces whose pods actually need CAP_SYS_ADMIN (FUSE mount).
@@ -102,34 +108,6 @@ bootstrap:
 
 podDisruptionBudget:
   enabled: true
-
-# Dual-stack Service ipFamilyPolicy. P0542: builders may run on a v6 pod
-# CIDR (I-073/I-079 — IPv4 /24 subnets exhaust at ~100-node autoscale).
-# `enabled: true` adds `ipFamilyPolicy: PreferDualStack` to scheduler/
-# store/gateway Services so they get both A and AAAA ClusterIPs (and the
-# headless Services return AAAA pod IPs to BalancedChannel). PreferDualStack
-# (not Require) means the chart still applies on v4-only clusters — the
-# apiserver assigns the single available family.
-#
-# THE CHART CHANGE ALONE DOES NOT FLIP A V4-ONLY CLUSTER. The cluster's
-# CNI must hand out v6 pod IPs. EKS: cluster created with `ip_family =
-# "ipv6"` OR a dual-stack VPC + aws-vpc-cni `ENABLE_IPv6=true`. GKE/AKS/
-# bare-metal Cilium/Calico: their respective dual-stack mode. Until then
-# `PreferDualStack` is a harmless no-op.
-dualStack:
-  enabled: true
-  # Override to RequireDualStack to make the apiserver REJECT the chart on
-  # v4-only clusters (fail-fast instead of silent v4-only assignment).
-  policy: PreferDualStack
-  # Family preference order. Default empty → omit `ipFamilies` and let
-  # PreferDualStack default it (single-stack cluster → its one family;
-  # dual-stack → cluster-primary first). EXPLICIT lists are validated
-  # regardless of policy — `[IPv6, IPv4]` is REJECTED on single-stack
-  # clusters (EKS ipFamily is ipv4|ipv6, never both — no dual-stack
-  # Service CIDR; bare v4-only k3s likewise). Set explicitly only in
-  # overlays for known dual-stack clusters (vmtest-full sets
-  # `[IPv6, IPv4]` for v6-primary ordering).
-  ipFamilies: []
 
 networkPolicy:
   enabled: true

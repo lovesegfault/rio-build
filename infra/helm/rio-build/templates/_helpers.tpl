@@ -210,12 +210,9 @@ $ctx is the map to hasKey against; $key the field name; $val the value.
 {{- end -}}
 
 {{/*
-Dual-stack Service ipFamily fields. Emits ipFamilyPolicy + ipFamilies on
-every in-cluster Service builders dial when dualStack.enabled. PreferDualStack
-(not Require) so the chart still applies on v4-only clusters — the apiserver
-quietly assigns the single available family. P0542: builders may run on a
-v6 pod CIDR (I-073/I-079 IPv4 subnet exhaustion at autoscale); the Services
-they dial need an AAAA-backed ClusterIP / pod-IP set.
+IPv6-only Service fields. rio assumes a v6 Service CIDR; the chart
+fails at apply on v4-only clusters (SingleStack + [IPv6] is rejected
+by the apiserver). v4 ingress/egress is external infra (NLB, NAT64).
 
 Usage (root context, inside a Service spec block):
   spec:
@@ -223,15 +220,9 @@ Usage (root context, inside a Service spec block):
     type: ClusterIP
 */}}
 {{- define "rio.ipFamily" -}}
-{{- with .Values.dualStack -}}
-{{- if .enabled -}}
-ipFamilyPolicy: {{ .policy | default "PreferDualStack" }}
-{{- with .ipFamilies }}
+ipFamilyPolicy: SingleStack
 ipFamilies:
-  {{- toYaml . | nindent 2 }}
-{{- end }}
-{{- end -}}
-{{- end -}}
+  - IPv6
 {{- end -}}
 
 {{/*

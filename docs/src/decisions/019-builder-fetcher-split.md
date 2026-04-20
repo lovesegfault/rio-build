@@ -70,9 +70,8 @@ r[builder.netpol.airgap]
 
 `builder-egress` NetworkPolicy (in `rio-builders`) allows: CoreDNS:53, `rio-scheduler.rio-system:9001`, `rio-store.rio-store:9002`. Nothing else. The `fod-proxy:3128` rule is deleted. Optionally, if `Pool.spec.s3Direct: true`, the S3 VPC endpoint CIDR is added (for direct chunk upload; default is store-proxied).
 
-r[fetcher.netpol.egress-open]
-
-`fetcher-egress` NetworkPolicy (in `rio-fetchers`) allows the same three, plus `0.0.0.0/0` on ports 80/443, **except** RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`), and loopback. The metadata-service block (`169.254.169.254`) is inherited from the link-local deny.
+r[fetcher.netpol.egress-open+2]
+`fetcher-egress` CiliumClusterwideNetworkPolicy (in `rio-fetchers`) allows the same three in-cluster targets as builders, plus `toEntities: [world]` on ports 80/443. The `world` entity matches any address Cilium does not recognise as a cluster identity — it is address-family-agnostic and inherently excludes pod, node, service, and host-local ranges (so the IMDS endpoint at `fd00:ec2::254` / `169.254.169.254` is denied without an explicit carve-out). With DNS64 enabled at the resolver, IPv4-only upstreams are reached via the `64:ff9b::/96` synthesised prefix, which `world` matches.
 
 r[store.netpol.egress]
 
