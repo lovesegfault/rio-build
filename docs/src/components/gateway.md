@@ -464,6 +464,9 @@ The client calls `processStderrReturn()` after the handshake, which reads messag
 r[gw.handshake.flush-points]
 > **Note on flush points:** The server must flush after steps 2-3, after step 6, after steps 9-10, and after step 11. Without explicit flushes, data may remain buffered and the client will block waiting for the response.
 
+r[gw.handshake.timeout]
+The gateway MUST bound the pre-handshake read with a timeout (default 30s) and close the channel on expiry. An authenticated client that opens a channel and sends the SSH `exec_request` but never sends `WORKER_MAGIC_1` would otherwise hold a session slot indefinitely (russh keepalives keep the transport alive, and the inter-opcode idle timeout only applies after the handshake completes).
+
 ## Protocol Multiplexing
 
 r[gw.conn.sequential]

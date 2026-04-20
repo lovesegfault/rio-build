@@ -550,3 +550,40 @@ async fn test_idle_timeout_fires_after_handshake() -> anyhow::Result<()> {
     sess.join_server().await;
     Ok(())
 }
+
+// r[verify gw.handshake.timeout]
+/// bug_087: a client that authenticates and sends `exec_request` but
+/// never sends `WORKER_MAGIC_1` must be disconnected after
+/// `HANDSHAKE_TIMEOUT` (30s), not parked indefinitely. Pre-fix the
+/// handshake read had no `timeout`/`select!{shutdown}` wrapper, so this
+/// test would need a 601s `advance` to complete (via the opcode-idle
+/// timer that the session never reaches).
+///
+/// Same `pause`/`advance` mechanics as
+/// [`test_idle_timeout_fires_after_handshake`].
+#[tokio::test(flavor = "current_thread")]
+async fn test_handshake_timeout_fires_before_magic() -> anyhow::Result<()> {
+    common::init_test_logging();
+    // Bare `new()` — no handshake. Server is now blocked on
+    // `timeout(30s, server_handshake_split(..))` waiting for
+    // WORKER_MAGIC_1. We send nothing.
+    let mut sess = common::GatewaySession::new().await?;
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+
+    // Handshake-timeout arm sends no STDERR (no negotiated wire to
+    // send it on); server just returns Ok(()) and closes. The client
+    // stream sees EOF.
+    let mut buf = [0u8; 1];
+    let n = tokio::io::AsyncReadExt::read(&mut sess.stream, &mut buf).await?;
+    assert_eq!(n, 0, "server must close stream on handshake timeout (EOF)");
+
+    // Bounded join: pre-fix the server task would still be parked.
+    tokio::time::timeout(std::time::Duration::from_secs(5), sess.join_server())
+        .await
+        .expect("server must exit within 5s after handshake timeout");
+    Ok(())
+}

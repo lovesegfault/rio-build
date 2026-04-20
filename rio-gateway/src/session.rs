@@ -72,6 +72,10 @@ async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
         // scheduler doesn't block the disconnect cleanup loop.
         match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            // no-jwt: best-effort cleanup on a closing session;
+            // CancelBuild keys on build_id only (no tenant scope) and
+            // attaching trace context here would orphan-root anyway —
+            // the session span is being torn down.
             ctx.scheduler_client.cancel_build(req),
         )
         .await
@@ -95,6 +99,17 @@ async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
 /// so a 3-hour `wopBuildDerivation` is unaffected. Real Nix clients'
 /// inter-opcode gap is milliseconds.
 const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+// r[impl gw.handshake.timeout]
+/// Max time to wait for the FIRST byte (`WORKER_MAGIC_1`) through the
+/// handshake completing. Guards the gap before [`OPCODE_IDLE_TIMEOUT`]
+/// applies: an authenticated client that opens a channel + sends the
+/// exec_request then goes silent would otherwise park on
+/// `read_u64(WORKER_MAGIC_1)` forever (russh keepalives keep transport
+/// alive). Real Nix clients complete the handshake in <100ms; 30s is
+/// generous but far below the 600s opcode-idle bound — no legitimate
+/// client idles before handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // r[impl gw.conn.per-channel-state]
 // r[impl gw.conn.sequential]
@@ -175,7 +190,30 @@ where
     W: AsyncWrite + Unpin,
 {
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
-    match handshake::server_handshake_split(reader, writer, &version_string).await {
+    // Same select-on-shutdown shape as the opcode-read below: a
+    // pre-handshake stall must not outlive the channel. No
+    // cancel_active_builds here — the map is empty by construction
+    // until the first build opcode runs.
+    let handshake_result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            debug!("channel closed before handshake (graceful shutdown signal)");
+            return Ok(());
+        }
+        r = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake::server_handshake_split(reader, writer, &version_string),
+        ) => r,
+    };
+    let handshake_result = match handshake_result {
+        Ok(r) => r,
+        Err(_elapsed) => {
+            metrics::counter!("rio_gateway_handshakes_total", "result" => "timeout").increment(1);
+            warn!(timeout = ?HANDSHAKE_TIMEOUT, "handshake timeout: no WORKER_MAGIC_1 received");
+            return Ok(());
+        }
+    };
+    match handshake_result {
         Ok(result) => {
             ctx.negotiated_version = result.negotiated_version();
             let (major, minor) = handshake::decode_version(result.negotiated_version());
@@ -274,8 +312,14 @@ where
                 return Ok(());
             }
             Ok(Err(e)) => {
+                // Non-EOF read error (ConnectionReset, malformed wire,
+                // etc). The client is gone or hostile either way; same
+                // cancel contract as the EOF arm above so
+                // cancel-on-disconnect holds for ALL six session-exit
+                // paths, not five.
                 metrics::counter!("rio_gateway_errors_total", "type" => "wire_read").increment(1);
                 error!(error = %e, "error reading opcode");
+                cancel_active_builds(ctx, "client_disconnect").await;
                 return Err(e.into());
             }
         };

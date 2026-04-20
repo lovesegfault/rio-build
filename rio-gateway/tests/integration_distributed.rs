@@ -363,3 +363,107 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     sched_handle.abort();
     Ok(())
 }
+
+// r[verify gw.conn.cancel-on-disconnect+2]
+/// bug_386: the catch-all `Ok(Err(e))` opcode-read arm (non-EOF wire
+/// error: malformed wire, ConnectionReset, etc) must call
+/// `cancel_active_builds` like every other session-exit path. Pre-fix
+/// it was the ONE arm of six that returned `Err` without cancelling.
+///
+/// Uses [`run_protocol_loop`] directly with a pre-seeded
+/// `active_build_ids` (same seam as
+/// [`test_idle_timeout_cancels_active_builds`]). The opcode-read is
+/// `wire::read_u64`, which only surfaces `WireError::Io` — so the
+/// catch-all is reachable via non-EOF io kinds (`ConnectionReset`,
+/// `BrokenPipe` on read). In-memory `DuplexStream` can't produce
+/// those, so we use a custom `AsyncRead` that yields the handshake
+/// bytes then `ConnectionReset` on the next poll.
+#[tokio::test(flavor = "current_thread")]
+async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
+    use rio_gateway::handler::SessionContext;
+    use rio_gateway::session::run_protocol_loop;
+    use rio_test_support::grpc::spawn_mock_store;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    common::init_test_logging();
+
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+
+    let mut ctx = SessionContext::new(
+        store_client,
+        scheduler_client,
+        None,
+        None,
+        None,
+        rio_gateway::TenantLimiter::disabled(),
+        rio_gateway::QuotaCache::new(),
+    );
+    ctx.active_build_ids
+        .insert("leaked-on-read-err".to_string(), 7);
+
+    /// Reader that yields `bytes` once, then `ConnectionReset` on the
+    /// next poll. Lets the handshake complete, then forces the
+    /// opcode-read into the non-EOF `Ok(Err(e))` catch-all.
+    struct ResetAfter {
+        bytes: Vec<u8>,
+    }
+    impl AsyncRead for ResetAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated RST",
+                )));
+            }
+            let n = buf.remaining().min(self.bytes.len());
+            buf.put_slice(&self.bytes[..n]);
+            self.bytes.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Client→server handshake bytes for protocol 1.35 (skips the
+    // ≥1.38 features-string read so the byte sequence is fixed):
+    // MAGIC_1, version=0x123, cpu_affinity=0, reserve_space=0.
+    // Server-side writes go to `sink()`, so we only need the reads.
+    let mut hs_bytes = Vec::new();
+    wire::write_u64(&mut hs_bytes, WORKER_MAGIC_1).await?;
+    wire::write_u64(&mut hs_bytes, 0x123).await?; // 1.35
+    wire::write_u64(&mut hs_bytes, 0).await?; // cpu_affinity
+    wire::write_u64(&mut hs_bytes, 0).await?; // reserve_space
+
+    let mut reader = ResetAfter { bytes: hs_bytes };
+    let mut writer = tokio::io::sink();
+    let shutdown = rio_common::signal::Token::new();
+
+    let result =
+        run_protocol_loop(&mut reader, &mut writer, &mut ctx, shutdown.child_token()).await;
+
+    assert!(
+        result.is_err(),
+        "non-EOF read error propagates as Err (catch-all arm)"
+    );
+
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "non-EOF opcode-read error with non-empty active_build_ids must \
+         send CancelBuild; got: {cancels:?}"
+    );
+    assert_eq!(cancels[0].0, "leaked-on-read-err");
+    assert_eq!(cancels[0].1, "client_disconnect");
+
+    store_handle.abort();
+    sched_handle.abort();
+    Ok(())
+}
