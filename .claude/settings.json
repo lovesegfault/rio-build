@@ -1,4 +1,9 @@
 {
+  "env": {
+    "BASH_ENV": ".claude/direnv-init.sh",
+    "ZDOTDIR": ".claude/zdotdir",
+    "DIRENV_LOG_FORMAT": ""
+  },
   "hooks": {
     "SessionStart": [
       {
