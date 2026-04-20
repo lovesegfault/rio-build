@@ -119,10 +119,16 @@ async fn main() -> anyhow::Result<()> {
     // error (operator configured it, failing silently = workers can
     // upload arbitrary paths = security surprise).
     let hmac_signer = rio_auth::hmac::HmacSigner::load(cfg.hmac_key_path.as_deref())
-        .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?
+        .map(Arc::new);
     if hmac_signer.is_some() {
         info!("HMAC assignment token signing enabled");
     }
+    // Same key, second handle: the gRPC layer verifies executor-identity
+    // tokens (r[sec.executor.identity-token]) the actor signed per
+    // SpawnIntent. `HmacKey` has both sign+verify; the role aliases
+    // (`HmacSigner`/`HmacVerifier`) are documentation only.
+    let hmac_for_grpc = hmac_signer.clone();
     // Service-identity signer (SEPARATE key). Lets the dispatch-time
     // FOD store-check assert tenant context via x-rio-probe-tenant-id
     // — see r[sched.dispatch.fod-substitute].
@@ -176,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
             log_flush_tx,
             log_buffers: Some(Arc::clone(&log_buffers)),
             event_persist_tx: Some(event_persist_tx),
-            hmac_signer: hmac_signer.map(Arc::new),
+            hmac_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             cost_table,
@@ -271,6 +277,11 @@ async fn main() -> anyhow::Result<()> {
         db,
         Arc::clone(&is_leader_for_grpc),
         Arc::clone(&generation),
+        // jwt_mode from config (not from `jwt_pubkey.is_some()` —
+        // that's loaded below the server-builder for hot-reload
+        // wiring; the path being set is what determines mode).
+        cfg.jwt.key_path.is_some(),
+        hmac_for_grpc,
     );
 
     // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll

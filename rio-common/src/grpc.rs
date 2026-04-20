@@ -82,6 +82,14 @@ pub const SERVICE_TOKEN_HEADER: &str = "x-rio-service-token";
 /// `rio_auth::jwt_interceptor` tests fails.
 pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 
+/// Executor-identity HMAC token. Minted by the scheduler per
+/// `SpawnIntent`, threaded via the controller as `RIO_EXECUTOR_TOKEN`,
+/// presented by builders on `BuildExecution` / `Heartbeat`. The
+/// scheduler verifies it to bind the stream to the intent the pod was
+/// spawned for. See `rio_auth::hmac::ExecutorClaims` and
+/// `r[sec.executor.identity-token]`.
+pub const EXECUTOR_TOKEN_HEADER: &str = "x-rio-executor-token";
+
 /// Tenant UUID asserted by a trusted internal caller (scheduler) that
 /// has no JWT to forward. The store only honours this when the request
 /// ALSO carries a valid `x-rio-service-token` whose `caller` is in the

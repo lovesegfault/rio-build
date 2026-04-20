@@ -146,6 +146,12 @@ pub enum ActorCommand {
     /// Cancel a build.
     CancelBuild {
         build_id: Uuid,
+        /// `r[sched.tenant.authz]`: attested `claims.sub` from the
+        /// gRPC layer's `require_tenant`. `Some` → handler verifies
+        /// `build.tenant_id == caller_tenant` and rejects with
+        /// `PermissionDenied` on mismatch. `None` (dev mode / admin
+        /// path) → unchecked.
+        caller_tenant: Option<Uuid>,
         reason: String,
         reply: oneshot::Sender<Result<bool, ActorError>>,
     },
@@ -160,6 +166,12 @@ pub enum ActorCommand {
         /// disconnect ordering) is ignored when the epoch doesn't
         /// match the entry's current `stream_epoch`.
         stream_epoch: u64,
+        /// `r[sec.executor.identity-token]`: HMAC-attested
+        /// `ExecutorClaims.intent_id` from `x-rio-executor-token`.
+        /// `handle_worker_connected` rejects reconnect when this
+        /// doesn't match the stored `intent_id` (stream-hijack
+        /// guard). `None` in dev mode (no HMAC key configured).
+        auth_intent: Option<String>,
     },
 
     /// A worker's BuildExecution stream closed.
@@ -223,6 +235,8 @@ pub enum ActorCommand {
     /// Query build status.
     QueryBuildStatus {
         build_id: Uuid,
+        /// See [`ActorCommand::CancelBuild::caller_tenant`].
+        caller_tenant: Option<Uuid>,
         reply: oneshot::Sender<Result<rio_proto::types::BuildStatus, ActorError>>,
     },
 
@@ -239,6 +253,8 @@ pub enum ActorCommand {
     /// bound. The actor only knows about the broadcast.
     WatchBuild {
         build_id: Uuid,
+        /// See [`ActorCommand::CancelBuild::caller_tenant`].
+        caller_tenant: Option<Uuid>,
         since_sequence: u64,
         reply: oneshot::Sender<
             Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError>,
@@ -738,6 +754,11 @@ pub enum ActorError {
     /// with a clear error instead of queueing builds that will all stall.
     #[error("store service unavailable (cache-check circuit breaker open)")]
     StoreUnavailable,
+
+    /// `r[sched.tenant.authz]`: caller's attested `claims.sub` does
+    /// not own the build. Maps to gRPC PERMISSION_DENIED.
+    #[error("permission denied: build {build_id} belongs to a different tenant")]
+    PermissionDenied { build_id: Uuid },
 }
 
 /// Read-only view of the actor's backpressure state.

@@ -388,6 +388,13 @@ message SpawnIntent {
   // Precedence in `ephemeral_deadline`: this > spec.deadline_seconds
   // > DEFAULT_EPHEMERAL_DEADLINE_SECS.
   uint32 deadline_secs = 9;
+  // r[sec.executor.identity-token]: HMAC-signed `ExecutorClaims
+  // {intent_id, expiry}` the controller passes through verbatim as the
+  // pod env `RIO_EXECUTOR_TOKEN`. The builder presents it on
+  // `BuildExecution` open and every `Heartbeat`; the scheduler verifies
+  // it to bind the connection to this intent. Empty when the scheduler
+  // has no HMAC key configured (dev mode).
+  string executor_token = 10;
 }
 
 message GetSpawnIntentsRequest {

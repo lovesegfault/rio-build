@@ -498,6 +498,20 @@ pub(super) fn build_job(
     let job_name = pod::job_name(&pool_name, pool.spec.kind, &suffix);
     let mut pod_spec = pod::build_executor_pod_spec(pool, scheduler, store);
     apply_intent_resources(&mut pod_spec, pool, intent);
+    // r[impl sec.executor.identity-token]
+    // Pass the scheduler-signed token through verbatim so the builder
+    // presents it on `BuildExecution` / `Heartbeat`. Per-intent (not
+    // per-Pool), so it's appended here rather than in the static
+    // `build_executor_pod_spec` env list. Empty in dev mode → builder
+    // omits the header → scheduler permissive (no HMAC key configured
+    // either).
+    if !intent.executor_token.is_empty()
+        && let Some(c) = pod_spec.containers.first_mut()
+    {
+        c.env
+            .get_or_insert_with(Vec::new)
+            .push(pod::env("RIO_EXECUTOR_TOKEN", &intent.executor_token));
+    }
     let mut job = ephemeral_job(
         job_name,
         pool.namespace(),

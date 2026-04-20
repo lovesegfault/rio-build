@@ -527,6 +527,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
             build_id,
             since_sequence: 0,
             reply: ev_tx,
+            caller_tenant: None,
         })
         .await?;
     let (mut events, _last_seq) = ev_rx.await??;
@@ -814,6 +815,7 @@ async fn test_reconcile_defers_stream_connected_unregistered_worker() -> TestRes
             executor_id: "defer-w1".into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for("defer-w1"),
+            auth_intent: None,
         })
         .await?;
     barrier(&handle).await;

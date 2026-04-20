@@ -388,6 +388,7 @@ pub(crate) async fn connect_executor_with(
             executor_id: executor_id.into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for(executor_id),
+            auth_intent: None,
         })
         .await?;
     send_heartbeat_with(handle, executor_id, system, f).await?;
@@ -568,6 +569,7 @@ pub(crate) async fn query_status(
     handle
         .send_unchecked(ActorCommand::QueryBuildStatus {
             build_id,
+            caller_tenant: None,
             reply: tx,
         })
         .await?;
@@ -584,6 +586,7 @@ pub(crate) async fn try_query_status(
     handle
         .send_unchecked(ActorCommand::QueryBuildStatus {
             build_id,
+            caller_tenant: None,
             reply: tx,
         })
         .await?;

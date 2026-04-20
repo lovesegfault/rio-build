@@ -42,17 +42,26 @@ impl SchedulerService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
+        // r[impl sched.tenant.authz]
+        // Tenant authorization chokepoint. In JWT mode this rejects
+        // token-less calls with UNAUTHENTICATED — the permissive
+        // interceptor lets builders (which reach :9001 for
+        // ExecutorService and never set `x-rio-tenant-token`) call
+        // SchedulerService too; this closes that. `caller_tenant` is
+        // the cryptographically-attested `claims.sub` and is the
+        // authoritative tenant identity below.
+        let caller_tenant = self.require_tenant(&request)?;
+
         // Grab JWT Claims BEFORE into_inner() consumes the request.
         // Extensions are part of the Request wrapper, not the proto
         // body — into_inner() drops them. Clone is cheap: Claims is
         // 4 fields (Uuid + 2×i64 + short String).
         //
-        // `None` is the common path: dev mode (no pubkey configured),
-        // dual-mode fallback (gateway in SSH-comment mode, no header),
-        // or VM tests (no interceptor in test harness). `Some` only
-        // when the gateway is in JWT mode AND set the header AND the
-        // interceptor verified it — i.e., we have a cryptographically
-        // attested jti to check against the revocation table.
+        // `None` only in dev mode (no pubkey configured) or VM tests
+        // (no interceptor in test harness) — `require_tenant` above
+        // already rejected the JWT-mode-but-absent case. `Some` means
+        // we have a cryptographically attested jti to check against
+        // the revocation table.
         let jwt_claims = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
@@ -154,15 +163,24 @@ impl SchedulerService for SchedulerGrpc {
             build_cores: req.build_cores,
         };
 
-        // r[impl sched.tenant.resolve]
-        // Tenant resolution: proto field carries tenant NAME (from gateway's
-        // authorized_keys comment); resolve to UUID here via the tenants
-        // table. `from_maybe_empty` → None (single-tenant mode, no PG
-        // roundtrip). Unknown name → InvalidArgument. Keeps gateway PG-free
-        // (stateless N-replica HA).
-        let tenant_id = match NormalizedName::from_maybe_empty(&req.tenant_name) {
-            None => None,
-            Some(name) => {
+        // r[impl sched.tenant.resolve+2]
+        // Tenant resolution. Primary path: `claims.sub` from
+        // `require_tenant` above — the attested identity wins, the body
+        // `tenant_name` is ignored (a builder cannot attribute its
+        // submission to another tenant by setting the body field).
+        // Dev-mode fallback (`caller_tenant` is None): proto field
+        // carries tenant NAME (from gateway's authorized_keys comment);
+        // resolve to UUID via the tenants table. `from_maybe_empty` →
+        // None (single-tenant mode, no PG roundtrip). Unknown name →
+        // InvalidArgument. Keeps gateway PG-free (stateless N-replica
+        // HA).
+        let tenant_id = match (
+            caller_tenant,
+            NormalizedName::from_maybe_empty(&req.tenant_name),
+        ) {
+            (Some(sub), _) => Some(sub),
+            (None, None) => None,
+            (None, Some(name)) => {
                 let db = self.db.as_ref().ok_or_else(|| {
                     Status::failed_precondition("tenant lookup requires database connection")
                 })?;
@@ -189,10 +207,10 @@ impl SchedulerService for SchedulerGrpc {
         // expired token. From the client's perspective "your token is
         // no longer valid" is one failure mode regardless of WHY.
         //
-        // No-Claims (dev/dual-mode) → skip. Can't revoke what wasn't
-        // presented. In JWT mode, Claims are ALWAYS present by the
-        // time we get here: the interceptor either attached them or
-        // returned UNAUTHENTICATED upstream, never a third state.
+        // No-Claims (dev mode) → skip. Can't revoke what wasn't
+        // presented. In JWT mode, Claims are present by the time we
+        // get here: `require_tenant` already returned UNAUTHENTICATED
+        // for the absent-header case.
         if let Some(claims) = &jwt_claims {
             // Same db-presence gate as tenant resolve. If db is
             // None AND Claims are Some, something is misconfigured
@@ -300,6 +318,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+        // r[impl sched.tenant.authz]
+        let caller_tenant = self.require_tenant(&request)?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -307,6 +327,7 @@ impl SchedulerService for SchedulerGrpc {
 
         let cmd = ActorCommand::WatchBuild {
             build_id,
+            caller_tenant,
             since_sequence: req.since_sequence,
             reply: reply_tx,
         };
@@ -362,6 +383,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+        // r[impl sched.tenant.authz]
+        let caller_tenant = self.require_tenant(&request)?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -369,6 +392,7 @@ impl SchedulerService for SchedulerGrpc {
 
         let cmd = ActorCommand::QueryBuildStatus {
             build_id,
+            caller_tenant,
             reply: reply_tx,
         };
 
@@ -384,6 +408,8 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+        // r[impl sched.tenant.authz]
+        let caller_tenant = self.require_tenant(&request)?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
 
@@ -391,6 +417,7 @@ impl SchedulerService for SchedulerGrpc {
 
         let cmd = ActorCommand::CancelBuild {
             build_id,
+            caller_tenant,
             reason: req.reason,
             reply: reply_tx,
         };
@@ -402,10 +429,14 @@ impl SchedulerService for SchedulerGrpc {
         }))
     }
 
-    // r[impl sched.tenant.resolve]
+    // r[impl sched.tenant.resolve+2]
     /// Name→UUID resolution exposed as an RPC for the gateway's JWT
     /// mint path. Same `resolve_tenant_name` helper as SubmitBuild's
     /// inline resolve — one source of truth for the lookup.
+    ///
+    /// NOT `require_tenant`-gated: the gateway calls this during SSH
+    /// `auth_publickey` BEFORE a JWT exists (it's resolving the tenant
+    /// to mint one). Read-only, idempotent, safe on any replica.
     ///
     /// NOT leader-gated: tenant lookup is a read-only PG query, no
     /// actor interaction, safe on any replica. The gateway calls this

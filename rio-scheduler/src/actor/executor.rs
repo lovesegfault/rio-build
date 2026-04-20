@@ -111,6 +111,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
         stream_epoch: u64,
+        auth_intent: Option<String>,
     ) {
         info!(executor_id = %executor_id, stream_epoch, "worker stream connected");
 
@@ -118,6 +119,59 @@ impl DagActor {
         let is_reconnect = matches!(entry, std::collections::hash_map::Entry::Occupied(_));
         let worker = entry.or_insert_with(|| ExecutorState::new(executor_id.clone()));
         worker.stream_epoch = stream_epoch;
+
+        // r[impl sec.executor.identity-token]
+        // Two reconnect rejections that together prevent stream hijack:
+        //
+        // 1. Existing stream still live → drop the NEW one. A
+        //    compromised builder opening a stream as another
+        //    executor's id would otherwise replace `stream_tx` and
+        //    receive its next `WorkAssignment.assignment_token`. A
+        //    legitimate same-process reconnect only happens after the
+        //    OLD stream's bridge task exited (output_rx dropped →
+        //    actor_rx dropped → `is_closed()`). Builder retries with
+        //    1s backoff; the I-056a race below is sub-ms.
+        //
+        // 2. HMAC-attested intent doesn't match the stored one →
+        //    drop. The stored `intent_id` was set by a token-gated
+        //    heartbeat or a prior connect; a token for a different
+        //    intent cannot take over. (1) alone leaves a window
+        //    between disconnect and reconnect; (2) closes it.
+        if is_reconnect {
+            if worker.stream_tx.as_ref().is_some_and(|tx| !tx.is_closed()) {
+                warn!(
+                    executor_id = %executor_id,
+                    "reconnect with existing live stream; rejecting new stream \
+                     (hijack guard — legitimate reconnect retries after the \
+                     old bridge task exits)"
+                );
+                metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
+                                  "reason" => "live_stream")
+                .increment(1);
+                return;
+            }
+            if auth_intent.is_some()
+                && worker.intent_id.is_some()
+                && worker.intent_id != auth_intent
+            {
+                warn!(
+                    executor_id = %executor_id,
+                    stored = ?worker.intent_id,
+                    presented = ?auth_intent,
+                    "reconnect with mismatched executor-token intent; rejecting"
+                );
+                metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
+                                  "reason" => "intent_mismatch")
+                .increment(1);
+                return;
+            }
+        }
+        // Stamp the attested intent immediately so dispatch can match
+        // before the first heartbeat lands, and so a later reconnect
+        // attempt with a different intent fails check (2) above.
+        if auth_intent.is_some() {
+            worker.intent_id = auth_intent;
+        }
 
         // I-056a: clear scheduler-side `draining` and `store_degraded`
         // on reconnect. We're here because the disconnect signal

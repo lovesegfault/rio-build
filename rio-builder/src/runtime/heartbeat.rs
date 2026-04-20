@@ -87,6 +87,7 @@ pub(super) struct HeartbeatCtx {
     pub(super) systems: Vec<String>,
     pub(super) features: Vec<String>,
     pub(super) intent_id: String,
+    pub(super) executor_token: String,
     pub(super) slot: Arc<BuildSlot>,
     pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
     pub(super) resources: crate::cgroup::ResourceSnapshotHandle,
@@ -109,6 +110,7 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
         systems,
         features,
         intent_id,
+        executor_token,
         slot,
         ready,
         resources,
@@ -134,6 +136,19 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
                 draining.load(std::sync::atomic::Ordering::Relaxed),
             )
             .await;
+
+            // r[impl sec.executor.identity-token]
+            // Attach the scheduler-signed token so the heartbeat's
+            // body `intent_id` is bound to the HMAC-attested one.
+            // Empty in dev mode → header omitted → scheduler
+            // permissive (no key configured either).
+            let mut request = tonic::Request::new(request);
+            if !executor_token.is_empty() {
+                let _ = rio_common::grpc::inject_metadata(
+                    request.metadata_mut(),
+                    &[(rio_proto::EXECUTOR_TOKEN_HEADER, &executor_token)],
+                );
+            }
 
             apply_heartbeat_response(
                 client.heartbeat(request).await.map(|r| r.into_inner()),

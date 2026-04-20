@@ -29,6 +29,15 @@ use super::SchedulerGrpc;
 /// per-connection and all clones must share the sequence.
 static STREAM_EPOCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Upper bound on distinct `derivation_path` values one
+/// `BuildExecution` stream may push to `LogBuffers`. Per
+/// `[Single build per pod, no knob]` a legitimate stream pushes for
+/// exactly ONE; 8 covers reassign/retry slop. A compromised worker
+/// streaming fabricated paths would otherwise create unbounded
+/// DashMap entries that `flush_periodic` iterates serially with one
+/// S3 PUT each — flusher starvation + memory growth + S3 cost.
+const MAX_DRVS_PER_STREAM: usize = 8;
+
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
     type BuildExecutionStream = ReceiverStream<Result<rio_proto::types::SchedulerMessage, Status>>;
@@ -42,6 +51,14 @@ impl ExecutorService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+        // r[impl sec.executor.identity-token]
+        // Bind this stream to the HMAC-attested intent the pod was
+        // spawned for. A compromised builder cannot mint a token for
+        // another pod's intent → cannot hijack its `stream_tx` (the
+        // actor rejects on `auth_intent` mismatch) → cannot receive
+        // its `WorkAssignment.assignment_token` → cannot poison its
+        // outputs. `None` in dev mode (no HMAC key configured).
+        let auth_intent = self.require_executor(&request)?;
         let mut stream = request.into_inner();
 
         // The first message MUST be a ExecutorRegister with the executor_id.
@@ -85,6 +102,7 @@ impl ExecutorService for SchedulerGrpc {
                 executor_id: executor_id.as_str().into(),
                 stream_tx: actor_tx,
                 stream_epoch,
+                auth_intent,
             })
             .await
             .map_err(Self::actor_error_to_status)?;
@@ -239,11 +257,27 @@ impl ExecutorService for SchedulerGrpc {
                         rio_proto::types::executor_message::Msg::LogBatch(log) => {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
+                            // 0. Per-stream distinct-path cap. The worker is NOT
+                            //    trusted; `push()` only gates on `sealed` so a
+                            //    fabricated path always creates a fresh DashMap
+                            //    entry that `flush_periodic` then iterates with
+                            //    one S3 PUT each. The actor's `hash_for_path`
+                            //    gate runs AFTER push and only drops the
+                            //    gateway-forward, not the buffer entry.
+                            if !seen_drvs.contains(&log.derivation_path) {
+                                if seen_drvs.len() >= MAX_DRVS_PER_STREAM {
+                                    metrics::counter!(
+                                        "rio_scheduler_log_unknown_drv_dropped_total"
+                                    )
+                                    .increment(1);
+                                    continue;
+                                }
+                                seen_drvs.insert(log.derivation_path.clone());
+                            }
                             // 1. Ring buffer write — direct, no actor involvement.
                             //    This is the durability path: even if the actor is
                             //    backpressured or the gateway stream lags, the lines
                             //    land here and are serveable via AdminService.
-                            seen_drvs.insert(log.derivation_path.clone());
                             log_buffers.push(&log);
 
                             // 2. Gateway forward — via actor (it owns the
@@ -276,11 +310,21 @@ impl ExecutorService for SchedulerGrpc {
 
             // The seal's job (block late batches between CompletionReport
             // and flusher drain) is done once this stream is closed — no
-            // more batches CAN arrive. Unseal (NOT discard: that would
-            // race the flusher's drain and lose the log). Bounds `sealed`
-            // to drvs whose worker stream is still open.
+            // more batches CAN arrive. Branch on whether a completion
+            // landed: sealed → unseal (leave the buffer for the flusher's
+            // drain — discard would race it and lose the log); NOT sealed
+            // → discard (no completion → fake path or aborted build →
+            // reap the entry so periodic-flush stops iterating it). A
+            // legitimate in-flight drv whose worker disconnected
+            // mid-build loses its in-memory tail; periodic-flush already
+            // snapshotted to S3 and the next assignment's logs replace
+            // it from scratch anyway.
             for drv in &seen_drvs {
-                log_buffers.unseal(drv);
+                if log_buffers.is_sealed(drv) {
+                    log_buffers.unseal(drv);
+                } else {
+                    log_buffers.discard(drv);
+                }
             }
 
             // Stream closed: worker disconnected. Use blocking send — if this
@@ -309,10 +353,26 @@ impl ExecutorService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+        // r[impl sec.executor.identity-token]
+        let auth_intent = self.require_executor(&request)?;
         let req = request.into_inner();
 
         if req.executor_id.is_empty() {
             return Err(Status::invalid_argument("executor_id is required"));
+        }
+        // Body `intent_id` MUST equal the token's. The actor's
+        // `worker.intent_id` (set from this body field) is what
+        // dispatch matches and what `handle_worker_connected` checks
+        // on reconnect — binding it here means it's
+        // cryptographically attested. A spoofed
+        // `Heartbeat{draining:true}` for another executor needs that
+        // executor's intent_id, which the attacker has no token for.
+        if let Some(ref ai) = auth_intent
+            && req.intent_id != *ai
+        {
+            return Err(Status::unauthenticated(
+                "heartbeat intent_id does not match x-rio-executor-token",
+            ));
         }
 
         // Bound heartbeat payload sizes. Heartbeats bypass backpressure

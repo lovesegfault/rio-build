@@ -120,6 +120,40 @@ impl HmacClaims for ServiceClaims {
     }
 }
 
+/// Claims for an executor-identity token. Minted by the scheduler per
+/// `SpawnIntent`, threaded through the controller as the
+/// `RIO_EXECUTOR_TOKEN` pod env var, presented by builders on
+/// `BuildExecution` open and every `Heartbeat` as
+/// `x-rio-executor-token`. The scheduler verifies it to bind a
+/// stream/heartbeat to the intent the pod was spawned for — a
+/// compromised pod cannot hijack another pod's stream or spoof its
+/// heartbeat fields, because it cannot mint a token for a different
+/// `intent_id`.
+///
+/// Signed with the SAME assignment-HMAC key as [`AssignmentClaims`]:
+/// both are scheduler-minted, scheduler-verified; the serde shape
+/// (`intent_id` vs `drv_hash`/`expected_outputs`) provides the
+/// cross-type isolation (`deny_unknown_fields`).
+// r[impl sec.executor.identity-token]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorClaims {
+    /// `SpawnIntent.intent_id` (= drv_hash) the token authorizes.
+    /// Checked against `HeartbeatRequest.intent_id` and the actor's
+    /// `ExecutorState.intent_id` on reconnect.
+    pub intent_id: String,
+    /// Unix seconds. Scheduler sets `now + deadline_secs + grace`;
+    /// pod outliving its `activeDeadlineSeconds` is a bug, so the
+    /// token outliving the pod is fine.
+    pub expiry_unix: u64,
+}
+
+impl HmacClaims for ExecutorClaims {
+    fn expiry_unix(&self) -> u64 {
+        self.expiry_unix
+    }
+}
+
 /// Shared HMAC key. The scheduler signs, the store verifies — same key
 /// file, same field, and a process is one role or the other (never
 /// both), so a single struct with both methods is sufficient. The

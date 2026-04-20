@@ -501,7 +501,7 @@ impl Handler for ConnectionHandler {
             //
             //   signing_key = Some  → attempt mint. ResolveTenant
             //     round-trip to scheduler (gateway is PG-free per
-            //     r[sched.tenant.resolve]). On success: mint + store
+            //     r[sched.tenant.resolve+2]). On success: mint + store
             //     in self.jwt_token → SessionContext → handler/build.rs
             //     injects as x-rio-tenant-token. On FAILURE
             //     (timeout, unknown tenant, mint error):

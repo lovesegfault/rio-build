@@ -23,7 +23,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::Database(_)
         | ActorError::Dag(_)
         | ActorError::MissingDbId { .. }
-        | ActorError::StoreUnavailable => {}
+        | ActorError::StoreUnavailable
+        | ActorError::PermissionDenied { .. } => {}
     }
 }
 

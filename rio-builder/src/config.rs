@@ -136,6 +136,14 @@ pub struct Config {
     /// in every heartbeat so the scheduler can match this pod to its
     /// pre-computed assignment. Empty = Static-sized pod (no intent).
     pub intent_id: String,
+    /// HMAC-signed `ExecutorClaims{intent_id, expiry}` from the
+    /// controller's `RIO_EXECUTOR_TOKEN` env var (passed through from
+    /// `SpawnIntent.executor_token`). Presented as
+    /// `x-rio-executor-token` on `BuildExecution` open and every
+    /// `Heartbeat` so the scheduler can bind this pod's stream to the
+    /// intent it was spawned for. Empty in dev mode → header omitted.
+    /// See `r[sec.executor.identity-token]`.
+    pub executor_token: String,
     /// Timeout (seconds) for the local nix-daemon subprocess build when
     /// the client didn't specify BuildOptions.build_timeout. Intentionally
     /// long (2h default) — some builds genuinely take that long; this is
@@ -201,6 +209,7 @@ impl Default for Config {
             node_name: String::new(),
             hw_class: String::new(),
             intent_id: String::new(),
+            executor_token: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),

@@ -57,6 +57,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
             executor_id: "drain-auth".into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for("drain-auth"),
+            auth_intent: None,
         })
         .await?;
 
@@ -153,6 +154,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
             executor_id: "i066-a".into(),
             stream_tx: stream_tx_a,
             stream_epoch: next_stream_epoch_for("i066-a"),
+            auth_intent: None,
         })
         .await?;
     send_heartbeat_with(&handle, "i066-a", "x86_64-linux", |hb| {
@@ -2011,6 +2013,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
             executor_id: "hb-worker".into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for("hb-worker"),
+            auth_intent: None,
         })
         .await?;
 
@@ -2567,6 +2570,7 @@ async fn test_orphan_watcher_reattach_resets_timer() -> TestResult {
     handle
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
+            caller_tenant: None,
             since_sequence: 0,
             reply: reply_tx,
         })
@@ -2914,6 +2918,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             executor_id: "fail-worker".into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for("fail-worker"),
+            auth_intent: None,
         })
         .await?;
     send_heartbeat_with(&handle, "fail-worker", "x86_64-linux", |_| {}).await?;
@@ -3638,6 +3643,124 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
     assert_eq!(
         recorder.get("rio_scheduler_worker_disconnects_total{}"),
         disconnects_before + 1
+    );
+    Ok(())
+}
+
+/// bug_077 / `r[sec.executor.identity-token]`: a second
+/// `ExecutorConnected` for the same id while the first stream is still
+/// live must NOT replace `stream_tx`. Asserted via: first rx still
+/// receives dispatch; second rx is dropped (closed) by the actor.
+// r[verify sec.executor.identity-token]
+#[tokio::test]
+async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    let (tx1, mut rx1) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "victim".into(),
+            stream_tx: tx1,
+            stream_epoch: next_stream_epoch_for("victim"),
+            auth_intent: Some("intent-A".into()),
+        })
+        .await?;
+    send_heartbeat_with(&handle, "victim", "x86_64-linux", |_| {}).await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "victim".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Attacker reconnect with a DIFFERENT auth_intent while rx1 is live.
+    let (tx2, mut rx2) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "victim".into(),
+            stream_tx: tx2,
+            stream_epoch: next_stream_epoch_for("victim"),
+            auth_intent: Some("intent-X".into()),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Second tx was rejected → its rx half closes immediately when the
+    // actor drops the unused sender on early-return.
+    assert!(
+        rx2.recv().await.is_none(),
+        "rejected reconnect's stream_tx should be dropped by the actor"
+    );
+
+    // Original stream is intact: dispatch a drv and it lands on rx1.
+    let build_id = Uuid::new_v4();
+    merge_single_node(&handle, build_id, "hijack", PriorityClass::Scheduled).await?;
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx1.recv())
+        .await
+        .expect("dispatch")
+        .expect("rx1 still open");
+    assert!(matches!(
+        msg.msg,
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+    ));
+    Ok(())
+}
+
+/// bug_077: after the original stream is gone, a reconnect with a
+/// MISMATCHED `auth_intent` is still rejected (the stored `intent_id`
+/// from the first connect is the bound identity).
+#[tokio::test]
+async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    // First connect binds intent-A; then drop tx1 → stream dead.
+    let (tx1, rx1) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w".into(),
+            stream_tx: tx1,
+            stream_epoch: next_stream_epoch_for("w"),
+            auth_intent: Some("intent-A".into()),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(rx1); // close the bridge half → stream_tx.is_closed()
+    barrier(&handle).await;
+
+    // Reconnect with intent-X → mismatch reject.
+    let (tx2, mut rx2) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w".into(),
+            stream_tx: tx2,
+            stream_epoch: next_stream_epoch_for("w"),
+            auth_intent: Some("intent-X".into()),
+        })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        rx2.recv().await.is_none(),
+        "mismatched-intent reconnect rejected even with dead prior stream"
+    );
+
+    // Reconnect with matching intent-A → accepted.
+    let (tx3, _rx3) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w".into(),
+            stream_tx: tx3,
+            stream_epoch: next_stream_epoch_for("w"),
+            auth_intent: Some("intent-A".into()),
+        })
+        .await?;
+    barrier(&handle).await;
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        workers.iter().any(|w| w.executor_id == "w" && w.has_stream),
+        "matching-intent reconnect accepted"
     );
     Ok(())
 }

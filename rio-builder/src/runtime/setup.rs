@@ -258,6 +258,7 @@ pub async fn setup(
         // move: setup() has no further use for features.
         features,
         intent_id: cfg.intent_id.clone(),
+        executor_token: cfg.executor_token.clone(),
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),
         resources: Arc::clone(&resource_snapshot),
@@ -322,6 +323,7 @@ pub async fn setup(
         latest_generation,
         heartbeat_handle,
         build_ctx,
+        executor_token: cfg.executor_token,
         prefetch: PrefetchDeps {
             cache: prefetch_cache,
             clients: store_clients,

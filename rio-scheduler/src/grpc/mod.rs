@@ -17,13 +17,15 @@ mod scheduler_service;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Status;
+use tonic::{Request, Status};
 use tracing::warn;
 use uuid::Uuid;
 
+use rio_auth::hmac::{ExecutorClaims, HmacKey};
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
@@ -66,6 +68,20 @@ pub struct SchedulerGrpc {
     /// forward `ProcessCompletion` for a generation it no longer owns
     /// (r[sched.lease.standby-drops-writes]). Tests default to `1`.
     pub(super) generation: Arc<AtomicU64>,
+    /// True when a JWT pubkey is configured. The interceptor is
+    /// permissive-on-absent-header (worker/health/admin callers
+    /// don't carry tenant tokens), so SchedulerService handlers
+    /// must close that gap themselves: when `jwt_mode` is set,
+    /// [`Self::require_tenant`] rejects requests without
+    /// interceptor-attached `TenantClaims`. See
+    /// `r[sched.tenant.authz]`.
+    pub(super) jwt_mode: bool,
+    /// Assignment-HMAC key, reused as the executor-identity verifier
+    /// (`r[sec.executor.identity-token]`). `None` = dev mode
+    /// (token-less ExecutorService calls accepted). When `Some`,
+    /// [`Self::require_executor`] rejects `BuildExecution` /
+    /// `Heartbeat` without a valid `x-rio-executor-token`.
+    pub(super) hmac_key: Option<Arc<HmacKey>>,
 }
 
 impl SchedulerGrpc {
@@ -84,6 +100,8 @@ impl SchedulerGrpc {
             db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
+            jwt_mode: false,
+            hmac_key: None,
         }
     }
 
@@ -97,6 +115,8 @@ impl SchedulerGrpc {
             db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(1)),
+            jwt_mode: false,
+            hmac_key: None,
         }
     }
 
@@ -106,12 +126,18 @@ impl SchedulerGrpc {
     ///
     /// `pool`: for WatchBuild's PG event-log replay. main.rs already
     /// has it (same pool as `SchedulerDb`).
+    ///
+    /// `jwt_mode`: whether a JWT pubkey is configured (drives
+    /// `require_tenant`). `hmac_key`: assignment-HMAC key, reused as
+    /// the executor-identity verifier (drives `require_executor`).
     pub fn with_log_buffers(
         actor: ActorHandle,
         log_buffers: Arc<LogBuffers>,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
         generation: Arc<AtomicU64>,
+        jwt_mode: bool,
+        hmac_key: Option<Arc<HmacKey>>,
     ) -> Self {
         Self {
             actor,
@@ -119,6 +145,8 @@ impl SchedulerGrpc {
             db: Some(db),
             is_leader,
             generation,
+            jwt_mode,
+            hmac_key,
         }
     }
 
@@ -169,6 +197,58 @@ impl SchedulerGrpc {
     /// Includes the parse error detail so CLI users see why it's invalid.
     pub(crate) fn parse_build_id(s: &str) -> Result<Uuid, Status> {
         s.parse().status_invalid("invalid build_id UUID")
+    }
+
+    // r[impl sched.tenant.authz]
+    /// Single chokepoint reconciling the permissive interceptor's third
+    /// state ("header absent → no Claims attached, request passes") with
+    /// per-RPC tenant authorization.
+    ///
+    /// Returns the interceptor-attached `TenantClaims.sub` when present.
+    /// When `jwt_mode` is set and no Claims are attached, returns
+    /// `Unauthenticated` — closes the gap that lets an untrusted builder
+    /// (which reaches :9001 for ExecutorService and never sets
+    /// `x-rio-tenant-token`) call SchedulerService RPCs token-less.
+    /// `Ok(None)` only in dev mode (no pubkey configured).
+    pub(super) fn require_tenant<T>(&self, req: &Request<T>) -> Result<Option<Uuid>, Status> {
+        match req.extensions().get::<rio_auth::jwt::TenantClaims>() {
+            Some(claims) => Ok(Some(claims.sub)),
+            None if self.jwt_mode => Err(Status::unauthenticated(
+                "SchedulerService requires x-rio-tenant-token in JWT mode",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    // r[impl sec.executor.identity-token]
+    /// Extract and verify `x-rio-executor-token`, returning the
+    /// HMAC-attested `intent_id`. Mirrors [`Self::require_tenant`] for
+    /// the worker-facing service: when an HMAC key is configured, a
+    /// missing or invalid token is `Unauthenticated`; when no key is
+    /// configured (dev mode), `Ok(None)`.
+    ///
+    /// Called by `build_execution` (binds the stream to the intent the
+    /// pod was spawned for) and `heartbeat` (binds the body's
+    /// `intent_id` to the token's). A compromised builder holds a token
+    /// for ITS OWN intent only — it cannot mint one for another pod's.
+    pub(super) fn require_executor<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
+        let Some(key) = &self.hmac_key else {
+            return Ok(None);
+        };
+        let token = req
+            .metadata()
+            .get(rio_proto::EXECUTOR_TOKEN_HEADER)
+            .ok_or_else(|| {
+                Status::unauthenticated(
+                    "ExecutorService requires x-rio-executor-token when HMAC is configured",
+                )
+            })?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("x-rio-executor-token: non-ASCII value"))?;
+        let claims: ExecutorClaims = key.verify(token).map_err(|e| {
+            Status::unauthenticated(format!("x-rio-executor-token verification failed: {e}"))
+        })?;
+        Ok(Some(claims.intent_id))
     }
 }
 
@@ -247,25 +327,38 @@ pub(crate) fn bridge_build_events(
     rio_common::task::spawn_monitored(task_name, async move {
         // Phase 1: PG replay. Best-effort — on error, fall through.
         // `dedup_watermark` starts at 0 (no dedup) and is raised to
-        // last_seq ONLY if replay succeeds. On PG failure we DON'T
-        // dedup — the broadcast ring might have events we'd otherwise
-        // skip, and a double is better than a hole.
+        // the highest seq PG ACTUALLY RETURNED — NOT `r.last_seq`. The
+        // persister's `try_send` drops under backpressure (event.rs
+        // `Full` arm), so PG can return `Ok` with rows missing at the
+        // tail. `handle_watch_build`'s safety-net terminal resend goes
+        // out at `seq = last_seq` post-subscribe; if we deduped at
+        // `last_seq` and PG never delivered it, that resend is
+        // suppressed and the gateway loops `EofWithoutTerminal`
+        // forever. On PG failure mid-stream we keep whatever the
+        // watermark reached — the broadcast ring might have events
+        // we'd otherwise skip, and a double is better than a hole.
         let mut dedup_watermark = 0u64;
         if let Some(r) = replay {
-            match crate::db::read_event_log(&r.pool, r.build_id, r.since, r.last_seq).await {
-                Ok(rows) => {
-                    // Replay succeeded (even if empty — the
-                    // persister may have dropped some under
-                    // backpressure, but we know nothing NEW is
-                    // coming ≤ last_seq). Safe to dedup.
-                    dedup_watermark = r.last_seq;
-                    for (seq, bytes) in rows {
+            // Row stream (not Vec): a fresh `since=0` watch on a
+            // 153k-node DAG would otherwise materialize ≥300k rows ×
+            // ~400B per concurrent watcher BEFORE the mpsc(256)
+            // backpressure can apply. Forwarding row-by-row lets the
+            // send `.await` propagate backpressure to the PG cursor.
+            let mut rows = std::pin::pin!(crate::db::read_event_log(
+                &r.pool, r.build_id, r.since, r.last_seq
+            ));
+            let mut max_seen = r.since;
+            let mut errored = false;
+            while let Some(row) = rows.next().await {
+                match row {
+                    Ok((seq, bytes)) => {
                         use prost::Message;
                         match rio_proto::types::BuildEvent::decode(&bytes[..]) {
                             Ok(event) => {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return; // client gone
                                 }
+                                max_seen = seq;
                             }
                             Err(e) => {
                                 // Corrupt row — written by us, so
@@ -280,22 +373,33 @@ pub(crate) fn bridge_build_events(
                             }
                         }
                     }
+                    Err(e) => {
+                        // PG unreachable / cursor error. Fall through
+                        // to broadcast-only. handle_watch_build's
+                        // terminal re-send covers the "build already
+                        // done" case. Non-terminal builds: the gateway
+                        // misses some history but sees live events.
+                        // Degraded, not dead.
+                        warn!(
+                            build_id = %r.build_id,
+                            since = r.since,
+                            last_seq = r.last_seq,
+                            error = %e,
+                            "event-log replay failed (PG unreachable?); \
+                             falling through to broadcast-only, gap possible"
+                        );
+                        errored = true;
+                        break;
+                    }
                 }
-                Err(e) => {
-                    // PG unreachable. Fall through to broadcast-only.
-                    // handle_watch_build's terminal re-send covers
-                    // the "build already done" case. Non-terminal
-                    // builds: the gateway misses some history but
-                    // sees live events. Degraded, not dead.
-                    warn!(
-                        build_id = %r.build_id,
-                        since = r.since,
-                        last_seq = r.last_seq,
-                        error = %e,
-                        "event-log replay failed (PG unreachable?); \
-                         falling through to broadcast-only, gap possible"
-                    );
-                }
+            }
+            // Watermark = highest seq actually forwarded. If PG
+            // errored before yielding ANY row, leave it at 0 (same
+            // semantics as before: no dedup on PG failure). If PG
+            // yielded a partial prefix then errored, dedup that
+            // prefix — those rows were delivered.
+            if !errored || max_seen > r.since {
+                dedup_watermark = max_seen;
             }
         }
 

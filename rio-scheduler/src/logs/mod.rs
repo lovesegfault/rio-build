@@ -231,6 +231,15 @@ impl LogBuffers {
         self.sealed.remove(drv_path);
     }
 
+    /// Whether `drv_path` is currently sealed (a completion landed and
+    /// the flusher owns drain). The recv task's stream-exit cleanup
+    /// branches on this: sealed → [`Self::unseal`] (leave the buffer
+    /// for the flusher); not sealed → [`Self::discard`] (no completion
+    /// → fake or aborted → reap so periodic-flush stops iterating it).
+    pub fn is_sealed(&self, drv_path: &str) -> bool {
+        self.sealed.contains(drv_path)
+    }
+
     /// Number of active buffers. For metrics + flusher periodic-scan skip.
     pub fn active_count(&self) -> usize {
         self.buffers.len()

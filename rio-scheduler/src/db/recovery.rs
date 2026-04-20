@@ -337,13 +337,20 @@ impl SchedulerDb {
 ///
 /// u64 → i64 cast: PG BIGINT is signed. See event_log.rs for the
 /// same rationale (2^63 events per build is not a real concern).
-pub async fn read_event_log(
+///
+/// Returns a row stream (`.fetch`, not `.fetch_all`): a fresh
+/// `WatchBuild{since_sequence:0}` against a 153k-node DAG would
+/// otherwise materialize ≥300k rows × ~400B into a `Vec` per
+/// concurrent watcher BEFORE the bridge's mpsc(256) backpressure can
+/// apply. The caller pins the stream and forwards row-by-row.
+pub fn read_event_log(
     pool: &PgPool,
     build_id: Uuid,
     since: u64,
     until: u64,
-) -> Result<Vec<(u64, Vec<u8>)>, sqlx::Error> {
-    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+) -> impl futures_util::Stream<Item = Result<(u64, Vec<u8>), sqlx::Error>> + '_ {
+    use futures_util::TryStreamExt;
+    sqlx::query_as::<_, (i64, Vec<u8>)>(
         "SELECT sequence, event_bytes FROM build_event_log \
          WHERE build_id = $1 AND sequence > $2 AND sequence <= $3 \
          ORDER BY sequence",
@@ -351,9 +358,8 @@ pub async fn read_event_log(
     .bind(build_id)
     .bind(since as i64)
     .bind(until as i64)
-    .fetch_all(pool)
-    .await?;
+    .fetch(pool)
     // i64 → u64: rows were written with `seq as i64` from a u64, so
     // they round-trip exactly. No values < 0 exist (seq starts at 1).
-    Ok(rows.into_iter().map(|(s, b)| (s as u64, b)).collect())
+    .map_ok(|(s, b)| (s as u64, b))
 }

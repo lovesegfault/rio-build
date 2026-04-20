@@ -451,6 +451,157 @@ async fn test_log_buffers_sealed_reaped_on_stream_close() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// bug_319: `log_buffers.push()` must not accept unbounded distinct
+/// `derivation_path` keys from an untrusted worker. One stream may
+/// create at most `MAX_DRVS_PER_STREAM` entries; on stream close,
+/// un-sealed entries are discarded so periodic-flush stops iterating
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()> {
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
+    let log_buffers = grpc.log_buffers();
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
+    stream_tx
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "cap-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // 12 distinct fake paths; cap is 8.
+    for i in 0..12 {
+        stream_tx
+            .send(rio_proto::types::ExecutorMessage {
+                msg: Some(rio_proto::types::executor_message::Msg::LogBatch(
+                    rio_proto::types::BuildLogBatch {
+                        derivation_path: test_drv_path(&format!("cap-{i}")),
+                        lines: vec![b"x".to_vec()],
+                        first_line_number: 0,
+                        executor_id: "cap-worker".into(),
+                    },
+                )),
+            })
+            .await?;
+    }
+    // recv task is on a worker thread; poll until cap is reached.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers.active_count() < 8 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("active_count should reach 8");
+    assert_eq!(
+        log_buffers.active_count(),
+        8,
+        "MAX_DRVS_PER_STREAM caps distinct buffer keys per stream"
+    );
+
+    // Close stream → not-sealed entries discarded.
+    drop(stream_tx);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while log_buffers.active_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("un-sealed entries discarded on stream close");
+    assert_eq!(log_buffers.active_count(), 0);
+    let _ = tokio::time::timeout(Duration::from_secs(2), inbound.next()).await;
+    Ok(())
+}
+
+/// bug_077 / `r[sec.executor.identity-token]`: when the HMAC key is
+/// configured, `BuildExecution` rejects without a valid
+/// `x-rio-executor-token`, and `Heartbeat` rejects when the body
+/// `intent_id` doesn't match the token's.
+// r[verify sec.executor.identity-token]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let key = std::sync::Arc::new(HmacKey::from_key(
+        b"test-key-32-bytes-long-here!!!!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&key));
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = ExecutorServiceClient::new(channel);
+
+    // 1. BuildExecution without token → Unauthenticated.
+    let (tx, rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(1);
+    tx.send(rio_proto::types::ExecutorMessage {
+        msg: Some(rio_proto::types::executor_message::Msg::Register(
+            rio_proto::types::ExecutorRegister {
+                executor_id: "victim".into(),
+            },
+        )),
+    })
+    .await?;
+    let err = worker_client
+        .build_execution(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect_err("token-less BuildExecution should be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // 2. Heartbeat with token for intent A, body intent_id = B → reject.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let token_a = key.sign(&ExecutorClaims {
+        intent_id: "intent-A".into(),
+        expiry_unix: now + 600,
+    });
+    let mut hb = tonic::Request::new(rio_proto::types::HeartbeatRequest {
+        executor_id: "spoof".into(),
+        intent_id: "intent-B".into(),
+        systems: vec!["x86_64-linux".into()],
+        ..Default::default()
+    });
+    hb.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token_a.parse()?);
+    let err = worker_client
+        .heartbeat(hb)
+        .await
+        .expect_err("mismatched-intent heartbeat should be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // 3. Heartbeat with matching intent → accepted.
+    let token_b = key.sign(&ExecutorClaims {
+        intent_id: "intent-B".into(),
+        expiry_unix: now + 600,
+    });
+    let mut hb_ok = tonic::Request::new(rio_proto::types::HeartbeatRequest {
+        executor_id: "spoof".into(),
+        intent_id: "intent-B".into(),
+        systems: vec!["x86_64-linux".into()],
+        ..Default::default()
+    });
+    hb_ok
+        .metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token_b.parse()?);
+    worker_client
+        .heartbeat(hb_ok)
+        .await
+        .expect("matching-intent heartbeat accepted");
+    Ok(())
+}
+
 /// CompletionReport with result: None → synthesizes InfrastructureFailure.
 /// A malformed completion must not silently drop — the drv would hang
 /// Running forever. The recv task's `.unwrap_or_else` synthesizes a

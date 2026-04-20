@@ -432,6 +432,10 @@ pub struct BuilderRuntime {
     latest_generation: Arc<AtomicU64>,
     heartbeat_handle: tokio::task::JoinHandle<()>,
     build_ctx: BuildSpawnContext,
+    /// `RIO_EXECUTOR_TOKEN` — attached as `x-rio-executor-token` on
+    /// every `build_execution` open. Empty in dev mode → omitted.
+    /// See `r[sec.executor.identity-token]`.
+    executor_token: String,
     /// Prefetch handler dependencies. Bundled so [`run`] can call
     /// [`handle_prefetch_hint`] without 7 loose fields.
     prefetch: PrefetchDeps,
@@ -514,11 +518,15 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             })
             .await?;
 
-        let mut build_stream = match rt
-            .scheduler_client
-            .build_execution(tokio_stream::wrappers::ReceiverStream::new(grpc_rx))
-            .await
-        {
+        // r[impl sec.executor.identity-token]
+        let mut be_req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(grpc_rx));
+        if !rt.executor_token.is_empty() {
+            let _ = rio_common::grpc::inject_metadata(
+                be_req.metadata_mut(),
+                &[(rio_proto::EXECUTOR_TOKEN_HEADER, &rt.executor_token)],
+            );
+        }
+        let mut build_stream = match rt.scheduler_client.build_execution(be_req).await {
             Ok(s) => s.into_inner(),
             Err(e) => {
                 // Leader still settling, or balance channel hasn't

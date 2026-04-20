@@ -1346,6 +1346,7 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
             executor_id: "w0".into(),
             stream_tx: tx,
             stream_epoch: next_stream_epoch_for("w0"),
+            auth_intent: None,
         })
         .await?;
     send_heartbeat_with(&handle, "w0", "x86_64-linux", |_| {}).await?;

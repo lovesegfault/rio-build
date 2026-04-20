@@ -56,7 +56,7 @@ async fn test_submit_build_rejects(#[case] mutate: fn(&mut Req), #[case] expecte
     );
 }
 
-// r[verify sched.tenant.resolve]
+// r[verify sched.tenant.resolve+2]
 /// SubmitBuild with a tenant name not in the tenants table → InvalidArgument.
 /// Proto field carries tenant NAME (from gateway's authorized_keys comment);
 /// scheduler resolves to UUID via PG lookup.
@@ -116,6 +116,143 @@ async fn test_submit_build_resolves_known_tenant() {
             .await
             .expect("build lookup");
     assert_eq!(db_tenant, Some(tenant_uuid));
+}
+
+// r[verify sched.tenant.authz]
+/// merged_bug_057: in JWT mode, SchedulerService rejects token-less
+/// calls (the permissive interceptor's third state would otherwise let
+/// a builder reach SubmitBuild/CancelBuild/WatchBuild unauthenticated).
+#[tokio::test]
+async fn test_submit_build_jwt_mode_rejects_tokenless() {
+    let (_db, mut grpc, _handle, _task) = setup_grpc_with_pool().await;
+    grpc.jwt_mode = true;
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_node("h")],
+        ..Default::default()
+    });
+    let status = grpc.submit_build(req).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    // Same gate on CancelBuild.
+    let status = grpc
+        .cancel_build(Request::new(rio_proto::types::CancelBuildRequest {
+            build_id: uuid::Uuid::new_v4().to_string(),
+            reason: "x".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+}
+
+// r[verify sched.tenant.authz]
+/// merged_bug_057: `claims.sub` is the authoritative tenant identity.
+/// A caller holding tenant-A's claims with body `tenant_name="B"`
+/// MUST be attributed to A, not B.
+#[tokio::test]
+async fn test_submit_build_claims_sub_overrides_body_tenant_name() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    let tenant_a = seed_tenant(&db.pool, "team-a").await;
+    let _tenant_b = seed_tenant(&db.pool, "team-b").await;
+
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_node("override")],
+        tenant_name: "team-b".into(),
+        ..Default::default()
+    });
+    req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
+        sub: tenant_a,
+        iat: 0,
+        exp: i64::MAX,
+        jti: "test".into(),
+    });
+    grpc.submit_build(req)
+        .await
+        .expect("submit with claims should succeed");
+
+    let db_tenant: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("build lookup");
+    assert_eq!(
+        db_tenant,
+        Some(tenant_a),
+        "claims.sub MUST override body tenant_name"
+    );
+}
+
+// r[verify sched.tenant.authz]
+/// merged_bug_057: cross-tenant Cancel/Watch is rejected with
+/// PERMISSION_DENIED. Submit as A, attempt cancel/watch as B.
+#[tokio::test]
+async fn test_cancel_watch_cross_tenant_denied() {
+    let (db, grpc, handle, _task) = setup_grpc_with_pool().await;
+    let tenant_a = seed_tenant(&db.pool, "team-a").await;
+    let tenant_b = seed_tenant(&db.pool, "team-b").await;
+
+    // Submit as A.
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_node("xtenant")],
+        ..Default::default()
+    });
+    req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
+        sub: tenant_a,
+        iat: 0,
+        exp: i64::MAX,
+        jti: "a".into(),
+    });
+    let resp = grpc.submit_build(req).await.expect("submit as A");
+    let build_id = resp
+        .metadata()
+        .get(rio_proto::BUILD_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let claims_b = rio_auth::jwt::TenantClaims {
+        sub: tenant_b,
+        iat: 0,
+        exp: i64::MAX,
+        jti: "b".into(),
+    };
+
+    // Cancel as B → PermissionDenied.
+    let mut cancel = Request::new(rio_proto::types::CancelBuildRequest {
+        build_id: build_id.clone(),
+        reason: "evil".into(),
+    });
+    cancel.extensions_mut().insert(claims_b.clone());
+    let status = grpc.cancel_build(cancel).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    // Watch as B → PermissionDenied.
+    let mut watch = Request::new(rio_proto::types::WatchBuildRequest {
+        build_id: build_id.clone(),
+        since_sequence: 0,
+    });
+    watch.extensions_mut().insert(claims_b);
+    let status = grpc.watch_build(watch).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    // Cancel as A → succeeds.
+    let mut cancel_a = Request::new(rio_proto::types::CancelBuildRequest {
+        build_id,
+        reason: "owner".into(),
+    });
+    cancel_a
+        .extensions_mut()
+        .insert(rio_auth::jwt::TenantClaims {
+            sub: tenant_a,
+            iat: 0,
+            exp: i64::MAX,
+            jti: "a".into(),
+        });
+    grpc.cancel_build(cancel_a)
+        .await
+        .expect("owner cancel should succeed");
+    drop(handle);
 }
 
 // r[verify obs.trace.scheduler-id-in-metadata]
@@ -251,7 +388,7 @@ async fn test_submit_build_empty_tenant_is_none() {
     assert_eq!(db_tenant, None);
 }
 
-// r[verify sched.tenant.resolve]
+// r[verify sched.tenant.resolve+2]
 /// ResolveTenant RPC: known name → UUID string, unknown → InvalidArgument,
 /// empty → InvalidArgument (caller error). Exercises the RPC path the
 /// gateway calls during JWT mint — same `resolve_tenant_name` helper as
@@ -355,13 +492,29 @@ async fn test_resolve_tenant_works_on_standby() {
 
 /// Build a Claims with the given jti. Other fields don't matter for
 /// the revocation check — it only reads `claims.jti`.
+/// Fixed `sub` for jti-revocation tests. Seeded into the tenants
+/// table per test (`seed_jti_tenant`) — `claims.sub` is now the
+/// authoritative `tenant_id` (`r[sched.tenant.authz]`), so an
+/// un-seeded UUID would FK-fail on the build INSERT.
+const JTI_TEST_SUB: uuid::Uuid = uuid::Uuid::from_u128(0xFEED);
+
 fn claims_with_jti(jti: &str) -> rio_auth::jwt::TenantClaims {
     rio_auth::jwt::TenantClaims {
-        sub: uuid::Uuid::from_u128(0xFEED),
+        sub: JTI_TEST_SUB,
         iat: 1_700_000_000,
         exp: 9_999_999_999, // far future — expiry is interceptor's job, not ours
         jti: jti.into(),
     }
+}
+
+async fn seed_jti_tenant(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO tenants (tenant_id, tenant_name) VALUES ($1, 'jti-t') ON CONFLICT DO NOTHING",
+    )
+    .bind(JTI_TEST_SUB)
+    .execute(pool)
+    .await
+    .expect("seed jti tenant");
 }
 
 /// A SubmitBuildRequest that would PASS all the pre-revocation
@@ -399,6 +552,7 @@ async fn revoked_jti_rejected_by_scheduler() {
     // (pool=None) would hit the failed_precondition branch instead,
     // testing the wrong thing.
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_jti_tenant(&db.pool).await;
 
     let jti = "revoked-session-abc123";
     let inserted = sqlx::query("INSERT INTO jwt_revoked (jti, reason) VALUES ($1, $2)")
@@ -440,6 +594,7 @@ async fn revoked_jti_rejected_by_scheduler() {
 #[tokio::test]
 async fn unrevoked_jti_passes_through() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_jti_tenant(&db.pool).await;
 
     // Stronger self-precondition than "don't insert": populate
     // jwt_revoked with OTHER jtis, then assert OURS isn't among

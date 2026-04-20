@@ -86,8 +86,11 @@ r[sched.merge.toctou-serial]
 r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by executor retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
-r[sched.tenant.resolve]
-The gateway sends the tenant name in `SubmitBuildRequest.tenant_name` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
+r[sched.tenant.resolve+2]
+The scheduler's `submit_build` handler derives the tenant UUID primarily from the interceptor-attached `TenantClaims.sub` (see `r[sched.tenant.authz]`). When no claims are attached (dev mode, no JWT pubkey configured), it falls back to resolving `SubmitBuildRequest.tenant_name` — captured by the gateway from the server-side `authorized_keys` comment — via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
+
+r[sched.tenant.authz]
+SchedulerService RPCs (`SubmitBuild`, `WatchBuild`, `QueryBuildStatus`, `CancelBuild`) MUST derive tenant identity from the interceptor-attached `TenantClaims.sub`, not from any proto body field. When a JWT pubkey is configured and no `TenantClaims` are attached (header absent — the interceptor is permissive-on-absent so co-hosted ExecutorService callers reach the port), the handler MUST reject with `UNAUTHENTICATED`. `WatchBuild`, `QueryBuildStatus`, and `CancelBuild` MUST additionally verify the target build's `tenant_id` equals `claims.sub` and reject with `PERMISSION_DENIED` on mismatch. `ResolveTenant` is exempt: the gateway calls it during SSH key auth before a JWT exists.
 
 r[sched.store-client.reconnect]
 The scheduler's gRPC channel to rio-store MUST use lazy connection (`Endpoint::connect_lazy`) with HTTP/2 keepalive so store pod rollouts do not require a scheduler restart. On `Unavailable`, the channel re-resolves DNS and reconnects transparently.

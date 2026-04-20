@@ -2067,6 +2067,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id,
+            caller_tenant: None,
             reason: "user request".into(),
             reply: reply_tx,
         })

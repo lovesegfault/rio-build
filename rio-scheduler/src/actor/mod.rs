@@ -609,7 +609,7 @@ impl DagActor {
                             "MergeDag reply receiver dropped, cancelling orphaned build"
                         );
                         if let Err(e) = self
-                            .handle_cancel_build(build_id, "client_disconnect_during_merge")
+                            .handle_cancel_build(build_id, None, "client_disconnect_during_merge")
                             .await
                         {
                             error!(build_id = %build_id, error = %e, "failed to cancel orphaned build");
@@ -651,18 +651,27 @@ impl DagActor {
                 }
                 ActorCommand::CancelBuild {
                     build_id,
+                    caller_tenant,
                     reason,
                     reply,
                 } => {
-                    let result = self.handle_cancel_build(build_id, &reason).await;
+                    let result = self
+                        .handle_cancel_build(build_id, caller_tenant, &reason)
+                        .await;
                     let _ = reply.send(result);
                 }
                 ActorCommand::ExecutorConnected {
                     executor_id,
                     stream_tx,
                     stream_epoch,
+                    auth_intent,
                 } => {
-                    self.handle_worker_connected(&executor_id, stream_tx, stream_epoch);
+                    self.handle_worker_connected(
+                        &executor_id,
+                        stream_tx,
+                        stream_epoch,
+                        auth_intent,
+                    );
                 }
                 ActorCommand::ExecutorDisconnected {
                     executor_id,
@@ -763,19 +772,24 @@ impl DagActor {
                 ActorCommand::Tick => {
                     self.handle_tick().await;
                 }
-                ActorCommand::QueryBuildStatus { build_id, reply } => {
-                    let result = self.handle_query_build_status(build_id);
+                ActorCommand::QueryBuildStatus {
+                    build_id,
+                    caller_tenant,
+                    reply,
+                } => {
+                    let result = self.handle_query_build_status(build_id, caller_tenant);
                     let _ = reply.send(result);
                 }
                 ActorCommand::WatchBuild {
                     build_id,
+                    caller_tenant,
                     // Actor doesn't use this — it's the gRPC layer's
                     // lower bound for PG replay. We only supply the
                     // upper bound (last_seq, inside handle_watch_build).
                     since_sequence: _,
                     reply,
                 } => {
-                    let result = self.handle_watch_build(build_id);
+                    let result = self.handle_watch_build(build_id, caller_tenant);
                     let _ = reply.send(result);
                 }
                 ActorCommand::CleanupTerminalBuild { build_id } => {

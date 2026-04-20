@@ -46,6 +46,7 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
             handle
                 .send_unchecked(ActorCommand::CancelBuild {
                     build_id,
+                    caller_tenant: None,
                     reason: "test cancel".into(),
                     reply: tx,
                 })
@@ -61,6 +62,7 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
     handle
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
+            caller_tenant: None,
             since_sequence: 0,
             reply: reply_tx,
         })
@@ -146,6 +148,7 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id,
+            caller_tenant: None,
             reason: "test cancel".into(),
             reply: reply_tx,
         })
@@ -178,6 +181,7 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id,
+            caller_tenant: None,
             reason: "already cancelled".into(),
             reply: reply_tx2,
         })
@@ -211,6 +215,7 @@ async fn test_watch_build_receives_events() -> TestResult {
     handle
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
+            caller_tenant: None,
             since_sequence: 0,
             reply: reply_tx,
         })
@@ -414,6 +419,7 @@ async fn test_cancel_unknown_build_returns_not_found() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id: Uuid::new_v4(),
+            caller_tenant: None,
             reason: "test".into(),
             reply: reply_tx,
         })
@@ -670,6 +676,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id,
+            caller_tenant: None,
             reason: "batch-cancel test".into(),
             reply: reply_tx,
         })
@@ -734,6 +741,7 @@ async fn test_cancel_reaps_dag_nodes() -> TestResult {
             build_id,
             reason: "reap test".into(),
             reply: tx,
+            caller_tenant: None,
         })
         .await?;
     assert!(rrx.await??);
@@ -775,6 +783,7 @@ async fn test_cancel_records_duration_histogram() -> TestResult {
             build_id,
             reason: "duration test".into(),
             reply: tx,
+            caller_tenant: None,
         })
         .await?;
     assert!(rx.await??);
@@ -839,6 +848,7 @@ async fn test_cancel_signals_total_counts_delivered_only() -> TestResult {
             build_id,
             reason: "csig test".into(),
             reply: tx,
+            caller_tenant: None,
         })
         .await?;
     assert!(rrx.await??);

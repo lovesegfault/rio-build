@@ -75,5 +75,6 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         ActorError::StoreUnavailable => {
             Status::unavailable("store service is unreachable; cache-check circuit breaker is open")
         }
+        ActorError::PermissionDenied { .. } => Status::permission_denied(err.to_string()),
     }
 }

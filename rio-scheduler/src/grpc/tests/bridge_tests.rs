@@ -331,6 +331,74 @@ async fn test_bridge_pg_failure_falls_through_no_dedup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// bug_372: dedup watermark must equal "highest seq PG actually
+/// returned", not `r.last_seq`. When the persister dropped the
+/// terminal under backpressure, PG returns Ok with rows missing at
+/// the tail; `handle_watch_build`'s safety-net resend at
+/// `seq=last_seq` would otherwise be suppressed by `N <= N` and the
+/// gateway loops `EofWithoutTerminal` forever.
+#[tokio::test]
+async fn test_bridge_watermark_tracks_pg_max_not_last_seq() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+
+    // PG: only seq 1..5 persisted. Persister dropped 6..10 under
+    // backpressure (simulated by not inserting them).
+    for seq in 1..=5 {
+        insert_event(&db.pool, build_id, seq).await?;
+    }
+
+    // Broadcast: handle_watch_build's terminal resend at seq=10
+    // (= last_seq). This is the ONLY copy of the terminal.
+    let (bcast_tx, bcast_rx) = broadcast::channel(16);
+    bcast_tx.send(mk_event(build_id, 10))?;
+
+    // Gateway reconnects with since=0; actor's last_seq=10.
+    let mut stream = bridge_build_events(
+        "test-watermark",
+        bcast_rx,
+        Some(EventReplay {
+            pool: db.pool.clone(),
+            build_id,
+            since: 0,
+            last_seq: 10,
+        }),
+    );
+
+    // Expect 1..5 from PG, then 10 from broadcast (NOT deduped:
+    // watermark = max-seen = 5, and 10 > 5). At b62291b8: watermark
+    // would be 10, broadcast's seq=10 deduped → only 1..5.
+    let seqs = collect_seqs(&mut stream, 6).await?;
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4, 5, 10],
+        "PG-dropped tail must NOT suppress broadcast resend at last_seq"
+    );
+    Ok(())
+}
+
+/// bug_375 structural assertion: `read_event_log` returns a stream
+/// (compile-time-checked by the `pin!` + `next().await` consumption
+/// pattern in `bridge_build_events`); rows arrive incrementally so
+/// the mpsc(256) backpressure can apply.
+#[tokio::test]
+async fn test_read_event_log_streams_rows() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+    for seq in 1..=200 {
+        insert_event(&db.pool, build_id, seq).await?;
+    }
+    // Consume the first row WITHOUT collecting the rest. If the
+    // function `.fetch_all()`'d internally this would still work,
+    // but the type signature (`impl Stream`) is the structural
+    // guarantee — the row-by-row forward in `bridge_build_events`
+    // is what propagates backpressure to the PG cursor.
+    let mut s = std::pin::pin!(crate::db::read_event_log(&db.pool, build_id, 0, 200));
+    let (first_seq, _) = s.next().await.expect("at least one row")?;
+    assert_eq!(first_seq, 1);
+    Ok(())
+}
+
 /// `read_event_log` range is half-open `(since, until]`. Boundary
 /// check: since=2, until=4 → returns 3,4 (not 2, not 5).
 #[tokio::test]
@@ -345,7 +413,11 @@ async fn test_read_event_log_half_open_range() -> anyhow::Result<()> {
         insert_event(&db.pool, Uuid::new_v4(), seq).await?;
     }
 
-    let rows = crate::db::read_event_log(&db.pool, build_id, 2, 4).await?;
+    let rows: Vec<_> = crate::db::read_event_log(&db.pool, build_id, 2, 4)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
     let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
     assert_eq!(
         seqs,

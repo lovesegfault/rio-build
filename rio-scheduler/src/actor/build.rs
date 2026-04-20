@@ -214,12 +214,17 @@ impl DagActor {
     pub(super) async fn handle_cancel_build(
         &mut self,
         build_id: Uuid,
+        caller_tenant: Option<Uuid>,
         reason: &str,
     ) -> Result<bool, ActorError> {
         let build = self
             .builds
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
+        // r[impl sched.tenant.authz]
+        if caller_tenant.is_some() && build.tenant_id != caller_tenant {
+            return Err(ActorError::PermissionDenied { build_id });
+        }
 
         if build.state().is_terminal() {
             return Ok(false);
@@ -267,11 +272,16 @@ impl DagActor {
     pub(super) fn handle_query_build_status(
         &self,
         build_id: Uuid,
+        caller_tenant: Option<Uuid>,
     ) -> Result<rio_proto::types::BuildStatus, ActorError> {
         let build = self
             .builds
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
+        // r[impl sched.tenant.authz]
+        if caller_tenant.is_some() && build.tenant_id != caller_tenant {
+            return Err(ActorError::PermissionDenied { build_id });
+        }
 
         let summary = self.dag.build_summary(build_id);
 
@@ -298,7 +308,14 @@ impl DagActor {
     pub(super) fn handle_watch_build(
         &self,
         build_id: Uuid,
+        caller_tenant: Option<Uuid>,
     ) -> Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError> {
+        // r[impl sched.tenant.authz]
+        if caller_tenant.is_some()
+            && self.builds.get(&build_id).map(|b| b.tenant_id) != Some(caller_tenant)
+        {
+            return Err(ActorError::PermissionDenied { build_id });
+        }
         let tx = self
             .events
             .channels
@@ -371,14 +388,16 @@ impl DagActor {
             // broadcast::send takes &self; Err means no receivers, but we just
             // subscribed so there's at least one.
             //
-            // This re-send uses seq == last_seq. With PG replay
-            // active, the gRPC bridge dedups seq ≤ last_seq from
-            // broadcast — so this event is SKIPPED there. That's
-            // fine: PG replay already delivered the real terminal
-            // event (emit_build_event persisted it). This re-send is
-            // now a safety net for when PG replay FAILS (store down)
-            // — the bridge falls through to broadcast-only, and THIS
-            // event is what the watcher sees.
+            // This re-send uses seq == last_seq. The gRPC bridge dedups
+            // broadcast at the highest seq PG ACTUALLY returned (not
+            // `last_seq`): if the persister wrote the original
+            // terminal, PG delivers it and the watermark covers this
+            // re-send (skipped — fine, the real one already went). If
+            // the persister DROPPED it under backpressure (event.rs
+            // `try_send` Full), PG returns rows < last_seq and the
+            // watermark stays below — this re-send passes dedup and
+            // IS what the watcher sees. Same for PG-down (watermark
+            // 0).
             let _ = tx.send(event);
         }
 

@@ -509,7 +509,7 @@ impl DagActor {
             );
             metrics::counter!("rio_scheduler_orphan_builds_cancelled_total").increment(1);
             if let Err(e) = self
-                .handle_cancel_build(build_id, "orphan_watcher_no_client")
+                .handle_cancel_build(build_id, None, "orphan_watcher_no_client")
                 .await
             {
                 error!(build_id = %build_id, error = %e,

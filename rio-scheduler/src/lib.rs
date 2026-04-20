@@ -294,6 +294,14 @@ pub fn describe_metrics() {
         "rio_scheduler_log_forward_dropped_total",
         "Log batches dropped (actor channel backpressure). Lines are still in the ring buffer."
     );
+    describe_counter!(
+        "rio_scheduler_log_unknown_drv_dropped_total",
+        "LogBatch dropped: stream exceeded MAX_DRVS_PER_STREAM distinct derivation_path values"
+    );
+    describe_counter!(
+        "rio_scheduler_executor_reconnect_rejected_total",
+        "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

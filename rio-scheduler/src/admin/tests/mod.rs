@@ -283,6 +283,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
             executor_id: "stream-only".into(),
             stream_tx,
             stream_epoch: crate::actor::tests::next_stream_epoch_for("stream-only"),
+            auth_intent: None,
         })
         .await?;
 

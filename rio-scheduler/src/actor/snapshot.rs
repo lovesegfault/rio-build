@@ -256,6 +256,29 @@ impl DagActor {
                 .get(drv_hash)
                 .map(|e| crate::sla::cost::selector_for(e.0, e.1))
                 .unwrap_or(intent.node_selector);
+            // r[impl sec.executor.identity-token]
+            // Sign per-intent so the spawned pod can prove on
+            // BuildExecution/Heartbeat that it was spawned for THIS
+            // intent. Expiry: deadline + 5-min grace (the pod's
+            // `activeDeadlineSeconds` is the upper bound; a token
+            // outliving the pod is harmless). Empty when no HMAC key
+            // is configured (dev mode → scheduler verify is permissive).
+            let executor_token = self
+                .hmac_signer
+                .as_ref()
+                .map(|s| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    s.sign(&rio_auth::hmac::ExecutorClaims {
+                        intent_id: drv_hash.to_string(),
+                        expiry_unix: now
+                            .saturating_add(u64::from(intent.deadline_secs))
+                            .saturating_add(300),
+                    })
+                })
+                .unwrap_or_default();
             intents.push((
                 state.sched.priority,
                 rio_proto::types::SpawnIntent {
@@ -268,6 +291,7 @@ impl DagActor {
                     system: state.system.clone(),
                     required_features: state.required_features.clone(),
                     deadline_secs: intent.deadline_secs,
+                    executor_token,
                 },
             ));
         }

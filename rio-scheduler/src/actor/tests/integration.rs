@@ -269,6 +269,7 @@ async fn test_handle_uses_shared_backpressure_flag() {
     let result = handle
         .send(ActorCommand::QueryBuildStatus {
             build_id: Uuid::new_v4(),
+            caller_tenant: None,
             reply: reply_tx,
         })
         .await;
@@ -301,6 +302,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
             executor_id: "tight-worker".into(),
             stream_tx,
             stream_epoch: next_stream_epoch_for("tight-worker"),
+            auth_intent: None,
         })
         .await?;
     send_heartbeat(&handle, "tight-worker", "x86_64-linux").await?;

@@ -43,6 +43,7 @@ fn spawn_intents_proto_roundtrip() {
                 system: "x86_64-linux".into(),
                 required_features: vec!["kvm".into()],
                 deadline_secs: 600,
+                executor_token: "tok".into(),
             },
             rio_proto::types::SpawnIntent {
                 intent_id: "i-fod".into(),
@@ -54,6 +55,7 @@ fn spawn_intents_proto_roundtrip() {
                 system: "aarch64-linux".into(),
                 required_features: vec![],
                 deadline_secs: 300,
+                executor_token: String::new(),
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),

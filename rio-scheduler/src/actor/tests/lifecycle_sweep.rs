@@ -298,6 +298,7 @@ async fn test_cancel_transitions_queued() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CancelBuild {
             build_id,
+            caller_tenant: None,
             reason: "test".into(),
             reply: reply_tx,
         })
