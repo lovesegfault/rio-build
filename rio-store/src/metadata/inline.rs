@@ -29,7 +29,7 @@ use tracing::{debug, instrument};
 ///   re-check (`narinfo."references" @> ARRAY[Q]`, fresh READ-COMMITTED
 ///   snapshot, scans `'uploading'` rows too) finds it and resurrects Q.
 ///
-/// See `r[store.gc.sweep-recheck]` for the full race trace.
+/// See `r[store.gc.sweep-recheck+2]` for the full race trace.
 ///
 /// Returns `Some(claim_id)` if inserted (the caller now OWNS the
 /// placeholder and uses `claim_id` for its cleanup paths — see

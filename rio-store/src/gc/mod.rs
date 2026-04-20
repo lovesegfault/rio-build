@@ -60,7 +60,7 @@ pub mod tenant;
 /// participated in sweep-time safety — it only made PutPath wait for
 /// the mark CTE, which doesn't change whether Q ends up in
 /// `unreachable` or whether the re-check saves it. See
-/// `r[store.gc.sweep-recheck]`.
+/// `r[store.gc.sweep-recheck+2]`.
 pub const GC_LOCK_ID: i64 = 0x724F_4743_0001;
 
 use std::sync::Arc;
@@ -459,7 +459,8 @@ pub(super) async fn decrement_and_enqueue(
         .into_iter()
         .map(|h| h.to_vec())
         .collect();
-    decrement_hashes_and_enqueue(tx, &unique_hashes, backend).await
+    let counts = vec![1i64; unique_hashes.len()];
+    decrement_hashes_and_enqueue(tx, &unique_hashes, &counts, backend).await
 }
 
 /// Deserialize a manifest's `chunk_list` and return its dedup'd hashes.
@@ -484,36 +485,57 @@ pub(super) fn parse_unique_chunk_hashes(chunk_list: &[u8]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// Decrement-and-enqueue body: takes pre-deduped hashes (typically the
-/// union across a sweep batch's chunk_lists — `r[store.chunk.lock-order]`
-/// requires ONE statement per tx so cross-path lock acquisition is in
-/// btree-scan order). Single-path callers use [`decrement_and_enqueue`]
-/// (parse + this).
+/// Decrement-and-enqueue body: takes pre-deduped hashes paired with
+/// per-hash decrement counts. The sweep batch supplies counts >1 when
+/// multiple swept paths reference the same chunk (each PutPath did
+/// `refcount += 1`, so each manifest delete must do `refcount -= 1`;
+/// collapsing N references into one decrement under-counts and leaks
+/// the chunk forever — see `r[store.chunk.refcount-txn]`).
+/// `r[store.chunk.lock-order]` still holds: ONE statement per tx, PG
+/// drives the `unnest` join through a btree scan on `blake3_hash`.
+/// Single-path callers use [`decrement_and_enqueue`] (parse + counts=1).
 pub(super) async fn decrement_hashes_and_enqueue(
     tx: &mut Transaction<'_, Postgres>,
     unique_hashes: &[Vec<u8>],
+    counts: &[i64],
     backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<DecrementStats, sqlx::Error> {
+    debug_assert_eq!(unique_hashes.len(), counts.len());
     let mut stats = DecrementStats::default();
     if unique_hashes.is_empty() {
         return Ok(stats);
     }
 
     // r[impl store.chunk.lock-order]
-    // Defense-in-depth only: with batch `= ANY($1)` PG locks rows in
-    // btree scan order regardless of array order, so this sort is NOT
-    // independently observable (see decrement_and_enqueue_no_deadlock).
+    // Defense-in-depth only: PG drives the unnest join through a btree
+    // scan on blake3_hash regardless of array order, so this sort is
+    // NOT independently observable (see decrement_and_enqueue_no_deadlock).
     // The load-bearing lock-order discipline for chunk-hash writers is
     // `with_sorted_retry`'s sort at the per-row contender boundary.
     // Kept for clarity and so any future per-row rewrite stays safe.
-    let mut unique_hashes: Vec<Vec<u8>> = unique_hashes.to_vec();
-    unique_hashes.sort_unstable();
+    let mut pairs: Vec<(Vec<u8>, i64)> = unique_hashes
+        .iter()
+        .cloned()
+        .zip(counts.iter().copied())
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let (unique_hashes, counts): (Vec<Vec<u8>>, Vec<i64>) = pairs.into_iter().unzip();
 
-    // Decrement refcounts. ANY($1) for batch.
-    sqlx::query("UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)")
-        .bind(&unique_hashes)
-        .execute(&mut **tx)
-        .await?;
+    // r[impl store.chunk.refcount-txn]
+    // Decrement by count: a chunk shared by N swept paths is
+    // decremented by N. unnest preserves single-statement semantics
+    // (one btree-scan-order lock acquisition).
+    sqlx::query(
+        r#"
+        UPDATE chunks c SET refcount = c.refcount - d.n
+          FROM unnest($1::bytea[], $2::bigint[]) AS d(h, n)
+         WHERE c.blake3_hash = d.h
+        "#,
+    )
+    .bind(&unique_hashes)
+    .bind(&counts)
+    .execute(&mut **tx)
+    .await?;
 
     // Mark refcount=0 as deleted, return hashes + sizes for stats.
     // Only rows we JUST touched (ANY) AND now at 0. `uploaded_at =
@@ -968,7 +990,7 @@ mod tests {
     /// `mark::tests::placeholder_refs_protect_closure` (mark side) +
     /// `sweep::tests::sweep_recheck_sees_uploading_placeholder` (sweep
     /// side) at N=100 with real concurrency on the insert burst.
-    // r[verify store.gc.sweep-recheck]
+    // r[verify store.gc.sweep-recheck+2]
     // r[verify store.put.placeholder-refs]
     #[tokio::test(flavor = "multi_thread")]
     async fn gc_mark_then_insert_then_sweep_preserves_referenced() {

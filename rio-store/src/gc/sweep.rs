@@ -1,7 +1,8 @@
 //! Sweep phase: delete unreachable paths + decrement chunks + enqueue S3.
 // r[impl store.gc.two-phase]
 
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,54 +106,103 @@ async fn setup_sweep_unreachable(
     Ok(())
 }
 
-/// Referrer-first iteration order over `sweep_unreachable`: depth 0 =
-/// paths with NO referrer inside the set; depth N = paths whose only
-/// in-set referrers are at depth <N. ORDER BY depth ASC (within a
-/// depth: by hash for determinism).
+/// Referrer-first iteration order over `sweep_unreachable`: layer 0 =
+/// paths with NO referrer inside the set; layer N = paths whose only
+/// in-set referrers are at layer <N. ORDER BY layer ASC (within a
+/// layer: by hash for determinism).
 ///
 /// Ensures any Y appears at index ≤ its dep Z, so the delete loop
 /// re-checks (and possibly resurrects + closure-removes Z from) Y
 /// BEFORE Z's batch. Without this, a `PutPath(P, refs=[Y])` landing
 /// between batch K's commit (Z) and batch K+M's re-check (Y) leaves
-/// live Y with `references=[deleted Z]`. Cycles (Y↔Z) get the same
-/// depth (recursive UNION dedups); the within-batch `still_unreachable`
-/// probe handles them.
+/// live Y with `references=[deleted Z]`.
+///
+/// # Algorithm
+///
+/// Rust-side Kahn's topological layering over the in-set referrer
+/// graph (referrer→reference edges, restricted to `sweep_unreachable`
+/// members). `layer[X] = 1 + max(layer[referrer of X])` is the
+/// LONGEST path from any 0-indeg seed — exactly the spec definition.
+/// O(|nodes| + |edges|). Cycle members never reach indeg 0, get no
+/// `layer` entry, and sort LAST (the within-batch `still_unreachable`
+/// probe handles them).
+///
+/// The previous SQL recursive CTE with per-row `visited[]` enumerated
+/// one row per *distinct walk* through the DAG (exponential on
+/// diamond-shaped reference graphs — Nix closures are diamond-dense)
+/// and aggregated with `MIN(d)` (shortest-path; a diamond's bottom
+/// node tied with its referrer and could sort before it). Kahn makes
+/// both unrepresentable.
 // r[impl store.gc.sweep-referrer-order]
 async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>>, sqlx::Error> {
-    // Cycle-safe via `visited` array (PG can't reference the
-    // recursive CTE in a subquery of the recursive arm). LEFT JOIN
-    // back to sweep_unreachable so cycle-only members (no path from a
-    // depth-0 seed → NULL d) are included LAST — within-batch
-    // `still_unreachable` handles them.
-    sqlx::query_scalar(
+    // One query: (hash, store_path, references[]) for every
+    // sweep_unreachable row. The set is already in memory at the
+    // caller (`unreachable: Vec<Vec<u8>>`), so materializing here
+    // adds only the references arrays.
+    let rows: Vec<(Vec<u8>, String, Vec<String>)> = sqlx::query_as(
         r#"
-        WITH RECURSIVE depth(path_hash, d, visited) AS (
-            SELECT su.path_hash, 0, ARRAY[su.path_hash]
-              FROM sweep_unreachable su
-              JOIN narinfo n ON n.store_path_hash = su.path_hash
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM narinfo r
-                   JOIN sweep_unreachable su2 ON su2.path_hash = r.store_path_hash
-                  WHERE n.store_path = ANY(r."references")
-                    AND r.store_path_hash <> su.path_hash
-             )
-          UNION ALL
-            SELECT dep.store_path_hash, depth.d + 1, visited || dep.store_path_hash
-              FROM depth
-              JOIN narinfo n ON n.store_path_hash = depth.path_hash
-              JOIN narinfo dep ON dep.store_path = ANY(n."references")
-              JOIN sweep_unreachable su ON su.path_hash = dep.store_path_hash
-             WHERE NOT dep.store_path_hash = ANY(visited)
-        )
-        SELECT su.path_hash
+        SELECT su.path_hash, n.store_path, n."references"
           FROM sweep_unreachable su
-          LEFT JOIN (SELECT path_hash, MIN(d) AS d FROM depth GROUP BY path_hash) dd
-            USING (path_hash)
-         ORDER BY COALESCE(dd.d, 2147483647), su.path_hash
+          JOIN narinfo n ON n.store_path_hash = su.path_hash
         "#,
     )
     .fetch_all(&mut *conn)
-    .await
+    .await?;
+
+    // store_path → hash for in-set membership; adjacency referrer→deps.
+    let by_path: HashMap<&str, &[u8]> = rows
+        .iter()
+        .map(|(h, p, _)| (p.as_str(), h.as_slice()))
+        .collect();
+    let mut indeg: HashMap<&[u8], usize> = rows.iter().map(|(h, _, _)| (h.as_slice(), 0)).collect();
+    let mut deps: HashMap<&[u8], Vec<&[u8]>> = HashMap::new();
+    for (h, _, refs) in &rows {
+        for r in refs {
+            if let Some(&dep_h) = by_path.get(r.as_str()) {
+                // Skip self-references (would be a 1-cycle).
+                if dep_h != h.as_slice() {
+                    deps.entry(h.as_slice()).or_default().push(dep_h);
+                    *indeg.get_mut(dep_h).unwrap() += 1;
+                }
+            }
+        }
+    }
+
+    // Kahn: layer[X] = 1 + max(layer[referrer]) (longest path from a
+    // 0-indeg seed).
+    let mut layer: HashMap<&[u8], u32> = HashMap::new();
+    let mut q: VecDeque<&[u8]> = indeg
+        .iter()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(&h, _)| {
+            layer.insert(h, 0);
+            h
+        })
+        .collect();
+    while let Some(h) = q.pop_front() {
+        let lh = layer[h];
+        for &d in deps.get(h).into_iter().flatten() {
+            let e = layer.entry(d).or_insert(0);
+            *e = (*e).max(lh + 1);
+            let id = indeg.get_mut(d).unwrap();
+            *id -= 1;
+            if *id == 0 {
+                q.push_back(d);
+            }
+        }
+    }
+
+    // Cycle members: indeg never hit 0 → no `layer` entry → sort last.
+    let mut out: Vec<Vec<u8>> = rows.iter().map(|(h, _, _)| h.clone()).collect();
+    out.sort_by(
+        |a, b| match (layer.get(a.as_slice()), layer.get(b.as_slice())) {
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| a.cmp(b)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
+        },
+    );
+    Ok(out)
 }
 
 /// Delete one swept path's metadata: realisations + path_tenants +
@@ -204,10 +254,12 @@ async fn delete_swept_path(
     Ok(deleted.rows_affected() > 0)
 }
 
-/// Re-check whether `store_path_hash` has a referrer outside the
-/// `sweep_unreachable` temp table, or a direct `scheduler_live_pins`
-/// entry. See the call-site comment in [`sweep`] for the GIN/anti-join
-/// rationale.
+/// Re-check whether `store_path_hash` has any concurrent-writable mark
+/// seed: (i) a `narinfo.references` referrer outside the
+/// `sweep_unreachable` temp table, (ii) a direct `scheduler_live_pins`
+/// entry, or (iii) a `path_tenants` row inside any tenant's retention
+/// window. See the call-site comment in [`sweep`] for the
+/// GIN/anti-join rationale.
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
@@ -227,6 +279,12 @@ async fn recheck_has_live_referrer(
              LIMIT 1
           )
           OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
+          OR EXISTS (
+            SELECT 1 FROM path_tenants pt
+              JOIN tenants t USING (tenant_id)
+             WHERE pt.store_path_hash = $1
+               AND pt.first_referenced_at > now() - make_interval(hours => t.gc_retention_hours)
+          )
         "#,
     )
     .bind(store_path_hash)
@@ -505,7 +563,7 @@ async fn sweep_one_batch(
         // deleting. If found: skip, increment resurrected metric.
         // I-192: this is the LOAD-BEARING mark-vs-PutPath guard
         // (there is no advisory lock).
-        // r[impl store.gc.sweep-recheck]
+        // r[impl store.gc.sweep-recheck+2]
         //
         // The subquery resolves hash→path because narinfo."references"
         // is TEXT[] (store_path strings, not hashes). The GIN index
@@ -532,6 +590,14 @@ async fn sweep_one_batch(
         // path that mark's snapshot missed. The table keys on
         // store_path_hash (first index column) so the EXISTS is a
         // point probe.
+        //
+        // Also re-check `path_tenants` (mark seed f): a scheduler
+        // merge-time tenant attribution (`upsert_path_tenants_raw`
+        // from `apply_cached_hits`/`reconcile_preexisting`) that
+        // landed between mark and now writes ONLY to path_tenants —
+        // an all-cache-hit merge never dispatches, so no
+        // scheduler_live_pins row, no narinfo write. PK on
+        // (store_path_hash, tenant_id) → point probe.
         if recheck_has_live_referrer(&mut tx, store_path_hash).await? {
             tracing::debug!(
                 store_path_hash = %hex::encode(store_path_hash),
@@ -576,13 +642,14 @@ async fn sweep_one_batch(
         .execute(&mut *tx)
         .await?;
 
-    // Collect cross-path chunk hashes into ONE set so the batch tx
-    // issues ONE `UPDATE chunks ... ANY($1)` (btree-scan-order locking
-    // → r[store.chunk.lock-order] satisfied across paths). Per-path
-    // calls issued N statements per tx; lock order within each path
-    // was scan-order, but cross-path it was path-iteration-order →
-    // 40P01 against a concurrent single-statement chunk writer.
-    let mut all_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+    // Collect cross-path chunk hashes into ONE map so the batch tx
+    // issues ONE `UPDATE chunks ... FROM unnest($1,$2)` (btree-scan-
+    // order locking → r[store.chunk.lock-order] satisfied across
+    // paths). A BTreeMap (not Set) preserves multiplicity: a chunk
+    // referenced by N paths in this batch must be decremented by N
+    // (each PutPath did refcount += 1). The previous BTreeSet
+    // collapsed N→1 → permanent S3 leak (refcount stuck ≥1).
+    let mut hash_counts: BTreeMap<[u8; 32], i64> = BTreeMap::new();
     for (store_path_hash, chunk_list) in to_delete {
         if !still_unreachable.contains(store_path_hash) {
             delta.paths_resurrected += 1;
@@ -597,13 +664,18 @@ async fn sweep_one_batch(
         delta.paths_deleted += 1;
 
         if let Some(bytes) = chunk_list {
-            all_hashes.extend(parse_unique_chunk_hashes(&bytes));
+            for h in parse_unique_chunk_hashes(&bytes) {
+                *hash_counts.entry(h).or_default() += 1;
+            }
         }
     }
 
     // r[impl store.chunk.lock-order]
-    let unique_hashes: Vec<Vec<u8>> = all_hashes.into_iter().map(|h| h.to_vec()).collect();
-    let dec = decrement_hashes_and_enqueue(&mut tx, &unique_hashes, chunk_backend).await?;
+    let (unique_hashes, counts): (Vec<Vec<u8>>, Vec<i64>) = hash_counts
+        .into_iter()
+        .map(|(h, n)| (h.to_vec(), n))
+        .unzip();
+    let dec = decrement_hashes_and_enqueue(&mut tx, &unique_hashes, &counts, chunk_backend).await?;
     delta.chunks_deleted += dec.chunks_zeroed;
     delta.s3_keys_enqueued += dec.s3_keys_enqueued;
     delta.bytes_freed += dec.bytes_freed;
@@ -1042,7 +1114,7 @@ mod tests {
     /// column is enough to resurrect Q. The grace window protects P
     /// itself; this proves Q (P's reference, past grace) is also
     /// protected — without an advisory lock.
-    // r[verify store.gc.sweep-recheck]
+    // r[verify store.gc.sweep-recheck+2]
     #[tokio::test]
     async fn sweep_recheck_sees_uploading_placeholder() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1239,15 +1311,23 @@ mod tests {
     async fn sweep_deletes_path_tenants() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Seed path + tenant + path_tenants row.
+        // Seed path + tenant + path_tenants row. The row must be
+        // STALE (outside the tenant's retention window) — a fresh row
+        // is mark seed (f) and now resurrects via the recheck.
         let hash = StoreSeed::path("tenant-swept").seed(&db.pool).await;
-        let tenant_id = TenantSeed::new("sweeper").seed(&db.pool).await;
-        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
-            .bind(&hash)
-            .bind(tenant_id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        let tenant_id = TenantSeed::new("sweeper")
+            .with_retention_hours(1)
+            .seed(&db.pool)
+            .await;
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+             VALUES ($1, $2, now() - interval '2 hours')",
+        )
+        .bind(&hash)
+        .bind(tenant_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
         // Sweep.
         let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
@@ -1669,6 +1749,291 @@ mod tests {
                 .await
                 .unwrap();
         assert!(z_exists);
+    }
+
+    /// bug_122: diamond `C1→Y→Z, C2→Z` — Z must be at layer 2
+    /// (longest path), strictly AFTER its referrer Y at layer 1. The
+    /// previous `MIN(d)` CTE gave Z layer 1 (via C2), tying with Y;
+    /// hash-order could place Z before Y across a batch boundary →
+    /// mid-sweep `PutPath(P,[Y])` left live `Y→deleted Z`.
+    // r[verify store.gc.sweep-referrer-order]
+    #[tokio::test]
+    async fn select_sweep_order_diamond_longest_path() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Names chosen so hash(Z) < hash(Y): old MIN(d) tied Y and Z
+        // at depth 1, hash-tiebreak put Z FIRST → assertion fails on
+        // d30227bd. (With "diamond-y"/"diamond-z" hash(Y) < hash(Z)
+        // and the test was vacuous.)
+        let z = test_store_path("diamond-z0");
+        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
+        let y = test_store_path("diamond-y0");
+        assert!(
+            path_hash(&z) < path_hash(&y),
+            "fixture invariant: hash(Z) < hash(Y) so MIN(d) tiebreak would mis-order"
+        );
+        let y_hash = StoreSeed::raw_path(&y)
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+        let c1_hash = StoreSeed::path("diamond-c1")
+            .with_refs(&[&y])
+            .seed(&db.pool)
+            .await;
+        let c2_hash = StoreSeed::path("diamond-c2")
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(
+            &mut conn,
+            &[
+                c1_hash.clone(),
+                c2_hash.clone(),
+                y_hash.clone(),
+                z_hash.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+        let order = select_sweep_order(&mut conn).await.unwrap();
+        let pos = |h: &Vec<u8>| order.iter().position(|x| x == h).unwrap();
+
+        assert!(
+            pos(&y_hash) < pos(&z_hash),
+            "Y (referrer) must precede Z (dep) — longest-path layering, not MIN(d)"
+        );
+        assert!(
+            pos(&c1_hash) < pos(&y_hash),
+            "C1 (layer 0) before Y (layer 1)"
+        );
+        assert!(
+            pos(&c2_hash) < pos(&z_hash),
+            "C2 (layer 0) before Z (layer 2)"
+        );
+        assert_eq!(order.len(), 4);
+    }
+
+    /// bug_102: K stacked diamonds → previous `UNION ALL` + per-row
+    /// `visited[]` CTE enumerated 2^K walks (exponential). Kahn is
+    /// O(nodes+edges); 20 stacked diamonds (40 nodes, 60 edges) must
+    /// complete well under 5s. On d30227bd this materialized 2^20 ≈ 1M
+    /// rows × ~1.2KB visited[] each.
+    #[tokio::test]
+    async fn select_sweep_order_stacked_diamonds_linear() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Layer i has nodes (i,0) and (i,1); each references both
+        // nodes of layer i+1. Bottom layer (K) is two leaf nodes.
+        const K: usize = 20;
+        let path = |i: usize, j: usize| test_store_path(&format!("stack-{i}-{j}"));
+        let mut all_hashes = Vec::new();
+        // Seed bottom-up so refs always point at already-seeded paths.
+        for j in 0..2 {
+            all_hashes.push(StoreSeed::raw_path(path(K, j)).seed(&db.pool).await);
+        }
+        for i in (0..K).rev() {
+            let refs = [path(i + 1, 0), path(i + 1, 1)];
+            for j in 0..2 {
+                all_hashes.push(
+                    StoreSeed::raw_path(path(i, j))
+                        .with_refs(&refs)
+                        .seed(&db.pool)
+                        .await,
+                );
+            }
+        }
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, &all_hashes)
+            .await
+            .unwrap();
+        let order = tokio::time::timeout(Duration::from_secs(5), select_sweep_order(&mut conn))
+            .await
+            .expect("select_sweep_order must be linear in |nodes|+|edges|, not 2^K")
+            .unwrap();
+        assert_eq!(order.len(), 2 * (K + 1));
+    }
+
+    /// Kahn layering: cycle members (indeg never reaches 0) sort
+    /// LAST. Preserves the previous `COALESCE(d, INT_MAX)` semantics
+    /// the within-batch `still_unreachable` probe relies on.
+    #[tokio::test]
+    async fn select_sweep_order_cycle_members_last() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A↔B cycle; leaf C with no refs.
+        let pa = test_store_path("ordcyc-a");
+        let pb = test_store_path("ordcyc-b");
+        let a_hash = StoreSeed::raw_path(&pa)
+            .with_refs(&[&pb])
+            .seed(&db.pool)
+            .await;
+        let b_hash = StoreSeed::raw_path(&pb)
+            .with_refs(&[&pa])
+            .seed(&db.pool)
+            .await;
+        let c_hash = StoreSeed::path("ordcyc-c").seed(&db.pool).await;
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, &[a_hash.clone(), b_hash.clone(), c_hash.clone()])
+            .await
+            .unwrap();
+        let order = select_sweep_order(&mut conn).await.unwrap();
+        let pos = |h: &Vec<u8>| order.iter().position(|x| x == h).unwrap();
+        assert_eq!(order.len(), 3);
+        assert!(
+            pos(&c_hash) < pos(&a_hash) && pos(&c_hash) < pos(&b_hash),
+            "leaf C (layer 0) must precede cycle members A,B (no layer → last)"
+        );
+    }
+
+    /// bug_003: a chunk shared by N paths swept in one batch must be
+    /// decremented by N, not 1. The previous BTreeSet collapsed
+    /// cross-path multiplicity → permanent S3 leak (refcount stuck ≥1,
+    /// invisible to the `WHERE refcount=0` reaper).
+    // r[verify store.chunk.refcount-txn]
+    #[tokio::test]
+    async fn sweep_batch_shared_chunk_full_decrement() {
+        use crate::manifest::{Manifest, ManifestEntry};
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // X shared by A and B (refcount=2); Y only A, Z only B
+        // (refcount=1 each).
+        let x = ChunkSeed::new(0x10).with_refcount(2).seed(&db.pool).await;
+        let y = ChunkSeed::new(0x11).with_refcount(1).seed(&db.pool).await;
+        let z = ChunkSeed::new(0x12).with_refcount(1).seed(&db.pool).await;
+
+        let mk = |hs: &[[u8; 32]]| {
+            Manifest {
+                entries: hs
+                    .iter()
+                    .map(|&h| ManifestEntry { hash: h, size: 100 })
+                    .collect(),
+            }
+            .serialize()
+        };
+        let a_hash = StoreSeed::path("shared-a").seed(&db.pool).await;
+        let b_hash = StoreSeed::path("shared-b").seed(&db.pool).await;
+        for (sph, cl) in [(&a_hash, mk(&[x, y])), (&b_hash, mk(&[x, z]))] {
+            sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+                .bind(sph)
+                .bind(cl)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Sweep A and B in one batch (SWEEP_BATCH_SIZE=2 under test).
+        let stats = sweep(&db.pool, None, vec![a_hash, b_hash], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 2);
+        assert_eq!(
+            stats.chunks_deleted, 3,
+            "X (shared, 2→0), Y (1→0), Z (1→0) — all zeroed"
+        );
+
+        let (x_rc, x_del): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(x.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            x_rc, 0,
+            "shared chunk X decremented by 2 (once per path), not 1"
+        );
+        assert!(x_del, "X marked deleted (reachable by refcount=0 reaper)");
+    }
+
+    /// bug_161: `path_tenants` is mark seed (f) and IS written
+    /// concurrently by the scheduler at merge time (all-cache-hit
+    /// merge writes ONLY path_tenants — no pin, no narinfo). A fresh
+    /// `path_tenants(X, B)` row landing in the mark→sweep window must
+    /// resurrect X. Before the fix, the recheck covered only narinfo
+    /// referrers + scheduler_live_pins; X was deleted along with B's
+    /// fresh attribution.
+    // r[verify store.gc.sweep-recheck+2]
+    #[tokio::test]
+    async fn recheck_resurrects_on_fresh_path_tenants() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // X: backdated past grace; tenant A's path_tenants row is
+        // STALE (outside A's 1h retention). With no other roots, mark
+        // would declare X unreachable.
+        let x_hash = StoreSeed::path("pt-recheck")
+            .created_hours_ago(720)
+            .seed(&db.pool)
+            .await;
+        let tenant_a = TenantSeed::new("pt-a")
+            .with_retention_hours(1)
+            .seed(&db.pool)
+            .await;
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+             VALUES ($1, $2, now() - interval '2 hours')",
+        )
+        .bind(&x_hash)
+        .bind(tenant_a)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // — mark→sweep window: tenant B's all-cache-hit merge lands —
+        // (writes ONLY path_tenants(X, B) at now()).
+        let tenant_b = TenantSeed::new("pt-b")
+            .with_retention_hours(168)
+            .seed(&db.pool)
+            .await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&x_hash)
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Direct recheck probe.
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, std::slice::from_ref(&x_hash))
+            .await
+            .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let live = recheck_has_live_referrer(&mut tx, &x_hash).await.unwrap();
+        assert!(
+            live,
+            "fresh path_tenants(X, B) inside B's retention window must resurrect X"
+        );
+        tx.rollback().await.unwrap();
+        drop(conn);
+
+        // End-to-end: sweep([X]) → X resurrected, NOT deleted; B's
+        // fresh attribution row survives.
+        let stats = sweep(&db.pool, None, vec![x_hash.clone()], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_resurrected, 1);
+        assert_eq!(stats.paths_deleted, 0);
+
+        let x_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM narinfo WHERE store_path_hash = $1)")
+                .bind(&x_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(x_exists, "X's narinfo survives (resurrected, not swept)");
+
+        let pt_b: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM path_tenants WHERE store_path_hash = $1 AND tenant_id = $2",
+        )
+        .bind(&x_hash)
+        .bind(tenant_b)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(pt_b, 1, "B's fresh path_tenants row survives");
     }
 
     /// bug_329: sweep batch with cross-path chunk hashes locks via ONE

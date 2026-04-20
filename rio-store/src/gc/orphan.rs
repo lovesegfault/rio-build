@@ -57,7 +57,10 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(200);
 /// Max stale-placeholder rows fetched per outer SELECT in [`scan_once`].
 /// The loop re-SELECTs until short. Bounds memory after a mass-crash
 /// backlog (drain.rs uses the same LIMIT-then-loop pattern).
+#[cfg(not(test))]
 const SCAN_BATCH_SIZE: i64 = 1000;
+#[cfg(test)]
+const SCAN_BATCH_SIZE: i64 = 2;
 
 /// Selector for [`reap_one`]. Replaces the old `Option<i64>` threshold —
 /// `None` ("this is mine, no stale check") was not an ownership check:
@@ -126,6 +129,7 @@ pub async fn scan_once(
             break;
         }
 
+        let mut progressed = 0u64;
         for (store_path_hash,) in stale {
             // Per-row isolation: a poison row (e.g. M023's
             // `chunks_refcount_nonneg` CHECK from a pre-existing
@@ -142,8 +146,13 @@ pub async fn scan_once(
             )
             .await
             {
-                Ok(true) => reaped += 1,
-                Ok(false) => {}
+                Ok(true) => {
+                    reaped += 1;
+                    progressed += 1;
+                }
+                // Row left the predicate independently (reaped by
+                // another replica / no longer stale).
+                Ok(false) => progressed += 1,
                 Err(e) => {
                     warn!(
                         store_path_hash = %hex::encode(&store_path_hash),
@@ -156,7 +165,14 @@ pub async fn scan_once(
             }
         }
 
-        if (n as i64) < SCAN_BATCH_SIZE {
+        // Exit on short read OR a full batch with zero forward
+        // progress. With ≥SCAN_BATCH_SIZE poison rows the predicate
+        // never shrinks (failed rows roll back, re-match next SELECT)
+        // → without the progress check the loop livelocks and the
+        // "next 15min tick" never fires. spawn_periodic re-finds
+        // poison rows next interval after the operator addresses the
+        // metric.
+        if (n as i64) < SCAN_BATCH_SIZE || progressed == 0 {
             break;
         }
     }
@@ -591,7 +607,10 @@ mod tests {
         seed_stale_chunked(&db.pool, &hash_b, &path_b).await;
 
         let (reaped, failed) = scan_once(&db.pool, None).await.unwrap();
-        assert_eq!(failed, 1, "A failed (CHECK violation)");
+        // With cfg(test) SCAN_BATCH_SIZE=2: iter1 selects {A,B}, A
+        // fails, B reaped (progressed=1). iter2 re-selects {A}, A
+        // fails again, n=1<2 → break. failed counts attempts.
+        assert_eq!(failed, 2, "A failed (CHECK violation), retried once");
         assert_eq!(reaped, 1, "B reaped despite A's failure");
 
         let b_gone: i64 =
@@ -601,6 +620,42 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(b_gone, 0, "B's narinfo deleted");
+    }
+
+    /// merged_bug_019: ≥SCAN_BATCH_SIZE poison rows must NOT livelock
+    /// the scanner. Per-row isolation rolls back failed rows (they
+    /// re-match the predicate); without the zero-progress break, a
+    /// full poison batch yields n=SCAN_BATCH_SIZE forever and
+    /// `spawn_periodic` never reaches the next tick. With the fix,
+    /// scan_once returns (0, SCAN_BATCH_SIZE) after one full batch.
+    #[tokio::test]
+    async fn scan_once_full_poison_batch_terminates() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // SCAN_BATCH_SIZE (=2 under cfg(test)) poison rows: chunk
+        // pre-decremented to 0 → reap_one's decrement_and_enqueue
+        // trips chunks_refcount_nonneg on every row.
+        for i in 0..SCAN_BATCH_SIZE {
+            let hash = vec![0x60u8 + i as u8; 32];
+            let path = rio_test_support::fixtures::test_store_path(&format!("poison-full-{i}"));
+            let (chunk, _) = seed_stale_chunked(&db.pool, &hash, &path).await;
+            sqlx::query("UPDATE chunks SET refcount = 0 WHERE blake3_hash = $1")
+                .bind(chunk.as_slice())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let (reaped, failed) =
+            tokio::time::timeout(Duration::from_secs(5), scan_once(&db.pool, None))
+                .await
+                .expect("scan_once must terminate on a full poison batch (zero-progress break)")
+                .unwrap();
+        assert_eq!(reaped, 0, "all rows poison");
+        assert_eq!(
+            failed, SCAN_BATCH_SIZE as u64,
+            "one full batch failed, then break (not unbounded re-count)"
+        );
     }
 
     /// Helper: insert an 'uploading' placeholder AND backdate
@@ -803,10 +858,15 @@ mod tests {
         // Run the FOR UPDATE query directly. With the stale-threshold
         // re-check, it should return None (fresh re-upload has
         // updated_at > now()-threshold → doesn't match).
+        // SELECT a non-nullable PK column (NOT md.chunk_list, which is
+        // NULL via LEFT JOIN regardless of WHERE-match → .flatten()
+        // collapsed "no row" with "row + NULL column", making the
+        // assertion vacuous). The LEFT JOIN stays so the FOR UPDATE
+        // shape mirrors production reap_one.
         let mut tx = db.pool.begin().await.unwrap();
-        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+        let matched: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
-            SELECT md.chunk_list
+            SELECT m.store_path_hash
               FROM manifests m
               LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
@@ -819,10 +879,9 @@ mod tests {
         .bind(0i64)
         .fetch_optional(&mut *tx)
         .await
-        .unwrap()
-        .flatten();
+        .unwrap();
         assert!(
-            chunk_list.is_none(),
+            matched.is_none(),
             "FOR UPDATE must NOT match fresh re-upload (stale threshold re-check)"
         );
 
