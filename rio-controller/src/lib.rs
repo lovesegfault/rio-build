@@ -101,7 +101,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_disruption_drains_total",
-        "DisruptionTarget watcher DrainExecutor calls. result=sent|rpc_error. \
+        "DisruptionTarget watcher DrainExecutor calls. result=sent|timeout|rpc_error. \
          Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
     );
     describe_gauge!(
