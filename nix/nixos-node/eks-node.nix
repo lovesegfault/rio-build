@@ -525,6 +525,15 @@ in
           requires = [
             "nodeadm-init.service"
             "containerd.service"
+            # NVMe mount failure must be fail-HARD (same rationale as
+            # the pause-import preStart below): a Ready node with
+            # /var/lib/kubelet on root EBS gets bin-packed by Karpenter
+            # against instanceStorePolicy:RAID0 capacity it doesn't
+            # have → DiskPressure evictions, never replaced.
+            # systemd.unit(5): Requires= on a Condition*-skipped unit
+            # is satisfied (job result `condition`), so EBS-only
+            # NodeClasses (rio-default/rio-metal) are unaffected.
+            "rio-nvme-mount.service"
           ];
           path = [
             # kubeconfig exec-auth (nodeadm.nix patches the template to

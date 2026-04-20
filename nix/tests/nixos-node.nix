@@ -200,6 +200,22 @@ pkgs.testers.runNixOSTest {
             "nvme-Amazon_EC2_NVMe_Instance_Storage"
         ), f"udevadm settle missing or after device glob:\n{script}"
 
+    # rio-nvme-mount script failure (mdadm/mkfs/mount) must NOT be
+    # fail-open: with only before= ordering + wantedBy=sysinit.target,
+    # tmpfiles would create /var/lib/kubelet on root EBS, kubelet
+    # starts, node Ready, Karpenter bin-packs against phantom RAID0
+    # capacity. QEMU has no instance-store NVMe (Condition skips the
+    # unit) so assert structurally on the rendered Requires=, then
+    # prove kubelet started anyway — Condition-skip satisfies
+    # Requires= (systemd.unit(5)), so EBS-only nodes are unaffected.
+    with subtest("rio-nvme-mount failure blocks kubelet (fail-hard)"):
+        deps = node.succeed("systemctl show -p Requires kubelet.service")
+        assert "rio-nvme-mount.service" in deps, (
+            f"kubelet does not Requires=rio-nvme-mount — NVMe mount "
+            f"failure would be fail-open (Ready node on root EBS). {deps}"
+        )
+        node.succeed("systemctl is-active kubelet.service")
+
     # bug_054: pause import previously had `|| true` and lacked --local.
     # With sandbox=localhost/kubernetes/pause there is no registry
     # fallback, so a swallowed failure left a Ready-but-100%-failing
