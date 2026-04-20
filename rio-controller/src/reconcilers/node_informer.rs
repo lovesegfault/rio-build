@@ -190,7 +190,16 @@ impl NodeLabelCache {
     /// flush so the evicted node's last slice still lands in the
     /// denominator.
     pub fn prune_absent(&self, seen: &HashSet<String>, now_epoch: f64) -> Vec<(String, f64)> {
-        let mut evicted = Vec::new();
+        // Aggregate by hw_class (mirrors `drain_live_spot_exposure`):
+        // the caller awaits one `report_exposure` RPC per returned
+        // entry inside a single `select!` arm, so per-NODE tuples turn
+        // a 100-node spot-storm relist into 100 sequential awaits ×
+        // ADMIN_RPC_TIMEOUT against a degraded scheduler — ~500s of
+        // watch-loop starvation. The RPC payload carries no per-node
+        // identity (only hw_class/kind/value, event_uid: None) and
+        // exposure sums into λ's denominator, so aggregation is
+        // lossless (bug_057).
+        let mut by_hw: HashMap<String, f64> = HashMap::new();
         self.0.write().retain(|name, m| {
             if seen.contains(name) {
                 return true;
@@ -198,11 +207,11 @@ impl NodeLabelCache {
             if m.capacity_type.as_deref() == Some("spot")
                 && let Some(last) = m.last_exposure_at
             {
-                evicted.push((m.hw.as_string(), (now_epoch - last).max(0.0)));
+                *by_hw.entry(m.hw.as_string()).or_default() += (now_epoch - last).max(0.0);
             }
             false
         });
-        evicted
+        by_hw.into_iter().collect()
     }
 
     /// Current cache size. For the `rio_controller_node_cache_size`
@@ -745,6 +754,7 @@ mod tests {
         let cache = NodeLabelCache::default();
         cache.apply(&spot_node("a", "7", 1000));
         cache.apply(&spot_node("b", "7", 1000));
+        cache.apply(&spot_node("b2", "7", 1000));
         cache.apply(&spot_node("c", "6", 1020));
         // On-demand: evicted but contributes no exposure slice.
         let mut od = node("od", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
@@ -754,18 +764,25 @@ mod tests {
         // Periodic flush at t=1060 advances all cursors to 1060.
         let _ = cache.drain_live_spot_exposure(1060.0);
 
-        // Relist at t=1090 saw only {a, c}. b and od deleted during
-        // the gap → prune. b's residual (1060..1090) is returned;
-        // od is not spot → no exposure slice.
+        // Relist at t=1090 saw only {a, c}. b, b2, od deleted during
+        // the gap → prune. b+b2 residuals (1060..1090 each) are
+        // returned AGGREGATED by hw_class (bug_057: per-node tuples
+        // would emit 2 entries × 30.0, defeating the watch-loop
+        // bound); od is not spot → no exposure slice.
         let seen: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
         let evicted = cache.prune_absent(&seen, 1090.0);
-        assert_eq!(evicted, vec![("unknown-7-ebs-unknown".into(), 30.0)]);
+        assert_eq!(
+            evicted,
+            vec![("unknown-7-ebs-unknown".into(), 60.0)],
+            "two same-hw_class spot nodes → ONE aggregated entry (Σsecs)"
+        );
         assert_eq!(cache.len(), 2);
         assert!(cache.hw_class_of("b").is_none());
+        assert!(cache.hw_class_of("b2").is_none());
         assert!(cache.hw_class_of("od").is_none());
 
         // Next periodic drain at t=1120: only survivors contribute —
-        // no phantom 60s from b.
+        // no phantom 60s from b/b2.
         let mut d = cache.drain_live_spot_exposure(1120.0);
         d.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
