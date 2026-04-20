@@ -266,14 +266,41 @@ pub async fn list_deployment_status(client: &Client, ns: &str) -> Result<Vec<Dep
     Ok(out)
 }
 
-/// One DaemonSet's readiness snapshot.
+/// One DaemonSet's readiness snapshot. `ok` mirrors [`deploy_status`]:
+/// observed-generation current AND every pod updated AND ready, so a
+/// mid-surge rollout (old pods still ready, `updated < desired`) reads
+/// as not-ok rather than green.
 #[derive(Serialize)]
 pub struct DsStatus {
     pub name: String,
     pub ready: i32,
     pub desired: i32,
     pub scheduled: i32,
+    pub updated: i32,
     pub ok: bool,
+}
+
+fn ds_status(d: &DaemonSet) -> DsStatus {
+    let st = d.status.clone().unwrap_or_default();
+    let desired = st.desired_number_scheduled;
+    let updated = st.updated_number_scheduled.unwrap_or(0);
+    let obs = st.observed_generation.unwrap_or(0);
+    let cur = d.metadata.generation.unwrap_or(0);
+    // Same surge-window guard as `deploy_status`: `updated == desired`
+    // catches old pods still running during a maxSurge rollout —
+    // without it, `xtask k8s status` shows cilium ok while old pods run.
+    let ok = obs >= cur
+        && updated == desired
+        && st.number_ready == desired
+        && st.number_unavailable.unwrap_or(0) == 0;
+    DsStatus {
+        name: d.name_any(),
+        ready: st.number_ready,
+        desired,
+        scheduled: st.current_number_scheduled,
+        updated,
+        ok,
+    }
 }
 
 /// Readiness snapshot of every DaemonSet in `ns`, sorted by name.
@@ -283,17 +310,7 @@ pub async fn list_daemonset_status(client: &Client, ns: &str) -> Result<Vec<DsSt
         .list(&ListParams::default())
         .await?
         .iter()
-        .map(|d| {
-            let st = d.status.clone().unwrap_or_default();
-            DsStatus {
-                name: d.name_any(),
-                ready: st.number_ready,
-                desired: st.desired_number_scheduled,
-                scheduled: st.current_number_scheduled,
-                ok: st.number_ready == st.desired_number_scheduled
-                    && st.number_unavailable.unwrap_or(0) == 0,
-            }
-        })
+        .map(ds_status)
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
@@ -376,4 +393,72 @@ fn chrono_now() -> String {
         .unwrap()
         .as_secs();
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::apps::v1::DaemonSetStatus;
+
+    fn ds(generation: i64, st: DaemonSetStatus) -> DaemonSet {
+        let mut d = DaemonSet::default();
+        d.metadata.generation = Some(generation);
+        d.status = Some(st);
+        d
+    }
+
+    #[test]
+    fn ds_status_false_during_surge() {
+        // Mid-rollout: old pods still ready, new pods not all out yet.
+        // numberReady==desired and unavailable==0, but updated < desired.
+        // Previously reported ok=true (green) here.
+        let d = ds(
+            6,
+            DaemonSetStatus {
+                observed_generation: Some(6),
+                desired_number_scheduled: 3,
+                number_ready: 3,
+                number_unavailable: Some(0),
+                updated_number_scheduled: Some(1),
+                current_number_scheduled: 3,
+                ..Default::default()
+            },
+        );
+        assert!(!ds_status(&d).ok);
+    }
+
+    #[test]
+    fn ds_status_false_on_stale_generation() {
+        // Spec edited (gen=6), controller hasn't observed it yet (obs=5).
+        let d = ds(
+            6,
+            DaemonSetStatus {
+                observed_generation: Some(5),
+                desired_number_scheduled: 3,
+                number_ready: 3,
+                number_unavailable: Some(0),
+                updated_number_scheduled: Some(3),
+                current_number_scheduled: 3,
+                ..Default::default()
+            },
+        );
+        assert!(!ds_status(&d).ok);
+    }
+
+    #[test]
+    fn ds_status_true_at_steady_state() {
+        let d = ds(
+            6,
+            DaemonSetStatus {
+                observed_generation: Some(6),
+                desired_number_scheduled: 3,
+                number_ready: 3,
+                number_unavailable: Some(0),
+                updated_number_scheduled: Some(3),
+                current_number_scheduled: 3,
+                ..Default::default()
+            },
+        );
+        assert!(ds_status(&d).ok);
+    }
 }
