@@ -301,6 +301,19 @@ pub fn intent_for(
         None => tiers,
     };
     let r = solve_mvp(fit, tiers, ceil);
+    // Infeasible-at-any-tier — the operator-facing alerting hook
+    // (observability.md). Gated on "≥1 tier had bounds": a pure
+    // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
+    // (unknown pinned-tier override) is not an exhaust event. Emitted
+    // HERE (the actual sizing decision-point for the non-hw-cost path)
+    // so `solve_mvp` stays pure for tier-name lookup callers.
+    if matches!(r, SolveResult::BestEffort { .. })
+        && tiers
+            .iter()
+            .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
+    {
+        super::cost::ceiling_exhausted();
+    }
     // ceil + clamp ≥1: solve_mvp's c_star is already ≥1.0 but
     // BestEffort.c can be fractional below 1 for degenerate fits.
     let cores = (r.cores().0.ceil() as u32).max(1);
@@ -443,16 +456,11 @@ pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveRe
             node_selector: None,
         };
     }
-    // Infeasible-at-any-tier — the operator-facing alerting hook
-    // (observability.md). Gated on "≥1 tier had bounds": a pure
-    // best-effort ladder (`tiers=[{p*:None}]`) or an empty ladder
-    // (unknown pinned-tier override) is not an exhaust event.
-    if tiers
-        .iter()
-        .any(|t| t.p50.is_some() || t.p90.is_some() || t.p99.is_some())
-    {
-        super::cost::ceiling_exhausted();
-    }
+    // Pure: callers emit `rio_scheduler_sla_infeasible_total{reason=…}`
+    // at the sizing decision-point — same convention as `best_effort`'s
+    // doc below. `solve_mvp` is also called for tier-NAME lookup
+    // (`solve_intent_for`'s predicted block) where the metric must not
+    // fire; emitting here double-counted infeasible drvs.
     best_effort(fit, cap_c, h, disk, ceil)
 }
 
@@ -1407,20 +1415,47 @@ mod tests {
     }
 
     #[test]
-    fn solve_mvp_emits_ceiling_exhausted_on_all_bounded_infeasible() {
+    fn intent_for_emits_ceiling_exhausted_on_all_bounded_infeasible() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
         metrics::with_local_recorder(&rec, || {
-            // T(c) ≫ 10 for all c ≤ 64: S=1e6.
+            // T(c) ≫ 10 for all c ≤ 64: S=1e6. n_eff/span force the
+            // solve branch (not explore).
             let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
-            let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
-            assert!(matches!(r, SolveResult::BestEffort { .. }));
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                None,
+                &cfg(),
+                &[t("normal", 10.0)],
+                &ceil(),
+            );
         });
         assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 1);
     }
 
+    /// `solve_mvp` is pure: emission is at the sizing decision-point
+    /// (`intent_for` / `solve_full`), not inside the solve. Regression
+    /// for `solve_intent_for`'s predicted-block re-calling `solve_mvp`
+    /// for tier-name lookup and double-counting infeasible drvs.
     #[test]
-    fn solve_mvp_no_emit_on_best_effort_tier() {
+    fn solve_mvp_is_pure() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = rec.snapshotter();
+        metrics::with_local_recorder(&rec, || {
+            let fit = mk_fit(1e6, 0.0, 0.0, f64::INFINITY, 0.1);
+            let r = solve_mvp(&fit, &[t("normal", 10.0)], &ceil());
+            assert!(matches!(r, SolveResult::BestEffort { .. }));
+        });
+        assert_eq!(
+            infeasible_count(&snapshotter, "ceiling_exhausted"),
+            0,
+            "solve_mvp must not emit; callers do at the decision-point"
+        );
+    }
+
+    #[test]
+    fn intent_for_no_emit_on_best_effort_tier() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = rec.snapshotter();
         metrics::with_local_recorder(&rec, || {
@@ -1433,10 +1468,17 @@ mod tests {
             };
             // Unbounded tier returns Feasible at cap_c (solve_envelope's
             // no-bounds arm), so no BestEffort fallthrough.
-            solve_mvp(&fit, &[unbounded], &ceil());
+            intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                None,
+                &cfg(),
+                &[unbounded],
+                &ceil(),
+            );
             // Empty ladder (unknown pinned-tier) → BestEffort but NOT
             // an exhaust event.
-            solve_mvp(&fit, &[], &ceil());
+            intent_for(Some(&fit), &DrvHints::default(), None, &cfg(), &[], &ceil());
         });
         assert_eq!(infeasible_count(&snapshotter, "ceiling_exhausted"), 0);
         assert_eq!(infeasible_count(&snapshotter, "capacity_exhausted"), 0);

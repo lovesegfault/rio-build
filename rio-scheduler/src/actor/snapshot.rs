@@ -34,24 +34,16 @@ impl DagActor {
                 let _ = reply.send(self.handle_debug_query_workers());
             }
             AdminQuery::SlaStatus { key, reply } => {
-                // active_override: re-run resolve so the RPC reflects
-                // exactly what dispatch would see, then surface the
-                // matching ROW (not the projected ResolvedTarget) so
-                // the CLI can show id/created_by/expires_at.
+                // active_override: surface the matching ROW (not the
+                // projected ResolvedTarget) so the CLI can show
+                // id/created_by/expires_at. `resolve_row` is the SAME
+                // filter+rank `resolve()` uses for dispatch — the
+                // previous inline reimplementation omitted `cluster`
+                // from the specificity rank and disagreed with dispatch
+                // when a cluster-scoped and a newer global row both
+                // matched.
                 let rows = self.sla_estimator.overrides();
-                let active = crate::sla::r#override::resolve(&key, &rows).and_then(|_| {
-                    rows.into_iter()
-                        .filter(|r| {
-                            r.pname == key.pname
-                                && r.system.as_deref().is_none_or(|s| s == key.system)
-                                && r.tenant.as_deref().is_none_or(|t| t == key.tenant)
-                        })
-                        .max_by(|a, b| {
-                            (u8::from(a.system.is_some()) + u8::from(a.tenant.is_some()))
-                                .cmp(&(u8::from(b.system.is_some()) + u8::from(b.tenant.is_some())))
-                                .then(a.created_at.total_cmp(&b.created_at))
-                        })
-                });
+                let active = crate::sla::r#override::resolve_row(&key, &rows).cloned();
                 let _ = reply.send((self.sla_estimator.cached(&key), active));
             }
             AdminQuery::SlaEvict { key, reply } => {
@@ -332,7 +324,12 @@ impl DagActor {
     /// timer is NOT reset by re-ack. After ICE-sweep removes a
     /// timed-out entry, the controller's reap-on-selector-drift +
     /// respawn + ack lands the NEW `(band, cap)` here as a fresh
-    /// insert.
+    /// insert. A re-ack of a cell ICE-marked SINCE the controller's
+    /// poll is dropped — the next poll returns the freshly-solved
+    /// (cell-excluded) selector, so reap-on-selector-drift fires.
+    /// Without the guard, a Tick sweep landing between poll and ack
+    /// (~1-5s of k8s work) would have the stale ack re-pin the swept
+    /// cell with a fresh timer, defeating ICE-backoff failover.
     pub(super) fn handle_ack_spawned_intents(&self, spawned: &[rio_proto::types::SpawnIntent]) {
         let now = std::time::Instant::now();
         for i in spawned {
@@ -341,7 +338,9 @@ impl DagActor {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            if let Some((band, cap)) = crate::sla::cost::parse_selector(&sel) {
+            if let Some((band, cap)) = crate::sla::cost::parse_selector(&sel)
+                && !self.ice.is_infeasible(band, cap)
+            {
                 self.pending_intents
                     .entry(i.intent_id.clone().into())
                     .or_insert((band, cap, now));
@@ -555,11 +554,23 @@ impl DagActor {
                 let (tier, tier_target) = if no_tier {
                     (None, None)
                 } else {
-                    match full
-                        .as_ref()
-                        .map(|r| r as &solve::SolveResult)
-                        .unwrap_or(&solve::solve_mvp(f, tiers, &self.sla_ceilings))
-                    {
+                    // `full` is `None` ⇒ re-run `solve_mvp` (now pure)
+                    // for the tier name. Match-on-borrow so the local
+                    // `mvp` outlives the `&SolveResult`. Previously
+                    // `unwrap_or(&solve_mvp(...))` evaluated EAGERLY,
+                    // running `solve_mvp` even when `full` was Some —
+                    // wasted compute, and double-counted the
+                    // `sla_infeasible_total` metric back when
+                    // `solve_mvp` emitted internally.
+                    let mvp;
+                    let r: &solve::SolveResult = match full.as_ref() {
+                        Some(r) => r,
+                        None => {
+                            mvp = solve::solve_mvp(f, tiers, &self.sla_ceilings);
+                            &mvp
+                        }
+                    };
+                    match r {
                         solve::SolveResult::Feasible { tier, .. } => (
                             Some(tier.clone()),
                             self.sla_tiers

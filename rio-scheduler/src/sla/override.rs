@@ -72,6 +72,17 @@ fn specificity(r: &SlaOverrideRow) -> u8 {
 ///
 /// [`SchedulerDb::read_sla_overrides`]: crate::db::SchedulerDb::read_sla_overrides
 pub fn resolve(key: &ModelKey, overrides: &[SlaOverrideRow]) -> Option<ResolvedTarget> {
+    resolve_row(key, overrides).map(ResolvedTarget::from)
+}
+
+/// [`resolve`] but returns the matching ROW (with `id`/`created_by`/
+/// `expires_at`) instead of the projected [`ResolvedTarget`]. Single
+/// implementation of the filter+rank so callers that need the full row
+/// (`AdminQuery::SlaStatus`) cannot drift from dispatch's resolution.
+pub fn resolve_row<'a>(
+    key: &ModelKey,
+    overrides: &'a [SlaOverrideRow],
+) -> Option<&'a SlaOverrideRow> {
     overrides
         .iter()
         .filter(|r| {
@@ -84,7 +95,6 @@ pub fn resolve(key: &ModelKey, overrides: &[SlaOverrideRow]) -> Option<ResolvedT
                 .cmp(&specificity(b))
                 .then(a.created_at.total_cmp(&b.created_at))
         })
-        .map(ResolvedTarget::from)
 }
 
 #[cfg(test)]
@@ -185,6 +195,29 @@ mod tests {
     #[test]
     fn empty_overrides_is_none() {
         assert!(resolve(&key("hello", "x", "t"), &[]).is_none());
+    }
+
+    #[test]
+    fn resolve_row_matches_resolve_with_cluster_scoped() {
+        // Regression for the SlaStatus inline-reimplementation drift:
+        // it ranked on `system+tenant` only (omitting `cluster`), so a
+        // newer global row beat a cluster-scoped row at the tie-break
+        // while dispatch (via `resolve`) picked the cluster row. With
+        // `resolve_row` as the single shared body, both agree.
+        let east = SlaOverrideRow {
+            cluster: Some("east".into()),
+            ..row("hello", None, None, 8.0, 1.0)
+        };
+        let global = row("hello", None, None, 4.0, 5.0);
+        let rows = [east.clone(), global];
+        let k = key("hello", "x86_64-linux", "acme");
+        let by_row = resolve_row(&k, &rows).unwrap();
+        assert_eq!(by_row.cores, Some(8.0), "resolve_row picks cluster-scoped");
+        assert_eq!(
+            resolve(&k, &rows).unwrap().forced_cores,
+            by_row.cores,
+            "resolve and resolve_row agree (shared body)"
+        );
     }
 
     #[test]

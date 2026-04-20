@@ -1601,6 +1601,60 @@ async fn ack_spawned_intents_reack_preserves_armed_at() {
     );
 }
 
+/// `handle_ack_spawned_intents` drops a re-ack of an ICE-marked cell.
+/// When the scheduler's `Tick` → `tick_sweep_pending_intents` lands
+/// between the controller's poll and ack (~1-5s of k8s work), the
+/// sweep removes the entry and ICE-marks `(band, cap)`. The stale ack
+/// — built from the PRE-sweep poll result — must NOT re-pin the swept
+/// cell with a fresh timer, or the next poll returns the ICE-marked
+/// selector instead of the freshly-solved (cell-excluded) one and
+/// `reap_stale_for_intents` sees no drift. Contrast the
+/// `post-removal ack arms fresh` case in
+/// [`ack_spawned_intents_reack_preserves_armed_at`]: there the cell is
+/// NOT ICE-marked (scheduler restart case) so re-arm is correct.
+#[tokio::test]
+async fn ack_after_ice_sweep_does_not_repin() {
+    use crate::sla::cost::{self, Band, Cap};
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
+
+    let sel = cost::selector_for(Band::Mid, Cap::Spot);
+    let intent = rio_proto::types::SpawnIntent {
+        intent_id: "x".into(),
+        node_selector: sel.into_iter().collect(),
+        ..Default::default()
+    };
+
+    // Ack → armed.
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
+    assert!(actor.pending_intents.contains_key("x"));
+
+    // tick_sweep_pending_intents fires: removes entry + marks ICE.
+    actor.ice.mark(Band::Mid, Cap::Spot);
+    actor.pending_intents.remove("x");
+
+    // Stale ack (controller built to_ack from pre-sweep poll) → dropped.
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent));
+    assert!(
+        !actor.pending_intents.contains_key("x"),
+        "ack of ICE-marked cell must not re-pin (next poll must see no \
+         pin → freshly-solved selector → reap-on-drift fires)"
+    );
+
+    // A different (non-ICE-marked) cell still arms — guard is per-cell.
+    let sel2 = cost::selector_for(Band::Mid, Cap::OnDemand);
+    let intent2 = rio_proto::types::SpawnIntent {
+        intent_id: "y".into(),
+        node_selector: sel2.into_iter().collect(),
+        ..Default::default()
+    };
+    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent2));
+    assert!(
+        actor.pending_intents.contains_key("y"),
+        "non-ICE-marked cell still arms"
+    );
+}
+
 /// `solve_full` wired into the actor: with `hw_cost_source` set, a
 /// populated hw-factor table, and a fitted key, `SpawnIntent.
 /// node_selector` carries `rio.build/hw-band` + `karpenter.sh/
