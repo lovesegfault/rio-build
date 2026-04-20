@@ -187,6 +187,11 @@ struct DiffRow<'a> {
     actor_kind: Option<&'static str>,
     actor_heartbeat_ago_secs: Option<u64>,
     actor_busy: Option<bool>,
+    /// I-056b: gate `has_capacity()`. Either true → dispatch can't
+    /// reach this worker even if stream/registered/warm all show Y.
+    /// Surfaced here so `--diff` matches `--actor`'s header markers.
+    actor_draining: Option<bool>,
+    actor_store_degraded: Option<bool>,
 }
 
 impl<'a> DiffRow<'a> {
@@ -211,7 +216,24 @@ impl<'a> DiffRow<'a> {
             actor_kind: actor.map(kind_str),
             actor_heartbeat_ago_secs: actor.map(|a| a.last_heartbeat_ago_secs),
             actor_busy: actor.map(|a| a.running_build.is_some()),
+            actor_draining: actor.map(|a| a.draining),
+            actor_store_degraded: actor.map(|a| a.store_degraded),
         }
+    }
+
+    /// I-056b suffix markers (`⚠ DRAINING` / `⚠ DEGRADED`). Same
+    /// strings as `print_actor_worker` so `--actor` and `--diff` scan
+    /// identically. NOT a divergence (draining is operator-intent, not
+    /// PG-vs-actor drift) so it doesn't bump `diverge_count`.
+    fn capacity_markers(&self) -> String {
+        let mut m = String::new();
+        if self.actor_draining == Some(true) {
+            m.push_str("  ⚠ DRAINING");
+        }
+        if self.actor_store_degraded == Some(true) {
+            m.push_str("  ⚠ DEGRADED");
+        }
+        m
     }
 
     /// Whether this row should get the `⚠` marker. Three failure
@@ -239,7 +261,7 @@ impl<'a> DiffRow<'a> {
                 // Fresh stream, PG last_seen not updated yet. Benign
                 // and transient — usually clears on next heartbeat.
                 println!(
-                    "{mark} {}  pg=ABSENT  actor=[stream={} reg={} warm={} {} hb={}s busy={}]  (PG last_seen stale)",
+                    "{mark} {}  pg=ABSENT  actor=[stream={} reg={} warm={} {} hb={}s busy={}]  (PG last_seen stale){}",
                     self.executor_id,
                     yn(self.actor_has_stream.unwrap()),
                     yn(self.actor_is_registered.unwrap()),
@@ -247,16 +269,17 @@ impl<'a> DiffRow<'a> {
                     self.actor_kind.unwrap(),
                     self.actor_heartbeat_ago_secs.unwrap(),
                     yn(self.actor_busy.unwrap()),
+                    self.capacity_markers(),
                 );
             }
             "both" => {
-                let zombie = if self.actor_has_stream == Some(false) {
-                    "  (ZOMBIE: entry exists, no stream)"
-                } else {
-                    ""
-                };
+                let mut suffix = String::new();
+                if self.actor_has_stream == Some(false) {
+                    suffix.push_str("  (ZOMBIE: entry exists, no stream)");
+                }
+                suffix.push_str(&self.capacity_markers());
                 println!(
-                    "{mark} {}  pg=[{}]  actor=[stream={} reg={} warm={} {} hb={}s busy={}]{zombie}",
+                    "{mark} {}  pg=[{}]  actor=[stream={} reg={} warm={} {} hb={}s busy={}]{suffix}",
                     self.executor_id,
                     self.pg_status.unwrap_or("?"),
                     yn(self.actor_has_stream.unwrap()),
@@ -428,5 +451,60 @@ fn print_worker(w: &ExecutorInfo) {
             r.disk_used_bytes,
             r.disk_total_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor(draining: bool, store_degraded: bool) -> DebugExecutorState {
+        DebugExecutorState {
+            executor_id: "ex-1".into(),
+            has_stream: true,
+            is_registered: true,
+            warm: true,
+            kind: ExecutorKind::Builder as i32,
+            draining,
+            store_degraded,
+            ..Default::default()
+        }
+    }
+
+    /// I-056b: `--diff` must surface DRAINING/DEGRADED markers (gate
+    /// `has_capacity()`). Before the fix, DiffRow lacked the fields
+    /// entirely — operator saw a clean row for a worker dispatch
+    /// rejects.
+    // r[verify cli.workers.actor-diff]
+    #[test]
+    fn diff_row_surfaces_draining_degraded() {
+        let a = actor(true, false);
+        let row = DiffRow::new("ex-1", None, Some(&a));
+        assert_eq!(row.actor_draining, Some(true));
+        assert_eq!(row.actor_store_degraded, Some(false));
+        assert!(row.capacity_markers().contains("DRAINING"));
+        assert!(!row.capacity_markers().contains("DEGRADED"));
+
+        let a = actor(false, true);
+        let row = DiffRow::new("ex-1", None, Some(&a));
+        assert!(row.capacity_markers().contains("DEGRADED"));
+
+        // draining/degraded are NOT divergence (operator-intent, not
+        // PG-vs-actor drift).
+        let pg = ExecutorInfo {
+            executor_id: "ex-1".into(),
+            status: "alive".into(),
+            ..Default::default()
+        };
+        let a = actor(true, true);
+        let row = DiffRow::new("ex-1", Some(&pg), Some(&a));
+        assert!(!row.diverges(), "draining must not bump diverge_count");
+        assert!(row.capacity_markers().contains("DRAINING"));
+        assert!(row.capacity_markers().contains("DEGRADED"));
+
+        // pg-only → no actor → no markers.
+        let row = DiffRow::new("ex-1", Some(&pg), None);
+        assert_eq!(row.actor_draining, None);
+        assert!(row.capacity_markers().is_empty());
     }
 }
