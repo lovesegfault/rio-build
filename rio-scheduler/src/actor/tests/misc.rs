@@ -924,7 +924,7 @@ async fn soft_feature_strip_only() {
     );
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 /// D4: `solve_intent_for` clamps its solved (mem, disk) at
 /// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior
 /// `bump_floor_or_count` cycles) gets a SpawnIntent with mem ≥ 32GiB
@@ -1033,6 +1033,67 @@ async fn solve_intent_for_clamps_at_ceil() {
         "forced_mem overlay: mem {} clamped to max_mem {}",
         intent.mem_bytes,
         max_mem
+    );
+
+    // r[verify sched.sla.reactive-floor+2]
+    // cores (a): forced_cores override above max_cores. The override path
+    // emits raw `c.ceil()` with no `.min(max_cores)`; the chokepoint is
+    // the only clamp.
+    let max_cores = actor.sla_ceilings.max_cores as u32;
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "big".into(),
+            cores: Some(f64::from(max_cores) + 50.0),
+            ..Default::default()
+        }]);
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        intent.cores <= max_cores,
+        "forced_cores override: cores {} clamped to max_cores {}",
+        intent.cores,
+        max_cores
+    );
+    actor.sla_estimator.seed_overrides(vec![]);
+
+    // cores (b): explore-frozen path returns raw `st.max_c` which can
+    // exceed a since-tightened `max_cores`. Seed n_eff<3 so the gate
+    // routes to `explore::next` → frozen → `max_c`.
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "wide".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Probe,
+        mem: MemFit::Independent {
+            p90: MemBytes(2 << 30),
+        },
+        disk_p90: None,
+        sigma_resid: 0.2,
+        log_residuals: Vec::new(),
+        n_eff: 2.0,
+        span: 2.0,
+        explore: ExploreState {
+            distinct_c: 2,
+            min_c: RawCores(1.0),
+            max_c: RawCores(f64::from(max_cores) + 20.0),
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("w", Some("wide"), "x86_64-linux", false);
+    let intent = actor.solve_intent_for(actor.dag.node("w").unwrap());
+    assert!(
+        intent.cores <= max_cores,
+        "explore-frozen st.max_c: cores {} clamped to max_cores {}",
+        intent.cores,
+        max_cores
     );
 }
 
@@ -1510,6 +1571,9 @@ async fn clear_persisted_state_clears_per_generation_maps() {
         "stale".into(),
         (Band::Mid, Cap::Spot, std::time::Instant::now()),
     );
+    actor
+        .ice_attempts
+        .insert("stale".into(), vec![(Band::Mid, Cap::Spot)]);
     actor.recently_disconnected.insert(
         "stale-exec".into(),
         ("stale".into(), std::time::Instant::now()),
@@ -1520,6 +1584,10 @@ async fn clear_persisted_state_clears_per_generation_maps() {
     assert!(
         actor.pending_intents.is_empty(),
         "pending_intents must be cleared on leader transition"
+    );
+    assert!(
+        actor.ice_attempts.is_empty(),
+        "ice_attempts must be cleared on leader transition"
     );
     assert!(
         actor.recently_disconnected.is_empty(),

@@ -74,10 +74,23 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
         if st.distinct_c >= 3 && c_up >= cfg.max_cores {
             metrics::suspicious_scaling(&f.key.tenant);
         }
-        decision(c_up, mem_for, disk)
+        // Clamp ate the step (already at ceiling, gradient into wall)
+        // → step the OPPOSITE direction once so `distinct_c` reaches 2
+        // and `frozen()`'s wall clause can fire on the next sample.
+        let c = if c_up > st.max_c.0 {
+            c_up
+        } else {
+            (st.min_c.0 / 2.0).floor().max(1.0)
+        };
+        decision(c, mem_for, disk)
     } else {
         let c_down = (st.min_c.0 / 2.0).floor().max(1.0);
-        decision(c_down, mem_for, disk)
+        let c = if c_down < st.min_c.0 {
+            c_down
+        } else {
+            (st.max_c.0 * 4.0).min(cfg.max_cores)
+        };
+        decision(c, mem_for, disk)
     }
 }
 
@@ -252,6 +265,31 @@ mod tests {
         // ladder DID walk there).
         let f = fit(st(32.0, 64.0, 2, true, 1500.0));
         assert_eq!(next(Some(&f), &cfg(), &DrvHints::default()).c.0, 64.0);
+    }
+
+    // r[verify sched.sla.explore-freeze]
+    #[test]
+    fn probe_at_boundary_gradient_into_wall_steps_away() {
+        // The two cases `probe_at_ceiling_walks_down_not_freeze`
+        // doesn't cover: gradient points INTO the boundary, so the
+        // clamp eats the step. Before the opposite-direction fallback,
+        // these re-emitted the boundary forever (distinct_c stuck at
+        // 1 → frozen() never fires → solve gate never opens).
+
+        // Ceiling, saturated+slow → ×4 clamps to 64 → step DOWN to 32.
+        let f = fit(st(64.0, 64.0, 1, true, 1500.0));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            32.0,
+            "ceiling+saturated+slow: clamp ate ×4 → step ÷2 instead"
+        );
+        // Floor, unsaturated → ÷2 clamps to 1 → step UP to 4.
+        let f = fit(st(1.0, 1.0, 1, false, 100.0));
+        assert_eq!(
+            next(Some(&f), &cfg(), &DrvHints::default()).c.0,
+            4.0,
+            "floor+unsaturated: clamp ate ÷2 → step ×4 instead"
+        );
     }
 
     // r[verify sched.sla.explore-freeze]

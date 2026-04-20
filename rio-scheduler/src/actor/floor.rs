@@ -39,7 +39,7 @@ pub struct FloorOutcome {
     pub at_cap: bool,
 }
 
-// r[impl sched.sla.reactive-floor]
+// r[impl sched.sla.reactive-floor+2]
 // r[impl sched.retry.promotion-exempt+2]
 /// Double the relevant `resource_floor` dimension on an explicit
 /// resource-exhaustion signal, or — if already at the cap — report

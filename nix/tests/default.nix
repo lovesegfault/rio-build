@@ -457,7 +457,7 @@ in
           # setOptions() call runs regardless).
           "setoptions-unreachable"
           "cancel-timing"
-          # r[verify sched.sla.reactive-floor]
+          # r[verify sched.sla.reactive-floor+2]
           "reassign"
           # r[verify obs.metric.scheduler]
           # r[verify obs.metric.builder]

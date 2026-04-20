@@ -10,7 +10,7 @@ use super::fit::headroom;
 use super::hw::HwTable;
 use super::r#override::ResolvedTarget;
 use super::quantile;
-use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
+use super::types::{DiskBytes, DurationFit, FittedParams, MemBytes, RawCores};
 
 /// `prefer_local_build = true` → trivially short. Smallest pod the
 /// controller will spawn.
@@ -274,7 +274,15 @@ pub fn intent_for(
     }
     let fit = match fit {
         Some(f)
-            if f.n_eff >= 3.0 && (f.span >= 4.0 || explore::frozen(&f.explore, ceil.max_cores)) =>
+            if f.n_eff >= 3.0
+                && (f.span >= 4.0 || explore::frozen(&f.explore, ceil.max_cores))
+                // `ingest::refit` sets `fit=Probe` whenever `span<4`,
+                // independent of `frozen()`; without this filter the
+                // `n_eff≥3 ∧ span<4 ∧ frozen` region (reachable via
+                // the `min_c<=1` wall clause) hands a Probe fit to
+                // `solve_mvp` → `t_at=∞` → cap_c=max_cores instead of
+                // explore's `max_c`.
+                && !matches!(f.fit, DurationFit::Probe) =>
         {
             f
         }
@@ -384,11 +392,14 @@ pub fn solve_envelope(
     // `hi` straddles an integer (e.g. c*=8.9 → hi=9.3 → ceil=10 but 9
     // is feasible). Probe `n-1` once — `feasible` is cheap.
     let n = hi.ceil();
-    Some(RawCores(if n > c_lo + 1.0 && feasible(n - 1.0) {
-        n - 1.0
-    } else {
-        n
-    }))
+    if n > c_lo + 1.0 && feasible(n - 1.0) {
+        return Some(RawCores(n - 1.0));
+    }
+    // `n = ⌈hi⌉` may be `⌈cap_c⌉ > cap_c` (USL c_opt non-integer); past
+    // c_opt, T(c) increases, so `feasible(n)` is NOT implied by
+    // `feasible(hi)`. When neither `n-1` nor `n` is feasible, no
+    // integer in `[c_lo, cap_c]` is — fall through to the next tier.
+    feasible(n).then_some(RawCores(n))
 }
 
 /// [`solve_envelope`] wrapper for [`super::explain::explain`]: returns
@@ -429,6 +440,10 @@ pub fn explain_envelope(
 // r[impl sched.sla.solve-citardauq]
 // r[impl sched.sla.solve-reject-not-clamp]
 pub fn solve_mvp(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveResult {
+    debug_assert!(
+        !matches!(fit.fit, DurationFit::Probe),
+        "solve_mvp called with DurationFit::Probe — gate must filter"
+    );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
@@ -524,6 +539,10 @@ pub fn solve_full(
     temp: f64,
     rng: &mut impl Rng,
 ) -> SolveResult {
+    debug_assert!(
+        !matches!(fit.fit, DurationFit::Probe),
+        "solve_full called with DurationFit::Probe — gate must filter"
+    );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff);
     let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
@@ -851,6 +870,31 @@ mod tests {
         let fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
         assert!(solve_envelope(&fit, &t("x", 300.0), 1.0, 64.0, 1.0, 0.0).is_none());
     }
+    // r[verify sched.sla.tier-envelope]
+    #[test]
+    fn envelope_non_integer_cap_c_no_feasible_integer_is_none() {
+        // USL S=0, P=2000, Q=4.327 → c_opt=√(2000/4.327)≈21.50.
+        // T(21)=186.105, T(21.5)=186.054, T(22)=186.103; σ clamped to
+        // 1e-3 so q90≈T·1.00128. With bound 186.32: feasible(21.5) is
+        // true (q=186.29), feasible(21) and feasible(22) are both
+        // false (q=186.34) → no integer in [1, 21.5] satisfies the
+        // bound. Before the `feasible(n)` guard this returned
+        // Some(22.0) — admitting the build to a tier whose bound it
+        // cannot meet.
+        let fit = mk_fit(0.0, 2000.0, 4.327, f64::INFINITY, 0.0);
+        assert_eq!(
+            solve_envelope(&fit, &t("x", 186.32), 1.0, 21.5, 1.0, 0.0),
+            None,
+            "⌈cap_c⌉ > cap_c with no feasible integer → None, not Some(⌈cap_c⌉)"
+        );
+        // Control: at a slightly looser bound, 21 IS feasible.
+        assert_eq!(
+            solve_envelope(&fit, &t("x", 186.5), 1.0, 21.5, 1.0, 0.0)
+                .unwrap()
+                .0,
+            21.0
+        );
+    }
     #[test]
     fn envelope_no_bounds_returns_cap_c() {
         // No-bounds tier → max useful cores (cap_c), not c_lo. Under
@@ -989,6 +1033,39 @@ mod tests {
         let (c, m, _) = intent_for(None, &DrvHints::default(), Some(&o), &cfg(), &[], &ceil());
         assert_eq!(c, 4, "probe.cpu");
         assert_eq!(m, 64 << 30);
+    }
+
+    // r[verify sched.sla.explore-freeze]
+    #[test]
+    fn intent_for_probe_fit_frozen_at_floor_routes_to_explore() {
+        // n_eff≥3 ∧ span<4 ∧ frozen (via min_c<=1 wall clause): the
+        // gate used to admit this Probe fit to solve_mvp → t_at=∞ →
+        // cap_c=max_cores=64. The explore arm correctly returns
+        // st.max_c=2 when frozen.
+        let mut f = mk_fit(0.0, 0.0, 0.0, f64::INFINITY, 0.2);
+        f.fit = DurationFit::Probe;
+        f.n_eff = 3.0;
+        f.span = 2.0;
+        f.explore = ExploreState {
+            distinct_c: 2,
+            min_c: RawCores(1.0),
+            max_c: RawCores(2.0),
+            saturated: false,
+            last_wall: WallSeconds(100.0),
+        };
+        assert!(explore::frozen(&f.explore, 64.0), "precondition: frozen");
+        let (c, _, _) = intent_for(
+            Some(&f),
+            &DrvHints::default(),
+            None,
+            &cfg(),
+            &[t("normal", 1200.0)],
+            &ceil(),
+        );
+        assert_eq!(
+            c, 2,
+            "Probe fit (frozen, span<4) routes to explore → max_c=2, NOT max_cores=64"
+        );
     }
 
     #[test]

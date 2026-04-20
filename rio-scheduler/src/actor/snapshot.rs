@@ -407,8 +407,17 @@ impl DagActor {
         // `hints` and would multi-core a `enableParallelBuilding=false`
         // build. The hw_table snapshot is one RwLock-read clone
         // (~dozens of entries); cost_table same.
+        // r[impl sched.sla.ice-ladder-cap]
+        // Per-build ICE-ladder exhausted → skip `solve_full` so the
+        // band-agnostic `intent_for` arm dispatches under no
+        // hw-band/capacity-type selector.
+        let ladder_exhausted = self
+            .ice_attempts
+            .get(&state.drv_hash)
+            .is_some_and(|a| a.len() as u32 >= self.ice_ladder_cap());
         let hw = self.sla_estimator.hw_table();
-        let full = (self.sla_config.hw_cost_source.is_some()
+        let full = (!ladder_exhausted
+            && self.sla_config.hw_cost_source.is_some()
             && !hw.is_empty()
             && override_
                 .as_ref()
@@ -423,6 +432,7 @@ impl DagActor {
             if f.n_eff < 3.0
                 || (f.span < 4.0
                     && !crate::sla::explore::frozen(&f.explore, self.sla_ceilings.max_cores))
+                || matches!(f.fit, crate::sla::types::DurationFit::Probe)
             {
                 return None;
             }
@@ -462,7 +472,7 @@ impl DagActor {
         // `solve_full` doesn't see `override_`, so without this a
         // `--mem`-only override is dead under `hwCostSource`.
         let mem = override_.as_ref().and_then(|o| o.forced_mem).unwrap_or(mem);
-        // r[impl sched.sla.reactive-floor]
+        // r[impl sched.sla.reactive-floor+2]
         // D4: floor AND ceiling at the single post-solve chokepoint.
         // Floor: a derivation that OOM'd at its solved mem had
         // `bump_floor_or_count` double `floor.mem`; the next solve
@@ -470,12 +480,16 @@ impl DagActor {
         // branches (forced/serial/local/explore) and the `forced_mem`
         // overlay above pass fit-derived bytes through unclamped, so
         // the `solve_mvp`/`solve_full` BestEffort clamp doesn't cover
-        // them — a `disk_p90` (or `--mem`) above a tightened
-        // `max_disk`/`max_mem` would otherwise spawn a permanently-
-        // Pending pod. `bump_floor_or_count` already caps `floor` at
-        // `ceil` (floor.rs), so `.max(floor).min(ceil)` always yields
-        // `≤ ceil`.
+        // them — a `disk_p90` (or `--mem` / `--cores`) above a
+        // tightened `max_disk`/`max_mem`/`max_cores` would otherwise
+        // spawn a permanently-Pending pod. `bump_floor_or_count`
+        // already caps `floor` at `ceil` (floor.rs), so
+        // `.max(floor).min(ceil)` always yields `≤ ceil`. Cores has no
+        // `resource_floor` dimension (OOM/DiskPressure are mem/disk
+        // under-provision, per the spec); `.max(1)` is belt-and-braces
+        // — every upstream branch already floors at 1.
         let floor = &state.sched.resource_floor;
+        let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
         let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
         // D7: deadline_secs. Fitted ⇒ `wall_p99 × 5` (p99 of the

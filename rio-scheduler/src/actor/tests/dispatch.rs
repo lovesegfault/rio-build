@@ -1262,7 +1262,7 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 /// D4: `InfrastructureFailure(CgroupOom)` doubles
 /// `resource_floor.mem_bytes` for both FOD and non-FOD (D2: same
 /// reactive path). The floor feeds `solve_intent_for`'s mem clamp →
@@ -1553,6 +1553,128 @@ async fn pending_intent_timeout_marks_ice() {
         intent_id: Some("fresh".into()),
     });
     assert!(actor.pending_intents.is_empty(), "heartbeat clears entry");
+}
+
+/// `r[sched.sla.ice-ladder-cap]`: a single drv's Pending-watch timeouts
+/// are bounded by `ladder_cap`; on exhaustion `solve_intent_for` skips
+/// `solve_full` and dispatches band-agnostic. Before, `ladder_cap` had
+/// zero production callers and a 1h-tier build cycled `(band, cap)`
+/// cells ~30 times until tier-deadline.
+// r[verify sched.sla.ice-ladder-cap]
+#[tokio::test]
+async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
+    use crate::sla::cost::{self, Band, Cap};
+    use crate::sla::{hw, types::*};
+    use std::time::{Duration, Instant};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
+    actor.sla_config = crate::sla::config::SlaConfig {
+        hw_cost_source: Some(cost::HwCostSource::Static),
+        hw_softmax_temp: 0.0,
+        hw_fallback_after_secs: 10.0,
+        ..test_sla_config()
+    };
+    actor.sla_ceilings = actor.sla_config.ceilings();
+    // p90=300s, fallback=10s → ladder_cap = ⌈300/10/4⌉ = 8.
+    actor.sla_tiers = vec![crate::sla::solve::Tier {
+        name: "normal".into(),
+        p50: None,
+        p90: Some(300.0),
+        p99: None,
+    }];
+    let cap = actor.ice_ladder_cap();
+    assert_eq!(cap, 8);
+    let mut m = HashMap::new();
+    m.insert("aws-7-ebs-mid".into(), 1.0);
+    actor.sla_estimator.seed_hw(hw::HwTable::from_map(m));
+    actor.sla_estimator.seed(FittedParams {
+        key: ModelKey {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: String::new(),
+        },
+        fit: DurationFit::Amdahl {
+            s: RefSeconds(10.0),
+            p: RefSeconds(500.0),
+        },
+        mem: MemFit::Independent {
+            p90: MemBytes(2 << 30),
+        },
+        disk_p90: Some(DiskBytes(10 << 30)),
+        sigma_resid: 0.1,
+        log_residuals: Vec::new(),
+        n_eff: 10.0,
+        span: 8.0,
+        explore: ExploreState {
+            distinct_c: 3,
+            min_c: RawCores(1.0),
+            max_c: RawCores(8.0),
+            saturated: false,
+            last_wall: WallSeconds(0.0),
+        },
+        t_min_ci: None,
+        ci_computed_at: None,
+        tier: None,
+        hw_bias: Default::default(),
+        prior_source: None,
+    });
+    actor.test_inject_ready("d", Some("p"), "x86_64-linux", false);
+
+    // Precondition: solve_full fires, selector populated.
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        !intent.node_selector.is_empty(),
+        "precondition: solve_full path active"
+    );
+
+    // Simulate `cap` consecutive Pending-watch timeouts.
+    let old = Instant::now() - Duration::from_secs(20);
+    for i in 0..cap {
+        actor
+            .pending_intents
+            .insert("d".into(), (Band::Mid, Cap::Spot, old));
+        actor.tick_sweep_pending_intents(Instant::now());
+        assert!(
+            !actor.pending_intents.contains_key("d"),
+            "timeout drops entry (selector-pin must not re-emit dead cell)"
+        );
+        assert_eq!(
+            actor.ice_attempts.get("d").map(|v| v.len() as u32),
+            Some(i + 1),
+            "attempt {i}: ice_attempts survives the drop"
+        );
+    }
+
+    // Ladder exhausted → band-agnostic.
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        intent.node_selector.is_empty(),
+        "ladder_cap reached → solve_full skipped → band-agnostic selector"
+    );
+
+    // Heartbeat clears the attempt log → next solve is band-targeted again.
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    actor.handle_worker_connected(&"w0".into(), tx, next_stream_epoch_for("w0"), None);
+    actor.handle_heartbeat(HeartbeatPayload {
+        executor_id: "w0".into(),
+        systems: vec!["x86_64-linux".into()],
+        supported_features: vec![],
+        running_build: None,
+        resources: None,
+        store_degraded: false,
+        draining: false,
+        kind: rio_proto::types::ExecutorKind::Builder,
+        intent_id: Some("d".into()),
+    });
+    assert!(
+        !actor.ice_attempts.contains_key("d"),
+        "heartbeat resets ladder"
+    );
+    let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    assert!(
+        !intent.node_selector.is_empty(),
+        "post-heartbeat: solve_full path restored"
+    );
 }
 
 /// `handle_ack_spawned_intents` is idempotent: a re-ack of an

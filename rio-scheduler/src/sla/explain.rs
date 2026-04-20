@@ -89,12 +89,18 @@ pub fn explain(
         };
     }
 
+    // `forced_mem` is hoisted so it shows in EVERY branch below
+    // (mirrors `intent_for` at solve.rs — that hoist was a prior
+    // bug-fix never ported here).
+    let forced_mem = override_.and_then(|o| o.forced_mem);
+    let fmt_mem = |m: u64| format!("forced mem={:.1}Gi", m as f64 / (1u64 << 30) as f64);
+
     let Some(fit) = fit else {
         return ExplainResult {
             key: key.clone(),
             fit_summary: "(no fit — cold-start probe)".into(),
             prior_source: "none".into(),
-            override_applied: None,
+            override_applied: forced_mem.map(fmt_mem),
             candidates: Vec::new(),
         };
     };
@@ -131,7 +137,7 @@ pub fn explain(
             continue;
         };
         row.c_star = Some(c_star);
-        let mem = (fit.mem.at(RawCores(c_star)).0 as f64 * h) as u64;
+        let mem = forced_mem.unwrap_or_else(|| (fit.mem.at(RawCores(c_star)).0 as f64 * h) as u64);
         row.mem = Some(mem);
         if mem > ceil.max_mem {
             row.binding_constraint = "mem-ceiling".into();
@@ -154,7 +160,19 @@ pub fn explain(
             .prior_source
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "per-key".into()),
-        override_applied: pinned.map(|t| format!("tier pinned to {t:?}")),
+        override_applied: match (pinned, forced_mem) {
+            (None, None) => None,
+            (tier, mem) => {
+                let mut parts = Vec::new();
+                if let Some(t) = tier {
+                    parts.push(format!("tier pinned to {t:?}"));
+                }
+                if let Some(m) = mem {
+                    parts.push(fmt_mem(m));
+                }
+                Some(parts.join(", "))
+            }
+        },
         candidates,
     }
 }
@@ -358,6 +376,53 @@ mod tests {
         assert_eq!(r.candidates.len(), 1);
         assert_eq!(r.candidates[0].tier, "t1");
         assert!(r.override_applied.as_deref().unwrap().contains("t1"));
+    }
+
+    #[test]
+    fn forced_mem_only_override_shows_in_explain() {
+        // Regression: a `--mem`-only override (no `--cores`, no
+        // `--tier`) fell through both the `forced_cores` short-circuit
+        // and the `tier` pickup → per-row mem showed model value and
+        // override_applied was None, while `intent_for` honored it.
+        let fit = mk_fit(30.0, 100.0, 0.0, 64.0);
+        let o = ResolvedTarget {
+            forced_mem: Some(64 << 30),
+            ..Default::default()
+        };
+        let r = explain(&key(), Some(&fit), &[t("t0", 600.0)], &ceil(), Some(&o));
+        assert_eq!(
+            r.candidates[0].mem,
+            Some(64 << 30),
+            "per-row mem reflects forced_mem, not model"
+        );
+        assert!(
+            r.override_applied.as_deref().unwrap().contains("mem"),
+            "override_applied surfaces forced_mem"
+        );
+        // Combined tier+mem: both show in summary.
+        let o = ResolvedTarget {
+            tier: Some("t0".into()),
+            forced_mem: Some(64 << 30),
+            ..Default::default()
+        };
+        let r = explain(&key(), Some(&fit), &[t("t0", 600.0)], &ceil(), Some(&o));
+        let s = r.override_applied.unwrap();
+        assert!(s.contains("t0") && s.contains("mem"));
+    }
+
+    #[test]
+    fn forced_mem_only_cold_start_shows_in_explain() {
+        // Cold-start branch (no fit): `intent_for` applies forced_mem
+        // in the explore arm too; explain must surface it.
+        let o = ResolvedTarget {
+            forced_mem: Some(64 << 30),
+            ..Default::default()
+        };
+        let r = explain(&key(), None, &[t("t0", 600.0)], &ceil(), Some(&o));
+        assert!(
+            r.override_applied.as_deref().unwrap().contains("mem"),
+            "cold-start branch surfaces forced_mem"
+        );
     }
 
     #[test]

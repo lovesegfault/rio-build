@@ -481,7 +481,7 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor]
+    // r[impl sched.sla.reactive-floor+2]
     /// Double the relevant `resource_floor` dimension for `drv_hash`
     /// (D4). Thin wrapper around [`floor::bump_floor_or_count`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG

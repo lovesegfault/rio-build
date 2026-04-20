@@ -12,8 +12,8 @@ r[sched.sla.fit-nnls]
 
 r[sched.sla.mem-coupled]
 
-r[sched.sla.reactive-floor]
-`SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs }` (default zeros) is the per-dimension reactive floor for cold-start safety. An explicit resource-exhaustion signal (controller-reported `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded`, worker-reported `CgroupOom`/`TimedOut`) MUST call `bump_floor_or_count`: if the relevant dimension is already at its ceiling (`Ceilings.max_{mem,disk}` / `86400` for deadline), increment `infra_count` (or `timeout_count` for deadline) and return `promoted=false`; otherwise set the dimension to `min(max(floor, last_intent) * 2, ceiling)` and return `promoted=true`. `last_intent` is `state.sched.last_intent.{mem,disk,deadline}_*` snapshotted at dispatch time. `solve_intent_for` MUST clamp its solved (mem, disk) at `resource_floor` before returning. Persisted as `derivations.floor_*` (`M_044`) so failover doesn't reset to zero. No `cores` floor: OOM/DiskPressure are mem/disk under-provision; DeadlineExceeded is a wall-time bound, not a parallelism bound.
+r[sched.sla.reactive-floor+2]
+`SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs }` (default zeros) is the per-dimension reactive floor for cold-start safety. An explicit resource-exhaustion signal (controller-reported `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded`, worker-reported `CgroupOom`/`TimedOut`) MUST call `bump_floor_or_count`: if the relevant dimension is already at its ceiling (`Ceilings.max_{mem,disk}` / `86400` for deadline), increment `infra_count` (or `timeout_count` for deadline) and return `promoted=false`; otherwise set the dimension to `min(max(floor, last_intent) * 2, ceiling)` and return `promoted=true`. `last_intent` is `state.sched.last_intent.{mem,disk,deadline}_*` snapshotted at dispatch time. `solve_intent_for` MUST clamp its solved (mem, disk) at `resource_floor` before returning, and MUST clamp (cores, mem, disk) at `Ceilings.max_{cores,mem,disk}`. Persisted as `derivations.floor_*` (`M_044`) so failover doesn't reset to zero. No `cores` floor: OOM/DiskPressure are mem/disk under-provision; DeadlineExceeded is a wall-time bound, not a parallelism bound.
 
 r[sched.sla.disk-scalar]
 
@@ -34,6 +34,12 @@ r[sched.sla.reassign-schmitt]
 r[sched.sla.hw-ref-seconds]
 
 r[sched.sla.hw-bench-append-only]
+
+r[sched.sla.cost-leader-edge-reload]
+On a false→true leader edge, the cost-table poller MUST reload `sla_ema_state` from PG before its first `persist()`. A failed reload MUST NOT proceed to `persist()` (which would overwrite the previous leader's evolved EMA with this replica's stale startup snapshot); retry on the next tick.
+
+r[sched.sla.ice-ladder-cap]
+A single derivation's ICE-backoff ladder MUST NOT exceed `ladder_cap = clamp(⌈max_tier_bound/hw_fallback_after/4⌉, 1, 8)` Pending-watch timeouts; on exhaustion the derivation MUST fall through to band-agnostic dispatch (`solve_intent_for` skips `solve_full`). The fleet-wide `IceBackoff::exhausted()` is unreachable from one build's serial probing because `ICE_TTL=60s < hw_fallback_after≈120s`. Attempted `(band, cap)` cells SHOULD be recorded for forensics.
 
 r[sched.sla.quantile-geo-lognormal]
 

@@ -200,16 +200,21 @@ impl DagActor {
     /// first heartbeat") but all three mean the `(band, cap)` failed to
     /// produce capacity within the window, and the 60s ICE TTL bounds
     /// the false-positive cost. See [`crate::sla::cost::IceBackoff`].
+    // r[impl sched.sla.ice-ladder-cap]
     pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
         let fallback = self.sla_config.hw_fallback_after_secs;
+        let ladder_cap = self.ice_ladder_cap();
         self.pending_intents.retain(|drv_hash, (band, cap, since)| {
             // Drop entries whose drv left Ready: they won't heartbeat
-            // and the timeout isn't a capacity signal.
+            // and the timeout isn't a capacity signal. Also drop the
+            // attempt log — a re-queue (e.g. resubmit) should not
+            // inherit a prior generation's exhaust.
             if self
                 .dag
                 .node(drv_hash)
                 .is_none_or(|s| s.status() != crate::state::DerivationStatus::Ready)
             {
+                self.ice_attempts.remove(drv_hash);
                 return false;
             }
             // Stable per-drv jitter ∈ [0.8, 1.2): hash low byte → factor.
@@ -220,6 +225,15 @@ impl DagActor {
                 return true;
             }
             self.ice.mark(*band, *cap);
+            // Per-build ladder cap: bound retries so a tier with a 1h
+            // p90 doesn't burn ~30 fallback rounds before demoting. The
+            // fleet-wide `ice.exhausted()` (all 6 cells live) is
+            // unreachable from one build's serial probing because
+            // `ICE_TTL=60s < hw_fallback_after≈120s`. `ice_attempts`
+            // is separate from `pending_intents` so it survives this
+            // drop + the controller's reap/respawn/ack `or_insert`.
+            let mut attempted = self.ice_attempts.entry(drv_hash.clone()).or_default();
+            attempted.push((*band, *cap));
             metrics::counter!(
                 "rio_scheduler_sla_ice_backoff_total",
                 "band" => band.label(),
@@ -229,11 +243,40 @@ impl DagActor {
             debug!(
                 drv_hash = %drv_hash, band = band.label(), cap = cap.label(),
                 pending_secs = now.duration_since(*since).as_secs(),
+                attempted = attempted.len(), ladder_cap,
                 "pending-watch: no heartbeat within hw_fallback_after; \
                  marking (band, cap) ICE-infeasible for 60s"
             );
+            if attempted.len() as u32 >= ladder_cap {
+                crate::sla::cost::capacity_exhausted();
+                debug!(
+                    drv_hash = %drv_hash,
+                    attempted = ?crate::sla::cost::IceBackoff::encode_attempted(&attempted),
+                    "pending-watch: ICE ladder cap reached; forcing band-agnostic dispatch"
+                );
+            }
             false
         });
+    }
+
+    /// `IceBackoff::ladder_cap` evaluated against the configured tier
+    /// ladder + `hw_fallback_after_secs`. Shared between the sweep and
+    /// `solve_intent_for`'s ladder-exhausted gate so both agree on the
+    /// same threshold.
+    pub(crate) fn ice_ladder_cap(&self) -> u32 {
+        let max_tier_bound = self
+            .sla_tiers
+            .iter()
+            .filter_map(crate::sla::solve::Tier::binding_bound)
+            .fold(0.0_f64, f64::max);
+        crate::sla::cost::IceBackoff::ladder_cap(
+            if max_tier_bound > 0.0 {
+                max_tier_bound
+            } else {
+                3600.0
+            },
+            self.sla_config.hw_fallback_after_secs,
+        )
     }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have

@@ -783,15 +783,23 @@ pub(crate) async fn poller_tick_prelude(
         *was_leader = false;
         return false;
     }
+    // r[impl sched.sla.cost-leader-edge-reload]
     if !*was_leader {
         let cluster = cost.read().cluster().to_owned();
         match CostTable::load(db, &cluster).await {
-            Ok(fresh) => *cost.write() = fresh,
+            Ok(fresh) => {
+                *cost.write() = fresh;
+                *was_leader = true;
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "cost reload on leader-acquire failed; using in-mem")
+                tracing::warn!(error = %e, "cost reload on leader-acquire failed; retrying next tick");
+                // Do NOT latch `was_leader` and do NOT proceed: the
+                // tick body would `persist()` this replica's stale
+                // startup snapshot over the previous leader's evolved
+                // EMA. Retried on the next tick.
+                return false;
             }
         }
-        *was_leader = true;
     }
     true
 }
@@ -1218,6 +1226,61 @@ mod tests {
         let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
         assert!(proceed);
         assert!((cost.read().price(Band::Hi, Cap::Spot) - 0.09).abs() < 1e-9);
+    }
+
+    /// Regression: when `CostTable::load` fails on the false→true
+    /// leader edge, the prelude must NOT latch `was_leader=true` and
+    /// must NOT return `true` — doing so would let the caller
+    /// `persist()` this replica's stale startup snapshot over the
+    /// previous leader's evolved EMA, and skip the reload retry on
+    /// every subsequent tick.
+    // r[verify sched.sla.cost-leader-edge-reload]
+    #[tokio::test]
+    async fn poller_prelude_load_failure_retries_and_skips_persist() {
+        use std::sync::Arc;
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+
+        // Seed PG with the previous leader's evolved state.
+        let mut prev = CostTable::seeded("c");
+        prev.set_price(Band::Hi, Cap::Spot, 0.08, 5000.0);
+        prev.persist(&sdb).await.unwrap();
+
+        // This replica's stale in-mem startup snapshot.
+        let mut mine = CostTable::seeded("c");
+        mine.set_price(Band::Hi, Cap::Spot, 0.02, 100.0);
+        let cost = Arc::new(parking_lot::RwLock::new(mine));
+
+        // Broken DB: a separate pool closed before use → load() Errs.
+        // (PgPool is Arc-backed; closing a clone of `db.pool` would
+        // also break `sdb`.)
+        let bad = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        bad.pool.close().await;
+        let bad_db = SchedulerDb::new(bad.pool.clone());
+
+        let mut was_leader = false;
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &bad_db).await;
+        assert!(
+            !proceed,
+            "load() Err → tick body skipped (no persist of stale snapshot)"
+        );
+        assert!(
+            !was_leader,
+            "load() Err → was_leader stays false so next tick retries"
+        );
+        assert!(
+            (cost.read().price(Band::Hi, Cap::Spot) - 0.02).abs() < 1e-9,
+            "in-mem unchanged on Err"
+        );
+
+        // Retry with a working DB: reload succeeds, latches, proceeds.
+        let proceed = poller_tick_prelude(&mut was_leader, true, &cost, &sdb).await;
+        assert!(proceed, "retry with working DB → proceed");
+        assert!(was_leader, "retry success → latched");
+        assert!(
+            (cost.read().price(Band::Hi, Cap::Spot) - 0.08).abs() < 1e-9,
+            "retry reloaded PG state (previous leader's EMA)"
+        );
     }
 
     /// `refresh_lambda` advances `updated_at` to the rows' `MAX(at)`,

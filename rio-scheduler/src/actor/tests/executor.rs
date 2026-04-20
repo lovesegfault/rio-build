@@ -826,7 +826,7 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
 /// `failed_builders`/`failure_count`/`retry_count` so the ladder is
 /// bounded by `Ceilings.max_disk`, not `PoisonConfig.threshold=3`.
 // r[verify sched.retry.promotion-exempt+2]
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     use rio_proto::types::TerminationReason;
@@ -892,7 +892,7 @@ async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 /// D4 cap-then-count: with `floor.mem == ceil.max_mem`, an OOM report
 /// returns `promoted=false` and increments `infra_count`; after
 /// `max_infra_retries` such cycles the drv poisons (via the
@@ -1399,7 +1399,7 @@ async fn controller_oom_at_ceiling_poisons() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 // r[verify sched.reassign.no-promote-on-ephemeral-disconnect+4]
 /// Bare disconnect does NOT promote `resource_floor`; the
 /// controller's follow-up `ReportExecutorTermination(OomKilled)` does.
@@ -1579,7 +1579,7 @@ async fn test_non_promoting_report_preserves_recently_disconnected() -> TestResu
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 /// Race-ahead order: `ReportExecutorTermination` lands BEFORE
 /// `ExecutorDisconnected` (controller observed Pod-status before the
 /// gRPC stream broke at the scheduler). The race-ahead arm reads the
@@ -1656,7 +1656,7 @@ async fn test_termination_report_race_ahead_of_disconnect_bumps_once() -> TestRe
     Ok(())
 }
 
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 /// At-ceiling variant of the race-ahead regression: with floor already
 /// at `max_mem`, each bump increments `infra_count` instead of
 /// doubling. One physical OOM under report→disconnect→re-report must

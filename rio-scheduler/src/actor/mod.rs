@@ -259,6 +259,17 @@ pub struct DagActor {
     /// lookup is `&self`.
     pub(crate) pending_intents:
         dashmap::DashMap<DrvHash, (crate::sla::cost::Band, crate::sla::cost::Cap, Instant)>,
+    /// Per-derivation ICE-ladder attempt log: `(band, cap)` cells this
+    /// drv has timed-out on so far. Separate from `pending_intents`
+    /// because the sweep DROPS that entry on timeout (so the selector-
+    /// pin doesn't re-emit the dead cell) and the next ack `or_insert`s
+    /// fresh — `attempted` must survive that cycle. `solve_intent_for`
+    /// checks `len() >= IceBackoff::ladder_cap()` to force band-
+    /// agnostic dispatch (`r[sched.sla.ice-ladder-cap]`).
+    /// `handle_heartbeat` clears on first heartbeat (pod scheduled →
+    /// ladder reset); `clear_persisted_state` clears on leader edge.
+    pub(crate) ice_attempts:
+        dashmap::DashMap<DrvHash, Vec<(crate::sla::cost::Band, crate::sla::cost::Cap)>>,
     /// Tick counter for periodic tasks that run less often than every
     /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
     /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
@@ -473,6 +484,7 @@ impl DagActor {
             cost_table: plumbing.cost_table,
             ice: Arc::new(crate::sla::cost::IceBackoff::default()),
             pending_intents: dashmap::DashMap::new(),
+            ice_attempts: dashmap::DashMap::new(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             leader: plumbing.leader,
@@ -528,6 +540,7 @@ impl DagActor {
         // spuriously bump `resource_floor` on a drv this generation
         // never assigned.
         self.pending_intents.clear();
+        self.ice_attempts.clear();
         self.recently_disconnected.clear();
         // Deliberately retained across generations:
         // - `executors`: live connections, not persisted (doc above).

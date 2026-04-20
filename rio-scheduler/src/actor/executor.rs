@@ -478,7 +478,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.sla.reactive-floor]
+    // r[impl sched.sla.reactive-floor+2]
     /// Controller-reported Pod termination reason. `OomKilled` /
     /// `EvictedDiskPressure` / `DeadlineExceeded` → bump the relevant
     /// `resource_floor` dimension (D4). Other reasons → no-op (log
@@ -903,6 +903,8 @@ impl DagActor {
         // downgrade below for that reason.
         if let Some(id) = &hb.intent_id {
             self.pending_intents.remove(id.as_str());
+            // Pod scheduled → ladder reset (r[sched.sla.ice-ladder-cap]).
+            self.ice_attempts.remove(id.as_str());
         }
         // intent_id: DOWNGRADE to None if it doesn't point at a
         // currently-Ready drv. Computed here (before `get_mut`) so the

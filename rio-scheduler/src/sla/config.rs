@@ -187,7 +187,7 @@ impl SlaConfig {
     /// blocks VM-test pools where `max_cores < 16` from booting at all.
     /// `explore::frozen`'s `distinct_c >= 2` guard makes a probe placed
     /// at either boundary recoverable (the ladder walks away from the
-    /// wall on the first sample); a config that won't load is not.
+    /// wall within two samples); a config that won't load is not.
     pub fn validate(&self) -> anyhow::Result<()> {
         let hi = self.max_cores;
         anyhow::ensure!(

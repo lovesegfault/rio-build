@@ -1292,7 +1292,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// reported sizing signal (pod-level OOMKilled is controller-
 /// reported via `ReportExecutorTermination`).
 // r[verify sched.retry.promotion-exempt+2]
-// r[verify sched.sla.reactive-floor]
+// r[verify sched.sla.reactive-floor+2]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
