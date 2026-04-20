@@ -27,18 +27,19 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
-    AckSpawnedIntentsRequest, AppendInterruptSampleRequest, BuildLogChunk, ClearPoisonRequest,
-    ClearPoisonResponse, ClusterStatusResponse, CreateTenantRequest, CreateTenantResponse,
-    DebugExecutorState, DebugListExecutorsResponse, DrainExecutorRequest, DrainExecutorResponse,
-    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
-    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
-    ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
-    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
-    SlaStatusResponse, TerminationReason,
+    AckSpawnedIntentsRequest, AppendInterruptSampleRequest, BuildLogChunk, CancelBuildRequest,
+    CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
+    CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
+    DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse,
+    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
+    GetSpawnIntentsRequest, GetSpawnIntentsResponse, ImportSlaCorpusRequest,
+    ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
+    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
+    ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
+    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
+    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
+    SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest, SlaStatusResponse,
+    TerminationReason,
 };
 use uuid::Uuid;
 
@@ -421,6 +422,38 @@ impl AdminService for AdminServiceImpl {
             accepted: result.accepted,
             busy: result.busy,
         }))
+    }
+
+    /// Operator cancel — service-token gated, dispatches
+    /// `ActorCommand::CancelBuild{caller_tenant: None}` (bypasses the
+    /// tenant-ownership check that `SchedulerService::cancel_build`
+    /// applies). rio-cli holds a service-HMAC identity, not a
+    /// tenant-JWT identity, so it cannot reach
+    /// `SchedulerService.CancelBuild` in JWT mode (`r[sched.tenant.authz]`).
+    // r[impl admin.rpc.cancel-build]
+    #[instrument(skip(self, request), fields(rpc = "CancelBuild"))]
+    async fn cancel_build(
+        &self,
+        request: Request<CancelBuildRequest>,
+    ) -> Result<Response<CancelBuildResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-controller"])?;
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let build_id = Uuid::parse_str(&req.build_id)
+            .map_err(|e| Status::invalid_argument(format!("invalid build_id: {e}")))?;
+
+        let cancelled = query_actor(&self.actor, |reply| ActorCommand::CancelBuild {
+            build_id,
+            caller_tenant: None,
+            reason: req.reason,
+            reply,
+        })
+        .await?
+        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+
+        Ok(Response::new(CancelBuildResponse { cancelled }))
     }
 
     /// Controller reports a builder/fetcher Pod's k8s termination

@@ -153,6 +153,9 @@ r[sched.admin.list-builds]
 r[sched.admin.clear-poison]
 `AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_builders`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error. The DAG is keyed on the full `.drv` store path; `rio-cli poison-clear` validates this client-side and rejects bare hashes (a silent no-match would look like "not poisoned" when it's actually "wrong key format").
 
+r[admin.rpc.cancel-build]
+`AdminService.CancelBuild` gates on `x-rio-service-token` (allowlist: `rio-cli`, `rio-controller`) and dispatches `ActorCommand::CancelBuild{caller_tenant: None}` --- operator override bypasses the tenant-ownership check that `SchedulerService.CancelBuild` applies. rio-cli holds a service-HMAC identity, not a tenant-JWT identity, so `SchedulerService.CancelBuild` is unreachable from the CLI in JWT mode (`r[sched.tenant.authz]`); this RPC is the CLI's path.
+
 r[sched.admin.list-poisoned]
 `AdminService.ListPoisoned` returns all currently-poisoned derivations from PostgreSQL (`status = 'poisoned'`). Each entry includes the full `.drv` store path (what `ClearPoison` takes), the list of executor IDs that failed building it, and the age in seconds (TTL is 24h). These are the ROOTS that cascade `DependencyFailed` — a single poisoned FOD can block hundreds of downstream derivations, which `rio-cli status` surfaces only as `[Failed] N/M drv` without naming the culprit.
 

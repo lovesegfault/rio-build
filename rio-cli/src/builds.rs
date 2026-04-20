@@ -1,7 +1,6 @@
 //! `rio-cli builds|cancel-build` — build listing + cancellation.
 
 use crate::AdminClient;
-use anyhow::anyhow;
 use rio_proto::types::{BuildInfo, CancelBuildRequest, ListBuildsRequest};
 
 use crate::{json, rpc};
@@ -60,24 +59,21 @@ pub(crate) async fn run_list(
     Ok(())
 }
 
-/// CancelBuild lives on SchedulerService, not AdminService — it's the
-/// same RPC the gateway calls on client disconnect. Same address
-/// (scheduler hosts both services on one port), separate client.
+/// Calls `AdminService.CancelBuild` (service-token gated, operator
+/// override with `caller_tenant=None`). `SchedulerService.CancelBuild`
+/// is the tenant-scoped path used by the gateway and is unreachable
+/// from the CLI in JWT mode (`r[sched.tenant.authz]`).
 pub(crate) async fn run_cancel(
     as_json: bool,
-    scheduler_addr: &str,
+    client: &mut AdminClient,
     a: CancelArgs,
 ) -> anyhow::Result<()> {
-    let mut sched: rio_proto::SchedulerServiceClient<_> =
-        rio_proto::client::connect_single(scheduler_addr)
-            .await
-            .map_err(|e| anyhow!("connect to scheduler at {scheduler_addr}: {e}"))?;
     let req = CancelBuildRequest {
         build_id: a.build_id.clone(),
         reason: a.reason,
     };
     let resp = rpc("CancelBuild", async || {
-        sched.cancel_build(req.clone()).await
+        client.cancel_build(req.clone()).await
     })
     .await?;
     if as_json {

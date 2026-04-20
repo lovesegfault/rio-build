@@ -68,19 +68,16 @@ mod tests {
 /// `AdminService::ListTenants` — keeps the store-only fast path
 /// scheduler-free, only requires scheduler reachability when the
 /// operator passes a name.
-async fn resolve_tenant(tenant: String, scheduler_addr: &str) -> anyhow::Result<String> {
+async fn resolve_tenant(tenant: String, cfg: &crate::Config) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(&tenant).is_ok() {
         return Ok(tenant);
     }
-    let mut ac: rio_proto::AdminServiceClient<_> =
-        rio_proto::client::connect_single(scheduler_addr)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "tenant '{tenant}' is not a UUID; name lookup needs scheduler at \
-                     {scheduler_addr}: {e}"
-                )
-            })?;
+    // connect_admin() attaches ServiceTokenInterceptor — same auth path
+    // as every other AdminService caller. A bare `connect_single` here
+    // would break the day `ListTenants` gets service-token gated.
+    let mut ac = cfg.connect_admin().await.map_err(|e| {
+        anyhow::anyhow!("tenant '{tenant}' is not a UUID; name lookup needs scheduler: {e}")
+    })?;
     let resp = rpc("ListTenants", async || ac.list_tenants(()).await).await?;
     resp.tenants
         .into_iter()
@@ -148,12 +145,12 @@ pub enum UpstreamCmd {
 pub(crate) async fn run(
     as_json: bool,
     client: &mut StoreAdminServiceClient<Channel>,
-    scheduler_addr: &str,
+    cfg: &crate::Config,
     cmd: UpstreamCmd,
 ) -> anyhow::Result<()> {
     match cmd {
         UpstreamCmd::List { tenant } => {
-            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
+            let tenant = resolve_tenant(tenant, cfg).await?;
             let req = ListUpstreamsRequest { tenant_id: tenant };
             let resp = rpc("ListUpstreams", async || {
                 client.list_upstreams(req.clone()).await
@@ -189,7 +186,7 @@ pub(crate) async fn run(
             for k in &trusted_keys {
                 validate_pubkey_entry(k)?;
             }
-            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
+            let tenant = resolve_tenant(tenant, cfg).await?;
             let req = AddUpstreamRequest {
                 tenant_id: tenant,
                 url,
@@ -220,7 +217,7 @@ pub(crate) async fn run(
             }
         }
         UpstreamCmd::Remove { tenant, url } => {
-            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
+            let tenant = resolve_tenant(tenant, cfg).await?;
             let req = RemoveUpstreamRequest {
                 tenant_id: tenant,
                 url: url.clone(),

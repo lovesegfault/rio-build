@@ -5,6 +5,7 @@ import "google/protobuf/empty.proto";
 import "types.proto";       // GCRequest, GCProgress (StoreAdmin types via TriggerGC)
 import "dag.proto";         // GetBuildGraphRequest/Response
 import "admin_types.proto"; // ClusterStatus*, ListExecutors*, ListBuilds*, etc.
+import "build_types.proto"; // CancelBuildRequest/Response (shared with SchedulerService)
 
 // Administrative service for the rio-cli and rio-dashboard.
 // Implemented by the rio-scheduler process (co-located with SchedulerService).
@@ -35,6 +36,11 @@ service AdminService {
 
   // Drain an executor: stop sending new assignments, wait for running builds to complete.
   rpc DrainExecutor(rio.types.DrainExecutorRequest) returns (rio.types.DrainExecutorResponse);
+
+  // Cancel a build. Operator override — caller_tenant=None bypasses the
+  // tenant-ownership check that SchedulerService.CancelBuild applies
+  // (r[sched.tenant.authz]). Service-token gated (rio-cli, rio-controller).
+  rpc CancelBuild(rio.types.CancelBuildRequest) returns (rio.types.CancelBuildResponse);
 
   // Controller reports a builder/fetcher Pod's container termination
   // reason (k8s OOMKilled / Evicted-DiskPressure / DeadlineExceeded /

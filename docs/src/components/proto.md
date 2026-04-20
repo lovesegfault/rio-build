@@ -104,6 +104,7 @@ service AdminService {
   rpc GetBuildLogs(GetBuildLogsRequest) returns (stream BuildLogChunk);
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
   rpc DrainExecutor(DrainExecutorRequest) returns (DrainExecutorResponse);
+  rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);  // operator override (caller_tenant=None); service-token gated
   rpc ClearPoison(ClearPoisonRequest) returns (ClearPoisonResponse);
   rpc ListTenants(Empty) returns (ListTenantsResponse);
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);

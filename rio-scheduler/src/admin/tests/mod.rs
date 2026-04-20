@@ -354,6 +354,57 @@ async fn drain_executor_without_service_token_rejected() {
         .expect("rio-cli allowed");
 }
 
+/// `AdminService.CancelBuild` is service-token gated. Builders share
+/// port 9001; without this gate a compromised builder could cancel
+/// arbitrary builds. rio-cli reaches the actor with `caller_tenant:
+/// None` (operator override) — this is the path `rio-cli cancel-build`
+/// uses; `SchedulerService.CancelBuild` (tenant-JWT gated) is
+/// unreachable from the CLI.
+// r[verify admin.rpc.cancel-build]
+#[tokio::test]
+async fn admin_cancel_build_gated_on_service_token() {
+    let (svc, signer, _task, _db) = setup_svc_with_service_verifier().await;
+    let r = CancelBuildRequest {
+        build_id: Uuid::new_v4().to_string(),
+        reason: "test".into(),
+    };
+
+    // No token → PermissionDenied (NOT Unauthenticated — that's the
+    // tenant-JWT gate on SchedulerService).
+    let err = svc.cancel_build(Request::new(r.clone())).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains(rio_proto::SERVICE_TOKEN_HEADER));
+
+    // Non-allowlisted caller (a builder identity) → PermissionDenied.
+    let err = svc
+        .cancel_build(req_with_token(&signer, "rio-builder", r.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("allowlist"));
+
+    // rio-cli → reaches the actor. Unknown build_id → actor returns
+    // BuildNotFound, which maps to NotFound — proves the request got
+    // PAST the gate and into `ActorCommand::CancelBuild{caller_tenant:
+    // None}`.
+    let err = svc
+        .cancel_build(req_with_token(&signer, "rio-cli", r.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "rio-cli token must reach actor (operator override path)"
+    );
+
+    // rio-controller also allowlisted (e.g. orphan-watcher sweep).
+    let err = svc
+        .cancel_build(req_with_token(&signer, "rio-controller", r))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
 /// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
 ///
 /// `get_build_logs` returns errors as stream items (not handler-level

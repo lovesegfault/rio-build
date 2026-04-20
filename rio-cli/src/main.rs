@@ -131,7 +131,7 @@ pub(crate) async fn rpc<T: Default>(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
-struct Config {
+pub(crate) struct Config {
     scheduler_addr: String,
     /// Store gRPC address. Only used by the `upstream` subcommand —
     /// StoreAdminService is hosted on the store's port, not the
@@ -176,7 +176,7 @@ impl Config {
     /// store / SchedulerService) are matched first so they never `?`
     /// on an unreachable scheduler — `rio-cli bps describe` must work
     /// when the scheduler is down (e.g., to diagnose why).
-    async fn connect_admin(&self) -> anyhow::Result<AdminClient> {
+    pub(crate) async fn connect_admin(&self) -> anyhow::Result<AdminClient> {
         let ch = rio_proto::client::connect_channel(&self.scheduler_addr)
             .await
             .map_err(|e| anyhow!("connect to scheduler at {}: {e}", self.scheduler_addr))?;
@@ -302,7 +302,7 @@ enum Cmd {
     /// the disconnect cleanup leaves the build Active forever. This is
     /// the manual escape hatch; the scheduler's orphan-watcher sweep is
     /// the automatic one.
-    // r[impl cli.cmd.cancel-build]
+    // r[impl cli.cmd.cancel-build+2]
     CancelBuild(builds::CancelArgs),
     /// Mark a worker draining. The scheduler stops dispatching new
     /// builds to it; in-flight builds complete (or, with --force, are
@@ -365,12 +365,9 @@ async fn main() -> anyhow::Result<()> {
         // chunk consistency.
         Cmd::Upstream { cmd } => {
             let mut sc = cfg.connect_store_admin().await?;
-            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, cmd).await
+            upstream::run(as_json, &mut sc, &cfg, cmd).await
         }
         Cmd::VerifyChunks(a) => verify_chunks::run(&mut cfg.connect_store_admin().await?, a).await,
-        // SchedulerService, not AdminService — same address, separate
-        // client (see `builds::run_cancel`).
-        Cmd::CancelBuild(a) => builds::run_cancel(as_json, &cfg.scheduler_addr, a).await,
         // Everything else talks to AdminService — connect once.
         admin => {
             let mut c = cfg.connect_admin().await?;
@@ -380,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Status => status::run(as_json, &mut c).await,
                 Cmd::Workers(a) => workers::run(as_json, &mut c, a).await,
                 Cmd::Builds(a) => builds::run_list(as_json, &mut c, a).await,
+                Cmd::CancelBuild(a) => builds::run_cancel(as_json, &mut c, a).await,
                 Cmd::Derivations(a) => derivations::run(as_json, &mut c, a).await,
                 Cmd::Logs(a) => logs::run(&mut c, a).await,
                 Cmd::Gc(a) => gc::run(&mut c, a).await,
@@ -387,10 +385,9 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
                 Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
-                Cmd::Pool { .. }
-                | Cmd::Upstream { .. }
-                | Cmd::VerifyChunks(_)
-                | Cmd::CancelBuild(_) => unreachable!("handled above"),
+                Cmd::Pool { .. } | Cmd::Upstream { .. } | Cmd::VerifyChunks(_) => {
+                    unreachable!("handled above")
+                }
             }
         }
     }

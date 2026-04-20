@@ -39,7 +39,7 @@ All unary admin RPCs go through `rpc()` which applies the retry above and a per-
 | `logs` | `AdminService.GetBuildLogs` | Stream a derivation's log (ring-buffer or S3) |
 | `gc` | `AdminService.TriggerGC` | Streamed mark/sweep; `--dry-run` |
 | `poison-list` / `poison-clear` | `AdminService.{ListPoisoned,ClearPoison}` | Show/clear derivation poison roots |
-| `cancel-build` | `SchedulerService.CancelBuild` | Force-cancel an active build |
+| `cancel-build` | `AdminService.CancelBuild` | Force-cancel an active build (operator override) |
 | `drain-executor` | `AdminService.DrainExecutor` | Mark a worker draining (`--force` reassigns) |
 | `pool` | k8s apiserver (no gRPC) | `Pool` CR get/describe |
 | `verify-chunks` | `StoreAdminService.VerifyChunks` | PG↔backend chunk audit |
@@ -49,8 +49,8 @@ All unary admin RPCs go through `rpc()` which applies the retry above and a per-
 r[cli.cmd.derivations]
 `rio-cli derivations [BUILD_ID] [--all-active] [--status S] [--stuck]` calls `InspectBuildDag` (`r[proto.admin.diag-rpc]`) — the live actor view, not PG. `--all-active` iterates `ListBuilds(status=active)` first. `--stuck` filters to derivations assigned to dead-stream executors (`!assigned_executor.is_empty() && !executor_has_stream` — the I-025 smoking gun). Per-derivation output surfaces `system`/`required_features`/`failed_builders` (the `hard_filter` inputs) and per-executor `rejections` so "why won't it dispatch" is one look. Sort: stuck first, then status, then name.
 
-r[cli.cmd.cancel-build]
-`rio-cli cancel-build BUILD_ID [--reason R]` calls `SchedulerService.CancelBuild` (NOT `AdminService` — cancel lives next to submit). Idempotent: returns `cancelled=false` for already-terminal/unknown. The operator lever for orphaned builds (gateway crash mid-disconnect cleanup, I-112); the scheduler's orphan-watcher sweep is the automatic counterpart.
+r[cli.cmd.cancel-build+2]
+`rio-cli cancel-build BUILD_ID [--reason R]` calls `AdminService.CancelBuild` (service-token gated, `caller_tenant=None` operator override --- `r[admin.rpc.cancel-build]`). `SchedulerService.CancelBuild` remains the tenant-scoped path used by the gateway and is unreachable from the CLI in JWT mode (`r[sched.tenant.authz]`). Idempotent: returns `cancelled=false` for already-terminal/unknown. The operator lever for orphaned builds (gateway crash mid-disconnect cleanup, I-112); the scheduler's orphan-watcher sweep is the automatic counterpart.
 
 r[cli.cmd.verify-chunks]
 `rio-cli verify-chunks [--batch-size N]` server-streams `StoreAdminService.VerifyChunks`. Missing chunk hashes go to **stdout** (one hex BLAKE3 per line — pipeable into `xargs aws s3api head-object`); progress goes to **stderr** so `verify-chunks | tee missing.txt` captures hashes while progress scrolls. Warns on stream-closed-without-`done` (store disconnected mid-scan). I-040 diagnostic.
