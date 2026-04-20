@@ -59,8 +59,8 @@ pub use inline::{check_manifest_complete, complete_manifest_inline, insert_manif
 #[cfg(test)]
 pub use inline::{delete_manifest_uploading, manifest_uploading_age};
 pub use queries::{
-    append_signatures, find_missing_paths, get_manifest, get_manifest_batch, path_by_nar_hash,
-    query_by_hash_part, query_path_info, query_path_info_batch,
+    append_signatures, find_missing_paths, get_manifest, get_manifest_batch, query_by_hash_part,
+    query_path_info, query_path_info_batch,
 };
 pub use tenant_keys::get_active_signer;
 pub use upstreams::{SigMode, Upstream};

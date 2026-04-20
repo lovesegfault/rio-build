@@ -188,6 +188,38 @@ pub async fn persist_nar(
     Ok(())
 }
 
+// r[impl store.put.drop-cleanup]
+/// Drop-safety for a [`PlaceholderClaim::Owned`] placeholder: if the
+/// owning future is DROPPED (tonic aborts on client RST_STREAM; a
+/// `try_substitute` caller times out) without having reached
+/// [`abort_placeholder`] or flipped to `'complete'`, this guard's spawn
+/// cleans it up. `reap_one` filters `status='uploading'` so firing after
+/// an explicit abort/complete is a harmless no-op. Defuse with
+/// `ScopeGuard::into_inner` on success.
+///
+/// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
+/// in a request handler future and so share the same drop hazard.
+pub fn spawn_placeholder_guard(
+    pool: PgPool,
+    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    store_path_hash: Vec<u8>,
+) -> scopeguard::ScopeGuard<(), impl FnOnce(())> {
+    scopeguard::guard((), move |()| {
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::gc::orphan::reap_one(&pool, &store_path_hash, None, chunk_backend.as_ref())
+                    .await
+            {
+                warn!(
+                    store_path_hash = %hex::encode(&store_path_hash),
+                    error = %e,
+                    "drop-path placeholder cleanup failed; orphan scanner will reclaim",
+                );
+            }
+        });
+    })
+}
+
 /// Best-effort placeholder cleanup after a failed ingest. Chunk-aware
 /// (reads `manifest_data.chunk_list` and decrements refcounts).
 /// `threshold=None`: this is OUR placeholder, no stale check needed.

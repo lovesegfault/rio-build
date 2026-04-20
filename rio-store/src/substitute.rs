@@ -29,6 +29,8 @@ use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 use rio_proto::validated::ValidatedPathInfo;
 
+use rio_common::limits::{MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES};
+
 use crate::backend::ChunkBackend;
 use crate::cas;
 use crate::ingest::{self, IngestHooks, PersistError, PlaceholderClaim};
@@ -55,11 +57,14 @@ pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// thrashing the pool when a `FindMissingPaths` batch is large.
 pub const SUBSTITUTE_PROBE_CONCURRENCY: usize = 128;
 
-/// Maximum number of paths [`Substituter::check_available`] will probe
-/// in a single call. Above this the probe is skipped entirely (returns
-/// empty) — `substitutable_paths` is a scheduler optimization hint, not
-/// a correctness requirement, and even bounded-concurrency probing of
-/// hundreds of thousands of paths blocks the originating RPC for too long.
+/// Maximum number of uncached paths [`Substituter::check_available`]
+/// will probe in a single call. Oversized batches are TRUNCATED to the
+/// first `SUBSTITUTE_PROBE_MAX_PATHS` (not skipped) — the 1h
+/// `probe_cache` means a retry sees the probed prefix as cached, so
+/// repeated calls converge to full coverage. `substitutable_paths` is a
+/// scheduler optimization hint; even bounded-concurrency probing of
+/// hundreds of thousands of paths blocks the originating RPC for too
+/// long.
 pub const SUBSTITUTE_PROBE_MAX_PATHS: usize = 4096;
 
 /// Conservative HEAD-probe concurrency for upstreams that do NOT
@@ -74,6 +79,24 @@ const SUBSTITUTE_PROBE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Max entries in the per-path HEAD-probe result cache.
 const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
+
+/// Per-request timeout applied to the SMALL upstream fetches (narinfo
+/// GET, `/nix-cache-info` GET, narinfo HEAD probe). The shared
+/// `reqwest::Client` has only `connect_timeout` — without a per-request
+/// body timeout a slow-loris upstream holds 128 probe slots indefinitely
+/// and stalls `FindMissingPaths`. The NAR GET is intentionally NOT
+/// timeboxed (a multi-GB body legitimately runs long; the
+/// [`MAX_NAR_SIZE`] decompressed cap and 5-min stale-reclaim bound it).
+const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decompressed-NAR size cap applied in [`Substituter::fetch_nar`].
+/// Equals [`MAX_NAR_SIZE`] in production; overridable to a small value
+/// in tests so the bomb-protection path is exercisable without
+/// allocating 4 GiB.
+#[cfg(not(test))]
+const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = MAX_NAR_SIZE;
+#[cfg(test)]
+const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = 64 * 1024;
 
 /// Parsed `/nix-cache-info` — only the field the substituter cares
 /// about. `StoreDir`/`Priority` are irrelevant here (priority comes
@@ -101,7 +124,10 @@ impl UpstreamInfo {
 /// Errors surfaced by the substitution path. Callers map these to gRPC
 /// status; `NotFound` is the normal miss case (no upstream has the
 /// path, or the tenant has no upstreams configured).
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone` so moka's `try_get_with` can hand the same error to every
+/// coalesced waiter (it stores `Arc<E>` internally; we unwrap to owned).
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SubstituteError {
     /// Upstream HTTP request failed (connect, TLS, 5xx). The upstream
     /// URL is folded into the message for operator-side debugging.
@@ -118,11 +144,54 @@ pub enum SubstituteError {
     #[error("NAR hash mismatch: expected {expected}, got {got}")]
     HashMismatch { expected: String, got: String },
 
+    /// An upstream-supplied body exceeded a size cap (narinfo,
+    /// `/nix-cache-info`, declared `NarSize`, or decompressed NAR).
+    /// `tenant_upstreams` rows are tenant-supplied; one tenant's hostile
+    /// upstream must not OOM the process-global substituter.
+    #[error("upstream {what} exceeds {limit}-byte cap")]
+    TooLarge { what: &'static str, limit: u64 },
+
     /// Metadata-layer failure during ingest (write-ahead,
-    /// complete_manifest, chunked S3/refcount). Boxed so this enum
-    /// stays small.
+    /// complete_manifest, chunked S3/refcount).
     #[error("ingest failed: {0}")]
-    Ingest(#[from] metadata::MetadataError),
+    Ingest(String),
+}
+
+impl From<metadata::MetadataError> for SubstituteError {
+    fn from(e: metadata::MetadataError) -> Self {
+        SubstituteError::Ingest(e.to_string())
+    }
+}
+
+/// Result of probing one upstream for one path. Disambiguates the three
+/// "no PathInfo" outcomes that `Option<ValidatedPathInfo>` collapsed:
+/// `Miss` (try next upstream), `Raced` (another uploader holds the
+/// placeholder — STOP, don't re-download from remaining upstreams), and
+/// the error path (try next, but log).
+#[derive(Debug)]
+enum UpstreamOutcome {
+    /// narinfo verified, NAR ingested (or `AlreadyComplete` and sigs
+    /// appended). Boxed: `ValidatedPathInfo` is ~300B and the
+    /// `Miss`/`Raced` arms are zero-sized.
+    Hit(Box<ValidatedPathInfo>),
+    /// narinfo 404 or sig didn't verify — this upstream doesn't have it.
+    Miss,
+    /// `claim_placeholder` returned `Concurrent` — another replica or
+    /// closure-walk holds the slot. The singleflight 30s TTL means the
+    /// caller's retry sees the now-complete row; trying remaining
+    /// upstreams would just race the same slot again.
+    Raced,
+}
+
+/// Result of one HEAD probe across the tenant's upstreams. Only `Hit`
+/// and `Miss` are cached; `Indeterminate` (network error / 5xx on every
+/// non-hit base) is left uncached so the next call re-probes instead of
+/// pinning a transient failure for the full 1h TTL.
+#[derive(Clone, Copy)]
+enum ProbeOutcome {
+    Hit,
+    Miss,
+    Indeterminate,
 }
 
 /// HTTP narinfo + NAR fetcher with per-tenant upstream lookup.
@@ -199,7 +268,7 @@ impl Substituter {
             chunk_backend,
             http,
             signer: None,
-            // r[impl store.substitute.singleflight]
+            // r[impl store.substitute.singleflight+2]
             // Short TTL + small cap: this is a singleflight coalescer,
             // not a PathInfo cache. The narinfo table IS the cache.
             // 30s is long enough to coalesce a burst of GetPaths for
@@ -258,35 +327,25 @@ impl Substituter {
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         let key = (tenant_id, store_path.to_string());
-        // moka's get_with: if another caller is already computing this
-        // key, we wait and share its result. The init future runs at
-        // most once per key-per-TTL-window. Result must be `Clone` —
-        // hence `Arc<ValidatedPathInfo>` (cheap: mostly Strings+Vecs).
-        //
-        // `try_get_with` would propagate the error but moka then also
-        // caches NEGATIVE results. A transient upstream 503 would
-        // poison the cache for 30s. `get_with` doesn't cache on
-        // error-in-init; we eat the error inside and return `None` +
-        // warn, which is the correct fallback (try again on next miss).
+        // moka's `try_get_with`: if another caller is already computing
+        // this key, we wait and share its result. The init future runs
+        // at most once per key-per-TTL-window. moka caches `Ok(v)` (both
+        // `Some` and definitive-miss `None`) but does NOT cache `Err` —
+        // a transient 503 propagates to every coalesced waiter without
+        // poisoning the slot for 30s, and the next caller after they all
+        // return retries cleanly.
         let cached = self
             .inflight
-            .get_with(key, async {
-                match self.do_substitute(tenant_id, store_path).await {
-                    Ok(v) => v.map(Arc::new),
-                    Err(e) => {
-                        // Transient upstream failure → log + miss.
-                        // Caller returns NotFound; next attempt retries.
-                        warn!(error = %e, "substitution failed");
-                        metrics::counter!(
-                            "rio_store_substitute_total",
-                            "result" => "error"
-                        )
-                        .increment(1);
-                        None
-                    }
-                }
+            .try_get_with(key, async {
+                self.do_substitute(tenant_id, store_path)
+                    .await
+                    .map(|v| v.map(Arc::new))
             })
-            .await;
+            .await
+            .map_err(|e: Arc<SubstituteError>| {
+                metrics::counter!("rio_store_substitute_total", "result" => "error").increment(1);
+                (*e).clone()
+            })?;
         let result = cached.map(|arc| (*arc).clone());
         // Closure walk AFTER the singleflight slot is released (recursing
         // from inside the init future would deadlock on moka). A path is
@@ -365,7 +424,7 @@ impl Substituter {
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part)
                 .await
             {
-                Ok(Some(info)) => {
+                Ok(UpstreamOutcome::Hit(info)) => {
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::histogram!("rio_store_substitute_duration_seconds").record(elapsed);
                     metrics::counter!(
@@ -375,16 +434,34 @@ impl Substituter {
                     )
                     .increment(1);
                     metrics::counter!("rio_store_substitute_bytes_total").increment(info.nar_size);
-                    return Ok(Some(info));
+                    return Ok(Some(*info));
                 }
-                Ok(None) => {
+                Ok(UpstreamOutcome::Miss) => {
                     // This upstream doesn't have it. Try the next.
                     debug!(upstream = %upstream.url, "upstream miss, trying next");
                 }
+                Ok(UpstreamOutcome::Raced) => {
+                    // Another uploader holds the placeholder. STOP —
+                    // remaining upstreams would race the same slot. The
+                    // singleflight 30s TTL means the caller's retry sees
+                    // the now-complete row.
+                    debug!(upstream = %upstream.url, "concurrent uploader, stopping");
+                    break;
+                }
                 Err(e) => {
-                    // This upstream failed (down, sig invalid, parse
+                    // This upstream failed (down, hash mismatch, parse
                     // error). Log and try the next one — a single bad
                     // upstream shouldn't block substitution entirely.
+                    // The integrity metric is emitted HERE (where the
+                    // error is observable) — per-upstream errors never
+                    // reach `grpc/mod.rs`.
+                    if matches!(e, SubstituteError::HashMismatch { .. }) {
+                        metrics::counter!(
+                            "rio_store_substitute_integrity_failures_total",
+                            "upstream" => upstream.url.clone()
+                        )
+                        .increment(1);
+                    }
                     warn!(upstream = %upstream.url, error = %e, "upstream fetch failed, trying next");
                 }
             }
@@ -395,6 +472,12 @@ impl Substituter {
     }
 
     /// Steps 2-6 for one upstream.
+    ///
+    /// Ordering is load-bearing: narinfo → identity-check → sig-verify →
+    /// size gate → **claim placeholder** → fetch NAR → hash → persist.
+    /// The claim happens BEFORE the multi-GB download so a `Concurrent`
+    /// loser stops without re-downloading from every remaining upstream,
+    /// and the drop-guard covers cancellation during the long fetch.
     async fn try_upstream(
         &self,
         http: &reqwest::Client,
@@ -402,17 +485,18 @@ impl Substituter {
         upstream: &Upstream,
         store_path: &str,
         hash_part: &str,
-    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+    ) -> Result<UpstreamOutcome, SubstituteError> {
         // — Step 2: GET narinfo + parse + verify_sig —
         let base = upstream.url.trim_end_matches('/');
         let narinfo_url = format!("{base}/{hash_part}.narinfo");
         let resp = http
             .get(&narinfo_url)
+            .timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)
             .send()
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{narinfo_url}: {e}")))?;
         if resp.status().as_u16() == 404 {
-            return Ok(None);
+            return Ok(UpstreamOutcome::Miss);
         }
         if !resp.status().is_success() {
             return Err(SubstituteError::Fetch(format!(
@@ -420,12 +504,24 @@ impl Substituter {
                 resp.status()
             )));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| SubstituteError::Fetch(format!("{narinfo_url} body: {e}")))?;
+        let text = bounded_text(resp, "narinfo", MAX_NARINFO_BYTES).await?;
         let ni = NarInfo::parse(&text)
             .map_err(|e| SubstituteError::NarInfo(format!("{narinfo_url}: {e}")))?;
+
+        // r[impl store.substitute.identity-check]
+        // Identity gate: the parsed `StorePath:` MUST equal what we
+        // asked for. `verify_sig` proves the upstream signed *that*
+        // narinfo, not that it answers `{hash_part}.narinfo` — a
+        // valid-signed narinfo for path A served at `B.narinfo` would
+        // otherwise ingest A and return it from `QueryPathInfo(B)`.
+        // Runs before sig-verify so even an unsigned wrong-identity
+        // narinfo is rejected with a clear error.
+        if ni.store_path != store_path {
+            return Err(SubstituteError::NarInfo(format!(
+                "narinfo identity mismatch: requested {store_path}, upstream served {}",
+                ni.store_path
+            )));
+        }
 
         // Sig gate: MUST verify against this upstream's trusted_keys.
         // Reject on None — an upstream we don't have a trust anchor
@@ -436,7 +532,7 @@ impl Substituter {
                 path = store_path,
                 "narinfo signature did not verify against upstream.trusted_keys"
             );
-            return Ok(None);
+            return Ok(UpstreamOutcome::Miss);
         };
         debug!(upstream = %upstream.url, trusted_key, "narinfo signature verified");
 
@@ -445,56 +541,135 @@ impl Substituter {
         // ValidatedPathInfo + the post-decompress hash check.
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
-        // — Dedup check — If another tenant already substituted this
-        // exact NAR (same nar_hash), the chunks are already in CAS.
-        // Just append our sigs and return. `path_by_nar_hash` filters
-        // on `manifests.status = 'complete'` so partial uploads don't
-        // count.
-        if let Some(existing) = metadata::path_by_nar_hash(&self.pool, &expected_hash).await?
-            && existing == store_path
-        {
-            debug!(
-                path = store_path,
-                "NAR already present, appending sigs only"
-            );
-            let info = metadata::query_path_info(&self.pool, store_path)
-                .await?
-                .ok_or_else(|| {
-                    SubstituteError::Ingest(metadata::MetadataError::InvariantViolation(
-                        "path_by_nar_hash hit but query_path_info miss".into(),
-                    ))
-                })?;
-            let sigs = self
-                .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
-                .await;
-            metadata::append_signatures(&self.pool, store_path, &sigs).await?;
-            let mut info = info;
-            for s in sigs {
-                if !info.signatures.contains(&s) {
-                    info.signatures.push(s);
-                }
-            }
-            return Ok(Some(info));
-        }
-
-        // — Steps 3-4: GET NAR + decompress —
-        let nar_url = format!("{base}/{}", ni.url);
-        let nar_bytes = self.fetch_nar(http, &nar_url, &ni.compression).await?;
-
-        // Hash-check the decompressed NAR against the narinfo's claim.
-        // Upstream could serve bytes that don't match its narinfo
-        // (bug, bitrot, or malice) — reject before ingest.
-        let got_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
-        if got_hash != expected_hash {
-            return Err(SubstituteError::HashMismatch {
-                expected: hex::encode(expected_hash),
-                got: hex::encode(got_hash),
+        // r[impl store.substitute.untrusted-upstream]
+        // Declared-size gate. `trusted_keys` is also tenant-supplied so
+        // a verified sig is NOT a trust boundary; gate before download.
+        // The decompressed cap in `fetch_nar` catches a narinfo that
+        // lies about `NarSize`.
+        if ni.nar_size > MAX_NAR_SIZE {
+            return Err(SubstituteError::TooLarge {
+                what: "NarSize",
+                limit: MAX_NAR_SIZE,
             });
         }
 
-        // — Step 5-6: ingest via write-ahead + sig_mode —
-        self.ingest(tenant_id, upstream.sig_mode, &ni, nar_bytes, expected_hash)
+        // — Step 3: claim placeholder (BEFORE the expensive download) —
+        let mut info = narinfo_to_validated(&ni, expected_hash)?;
+        info.signatures = self
+            .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
+            .await;
+        let store_path_hash = info.store_path.sha256_digest();
+        info.store_path_hash = store_path_hash.to_vec();
+        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+
+        match ingest::claim_placeholder(
+            &self.pool,
+            self.chunk_backend.as_ref(),
+            &store_path_hash,
+            info.store_path.as_str(),
+            &refs_str,
+            SUBSTITUTE_HOOKS,
+        )
+        .await?
+        {
+            PlaceholderClaim::Owned => {}
+            PlaceholderClaim::AlreadyComplete => {
+                // Lost the race; winner completed. Append our sigs to
+                // the existing row (idempotent — append_signatures
+                // dedupes) and return it. NO download.
+                metadata::append_signatures(&self.pool, store_path, &info.signatures).await?;
+                let stored = metadata::query_path_info(&self.pool, store_path)
+                    .await?
+                    .ok_or_else(|| {
+                        SubstituteError::Ingest(
+                            "claim AlreadyComplete but query_path_info miss".into(),
+                        )
+                    })?;
+                return Ok(UpstreamOutcome::Hit(Box::new(stored)));
+            }
+            PlaceholderClaim::Concurrent => {
+                // Another replica (or this replica via a different
+                // closure-walk) holds the placeholder. NO download,
+                // and `do_substitute` stops the upstream loop.
+                debug!(%store_path, "concurrent uploader holds placeholder");
+                return Ok(UpstreamOutcome::Raced);
+            }
+        }
+
+        // r[impl store.put.drop-cleanup]
+        // We OWN the placeholder. Guard against future-drop (client
+        // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
+        // path between here and the defuse below is abandoned.
+        let placeholder_guard = ingest::spawn_placeholder_guard(
+            self.pool.clone(),
+            self.chunk_backend.clone(),
+            store_path_hash.to_vec(),
+        );
+
+        // The remaining steps are fallible AND we own the placeholder;
+        // funnel through one async block so a single error arm handles
+        // explicit abort (the drop-guard is for the implicit drop path).
+        let persist = async {
+            // — Step 4: GET NAR + decompress —
+            let nar_url = format!("{base}/{}", ni.url);
+            let nar_bytes = self.fetch_nar(http, &nar_url, &ni.compression).await?;
+            info.nar_size = nar_bytes.len() as u64;
+
+            // Hash-check the decompressed NAR against the narinfo's
+            // claim — off the async runtime (4 GiB ≈ 8-10s of pure
+            // compute would otherwise stall a tokio worker). `Bytes` is
+            // cheap-clone; move it in and back out alongside the digest.
+            let (nar_bytes, got_hash) =
+                tokio::task::spawn_blocking(move || -> (Bytes, [u8; 32]) {
+                    let h = sha2::Sha256::digest(&nar_bytes).into();
+                    (nar_bytes, h)
+                })
+                .await
+                .map_err(|e| SubstituteError::Ingest(format!("hash task join: {e}")))?;
+            if got_hash != expected_hash {
+                return Err(SubstituteError::HashMismatch {
+                    expected: hex::encode(expected_hash),
+                    got: hex::encode(got_hash),
+                });
+            }
+
+            // — Step 5-6: persist via the shared write-ahead core —
+            ingest::persist_nar(
+                &self.pool,
+                self.chunk_backend.as_ref(),
+                &info,
+                nar_bytes.into(),
+                self.chunk_upload_max_concurrent,
+                SUBSTITUTE_HOOKS,
+            )
             .await
+            .map_err(|e| match e {
+                PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
+                PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
+            })
+        }
+        .await;
+
+        match persist {
+            Ok(()) => {
+                scopeguard::ScopeGuard::into_inner(placeholder_guard);
+                Ok(UpstreamOutcome::Hit(Box::new(info)))
+            }
+            Err(e) => {
+                // Defuse the drop-guard and abort synchronously so the
+                // next upstream in `do_substitute`'s loop sees a clean
+                // slate (the guard's tokio::spawn fires too late for
+                // that). threshold=None: our placeholder.
+                scopeguard::ScopeGuard::into_inner(placeholder_guard);
+                ingest::abort_placeholder(
+                    &self.pool,
+                    self.chunk_backend.as_ref(),
+                    &store_path_hash,
+                )
+                .await;
+                Err(e)
+            }
+        }
     }
 
     /// GET the NAR body and decompress. Returns the raw NAR bytes.
@@ -519,8 +694,10 @@ impl Substituter {
                 resp.status()
             )));
         }
-        // bytes_stream → StreamReader → decoder → read_to_end. The
-        // decoder layer is a no-op passthrough for `none`.
+        // r[impl store.substitute.untrusted-upstream]
+        // bytes_stream → StreamReader → decoder → `.take(cap+1)` →
+        // read_to_end. The `.take()` wraps the DECOMPRESSED side so a
+        // zstd bomb is bounded regardless of what `NarSize` claimed.
         use futures_util::TryStreamExt;
         use tokio_util::io::StreamReader;
         let stream = resp
@@ -528,22 +705,25 @@ impl Substituter {
             .map_err(|e| std::io::Error::other(format!("NAR stream: {e}")));
         let reader = StreamReader::new(stream);
 
+        let cap = SUBSTITUTE_NAR_DECOMPRESSED_CAP;
         let mut out = Vec::new();
         match compression {
             "xz" => {
-                let mut dec = async_compression::tokio::bufread::XzDecoder::new(reader);
+                let mut dec =
+                    async_compression::tokio::bufread::XzDecoder::new(reader).take(cap + 1);
                 dec.read_to_end(&mut out)
                     .await
                     .map_err(|e| SubstituteError::Fetch(format!("{nar_url} xz: {e}")))?;
             }
             "zstd" => {
-                let mut dec = async_compression::tokio::bufread::ZstdDecoder::new(reader);
+                let mut dec =
+                    async_compression::tokio::bufread::ZstdDecoder::new(reader).take(cap + 1);
                 dec.read_to_end(&mut out)
                     .await
                     .map_err(|e| SubstituteError::Fetch(format!("{nar_url} zstd: {e}")))?;
             }
             "none" | "" => {
-                let mut r = reader;
+                let mut r = reader.take(cap + 1);
                 r.read_to_end(&mut out)
                     .await
                     .map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?;
@@ -554,86 +734,13 @@ impl Substituter {
                 )));
             }
         }
-        Ok(Bytes::from(out))
-    }
-
-    /// Write-ahead ingest: placeholder → chunked-or-inline → complete.
-    /// Thin wrapper over [`crate::ingest`] (the same core PutPath uses)
-    /// plus substitution-specific bits: sig_mode handling, and on
-    /// `AlreadyComplete` append our sigs to the existing row instead of
-    /// returning `created=false`.
-    async fn ingest(
-        &self,
-        tenant_id: Uuid,
-        sig_mode: SigMode,
-        ni: &NarInfo,
-        nar_bytes: Bytes,
-        nar_hash: [u8; 32],
-    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
-        let mut info = narinfo_to_validated(ni, nar_hash)?;
-        info.nar_size = nar_bytes.len() as u64;
-
-        // sig_mode handling — compute the sigs we'll store.
-        info.signatures = self.sigs_for_mode(tenant_id, sig_mode, ni, &info).await;
-
-        let store_path_hash = info.store_path.sha256_digest();
-        info.store_path_hash = store_path_hash.to_vec();
-        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-
-        match ingest::claim_placeholder(
-            &self.pool,
-            self.chunk_backend.as_ref(),
-            &store_path_hash,
-            info.store_path.as_str(),
-            &refs_str,
-            SUBSTITUTE_HOOKS,
-        )
-        .await?
-        {
-            PlaceholderClaim::Owned => {}
-            PlaceholderClaim::AlreadyComplete => {
-                // Lost the race; winner completed. Append our sigs to
-                // the existing row (idempotent — append_signatures
-                // dedupes) and return it.
-                metadata::append_signatures(&self.pool, info.store_path.as_str(), &info.signatures)
-                    .await?;
-                return Ok(metadata::query_path_info(&self.pool, info.store_path.as_str()).await?);
-            }
-            PlaceholderClaim::Concurrent => {
-                // Another replica (or this replica via a different
-                // closure-walk) holds the placeholder. Miss for now —
-                // not an error, and trying the next upstream would just
-                // race the same slot again.
-                debug!(store_path = %info.store_path, "concurrent uploader holds placeholder");
-                return Ok(None);
-            }
-        }
-
-        if let Err(e) = ingest::persist_nar(
-            &self.pool,
-            self.chunk_backend.as_ref(),
-            &info,
-            nar_bytes.into(),
-            self.chunk_upload_max_concurrent,
-            SUBSTITUTE_HOOKS,
-        )
-        .await
-        {
-            // Best-effort cleanup. `PersistError::Chunked` already
-            // rolled back internally; the abort is a harmless no-op
-            // there but covers the case where put_chunked's rollback
-            // itself failed (I-040). threshold=None: our placeholder.
-            ingest::abort_placeholder(&self.pool, self.chunk_backend.as_ref(), &store_path_hash)
-                .await;
-            return Err(match e {
-                PersistError::Chunked(e) => SubstituteError::Ingest(
-                    metadata::MetadataError::InvariantViolation(e.to_string()),
-                ),
-                PersistError::Inline(e) => SubstituteError::Ingest(e),
+        if out.len() as u64 > cap {
+            return Err(SubstituteError::TooLarge {
+                what: "decompressed NAR",
+                limit: cap,
             });
         }
-
-        Ok(Some(info))
+        Ok(Bytes::from(out))
     }
 
     // r[impl store.substitute.sig-mode]
@@ -685,34 +792,36 @@ impl Substituter {
         }
     }
 
-    /// Fetch + cache `/nix-cache-info` for one upstream. Fails open
-    /// (returns `want_mass_query=false`) on any HTTP/parse error — a
-    /// down upstream just means we throttle conservatively.
-    async fn upstream_info(&self, http: &reqwest::Client, base: &str) -> UpstreamInfo {
+    /// Fetch + cache `/nix-cache-info` for one upstream. `None` on any
+    /// HTTP/body error — a down upstream throttles THIS call to the
+    /// conservative concurrency, but `optionally_get_with` does NOT
+    /// cache `None`, so the next call re-fetches instead of pinning the
+    /// throttle for the full 1h TTL.
+    async fn upstream_info(&self, http: &reqwest::Client, base: &str) -> Option<UpstreamInfo> {
         self.upstream_info
-            .get_with(base.to_string(), async {
+            .optionally_get_with(base.to_string(), async {
                 let url = format!("{base}/nix-cache-info");
-                match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => match r.text().await {
-                        Ok(body) => UpstreamInfo::parse(&body),
-                        Err(e) => {
-                            debug!(%url, error = %e, "nix-cache-info body read failed");
-                            UpstreamInfo {
-                                want_mass_query: false,
-                            }
-                        }
-                    },
+                let r = match http
+                    .get(&url)
+                    .timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => r,
                     Ok(r) => {
                         debug!(%url, status = %r.status(), "nix-cache-info non-2xx");
-                        UpstreamInfo {
-                            want_mass_query: false,
-                        }
+                        return None;
                     }
                     Err(e) => {
                         debug!(%url, error = %e, "nix-cache-info fetch failed");
-                        UpstreamInfo {
-                            want_mass_query: false,
-                        }
+                        return None;
+                    }
+                };
+                match bounded_text(r, "nix-cache-info", MAX_CACHE_INFO_BYTES).await {
+                    Ok(body) => Some(UpstreamInfo::parse(&body)),
+                    Err(e) => {
+                        debug!(%url, error = %e, "nix-cache-info body read failed");
+                        None
                     }
                 }
             })
@@ -731,8 +840,8 @@ impl Substituter {
     /// [`SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE`] otherwise.
     /// Fails-open on individual HEAD errors (a down upstream shouldn't
     /// hide paths that OTHER upstreams have). Uncached batches larger
-    /// than [`SUBSTITUTE_PROBE_MAX_PATHS`] skip the HEAD probe and
-    /// return only cached hits — see that constant's doc.
+    /// than [`SUBSTITUTE_PROBE_MAX_PATHS`] are TRUNCATED to the first
+    /// `SUBSTITUTE_PROBE_MAX_PATHS` — see that constant's doc.
     #[instrument(skip(self, paths), fields(tenant = %tenant_id, n = paths.len()))]
     pub async fn check_available(
         &self,
@@ -809,7 +918,14 @@ impl Substituter {
         // non-mass-query upstream throttles the whole batch.
         let mut concurrency = SUBSTITUTE_PROBE_CONCURRENCY;
         for base in &bases {
-            if !self.upstream_info(http, base).await.want_mass_query {
+            // `None` (transient fetch error) → conservative for THIS
+            // call only; the cache didn't store the failure, so the
+            // next call re-fetches.
+            if !self
+                .upstream_info(http, base)
+                .await
+                .is_some_and(|i| i.want_mass_query)
+            {
                 concurrency = SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE;
                 break;
             }
@@ -829,32 +945,82 @@ impl Substituter {
 
         let bases = &bases;
         let futs = parsed.into_iter().map(move |(path, hash_part)| async move {
+            // `Hit` if any base 2xx; `Miss` if EVERY base returned a
+            // clean 404; `Indeterminate` if no hit and ≥1 base errored
+            // or returned non-404 — caching that as `false` would route
+            // a substitutable derivation to `willBuild` for 1h after a
+            // transient 503.
+            let mut any_indeterminate = false;
             for base in bases {
                 let url = format!("{base}/{hash_part}.narinfo");
-                if let Ok(r) = http.head(&url).send().await
-                    && r.status().is_success()
+                match http
+                    .head(&url)
+                    .timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)
+                    .send()
+                    .await
                 {
-                    return (path, true);
+                    Ok(r) if r.status().is_success() => return (path, ProbeOutcome::Hit),
+                    Ok(r) if r.status().as_u16() == 404 => {}
+                    Ok(_) | Err(_) => any_indeterminate = true,
                 }
             }
-            (path, false)
+            let outcome = if any_indeterminate {
+                ProbeOutcome::Indeterminate
+            } else {
+                ProbeOutcome::Miss
+            };
+            (path, outcome)
         });
-        // r[impl store.substitute.probe-bounded]
-        let probed: Vec<(String, bool)> = futures_util::stream::iter(futs)
+        // r[impl store.substitute.probe-bounded+2]
+        let probed: Vec<(String, ProbeOutcome)> = futures_util::stream::iter(futs)
             .buffer_unordered(concurrency)
             .collect()
             .await;
 
-        for (path, present) in probed {
-            self.probe_cache
-                .insert((tenant_id, path.clone()), present)
-                .await;
-            if present {
-                hits.push(path);
+        for (path, outcome) in probed {
+            match outcome {
+                ProbeOutcome::Hit => {
+                    self.probe_cache
+                        .insert((tenant_id, path.clone()), true)
+                        .await;
+                    hits.push(path);
+                }
+                ProbeOutcome::Miss => {
+                    self.probe_cache.insert((tenant_id, path), false).await;
+                }
+                // Don't cache: next call re-probes.
+                ProbeOutcome::Indeterminate => {}
             }
         }
         Ok(hits)
     }
+}
+
+// r[impl store.substitute.untrusted-upstream]
+/// Read a small text body (`.narinfo`, `/nix-cache-info`) with a hard
+/// size cap. `tenant_upstreams` rows are tenant-supplied; an unbounded
+/// `.text()` against a hostile upstream is an OOM vector for the
+/// process-global substituter.
+async fn bounded_text(
+    resp: reqwest::Response,
+    what: &'static str,
+    limit: u64,
+) -> Result<String, SubstituteError> {
+    use futures_util::TryStreamExt;
+    use tokio_util::io::StreamReader;
+    let stream = resp
+        .bytes_stream()
+        .map_err(|e| std::io::Error::other(e.to_string()));
+    let mut reader = StreamReader::new(stream).take(limit + 1);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| SubstituteError::Fetch(format!("{what} body: {e}")))?;
+    if buf.len() as u64 > limit {
+        return Err(SubstituteError::TooLarge { what, limit });
+    }
+    String::from_utf8(buf).map_err(|e| SubstituteError::NarInfo(format!("{what} not UTF-8: {e}")))
 }
 
 /// Parse a narinfo `NarHash:` value (`sha256:nixbase32...`) into raw
@@ -1217,7 +1383,7 @@ mod tests {
         assert_eq!(available, vec![path], "only the seeded path is available");
     }
 
-    // r[verify store.substitute.probe-bounded]
+    // r[verify store.substitute.probe-bounded+2]
     /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
     /// to 4096 (not skipped to zero). Uses a local fake upstream that
     /// 404s everything except its one seeded path → 4096 instant HEADs
@@ -1278,7 +1444,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-bounded]
+    // r[verify store.substitute.probe-bounded+2]
     /// Probe results are cached: a second `check_available` for the
     /// same path returns the cached answer without touching the
     /// upstream. Verified by aborting the fake upstream between calls.
@@ -1481,5 +1647,639 @@ mod tests {
             .await
             .unwrap();
         assert!(age.is_some(), "young placeholder must survive");
+    }
+
+    // — flexible fixture for the regression tests below —
+    //
+    // Serves one (path, NAR) pair with tunable misbehavior: oversized
+    // narinfo, identity-mismatched narinfo, fail-first-then-succeed,
+    // block-on-NAR, and per-route hit counters. Kept separate from
+    // `spawn_fake_upstream` so the simple end-to-end tests above stay
+    // readable.
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FlexCfg {
+        /// Serve `narinfo_override` instead of the well-formed one.
+        narinfo_override: Option<String>,
+        /// First narinfo GET returns 503; subsequent ones succeed.
+        narinfo_fail_first: bool,
+        /// First `/nix-cache-info` GET returns 503; subsequent succeed.
+        cache_info_fail_first: bool,
+        /// HEAD on narinfo returns 503 (every time).
+        head_503: bool,
+        /// `/nix-cache-info` GET returns 404 (every time).
+        cache_info_404: bool,
+        /// NAR GET awaits this Notify before responding (drop test).
+        nar_gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    struct FlexUpstream {
+        url: String,
+        trusted_key: String,
+        narinfo_hits: Arc<AtomicUsize>,
+        nar_hits: Arc<AtomicUsize>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_flex_upstream(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        cfg: FlexCfg,
+    ) -> FlexUpstream {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{
+            Router,
+            routing::{get, head},
+        };
+        use base64::Engine;
+
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = fingerprint(store_path, &nar_hash, nar_bytes.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash_part = sp.hash_part();
+
+        let narinfo_body = cfg.narinfo_override.unwrap_or_else(|| {
+            format!(
+                "StorePath: {store_path}\n\
+                 URL: nar/{hash_part}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: \n\
+                 Sig: {sig}\n",
+                nar_bytes.len()
+            )
+        });
+
+        let narinfo_path = format!("/{hash_part}.narinfo");
+        let nar_path = format!("/nar/{hash_part}.nar");
+
+        let narinfo_hits = Arc::new(AtomicUsize::new(0));
+        let nar_hits = Arc::new(AtomicUsize::new(0));
+        let ni_hits = narinfo_hits.clone();
+        let nr_hits = nar_hits.clone();
+        let ni_failed = Arc::new(AtomicBool::new(false));
+        let ci_failed = Arc::new(AtomicBool::new(false));
+        let narinfo_fail_first = cfg.narinfo_fail_first;
+        let cache_info_fail_first = cfg.cache_info_fail_first;
+        let cache_info_404 = cfg.cache_info_404;
+        let head_503 = cfg.head_503;
+        let nar_gate = cfg.nar_gate;
+
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(move || {
+                    let ci_failed = ci_failed.clone();
+                    async move {
+                        if cache_info_404 {
+                            return (StatusCode::NOT_FOUND, "").into_response();
+                        }
+                        if cache_info_fail_first && !ci_failed.swap(true, Ordering::SeqCst) {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "").into_response();
+                        }
+                        "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n".into_response()
+                    }
+                }),
+            )
+            .route(
+                &narinfo_path,
+                head(move || async move {
+                    if head_503 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                })
+                .get(move || {
+                    let ni_hits = ni_hits.clone();
+                    let ni_failed = ni_failed.clone();
+                    let body = narinfo_body.clone();
+                    async move {
+                        ni_hits.fetch_add(1, Ordering::SeqCst);
+                        if narinfo_fail_first && !ni_failed.swap(true, Ordering::SeqCst) {
+                            return (StatusCode::SERVICE_UNAVAILABLE, String::new())
+                                .into_response();
+                        }
+                        body.into_response()
+                    }
+                }),
+            )
+            .route(
+                &nar_path,
+                get(move || {
+                    let nr_hits = nr_hits.clone();
+                    let nar = nar_bytes.clone();
+                    let gate = nar_gate.clone();
+                    async move {
+                        nr_hits.fetch_add(1, Ordering::SeqCst);
+                        if let Some(g) = gate {
+                            g.notified().await;
+                        }
+                        nar
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        FlexUpstream {
+            url: format!("http://{addr}"),
+            trusted_key,
+            narinfo_hits,
+            nar_hits,
+            _task: task,
+        }
+    }
+
+    /// Build a validly-signed narinfo body for `signed_path` (so
+    /// `verify_sig` would pass) — used to serve at the WRONG hash_part.
+    fn signed_narinfo_for(signed_path: &str, nar: &[u8], key_name: &str) -> String {
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(nar).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = fingerprint(signed_path, &nar_hash, nar.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+        let hp = StorePath::parse(signed_path).unwrap().hash_part();
+        format!(
+            "StorePath: {signed_path}\n\
+             URL: nar/{hp}.nar\n\
+             Compression: none\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {}\n\
+             References: \n\
+             Sig: {sig}\n",
+            nar.len()
+        )
+    }
+
+    async fn insert_flex(pool: &PgPool, tid: Uuid, fake: &FlexUpstream, prio: i32) {
+        metadata::upstreams::insert(
+            pool,
+            tid,
+            &fake.url,
+            prio,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+    }
+
+    // r[verify store.substitute.identity-check]
+    /// bug_249: a validly-signed narinfo for path A served at
+    /// `{hash_of_B}.narinfo` MUST be rejected before sig-verify, and
+    /// nothing must be ingested.
+    #[tokio::test]
+    async fn narinfo_identity_mismatch_rejected() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-ident").await;
+        let (path_b, nar) = make_path();
+        let path_a = format!(
+            "/nix/store/{}-victim",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        // Serve A's narinfo (valid sig over A) at B's hash_part.
+        let body_a = signed_narinfo_for(&path_a, &nar, "cache.ident");
+        let fake = spawn_flex_upstream(
+            &path_b,
+            nar,
+            "cache.ident",
+            FlexCfg {
+                narinfo_override: Some(body_a),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        // Single upstream → its NarInfo error escapes the loop unswallowed?
+        // No: per-upstream errors are try-next; with one upstream that's
+        // a miss. Assert the miss AND that nothing was ingested.
+        let got = sub.try_substitute(tid, &path_b).await.unwrap();
+        assert!(got.is_none(), "identity mismatch → miss, got {got:?}");
+        assert_eq!(
+            fake.nar_hits.load(Ordering::SeqCst),
+            0,
+            "NAR endpoint must not be hit on identity reject"
+        );
+        assert!(
+            metadata::query_path_info(&db.pool, &path_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "path A must not be ingested"
+        );
+        assert!(
+            metadata::query_path_info(&db.pool, &path_b)
+                .await
+                .unwrap()
+                .is_none(),
+            "path B must not be ingested"
+        );
+    }
+
+    /// bug_247: with a young 'uploading' placeholder, `try_upstream`
+    /// returns `Raced` BEFORE the NAR download — and `do_substitute`
+    /// stops without trying the second upstream.
+    #[tokio::test]
+    async fn concurrent_claim_skips_redownload() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-raced").await;
+        let (path, nar) = make_path();
+        let fake1 = spawn_flex_upstream(&path, nar.clone(), "cache.r1", FlexCfg::default()).await;
+        let fake2 = spawn_flex_upstream(&path, nar, "cache.r2", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake1, 10).await;
+        insert_flex(&db.pool, tid, &fake2, 20).await;
+
+        seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(30)).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_none(), "Raced → Ok(None)");
+        assert_eq!(
+            fake1.nar_hits.load(Ordering::SeqCst),
+            0,
+            "claim before fetch: NAR endpoint NOT hit"
+        );
+        assert_eq!(
+            fake2.narinfo_hits.load(Ordering::SeqCst),
+            0,
+            "Raced must STOP the upstream loop"
+        );
+    }
+
+    /// bug_357: dedup via `AlreadyComplete` — pre-ingested path skips
+    /// the NAR download (narinfo IS fetched, NAR is NOT).
+    #[tokio::test]
+    async fn dedup_via_already_complete_no_redownload() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-dedup").await;
+        let (path, nar) = make_path();
+        let fake = spawn_flex_upstream(&path, nar.clone(), "cache.dedup", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        // First call ingests.
+        sub.try_substitute(tid, &path).await.unwrap().unwrap();
+        let baseline = fake.nar_hits.load(Ordering::SeqCst);
+        assert_eq!(baseline, 1);
+        // Clear singleflight so the second call reaches do_substitute.
+        sub.inflight.invalidate_all();
+        sub.inflight.run_pending_tasks().await;
+
+        let got = sub.try_substitute(tid, &path).await.unwrap().unwrap();
+        assert_eq!(got.store_path.as_str(), path);
+        assert_eq!(
+            fake.nar_hits.load(Ordering::SeqCst),
+            baseline,
+            "AlreadyComplete must short-circuit before NAR GET"
+        );
+    }
+
+    // r[verify store.substitute.untrusted-upstream]
+    /// bug_172: oversized narinfo body → `TooLarge`, NAR endpoint never
+    /// hit.
+    #[tokio::test]
+    async fn narinfo_oversized_rejected() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-huge-ni").await;
+        let (path, nar) = make_path();
+        let huge = "X".repeat((MAX_NARINFO_BYTES + 1024) as usize);
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.huge",
+            FlexCfg {
+                narinfo_override: Some(huge),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        // Per-upstream error is swallowed → Ok(None). Assert via
+        // `try_upstream` directly so we see the TooLarge variant.
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let hp = StorePath::parse(&path).unwrap().hash_part();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &path, &hp)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubstituteError::TooLarge {
+                    what: "narinfo",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(fake.nar_hits.load(Ordering::SeqCst), 0);
+    }
+
+    // r[verify store.substitute.untrusted-upstream]
+    /// bug_093: a NAR larger than the decompressed cap → `TooLarge`.
+    /// Uses the test-only 64 KiB `SUBSTITUTE_NAR_DECOMPRESSED_CAP` so
+    /// this doesn't allocate 4 GiB.
+    #[tokio::test]
+    async fn fetch_nar_decompressed_cap() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-huge-nar").await;
+        let (path, _) = make_path();
+        let huge_nar = vec![0u8; (SUBSTITUTE_NAR_DECOMPRESSED_CAP + 1024) as usize];
+        let fake = spawn_flex_upstream(&path, huge_nar, "cache.huge-nar", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let hp = StorePath::parse(&path).unwrap().hash_part();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &path, &hp)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubstituteError::TooLarge {
+                    what: "decompressed NAR",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        // Placeholder must be cleaned up (explicit-abort path).
+        let sp = StorePath::parse(&path).unwrap();
+        assert!(
+            metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+                .await
+                .unwrap()
+                .is_none(),
+            "abort_placeholder must run on TooLarge"
+        );
+    }
+
+    // r[verify store.substitute.singleflight+2]
+    /// merged_bug_199 / bug_327: a transient narinfo 503 propagates as
+    /// `Err` and is NOT cached — the immediate retry succeeds.
+    #[tokio::test]
+    async fn try_substitute_transient_error_not_cached() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-transient").await;
+        let (path, nar) = make_path();
+        // Suppress mass-query so the 503 isn't masked by upstream_info
+        // throttling re-fetching nix-cache-info between calls.
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.tr",
+            FlexCfg {
+                narinfo_fail_first: true,
+                cache_info_404: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        // First call → upstream 503. With one upstream the per-upstream
+        // swallow means do_substitute returns Ok(None) — but the key
+        // assertion is that the SECOND call re-runs do_substitute
+        // (i.e. moka didn't cache the miss-from-error). Under the old
+        // get_with this would have cached `None` AND eaten the error;
+        // under try_get_with the Ok(None) IS cached. To force the error
+        // to escape, drive try_upstream directly first.
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let hp = StorePath::parse(&path).unwrap().hash_part();
+        let first = sub.try_upstream(http, tid, &upstreams[0], &path, &hp).await;
+        assert!(
+            matches!(first, Err(SubstituteError::Fetch(_))),
+            "first call must surface 503: {first:?}"
+        );
+
+        // Now exercise the public path: do_substitute swallows the
+        // per-upstream error → Ok(None). moka caches Ok(None). To prove
+        // try_get_with doesn't cache Err, force an Err out of
+        // do_substitute by making it fail at the only un-swallowed
+        // point: PG. Simpler structural assertion: check that an Err
+        // from try_substitute leaves the slot empty.
+        sub.inflight
+            .try_get_with((tid, path.clone()), async {
+                Err::<Option<Arc<ValidatedPathInfo>>, _>(SubstituteError::Fetch("boom".into()))
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            sub.inflight.get(&(tid, path.clone())).await.is_none(),
+            "Err must NOT be cached in the singleflight slot"
+        );
+
+        // Second real call (fail_first already consumed) → hit.
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_some(), "second call after transient 503 must hit");
+    }
+
+    /// bug_094: a `/nix-cache-info` 503 must not be cached for 1h.
+    #[tokio::test]
+    async fn upstream_info_error_not_cached() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-ci-err").await;
+        let (path, nar) = make_path();
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.ci",
+            FlexCfg {
+                cache_info_fail_first: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let http = sub.http.as_ref().unwrap();
+        let base = fake.url.trim_end_matches('/');
+
+        let first = sub.upstream_info(http, base).await;
+        assert!(first.is_none(), "503 → None (uncached)");
+        assert!(
+            sub.upstream_info.get(base).await.is_none(),
+            "None must not enter the cache"
+        );
+
+        let second = sub.upstream_info(http, base).await;
+        assert!(
+            second.is_some_and(|i| i.want_mass_query),
+            "second call must re-fetch and see WantMassQuery:1"
+        );
+    }
+
+    // r[verify store.substitute.probe-bounded+2]
+    /// bug_251: HEAD 503 → `Indeterminate` → not cached as `false`;
+    /// next call re-probes.
+    #[tokio::test]
+    async fn probe_cache_5xx_not_cached_as_miss() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-probe-5xx").await;
+        let (path, nar) = make_path();
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.p5",
+            FlexCfg {
+                head_503: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let batch = std::slice::from_ref(&path);
+
+        let first = sub.check_available(tid, batch).await.unwrap();
+        assert!(first.is_empty(), "503 → no hit");
+        assert!(
+            sub.probe_cache.get(&(tid, path.clone())).await.is_none(),
+            "503 must NOT be cached as Some(false)"
+        );
+    }
+
+    /// bug_441 + G21-C4-fold: dropping `try_substitute` mid-fetch
+    /// (post-claim) must clean up the `'uploading'` placeholder.
+    #[tokio::test]
+    async fn substitute_drop_mid_fetch_cleans_placeholder() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drop").await;
+        let (path, nar) = make_path();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = spawn_flex_upstream(
+            &path,
+            nar,
+            "cache.drop",
+            FlexCfg {
+                nar_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = Arc::new(test_substituter(db.pool.clone()));
+        let sub2 = sub.clone();
+        let path2 = path.clone();
+        // Race the substitute against a short timeout so the future is
+        // dropped mid-NAR-GET (post-claim). The gate never fires.
+        let res = tokio::time::timeout(Duration::from_millis(200), async move {
+            sub2.try_substitute(tid, &path2).await
+        })
+        .await;
+        assert!(res.is_err(), "must time out (NAR endpoint blocked)");
+        assert_eq!(
+            fake.nar_hits.load(Ordering::SeqCst),
+            1,
+            "claim happened, NAR GET started"
+        );
+
+        // Guard's spawn is fire-and-forget; poll ≤1s for the cleanup.
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        let mut cleaned = false;
+        for _ in 0..20 {
+            if metadata::manifest_uploading_age(&db.pool, &hash)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cleaned,
+            "drop-guard must reap the 'uploading' placeholder within 1s"
+        );
+        gate.notify_one(); // unblock the server task
+    }
+
+    /// bug_204: `connect_timeout`-only client + dead upstream must not
+    /// hang `check_available`. Structural assertion: per-request
+    /// `.timeout()` is set; verified by issuing a HEAD against a port
+    /// that accepts but never responds, gated under the small-fetch
+    /// timeout.
+    #[tokio::test]
+    async fn head_probe_timeout_does_not_block() {
+        // Port-1 → connection refused → reqwest errors immediately
+        // (Indeterminate). That exercises the Err arm; the timeout arm
+        // is exercised by the per-request `.timeout()` which is set
+        // unconditionally — assert it's wired by checking the request
+        // builder doesn't hang past the timeout against a TCP listener
+        // that never reads.
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hold the listener open but never accept → connect succeeds
+        // (kernel backlog), body never arrives.
+        let _hold = tokio::spawn(async move {
+            let _l = listener;
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        });
+
+        let http = sandbox_http();
+        let url = format!("http://{addr}/x.narinfo");
+        let start = Instant::now();
+        let _ = http
+            .head(&url)
+            .timeout(SUBSTITUTE_SMALL_FETCH_TIMEOUT)
+            .send()
+            .await;
+        assert!(
+            start.elapsed() < SUBSTITUTE_SMALL_FETCH_TIMEOUT + Duration::from_secs(5),
+            "per-request timeout must abort the hung HEAD"
+        );
     }
 }

@@ -11,6 +11,20 @@
 /// providing a hard ceiling well within addressable memory on typical nodes.
 pub const MAX_NAR_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Maximum size of a `.narinfo` body fetched from an upstream binary cache.
+///
+/// Typical narinfos are under 2 KiB, but `References:` is unbounded by the
+/// format: a buildEnv-style path at the [`MAX_REFERENCES`] cap (10 000 refs ×
+/// ~60 B basename) is ~600 KiB. 1 MiB gives comfortable headroom for that
+/// legitimate ceiling while still bounding the `.text()` allocation against a
+/// hostile tenant-configured upstream that streams gigabytes.
+pub const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
+
+/// Maximum size of a `/nix-cache-info` body fetched from an upstream cache.
+///
+/// The real document is three short `Key: Value` lines (~60 bytes).
+pub const MAX_CACHE_INFO_BYTES: u64 = 4 * 1024;
+
 /// Maximum number of references in a single PathInfo.
 ///
 /// Bounds unbounded repeated fields from untrusted proto input. A malicious

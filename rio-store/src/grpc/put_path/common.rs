@@ -24,7 +24,7 @@
 
 use bytes::Bytes;
 use tonic::{Request, Status, Streaming};
-use tracing::{error, warn};
+use tracing::warn;
 
 use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
@@ -384,34 +384,18 @@ impl StoreServiceImpl {
         Ok(permit)
     }
 
-    // r[impl store.put.drop-cleanup]
-    /// Drop-safety for an [`PlaceholderClaim::Owned`] placeholder: if
-    /// the handler future is DROPPED (tonic aborts on client
-    /// RST_STREAM) without having called `abort_upload` or flipped to
-    /// `'complete'`, this guard's spawn cleans it up. `reap_one`
-    /// filters `status='uploading'` so firing after an explicit
-    /// abort/complete is a harmless no-op. Defuse with
-    /// `ScopeGuard::into_inner` on success.
+    /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
+    /// supplying `self.pool` / `self.chunk_backend`. See that fn's doc
+    /// for the drop-cleanup invariant.
     pub(in crate::grpc) fn spawn_placeholder_guard(
         &self,
         store_path_hash: Vec<u8>,
     ) -> scopeguard::ScopeGuard<(), impl FnOnce(())> {
-        let pool = self.pool.clone();
-        let chunk_backend = self.chunk_backend.clone();
-        scopeguard::guard((), move |()| {
-            tokio::spawn(async move {
-                if let Err(e) = crate::gc::orphan::reap_one(
-                    &pool,
-                    &store_path_hash,
-                    None,
-                    chunk_backend.as_ref(),
-                )
-                .await
-                {
-                    error!(error = %e, "PutPath: drop-path placeholder cleanup failed");
-                }
-            });
-        })
+        crate::ingest::spawn_placeholder_guard(
+            self.pool.clone(),
+            self.chunk_backend.clone(),
+            store_path_hash,
+        )
     }
 
     /// Drain a single-output PutPath stream after metadata: accumulate

@@ -364,6 +364,11 @@ pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result
 ///
 /// Uses `idx_narinfo_nar_hash` (migration 002_store.sql). Without it, every NAR
 /// fetch would seq-scan narinfo.
+///
+/// Currently no production caller (the substituter's dedup check was
+/// subsumed by `claim_placeholder`'s `AlreadyComplete` arm); kept for the
+/// planned binary-cache HTTP server.
+#[allow(dead_code)]
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
 pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the

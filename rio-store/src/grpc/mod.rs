@@ -434,17 +434,22 @@ impl StoreServiceImpl {
         };
         sub.try_substitute(tid, store_path).await.map_err(|e| {
             tracing::warn!(error = %e, store_path, "substitution failed");
+            // HashMismatch is intentionally NOT mapped here: per-upstream
+            // hash mismatches are caught (and the integrity metric
+            // emitted) inside `do_substitute`'s loop and swallowed as
+            // try-next-upstream — they never escape `try_substitute`.
+            // Only errors that abort the whole substitution reach this
+            // arm.
             match e {
                 SubstituteError::Fetch(_) => {
                     Status::unavailable("upstream substitute fetch failed")
                 }
-                SubstituteError::HashMismatch { .. } => {
-                    metrics::counter!("rio_store_substitute_integrity_failures_total").increment(1);
-                    Status::data_loss("upstream substitute NAR hash mismatch")
-                }
-                SubstituteError::NarInfo(_) | SubstituteError::Ingest(_) => {
-                    Status::internal("substitute ingest failed")
-                }
+                SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
+                    "upstream substitute {what} exceeds {limit}-byte cap"
+                )),
+                SubstituteError::HashMismatch { .. }
+                | SubstituteError::NarInfo(_)
+                | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
             }
         })
     }
