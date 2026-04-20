@@ -113,14 +113,26 @@ pub(super) async fn collect_outputs(
     // (io::copy for flat, dump_path_streaming for recursive) +
     // hashing. Both branches stream — O(1) memory regardless of
     // output size (fetchurl flat-hashed blobs reach multi-GB).
+    //
+    // await_dump_bounded: a spawn_blocking task parked in open(2)/
+    // read(2) (mkfifo $out in a malicious FOD, wedged overlay) never
+    // returns; tokio cannot abort blocking tasks. The bare `.await`
+    // would hang the worker forever — same FIFO-hang surface as the
+    // upload-side scan_references/dump_tee joins (G28 C4). Budget =
+    // GRPC_STREAM_TIMEOUT (300s, generous for local-disk hashing of
+    // even 100GB at NVMe speeds); fires only on a true hang.
     if is_fod {
         let drv_for_verify = drv.clone();
         let upper_store_for_verify = overlay_mount.upper_store();
-        let verify_result = tokio::task::spawn_blocking(move || {
-            verify_fod_hashes(&drv_for_verify, &upper_store_for_verify)
-        })
+        let verify_result = crate::upload::common::await_dump_bounded(
+            "FOD verify",
+            rio_common::grpc::GRPC_STREAM_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                verify_fod_hashes(&drv_for_verify, &upper_store_for_verify)
+            }),
+        )
         .await
-        .map_err(|e| ExecutorError::BuildFailed(format!("FOD verify task panicked: {e}")))?;
+        .map_err(|s| ExecutorError::BuildFailed(s.message().to_owned()))?;
 
         if let Err(e) = verify_result {
             tracing::error!(

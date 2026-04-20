@@ -26,7 +26,7 @@ use super::UploadError;
 /// Slack added to a join-timeout beyond the operation's own budget, so the
 /// inner timeout (gRPC) fires first and the join-timeout only catches the
 /// "blocking thread parked in syscall" case.
-pub(super) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
+pub(crate) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
 
 /// Await a `spawn_blocking` dump `JoinHandle` with a deadline. On timeout
 /// the blocking thread leaks (tokio limitation — `spawn_blocking` is
@@ -39,7 +39,7 @@ pub(super) const DUMP_JOIN_SLACK: Duration = Duration::from_secs(30);
 /// is parked in `open(2)`/`read(2)` (FIFO in `$out`, wedged FUSE/overlay,
 /// suspended dm device) and never reaches `blocking_send` to observe
 /// rx-drop.
-pub(super) async fn await_dump_bounded<T>(
+pub(crate) async fn await_dump_bounded<T>(
     what: &'static str,
     budget: Duration,
     handle: tokio::task::JoinHandle<T>,
