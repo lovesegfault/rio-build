@@ -156,6 +156,15 @@ async fn cmd_run(
         );
     }
 
+    // Ctrl-C handler registered BEFORE spawning anything: default
+    // SIGINT disposition terminates the process abnormally (no Drop),
+    // so without this the ProcessGuard killpg never runs and tunnels
+    // (own process group via `process_group(0)`) leak. Covers both the
+    // spawn loop and the wait loop; the inner select! arms re-poll the
+    // same pinned future.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
     // Tunnels (ProcessGuard: killpg on drop) + builds (kill_on_drop).
     // Held in Vecs for the lifetime of the await below — Ctrl-C or `?`
     // anywhere drops everything.
@@ -205,14 +214,20 @@ async fn cmd_run(
         kind
     );
 
-    // Await all. With --watch, also poll status every 30s.
+    // Await all. With --watch, also poll status every 30s. Single
+    // select! covers both paths so Ctrl-C without --watch ALSO unwinds
+    // (→ ProcessGuard::Drop → killpg) instead of taking the default
+    // SIGINT disposition.
     let mut ok = 0usize;
-    if watch {
-        let client = crate::k8s::client::client().await?;
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {
+    tokio::select! {
+        biased;
+        _ = &mut ctrl_c => anyhow::bail!("interrupted"),
+        r = async {
+            if watch {
+                let client = crate::k8s::client::client().await?;
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
                     let mut alive = 0usize;
                     for (_, c) in &mut builds {
                         if matches!(c.try_wait(), Ok(None)) { alive += 1; }
@@ -227,24 +242,22 @@ async fn cmd_run(
                     eprintln!("{} alive={alive}/{parallel}  {}", style("·").dim(), style(m).dim());
                     if alive == 0 { break; }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    anyhow::bail!("interrupted");
+            }
+            for (port, mut child) in builds {
+                let status = child.wait().await?;
+                if status.success() {
+                    ok += 1;
+                    eprintln!("  {} [{port}] ok", style("✓").green());
+                } else {
+                    eprintln!(
+                        "  {} [{port}] {status} — see {}/build-{port}.log",
+                        style("✗").red(),
+                        dir.display()
+                    );
                 }
             }
-        }
-    }
-    for (port, mut child) in builds {
-        let status = child.wait().await?;
-        if status.success() {
-            ok += 1;
-            eprintln!("  {} [{port}] ok", style("✓").green());
-        } else {
-            eprintln!(
-                "  {} [{port}] {status} — see {}/build-{port}.log",
-                style("✗").red(),
-                dir.display()
-            );
-        }
+            anyhow::Ok(())
+        } => r?,
     }
     drop(tunnels);
 
