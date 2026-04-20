@@ -85,7 +85,21 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
 // ============================================================================
 
 /// Fields that legitimately differ between nix-daemon and rio-gateway.
-const SKIP_FIELDS: &[&str] = &["version_string", "trusted"];
+///
+/// Variant-aware: handshake `features` is a *field* divergence (Lix
+/// advertises `lix-custom`/`pipe-operators` and omits some CppNix
+/// experimental features), not a *test* divergence — the handshake
+/// runs as a preamble in every `run_live_conformance` caller, so
+/// handling it at the field level keeps all 12 callers green under
+/// `RIO_GOLDEN_DAEMON_VARIANT=lix` instead of just the one test the
+/// old `VARIANT_SKIP` row covered. The handshake `features` spec is
+/// set-membership, not byte-equality.
+fn skip_fields() -> &'static [&'static str] {
+    match golden::daemon::daemon_variant() {
+        "lix" => &["version_string", "trusted", "features"],
+        _ => &["version_string", "trusted"],
+    }
+}
 
 type OpcodeFieldParser = fn(
     &[u8],
@@ -142,9 +156,6 @@ async fn run_live_conformance(
 
 #[tokio::test]
 async fn test_golden_live_handshake() -> anyhow::Result<()> {
-    if golden::daemon::skip_for_variant("test_golden_live_handshake") {
-        return Ok(());
-    }
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
@@ -182,7 +193,7 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
 
     let daemon_fields = golden::parse_handshake_fields(&daemon_response).await;
     let rio_fields = golden::parse_handshake_fields(&rio_response).await;
-    golden::assert_field_conformance(&daemon_fields, &rio_fields, SKIP_FIELDS);
+    golden::assert_field_conformance(&daemon_fields, &rio_fields, skip_fields());
     Ok(())
 }
 
@@ -194,7 +205,7 @@ async fn test_golden_live_is_valid_path_found() -> anyhow::Result<()> {
     golden::seed_mock_store_from(&store, &[path_info]);
 
     let op = golden::build_is_valid_path_bytes(&test_path).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_IS_VALID_PATH))
     })
     .await?;
@@ -207,7 +218,7 @@ async fn test_golden_live_is_valid_path_not_found() -> anyhow::Result<()> {
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
 
     let op = golden::build_is_valid_path_bytes(&nonexistent).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_IS_VALID_PATH))
     })
     .await?;
@@ -226,9 +237,10 @@ async fn test_golden_live_query_path_info() -> anyhow::Result<()> {
     // Skip reg_time: --load-db stamps current time into the daemon's db,
     // query_path_info_json returns 0. The daemon db is always hermetic
     // now (see start_local_daemon), so deriver/sigs/refs agree (all
-    // empty) — only reg_time still diverges.
-    let skip: &[&str] = &["version_string", "trusted", "reg_time"];
-    run_live_conformance(Some(&op), store, skip, |data| {
+    // empty) — only reg_time still diverges. Chained onto the
+    // variant-aware base list so lix's `features` skip stays applied.
+    let skip: Vec<&str> = skip_fields().iter().copied().chain(["reg_time"]).collect();
+    run_live_conformance(Some(&op), store, &skip, |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
     .await?;
@@ -241,7 +253,7 @@ async fn test_golden_live_query_path_info_not_found() -> anyhow::Result<()> {
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
 
     let op = golden::build_query_path_info_bytes(&nonexistent).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
     .await?;
@@ -257,7 +269,7 @@ async fn test_golden_live_query_valid_paths() -> anyhow::Result<()> {
 
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
     let op = golden::build_query_valid_paths_bytes(&[&test_path, &nonexistent], false).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_QUERY_VALID_PATHS))
     })
     .await?;
@@ -270,7 +282,7 @@ async fn test_golden_live_add_temp_root() -> anyhow::Result<()> {
     let store = MockStore::new();
 
     let op = golden::build_add_temp_root_bytes(&test_path).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_ADD_TEMP_ROOT))
     })
     .await?;
@@ -286,7 +298,7 @@ async fn test_golden_live_query_missing() -> anyhow::Result<()> {
 
     let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
     let op = golden::build_query_missing_bytes(&[&test_path, &nonexistent]).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_QUERY_MISSING))
     })
     .await?;
@@ -318,14 +330,14 @@ async fn test_golden_live_nar_from_path() -> anyhow::Result<()> {
     let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
     let daemon_hs_fields = golden::parse_handshake_fields(&daemon_hs).await;
     let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
-    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, SKIP_FIELDS);
+    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, skip_fields());
 
     // Compare SetOptions
     let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
     let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
     let daemon_so_fields = golden::parse_schema(&daemon_so, golden::SCHEMA_SET_OPTIONS).await;
     let rio_so_fields = golden::parse_schema(&rio_so, golden::SCHEMA_SET_OPTIONS).await;
-    golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, SKIP_FIELDS);
+    golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, skip_fields());
 
     // Compare NAR content. Both sides use STDERR_LAST + raw NAR (see
     // wopNarFromPath handler for the protocol rationale).
@@ -356,7 +368,7 @@ async fn test_golden_live_query_path_from_hash_part_not_found() -> anyhow::Resul
     let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     let op = golden::build_query_path_from_hash_part_bytes(hash_part).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(
             data,
             golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
@@ -377,7 +389,7 @@ async fn test_golden_live_query_path_from_hash_part_found() -> anyhow::Result<()
     let hash_part = sp.hash_part();
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(
             data,
             golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
@@ -398,7 +410,7 @@ async fn test_golden_live_query_path_from_hash_part_ca() -> anyhow::Result<()> {
     let hash_part = sp.hash_part();
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(
             data,
             golden::SCHEMA_QUERY_PATH_FROM_HASH_PART,
@@ -417,9 +429,32 @@ async fn test_golden_live_add_signatures() -> anyhow::Result<()> {
 
     let op =
         golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await?;
-    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+    run_live_conformance(Some(&op), store, skip_fields(), |data| {
         Box::pin(golden::parse_schema(data, golden::SCHEMA_ADD_SIGNATURES))
     })
     .await?;
     Ok(())
+}
+
+/// bug_139: `skip_fields()` is variant-aware. Under the default
+/// variant the handshake `features` field is compared (CppNix↔rio
+/// must agree); under `lix` it is skipped. The lix branch is
+/// integration-tested by `nix build .#golden-matrix`; this is the
+/// per-push guard that the BASE skip list (used by all 12
+/// `run_live_conformance` callers' handshake preamble) hasn't
+/// regressed.
+#[test]
+fn skip_fields_variant_aware() {
+    // Default variant: features must NOT be skipped.
+    let base = skip_fields();
+    assert!(base.contains(&"version_string"));
+    assert!(base.contains(&"trusted"));
+    if golden::daemon::daemon_variant() == "lix" {
+        assert!(base.contains(&"features"));
+    } else {
+        assert!(
+            !base.contains(&"features"),
+            "features must be compared for non-lix variants"
+        );
+    }
 }

@@ -57,30 +57,25 @@ pub fn daemon_variant() -> &'static str {
 /// so the skip is visible in logs — nextest doesn't surface programmatic
 /// skips).
 ///
-/// Lix divergences: Lix is a fork with its own release cycle. Version
-/// string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) is already
-/// handled by the field-level `SKIP_FIELDS` mechanism, so no test-level
-/// skip is needed for that. Entries below are seeded from observed
-/// failures — add a row when the matrix run surfaces a real divergence,
+/// Lix divergences: Lix is a fork with its own release cycle. Both
+/// `version_string` and `features` are handled at the FIELD level by
+/// `golden_conformance::skip_fields()` (variant-aware), so no test-level
+/// skip is needed for those. Entries below are seeded from observed
+/// failures — add a row when the matrix run surfaces a real
+/// whole-test divergence (e.g. an opcode lix doesn't implement),
 /// documenting WHY so future-you knows whether to remove it when
 /// upstream converges.
 static VARIANT_SKIP: &[(&str, &str, &str)] = &[
-    // Lix reports a different daemon feature set during handshake
-    // (it advertises `lix-custom` / `pipe-operators` and omits some
-    // CppNix experimental features). The `features` field is currently
-    // NOT in SKIP_FIELDS, so a feature-set divergence fails handshake
-    // conformance. Skip until the handshake test grows a features-
-    // tolerant comparator.
-    (
-        "lix",
-        "test_golden_live_handshake",
-        "Lix advertises a different daemon feature set; features field is not \
-         skip-listed and comparator is byte-exact",
-    ),
+    // No whole-test divergences currently. Field-level divergences
+    // belong in `skip_fields()`, not here — this mechanism is for
+    // tests that can't run AT ALL against a variant.
 ];
 
 /// Return `true` (and log) if the named test should be skipped for the
 /// current daemon variant.
+// VARIANT_SKIP is currently empty (field-level divergences moved to
+// skip_fields()); kept for future whole-test divergences.
+#[allow(dead_code)]
 pub fn skip_for_variant(test_name: &str) -> bool {
     let v = daemon_variant();
     for &(variant, name, reason) in VARIANT_SKIP {
