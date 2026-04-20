@@ -548,6 +548,10 @@ impl DagActor {
             .iter()
             .flat_map(|(_, p)| p.iter().cloned())
             .collect();
+        // Deliberately NOT gated on `cache_breaker`: dispatch-time
+        // probe failure degrades to cache-miss (per-drv fallback
+        // retries), not StoreUnavailable. The breaker is for merge-time
+        // admission only — here the call IS the work.
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
         let resp =
@@ -963,6 +967,8 @@ impl DagActor {
         let probe = self.probe_tenant_meta(std::iter::once(drv_hash));
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // Deliberately NOT gated on `cache_breaker`: per-drv fallback;
+        // failure = cache-miss → dispatch normally.
         let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: paths.clone(),
         });

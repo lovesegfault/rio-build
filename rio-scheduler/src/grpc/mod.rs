@@ -15,7 +15,7 @@ mod executor_service;
 mod scheduler_service;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
@@ -60,6 +60,12 @@ pub struct SchedulerGrpc {
     /// a health-aware balanced channel route to the leader
     /// instead. Tests default to `true` (always-leader).
     is_leader: Arc<AtomicBool>,
+    /// Shared with the lease loop. The `worker-stream-reader` loop
+    /// captures this at stream-open and breaks if it changes —
+    /// generation-fences open worker streams so an ex-leader doesn't
+    /// forward `ProcessCompletion` for a generation it no longer owns
+    /// (r[sched.lease.standby-drops-writes]). Tests default to `1`.
+    pub(super) generation: Arc<AtomicU64>,
 }
 
 impl SchedulerGrpc {
@@ -77,6 +83,7 @@ impl SchedulerGrpc {
             log_buffers: Arc::new(LogBuffers::new()),
             db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
+            generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -89,6 +96,7 @@ impl SchedulerGrpc {
             log_buffers: Arc::new(LogBuffers::new()),
             db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
+            generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -103,12 +111,14 @@ impl SchedulerGrpc {
         log_buffers: Arc<LogBuffers>,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
+        generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
             actor,
             log_buffers,
             db: Some(db),
             is_leader,
+            generation,
         }
     }
 

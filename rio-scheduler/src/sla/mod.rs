@@ -222,12 +222,18 @@ impl SlaEstimator {
         self.cache.read().get(key).cloned()
     }
 
-    /// `T_min` (ref-seconds) for one cached key. `None` for never-seen
-    /// keys AND for `Probe`-stage fits (n_eff<3 ∨ span<4) — caller falls
-    /// back to `critical_path::DEFAULT_DURATION_SECS`. Feeds
-    /// critical-path priority (D1): a relative ordering, so the point
-    /// estimate at `min(p̄, c_opt)` suffices — no solve, no tier/ceiling
-    /// dependency.
+    /// `T_min` (**ref-seconds**, hw-normalized — NOT wall-clock) for
+    /// one cached key. `None` for never-seen keys AND for `Probe`-stage
+    /// fits (n_eff<3 ∨ span<4) — caller falls back to
+    /// `critical_path::DEFAULT_DURATION_SECS`. Feeds critical-path
+    /// priority (D1): a relative ordering, so the point estimate at
+    /// `min(p̄, c_opt)` suffices — no solve, no tier/ceiling dependency.
+    ///
+    /// r[sched.sla.hw-ref-seconds]: the fit ingests hw-normalized
+    /// samples, so `t_min()` is in ref-seconds. Downstream consumers
+    /// that surface this to users (`critical_path_remaining_secs`,
+    /// `ca_cutoff_seconds_saved`) carry ref-seconds, NOT wall-clock —
+    /// divide by fleet hw_factor for a wall-time estimate.
     ///
     /// `Probe.t_min() = ∞` MUST NOT propagate: priority is additive
     /// bottom-up (∞ taints the whole ancestor cone, defeating

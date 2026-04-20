@@ -130,9 +130,20 @@ impl BuildEventBus {
     pub(super) fn emit(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
         use rio_proto::types::build_event::Event;
 
-        let seq = self.sequences.entry(build_id).or_insert(0);
-        *seq += 1;
-        let seq = *seq;
+        // Log isn't persisted (see below) — assigning it a fresh seq
+        // would diverge the in-memory counter from PG `MAX(sequence)`,
+        // breaking the `since_sequence < last_seq` replay guard after
+        // failover (gateway saw seq=100 via broadcast, recovery seeds
+        // last_seq=41 from PG → no replay → events 42..100 lost). Reuse
+        // the last persisted seq for Log; the gateway tracker
+        // (build.rs) overwrites, so monotonicity is preserved.
+        let seq = if matches!(event, Event::Log(_)) {
+            self.sequences.get(&build_id).copied().unwrap_or(0)
+        } else {
+            let s = self.sequences.entry(build_id).or_insert(0);
+            *s += 1;
+            *s
+        };
 
         let build_event = rio_proto::types::BuildEvent {
             build_id: build_id.to_string(),
@@ -211,10 +222,14 @@ impl BuildEventBus {
         let Some(tx) = &self.flush_tx else {
             return;
         };
-        if tx.try_send(req).is_err() {
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(req) {
             warn!("log flush channel full, dropped; periodic tick will snapshot");
             metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
         }
+        // Closed: flusher task died — spawn_monitored already logged the
+        // panic. Don't spam the warn/metric (which would say "full" and
+        // imply the periodic tick recovers — it can't, it lives in the
+        // dead task).
     }
 }
 

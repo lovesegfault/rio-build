@@ -441,6 +441,38 @@ async fn test_gc_roots_dedupes() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.gc.live-pins]
+/// Floating-CA derivations carry `expected_output_paths == [""]`
+/// pre-completion (translate.rs convention). GcRoots must filter these
+/// — a `""` in the roots list makes the store's `validate_store_path`
+/// reject the whole batch with `InvalidArgument`, breaking GC whenever
+/// any CA build is in flight.
+#[tokio::test]
+async fn test_gc_roots_filters_empty_ca_paths() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let real_out = test_store_path("gc-ca-real");
+    let mut ia = make_node("gc-ca-ia");
+    ia.expected_output_paths = vec![real_out.clone()];
+    // Floating-CA: path-less placeholder until completion.
+    let mut ca = make_node("gc-ca-float");
+    ca.expected_output_paths = vec![String::new()];
+    merge_dag(&handle, Uuid::new_v4(), vec![ia, ca], vec![], false).await?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::Admin(AdminQuery::GcRoots { reply: reply_tx }))
+        .await?;
+    let roots = reply_rx.await?;
+
+    assert!(
+        !roots.iter().any(String::is_empty),
+        "GcRoots must filter empty CA placeholder paths; got {roots:?}"
+    );
+    assert!(roots.contains(&real_out), "real IA output still rooted");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // MergeDag reply dropped → orphan build cancelled (Round 4 Z1)
 // ---------------------------------------------------------------------------
@@ -845,9 +877,9 @@ async fn solve_intent_for_clamps_at_resource_floor() {
     // ceiling, not the floor.
     let mut actor = bare_actor_sla(db.pool.clone());
 
-    // floor.mem=32GiB; cold-start solve (no fit, no override) returns
-    // probe-default mem (typically a few GiB) — the clamp raises it.
-    actor.test_inject_ready_with_floor("a", "x86_64-linux", 32 << 30);
+    // floor.{mem,disk}=32/50 GiB; cold-start solve (no fit, no override)
+    // returns probe-default (typically a few GiB) — the clamp raises both.
+    actor.test_inject_ready_with_floor("a", "x86_64-linux", 32 << 30, 50 << 30);
     let state = actor.dag.node("a").unwrap();
     let intent = actor.solve_intent_for(state);
     assert!(
@@ -855,14 +887,17 @@ async fn solve_intent_for_clamps_at_resource_floor() {
         "D4: solve_intent_for clamps mem at floor (got {})",
         intent.mem_bytes
     );
+    assert!(
+        intent.disk_bytes >= 50 << 30,
+        "D4: solve_intent_for clamps disk at floor (got {})",
+        intent.disk_bytes
+    );
 
     // floor=zero (cold start) → solve returns its own value unchanged.
-    actor.test_inject_ready_with_floor("b", "x86_64-linux", 0);
+    actor.test_inject_ready_with_floor("b", "x86_64-linux", 0, 0);
     let state = actor.dag.node("b").unwrap();
     let intent_b = actor.solve_intent_for(state);
     assert!(intent_b.mem_bytes < 32 << 30, "control: floor=0 → no clamp");
-    // disk also clamped (orthogonal dimension).
-    let _ = intent.disk_bytes;
 }
 
 // r[verify sched.sla.intent-from-solve]
@@ -1392,4 +1427,111 @@ async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
         "dispatch_wait_seconds not recorded on Ready→Assigned"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// clear_persisted_state: per-generation maps
+// ---------------------------------------------------------------------------
+
+/// `clear_persisted_state` clears `pending_intents` and
+/// `recently_disconnected` (per-generation maps). Same-process
+/// lose→reacquire would otherwise carry stale `(band, cap, since)` /
+/// stale executor IDs into the new generation.
+#[tokio::test]
+async fn clear_persisted_state_clears_per_generation_maps() {
+    use crate::sla::cost::{Band, Cap};
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    actor.pending_intents.insert(
+        "stale".into(),
+        (Band::Mid, Cap::Spot, std::time::Instant::now()),
+    );
+    actor.recently_disconnected.insert(
+        "stale-exec".into(),
+        ("stale".into(), std::time::Instant::now()),
+    );
+
+    actor.clear_persisted_state();
+
+    assert!(
+        actor.pending_intents.is_empty(),
+        "pending_intents must be cleared on leader transition"
+    );
+    assert!(
+        actor.recently_disconnected.is_empty(),
+        "recently_disconnected must be cleared on leader transition"
+    );
+    // Regression: soft_features survives (existing :649 invariant).
+    actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
+}
+
+// ---------------------------------------------------------------------------
+// BuildEventBus: Log seq + try_log_flush Closed-vs-Full
+// ---------------------------------------------------------------------------
+
+/// `Event::Log` is not persisted, so it MUST NOT consume a sequence
+/// number — otherwise the in-memory counter diverges from PG
+/// `MAX(sequence)` and the `since_sequence < last_seq` replay guard
+/// misfires after failover.
+#[tokio::test]
+async fn log_events_do_not_consume_sequence() {
+    use crate::actor::event::BuildEventBus;
+    use rio_proto::types::build_event::Event;
+    let mut bus = BuildEventBus::new(None, None);
+    let build_id = Uuid::new_v4();
+    let _rx = bus.register(build_id);
+
+    bus.emit(
+        build_id,
+        Event::Started(rio_proto::types::BuildStarted::default()),
+    );
+    assert_eq!(bus.last_seq(build_id), 1);
+    for _ in 0..50 {
+        bus.emit(
+            build_id,
+            Event::Log(rio_proto::types::BuildLogBatch::default()),
+        );
+    }
+    assert_eq!(bus.last_seq(build_id), 1, "Log must not consume seq");
+    bus.emit(
+        build_id,
+        Event::Derivation(rio_proto::types::DerivationEvent::default()),
+    );
+    assert_eq!(
+        bus.last_seq(build_id),
+        2,
+        "next persisted event gets seq=2, not 52"
+    );
+}
+
+/// `try_log_flush` MUST NOT warn/count when the receiver is dropped
+/// (Closed) — only when Full. A dead flusher task is signalled by
+/// `spawn_monitored`; spamming "channel full ... periodic tick will
+/// snapshot" is doubly misleading (it's Closed, and the tick lives in
+/// the dead task).
+#[tokio::test]
+#[traced_test]
+async fn try_log_flush_silent_on_closed() {
+    use crate::actor::event::BuildEventBus;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx); // flusher died
+    let bus = BuildEventBus::new(None, Some(tx));
+    bus.try_log_flush(crate::logs::FlushRequest {
+        drv_path: "x".into(),
+        interested_builds: vec![],
+    });
+
+    assert_eq!(
+        recorder.get("rio_scheduler_log_flush_dropped_total{}"),
+        0,
+        "Closed must not increment dropped_total"
+    );
+    assert!(
+        !logs_contain("log flush channel full"),
+        "Closed must not warn 'channel full'"
+    );
 }

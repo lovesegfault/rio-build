@@ -1591,3 +1591,121 @@ async fn test_recovery_orphan_ready_not_pushed() -> TestResult {
     }
     Ok(())
 }
+
+// r[verify sched.lease.standby-drops-writes]
+/// `ProcessCompletion` arriving after `on_lose()` MUST be dropped at
+/// actor dispatch — an ex-leader must not write `persist_status(Completed)`
+/// to PG (races the new leader's recovery → Completed→Ready races,
+/// duplicate dispatch).
+#[tokio::test]
+async fn ex_leader_drops_process_completion() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let leader = crate::lease::LeaderState::default(); // always-leader
+    let leader_for_actor = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = leader_for_actor;
+    });
+
+    let build_id = Uuid::new_v4();
+    let mut rx = connect_executor(&handle, "ex-w", "x86_64-linux").await?;
+    merge_single_node(&handle, build_id, "ex-drv", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // Lose the lease. Open worker stream stays open (on_lose only flips
+    // atomics) — that's what the gRPC-layer fence covers; this test
+    // exercises the actor-dispatch defense-in-depth.
+    leader.on_lose();
+
+    // CompletionReport arrives on the still-open stream → forwarded to
+    // actor as ProcessCompletion. Send directly (bypassing the gRPC
+    // reader) to isolate the actor-level gate.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "ex-w".into(),
+            drv_key: test_drv_path("ex-drv"),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            peak_cpu_cores: 0.0,
+            node_name: None,
+            hw_class: None,
+            final_resources: None,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // PG status MUST NOT be Completed.
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'ex-drv'")
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_ne!(
+        row.as_ref().map(|r| r.0.as_str()),
+        Some("Completed"),
+        "ex-leader must NOT persist Completed; got {row:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.lease.standby-drops-writes]
+/// `Heartbeat`/`PrefetchComplete` arms stay ungated (keep
+/// `self.executors` accurate) but their PG-touching sub-calls MUST be:
+/// `dispatch_ready` self-gates (dispatch.rs early-return); the
+/// Heartbeat arm's `drain_phantoms` (which `persist_status`es Ready)
+/// is gated at the call site. After `on_lose()`, neither writes PG.
+#[tokio::test]
+async fn ex_leader_heartbeat_prefetch_no_pg_writes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let leader = crate::lease::LeaderState::default();
+    let leader_for_actor = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = leader_for_actor;
+    });
+
+    // Ready drv waiting for dispatch; worker connected.
+    let mut rx = connect_executor(&handle, "exhb-w", "x86_64-linux").await?;
+    merge_single_node(&handle, Uuid::new_v4(), "exhb-a", PriorityClass::Scheduled).await?;
+    let _assign = recv_assignment(&mut rx).await; // exhb-a → Assigned/Running
+
+    // Second drv left Ready (PrefetchComplete inline-dispatch would
+    // pick it up if dispatch_ready weren't gated).
+    merge_single_node(&handle, Uuid::new_v4(), "exhb-b", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    // Baseline PG status before lease-loss.
+    let baseline: Vec<(String, String)> = sqlx::query_as(
+        "SELECT drv_hash, status FROM derivations \
+         WHERE drv_hash IN ('exhb-a','exhb-b') ORDER BY drv_hash",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    leader.on_lose();
+
+    // PrefetchComplete (cold→warm edge) → dispatch_ready inline.
+    // Self-gated inside dispatch_ready.
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "exhb-w".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    // Heartbeat became_idle path → dispatch_ready inline + (if
+    // phantoms) drain_phantoms. Gated at call site.
+    send_heartbeat_with(&handle, "exhb-w", "x86_64-linux", |_| {}).await?;
+    barrier(&handle).await;
+
+    let after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT drv_hash, status FROM derivations \
+         WHERE drv_hash IN ('exhb-a','exhb-b') ORDER BY drv_hash",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        baseline, after,
+        "ex-leader Heartbeat/PrefetchComplete must not write PG"
+    );
+    Ok(())
+}

@@ -402,6 +402,21 @@ impl DagActor {
             return HashMap::new();
         }
 
+        // r[impl sched.breaker.cache-check+2]
+        // Same store, same unavailability signal as merge.rs's
+        // `find_missing_with_breaker`. The breaker exists to protect the
+        // single-threaded actor loop from blocking on a known-down
+        // store; without this gate, the timeout below blocks for up to
+        // `grpc_timeout` (30s) per CA completion during an outage even
+        // when the breaker is already open. Read-only: completion.rs
+        // trusts the merge-time probe rather than re-feeding `record_*`
+        // (avoids `&mut self` plumbing into a `&self`-ish path; merge.rs
+        // half-open-probe model already covers recovery).
+        if self.cache_breaker.is_open() {
+            debug!("CA cutoff verify: cache breaker open; skipping cascade");
+            return HashMap::new();
+        }
+
         // Batch FindMissingPaths: verify all discovered prior outputs
         // still exist in the store (not GC'd). Failure → empty
         // verified set (safe fallback; downstream runs normally).
@@ -1194,10 +1209,12 @@ impl DagActor {
                 .cascade_cutoff(drv_hash, |h| verified.contains_key(h));
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
-            // Sum of estimated durations — lower-bound on wall-clock
-            // saved. est_duration is the SLA estimator's prediction
-            // (set at merge time from build_samples); for a
-            // derivation that has never run, it's the cold-start
+            // Sum of est_duration in hw-normalized ref-seconds
+            // (r[sched.sla.hw-ref-seconds]; NOT wall-clock — skipped
+            // builds were never assigned, so no hw_factor exists to
+            // denormalize). est_duration is the SLA estimator's
+            // prediction (set at merge time from build_samples); for
+            // a derivation that has never run, it's the cold-start
             // probe default. Counter not gauge: cumulative across
             // all cascades, like saves_total.
             let seconds_saved: f64 = skipped

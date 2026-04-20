@@ -971,15 +971,22 @@ impl DagActor {
         drv_hash: &DrvHash,
         expected_outputs: &[String],
     ) -> bool {
-        if expected_outputs.is_empty() {
+        // Floating-CA carries `[""]` pre-completion (translate.rs
+        // convention) — filter so a CA orphan doesn't send `""` to
+        // FMP and get a misleading InvalidArgument warn. Empty after
+        // filter ⇒ nothing verifiable ⇒ conservative `false`.
+        let store_paths: Vec<String> = expected_outputs
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+        if store_paths.is_empty() {
             return false;
         }
         let Some(client) = &mut self.store_client else {
             return false;
         };
-        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: expected_outputs.to_vec(),
-        });
+        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         match client.find_missing_paths(fmp_req).await {
             Ok(resp) => resp.into_inner().missing_paths.is_empty(),

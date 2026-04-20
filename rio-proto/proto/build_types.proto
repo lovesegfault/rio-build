@@ -81,9 +81,13 @@ message BuildProgress {
   uint32 total = 4;                         // Total derivations
   // Estimated seconds remaining on the critical path (longest chain of
   // incomplete derivations; per-node weight from SLA T_min via
-  // critical_path.rs est_duration). Decreases
-  // as derivations complete — root's priority drops when a child goes
-  // terminal (update_ancestors excludes terminal children from the max).
+  // critical_path.rs est_duration). Unit is hw-normalized REF-SECONDS
+  // (r[sched.sla.hw-ref-seconds]), NOT wall-clock — the value spans
+  // future unassigned work, so there is no single hw_factor to
+  // denormalize by. Dashboards that want a wall-time ETA divide by
+  // fleet median hw_factor client-side. Decreases as derivations
+  // complete — root's priority drops when a child goes terminal
+  // (update_ancestors excludes terminal children from the max).
   // Dashboard (P0278) shows this in the progress column.
   optional uint64 critical_path_remaining_secs = 5;
   // Executor IDs currently assigned to this build's running/assigned
@@ -402,10 +406,11 @@ message BuildStatus {
   google.protobuf.Timestamp started_at = 10;
   google.protobuf.Timestamp finished_at = 11;
   string error_summary = 12;              // Non-empty if state is FAILED
-  // Same semantics as BuildProgress.critical_path_remaining_secs /
-  // assigned_executors — BuildStatus is the polling-query snapshot,
-  // BuildProgress is the stream-event delta. Both pull from the
-  // scheduler's build_summary() single-pass.
+  // Same semantics + unit (hw-normalized ref-seconds, NOT wall-clock)
+  // as BuildProgress.critical_path_remaining_secs / assigned_executors
+  // — BuildStatus is the polling-query snapshot, BuildProgress is the
+  // stream-event delta. Both pull from the scheduler's build_summary()
+  // single-pass.
   optional uint64 critical_path_remaining_secs = 13;
   repeated string assigned_executors = 14;
 }

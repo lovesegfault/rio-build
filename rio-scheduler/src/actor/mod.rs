@@ -121,8 +121,9 @@ pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::b
 };
 
 /// Max attempts per path for the detached substitute fetch. With
-/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s→4s ≈ 8s total
-/// retry budget per path before demoting to cache-miss.
+/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s ≈ 3.75s total
+/// retry budget per path (4 backoffs between 5 attempts; the loop
+/// breaks before the final sleep) before demoting to cache-miss.
 pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 5;
 
 /// Per-path timeout for the detached substitute fetch's
@@ -185,7 +186,7 @@ pub struct DagActor {
     /// [`executor::TERMINATION_REPORT_TTL`]. In-memory only: a lost
     /// entry (scheduler restart) degrades to "one OOM doesn't promote"
     /// — same as pre-I-197 behavior for one cycle.
-    recently_disconnected: HashMap<ExecutorId, (DrvHash, Instant)>,
+    pub(crate) recently_disconnected: HashMap<ExecutorId, (DrvHash, Instant)>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -212,7 +213,7 @@ pub struct DagActor {
     /// `buffer_unordered(N)` in `check_cached_outputs`. Unbounded
     /// fan-out of ~1k concurrent QPI calls saturates the store's S3
     /// connection pool → "dispatch failure" → false demotes. Default
-    /// [`DEFAULT_SUBSTITUTE_CONCURRENCY`] (16). Overridable via
+    /// [`DEFAULT_SUBSTITUTE_CONCURRENCY`]. Overridable via
     /// `RIO_SUBSTITUTE_MAX_CONCURRENT` env or scheduler.toml.
     substitute_max_concurrent: usize,
     /// Bounds in-flight detached substitute-fetch tasks. The
@@ -526,6 +527,23 @@ impl DagActor {
         self.ready_queue.clear();
         self.builds.clear();
         self.events.clear();
+        // Per-generation maps: a same-process lose→reacquire (apiserver
+        // blip) would otherwise carry stale `(band, cap, since)` entries
+        // into the new generation → `compute_spawn_intents` pins
+        // selectors to the previous leader's cell + false `ice.mark()`
+        // from stale `since`. `recently_disconnected` is keyed by
+        // executor IDs from the previous generation — a stale entry
+        // would let a `ReportExecutorTermination` from the previous gen
+        // spuriously bump `resource_floor` on a drv this generation
+        // never assigned.
+        self.pending_intents.clear();
+        self.recently_disconnected.clear();
+        // Deliberately retained across generations:
+        // - `executors`: live connections, not persisted (doc above).
+        // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
+        // - `cache_breaker`: store availability is generation-independent.
+        // - `sla_estimator`: cluster-wide fitted curves.
+        // - `tick_count`: harmless counter.
     }
 
     /// Run the actor with a weak clone of its own sender for scheduling
@@ -617,15 +635,28 @@ impl DagActor {
                     hw_class,
                     final_resources,
                 } => {
-                    self.handle_completion(
-                        &executor_id,
-                        &drv_key,
-                        result,
-                        (peak_memory_bytes, peak_cpu_cores),
-                        (node_name, hw_class),
-                        final_resources,
-                    )
-                    .await;
+                    // r[impl sched.lease.standby-drops-writes]
+                    // Defense-in-depth under the stream-reader's
+                    // generation fence (executor_service.rs): an
+                    // ex-leader MUST NOT write terminal PG state
+                    // (`persist_status(Completed)` + realisations +
+                    // SLA samples) — races the new leader's recovery.
+                    if !self.leader.is_leader() {
+                        warn!(
+                            %executor_id, drv = %drv_key,
+                            "dropping ProcessCompletion: not leader"
+                        );
+                    } else {
+                        self.handle_completion(
+                            &executor_id,
+                            &drv_key,
+                            result,
+                            (peak_memory_bytes, peak_cpu_cores),
+                            (node_name, hw_class),
+                            final_resources,
+                        )
+                        .await;
+                    }
                 }
                 ActorCommand::CancelBuild {
                     build_id,
@@ -654,11 +685,23 @@ impl DagActor {
                     reason,
                     reply,
                 } => {
-                    let promoted = self.handle_executor_termination(&executor_id, reason).await;
+                    // r[impl sched.lease.standby-drops-writes] —
+                    // would bump `resource_floor` from a previous
+                    // generation's assignment.
+                    let promoted = if self.leader.is_leader() {
+                        self.handle_executor_termination(&executor_id, reason).await
+                    } else {
+                        false
+                    };
                     let _ = reply.send(promoted);
                 }
                 ActorCommand::AckSpawnedIntents { spawned } => {
-                    self.handle_ack_spawned_intents(&spawned);
+                    // r[impl sched.lease.standby-drops-writes] —
+                    // would arm `pending_intents` for a previous
+                    // generation's spawn.
+                    if self.leader.is_leader() {
+                        self.handle_ack_spawned_intents(&spawned);
+                    }
                 }
                 ActorCommand::PrefetchComplete {
                     executor_id,
@@ -674,6 +717,11 @@ impl DagActor {
                     // sequential dispatch_ready passes. Already-warm
                     // re-ACKs (per-assignment hints) change no
                     // eligibility → skip dispatch entirely.
+                    //
+                    // r[sched.lease.standby-drops-writes]: arm stays
+                    // ungated — `handle_prefetch_complete` is in-memory
+                    // only; `dispatch_ready` self-gates on `is_leader()`
+                    // (dispatch.rs).
                     if self.handle_prefetch_complete(&executor_id, paths_fetched) {
                         if self.became_idle_inline_this_tick < BECAME_IDLE_INLINE_CAP {
                             self.became_idle_inline_this_tick += 1;
@@ -689,7 +737,13 @@ impl DagActor {
                     // I-035: drain phantom assignments BEFORE the next
                     // dispatch so the freed slot + re-queued derivation
                     // are both visible to it.
-                    if !phantoms.is_empty() {
+                    // r[impl sched.lease.standby-drops-writes] —
+                    // `drain_phantoms` persists Ready to PG; the arm
+                    // itself stays ungated (`handle_heartbeat` keeps
+                    // `self.executors` accurate for reconnect-after-
+                    // reacquire and doesn't write PG). `dispatch_ready`
+                    // below self-gates (dispatch.rs).
+                    if !phantoms.is_empty() && self.leader.is_leader() {
                         self.drain_phantoms(&executor_id, phantoms).await;
                     }
                     // I-163: mark dirty instead of dispatching inline.
@@ -773,10 +827,16 @@ impl DagActor {
                     self.dispatch_ready().await;
                 }
                 ActorCommand::ReconcileAssignments => {
-                    self.handle_reconcile_assignments().await;
+                    // r[impl sched.lease.standby-drops-writes]
+                    if self.leader.is_leader() {
+                        self.handle_reconcile_assignments().await;
+                    }
                 }
                 ActorCommand::SubstituteComplete { drv_hash, ok } => {
-                    self.handle_substitute_complete(&drv_hash, ok).await;
+                    // r[impl sched.lease.standby-drops-writes]
+                    if self.leader.is_leader() {
+                        self.handle_substitute_complete(&drv_hash, ok).await;
+                    }
                 }
                 #[cfg(test)]
                 ActorCommand::Debug(d) => {

@@ -424,9 +424,11 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_ca_cutoff_seconds_saved",
-        "Sum of est_duration (reference-seconds, hw-normalized) of skipped \
-         derivations. Divide by fleet min hw_factor for a wall-clock lower \
-         bound. est_duration is the Estimator's EMA, not actual — a \
+        "Sum of est_duration of skipped derivations, in hw-normalized \
+         ref-seconds (r[sched.sla.hw-ref-seconds]; NOT wall-clock per-build — \
+         skipped builds were never assigned, so no hw_factor exists to \
+         denormalize; divide by fleet min hw_factor for a wall-clock lower \
+         bound). est_duration is the Estimator's EMA, not actual — a \
          derivation that's never run has no actual. Paired with saves_total \
          for avg-seconds-per-save."
     );

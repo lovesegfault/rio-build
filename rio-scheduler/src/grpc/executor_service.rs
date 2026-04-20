@@ -102,9 +102,25 @@ impl ExecutorService for SchedulerGrpc {
         let actor_for_recv = self.actor.clone();
         let log_buffers = Arc::clone(&self.log_buffers);
         let executor_id_for_recv = executor_id.clone();
+        // r[impl sched.lease.standby-drops-writes]
+        // Generation-fence the stream: capture the lease generation at
+        // open-time. `ensure_leader()` above only checks at open; the
+        // reader loop below sends `ProcessCompletion`/`PrefetchComplete`
+        // via `send_unchecked` for the stream's lifetime. If the lease
+        // is lost (or flapped) mid-stream, an ex-leader would otherwise
+        // forward a `CompletionReport` and write terminal PG state for
+        // a generation it no longer owns. Breaking the loop closes the
+        // stream → worker reconnects to the new leader.
+        let is_leader = Arc::clone(&self.is_leader);
+        let generation = Arc::clone(&self.generation);
+        let stream_gen = generation.load(std::sync::atomic::Ordering::Acquire);
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
             let mut seen_drvs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let stream_is_stale = || {
+                !is_leader.load(std::sync::atomic::Ordering::SeqCst)
+                    || generation.load(std::sync::atomic::Ordering::Acquire) != stream_gen
+            };
             loop {
                 let msg = match stream.message().await {
                     Ok(Some(m)) => m,
@@ -134,6 +150,13 @@ impl ExecutorService for SchedulerGrpc {
                             );
                         }
                         rio_proto::types::executor_message::Msg::PrefetchComplete(pc) => {
+                            if stream_is_stale() {
+                                info!(
+                                    executor_id = %executor_id_for_recv,
+                                    "lease lost/flapped mid-stream; closing worker stream"
+                                );
+                                break;
+                            }
                             // r[sched.assign.warm-gate]: worker ACKed
                             // the initial PrefetchHint. Forward to
                             // the actor which flips ExecutorState.warm.
@@ -155,6 +178,13 @@ impl ExecutorService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::executor_message::Msg::Completion(mut report) => {
+                            if stream_is_stale() {
+                                info!(
+                                    executor_id = %executor_id_for_recv,
+                                    "lease lost/flapped mid-stream; closing worker stream"
+                                );
+                                break;
+                            }
                             let drv_path = std::mem::take(&mut report.drv_path);
                             // A CompletionReport with result: None is malformed, but
                             // we must not silently drop it — the derivation would hang

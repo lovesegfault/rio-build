@@ -695,6 +695,11 @@ impl DagActor {
     /// (shared dependency) → same expected_output_paths would be
     /// duplicated N× in the roots list. The store's mark CTE handles
     /// dups correctly, but it's wasted network + CTE work.
+    ///
+    /// Floating-CA derivations carry `expected_output_paths == [""]`
+    /// pre-completion (translate.rs convention) — filter so the
+    /// store's `validate_store_path` doesn't reject the whole batch
+    /// with `InvalidArgument` whenever any CA build is in flight.
     // r[impl sched.gc.live-pins]
     pub(super) fn handle_gc_roots(&self) -> Vec<String> {
         self.dag
@@ -704,6 +709,7 @@ impl DagActor {
                 s.expected_output_paths
                     .iter()
                     .chain(s.output_paths.iter())
+                    .filter(|p| !p.is_empty())
                     .cloned()
             })
             .collect::<std::collections::HashSet<_>>()

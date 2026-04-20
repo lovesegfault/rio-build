@@ -288,7 +288,7 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     actor
         .events
         .emit(build_id, Event::Log(BuildLogBatch::default()));
-    // 3. State event → persisted. seq=3 (Log consumed seq=2).
+    // 3. State event → persisted. seq=2 (Log did NOT consume a seq).
     actor.events.emit(
         build_id,
         Event::Cancelled(BuildCancelled {
@@ -311,9 +311,11 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     assert_eq!(received[0].0, build_id);
     assert_eq!(received[0].1, 1, "first Cancelled at seq=1");
     assert_eq!(
-        received[1].1, 3,
-        "second Cancelled at seq=3 — Log still consumed seq=2 \
-         (broadcast seq, not persister seq; gateway dedup uses broadcast seq)"
+        received[1].1, 2,
+        "second Cancelled at seq=2 — Log MUST NOT consume a seq \
+         (broadcast carries last-persisted seq; gateway tracker overwrites). \
+         Consuming a seq diverges in-memory from PG MAX(sequence) → \
+         since_sequence replay guard misfires after failover."
     );
 
     // Bytes decode back to the same event (proves encode is right

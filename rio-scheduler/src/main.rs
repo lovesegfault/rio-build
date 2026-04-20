@@ -270,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&log_buffers),
         db,
         Arc::clone(&is_leader_for_grpc),
+        Arc::clone(&generation),
     );
 
     // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll

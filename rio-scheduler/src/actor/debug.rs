@@ -318,7 +318,7 @@ impl DagActor {
         });
     }
 
-    /// Inject a Ready non-FOD with a given `resource_floor.mem_bytes`.
+    /// Inject a Ready non-FOD with a given `resource_floor.{mem,disk}_bytes`.
     /// For the D4 solve_intent_for-clamps-at-floor test — bypasses the
     /// disconnect→`bump_floor_or_count` dance.
     pub(crate) fn test_inject_ready_with_floor(
@@ -326,9 +326,11 @@ impl DagActor {
         hash: &str,
         system: &str,
         floor_mem_bytes: u64,
+        floor_disk_bytes: u64,
     ) {
         self.test_inject_ready_row(crate::db::RecoveryDerivationRow {
             floor_mem_bytes: floor_mem_bytes as i64,
+            floor_disk_bytes: floor_disk_bytes as i64,
             ..crate::db::RecoveryDerivationRow::test_default(hash, system)
         });
     }

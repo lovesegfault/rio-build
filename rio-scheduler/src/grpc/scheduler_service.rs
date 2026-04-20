@@ -318,11 +318,22 @@ impl SchedulerService for SchedulerGrpc {
         // everything, empty range, skip the PG round-trip.
         // `since_sequence == 0 && last_seq == 0` → build just
         // started, nothing emitted yet — common case, cheap exit.
+        //
+        // `since_sequence > last_seq` (counter regressed): defensive
+        // full replay from 0. Shouldn't happen now that Log doesn't
+        // consume seq numbers (event.rs), but a gateway that connected
+        // to a pre-fix scheduler can carry an inflated `since`.
         let replay = match &self.db {
             Some(db) if req.since_sequence < last_seq => Some(EventReplay {
                 pool: db.pool().clone(),
                 build_id,
                 since: req.since_sequence,
+                last_seq,
+            }),
+            Some(db) if req.since_sequence > last_seq && last_seq > 0 => Some(EventReplay {
+                pool: db.pool().clone(),
+                build_id,
+                since: 0,
                 last_seq,
             }),
             _ => None,
