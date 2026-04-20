@@ -21,6 +21,20 @@ use crate::cgroup::ResourceSnapshotHandle;
 pub(super) const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
+/// Per-RPC timeout, strictly < `HEARTBEAT_INTERVAL` so one slow RPC can
+/// never consume more than one missed-heartbeat budget. 2s slack leaves
+/// room for the request-build + apply between tick and RPC. bug_044:
+/// the loop is sequential (`tick → await RPC → apply`); without this,
+/// one RPC stalled >30s (scheduler actor mpsc backed up at
+/// `send_unchecked`, or asymmetric network delay on a live connection)
+/// blocked the whole loop past `HEARTBEAT_TIMEOUT_SECS=30` →
+/// `tick_check_heartbeats` reaped a healthy worker. h2 keepalive (~40s
+/// detection) doesn't help — it detects dead transports, not slow
+/// application handlers.
+// r[impl builder.heartbeat.rpc-timeout]
+pub(super) const HEARTBEAT_RPC_TIMEOUT: Duration =
+    Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS - 2);
+
 /// Build a heartbeat request, populating `running_build` from the shared
 /// tracker.
 ///
@@ -121,6 +135,11 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
     } = ctx;
     rio_common::task::spawn_monitored("heartbeat-loop", async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // bug_044: after an 8s RPC, default `Burst` would fire the
+        // missed tick immediately (two heartbeats back-to-back).
+        // `Delay` resumes the regular cadence — the scheduler's reap
+        // check is wall-clock, so bursting buys nothing.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
 
@@ -151,7 +170,13 @@ pub(super) fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> 
             }
 
             apply_heartbeat_response(
-                client.heartbeat(request).await.map(|r| r.into_inner()),
+                rio_common::grpc::with_timeout_status(
+                    "Heartbeat",
+                    HEARTBEAT_RPC_TIMEOUT,
+                    client.heartbeat(request),
+                )
+                .await
+                .map(|r| r.into_inner()),
                 &ready,
                 &generation,
             );
@@ -208,5 +233,49 @@ pub(super) fn apply_heartbeat_response(
             // the scheduler's availability from our perspective.
             ready.store(false, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// bug_044: one slow RPC must not consume >1 missed-heartbeat
+    /// budget. The loop is `tick → await RPC → apply`; with the RPC
+    /// bounded under the interval, a stalled scheduler handler costs
+    /// at most one tick on the scheduler's `now - last_heartbeat`
+    /// clock instead of all `MAX_MISSED_HEARTBEATS`.
+    // r[verify builder.heartbeat.rpc-timeout]
+    #[test]
+    fn heartbeat_rpc_timeout_under_interval() {
+        assert!(
+            HEARTBEAT_RPC_TIMEOUT < HEARTBEAT_INTERVAL,
+            "RPC timeout {HEARTBEAT_RPC_TIMEOUT:?} must be < interval \
+             {HEARTBEAT_INTERVAL:?} so one slow RPC ≤ one missed budget"
+        );
+        assert!(
+            HEARTBEAT_RPC_TIMEOUT >= Duration::from_secs(1),
+            "RPC timeout {HEARTBEAT_RPC_TIMEOUT:?} must allow real RTT"
+        );
+    }
+
+    /// `with_timeout_status` returns `Status::deadline_exceeded` on
+    /// elapse; this is the path the loop takes when bug_044's bound
+    /// fires. Pin that the existing `Err` arm handles it (sets
+    /// `ready=false`, doesn't touch `generation`).
+    #[test]
+    fn apply_heartbeat_response_timeout_sets_unready() {
+        let ready = AtomicBool::new(true);
+        let generation = AtomicU64::new(7);
+        apply_heartbeat_response(
+            Err(tonic::Status::deadline_exceeded(
+                "'Heartbeat' timed out after 8s",
+            )),
+            &ready,
+            &generation,
+        );
+        assert!(!ready.load(Ordering::Relaxed));
+        assert_eq!(generation.load(Ordering::Relaxed), 7);
     }
 }
