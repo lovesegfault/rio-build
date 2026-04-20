@@ -117,6 +117,11 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
     Ok(BuiltImages { dir, tag })
 }
 
+/// Namespaces that get a `rio-postgres` URL secret. `ensure_pg_secrets`
+/// creates one in each; `K3s::destroy` deletes from each. Shared so
+/// create/destroy can't drift (ADR-019 added NS_STORE to create only).
+pub const PG_SECRET_NAMESPACES: [&str; 2] = [NS, super::NS_STORE];
+
 /// Create the two postgres Secrets for the in-cluster bitnami path
 /// (k3s). Generates a random password on first deploy; reuses
 /// the existing one on upgrades so the DB doesn't get locked out.
@@ -145,10 +150,13 @@ pub async fn ensure_gateway_ssh_secret(
 ) -> Result<()> {
     let tenant = match tenant.or(cfg.ssh_tenant.as_deref()) {
         explicit @ Some(_) => explicit.map(str::to_owned),
-        None => kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
-            .await?
-            .as_deref()
-            .and_then(crate::ssh::parse_tenant_comment),
+        None => {
+            let key = crate::ssh::read_pubkey(cfg)?;
+            kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
+                .await?
+                .as_deref()
+                .and_then(|ak| crate::ssh::tenant_for_key(ak, &key))
+        }
     };
     let authorized = crate::ssh::authorized_keys(cfg, tenant.as_deref())?;
     // MERGE, don't replace: a redeploy must not wipe keys added via
@@ -160,25 +168,12 @@ pub async fn ensure_gateway_ssh_secret(
 /// Upsert one `authorized_keys` line into the `rio-gateway-ssh`
 /// Secret. Dedups on (key-type, base64) — comment may change (re-
 /// granting the same key under a different tenant replaces its line).
-/// All other existing lines are preserved.
+/// All other existing lines are preserved IN ORDER.
 pub async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Result<()> {
     let existing = kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
         .await?
         .unwrap_or_default();
-    let key_id = |l: &str| {
-        let mut it = l.split_whitespace();
-        Some((it.next()?.to_owned(), it.next()?.to_owned()))
-    };
-    let new_id = key_id(key_line);
-    let mut merged: String = existing
-        .lines()
-        .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
-        .map(|l| format!("{l}\n"))
-        .collect();
-    merged.push_str(key_line);
-    if !merged.ends_with('\n') {
-        merged.push('\n');
-    }
+    let merged = merge_authorized_key_lines(&existing, key_line);
     kube::apply_secret(
         client,
         NS,
@@ -186,6 +181,37 @@ pub async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Resu
         BTreeMap::from([("authorized_keys".into(), merged)]),
     )
     .await
+}
+
+/// Pure half of [`merge_authorized_key`]. Map-in-place: walk
+/// `existing`, replace the line whose (type, base64) matches `key_line`
+/// (comment may differ), append if no match. Preserves order — the
+/// previous filter-then-append moved the upserted key to the end,
+/// which combined with positional tenant lookup (now fixed) silently
+/// re-tagged the operator's key after `grant`.
+fn merge_authorized_key_lines(existing: &str, key_line: &str) -> String {
+    let key_id = |l: &str| {
+        let mut it = l.split_whitespace();
+        Some((it.next()?.to_owned(), it.next()?.to_owned()))
+    };
+    let new_id = key_id(key_line);
+    let key_line = key_line.trim_end_matches('\n');
+    let mut replaced = false;
+    let mut merged = String::new();
+    for l in existing.lines().filter(|l| !l.trim().is_empty()) {
+        if key_id(l) == new_id {
+            merged.push_str(key_line);
+            replaced = true;
+        } else {
+            merged.push_str(l);
+        }
+        merged.push('\n');
+    }
+    if !replaced {
+        merged.push_str(key_line);
+        merged.push('\n');
+    }
+    merged
 }
 
 /// Grant build access to one SSH public key under its own tenant.
@@ -291,7 +317,7 @@ pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
     // the url secret; scheduler reads the rio-system copy, store reads
     // the rio-store copy. Same connection string (postgresql Service
     // lives in rio-system either way).
-    for ns in [NS, super::NS_STORE] {
+    for ns in PG_SECRET_NAMESPACES {
         kube::apply_secret(
             client,
             ns,
@@ -647,8 +673,38 @@ mod tests {
         panic!("grandchild {grandchild} still alive 2s after ProcessGuard drop");
     }
 
+    #[test]
+    fn merge_authorized_key_preserves_order() {
+        let existing = "ssh-ed25519 AAAA ops\nssh-ed25519 BBBB alice\n";
+        // Upsert ops with a new comment → replaces in place, NOT appended.
+        let merged = merge_authorized_key_lines(existing, "ssh-ed25519 AAAA newops\n");
+        assert_eq!(merged, "ssh-ed25519 AAAA newops\nssh-ed25519 BBBB alice\n");
+        // New key → appended.
+        let merged = merge_authorized_key_lines(existing, "ssh-ed25519 CCCC bob");
+        assert_eq!(
+            merged,
+            "ssh-ed25519 AAAA ops\nssh-ed25519 BBBB alice\nssh-ed25519 CCCC bob\n"
+        );
+        // Empty existing → just the new line.
+        assert_eq!(
+            merge_authorized_key_lines("", "ssh-ed25519 AAAA ops"),
+            "ssh-ed25519 AAAA ops\n"
+        );
+    }
+
+    #[test]
+    fn pg_secret_namespaces_covers_store() {
+        // ADR-019 deploy/destroy symmetry: ensure_pg_secrets writes
+        // into NS_STORE; K3s::destroy iterates the same const.
+        assert!(PG_SECRET_NAMESPACES.contains(&crate::k8s::NS_STORE));
+        assert!(PG_SECRET_NAMESPACES.contains(&NS));
+    }
+
     /// I-161 regression guard: `NIX_SSHOPTS_BASE` carries the I-149
-    /// ServerAlive options + ControlMaster suppression + IdentitiesOnly.
+    /// ServerAlive options, ControlMaster suppression, IdentitiesOnly,
+    /// and IdentityAgent=none. The last is the actual I-161 root cause
+    /// (dead forwarded agent → ssh hangs pre-KEXINIT); IdentitiesOnly
+    /// alone is insufficient — see the const's doc.
     #[test]
     fn nix_sshopts_have_keepalive_and_no_mux() {
         for needle in [
@@ -657,6 +713,7 @@ mod tests {
             "ControlMaster=no",
             "ControlPath=none",
             "IdentitiesOnly=yes",
+            "IdentityAgent=none",
         ] {
             assert!(
                 NIX_SSHOPTS_BASE.contains(needle),

@@ -132,7 +132,11 @@ impl Provider for K3s {
             let client = kube::client().await?;
             kube::delete_secret(&client, NS, "rio-gateway-ssh").await?;
             kube::delete_secret(&client, NS, "rio-s3-creds").await?;
-            kube::delete_secret(&client, NS, "rio-postgres").await?;
+            // ADR-019: ensure_pg_secrets writes rio-postgres into both
+            // namespaces; delete from both.
+            for ns in shared::PG_SECRET_NAMESPACES {
+                kube::delete_secret(&client, ns, "rio-postgres").await?;
+            }
             kube::delete_secret(&client, NS, "rio-postgres-auth").await
         })
         .await?;

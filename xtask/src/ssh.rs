@@ -50,13 +50,30 @@ pub fn authorized_keys(cfg: &XtaskConfig, tenant: Option<&str>) -> Result<String
     Ok(key.to_openssh().map(|s| s + "\n")?)
 }
 
-/// Extract the tenant name (comment field) from an authorized_keys
-/// line. First non-empty line wins; empty/absent comment → `None`.
-pub fn parse_tenant_comment(authorized_keys: &str) -> Option<String> {
+/// Read the operator's pubkey from `RIO_SSH_PUBKEY` (same path
+/// [`authorized_keys`] reads). Split out so [`tenant_for_key`] callers
+/// can resolve "the operator's key" without re-parsing the file.
+pub fn read_pubkey(cfg: &XtaskConfig) -> Result<PublicKey> {
+    let path = pubkey_path(cfg);
+    PublicKey::read_openssh_file(&path).with_context(|| {
+        format!(
+            "{} is not a valid OpenSSH public key (set RIO_SSH_PUBKEY)",
+            path.display()
+        )
+    })
+}
+
+/// Extract the tenant name (comment field) of `key`'s line in
+/// `authorized_keys`. Matches by key identity (algorithm + key data),
+/// NOT line position — `merge_authorized_key` reorders lines, so
+/// "first line" is whoever was last upserted, not the operator. I-100:
+/// after `grant alice` + a bare `deploy`, positional lookup re-tagged
+/// the operator's key as `alice`. Empty/absent comment → `None`.
+pub fn tenant_for_key(authorized_keys: &str, key: &PublicKey) -> Option<String> {
     authorized_keys
         .lines()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| PublicKey::from_openssh(l).ok())
+        .filter_map(|l| PublicKey::from_openssh(l).ok())
+        .find(|k| k.key_data() == key.key_data())
         .map(|k| k.comment().to_owned())
         .filter(|c| !c.is_empty())
 }
@@ -161,20 +178,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_tenant_comment_roundtrip() {
+    fn tenant_for_key_finds_own_key() {
         let (_d, cfg) = cfg_with_key(None);
         let ak = authorized_keys(&cfg, Some("smoke-test")).unwrap();
-        assert_eq!(parse_tenant_comment(&ak).as_deref(), Some("smoke-test"));
+        let key = read_pubkey(&cfg).unwrap();
+        assert_eq!(tenant_for_key(&ak, &key).as_deref(), Some("smoke-test"));
         // leading blank lines / trailing newline tolerated
         assert_eq!(
-            parse_tenant_comment(&format!("\n\n{ak}\n")).as_deref(),
+            tenant_for_key(&format!("\n\n{ak}\n"), &key).as_deref(),
             Some("smoke-test")
         );
         // empty comment → None (don't preserve "")
         let (_, no_comment) = generate("").unwrap();
-        assert_eq!(parse_tenant_comment(&no_comment), None);
-        // garbage → None
-        assert_eq!(parse_tenant_comment("not a key"), None);
-        assert_eq!(parse_tenant_comment(""), None);
+        let nc_key = PublicKey::from_openssh(no_comment.trim()).unwrap();
+        assert_eq!(tenant_for_key(&no_comment, &nc_key), None);
+        // garbage / key not present → None
+        assert_eq!(tenant_for_key("not a key", &key), None);
+        assert_eq!(tenant_for_key("", &key), None);
+    }
+
+    /// I-100 regression: the operator's tenant must be resolved by key
+    /// IDENTITY, not line position. After `grant alice`, alice's key is
+    /// appended; the old positional lookup returned `alice` when asked
+    /// "what's the operator's tenant?".
+    #[test]
+    fn tenant_for_key_ignores_position() {
+        let (_, alice_pub) = generate("alice").unwrap();
+        let (_, op_pub) = generate("ops").unwrap();
+        let op_key = PublicKey::from_openssh(op_pub.trim()).unwrap();
+        // alice first, operator second — positional lookup would return "alice".
+        let ak = format!("{alice_pub}{op_pub}");
+        assert_eq!(tenant_for_key(&ak, &op_key).as_deref(), Some("ops"));
+        // reversed order — same answer.
+        let ak = format!("{op_pub}{alice_pub}");
+        assert_eq!(tenant_for_key(&ak, &op_key).as_deref(), Some("ops"));
+        // operator's key absent → None (don't borrow someone else's tenant).
+        assert_eq!(tenant_for_key(&alice_pub, &op_key), None);
     }
 }
