@@ -893,7 +893,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     //      channel_close → ChannelSession::Drop → proto_task.abort(),
     //      no cancel logic anywhere.
     //
-    // Result: build leaks until r[sched.backstop.timeout+2]. For a 6h
+    // Result: build leaks until r[sched.backstop.timeout+3]. For a 6h
     // nixpkgs build, that's a 6h worker-slot leak per dropped client.
     //
     // Fix is two-part (both needed — step 3 and step 6 compound):

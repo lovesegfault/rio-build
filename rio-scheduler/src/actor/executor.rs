@@ -138,11 +138,13 @@ impl DagActor {
         //    actor_rx dropped → `is_closed()`). Builder retries with
         //    1s backoff; the I-056a race below is sub-ms.
         //
-        // 2. HMAC-attested intent doesn't match the stored one →
-        //    drop. The stored `intent_id` was set by a token-gated
-        //    heartbeat or a prior connect; a token for a different
-        //    intent cannot take over. (1) alone leaves a window
-        //    between disconnect and reconnect; (2) closes it.
+        // 2. HMAC-attested intent doesn't match the stored
+        //    `auth_intent` → drop. `auth_intent` was set by a prior
+        //    token-gated connect and is NEVER mutated by heartbeat
+        //    (unlike `intent_id`, which is dispatch-downgradeable);
+        //    a token for a different intent cannot take over. (1)
+        //    alone leaves a window between disconnect and reconnect;
+        //    (2) closes it.
         if is_reconnect {
             if worker.stream_tx.as_ref().is_some_and(|tx| !tx.is_closed()) {
                 warn!(
@@ -157,12 +159,12 @@ impl DagActor {
                 return Err("live stream");
             }
             if auth_intent.is_some()
-                && worker.intent_id.is_some()
-                && worker.intent_id != auth_intent
+                && worker.auth_intent.is_some()
+                && worker.auth_intent != auth_intent
             {
                 warn!(
                     executor_id = %executor_id,
-                    stored = ?worker.intent_id,
+                    stored = ?worker.auth_intent,
                     presented = ?auth_intent,
                     "reconnect with mismatched executor-token intent; rejecting"
                 );
@@ -182,7 +184,12 @@ impl DagActor {
         // Stamp the attested intent immediately so dispatch can match
         // before the first heartbeat lands, and so a later reconnect
         // attempt with a different intent fails check (2) above.
+        // `auth_intent` is the immutable identity key (read by the
+        // reconnect guard and `handle_heartbeat`'s spoof check);
+        // `intent_id` is the dispatch-reservation hint (heartbeat may
+        // downgrade it to None when the drv leaves Ready).
         if auth_intent.is_some() {
+            worker.auth_intent.clone_from(&auth_intent);
             worker.intent_id = auth_intent;
         }
 
@@ -220,6 +227,15 @@ impl DagActor {
         }
 
         let was_registered = worker.is_registered();
+        // `stream_epoch` and `stream_tx` are paired: the epoch
+        // identifies the stream stored in `stream_tx`. Written
+        // together AFTER the rejection guards above so a rejected
+        // reconnect cannot leave `{stream_tx=TX_legit, stream_epoch=
+        // E_rejected}` — the gRPC handler unconditionally spawns a
+        // reader that fires `ExecutorDisconnected{stream_epoch}` on
+        // close, and a corrupted epoch would let the rejected
+        // stream's disconnect evict the legitimate worker.
+        worker.stream_epoch = stream_epoch;
         worker.stream_tx = Some(stream_tx);
 
         if !was_registered && worker.is_registered() {
@@ -648,10 +664,15 @@ impl DagActor {
 
     /// `activeDeadlineSeconds` backstop fired — worker was too wedged
     /// to fire its own `daemon_timeout`. Bump `resource_floor.
-    /// deadline_secs` (D4; `bump_floor_or_count` handles the
-    /// `timeout_count` increment at the cap — same bounded-ladder
-    /// semantics as `handle_timeout_failure`,
-    /// `r[sched.timeout.promote-on-exceed+2]`).
+    /// deadline_secs` (D4) and increment `timeout_count`
+    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+2]`, same
+    /// I-200 semantics as `handle_timeout_failure`): every timeout
+    /// consumes budget regardless of promotion, so
+    /// `max_timeout_retries` bounds TOTAL attempts. NOT gated on
+    /// `at_cap` — that's the OOM/DiskPressure shape above (infra IS
+    /// promotion-exempt; timeout is not). With the gate, a
+    /// deterministically-wedging drv climbed ~9 free ladder rungs
+    /// (180s→…→86400s) before the counter moved.
     ///
     /// `job_name` is the JOB name; the Pod is already deleted.
     /// Prefix-match `recently_disconnected` (pod name = `{job}-{5}`).
@@ -660,14 +681,13 @@ impl DagActor {
     /// `reset_to_ready` — `handle_executor_disconnected` already re-
     /// queued, and the drv may already be re-dispatched.
     ///
-    /// At the 24h cap (`counted=true`), `timeout_count >=
-    /// max_timeout_retries` poisons HERE — the backstop fires
-    /// precisely when the worker is too wedged (FUSE/kernel hang) to
-    /// send `CompletionReport{TimedOut}`, so `handle_timeout_failure`'s
-    /// cap-check never runs and a deterministically-wedging drv would
-    /// otherwise re-queue at 24h forever (`is_poisoned()` reads
-    /// `failure_count`/`failed_builders`, never `timeout_count`).
-    /// Mirrors the m044 OOM/DiskPressure cap-check above.
+    /// `timeout_count >= max_timeout_retries` poisons HERE — the
+    /// backstop fires precisely when the worker is too wedged
+    /// (FUSE/kernel hang) to send `CompletionReport{TimedOut}`, so
+    /// `handle_timeout_failure`'s cap-check never runs and a
+    /// deterministically-wedging drv would otherwise re-queue forever
+    /// (`is_poisoned()` reads `failure_count`/`failed_builders`,
+    /// never `timeout_count`).
     async fn handle_deadline_exceeded(&mut self, job_name: &ExecutorId) -> bool {
         use rio_proto::types::TerminationReason as R;
         let prefix = format!("{job_name}-");
@@ -693,8 +713,7 @@ impl DagActor {
             .await;
 
         let max = self.retry_policy.max_timeout_retries;
-        if outcome.at_cap
-            && let Some(state) = self.dag.node_mut(&drv_hash)
+        if let Some(state) = self.dag.node_mut(&drv_hash)
             && matches!(
                 state.status(),
                 DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
@@ -705,12 +724,11 @@ impl DagActor {
                     drv_hash = %drv_hash, job_name = %job_name,
                     timeout_retry_count = state.retry.timeout_count, max,
                     resource_floor = ?state.sched.resource_floor,
-                    "DeadlineExceeded backstop: max_timeout_retries exhausted \
-                     at cap, poisoning"
+                    "DeadlineExceeded backstop: max_timeout_retries exhausted, poisoning"
                 );
                 self.poison_and_cascade(
                     &drv_hash,
-                    &format!("max_timeout_retries={max} exhausted at 24h deadline cap"),
+                    &format!("max_timeout_retries={max} exhausted (DeadlineExceeded backstop)"),
                 )
                 .await;
                 return false;
@@ -911,33 +929,27 @@ impl DagActor {
             return (Vec::new(), false);
         }
         // r[impl sec.executor.identity-token+2]
-        // Defence-in-depth: once `executor_id` is bound to an attested
-        // `intent_id` (by `handle_worker_connected` on accept, or a
-        // prior token-gated heartbeat), a heartbeat for that
-        // `executor_id` with a DIFFERENT non-empty `intent_id` is a
-        // spoof — the gRPC bind only proves the body matches the
-        // CALLER's token, not that `executor_id` belongs to that
-        // caller. Without this, a worker holding a token for `I_self`
-        // can heartbeat `{executor_id: E_victim, intent_id: I_self}`,
-        // pass the gRPC bind, and overwrite
-        // `executors[E_victim].intent_id` / `kind` — poisoning
-        // E_victim's dispatch match. Mirrors the reconnect
-        // intent-mismatch guard in `handle_worker_connected` (both-Some
-        // and differ; `hb.intent_id = None` is unreachable in HMAC mode
-        // for a bound executor — the gRPC bind rejects "" ≠ stored).
-        if let Some(w) = self.executors.get(executor_id.as_str())
-            && let Some(stored) = w.intent_id.as_ref()
-            && let Some(presented) = hb.intent_id.as_ref()
-            && presented != stored
+        // Bind the heartbeat to the executor entry: `hb.intent_id` is
+        // token-attested (gRPC bound it to the caller's token at
+        // executor_service.rs); the stored `auth_intent` was token-
+        // attested at connect. Mismatch = cross-executor spoof
+        // (compromised pod A heartbeating as B with A's own intent).
+        // None on either side = dev-mode / Static-sized → permissive.
+        // Runs BEFORE any mutation (reconcile_running_build, intent_id
+        // overwrite, draining_hb/store_degraded) so a spoof cannot
+        // phantom-drain or flag-flip the victim.
+        if let Some(worker) = self.executors.get(executor_id.as_str())
+            && let Some(stored) = &worker.auth_intent
+            && let Some(presented) = &hb.intent_id
+            && stored != presented
         {
             warn!(
-                executor_id = %executor_id,
-                stored = %stored,
-                presented = %presented,
-                "heartbeat intent_id differs from bound intent; dropping (spoof?)"
+                executor_id = %executor_id, stored = %stored, presented = %presented,
+                "heartbeat intent mismatch vs stored auth_intent; dropping \
+                 (cross-executor spoof?)"
             );
-            metrics::counter!("rio_scheduler_executor_reconnect_rejected_total",
-                              "reason" => "heartbeat_intent_mismatch")
+            metrics::counter!("rio_scheduler_heartbeat_rejected_total",
+                              "reason" => "intent_mismatch")
             .increment(1);
             return (Vec::new(), false);
         }
@@ -1133,10 +1145,11 @@ impl DagActor {
 
         // Compute the reconciled value before borrowing worker mutably,
         // so we can read self.dag for derivation state checks.
-        let prev_running: Option<DrvHash> = self
+        let (prev_running, admin_draining) = self
             .executors
             .get(executor_id.as_str())
-            .and_then(|w| w.running_build.clone());
+            .map(|w| (w.running_build.clone(), w.draining))
+            .unwrap_or((None, false));
 
         // Keep the scheduler-assigned build if still in-flight ON THIS
         // EXECUTOR. The ownership check matters for the adopt-conflict
@@ -1182,7 +1195,15 @@ impl DagActor {
         // dispatch_ready to a worker that's actually busy.
         let mut reconciled: Option<DrvHash> = match (&prev_kept, &heartbeat_hash) {
             (None, Some(hb)) => {
-                if prev_running.as_ref() != Some(hb) {
+                // Skip DAG-side adoption for an admin-draining worker:
+                // force-drain just reset this drv to Ready and the
+                // worker's CompletionReport{Cancelled} must find it
+                // Ready to no-op (handle_drain_executor :821-825).
+                // `draining` (admin-set), NOT `is_draining()` — the
+                // I-066 post-restart adopt path relies on this firing
+                // while `draining_hb` is true (worker.draining is
+                // cleared on reconnect).
+                if prev_running.as_ref() != Some(hb) && !admin_draining {
                     self.adopt_heartbeat_build(executor_id, hb);
                 }
                 Some(hb.clone())

@@ -2323,11 +2323,7 @@ impl DagActor {
         // terminal-path attempt should record that this deadline was
         // inadequate, so an explicit resubmit starts at the doubled
         // floor instead of replaying the timeout. Same shape as
-        // I-199's handle_infrastructure_failure prologue. D4: at the
-        // 24h cap `bump_floor_or_count` increments `timeout_count`
-        // instead — that's the SAME counter the cap check below reads,
-        // so a build that hit the deadline cap goes terminal on the
-        // next iteration regardless of `max_timeout_retries`.
+        // I-199's handle_infrastructure_failure prologue.
         let floor_outcome = self
             .bump_resource_floor(
                 drv_hash,

@@ -82,6 +82,9 @@ impl ExecutorService for SchedulerGrpc {
                 ));
             }
         };
+        // `executor_id` is body-supplied (not in `ExecutorClaims`); the
+        // actor-side `auth_intent` checks (reconnect intent-mismatch +
+        // heartbeat spoof guard) are the identity binding.
         info!(executor_id = %executor_id, "worker stream opened");
 
         // Create the internal channel for the actor to send SchedulerMessages to this worker.
@@ -370,15 +373,19 @@ impl ExecutorService for SchedulerGrpc {
         if req.executor_id.is_empty() {
             return Err(Status::invalid_argument("executor_id is required"));
         }
-        // Body `intent_id` and `kind` MUST equal the token's. The
-        // actor's `worker.intent_id` (set from this body field) is
-        // what dispatch matches and what `handle_worker_connected`
-        // checks on reconnect; `worker.kind` is what `hard_filter`
-        // reads for the FOD/non-FOD airgap split. Binding both here
-        // means they're cryptographically attested — a compromised
-        // open-egress Fetcher cannot heartbeat `kind=Builder` and
-        // receive non-FOD builds with secret inputs (its CNP stays
-        // wide open; only the work routed to it would change).
+        // Body `intent_id` and `kind` MUST equal the token's, so what
+        // reaches the actor is cryptographically attested. `worker.kind`
+        // is what `hard_filter` reads for the FOD/non-FOD airgap split —
+        // a compromised open-egress Fetcher cannot heartbeat
+        // `kind=Builder` and receive non-FOD builds with secret inputs
+        // (its CNP stays wide open; only the work routed to it would
+        // change). The actor then binds `hb.intent_id` to the target
+        // executor's stored `auth_intent` (set at connect from THAT
+        // executor's token): a compromised pod A heartbeating as B with
+        // A's own intent passes THIS check (X==X) but fails the
+        // actor-side check (B's auth_intent=Y ≠ X). `executor_id` is
+        // body-supplied and unbound here; the actor-side `auth_intent`
+        // check is the identity binding.
         if let Some(ref c) = auth_claims {
             if req.intent_id != c.intent_id {
                 return Err(Status::unauthenticated(

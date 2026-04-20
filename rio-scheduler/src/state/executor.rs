@@ -165,6 +165,15 @@ pub struct ExecutorState {
     /// Dispatch (Phase-2) prefers the pre-computed assignment for
     /// this intent; falls through to pick-from-queue if no match.
     pub intent_id: Option<String>,
+    /// HMAC-attested intent this executor was spawned for. Set once
+    /// from `ExecutorConnected.auth_intent`; NEVER mutated by
+    /// heartbeat. Distinct from `intent_id`, which is dispatch-
+    /// downgradeable to `None` when the drv leaves Ready.
+    /// `handle_heartbeat` and the reconnect intent-mismatch guard
+    /// read this (not `intent_id`) to bind a request to the worker
+    /// entry — the token attests the intent, and the intent is the
+    /// immutable identity key (`r[sec.executor.identity-token]`).
+    pub auth_intent: Option<String>,
     /// Per-stream epoch tying `ExecutorDisconnected` to the specific
     /// `BuildExecution` stream that closed. Allocated by the gRPC
     /// handler on stream open (monotonic across the process) and
@@ -204,6 +213,7 @@ impl ExecutorState {
             warm: false,
             phantom_suspect: None,
             intent_id: None,
+            auth_intent: None,
             stream_epoch: 0,
         }
     }

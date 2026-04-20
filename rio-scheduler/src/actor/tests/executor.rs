@@ -827,7 +827,7 @@ async fn test_three_disconnects_never_poison(#[case] mark_running: bool) -> Test
 /// `resource_floor.disk_bytes`. The bump never records into
 /// `failed_builders`/`failure_count`/`retry_count` so the ladder is
 /// bounded by `Ceilings.max_disk`, not `PoisonConfig.threshold=3`.
-// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.retry.promotion-exempt+3]
 // r[verify sched.sla.reactive-floor+2]
 #[tokio::test]
 async fn test_disk_pressure_report_climbs_ladder_no_poison() -> TestResult {
@@ -1109,7 +1109,7 @@ async fn cold_start_timeout_consumes_budget_then_cancels() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.retry.promotion-exempt+3]
 /// Regression: at-cap cgroup-OOM (worker-reported InfrastructureFailure
 /// path) used to double-count `infra_count` — `bump_floor_or_count`
 /// incremented at-cap, THEN `handle_infrastructure_failure`'s
@@ -1204,7 +1204,7 @@ async fn at_cap_cgroup_oom_single_counts_infra() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.retry.promotion-exempt+3]
 /// m044 regression: at-cap cgroup-OOM with the I-127 retry window
 /// ELAPSED used to reset `infra_count` to 0 — `bump_floor_or_count`
 /// incremented (counted=true) BEFORE the window-reset zeroed it, then
@@ -1289,7 +1289,7 @@ async fn at_cap_cgroup_oom_window_reset_preserves_count() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.retry.promotion-exempt+3]
 /// m044 regression: PURE controller-reported termination at the
 /// ceiling (kubelet OOMKilled / EvictedDiskPressure → pod dead, no
 /// worker `CompletionReport`) used to loop forever —
@@ -1859,8 +1859,8 @@ async fn test_deadline_exceeded_report_promotes_and_counts() -> TestResult {
         "D4: floor.deadline_secs == 2 × est_deadline_secs"
     );
     assert_eq!(
-        info.retry.timeout_count, 0,
-        "below cap → bump_floor_or_count does NOT increment timeout_count"
+        info.retry.timeout_count, 1,
+        "I-200: every DeadlineExceeded consumes timeout budget regardless of promotion"
     );
 
     // Second report for same Job → recently_disconnected entry already
@@ -2247,7 +2247,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
     Ok(())
 }
 
-// r[verify sched.backstop.timeout+2]
+// r[verify sched.backstop.timeout+3]
 /// Backstop timeout: a derivation Running far longer than expected
 /// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor
 /// is 0s (BACKSTOP_DAEMON_TIMEOUT_SECS=0, BACKSTOP_SLACK_SECS=0) so
@@ -2299,32 +2299,44 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
         other => panic!("expected CancelSignal, got {other:?}"),
     }
 
-    // Drv should be Ready (reset for retry). It may immediately
-    // re-dispatch to the same worker (only one available). Either
-    // Ready or a fresh Assigned (dispatch fired again). What
-    // matters is: NOT stuck in Running. Backstop reassign does NOT
-    // increment retry_count or record into failed_builders — the
-    // scheduler-side backstop is "worker hung, never reported", not
-    // a build-determinism signal.
+    // Drv should be Ready (reset for retry). The wedged worker is now
+    // draining, so the same worker is NOT re-dispatched. Backstop
+    // accounts the attempt into failed_builders/failure_count so
+    // `is_poisoned()` bounds the loop; `retry.count` (transient
+    // budget) stays zero.
     let post = expect_drv(&handle, "bs-drv").await;
-    assert!(
-        matches!(
-            post.status,
-            DerivationStatus::Ready | DerivationStatus::Assigned
-        ),
-        "backstop should reset drv (not leave it Running); got {:?}",
-        post.status
+    assert_eq!(
+        post.status,
+        DerivationStatus::Ready,
+        "backstop should reset drv to Ready; wedged worker is draining \
+         so no re-dispatch"
     );
     assert_eq!(
         post.retry.count, 0,
-        "backstop reassign re-queues at current floor only (no retry budget consumed)"
+        "backstop reassign re-queues at current floor only (no transient budget consumed)"
+    );
+    assert_eq!(
+        post.retry.failure_count, 1,
+        "backstop accounts the attempt so is_poisoned() bounds the loop"
+    );
+    assert!(
+        post.retry
+            .failed_builders
+            .contains(&ExecutorId::from("bs-worker")),
+        "backstop records the wedged worker in failed_builders"
+    );
+    let w = expect_worker(&handle, "bs-worker").await;
+    assert!(
+        w.draining,
+        "wedged-but-heartbeating worker quarantined so dispatch doesn't \
+         feed it new work that would sit Assigned forever"
     );
 
     Ok(())
 }
 
 // r[verify sched.sla.hw-ref-seconds]
-// r[verify sched.backstop.timeout+2]
+// r[verify sched.backstop.timeout+3]
 /// `est_duration` is reference-seconds (sla `t_min`); `elapsed` is
 /// wall-clock. The backstop must denormalize via `min_factor()` so a
 /// long build on slow hardware (`hw_factor < 1/3`) is not cancelled
@@ -3593,6 +3605,11 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
     let drv_hash = "epoch-drv";
     let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     let _ = recv_assignment(&mut rx1).await;
+    // Old bridge task exited — models the production I-056a ordering
+    // (legitimate reconnect only happens after the prior stream's
+    // bridge dropped). Without this, the live-stream hijack guard
+    // rejects the second connect and the test exercises the wrong path.
+    drop(rx1);
 
     // Reconnect WITHOUT sending the disconnect first (entry persists,
     // epoch overwritten). This is the connect-before-disconnect
@@ -3603,7 +3620,6 @@ async fn test_stale_disconnect_after_reconnect_is_ignored() -> TestResult {
     // models the bridge exit; the reconnect would otherwise be
     // rejected by the live-stream guard (which is the
     // hijack-prevention path, not the I-056a path).
-    drop(rx1);
     let _rx2 = connect_executor(&handle, "epoch-w", "x86_64-linux").await?;
     let epoch2 = stream_epoch_for("epoch-w");
     assert_ne!(epoch1, epoch2);
@@ -3936,6 +3952,327 @@ async fn test_stale_epoch_disconnect_preserves_buffer() -> anyhow::Result<()> {
     assert!(
         log_buffers.read_since(&fake_path, 0).is_some(),
         "stale-epoch disconnect is a no-op — nothing discarded"
+    );
+    Ok(())
+}
+
+/// bug_008: a REJECTED reconnect must not corrupt `stream_epoch`. The
+/// gRPC handler unconditionally spawns a reader that fires
+/// `ExecutorDisconnected{stream_epoch}` on close — if the rejected
+/// connect had overwritten the epoch, the rejected stream's disconnect
+/// would pass the epoch filter and evict the legitimate worker.
+#[tokio::test]
+async fn test_rejected_reconnect_does_not_corrupt_epoch() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let mut rx1 = connect_executor(&handle, "epoch-v", "x86_64-linux").await?;
+    let epoch1 = stream_epoch_for("epoch-v");
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "epoch-vdrv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = recv_assignment(&mut rx1).await;
+
+    // Second connect WHILE rx1 is live → rejected at the live-stream
+    // hijack guard. Allocate a fresh epoch so we can fire its
+    // disconnect afterwards.
+    let (tx2, mut rx2) = mpsc::channel(8);
+    let epoch2 = next_stream_epoch_for("epoch-v");
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "epoch-v".into(),
+            stream_tx: tx2,
+            stream_epoch: epoch2,
+            auth_intent: None,
+            reply: noop_connect_reply(),
+        })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        rx2.try_recv().is_err(),
+        "rejected stream_tx dropped by actor"
+    );
+    drop(rx2);
+
+    // Rejected stream's reader fires its disconnect. Must NOT evict.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "epoch-v".into(),
+            stream_epoch: epoch2,
+            seen_drvs: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let w = expect_worker(&handle, "epoch-v").await;
+    assert_eq!(
+        w.running_build,
+        Some("epoch-vdrv".into()),
+        "rejected stream's disconnect must not evict the legitimate worker"
+    );
+
+    // Legitimate stream's disconnect (epoch1) → evicts.
+    drop(rx1);
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "epoch-v".into(),
+            stream_epoch: epoch1,
+            seen_drvs: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        !workers.iter().any(|w| w.executor_id == "epoch-v"),
+        "legitimate stream's disconnect removes the entry"
+    );
+    Ok(())
+}
+
+/// bug_011 / `r[sec.executor.identity-token]`: a heartbeat whose
+/// token-attested intent differs from the target executor's stored
+/// `auth_intent` is dropped before any mutation. A compromised pod A
+/// holding a token for its own intent X cannot phantom-drain or flip
+/// `draining_hb`/`store_degraded` on victim B (auth_intent=Y).
+// r[verify sec.executor.identity-token+2]
+#[tokio::test]
+async fn test_heartbeat_cross_executor_spoof_rejected() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Victim connects with auth_intent=Y, gets a build dispatched.
+    let (tx_v, mut rx_v) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "spoof-victim".into(),
+            stream_tx: tx_v,
+            stream_epoch: next_stream_epoch_for("spoof-victim"),
+            auth_intent: Some("intent-Y".into()),
+            reply: noop_connect_reply(),
+        })
+        .await?;
+    send_heartbeat_with(&handle, "spoof-victim", "x86_64-linux", |hb| {
+        hb.intent_id = Some("intent-Y".into());
+    })
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "spoof-victim".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "intent-Y",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let asgn = recv_assignment(&mut rx_v).await;
+    assert!(asgn.drv_path.contains("intent-Y"));
+
+    // Attacker (token attests intent-X) sends two heartbeats AS the
+    // victim, claiming `running_build=None, draining=true`. Pre-fix:
+    // first sets phantom_suspect, second confirms → drv reset to
+    // Ready; victim's draining_hb/store_degraded flipped. Post-fix:
+    // both are dropped at the auth_intent check.
+    for _ in 0..2 {
+        send_heartbeat_with(&handle, "spoof-victim", "x86_64-linux", |hb| {
+            hb.intent_id = Some("intent-X".into());
+            hb.running_build = None;
+            hb.draining = true;
+            hb.store_degraded = true;
+        })
+        .await?;
+    }
+    barrier(&handle).await;
+
+    let w = expect_worker(&handle, "spoof-victim").await;
+    assert_eq!(
+        w.running_build,
+        Some("intent-Y".into()),
+        "spoofed heartbeat must not phantom-drain victim's running_build"
+    );
+    assert!(
+        !w.draining,
+        "spoofed heartbeat must not flip victim's draining_hb"
+    );
+    assert!(
+        !w.store_degraded,
+        "spoofed heartbeat must not flip victim's store_degraded"
+    );
+    let info = expect_drv(&handle, "intent-Y").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "drv stays Assigned (not phantom-reset to Ready)"
+    );
+    Ok(())
+}
+
+/// merged_bug_147 / I-200: `handle_deadline_exceeded` increments
+/// `timeout_count` UNCONDITIONALLY, so a deterministically-wedging drv
+/// poisons after `max_timeout_retries` backstop reports instead of
+/// climbing ~9 free ladder rungs. Default `max_timeout_retries=4`.
+// r[verify sched.timeout.promote-on-exceed+2]
+#[tokio::test]
+async fn test_deadline_exceeded_unconditional_timeout_count() -> TestResult {
+    use rio_proto::types::TerminationReason;
+    let (_db, handle, _task) = setup().await;
+    // Hold the event rx for the build's lifetime so the orphan-watcher
+    // sweep (zero grace under cfg(test)) doesn't auto-cancel it across
+    // the Tick-driven dispatches below.
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "wedge-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .debug_seed_sched_hint("wedge-drv", None, None, Some(300), None)
+        .await?;
+
+    // 5 cycles of fresh-pod connect → dispatch → disconnect →
+    // DeadlineExceeded report. timeout_count goes 1,2,3,4; the 5th
+    // report sees count >= max=4 → poison.
+    for i in 0..5 {
+        let pod = format!("rio-builder-dl-{i}-abcde");
+        let job = format!("rio-builder-dl-{i}");
+        let mut rx = connect_builder(&handle, &pod, "x86_64-linux").await?;
+        tick(&handle).await?;
+        let _ = recv_assignment(&mut rx).await;
+        disconnect(&handle, &pod).await?;
+        drop(rx);
+        report_termination(&handle, &job, TerminationReason::DeadlineExceeded).await?;
+
+        let info = expect_drv(&handle, "wedge-drv").await;
+        if i < 4 {
+            assert_eq!(
+                info.retry.timeout_count,
+                i + 1,
+                "I-200: every DeadlineExceeded consumes budget (cycle {i})"
+            );
+            assert_ne!(info.status, DerivationStatus::Poisoned);
+        } else {
+            assert_eq!(
+                info.status,
+                DerivationStatus::Poisoned,
+                "max_timeout_retries=4 exhausted → poisoned on 5th report"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// bug_098 / `r[sched.backstop.timeout]`: backstop accounting bounds
+/// the retry loop. A drv that wedges 3 distinct workers (default
+/// poison threshold, distinct-workers mode) is poisoned by
+/// `reassign_derivations`' poison check on the 3rd backstop instead
+/// of looping forever with `failure_count=0`.
+// r[verify sched.backstop.timeout+3]
+#[tokio::test]
+async fn test_backstop_timeout_bounds_retry_loop() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "bs-loop", PriorityClass::Scheduled).await?;
+
+    for i in 0..3 {
+        let id = format!("bs-loop-w{i}");
+        let mut rx = connect_builder(&handle, &id, "x86_64-linux").await?;
+        let _ = recv_assignment(&mut rx).await;
+        let ok = handle.debug_backdate_running("bs-loop", 200).await?;
+        assert!(ok);
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+
+        let info = expect_drv(&handle, "bs-loop").await;
+        if i < 2 {
+            assert_eq!(
+                info.retry.failure_count,
+                i + 1,
+                "backstop accounts attempt {i}"
+            );
+            assert_eq!(info.retry.failed_builders.len() as u32, i + 1);
+            assert_ne!(info.status, DerivationStatus::Poisoned);
+        } else {
+            assert_eq!(
+                info.status,
+                DerivationStatus::Poisoned,
+                "poison threshold (3 distinct workers) reached → poisoned"
+            );
+        }
+        // Drain rx so the cancel signal is consumed.
+        let _ = rx.try_recv();
+    }
+    Ok(())
+}
+
+/// bug_119: after `DrainExecutor(force=true)` resets D→Ready and takes
+/// `running_build`, an in-flight heartbeat from the draining worker
+/// (sent before it processed CancelSignal) reports `running_build=D`.
+/// `reconcile_running_build` must NOT re-adopt D back to Assigned —
+/// W's later `CompletionReport{Cancelled}` must find D Ready and
+/// no-op, not land in the "unsolicited Cancelled" arm and bump
+/// `infra_count`.
+#[tokio::test]
+async fn test_force_drain_heartbeat_race_no_infra_count() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("fd-race-w", "x86_64-linux").await?;
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "fd-race-d",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let asgn = recv_assignment(&mut rx).await;
+    let drv_path = asgn.drv_path.clone();
+    // Transition Assigned → Running so the post-drain status check is
+    // unambiguous (force-drain resets Running→Ready via reassign).
+    let ok = handle.debug_backdate_running("fd-race-d", 1).await?;
+    assert!(ok);
+
+    // Force-drain: D→Ready, running_build taken, draining=true.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "fd-race-w".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    let _ = reply_rx.await?;
+    barrier(&handle).await;
+    let info = expect_drv(&handle, "fd-race-d").await;
+    assert_eq!(info.status, DerivationStatus::Ready);
+    let w = expect_worker(&handle, "fd-race-w").await;
+    assert!(w.draining);
+    assert_eq!(w.running_build, None);
+
+    // In-flight heartbeat reports the (now-reset) drv as running.
+    // No Tick: isolate from any inline dispatch.
+    send_heartbeat_with(&handle, "fd-race-w", "x86_64-linux", |hb| {
+        hb.running_build = Some(drv_path.clone());
+    })
+    .await?;
+    barrier(&handle).await;
+
+    // D must STILL be Ready (NOT re-adopted to Assigned). Worker's
+    // running_build reflects busy-until-Cancelled.
+    let info = expect_drv(&handle, "fd-race-d").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "admin-draining worker's heartbeat must not re-adopt force-drained drv"
+    );
+    assert_eq!(info.retry.infra_count, 0);
+    let w = expect_worker(&handle, "fd-race-w").await;
+    assert_eq!(
+        w.running_build,
+        Some("fd-race-d".into()),
+        "worker stays at-capacity until its CompletionReport{{Cancelled}} arrives"
     );
     Ok(())
 }

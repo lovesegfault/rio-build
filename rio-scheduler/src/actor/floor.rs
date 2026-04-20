@@ -40,7 +40,7 @@ pub struct FloorOutcome {
 }
 
 // r[impl sched.sla.reactive-floor+2]
-// r[impl sched.retry.promotion-exempt+2]
+// r[impl sched.retry.promotion-exempt+3]
 /// Double the relevant `resource_floor` dimension on an explicit
 /// resource-exhaustion signal, or — if already at the cap — report
 /// `at_cap=true` so the caller's retry counter bounds it. See

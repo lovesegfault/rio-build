@@ -312,6 +312,10 @@ pub fn describe_metrics() {
         "rio_scheduler_executor_reconnect_rejected_total",
         "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
     );
+    describe_counter!(
+        "rio_scheduler_heartbeat_rejected_total",
+        "Heartbeats dropped by the actor-side identity binding (label: reason)"
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

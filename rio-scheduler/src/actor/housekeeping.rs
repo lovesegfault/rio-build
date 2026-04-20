@@ -321,7 +321,7 @@ impl DagActor {
     ///
     /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
     /// `(drv_hash, drv_path, executor_id)`.
-    // r[impl sched.backstop.timeout+2]
+    // r[impl sched.backstop.timeout+3]
     fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
@@ -394,10 +394,13 @@ impl DagActor {
         (expired_poisons, backstop_timeouts)
     }
 
-    /// Process backstop timeouts: send CancelSignal, reset to
-    /// Ready for retry. This is a TRANSIENT failure (the build
-    /// may work fine on another worker or even the same worker
-    /// after a restart) so we go through retry not poison.
+    /// Process backstop timeouts: send CancelSignal, quarantine the
+    /// wedged worker, record into `failed_builders`/`failure_count`,
+    /// reset to Ready for retry. This is a TRANSIENT failure (the
+    /// build may work fine on another worker) so we go through retry
+    /// not poison — but the attempt IS accounted, so
+    /// `reassign_derivations`'s poison check bounds the loop at
+    /// `threshold` iterations.
     async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, ExecutorId)]) {
         for (drv_hash, drv_path, executor_id) in timeouts {
             warn!(
@@ -442,12 +445,26 @@ impl DagActor {
                 && worker.running_build.as_ref() == Some(drv_hash)
             {
                 worker.running_build = None;
+                // Backstop fired while heartbeats continue → executor
+                // task is wedged but pod alive. Mark draining so
+                // dispatch doesn't feed it new work that would sit
+                // Assigned forever (`tick_scan_dag` only scans
+                // Running). Same shape as completion.rs's one-shot
+                // post-completion drain.
+                worker.draining = true;
             }
-            // Reassign (same path as worker disconnect): reset_to_
-            // ready + PG status + push_ready. Backstop-timeout is NOT
-            // a sizing signal — handle_timeout_failure (worker-reported
-            // TimedOut) does the floor promotion; this scheduler-side
-            // backstop is "worker hung, never reported."
+            // r[impl sched.backstop.timeout+3]
+            // Backstop is the no-CompletionReport path — completion.rs
+            // will never account this attempt. Record it here so
+            // `is_poisoned()` in `reassign_derivations` caps the loop
+            // at `threshold`. NOT a sizing signal —
+            // `handle_timeout_failure` (worker-reported TimedOut) does
+            // the floor promotion; this scheduler-side backstop is
+            // "worker hung, never reported."
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.retry.failed_builders.insert(executor_id.clone());
+                state.retry.failure_count += 1;
+            }
             self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
                 .await;
         }

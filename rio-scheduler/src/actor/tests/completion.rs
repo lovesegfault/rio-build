@@ -1291,7 +1291,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// reports-reason design that's wrong. CgroupOom is the worker-
 /// reported sizing signal (pod-level OOMKilled is controller-
 /// reported via `ReportExecutorTermination`).
-// r[verify sched.retry.promotion-exempt+2]
+// r[verify sched.retry.promotion-exempt+3]
 // r[verify sched.sla.reactive-floor+2]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
