@@ -443,11 +443,6 @@ where
 /// PG credentials to anyone who can read pod logs (`kubectl logs`,
 /// log aggregators).
 pub fn redact_db_url(url: &str) -> String {
-    // Find scheme://. If absent, not a URL we recognize.
-    let Some(scheme_end) = url.find("://") else {
-        return "<redacted>".to_string();
-    };
-
     // Split off the query string FIRST. libpq/sqlx accept `?password=` /
     // `?sslpassword=` as an alternative to userinfo, so we must scrub
     // both shapes. Splitting first also keeps `rfind('@')` from matching
@@ -455,6 +450,13 @@ pub fn redact_db_url(url: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (url, None),
+    };
+    // Find scheme:// in `base` (NOT `url`). If absent — or only present
+    // after the first '?' — not a URL we recognize. Computing the index
+    // against `base` keeps `&base[scheme_end + 3..]` in-bounds by
+    // construction.
+    let Some(scheme_end) = base.find("://") else {
+        return "<redacted>".to_string();
     };
     let after_scheme = &base[scheme_end + 3..];
 
@@ -968,6 +970,11 @@ mod tests {
         // Doesn't look like a URL → fully redacted (safe default).
         assert_eq!(redact_db_url("not a url"), "<redacted>");
         assert_eq!(redact_db_url(""), "<redacted>");
+        // '?' before '://' — `base` is shorter than the full-url offset
+        // of '://'. Must fall back, NOT panic on slice out-of-bounds.
+        assert_eq!(redact_db_url("postgresql?x://h/d"), "<redacted>");
+        assert_eq!(redact_db_url("?://"), "<redacted>");
+        assert_eq!(redact_db_url("abc?def://ghi"), "<redacted>");
     }
 
     #[test]
