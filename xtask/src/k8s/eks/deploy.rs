@@ -89,6 +89,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
     let db_arn = tf.get("db_secret_arn")?;
     let db_host = tf.get("db_endpoint")?;
+    let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
     let cluster = tf.get("cluster_name")?;
     let node_role = tf.get("karpenter_node_role_name")?;
 
@@ -203,6 +204,10 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("externalSecrets.enabled", "true")
             .set("externalSecrets.auroraSecretArn", &db_arn)
             .set("externalSecrets.auroraEndpoint", &db_host)
+            // store-egress CiliumNetworkPolicy admits postgres on this
+            // CIDR; the chart default fc00::/7 (ULA) does NOT match a
+            // VPC GUA, so without this rio-store→Aurora is dropped.
+            .set("global.postgresCidr", &vpc_ipv6_cidr)
             .set("bootstrap.enabled", "true")
             .set(
                 r"bootstrap.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",

@@ -16,12 +16,13 @@
 # doesn't verify the cert — fine for in-VPC + SG-restricted.
 # `verify-full` would need the RDS CA bundle mounted into pods.
 
-# Subnet group: private subnets only. Aurora in public subnets
-# is almost always wrong (it gets a public IP if publicly_accessible
-# is set, which we don't, but the subnet choice is still hygiene).
+# Subnet group: dual-stack database tier (NOT private_subnets — those
+# are ipv6_native and AWS rejects a DB subnet group whose subnets lack
+# a v4 CIDR, even with network_type=DUAL on the cluster). rio-store
+# connects via the cluster endpoint's AAAA from the v6-only node tier.
 resource "aws_db_subnet_group" "rio" {
   name       = "${var.cluster_name}-aurora"
-  subnet_ids = module.vpc.private_subnets
+  subnet_ids = module.vpc.database_subnets
 }
 
 # Security group: inbound 5432 from the EKS node SG only.

@@ -77,20 +77,16 @@ resource "helm_release" "cilium" {
         operator = {
           clusterPoolIPv6PodCIDRList = ["fd42::/104"]
           clusterPoolIPv6MaskSize    = 120
-          # IPv4 pool: pods don't use these (Services are IPv6-only),
-          # but ipv4.enabled=true requires a pool to be configured.
-          clusterPoolIPv4PodCIDRList = ["10.244.0.0/16"]
         }
       }
       ipv6 = { enabled = true }
-      # ipv4.enabled=true is REQUIRED for the Geneve underlay: cilium-
-      # agent --underlay-protocol defaults to ipv4. With ipv4 disabled,
-      # the node has no IPv4 datapath address → tunnelendpoint=0.0.0.0
-      # → all cross-node overlay traffic dropped. Nodes have VPC IPv4
-      # (10.42.x.x); Geneve uses that as the tunnel outer. Pod traffic
-      # stays IPv6. The pure-IPv6 alternative (underlayProtocol: ipv6,
-      # PR #40324) is untested here.
-      ipv4                 = { enabled = true }
+      # Nodes are on ipv6_native subnets (no VPC v4). Geneve outer is
+      # the node GUA via underlayProtocol=ipv6 (TOP-LEVEL helm key —
+      # not nested under tunnel.*; the nested form silently no-ops).
+      # The k3s VM fixture (nix/cilium-render.nix) runs the same
+      # ipv4.enabled=false + v6-underlay config under CI.
+      ipv4                 = { enabled = false }
+      underlayProtocol     = "ipv6"
       enableIPv6Masquerade = true
 
       routingMode    = "tunnel"
@@ -104,12 +100,12 @@ resource "helm_release" "cilium" {
       # programs only link-local + ULA (fd00:ec2::23 from pod-id-link0),
       # NOT the node's global-unicast IPv6. NLB target-type=instance
       # sends to the instance's primary GUA → no LB-map entry →
-      # cil_from_netdev passes to stack → RST. Explicit VPC CIDRs force
+      # cil_from_netdev passes to stack → RST. Explicit VPC CIDR forces
       # the GUA frontend. (Cross-node tests pass without this because
       # host-netns connects are socket-LB-intercepted via [::] wildcard
       # before hitting the physical-IP path — false positive.)
       nodePort = {
-        addresses = [module.vpc.vpc_ipv6_cidr_block, module.vpc.vpc_cidr_block]
+        addresses = [module.vpc.vpc_ipv6_cidr_block]
       }
       # Exclude pod-id-link0 (EKS Pod Identity veth) from device
       # auto-detect; it's not a datapath NIC but gets spurious

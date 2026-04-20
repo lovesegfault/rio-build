@@ -58,6 +58,11 @@ output "vpc_id" {
   value       = module.vpc.vpc_id
 }
 
+output "vpc_ipv6_cidr_block" {
+  description = "VPC IPv6 /56 (xtask passes as --set global.postgresCidr so the store-egress CiliumNetworkPolicy admits the Aurora AAAA endpoint)"
+  value       = module.vpc.vpc_ipv6_cidr_block
+}
+
 output "karpenter_node_role_name" {
   description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — xtask passes as --set karpenter.nodeRoleName)"
   value       = module.karpenter.node_iam_role_name

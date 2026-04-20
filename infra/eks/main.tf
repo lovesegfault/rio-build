@@ -114,20 +114,39 @@ module "vpc" {
   name = "${var.cluster_name}-vpc"
   cidr = "10.42.0.0/16"
 
-  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
-  private_subnets = ["10.42.1.0/24", "10.42.2.0/24", "10.42.3.0/24"]
-  public_subnets  = ["10.42.101.0/24", "10.42.102.0/24", "10.42.103.0/24"]
+  azs            = slice(data.aws_availability_zones.available.names, 0, 3)
+  public_subnets = ["10.42.101.0/24", "10.42.102.0/24", "10.42.103.0/24"]
 
-  # IPv6 (P0542 / I-073): AWS assigns a /56 to the VPC, /64 per subnet.
-  # With cluster_ip_family="ipv6" below, pods get v6 addresses from the
-  # subnet /64 — effectively unlimited. The /24 v4 CIDRs above stay for
-  # node ENIs (primary IP) and the few v4-only AWS endpoints; pods no
-  # longer consume them.
-  enable_ipv6                                    = true
-  private_subnet_ipv6_prefixes                   = [0, 1, 2]
-  public_subnet_ipv6_prefixes                    = [3, 4, 5]
-  private_subnet_assign_ipv6_address_on_creation = true
-  public_subnet_assign_ipv6_address_on_creation  = true
+  # IPv6-only private subnets: rio nodes get a GUA from the /64 only —
+  # NO v4 (the cluster is ip_family=ipv6; nothing in rio needs node v4).
+  # The VPC keeps cidr=10.42.0.0/16 (AWS requires a v4 CIDR on the VPC
+  # itself); public + database subnets stay dual-stack (NAT GW, NLB,
+  # Aurora live there). With private_subnets dropped, subnet count
+  # comes from len(private_subnet_ipv6_prefixes) = 3. The vpc module
+  # forces assign_ipv6_address_on_creation=true under ipv6_native.
+  enable_ipv6                                   = true
+  private_subnet_ipv6_native                    = true
+  private_subnet_ipv6_prefixes                  = [0, 1, 2]
+  public_subnet_ipv6_prefixes                   = [3, 4, 5]
+  public_subnet_assign_ipv6_address_on_creation = true
+
+  # Dual-stack "infra" tier (the module calls it database_subnets):
+  # everything that AWS won't accept on an ipv6_native subnet —
+  #   - RDS DB subnet group (requires v4 CIDR even with network_type=
+  #     DUAL; DUAL means endpoint gets A+AAAA, not v6-only-subnet-ok)
+  #   - EKS control-plane cross-account ENIs (CreateCluster: "Atleast
+  #     one subnet in each AZ should have 2 free IPs")
+  #   - EKS system managed nodegroup (CreateNodegroup: "Not enough
+  #     available IPs across subnets")
+  # rio nodes (Karpenter-provisioned, tagged karpenter.sh/discovery on
+  # private_subnet_tags) stay v6-only. With create_database_subnet_
+  # route_table left false the database subnets associate with the
+  # PRIVATE route table — system nodes get the same NAT/eigw/NAT64
+  # routes as Karpenter nodes; Aurora ignores them.
+  database_subnets                                = ["10.42.21.0/24", "10.42.22.0/24", "10.42.23.0/24"]
+  database_subnet_ipv6_prefixes                   = [6, 7, 8]
+  database_subnet_assign_ipv6_address_on_creation = true
+  create_database_subnet_group                    = true
 
   enable_nat_gateway   = true
   single_nat_gateway   = true # dev: one NAT is fine; prod: HA with per-AZ
@@ -166,8 +185,16 @@ module "eks" {
   name               = var.cluster_name
   kubernetes_version = var.kubernetes_version
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id = module.vpc.vpc_id
+  # Both control-plane ENIs and the AL2023 system nodegroup land on
+  # the dual-stack tier (CreateCluster/CreateNodegroup both reject
+  # ipv6_native subnets even with ip_family=ipv6). subnet_ids is the
+  # nodegroup default; control_plane_subnet_ids is what goes into
+  # aws_eks_cluster.vpc_config. rio worker nodes are NOT here —
+  # Karpenter discovers private_subnets via the karpenter.sh/discovery
+  # tag (private_subnet_tags above) and provisions v6-only.
+  subnet_ids               = module.vpc.database_subnets
+  control_plane_subnet_ids = module.vpc.database_subnets
 
   # Native IPv6 cluster (P0542): pods and Service ClusterIPs are v6.
   # Cilium cluster-pool IPAM hands out v6 from a ULA /104 (no v4
@@ -217,6 +244,33 @@ module "eks" {
   addons = {
     coredns = {
       most_recent = true
+      # Pods are v6-only (cilium ipv4.enabled=false), so the default
+      # `forward . /etc/resolv.conf` (node DHCP option set → 10.42.0.2)
+      # is unreachable from the coredns pod: "dial udp 10.42.0.2:53:
+      # network is unreachable". Route53 Resolver's well-known v6
+      # address works from any v6-enabled subnet and honours the
+      # subnet-level DNS64 flag (AAAA-synth under 64:ff9b::/96).
+      configuration_values = jsonencode({
+        corefile = <<-EOT
+          .:53 {
+              errors
+              health {
+                  lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                  pods insecure
+                  fallthrough in-addr.arpa ip6.arpa
+              }
+              prometheus :9153
+              forward . fd00:ec2::253
+              cache 30
+              loop
+              reload
+              loadbalance
+          }
+        EOT
+      })
     }
     eks-pod-identity-agent = {
       before_compute = true

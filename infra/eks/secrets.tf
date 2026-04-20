@@ -79,7 +79,7 @@ resource "helm_release" "external_secrets" {
       value = module.eso_irsa.arn
     },
     # hostNetwork: EKS managed API server can't route to overlay pod IPs
-    # (Cilium cluster-pool fd42::/10.244.x) for admission webhook calls →
+    # (Cilium cluster-pool fd42::) for admission webhook calls →
     # "Address is not allowed". hostNetwork puts the webhook on a node
     # VPC IP. Port 10260 avoids kubelet's 10250.
     {

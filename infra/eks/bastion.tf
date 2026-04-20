@@ -75,15 +75,17 @@ resource "aws_security_group" "bastion" {
 resource "aws_instance" "bastion" {
   ami           = data.aws_ami.al2023.id
   instance_type = "t3.micro"
-  # Private subnet — no public IP. SSM reaches it via the agent's
-  # outbound connection through the NAT gateway.
-  subnet_id                   = module.vpc.private_subnets[0]
+  # Dual-stack tier (NOT private_subnets — those are ipv6_native and
+  # SSM AWS-StartPortForwardingSessionToRemoteHost connects to the
+  # remote v4 address; from a v6-only bastion that times out). The
+  # bastion is debug infra, not a rio node — same category as the
+  # AL2023 system nodegroup. SSM agent reaches the SSM endpoint via
+  # NAT (database tier shares the private route table).
+  subnet_id                   = module.vpc.database_subnets[0]
   vpc_security_group_ids      = [aws_security_group.bastion.id]
   iam_instance_profile        = aws_iam_instance_profile.bastion.name
   associate_public_ip_address = false
-  # P0542: bastion → NLB may resolve AAAA. AL2023 dual-stacks
-  # automatically when the ENI has a v6 address.
-  ipv6_address_count = 1
+  ipv6_address_count          = 1
 
   # IMDSv2 only. Same defense-in-depth as the worker nodes (though
   # the bastion runs nothing interesting — it's just a TCP forward).
