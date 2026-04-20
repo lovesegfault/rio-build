@@ -1675,6 +1675,20 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
         !intent.node_selector.is_empty(),
         "post-heartbeat: solve_full path restored"
     );
+
+    // Orphan case: a ladder-exhausted drv that then leaves Ready
+    // (band-agnostic dispatch → no `pending_intents` entry → parasitic
+    // cleanup wouldn't fire). The dag-state-keyed sweep reaps it.
+    actor
+        .ice_attempts
+        .insert("orphan".into(), vec![(Band::Mid, Cap::Spot); cap as usize]);
+    assert!(!actor.pending_intents.contains_key("orphan"));
+    actor.tick_sweep_pending_intents(Instant::now());
+    assert!(
+        !actor.ice_attempts.contains_key("orphan"),
+        "ice_attempts reaped for drv not in dag (left Ready), \
+         independent of pending_intents membership"
+    );
 }
 
 /// `handle_ack_spawned_intents` is idempotent: a re-ack of an

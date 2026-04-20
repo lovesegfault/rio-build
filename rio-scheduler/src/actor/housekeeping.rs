@@ -204,17 +204,25 @@ impl DagActor {
     pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
         let fallback = self.sla_config.hw_fallback_after_secs;
         let ladder_cap = self.ice_ladder_cap();
+        // Reap `ice_attempts` for drvs that left Ready. Keyed on dag
+        // state directly — NOT parasitic on `pending_intents` membership:
+        // a ladder-exhausted drv dispatches band-agnostic, so its acks
+        // don't re-enter `pending_intents` (parse_selector → None) and
+        // a parasitic cleanup would orphan the entry forever. A re-queue
+        // (e.g. resubmit) must not inherit a prior generation's exhaust.
+        self.ice_attempts.retain(|drv_hash, _| {
+            self.dag
+                .node(drv_hash)
+                .is_some_and(|s| s.status() == crate::state::DerivationStatus::Ready)
+        });
         self.pending_intents.retain(|drv_hash, (band, cap, since)| {
             // Drop entries whose drv left Ready: they won't heartbeat
-            // and the timeout isn't a capacity signal. Also drop the
-            // attempt log — a re-queue (e.g. resubmit) should not
-            // inherit a prior generation's exhaust.
+            // and the timeout isn't a capacity signal.
             if self
                 .dag
                 .node(drv_hash)
                 .is_none_or(|s| s.status() != crate::state::DerivationStatus::Ready)
             {
-                self.ice_attempts.remove(drv_hash);
                 return false;
             }
             // Stable per-drv jitter ∈ [0.8, 1.2): hash low byte → factor.

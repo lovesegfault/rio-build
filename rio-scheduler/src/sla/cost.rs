@@ -563,15 +563,18 @@ fn now_epoch() -> f64 {
 ///
 /// # Ladder protocol
 ///
-/// 1. Dispatch picks `(b₀, c₀)` via `solve_full`, records it in
-///    `attempted` (and `builds.attempted_candidates` JSONB), spawns.
+/// 1. Dispatch picks `(b₀, c₀)` via `solve_full`, spawns.
 /// 2. Pending-watch sees the pod still `Pending` after
-///    `hw_fallback_after_secs` → [`Self::mark`]`(b₀, c₀)`, deletes the
-///    pod, re-runs `solve_full` (which now skips `(b₀, c₀)`).
-/// 3. Repeat up to [`Self::ladder_cap`] times. With every cell backed
-///    off, `solve_full` finds no candidate at any tier and falls
-///    through to `BestEffort` (emits `infeasible_total{reason=
-///    solve_infeasible}`).
+///    `hw_fallback_after_secs` → [`Self::mark`]`(b₀, c₀)`, records it
+///    in the actor's per-drv `ice_attempts`, deletes the pod, re-runs
+///    `solve_full` (which now skips `(b₀, c₀)`).
+/// 3. Repeat up to [`Self::ladder_cap`] times. On exhaust the drv
+///    falls through to band-agnostic dispatch (`solve_intent_for`
+///    skips `solve_full`; emits `infeasible_total{reason=
+///    capacity_exhausted}`); the [`Self::encode_attempted`] JSON of
+///    the attempt log is emitted at `debug!` for forensics. The
+///    `builds.attempted_candidates` JSONB column (M_042) is reserved
+///    for a future persisted write — currently log-only.
 ///
 /// Step 2 is scheduler-side: the actor records `(drv_hash → (band,
 /// cap, emitted_at))` when `solve_intent_for` first emits a
