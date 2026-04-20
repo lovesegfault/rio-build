@@ -116,6 +116,11 @@ pub(crate) fn conditions_array(_: &mut schemars::SchemaGenerator) -> schemars::S
         "nullable": true,
         "items": {
             "type": "object",
+            // K8s CRD validation requires every list-map-key to be an
+            // explicit `properties` entry AND in `required` —
+            // preserve-unknown-fields alone is not enough.
+            "properties": { "type": { "type": "string" } },
+            "required": ["type"],
             "x-kubernetes-preserve-unknown-fields": true,
         },
         "x-kubernetes-list-type": "map",

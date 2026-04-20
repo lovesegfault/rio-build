@@ -265,6 +265,11 @@ spec:
                   \ \u2014 disambiguates \"scheduler idle,\nqueued=0\" from \"scheduler\
                   \ down, queued unknown\")."
                 items:
+                  properties:
+                    type:
+                      type: string
+                  required:
+                  - type
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
                 nullable: true
