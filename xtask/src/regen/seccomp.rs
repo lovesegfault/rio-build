@@ -13,6 +13,10 @@ use tracing::info;
 
 use crate::sh::{cmd, repo_root, shell};
 
+/// Checked-in builder seccomp profile (ADR-021: baked into the NixOS
+/// node AMI; the helm `files/` copy was removed).
+const PROFILE_PATH: &str = "nix/nixos-node/seccomp/rio-builder.json";
+
 const WORKER_CAPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_CHROOT"];
 const DENIED: &[&str] = &[
     "ptrace",
@@ -23,7 +27,12 @@ const DENIED: &[&str] = &[
 ];
 
 pub async fn run(tag: &str) -> Result<()> {
-    let ours = repo_root().join("infra/helm/rio-build/files/seccomp-rio-builder.json");
+    let ours = repo_root().join(PROFILE_PATH);
+    anyhow::ensure!(
+        ours.exists(),
+        "checked-in profile not found at {} — path moved? update PROFILE_PATH",
+        ours.display()
+    );
     let url =
         format!("https://raw.githubusercontent.com/moby/moby/{tag}/profiles/seccomp/default.json");
 
@@ -67,3 +76,7 @@ pub async fn run(tag: &str) -> Result<()> {
     info!("no drift vs moby {tag}");
     Ok(())
 }
+
+// No path-exists unit test: crate2nix per-crate builds copy only the
+// xtask/ subtree into the test sandbox, so `repo_root().join(...)` never
+// resolves there. The `ensure!(ours.exists())` above is the runtime guard.

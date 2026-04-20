@@ -272,8 +272,6 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("gateway.resources.requests.cpu", "32")
             .set("gateway.resources.requests.memory", "16Gi")
             .set("gateway.resources.limits.memory", "64Gi")
-            .set("fetcherDefaults.resources.requests.cpu", "2")
-            .set("fetcherDefaults.resources.limits.memory", "4Gi")
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt.seed)
             .set("jwt.publicKey", &jwt.pubkey)
