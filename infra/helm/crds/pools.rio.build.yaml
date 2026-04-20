@@ -251,6 +251,10 @@ spec:
             - message: "kind=Fetcher forbids FUSE tuning knobs \u2014 fetches are\
                 \ network-bound, not FUSE-bound"
               rule: self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))
+            - message: "kind=Fetcher forbids features \u2014 FODs route by is_fixed_output\
+                \ alone, not features (ADR-019)"
+              rule: self.kind != 'Fetcher' || !has(self.features) || size(self.features)
+                == 0
           status:
             description: "Pool status \u2014 reconciler writes, operators read.\n\n\
               `Default` because kube-rs initializes it to `None` \u2192\n`Some(default())`\
