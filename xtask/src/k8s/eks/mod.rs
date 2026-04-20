@@ -33,15 +33,7 @@ impl Provider for Eks {
     }
 
     async fn provision(&self, cfg: &XtaskConfig, auto: bool) -> Result<()> {
-        let backend = ui::step("resolve tfstate backend", || async {
-            let aws = crate::aws::config(None).await;
-            Ok(tofu::Backend {
-                bucket: tofu::state_bucket(cfg, aws).await?,
-                region: cfg.tfstate_region.clone(),
-            })
-        })
-        .await?;
-        ui::step("tofu init", || async { tofu::init(TF_DIR, &backend) }).await?;
+        init_backend(cfg).await?;
         // hubble_ui_enabled defaults false (variables.tf); xtask-driven
         // dev/QA clusters get the web UI for flow debugging.
         tofu::apply(TF_DIR, auto, &[("hubble_ui_enabled", "true")]).await?;
@@ -86,9 +78,25 @@ impl Provider for Eks {
         crate::k8s::shared::tunnel_grpc(sched_port, store_port).await
     }
 
-    async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
-        destroy::run().await
+    async fn destroy(&self, cfg: &XtaskConfig) -> Result<()> {
+        destroy::run(cfg).await
     }
+}
+
+/// Resolve the S3 tfstate backend (bucket from STS account-id, region
+/// from config) and `tofu init -reconfigure` against it. Shared by
+/// `provision` and `destroy` so a stale `.terraform/` — init'd against
+/// a different account's bucket — can't leak into the next tofu run.
+pub(super) async fn init_backend(cfg: &XtaskConfig) -> Result<()> {
+    let backend = ui::step("resolve tfstate backend", || async {
+        let aws = crate::aws::config(None).await;
+        Ok(tofu::Backend {
+            bucket: tofu::state_bucket(cfg, aws).await?,
+            region: cfg.tfstate_region.clone(),
+        })
+    })
+    .await?;
+    ui::step("tofu init", || async { tofu::init(TF_DIR, &backend) }).await
 }
 
 fn kubeconfig() -> Result<()> {

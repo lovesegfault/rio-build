@@ -44,6 +44,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use super::TF_DIR;
+use crate::config::XtaskConfig;
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::{tofu, ui};
@@ -98,7 +99,12 @@ async fn k_patch_all(ns: &str, kind: &str, patch: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(cfg: &XtaskConfig) -> Result<()> {
+    // A stale .terraform/ (init'd against a different account's tfstate
+    // bucket) makes tofu hang silently in S3 backend init — no output,
+    // no error, futex_wait forever. Re-init is cheap and idempotent.
+    super::init_backend(cfg).await?;
+
     let cluster =
         tofu::output(TF_DIR, "cluster_name").unwrap_or_else(|_| "(tofu output unavailable)".into());
     info!("destroy target: EKS cluster '{cluster}'");
