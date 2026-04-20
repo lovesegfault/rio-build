@@ -358,6 +358,13 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             act.drv.insert(drv_event.derivation_path.clone(), aid);
         }
         types::DerivationEventKind::Completed => {
+            // Terminal: close any dangling actSubstitute. Substituting
+            // → Completed shouldn't happen via the normal scheduler
+            // FSM, but terminal-arm symmetry costs nothing and guards
+            // future scheduler changes.
+            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            }
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
             } else {
@@ -376,6 +383,16 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             }
         }
         types::DerivationEventKind::Failed => {
+            // Terminal: close any dangling actSubstitute. Scheduler
+            // path Substituting → (silent revert to Queued via
+            // `handle_substitute_complete(ok=false)` with
+            // `!all_deps_completed`) → DependencyFailed cascade emits
+            // Failed without ever emitting Started/Cached — the subst
+            // aid was never closed and nom showed a stuck
+            // "substituting 'X'" line until build terminus.
+            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
+                stderr.stop_activity(aid).await?;
+            }
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
             } else {
@@ -1617,6 +1634,90 @@ mod tests {
         assert_eq!(
             wire::read_u64(&mut r).await.unwrap(),
             ActivityType::Build as u64
+        );
+    }
+
+    /// Substituting → (silent revert to Queued) → DependencyFailed
+    /// cascade → Failed. The Failed arm must close the dangling
+    /// actSubstitute aid; pre-fix it only touched `act.drv`, leaving
+    /// nom showing a stuck "substituting 'X'" line.
+    #[tokio::test]
+    async fn relay_substituting_then_failed_stops_subst() {
+        use rio_nix::protocol::stderr::STDERR_NEXT;
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/dddddddddddddddddddddddddddddddd-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let subst_aid = *act.subst.get(drv).unwrap();
+
+        let mut fail_ev = ev(Failed, drv, &[]);
+        fail_ev.error_message = "dependency failed".into();
+        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+            .await
+            .unwrap();
+        assert!(
+            act.subst.is_empty(),
+            "Failed must clear subst aid (pre-fix: leaked → stuck nom line)"
+        );
+        assert!(act.drv.is_empty(), "drv was never Started");
+
+        // Wire order: START(Substitute), STOP(subst_aid), STDERR_NEXT(log).
+        // STOP must precede the failure log so nom clears the
+        // substituting line before printing the error.
+        let mut r = std::io::Cursor::new(buf);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
+        let _ = wire::read_u64(&mut r).await.unwrap(); // aid
+        let _ = wire::read_u64(&mut r).await.unwrap(); // level
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ActivityType::Substitute as u64
+        );
+        let _ = wire::read_string(&mut r).await.unwrap();
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
+        for _ in 0..2 {
+            let _ = wire::read_u64(&mut r).await.unwrap();
+            let _ = wire::read_string(&mut r).await.unwrap();
+        }
+        let _ = wire::read_u64(&mut r).await.unwrap(); // parent
+
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), subst_aid);
+
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_NEXT);
+        let msg = wire::read_string(&mut r).await.unwrap();
+        assert!(msg.contains("failed"));
+    }
+
+    /// Substituting → Completed (defensive — not a normal scheduler
+    /// FSM transition). Terminal arm closes any tracked subst aid.
+    #[tokio::test]
+    async fn relay_substituting_then_completed_stops_subst() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/5555555555555555555555555555555c-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        assert!(act.subst.contains_key(drv));
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, drv, &[]))
+            .await
+            .unwrap();
+        assert!(
+            act.subst.is_empty(),
+            "Completed must clear subst aid (terminal-arm symmetry)"
         );
     }
 }
