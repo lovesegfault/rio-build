@@ -18,7 +18,7 @@ use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct PrefetchFiltered;
 
-const METRIC: &str = r#"rio_scheduler_prefetch_filtered_total{reason="undeclared_output"}"#;
+const METRIC: &str = "rio_scheduler_prefetch_filtered_total";
 
 #[async_trait]
 impl Scenario for PrefetchFiltered {
@@ -52,9 +52,13 @@ impl Scenario for PrefetchFiltered {
             }}"#
         );
 
-        let before = ctx.scrape_scheduler().await?.sum(METRIC);
+        let scrape = |s: crate::k8s::status::Scrape| {
+            s.labeled(METRIC, "reason", "undeclared_output")
+                .unwrap_or(0.0)
+        };
+        let before = scrape(ctx.scrape_scheduler().await?);
         ctx.nix_build_expr_via_gateway(0, &expr).await?;
-        let after = ctx.scrape_scheduler().await?.sum(METRIC);
+        let after = scrape(ctx.scrape_scheduler().await?);
 
         if after > before {
             Ok(Verdict::Pass)

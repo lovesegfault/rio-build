@@ -47,14 +47,16 @@ impl Scenario for BigParallelRouting {
         let kvm_before = ctx
             .scrape_scheduler()
             .await?
-            .sum("rio_scheduler_spawn_intents{pool=\"kvm\"}");
+            .labeled("rio_scheduler_spawn_intents", "pool", "kvm")
+            .unwrap_or(0.0);
 
         ctx.nix_build_expr_via_gateway(0, &expr).await?;
 
         let kvm_after = ctx
             .scrape_scheduler()
             .await?
-            .sum("rio_scheduler_spawn_intents{pool=\"kvm\"}");
+            .labeled("rio_scheduler_spawn_intents", "pool", "kvm")
+            .unwrap_or(0.0);
 
         if kvm_after > kvm_before {
             Ok(Verdict::Fail(format!(
