@@ -56,7 +56,19 @@ pub async fn config(region: Option<&str>) -> &'static SdkConfig {
 /// obj/s with `concurrency=8`.
 pub async fn empty_bucket(region: &str, bucket: &str) -> Result<usize> {
     const CONCURRENCY: usize = 8;
-    let s3 = aws_sdk_s3::Client::new(config(Some(region)).await);
+    // Adaptive retry: SDK does client-side token-bucket rate limiting
+    // when it sees throttling responses (SlowDown 503). At 8×1000-key
+    // DeleteObjects in flight, a bucket whose prefix partitioning
+    // hasn't auto-scaled yet returns SlowDown — standard mode's 3
+    // attempts exhaust under sustained throttle. Adaptive backs the
+    // whole client off, and 16 attempts (~30s of backoff at the cap)
+    // rides out the partition scale-up.
+    use aws_config::retry::RetryConfig;
+    let s3 = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(config(Some(region)).await)
+            .retry_config(RetryConfig::adaptive().with_max_attempts(16))
+            .build(),
+    );
     let sem = std::sync::Arc::new(Semaphore::new(CONCURRENCY));
     let mut tasks: JoinSet<Result<usize>> = JoinSet::new();
 

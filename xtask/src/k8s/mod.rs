@@ -87,7 +87,7 @@ pub struct UpOpts {
     ami: bool,
     /// Build + push docker images (ECR | ctr import).
     #[arg(long)]
-    push: bool,
+    pub(super) push: bool,
     /// helm upgrade rio chart.
     #[arg(long)]
     pub(super) deploy: bool,

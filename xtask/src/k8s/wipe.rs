@@ -34,6 +34,18 @@ const WIPE_NAMESPACES: &[&str] = &[NS_STORE, NS_BUILDERS, NS_FETCHERS];
 pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
 
+    // ── 0. Capture PG URL BEFORE uninstall (eks) ────────────────────
+    // On EKS, `rio-postgres` is an ExternalSecret-managed Secret —
+    // `helm uninstall` removes the ExternalSecret CR and the operator
+    // GCs the synced Secret. The schema-reset step (step 8) runs AFTER
+    // namespace deletes (open conns block DROP CASCADE), so by then
+    // the Secret is gone. Read it now; pass the URL forward.
+    let pg_url = if matches!(kind, ProviderKind::Eks) {
+        kube::get_secret_key(&client, NS, "rio-postgres", "url").await?
+    } else {
+        None
+    };
+
     // ── 1–3. uninstall chart + strip CR finalizers ──────────────────
     // Shared with `destroy` — same ordering constraints (Pool delete
     // first so the controller starts draining; finalizer-strip after
@@ -76,7 +88,14 @@ pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) ->
             // PG-schema reset MUST come after the namespace deletes:
             // store/scheduler pods hold connections that block DROP
             // SCHEMA on RDS until they're gone.
-            reset_pg_schema(&client).await?;
+            match pg_url {
+                Some(url) => reset_pg_schema(&url).await?,
+                None => warn!(
+                    "rio-postgres Secret was already gone before wipe started \
+                     (prior partial wipe?) — skipping schema reset; \
+                     `up --deploy` migration will fail if old tables remain"
+                ),
+            }
         }
         ProviderKind::K3s => {
             // bitnami PG is a subchart of `rio` in `rio-system`; helm
@@ -88,12 +107,15 @@ pub async fn run(p: Arc<dyn Provider>, kind: ProviderKind, cfg: &XtaskConfig) ->
     }
 
     // ── 9. Redeploy ─────────────────────────────────────────────────
-    // Exactly `up --deploy`: ensure_namespaces, secrets, helm install,
-    // migration job. NOT `up` (all phases) — push/ami/provision are
-    // infra-shape and untouched by wipe.
-    ui::step("redeploy (up --deploy)", || {
+    // `up --push --deploy`: deploy's preflight rejects tags not in ECR,
+    // and HEAD has typically moved since the last push (this is a dev
+    // iteration tool). Push is idempotent — `nix build .#images` is
+    // cached and the ECR tag-exists check skips re-upload. NOT full
+    // `up` — provision/ami are infra-shape and untouched by wipe.
+    ui::step("redeploy (up --push --deploy)", || {
         let cfg = cfg.clone();
         let opts = UpOpts {
+            push: true,
             deploy: true,
             ..Default::default()
         };
@@ -144,12 +166,21 @@ async fn empty_chunk_bucket() -> Result<()> {
 }
 
 /// `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` so the
-/// migration Job (run by `up --deploy`) starts from 001. RDS instance
-/// itself is untouched.
-async fn reset_pg_schema(client: &kube::Client) -> Result<()> {
+/// migration Job (run by `up --deploy`) starts from 001.
+///
+/// RDS lives in private VPC subnets — the operator's machine can't
+/// reach it directly, and by this step we've deleted every rio pod
+/// that could be port-forwarded through. So: spawn a one-shot psql
+/// pod in `rio-system` (which still exists), pass the URL via env
+/// (not argv — pod spec argv is logged by kubelet), wait for it to
+/// exit 0. The bitnami postgresql image is already on the AMI
+/// (prebaked via `nix/docker-pulled.nix` for the subchart).
+async fn reset_pg_schema(url: &str) -> Result<()> {
     ui::step("reset PG schema", || async {
-        let pg = PgHandle::open(client).await?;
-        // Single batch; CASCADE handles all dependent objects.
+        // PgHandle::open_with_url spawns the socat relay → port-forward
+        // → sqlx; rio-system (where the relay pod lands) is the one
+        // namespace wipe preserves.
+        let pg = PgHandle::open_with_url(url).await?;
         sqlx::query("DROP SCHEMA public CASCADE")
             .execute(&pg.pool)
             .await
@@ -158,14 +189,11 @@ async fn reset_pg_schema(client: &kube::Client) -> Result<()> {
             .execute(&pg.pool)
             .await
             .context("CREATE SCHEMA public")?;
-        // The connecting role (from rio-postgres URL) created the
-        // schema, so it already owns it. Explicit GRANT for the
-        // generic `public` role mirrors what `initdb` does.
         if let Err(e) = sqlx::query("GRANT ALL ON SCHEMA public TO public")
             .execute(&pg.pool)
             .await
         {
-            warn!("GRANT ALL ON SCHEMA public TO public: {e:#} (continuing — owner already has rights)");
+            warn!("GRANT ALL ON SCHEMA public TO public: {e:#} (continuing — owner has rights)");
         }
         Ok(())
     })

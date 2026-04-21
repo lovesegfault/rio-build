@@ -190,46 +190,90 @@ pub struct PgHandle {
 }
 
 impl PgHandle {
-    /// Fetch the `rio-postgres` Secret URL, port-forward if it points at
-    /// an in-cluster service, connect.
-    ///
-    /// On EKS the host is RDS (`*.rds.amazonaws.com`) — reachable
-    /// directly, no port-forward. On k3s the host is `rio-postgresql.
-    /// rio-system` — port-forward `svc/rio-postgresql:5432` and rewrite
-    /// the host to `localhost:{bound}`.
+    /// Fetch the `rio-postgres` Secret URL from `rio-system`, then
+    /// [`Self::open_with_url`].
     pub async fn open(kube_client: &kube::Client) -> Result<Self> {
         let url = kube::get_secret_key(kube_client, NS, "rio-postgres", "url")
             .await?
             .context("Secret rio-postgres/url not found — was `up --deploy` run?")?;
+        Self::open_with_url(&url).await
+    }
 
-        let (host, _port) = pg_host_port(&url)?;
+    /// Connect to the cluster's PG via an in-cluster relay.
+    ///
+    /// RDS is in private VPC subnets and its SG only admits the EKS
+    /// node SG — the operator's machine can't reach it directly. On
+    /// k3s, bitnami PG is in-cluster. Either way: port-forward to
+    /// something in `rio-system` that listens on 5432. On k3s that's
+    /// `svc/rio-postgresql`. On EKS, we spawn an `alpine/socat` relay
+    /// pod (5432 → RDS endpoint) and port-forward to THAT, then
+    /// sqlx connects to `localhost:{bound}`.
+    ///
+    /// `wipe` calls this with a URL captured BEFORE `helm uninstall`
+    /// (which removes the ExternalSecret-backed `rio-postgres` Secret).
+    pub async fn open_with_url(url: &str) -> Result<Self> {
+        let (host, port) = pg_host_port(url)?;
         let in_cluster = host.ends_with(&format!(".{NS}")) || host == "rio-postgresql";
 
-        let (url, guard) = if in_cluster {
-            let (bound, g) = shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?;
-            (
-                rewrite_pg_host(&url, &format!("localhost:{bound}")),
-                Some(g),
-            )
+        let (bound, guard) = if in_cluster {
+            // k3s: bitnami PG is a Service in rio-system.
+            shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?
         } else {
-            (url, None)
+            // EKS: RDS is VPC-private. Spawn a socat relay pod that
+            // listens on 5432 and forwards to the RDS endpoint, then
+            // port-forward to THAT pod.
+            spawn_socat_relay(&host, port).await?
         };
 
+        let url = rewrite_pg_host(url, &format!("localhost:{bound}"));
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&url)
             .await
-            .context("connect to cluster PG")?;
+            .context("connect to cluster PG via port-forward")?;
         info!(
             "qa pg handle open ({}, {})",
-            if in_cluster { "port-forward" } else { "direct" },
+            if in_cluster {
+                "port-forward svc"
+            } else {
+                "socat-relay"
+            },
             host
         );
         Ok(Self {
             pool,
-            _guard: guard,
+            _guard: Some(guard),
         })
     }
+}
+
+/// Spawn an `alpine/socat` pod in `rio-system` that listens on 5432 and
+/// forwards to `host:port` (the RDS endpoint), wait for it to be
+/// Running, port-forward to it. Named `rio-qa-pg-relay`; pre-deletes
+/// any prior instance so re-runs are idempotent. The pod is left
+/// behind when the run ends — it's a 5MB image listening on a socket,
+/// and `wipe` clears it (it's in `rio-system` which `wipe` keeps, but
+/// the next qa run's pre-delete handles it).
+async fn spawn_socat_relay(host: &str, port: u16) -> Result<(u16, ProcessGuard)> {
+    const POD: &str = "rio-qa-pg-relay";
+    let s = sh::shell()?;
+    let _ = sh::try_read(cmd!(
+        s,
+        "kubectl -n {NS} delete pod {POD} --ignore-not-found --wait=true"
+    ));
+    let target = format!("TCP:{host}:{port}");
+    sh::try_read(cmd!(
+        s,
+        "kubectl -n {NS} run {POD} --image=alpine/socat --restart=Never -- TCP-LISTEN:5432,fork,reuseaddr {target}"
+    ))?;
+    // Wait Running (alpine/socat is small; usually <10s).
+    sh::try_read(cmd!(
+        s,
+        "kubectl -n {NS} wait --for=condition=Ready pod/{POD} --timeout=60s"
+    ))
+    .context("socat relay pod never became Ready")?;
+    // Port-forward to the socat pod's 5432.
+    shared::port_forward(NS, &format!("pod/{POD}"), 0, 5432).await
 }
 
 /// Parse `host` and `port` from a `postgres://user:pass@host:port/db`
