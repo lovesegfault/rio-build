@@ -13,12 +13,16 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use super::common::scrape_builder;
 use crate::k8s::eks::smoke::BUSYBOX_LET;
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct PrefetchFiltered;
 
-const METRIC: &str = "rio_scheduler_prefetch_filtered_total";
+// I-212's filter is BUILDER-side (warm-gate) — the metric is
+// `rio_builder_...`, reason `not_input` (JIT allowlist armed and path
+// not in declared inputs). See observability.md:229.
+const METRIC: &str = "rio_builder_prefetch_filtered_total";
 
 #[async_trait]
 impl Scenario for PrefetchFiltered {
@@ -56,20 +60,29 @@ impl Scenario for PrefetchFiltered {
             }}"#
         );
 
-        let scrape = |s: crate::k8s::status::Scrape| {
-            s.labeled(METRIC, "reason", "undeclared_output")
-                .unwrap_or(0.0)
-        };
-        let before = scrape(ctx.scrape_scheduler().await?);
+        // The builder pod that handles the consumer drv is ephemeral
+        // and unknown until it runs — submit, then scrape EVERY
+        // running builder; the filter is per-prefetch-hint so any
+        // increment anywhere proves it fired.
         ctx.nix_build_expr_via_gateway(0, &expr).await?;
-        let after = scrape(ctx.scrape_scheduler().await?);
 
-        if after > before {
+        let pods = ctx.running_pods(QaCtx::NS_BUILDERS, QaCtx::BUILDER_LABEL)?;
+        let mut total = 0.0;
+        for p in &pods {
+            if let Ok(s) = scrape_builder(ctx, p).await {
+                total += s.labeled(METRIC, "reason", "not_input").unwrap_or(0.0);
+            }
+        }
+
+        if total > 0.0 {
             Ok(Verdict::Pass)
+        } else if pods.is_empty() {
+            Ok(Verdict::Skip("no builder pods to scrape".into()))
         } else {
             Ok(Verdict::Fail(format!(
-                "{METRIC} did not increment ({before} → {after}) — \
-                 prefetch hint may be sending undeclared outputs"
+                "{METRIC}{{reason=not_input}} == 0 across {} builders — \
+                 prefetch hint may be sending undeclared outputs",
+                pods.len()
             )))
         }
     }
