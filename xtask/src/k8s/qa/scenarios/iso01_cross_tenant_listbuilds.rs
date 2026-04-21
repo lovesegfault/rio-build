@@ -1,11 +1,12 @@
-//! Cross-tenant: `ListBuilds` tenant filter is honored server-side.
+//! Cross-tenant: SubmitBuild attribution goes to the submitter.
 //!
-//! Policy (from docs): `AdminService.ListBuilds` is operator-auth
-//! (service-token), so a tenant can't enumerate builds via that path
-//! at all. The relevant guarantee is that the `tenant_filter`
-//! parameter is applied SERVER-SIDE — `rio-cli builds --tenant <B>`
-//! must not return A's build. If filtering were client-side only, a
-//! malicious caller bypasses it; the server filter is the boundary.
+//! `rio-cli builds` doesn't expose `--tenant` (the proto's
+//! `ListBuildsRequest.tenant_filter` exists but isn't wired to the
+//! CLI), so the server-side-filter probe is deferred. What we CAN
+//! assert: A submits → that build's `tenant_id` is A's UUID (not B's,
+//! not empty). And B has zero builds (B didn't submit). If the gateway
+//! mis-attributed (wrong key→tenant mapping, JWT sub mix-up), one of
+//! those would fail.
 //!
 //! `r[sched.tenant.authz+2]` covers SchedulerService RPCs (Watch/
 //! Cancel/QueryStatus reject `PERMISSION_DENIED` on tenant mismatch);
@@ -36,45 +37,37 @@ impl Scenario for CrossTenantListBuilds {
         let a_uuid = ctx.tenant_uuid(0)?;
         let b_uuid = ctx.tenant_uuid(1)?;
 
-        // A submits a build (5s, completes before we check).
+        // A submits a build (5s, completes before we check). B does NOT.
         ctx.nix_build_via_gateway(0, "iso01-a", 5, 1).await?;
 
-        // Filtered by B's UUID — A's build must not appear.
-        let resp: Value = ctx.cli_json(&["builds", "--tenant", &b_uuid])?;
+        // No `--tenant` on rio-cli; fetch all and filter client-side.
+        let resp: Value = ctx.cli_json(&["builds"])?;
         let builds = resp
             .get("builds")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let leaked: Vec<_> = builds
-            .iter()
-            .filter(|b| b.get("tenant_id").and_then(Value::as_str) == Some(a_uuid.as_str()))
-            .filter_map(|b| b.get("build_id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
+        let count = |uuid: &str| -> usize {
+            builds
+                .iter()
+                .filter(|b| b.get("tenant_id").and_then(Value::as_str) == Some(uuid))
+                .count()
+        };
+        let n_a = count(&a_uuid);
+        let n_b = count(&b_uuid);
 
-        if !leaked.is_empty() {
+        if n_a == 0 {
             return Ok(Verdict::Fail(format!(
-                "ListBuilds(tenant_filter={b_uuid}) returned {} build(s) with \
-                 tenant_id={a_uuid}: {leaked:?} — server-side filter not applied",
-                leaked.len()
+                "no build with tenant_id={a_uuid} after A submitted — \
+                 SubmitBuild attribution dropped or mis-attributed"
             )));
         }
-
-        // Sanity: filter by A DOES include A's build (filter isn't
-        // returning empty for everything).
-        let resp_a: Value = ctx.cli_json(&["builds", "--tenant", &a_uuid])?;
-        let a_builds = resp_a
-            .get("builds")
-            .and_then(Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if a_builds == 0 {
+        if n_b != 0 {
             return Ok(Verdict::Fail(format!(
-                "ListBuilds(tenant_filter={a_uuid}) returned 0 — A's own build \
-                 not visible; filter may be over-rejecting"
+                "{n_b} build(s) with tenant_id={b_uuid} but B never submitted — \
+                 cross-tenant attribution leak (A's key mapped to B?)"
             )));
         }
-
         Ok(Verdict::Pass)
     }
 }

@@ -59,16 +59,21 @@ impl Scenario for CrossTenantSameDrv {
         // content-addressed, B is allowed to build it.
         ctx.nix_build_expr_via_gateway(1, &expr).await?;
 
-        let count_for = |uuid: &str| -> Result<usize> {
-            let resp: Value = ctx.cli_json(&["builds", "--tenant", uuid])?;
-            Ok(resp
-                .get("builds")
-                .and_then(Value::as_array)
-                .map(|a| a.len())
-                .unwrap_or(0))
+        // No `--tenant` on rio-cli; fetch all and filter client-side.
+        let resp: Value = ctx.cli_json(&["builds"])?;
+        let builds = resp
+            .get("builds")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count_for = |uuid: &str| -> usize {
+            builds
+                .iter()
+                .filter(|b| b.get("tenant_id").and_then(Value::as_str) == Some(uuid))
+                .count()
         };
-        let n_a = count_for(&a_uuid)?;
-        let n_b = count_for(&b_uuid)?;
+        let n_a = count_for(&a_uuid);
+        let n_b = count_for(&b_uuid);
 
         if n_a == 0 || n_b == 0 {
             return Ok(Verdict::Fail(format!(

@@ -58,19 +58,16 @@ impl Scenario for CrossTenantPathRead {
             sh::run_read(cmd!(s, "nix-instantiate --expr {expr}")).await?
         };
         ctx.nix_build_expr_via_gateway(0, &expr).await?;
+        // `nix derivation show` keys the output spec differently across
+        // CA-mode/nix-versions; `nix-store -q --outputs` is the
+        // unambiguous "what paths does this drv produce" query.
         let out = {
             let s = shell()?;
-            // nix derivation show {drv} → {drv: {outputs: {out: {path}}}}
-            let json = sh::run_read(cmd!(s, "nix derivation show {drv}")).await?;
-            let v: serde_json::Value = serde_json::from_str(&json)?;
-            v.as_object()
-                .and_then(|o| o.values().next())
-                .and_then(|d| d.get("outputs"))
-                .and_then(|o| o.get("out"))
-                .and_then(|o| o.get("path"))
-                .and_then(|p| p.as_str())
+            let outs = sh::run_read(cmd!(s, "nix-store -q --outputs {drv}")).await?;
+            outs.lines()
+                .next()
                 .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("nix derivation show: no out path for {drv}"))?
+                .ok_or_else(|| anyhow::anyhow!("nix-store -q --outputs {drv}: empty"))?
         };
 
         // B attempts to copy A's output. NIX_SSHOPTS for BatchMode etc.
