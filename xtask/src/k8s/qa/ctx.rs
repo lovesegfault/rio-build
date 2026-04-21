@@ -106,7 +106,7 @@ impl QaCtx {
         out_kb: u32,
     ) -> Result<()> {
         let key = self.tenant(tenant_idx).key.clone();
-        gateway_build(key, tag.to_owned(), secs, out_kb).await
+        gateway_build(key, smoke::smoke_expr(tag, secs, out_kb)).await
     }
 
     /// Spawn `nix_build_via_gateway` in the background. For asserts that
@@ -119,8 +119,28 @@ impl QaCtx {
         out_kb: u32,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let key = self.tenant(tenant_idx).key.clone();
-        let tag = tag.to_owned();
-        tokio::spawn(gateway_build(key, tag, secs, out_kb))
+        tokio::spawn(gateway_build(key, smoke::smoke_expr(tag, secs, out_kb)))
+    }
+
+    /// Submit an arbitrary Nix expression via the gateway as
+    /// `self.tenants[tenant_idx]`. The expression must evaluate to a
+    /// single derivation (`nix-instantiate --expr` is the front end).
+    /// Unlocks scenarios that need `requiredSystemFeatures`, multi-
+    /// output, custom name, etc. — everything `smoke_expr` can't shape.
+    pub async fn nix_build_expr_via_gateway(&self, tenant_idx: usize, expr: &str) -> Result<()> {
+        let key = self.tenant(tenant_idx).key.clone();
+        gateway_build(key, expr.to_owned()).await
+    }
+
+    /// Background variant of `nix_build_expr_via_gateway`.
+    #[allow(dead_code)] // sibling of _bg above; first user lands with i181-style asserts
+    pub fn nix_build_expr_via_gateway_bg(
+        &self,
+        tenant_idx: usize,
+        expr: &str,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let key = self.tenant(tenant_idx).key.clone();
+        tokio::spawn(gateway_build(key, expr.to_owned()))
     }
 
     /// Scheduler-leader pod name. Several scenarios need this for log
@@ -133,10 +153,10 @@ impl QaCtx {
     pub const NS_BUILDERS: &str = NS_BUILDERS;
 }
 
-/// Port-forward gateway:22, wait for SSH banner, run `smoke_build`.
-/// Shared body of `nix_build_via_gateway[_bg]` so the bg variant doesn't
-/// duplicate the readiness poll.
-async fn gateway_build(key: PathBuf, tag: String, secs: u32, out_kb: u32) -> Result<()> {
+/// Port-forward gateway:22, wait for SSH banner, run `build_expr`.
+/// Shared body of all four `nix_build[_expr]_via_gateway[_bg]` so each
+/// variant is a one-liner.
+async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
     let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
     crate::ui::poll(
         "gateway SSH banner",
@@ -156,7 +176,7 @@ async fn gateway_build(key: PathBuf, tag: String, secs: u32, out_kb: u32) -> Res
         "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
         key.display()
     );
-    smoke::smoke_build(&tag, secs, out_kb, &store).await
+    smoke::build_expr(&expr, &store).await
 }
 
 // ─── PG handle ─────────────────────────────────────────────────────────

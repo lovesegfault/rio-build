@@ -511,23 +511,44 @@ pub async fn step_pool_reconciled(
     wait_cr_status::<Pool>(client, ns, name).await
 }
 
-/// nix-instantiate + nix copy + nix build
-///
-/// `out_kb` is the output size in KiB. `out_kb >= 256` pushes the NAR
-/// over `cas::INLINE_THRESHOLD` and exercises the chunked-S3 PutPath —
-/// see the doc on [`SMOKE_EXPR`] for why that matters.
-pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
-    let expr = SMOKE_EXPR
+/// The pinned-busybox FOD `let`-binding from [`SMOKE_EXPR`], exposed
+/// so qa scenarios can compose their own derivations on top of it
+/// (e.g. `requiredSystemFeatures`, multi-output, custom name) without
+/// duplicating the tarball pin.
+pub const BUSYBOX_LET: &str = r#"let busybox = builtins.derivation {
+    name = "busybox";
+    builder = "builtin:fetchurl";
+    system = "builtin";
+    url = "http://tarballs.nixos.org/stdenv/x86_64-unknown-linux-gnu/82b583ba2ba2e5706b35dbe23f31362e62be2a9d/busybox";
+    outputHashMode = "recursive";
+    outputHashAlgo = "sha256";
+    outputHash = "sha256-QrTEnQTBM1Y/qV9odq8irZkQSD9uOMbs2Q5NgCvKCNQ=";
+    executable = true;
+    unpack = false;
+  }; in"#;
+
+/// Render the busybox SMOKE_EXPR template. `out_kb >= 256` pushes the
+/// NAR over `cas::INLINE_THRESHOLD` and exercises the chunked-S3
+/// PutPath — see the doc on [`SMOKE_EXPR`] for why that matters.
+pub fn smoke_expr(tag: &str, secs: u32, out_kb: u32) -> String {
+    SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string())
         .replace("@KB_ITER@", &"x ".repeat(out_kb as usize))
         // 1023 chars + echo's newline = 1024 bytes/iter. No quoting
         // needed (alphanumeric). This busybox lacks printf too.
-        .replace("@CHUNK@", &"x".repeat(1023));
+        .replace("@CHUNK@", &"x".repeat(1023))
+}
+
+/// nix-instantiate + nix copy + nix build for an arbitrary expression.
+/// The expr must evaluate to a single derivation. Factored out of the
+/// busybox-only path so qa scenarios can submit derivations with
+/// `requiredSystemFeatures`, multi-output, custom names, etc.
+pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
     // IdentitiesOnly=yes (see `shared::NIX_SSHOPTS_BASE`): the user's
     // deploy key (comment "default") is in authorized_keys too. Without
     // this, ssh-agent offers that key first → gateway routes the build
-    // to tenant "default" instead of [`TENANT`].
+    // to tenant "default" instead of the intended one.
     const SSHOPTS: &str = crate::k8s::shared::NIX_SSHOPTS_BASE;
 
     // Scope each Shell to end before .await so the future stays Send
@@ -564,4 +585,11 @@ pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> 
         )
     })
     .await
+}
+
+/// Busybox build = `build_expr(smoke_expr(...))`. Kept as a convenience
+/// for the health-check path where most callers don't care about the
+/// expression body.
+pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
+    build_expr(&smoke_expr(tag, secs, out_kb), store_url).await
 }
