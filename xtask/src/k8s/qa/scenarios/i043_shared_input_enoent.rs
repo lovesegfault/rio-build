@@ -39,15 +39,22 @@ impl Scenario for SharedInputEnoent {
         ctx.nix_build_via_gateway(0, "i043a", 3, 1).await?;
         ctx.nix_build_via_gateway(0, "i043b", 3, 1).await?;
 
-        let logs = ctx.kubectl(&[
-            "-n",
-            QaCtx::NS_BUILDERS,
-            "logs",
-            "-l",
-            QaCtx::BUILDER_LABEL,
-            "--since=2m",
-            "--prefix",
-        ])?;
+        // `--ignore-errors`: ephemeral builders may have terminated by
+        // the time we scrape; without this, kubectl exits 1 (one pod's
+        // log fetch fails) and the whole scenario errors out on a
+        // non-ENOENT condition.
+        let logs = ctx
+            .kubectl(&[
+                "-n",
+                QaCtx::NS_BUILDERS,
+                "logs",
+                "-l",
+                QaCtx::BUILDER_LABEL,
+                "--since=2m",
+                "--prefix",
+                "--ignore-errors",
+            ])
+            .unwrap_or_default();
         let enoent: Vec<_> = logs
             .lines()
             .filter(|l| l.contains("build input") && l.contains("does not exist"))

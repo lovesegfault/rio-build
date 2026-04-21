@@ -77,10 +77,19 @@ pub fn first_pod(ctx: &QaCtx, ns: &str, app: &str) -> Result<String> {
 
 /// Wait until the scheduler-leader pod name differs from `old_leader`
 /// (failover after a kill/restart). Returns the new leader name.
+///
+/// `kube::scheduler_leader` returns Err("scheduler lease has no
+/// holder") during the brief window between the old holder's lease
+/// expiry and the standby acquiring it — that's "not yet", not a
+/// failure.
 pub async fn wait_new_leader(ctx: &QaCtx, old_leader: &str, deadline: Duration) -> Result<String> {
     poll_until(deadline, Duration::from_secs(2), || async {
-        let cur = ctx.scheduler_leader().await?;
-        Ok((cur != old_leader).then_some(cur))
+        match ctx.scheduler_leader().await {
+            Ok(cur) if cur != old_leader && !cur.is_empty() => Ok(Some(cur)),
+            Ok(_) => Ok(None),
+            Err(e) if format!("{e:#}").contains("lease has no holder") => Ok(None),
+            Err(e) => Err(e),
+        }
     })
     .await?
     .ok_or_else(|| anyhow::anyhow!("no leader failover within {deadline:?}"))
@@ -94,7 +103,9 @@ pub async fn wait_recovery_done(ctx: &QaCtx, before: f64, deadline: Duration) ->
     let r = poll_until(deadline, Duration::from_secs(3), || async {
         // scrape may transiently fail mid-failover; treat as not-yet.
         let now = match ctx.scrape_scheduler().await {
-            Ok(s) => s.sum(r#"rio_scheduler_recovery_total{outcome="success"}"#),
+            Ok(s) => s
+                .labeled("rio_scheduler_recovery_total", "outcome", "success")
+                .unwrap_or(0.0),
             Err(_) => return Ok(None),
         };
         Ok((now > before).then_some(()))

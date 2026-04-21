@@ -409,6 +409,15 @@ impl Scrape {
         self.series(name).first().map(|(_, v)| *v)
     }
 
+    /// True iff at least one series name starts with `prefix`. BTreeMap
+    /// range = O(log n) prefix scan.
+    pub(crate) fn any_with_prefix(&self, prefix: &str) -> bool {
+        self.by_name
+            .range(prefix.to_owned()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(prefix))
+    }
+
     /// First series for `name` whose label string contains
     /// `key="value"`. Substring match — robust to label ordering.
     pub(crate) fn labeled(&self, name: &str, key: &str, value: &str) -> Option<f64> {

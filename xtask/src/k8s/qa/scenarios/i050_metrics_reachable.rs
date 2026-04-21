@@ -29,9 +29,7 @@ impl Scenario for MetricsReachable {
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let scrape = ctx.scrape_scheduler().await?;
-        // Any rio_scheduler_* gauge is fine; build_info is registered at
-        // startup so it's present even with zero traffic.
-        if scrape.first("rio_scheduler_build_info").is_some() {
+        if scrape.any_with_prefix("rio_scheduler_") {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(

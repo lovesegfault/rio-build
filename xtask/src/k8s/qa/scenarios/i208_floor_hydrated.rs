@@ -1,10 +1,11 @@
-//! I-208: `derivations.size_class_floor` must survive merge.
+//! I-208: `derivations` resource floor must survive merge/recovery.
 //!
-//! Seed a floor value on an existing derivation, submit a build that
-//! re-merges it, assert the PG floor was NOT reset to NULL/tiny.
-//! Live trigger needs the same .drv hash across runs — `smoke_expr`
-//! defeats that with `currentTime`. So this asserts the persistence
-//! direction: write a floor, restart scheduler, read it back. If
+//! The legacy `size_class_floor` column was DROPPED (migration 045);
+//! ADR-023 replaced it with `floor_mem_bytes`/`floor_disk_bytes`/
+//! `floor_deadline_secs` (migration 044). The original I-208 bug was
+//! that merge didn't hydrate the floor from PG, so a learned floor
+//! reset to default every run. This asserts the persistence direction:
+//! write `floor_mem_bytes`, restart scheduler, read it back. If
 //! recovery loads it, merge will too (same `from_row` codepath).
 
 use std::time::Duration;
@@ -17,6 +18,8 @@ use super::common::{NS_SYSTEM, PgCleanup, kill_pod, wait_new_leader, wait_recove
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct FloorHydrated;
+
+const PROBE_FLOOR: i64 = 1_073_741_824; // 1 GiB — distinct from any default
 
 #[async_trait]
 impl Scenario for FloorHydrated {
@@ -32,31 +35,29 @@ impl Scenario for FloorHydrated {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // Find one terminal derivation with NULL floor and a non-null
-        // drv_path (so it was a real build, not synthetic).
+        // Find one terminal derivation with default (0) floor.
         let row = sqlx::query(
-            "SELECT derivation_id, derivation_hash FROM derivations \
-             WHERE size_class_floor IS NULL AND drv_path IS NOT NULL \
+            "SELECT derivation_id FROM derivations \
+             WHERE floor_mem_bytes = 0 \
              AND status IN ('completed','poisoned') LIMIT 1",
         )
         .fetch_optional(ctx.pg())
         .await?;
         let Some(row) = row else {
             return Ok(Verdict::Skip(
-                "no terminal derivation with NULL floor to test against".into(),
+                "no terminal derivation with floor_mem_bytes=0 to test against".into(),
             ));
         };
         let drv_id: sqlx::types::Uuid = row.try_get("derivation_id")?;
 
-        sqlx::query("UPDATE derivations SET size_class_floor = 'small' WHERE derivation_id = $1")
+        sqlx::query("UPDATE derivations SET floor_mem_bytes = $2 WHERE derivation_id = $1")
             .bind(drv_id)
+            .bind(PROBE_FLOOR)
             .execute(ctx.pg())
             .await?;
         let cleanup = PgCleanup::new(
             ctx.pg(),
-            format!(
-                "UPDATE derivations SET size_class_floor = NULL WHERE derivation_id = '{drv_id}'"
-            ),
+            format!("UPDATE derivations SET floor_mem_bytes = 0 WHERE derivation_id = '{drv_id}'"),
         );
 
         let old_leader = ctx.scheduler_leader().await?;
@@ -67,20 +68,21 @@ impl Scenario for FloorHydrated {
             return Ok(Verdict::Fail("new leader never completed recovery".into()));
         }
 
-        // Floor should still be 'small'. If recovery's hydration path
-        // wrote it back to NULL (the bug), this fails.
-        let after: Option<String> =
-            sqlx::query_scalar("SELECT size_class_floor FROM derivations WHERE derivation_id = $1")
+        // Floor should still be PROBE_FLOOR. If recovery's hydration
+        // wrote it back to 0 (the bug), this fails.
+        let after: i64 =
+            sqlx::query_scalar("SELECT floor_mem_bytes FROM derivations WHERE derivation_id = $1")
                 .bind(drv_id)
                 .fetch_one(ctx.pg())
                 .await?;
         cleanup.run().await?;
 
-        match after.as_deref() {
-            Some("small") => Ok(Verdict::Pass),
-            other => Ok(Verdict::Fail(format!(
-                "size_class_floor not preserved across recovery: expected 'small', got {other:?}"
-            ))),
+        if after == PROBE_FLOOR {
+            Ok(Verdict::Pass)
+        } else {
+            Ok(Verdict::Fail(format!(
+                "floor_mem_bytes not preserved across recovery: expected {PROBE_FLOOR}, got {after}"
+            )))
         }
     }
 }

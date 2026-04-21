@@ -34,9 +34,11 @@ impl Scenario for StaleRealisation {
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // Live invariant: no realisations point at non-existent narinfo.
+        // Schema (002_store.sql): realisations(drv_hash BYTEA,
+        // output_name, output_path, output_hash BYTEA, ...).
         let stale: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM realisations r \
-             LEFT JOIN narinfo n ON n.store_path = r.store_path \
+             LEFT JOIN narinfo n ON n.store_path = r.output_path \
              WHERE n.store_path_hash IS NULL",
         )
         .fetch_one(ctx.pg())
@@ -53,24 +55,27 @@ impl Scenario for StaleRealisation {
         // query above counts it (validates the detection query the
         // scheduler's filter uses), then delete.
         let drv_hash = b"qai048a_stale_realisation_probe_";
+        let probe_path = "/nix/store/qai048a-nonexistent";
         sqlx::query(
-            "INSERT INTO realisations (drv_hash, output_name, store_path) \
-             VALUES ($1, 'out', '/nix/store/qai048a-nonexistent') \
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+             VALUES ($1, 'out', $2, $1) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&drv_hash[..])
+        .bind(probe_path)
         .execute(ctx.pg())
         .await?;
         let cleanup = PgCleanup::new(
             ctx.pg(),
-            "DELETE FROM realisations WHERE store_path = '/nix/store/qai048a-nonexistent'",
+            format!("DELETE FROM realisations WHERE output_path = '{probe_path}'"),
         );
 
         let detected: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM realisations r \
-             LEFT JOIN narinfo n ON n.store_path = r.store_path \
-             WHERE n.store_path_hash IS NULL AND r.store_path = '/nix/store/qai048a-nonexistent'",
+             LEFT JOIN narinfo n ON n.store_path = r.output_path \
+             WHERE n.store_path_hash IS NULL AND r.output_path = $1",
         )
+        .bind(probe_path)
         .fetch_one(ctx.pg())
         .await?;
         cleanup.run().await?;

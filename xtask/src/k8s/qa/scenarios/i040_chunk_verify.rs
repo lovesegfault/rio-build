@@ -78,6 +78,21 @@ impl Scenario for ChunkVerify {
             }
         };
 
+        // Restore PG↔S3 consistency: the S3 object is gone and we
+        // can't easily put it back, so delete the PG `chunks` row too.
+        // Otherwise i201 (which asserts no PG-says-exists-S3-says-404)
+        // will Fail on the row this scenario deliberately stranded.
+        // Any manifest_chunks referencing it will see it gone, but
+        // that's the lesser inconsistency (verify-chunks would re-flag
+        // the manifest — same as a real corruption).
+        if let Err(e) = sqlx::query("DELETE FROM chunks WHERE blake3_hash = decode($1, 'hex')")
+            .bind(&hex)
+            .execute(ctx.pg())
+            .await
+        {
+            tracing::warn!("i040 cleanup: DELETE FROM chunks {hex}: {e:#}");
+        }
+
         if out.contains(&hex) {
             Ok(Verdict::Pass)
         } else {

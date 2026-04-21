@@ -34,12 +34,17 @@ impl Scenario for OrphanDerivations {
         // Seed: one Ready derivation with NO build_derivations link.
         // Hash is synthetic so it can't collide with a real drv.
         // `system` must be valid or unroutable-ready gauge fires
-        // (which is a different signal).
+        // (which is a different signal). Schema (001_scheduler.sql):
+        // PK derivation_id UUID, drv_hash TEXT (no UNIQUE constraint
+        // by itself, so no ON CONFLICT target — pre-delete instead).
         let drv_hash = "qai059orphan0000000000000000000000000000".to_string();
+        sqlx::query("DELETE FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_hash)
+            .execute(ctx.pg())
+            .await?;
         let row = sqlx::query(
-            "INSERT INTO derivations (derivation_hash, drv_path, system, status) \
+            "INSERT INTO derivations (drv_hash, drv_path, system, status) \
              VALUES ($1, $2, 'x86_64-linux', 'ready') \
-             ON CONFLICT (derivation_hash) DO UPDATE SET status='ready' \
              RETURNING derivation_id",
         )
         .bind(&drv_hash)

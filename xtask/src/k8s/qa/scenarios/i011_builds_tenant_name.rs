@@ -8,18 +8,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde_json::Value;
 
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct BuildsTenantName;
-
-#[derive(Deserialize)]
-struct Build {
-    build_id: String,
-    #[serde(default)]
-    tenant_name: String,
-}
 
 #[async_trait]
 impl Scenario for BuildsTenantName {
@@ -35,29 +28,35 @@ impl Scenario for BuildsTenantName {
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         ctx.nix_build_via_gateway(0, "i011", 5, 1).await?;
 
-        let builds: Vec<Build> = match ctx.cli_json(&["builds"]) {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(Verdict::Skip(format!(
-                    "rio-cli builds --json shape mismatch: {e:#}"
-                )));
-            }
-        };
+        // `rio-cli builds --json` outputs ListBuildsResponse:
+        // {"builds": [...], "total_count": N, ...}. The proto has
+        // `tenant_id` (UUID string), not `tenant_name` — the human
+        // output resolves id→name via a separate ListTenants call.
+        let resp: Value = ctx.cli_json(&["builds"])?;
+        let builds = resp
+            .get("builds")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         if builds.is_empty() {
             return Ok(Verdict::Skip("no builds returned".into()));
         }
-        let empty: Vec<_> = builds
+        let empty: Vec<String> = builds
             .iter()
-            .filter(|b| b.tenant_name.trim().is_empty())
-            .map(|b| b.build_id.as_str())
+            .filter(|b| {
+                b.get("tenant_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.trim().is_empty())
+            })
+            .filter_map(|b| b.get("build_id").and_then(Value::as_str).map(str::to_owned))
             .take(5)
             .collect();
         if empty.is_empty() {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
-                "{} build(s) with empty tenant_name (first 5): {empty:?} \
-                 — SubmitBuild tenant resolution or cli rendering",
+                "{} build(s) with empty tenant_id (first 5): {empty:?} \
+                 — SubmitBuild tenant resolution silently dropped",
                 empty.len()
             )))
         }
