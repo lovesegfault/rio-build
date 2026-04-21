@@ -40,7 +40,10 @@ impl Scenario for PendingReaped {
         // → cancel-on-disconnect (r[sched.cancel.on-disconnect]).
         bg.abort();
 
-        let reaped = poll_until(Duration::from_secs(90), Duration::from_secs(5), || async {
+        // Observed 39s/59s/93s/106s across runs — variance is the
+        // controller's reconcile-tick interval × concurrent phase-2
+        // scheduler-kills delaying GetSpawnIntents. 150s budget.
+        let reaped = poll_until(Duration::from_secs(150), Duration::from_secs(5), || async {
             let now = scrape_controller(ctx).await?.sum(METRIC);
             Ok((now > before).then_some(now))
         })
@@ -52,7 +55,7 @@ impl Scenario for PendingReaped {
                 Ok(Verdict::Pass)
             }
             None => Ok(Verdict::Fail(format!(
-                "{METRIC} did not increment within 90s of cancel — Pending \
+                "{METRIC} did not increment within 150s of cancel — Pending \
                  Jobs not reaped (controller still trying to provision nodes)"
             ))),
         }
