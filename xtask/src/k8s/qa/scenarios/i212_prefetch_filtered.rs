@@ -48,7 +48,11 @@ impl Scenario for PrefetchFiltered {
               name = "rio-qa-i212-consumer-${{toString builtins.currentTime}}";
               system = "x86_64-linux";
               builder = "${{busybox}}";
-              args = ["sh" "-c" "cat ${{multi.out}} > $out"];
+              # busybox sh has no PATH — sh builtins only. Referencing
+              # ${{multi.out}} (NOT ${{multi.doc}}) is what makes the
+              # declared inputDrv outputs = ["out"]; the body just needs
+              # to use it.
+              args = ["sh" "-c" "echo ${{multi.out}} > $out"];
             }}"#
         );
 
