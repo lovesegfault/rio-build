@@ -113,7 +113,7 @@ pub struct MockStoreFaults {
     /// can't express that with concurrent callers (each decrements).
     /// `std::time::Instant` (not tokio's) because the scheduler's
     /// substitute-fetch tests run on real time (ephemeral PG + paused
-    /// time don't compose; see merge.rs `transient_retry`).
+    /// time don't compose; see scheduler `merge.rs::transient_retry`).
     pub fail_qpi_resource_exhausted_until: Arc<RwLock<Option<std::time::Instant>>>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,

@@ -121,10 +121,18 @@ pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::b
 };
 
 /// Max attempts per path for the detached substitute fetch. With
-/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s ≈ 3.75s total
-/// retry budget per path (4 backoffs between 5 attempts; the loop
-/// breaks before the final sleep) before demoting to cache-miss.
-pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 5;
+/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s→4s→8s→16s ≈ 31.75 s
+/// total retry budget per path (7 backoffs between 8 attempts; the loop
+/// breaks before the final sleep — the 30 s `cap` limits the 7th
+/// backoff to 16 s, not 32 s) before demoting to cache-miss. Raised
+/// 5→8 alongside `r[store.substitute.admission]`: the store now queues
+/// up to `SUBSTITUTE_ADMISSION_WAIT` (30 s) before returning
+/// `RESOURCE_EXHAUSTED`, so each attempt is itself a 30 s server-side
+/// wait under saturation; 8 attempts give a ~90 s window
+/// (≥1 attempt's bounded-wait + backoffs) for the burst to clear
+/// before demoting. Belt-and-suspenders — under normal load the
+/// store's bounded-wait absorbs the burst on attempt 1.
+pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 
 /// Per-path timeout for the detached substitute fetch's
 /// `QueryPathInfo`. Separate from `grpc_timeout` (30s) because the
