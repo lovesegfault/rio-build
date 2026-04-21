@@ -210,24 +210,26 @@ pkgs.testers.runNixOSTest {
     # netpol-imds — IMDS egress blocked (exit criterion)
     # ══════════════════════════════════════════════════════════════════
     # IMDS is the prime threat — a sandbox escapee shouldn't get AWS
-    # creds. fd00:ec2::254 (the v6 IMDS endpoint) is the Cilium `host`
-    # entity, not in any rio-builder-egress allow-rule → default-deny.
-    # Cilium drops → curl times out.
+    # creds. builder-egress carries an explicit egressDeny toCIDR for
+    # BOTH 169.254.169.254/32 and fd00:ec2::254/128 (second independent
+    # control alongside hop-limit=1; live spike showed pods TCP-connect
+    # to fd00:ec2::254 absent the deny). Cilium drops → curl times out.
     #
     # WEAK in VM context: no IMDS listener exists in a NixOS QEMU VM
     # anyway (not an EC2 instance). rc≠0 would happen regardless. The
     # netpol-kubeapi subtest above is the REAL proof; this one satisfies
     # the plan's exit criterion and matches production's threat model.
-    with subtest("netpol-imds: IMDS egress blocked"):
-        rc, out = netns_exec(
-            "${curl} --max-time 5 -sS 'http://[fd00:ec2::254]/latest/meta-data/'"
-        )
-        assert rc != 0, (
-            "IMDS curl succeeded (rc=0) — NetPol NOT enforcing. "
-            "fd00:ec2::254 is the host entity, not in any allow-rule; "
-            f"Cilium should DROP.\n{out}"
-        )
-        print(f"netpol-imds PASS: IMDS blocked (curl rc={rc})")
+    with subtest("netpol-imds: IMDS egress blocked (v4+v6)"):
+        for ep in ("[fd00:ec2::254]", "169.254.169.254"):
+            rc, out = netns_exec(
+                f"${curl} --max-time 5 -sS 'http://{ep}/latest/meta-data/'"
+            )
+            assert rc != 0, (
+                f"IMDS curl to {ep} succeeded (rc=0) — NetPol NOT "
+                f"enforcing. builder-egress egressDeny lists this CIDR; "
+                f"Cilium should DROP.\n{out}"
+            )
+            print(f"netpol-imds PASS: {ep} blocked (curl rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
     # netpol-internet — public egress blocked (exit criterion)

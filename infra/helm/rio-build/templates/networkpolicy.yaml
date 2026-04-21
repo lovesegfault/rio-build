@@ -80,6 +80,15 @@ spec:
     - toCIDR: [{{ . | quote }}]
       toPorts: [{ports: [{port: "443", protocol: TCP}]}]
     {{- end }}
+  # Explicit IMDS deny — second independent control alongside
+  # httpPutResponseHopLimit: 1 (karpenter.yaml). Cilium deny rules take
+  # precedence over allow at the same L3/L4 scope. Builders have no
+  # world allow so this is belt-and-suspenders; the fetcher copy below
+  # is the load-bearing one.
+  egressDeny:
+    - toCIDR:
+        - 169.254.169.254/32
+        - fd00:ec2::254/128
 ---
 # r[impl fetcher.netpol.egress-open+2]
 #
@@ -87,10 +96,13 @@ spec:
 # FODs only (scheduler hard_filter routes by ExecutorKind); the FOD
 # outputHash check is the integrity boundary. `toEntities: [world]`
 # matches any IP NOT known to Cilium as a cluster identity — so it
-# inherently EXCLUDES pod/service/node IPs and the link-local range
-# (no manual `except:` carve-out needed; Cilium's identity model does
-# it). IMDS (169.254.169.254 / fd00:ec2::254) is host-local → covered
-# by the `host` entity, NOT `world` → DENIED.
+# inherently EXCLUDES pod/service/node IPs (no manual `except:`
+# carve-out needed; Cilium's identity model does it). IMDS is NOT
+# covered by that exclusion: live spike showed a default-ns pod
+# TCP-connects to fd00:ec2::254 (gets 401 on bare GET; only the
+# token-PUT response TTL-expires at hop-limit 1). The `world` entity
+# may or may not match fd00:ec2::254 depending on Cilium's link-local
+# classification — explicit egressDeny below removes the ambiguity.
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -126,6 +138,14 @@ spec:
         - ports:
             - {port: "80", protocol: TCP}
             - {port: "443", protocol: TCP}
+  # Explicit IMDS deny — second independent control alongside
+  # httpPutResponseHopLimit: 1 (karpenter.yaml). Deny takes precedence
+  # over the world:80 allow above regardless of how Cilium classifies
+  # the IMDS link-local/ULA addresses.
+  egressDeny:
+    - toCIDR:
+        - 169.254.169.254/32
+        - fd00:ec2::254/128
 ---
 # Controller egress: DNS + kube-apiserver. The controller's ONLY
 # upstream is the k8s API (watch/patch CRs across namespaces). The old

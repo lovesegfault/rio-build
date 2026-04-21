@@ -273,21 +273,25 @@ pkgs.testers.runNixOSTest {
         print(f"fetcher-egress PASS: [{origin_v6}]:80 reachable (http {out.strip()})")
 
     # ══════════════════════════════════════════════════════════════════
-    # fetcher-imds-blocked — host entity not in world
+    # fetcher-imds-blocked — explicit egressDeny on both families
     # ══════════════════════════════════════════════════════════════════
     # WEAK-in-VM (same caveat as netpol.nix): no IMDS listener in
-    # QEMU. The fetcher-egress subtest above is the non-vacuous gate;
-    # this proves the v6 IMDS endpoint (Cilium `host` entity, NOT
-    # `world`) is denied.
-    with subtest("fetcher-imds-blocked: fd00:ec2::254 blocked"):
-        rc, _ = fetcher_exec(
-            "${curl} --max-time 5 -sS 'http://[fd00:ec2::254]/latest/meta-data/'"
-        )
-        assert rc != 0, (
-            "fetcher reached IMDS (rc=0) — fetcher-egress world rule "
-            "should NOT match the host entity (fd00:ec2::254)."
-        )
-        print(f"fetcher-imds PASS: blocked (rc={rc})")
+    # QEMU. The fetcher-egress subtest above is the non-vacuous gate.
+    # fetcher-egress carries an explicit egressDeny toCIDR for BOTH
+    # 169.254.169.254/32 and fd00:ec2::254/128 — second independent
+    # control alongside hop-limit=1. Live spike showed a pod TCP-
+    # connects to fd00:ec2::254 (gets 401) absent the deny; the prior
+    # "host entity, NOT world" reasoning was unverified.
+    with subtest("fetcher-imds-blocked: IMDS egress denied (v4+v6)"):
+        for ep in ("[fd00:ec2::254]", "169.254.169.254"):
+            rc, _ = fetcher_exec(
+                f"${curl} --max-time 5 -sS 'http://{ep}/latest/meta-data/'"
+            )
+            assert rc != 0, (
+                f"fetcher reached IMDS {ep} (rc=0) — fetcher-egress "
+                f"egressDeny lists this CIDR; Cilium should DROP."
+            )
+            print(f"fetcher-imds PASS: {ep} blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
     # builder-airgap — builder BLOCKED from upstream-v4 via NAT64

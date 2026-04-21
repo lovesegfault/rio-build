@@ -490,13 +490,17 @@ in
             pkgs.curl
             pkgs.jq
           ];
-          # IMDS via link-local v4 — works on ipv6_native subnets;
-          # HttpProtocolIpv6 is disabled in EC2NodeClass MetadataOptions
-          # so the v6 endpoint (fd00:ec2::254) doesn't respond.
+          # IMDS via the v6 endpoint — httpProtocolIPv6: enabled in
+          # EC2NodeClass MetadataOptions (karpenter.yaml). Hop-limit 1
+          # lets the host netns through (token-PUT response is hop 0);
+          # pod token-PUT responses TTL-expire across host→veth→pod.
+          # AWS does NOT auto-set IsPrimaryIpv6 on ipv6_native subnets,
+          # so this oneshot stays load-bearing for NLB dualstack
+          # instance-target registration.
           script = ''
             set -uo pipefail
-            imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
-            TOKEN=$(curl -sf -X PUT 'http://169.254.169.254/latest/api/token' \
+            imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://[fd00:ec2::254]/latest/meta-data/$1"; }
+            TOKEN=$(curl -sf -X PUT 'http://[fd00:ec2::254]/latest/api/token' \
               -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
             MAC=$(imds mac)
             ENI=$(imds "network/interfaces/macs/$MAC/interface-id")

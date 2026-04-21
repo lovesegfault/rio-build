@@ -62,15 +62,22 @@ spec:
   securityGroupSelectorTerms:
     - tags:
         karpenter.sh/discovery: {{ $k.clusterName }}
-  # IMDSv2 hop limit 1. Pods can't reach IMDS regardless: no v4 route in
-  # the pod netns and httpProtocolIpv6 defaults disabled — so hop-limit
-  # isn't load-bearing. Kept at 1 for defense-in-depth. (The old
-  # limit-2 rationale was vpc-cni's SNAT hop; Cilium adds no such hop,
-  # and hostNetwork agents work fine at limit 1.)
+  # IMDSv2 hop-limit 1 + v6 endpoint enabled. primary-ipv6-init (host
+  # netns) reaches fd00:ec2::254 directly (hop 0 → token-PUT works);
+  # a non-hostNetwork pod's token-PUT response decrements TTL to 0
+  # crossing host→veth→pod and is dropped — pod TCP-connects (gets 401
+  # on bare GET) but cannot obtain a token. Live spike confirmed both
+  # halves at hop-limit=1 and full pod IMDS read at hop-limit=2, so
+  # hop-limit IS load-bearing here. Second independent control:
+  # explicit egressDeny toCIDR fd00:ec2::254/128 + 169.254.169.254/32
+  # in networkpolicy.yaml (builder-egress + fetcher-egress CCNPs). The
+  # old limit-2 rationale was vpc-cni's SNAT hop; Cilium adds none, and
+  # hostNetwork agents work fine at limit 1.
   metadataOptions:
     httpEndpoint: enabled
     httpTokens: required
     httpPutResponseHopLimit: 1
+    httpProtocolIPv6: enabled
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:
