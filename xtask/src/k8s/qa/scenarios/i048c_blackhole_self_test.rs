@@ -33,12 +33,25 @@ impl Scenario for BlackholeSelfTest {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // Precondition: at least one builder connected, otherwise the
-        // disconnect counter has nothing to count and we'd false-Pass.
-        let builders = ctx.running_pods(QaCtx::NS_BUILDERS, QaCtx::BUILDER_LABEL)?;
-        if builders.is_empty() {
+        // Precondition: at least one builder CONNECTED to the leader,
+        // not just running. After a prior phase-2 leader-kill (i024/
+        // i033/i058), builders may be running but mid-reconnect to the
+        // new leader — blackholing then has nothing to disconnect →
+        // false-Fail. Poll the in-memory connected count.
+        let connected =
+            super::common::poll_until(Duration::from_secs(30), Duration::from_secs(3), || async {
+                let n = ctx
+                    .scrape_scheduler()
+                    .await?
+                    .sum("rio_scheduler_workers_active");
+                Ok((n > 0.0).then_some(n))
+            })
+            .await?;
+        if connected.is_none() {
             return Ok(Verdict::Skip(
-                "no running builder pods — nothing to disconnect".into(),
+                "no executors connected to scheduler-leader within 30s — \
+                 prior leader-kill recovery still settling"
+                    .into(),
             ));
         }
 

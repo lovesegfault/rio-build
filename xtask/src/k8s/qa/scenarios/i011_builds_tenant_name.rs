@@ -28,20 +28,36 @@ impl Scenario for BuildsTenantName {
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         ctx.nix_build_via_gateway(0, "i011", 5, 1).await?;
 
-        // `rio-cli builds --json` outputs ListBuildsResponse:
-        // {"builds": [...], "total_count": N, ...}. The proto has
-        // `tenant_id` (UUID string), not `tenant_name` — the human
-        // output resolves id→name via a separate ListTenants call.
+        // I-011 is about SubmitBuild dropping tenant resolution — the
+        // probe is "did the build I JUST submitted get my tenant_id?".
+        // builds.tenant_id IS NULL is also a valid state for orphans
+        // (FK ON DELETE SET NULL after DeleteTenant — every prior qa
+        // run's cleanup orphans its builds), so checking ALL builds
+        // false-positives. Find THIS build by matching the unique
+        // smoke-tag in its name.
+        let tag = "i011";
         let resp: Value = ctx.cli_json(&["builds"])?;
         let builds = resp
             .get("builds")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if builds.is_empty() {
-            return Ok(Verdict::Skip("no builds returned".into()));
+        let mine: Vec<_> = builds
+            .iter()
+            .filter(|b| {
+                b.get("name")
+                    .or_else(|| b.get("display_name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.contains(tag))
+            })
+            .collect();
+        if mine.is_empty() {
+            return Ok(Verdict::Skip(format!(
+                "no build with tag '{tag}' in `rio-cli builds` output — \
+                 name field missing or build not listed"
+            )));
         }
-        let empty: Vec<String> = builds
+        let empty: Vec<String> = mine
             .iter()
             .filter(|b| {
                 b.get("tenant_id")
@@ -49,15 +65,14 @@ impl Scenario for BuildsTenantName {
                     .is_none_or(|s| s.trim().is_empty())
             })
             .filter_map(|b| b.get("build_id").and_then(Value::as_str).map(str::to_owned))
-            .take(5)
             .collect();
         if empty.is_empty() {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
-                "{} build(s) with empty tenant_id (first 5): {empty:?} \
-                 — SubmitBuild tenant resolution silently dropped",
-                empty.len()
+                "build(s) {empty:?} submitted as tenant '{}' have empty \
+                 tenant_id — SubmitBuild resolution silently dropped",
+                ctx.tenant(0).name
             )))
         }
     }

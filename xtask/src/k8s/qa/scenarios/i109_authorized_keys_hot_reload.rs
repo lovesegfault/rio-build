@@ -43,9 +43,13 @@ impl Scenario for AuthorizedKeysHotReload {
         let (_, pub_line) = ssh::generate(comment)?;
         shared::merge_authorized_keys_batch(&ctx.kube, &[&pub_line]).await?;
 
-        // r[gw.keys.hot-reload]: kubelet ~60s + gateway 10s poll.
+        // r[gw.keys.hot-reload]: kubelet ~60s + gateway 10s poll. The
+        // 60s is kubelet's --sync-frequency CEILING — actual refresh
+        // is uniform-random within it, so tail can approach 70s. 90s
+        // budget left ~20s slack which proved tight under phase-2
+        // contention (i064 gateway-restart settling). Widen to 120s.
         let want = before_count + 1;
-        let reloaded = poll_until(Duration::from_secs(90), Duration::from_secs(5), || async {
+        let reloaded = poll_until(Duration::from_secs(120), Duration::from_secs(5), || async {
             let lines = logs_since_contain(ctx, NS_SYSTEM, &gw_pod, 95, "loaded authorized keys")?;
             // Any line whose count >= want proves the new key was seen.
             Ok(lines
@@ -71,7 +75,7 @@ impl Scenario for AuthorizedKeysHotReload {
             Ok(Verdict::Pass)
         } else {
             Ok(Verdict::Fail(format!(
-                "gateway did not log reload to count≥{want} within 90s — \
+                "gateway did not log reload to count≥{want} within 120s — \
                  authorized_keys hot-reload not firing"
             )))
         }

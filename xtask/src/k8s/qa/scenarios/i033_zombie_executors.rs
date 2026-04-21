@@ -51,7 +51,8 @@ impl Scenario for ZombieExecutors {
         let recovery_before = ctx
             .scrape_scheduler()
             .await?
-            .sum(r#"rio_scheduler_recovery_total{outcome="success"}"#);
+            .labeled("rio_scheduler_recovery_total", "outcome", "success")
+            .unwrap_or(0.0);
 
         kill_pod(ctx, NS_SYSTEM, &old_leader)?;
         let _ = wait_new_leader(ctx, &old_leader, Duration::from_secs(60)).await?;

@@ -211,10 +211,24 @@ async fn exec(
         pg,
         tenants,
     };
-    let verdict = match tokio::time::timeout(meta.timeout, s.run(&mut ctx)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => Verdict::Fail(format!("error: {e:#}")),
-        Err(_) => Verdict::Fail(format!("timeout after {:?}", meta.timeout)),
+    // Catch panics so one scenario's debug_assert / unwrap doesn't
+    // take down the whole run (and lose all other verdicts + leave
+    // phase-2 components held forever).
+    use futures_util::FutureExt;
+    let fut = std::panic::AssertUnwindSafe(tokio::time::timeout(meta.timeout, s.run(&mut ctx)))
+        .catch_unwind();
+    let verdict = match fut.await {
+        Ok(Ok(Ok(v))) => v,
+        Ok(Ok(Err(e))) => Verdict::Fail(format!("error: {e:#}")),
+        Ok(Err(_)) => Verdict::Fail(format!("timeout after {:?}", meta.timeout)),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic payload".into());
+            Verdict::Fail(format!("PANIC: {msg}"))
+        }
     };
     Outcome {
         id: meta.id,

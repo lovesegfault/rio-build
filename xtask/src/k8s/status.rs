@@ -398,6 +398,14 @@ impl Scrape {
 
     /// Sum of all series for `name` — what most counter-asserts want.
     pub(crate) fn sum(&self, name: &str) -> f64 {
+        // 3× independently this was called as sum("metric{label=v}")
+        // and silently returned 0.0 (i204, i212, wait_recovery_done).
+        // The map keys are bare names; label-filtered lookup is
+        // `labeled()`. Fail loud instead of silent-zero.
+        debug_assert!(
+            !name.contains('{'),
+            "Scrape::sum() takes a bare metric name; use labeled() for {name}"
+        );
         self.series(name).iter().map(|(_, v)| *v).sum()
     }
 
