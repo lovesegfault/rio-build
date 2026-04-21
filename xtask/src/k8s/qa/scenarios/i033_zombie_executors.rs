@@ -44,7 +44,11 @@ impl Scenario for ZombieExecutors {
         .await?;
         if warm.is_none() {
             bg.abort();
-            return Ok(Verdict::Skip("no worker came up within 60s".into()));
+            return Ok(Verdict::Fail(
+                "no worker connected to scheduler-leader within 60s of \
+                 submitting a build — dispatch/spawn-intent path broken"
+                    .into(),
+            ));
         }
 
         let old_leader = ctx.scheduler_leader().await?;

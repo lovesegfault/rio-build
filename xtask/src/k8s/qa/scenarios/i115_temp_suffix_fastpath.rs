@@ -72,8 +72,10 @@ impl Scenario for TempSuffixFastpath {
         bg.await??;
 
         if scraped == 0 {
-            return Ok(Verdict::Skip(
-                "no builder pod became scrapeable within 60s — cold-start dispatch slow?".into(),
+            return Ok(Verdict::Fail(
+                "no builder pod became scrapeable within 60s of submitting a \
+                 build — dispatch/spawn-intent path broken"
+                    .into(),
             ));
         }
         if reject_sum > 0.0 {

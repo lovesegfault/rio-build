@@ -29,8 +29,12 @@ impl Scenario for StoreKillSurvives {
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let stores = ctx.running_pods(NS_STORE, "app.kubernetes.io/name=rio-store")?;
         if stores.len() < 2 {
-            return Ok(Verdict::Skip(format!(
-                "only {} store replica(s) — need ≥2 for survivable kill",
+            // Chart deploys store.replicas≥2 on EKS for HA. <2 is a
+            // real misconfiguration (any store kill = total outage),
+            // not a precondition to skip.
+            return Ok(Verdict::Fail(format!(
+                "only {} store replica(s) Running — store HA broken \
+                 (chart sets replicas≥2; deploy or readiness issue)",
                 stores.len()
             )));
         }

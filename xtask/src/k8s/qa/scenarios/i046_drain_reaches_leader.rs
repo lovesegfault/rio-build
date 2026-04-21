@@ -42,7 +42,11 @@ impl Scenario for DrainReachesLeader {
         .await?;
         let Some(pod) = pod else {
             bg.abort();
-            return Ok(Verdict::Skip("no builder pod came up within 60s".into()));
+            return Ok(Verdict::Fail(
+                "no builder pod within 60s of submitting a build \
+                 — dispatch/spawn-intent path broken"
+                    .into(),
+            ));
         };
 
         // Graceful delete (default grace period) — SIGTERM → drain.

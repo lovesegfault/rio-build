@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::time::sleep;
 
-use super::common::any_builder;
+use super::common::{any_builder, poll_until};
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
 pub struct IdleExit;
@@ -30,12 +30,24 @@ impl Scenario for IdleExit {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        ctx.nix_build_via_gateway(0, "i116", 3, 1).await?;
-        let Some(pod) = any_builder(ctx)? else {
-            return Ok(Verdict::Skip(
-                "no running builder after build — already exited".into(),
+        // bg build that outlives the poll so the builder pod is
+        // observable WHILE running (the original blocking 3s build
+        // could finish + idle-exit before we sample).
+        let bg = ctx.nix_build_via_gateway_bg(0, "i116", 15, 1);
+        let pod = poll_until(Duration::from_secs(90), Duration::from_secs(3), || async {
+            any_builder(ctx)
+        })
+        .await?;
+        let Some(pod) = pod else {
+            bg.abort();
+            return Ok(Verdict::Fail(
+                "no running builder pod within 90s of submitting a build \
+                 — dispatch/spawn-intent path broken"
+                    .into(),
             ));
         };
+        // Let the build complete so the idle clock starts.
+        let _ = bg.await;
 
         sleep(IDLE_WINDOW).await;
 

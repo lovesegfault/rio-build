@@ -43,8 +43,10 @@ impl Scenario for RestartDrainsFods {
         .await?;
         if queued.is_none() {
             bg.abort();
-            return Ok(Verdict::Skip(
-                "build never queued (gateway path issue?)".into(),
+            return Ok(Verdict::Fail(
+                "submitted build never queued/running within 45s \
+                 — gateway→SubmitBuild→DAG-insert path broken"
+                    .into(),
             ));
         }
 

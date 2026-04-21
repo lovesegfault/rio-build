@@ -39,7 +39,14 @@ impl Scenario for NodepoolSchedulable {
         };
         let pools: Vec<_> = pools_out.split_whitespace().collect();
         if pools.is_empty() {
-            return Ok(Verdict::Skip("no NodePools defined".into()));
+            // CRD exists (line above succeeded) but zero NodePools — on
+            // EKS that means deploy didn't render karpenter.yaml, which
+            // is a real misconfiguration (no builders can ever spawn).
+            return Ok(Verdict::Fail(
+                "Karpenter NodePool CRD present but zero NodePools defined \
+                 — karpenter.yaml not rendered or all deleted"
+                    .into(),
+            ));
         }
 
         let controller_logs = ctx

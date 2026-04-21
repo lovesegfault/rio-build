@@ -41,7 +41,14 @@ impl Scenario for KvmFeatureless {
             .map(|(n, _)| n.to_string())
             .collect();
         if kvm_pools.is_empty() {
-            return Ok(Verdict::Skip("no kvm-feature pools defined".into()));
+            // x86-64-kvm + aarch64-kvm Pools are part of the standard
+            // deploy (POOLS_JSON / pool.yaml). Absent ⇒ kvm/nixos-test
+            // builds can never schedule — deployment-shape regression.
+            return Ok(Verdict::Fail(
+                "no Pool with features∋kvm defined — kvm/nixos-test builds \
+                 unschedulable (deploy didn't render kvm pools)"
+                    .into(),
+            ));
         }
 
         let bg = ctx.nix_build_via_gateway_bg(0, "i181", 20, 1);

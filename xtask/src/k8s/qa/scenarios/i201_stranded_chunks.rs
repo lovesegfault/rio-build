@@ -51,7 +51,9 @@ impl Scenario for StrandedChunks {
         .fetch_all(ctx.pg())
         .await?;
         if rows.is_empty() {
-            return Ok(Verdict::Skip("no referenced chunks in PG".into()));
+            // No chunks ⇒ no stranded chunks. Vacuously the assertion
+            // ("no PG-says-exists, S3-says-404 inconsistency") holds.
+            return Ok(Verdict::Pass);
         }
 
         let s = sh::shell()?;

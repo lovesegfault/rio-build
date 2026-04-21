@@ -83,9 +83,12 @@ impl Scenario for StaleRealisation {
         if detected == 1 {
             Ok(Verdict::Pass)
         } else {
-            Ok(Verdict::Skip(
-                "stale-realisation detection query returned 0 for seeded row — \
-                 schema differs from expected; adjust JOIN"
+            // Seeded a probe row that the detection query MUST find;
+            // 0 means the query (or schema assumption) is wrong, not
+            // a precondition miss. Loud Fail so it gets fixed.
+            Ok(Verdict::Fail(
+                "stale-realisation detection query returned 0 for the row \
+                 this scenario seeded — query/schema mismatch (fix the JOIN)"
                     .into(),
             ))
         }

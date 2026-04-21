@@ -35,17 +35,24 @@ impl Scenario for FloorHydrated {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // Find one terminal derivation with default (0) floor.
+        // Seed our own derivation row (don't rely on ambient state).
+        // The row exists once SubmitBuild's DAG-insert commits, so a
+        // completed trivial build guarantees one with floor_mem_bytes=0.
+        ctx.nix_build_via_gateway(0, "i208-seed", 3, 1).await?;
         let row = sqlx::query(
             "SELECT derivation_id FROM derivations \
              WHERE floor_mem_bytes = 0 \
-             AND status IN ('completed','poisoned') LIMIT 1",
+             AND status IN ('completed','poisoned') \
+             ORDER BY created_at DESC LIMIT 1",
         )
         .fetch_optional(ctx.pg())
         .await?;
         let Some(row) = row else {
-            return Ok(Verdict::Skip(
-                "no terminal derivation with floor_mem_bytes=0 to test against".into(),
+            return Ok(Verdict::Fail(
+                "no terminal derivation with floor_mem_bytes=0 even after \
+                 seeding one — DAG-insert wrote a non-zero default, or \
+                 status didn't reach completed"
+                    .into(),
             ));
         };
         let drv_id: sqlx::types::Uuid = row.try_get("derivation_id")?;
