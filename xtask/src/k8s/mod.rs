@@ -19,6 +19,7 @@ pub(crate) mod qa;
 pub mod shared;
 pub(crate) mod status;
 mod stress;
+mod wipe;
 
 use client as kube;
 
@@ -89,7 +90,7 @@ pub struct UpOpts {
     push: bool,
     /// helm upgrade rio chart.
     #[arg(long)]
-    deploy: bool,
+    pub(super) deploy: bool,
 
     // Namespaced per-phase opts. NO clap `requires` attribute —
     // validated at runtime by `validate_phase_opts()` so the
@@ -272,6 +273,16 @@ pub enum K8sCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Reset the data plane (S3 chunks, PG schema, tenants/builds,
+    /// builder Jobs, gateway authorized_keys) and redeploy.
+    /// Infrastructure (RDS instance, bucket, AMI, NodePools, tofu-
+    /// managed helm releases) is preserved. ~2min vs `destroy`+`up`'s
+    /// ~20min.
+    Wipe {
+        /// Skip the interactive confirm.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Open a tunnel to the gateway and run `nix build --store
     /// ssh-ng://rio@localhost:PORT <ARGS>`. Uses your SSH key (the
     /// pair of RIO_SSH_PUBKEY installed by `deploy`).
@@ -423,6 +434,23 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             p.destroy(cfg).await
         }
+        K8sCmd::Wipe { yes } => {
+            let what = match kind {
+                ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
+                    .map(|n| format!("EKS cluster '{n}'"))
+                    .unwrap_or_else(|_| "the EKS cluster".into()),
+                ProviderKind::K3s => "the local k3s rio deployment".into(),
+            };
+            if !yes
+                && !ui::confirm_destroy(&format!(
+                    "This will WIPE all rio data (S3 chunks, PG schema, tenants, builds) on {what}. \
+                     Infrastructure (RDS instance, bucket, AMI, NodePools) is preserved. Continue?"
+                ))?
+            {
+                bail!("wipe cancelled (use --yes to bypass)");
+            }
+            wipe::run(p, kind, cfg).await
+        }
         K8sCmd::RemoteStoreBuild { remote } => {
             with_remote_store(&*p, cfg, remote.port, |sh, store| {
                 let args = &remote.args;
@@ -492,7 +520,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 /// applicable here). Same distinction lets `validate_phase_opts`
 /// reject `--push --deploy-tenant foo` while accepting
 /// `--deploy-tenant foo` alone.
-async fn run_up(
+pub(super) async fn run_up(
     p: Arc<dyn Provider>,
     kind: ProviderKind,
     cfg: &XtaskConfig,

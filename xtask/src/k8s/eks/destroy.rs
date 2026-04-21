@@ -62,7 +62,7 @@ use crate::{tofu, ui};
 /// First exposed by destroying a cluster that never had the rio chart
 /// installed → no `pool` CRD → kubectl exits 1 with "the server doesn't
 /// have a resource type" on stderr → match missed → hard fail.
-async fn k(args: &[&str]) -> Result<()> {
+pub(in crate::k8s) async fn k(args: &[&str]) -> Result<()> {
     let sh = shell()?;
     sh::run_benign_if(cmd!(sh, "kubectl {args...}"), is_benign_destroy_failure).await
 }
@@ -133,33 +133,16 @@ async fn k_patch_all(ns: &str, kind: &str, patch: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(cfg: &XtaskConfig) -> Result<()> {
-    // A stale .terraform/ (init'd against a different account's tfstate
-    // bucket) makes tofu hang silently in S3 backend init — no output,
-    // no error, futex_wait forever. Re-init is cheap and idempotent.
-    super::init_backend(cfg).await?;
-
-    let cluster =
-        tofu::output(TF_DIR, "cluster_name").unwrap_or_else(|_| "(tofu output unavailable)".into());
-    info!("destroy target: EKS cluster '{cluster}'");
-
-    // Reachability gate: a re-run after partial tofu destroy has no
-    // cluster to talk to. Skip all kubectl steps and go straight to
-    // tofu destroy. Using a raw `kubectl version` as the probe — it
-    // fails fast and the failure mode (connection refused / no such
-    // host / Unauthorized) is exactly what we want to catch.
-    let sh = shell()?;
-    let cluster_reachable = sh::run(cmd!(sh, "kubectl version --request-timeout=5s"))
-        .await
-        .is_ok();
-    if !cluster_reachable {
-        warn!(
-            "kube-apiserver unreachable (cluster already deleted?); \
-             skipping kubectl steps and proceeding to tofu destroy"
-        );
-        return tofu_destroy().await;
-    }
-
+/// Steps 1–3 shared between `destroy` and `wipe`: kick off Pool CR
+/// deletion, `helm uninstall rio --wait`, then strip orphaned
+/// `*.rio.build` finalizers and wait for the Pool deletes to complete.
+/// After this returns, the chart's resources are gone and no rio CR
+/// has a finalizer that could wedge a subsequent namespace delete.
+///
+/// Provider-agnostic — kubectl/helm only. NodeClaim handling is
+/// caller-specific (destroy explicitly deletes; wipe waits for
+/// Karpenter to reconcile).
+pub(in crate::k8s) async fn uninstall_chart() -> Result<()> {
     // ── 1. Kick off pool CR deletion ───────────────────────────────
     // --wait=false: the drain finalizer holds these until step 3
     // strips it (controller will be gone after step 2). Deleting now
@@ -233,7 +216,37 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
         }
         Ok(())
     })
-    .await?;
+    .await
+}
+
+pub async fn run(cfg: &XtaskConfig) -> Result<()> {
+    // A stale .terraform/ (init'd against a different account's tfstate
+    // bucket) makes tofu hang silently in S3 backend init — no output,
+    // no error, futex_wait forever. Re-init is cheap and idempotent.
+    super::init_backend(cfg).await?;
+
+    let cluster =
+        tofu::output(TF_DIR, "cluster_name").unwrap_or_else(|_| "(tofu output unavailable)".into());
+    info!("destroy target: EKS cluster '{cluster}'");
+
+    // Reachability gate: a re-run after partial tofu destroy has no
+    // cluster to talk to. Skip all kubectl steps and go straight to
+    // tofu destroy. Using a raw `kubectl version` as the probe — it
+    // fails fast and the failure mode (connection refused / no such
+    // host / Unauthorized) is exactly what we want to catch.
+    let sh = shell()?;
+    let cluster_reachable = sh::run(cmd!(sh, "kubectl version --request-timeout=5s"))
+        .await
+        .is_ok();
+    if !cluster_reachable {
+        warn!(
+            "kube-apiserver unreachable (cluster already deleted?); \
+             skipping kubectl steps and proceeding to tofu destroy"
+        );
+        return tofu_destroy().await;
+    }
+
+    uninstall_chart().await?;
 
     // ── 4. Delete Karpenter NodeClaims ─────────────────────────────
     // Cluster-scoped. With NodePools gone (helm uninstall), Karpenter

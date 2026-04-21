@@ -10,7 +10,7 @@ use crate::{sh, tofu, ui};
 pub mod ami;
 mod bootstrap;
 pub(super) mod deploy;
-mod destroy;
+pub(in crate::k8s) mod destroy;
 mod push;
 // pub so k3s/smoke.rs can reuse the provider-agnostic chaos helpers
 // (tenant setup, ssh key, worker-kill, smoke_build).

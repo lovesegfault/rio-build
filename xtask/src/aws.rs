@@ -10,8 +10,12 @@
 
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use aws_config::{Region, SdkConfig, identity::IdentityCache};
-use tokio::sync::OnceCell;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use tokio::sync::{OnceCell, Semaphore};
+use tokio::task::JoinSet;
+use tracing::info;
 
 /// SSO/IMDS credential resolution can take >5s under contention
 /// (concurrent up-phases each hitting the SSO cache). 30s is generous
@@ -39,4 +43,66 @@ pub async fn config(region: Option<&str>) -> &'static SdkConfig {
             b.load().await
         })
         .await
+}
+
+/// Delete every object in `bucket`. Paginates `ListObjectsV2` (1000
+/// keys/page), streams pages into a bounded-concurrency `DeleteObjects`
+/// fan-out (1000 keys/call, max per S3 API). Bucket itself is left
+/// intact.
+///
+/// `aws s3 rm --recursive` is too slow at >100K objects; lifecycle
+/// rules are async (≤24h to fire) so unsuitable for a synchronous
+/// `wipe`. This is the lister→batched-DeleteObjects pattern at ~9K
+/// obj/s with `concurrency=8`.
+pub async fn empty_bucket(region: &str, bucket: &str) -> Result<usize> {
+    const CONCURRENCY: usize = 8;
+    let s3 = aws_sdk_s3::Client::new(config(Some(region)).await);
+    let sem = std::sync::Arc::new(Semaphore::new(CONCURRENCY));
+    let mut tasks: JoinSet<Result<usize>> = JoinSet::new();
+
+    let mut pages = s3.list_objects_v2().bucket(bucket).into_paginator().send();
+    while let Some(page) = pages.next().await {
+        let page = page.with_context(|| format!("ListObjectsV2 on s3://{bucket}"))?;
+        let objs: Vec<ObjectIdentifier> = page
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .map(|k| {
+                ObjectIdentifier::builder()
+                    .key(k)
+                    .build()
+                    .expect("key is set")
+            })
+            .collect();
+        if objs.is_empty() {
+            continue;
+        }
+        let n = objs.len();
+        let s3 = s3.clone();
+        let bucket = bucket.to_owned();
+        let permit = sem.clone().acquire_owned().await.expect("never closed");
+        tasks.spawn(async move {
+            let _permit = permit;
+            s3.delete_objects()
+                .bucket(&bucket)
+                .delete(
+                    Delete::builder()
+                        .set_objects(Some(objs))
+                        .quiet(true)
+                        .build()
+                        .expect("objects is set"),
+                )
+                .send()
+                .await
+                .with_context(|| format!("DeleteObjects on s3://{bucket}"))?;
+            Ok(n)
+        });
+    }
+
+    let mut deleted = 0usize;
+    while let Some(r) = tasks.join_next().await {
+        deleted += r.expect("delete task panicked")?;
+    }
+    info!("emptied s3://{bucket}: {deleted} objects deleted");
+    Ok(deleted)
 }
