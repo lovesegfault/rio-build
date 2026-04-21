@@ -60,6 +60,7 @@ let
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
+  substitute-scale = import ./scenarios/substitute-scale.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
@@ -676,6 +677,49 @@ in
         "componentScaler.store.max" = 4;
         "componentScaler.store.seedRatio" = 10;
       };
+    };
+  };
+
+  # r[verify ctrl.scaler.signal-substituting]
+  # r[verify store.substitute.admission]
+  # r[verify store.admin.get-load+2]
+  #   Substitution → ComponentScaler closed loop. 30-leaf substitutable
+  #   fanout against a 4-permit store admission gate: scheduler reports
+  #   substituting_derivations → ComponentScaler counts it (P1) →
+  #   desiredReplicas RISES (never drops mid-cascade) → GetLoad's
+  #   substitute_admission_utilization reaches CR.status (P2). Zero
+  #   builder pods for the leaves. ~7min (k3s + cache-seed + 90s poll).
+  #
+  # Distinct runNixOSTest name (rio-substitute-scale) — NOT a variant
+  # of rio-componentscaler / rio-substitute, so .#ci aggregate doesn't
+  # collide.
+  #
+  # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
+  # short-circuits without x-rio-tenant-token); the gateway must mint
+  # it from the SSH key comment. seedRatio=10 → 30 substituting leaves
+  # predict ceil(30/10)=3 > min=1. RIO_SUBSTITUTE_ADMISSION_PERMITS=1
+  # serializes the 30 fetches so (with 200ms tc-netem on upstream-v6)
+  # the cascade outlives the controller's 10s reconcile tick — at the
+  # default 4, tiny NARs drain in ~400ms and desiredReplicas never
+  # moves. store.extraEnv is a list — needs a values file, not --set.
+  vm-substitute-scale-k3s = substitute-scale {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      extraValuesTyped = {
+        "componentScaler.store.enabled" = true;
+        "componentScaler.store.min" = 1;
+        "componentScaler.store.max" = 4;
+        "componentScaler.store.seedRatio" = 10;
+      };
+      extraValuesFiles = [
+        (pkgs.writeText "subscale-store-env.yaml" ''
+          store:
+            extraEnv:
+              - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
+                value: "1"
+        '')
+      ];
     };
   };
 
