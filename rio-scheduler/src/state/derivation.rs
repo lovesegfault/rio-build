@@ -874,6 +874,19 @@ impl DerivationState {
         &self.drv_path
     }
 
+    /// True iff this node can be checked against `FindMissingPaths`:
+    /// every expected output path is known. Floating-CA
+    /// (`expected_output_paths == [""]`) and nodes submitted without
+    /// paths fail this — they cannot substitute by path and the
+    /// dispatch-time probe never stamps their `probed_generation`.
+    /// Shared by `batch_probe_cached_ready`, `ready_check_or_spawn`,
+    /// and `r[sched.admin.spawn-intents.probed-gate]` — all three MUST
+    /// agree or the gate dead-locks unprobeable nodes.
+    pub fn output_paths_probeable(&self) -> bool {
+        !self.expected_output_paths.is_empty()
+            && self.expected_output_paths.iter().all(|p| !p.is_empty())
+    }
+
     /// The derivation's `name` attribute, as encoded in the `.drv`
     /// store path (`{hash}-{name}.drv` → `{name}`). This is what
     /// Nix's `outputPathName` keys output-path name segments on —

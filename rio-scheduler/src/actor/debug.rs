@@ -315,9 +315,20 @@ impl DagActor {
     /// `resource_floor=zeros`; callers override via struct-update on
     /// [`crate::db::RecoveryDerivationRow::test_default`].
     pub(crate) fn test_inject_ready_row(&mut self, row: crate::db::RecoveryDerivationRow) {
+        let hash = row.drv_hash.clone();
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
             .expect("test_drv_path generates valid StorePath");
         self.dag.insert_recovered_node(state);
+        // r[sched.admin.spawn-intents.probed-gate]: injected nodes
+        // model "probed, not substitutable" so existing
+        // compute_spawn_intents filter tests stay focused on
+        // kind/system/feature logic. Reset via
+        // [`Self::test_set_probed_generation`] to model the
+        // SubstituteComplete cascade window.
+        self.dag
+            .node_mut(&hash)
+            .expect("just inserted")
+            .probed_generation = 1;
     }
 
     /// Set `sched.priority` on an already-injected node. For
@@ -325,6 +336,18 @@ impl DagActor {
     /// rows default to priority 0.0.
     pub(crate) fn test_set_priority(&mut self, hash: &str, p: f64) {
         self.dag.node_mut(hash).expect("node exists").sched.priority = p;
+    }
+
+    /// Set `probed_generation` on an already-injected node. For
+    /// `r[sched.admin.spawn-intents.probed-gate]` tests —
+    /// [`Self::test_inject_ready_row`] stamps `1` so injected nodes are
+    /// intent-eligible; reset to `0` to model the SubstituteComplete
+    /// cascade window (Ready, not yet probed).
+    pub(crate) fn test_set_probed_generation(&mut self, hash: &str, g: u64) {
+        self.dag
+            .node_mut(hash)
+            .expect("node exists")
+            .probed_generation = g;
     }
 
     /// Inject a Ready derivation with default fields. `is_fod` sets

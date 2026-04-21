@@ -545,8 +545,7 @@ impl DagActor {
             .filter(|(_, s)| {
                 s.status() == DerivationStatus::Ready
                     && s.probed_generation < probe_gen
-                    && !s.expected_output_paths.is_empty()
-                    && s.expected_output_paths.iter().all(|p| !p.is_empty())
+                    && s.output_paths_probeable()
             })
             .map(|(h, s)| (DrvHash::from(h), s.expected_output_paths.clone()))
             .collect();
@@ -933,10 +932,22 @@ impl DagActor {
             // (output_paths, persist, upsert_path_tenants, promote_
             // newly_ready, per-build events + completion check).
             self.complete_ready_from_store(drv_hash).await;
-            // promote_newly_ready pushed dependents to ready_queue;
-            // mark dirty so the next Tick dispatches them (this
-            // handler runs outside dispatch_ready's drain loop).
-            self.dispatch_dirty = true;
+            // r[impl sched.dispatch.substitute-complete-inline]
+            // promote_newly_ready pushed dependents to ready_queue at
+            // probed_generation=0. Probe inline so the cascade
+            // doesn't wait one Tick per layer; share the
+            // BECAME_IDLE_INLINE_CAP budget — fresh-cluster
+            // substitution can post thousands of these in a burst,
+            // and uncapped inline dispatch is the I-163 storm shape.
+            // Past the cap, `r[sched.admin.spawn-intents.probed-gate]`
+            // still suppresses spurious intents; the dependent just
+            // waits ≤1 Tick.
+            if self.became_idle_inline_this_tick < super::BECAME_IDLE_INLINE_CAP {
+                self.became_idle_inline_this_tick += 1;
+                self.dispatch_ready().await;
+            } else {
+                self.dispatch_dirty = true;
+            }
             return;
         }
         // r[impl sched.merge.substitute-topdown+3]
@@ -1077,9 +1088,7 @@ impl DagActor {
             // Floating-CA: output path unknown until built → nothing
             // to ask FindMissingPaths. Guard so an empty-paths edge
             // case can't fall through to "all present".
-            if state.expected_output_paths.is_empty()
-                || state.expected_output_paths.iter().any(String::is_empty)
-            {
+            if !state.output_paths_probeable() {
                 return false;
             }
             state.probed_generation = probe_gen;

@@ -1405,6 +1405,136 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 
 // ─── ADR-023 SlaEstimator → SpawnIntent ────────────────────────────────
 
+/// `compute_spawn_intents` skips Ready nodes with `probed_generation==0`.
+///
+/// Pre-fix: `handle_substitute_complete{ok=true}` promotes dependents
+/// Queued→Ready then defers their substitute-probe to the next Tick
+/// (`dispatch_dirty=true`). A `GetSpawnIntents` poll in that ≤1s window
+/// emitted intents → controller spawned Jobs → next Tick probed →
+/// dependents went Substituting→Completed → `reap_stale_for_intents`
+/// deleted the Pending Jobs 10s later. Fresh-cluster substitution
+/// cascades hit this once per DAG layer.
+///
+/// `queued_by_system` is intentionally NOT gated — it must match
+/// `ClusterSnapshot.queued_by_system` (snapshot.rs).
+// r[verify sched.admin.spawn-intents.probed-gate]
+#[tokio::test]
+async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig {
+            sla: test_sla_config(),
+            ..Default::default()
+        },
+        DagActorPlumbing {
+            store_client: Some(store_client),
+            ..Default::default()
+        },
+    );
+
+    // `probeable`: has expected_output_paths → gate applies.
+    // `unprobeable`: empty expected_output_paths (floating-CA / VM-test
+    // SubmitBuild shape) → batch_probe_cached_ready never stamps it →
+    // gate must NOT apply or it dead-locks at zero intents.
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        expected_output_paths: vec![test_store_path("probeable-out")],
+        ..crate::db::RecoveryDerivationRow::test_default("probeable", "x86_64-linux")
+    });
+    actor.test_inject_ready("unprobeable", None, "x86_64-linux", false);
+    actor.test_set_probed_generation("probeable", 0);
+    actor.test_set_probed_generation("unprobeable", 0);
+
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert_eq!(
+        snap.intents.len(),
+        1,
+        "probeable+gen=0 gated; unprobeable+gen=0 emits (gate exempt)"
+    );
+    assert_eq!(snap.intents[0].intent_id, "unprobeable");
+    assert_eq!(
+        snap.queued_by_system.get("x86_64-linux"),
+        Some(&2),
+        "queued_by_system counts both (matches ClusterSnapshot, gate-independent)"
+    );
+
+    actor.test_set_probed_generation("probeable", 1);
+    let snap = actor.compute_spawn_intents(&Default::default());
+    assert_eq!(snap.intents.len(), 2, "post-probe: both emit SpawnIntent");
+
+    Ok(())
+}
+
+/// `handle_substitute_complete{ok=true}` calls `dispatch_ready` inline
+/// (under [`BECAME_IDLE_INLINE_CAP`](crate::actor::BECAME_IDLE_INLINE_CAP))
+/// so cascade-promoted dependents are probed in the same handler, not
+/// deferred to the next Tick.
+///
+/// Pre-fix: only `dispatch_dirty=true` → dependent sat Ready+unprobed
+/// for ≤1s. Combined with `r[sched.admin.spawn-intents.probed-gate]`,
+/// that's correct but adds 1 Tick latency per cascade layer; this
+/// keeps cold-start cascades tight.
+// r[verify sched.dispatch.substitute-complete-inline]
+#[tokio::test]
+async fn substitute_complete_inline_probes_dependents() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let dep_out = test_store_path("sub-chain-dep-out");
+    let tgt_out = test_store_path("sub-chain-tgt-out");
+    let mut dep = make_node("sub-chain-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    let mut tgt = make_node("sub-chain-tgt");
+    tgt.expected_output_paths = vec![tgt_out.clone()];
+
+    // Seed ONLY dep so merge-time `check_cached_outputs` (which probes
+    // Queued nodes too) misses tgt. Arm the QPI gate so dep's detached
+    // fetch PARKS — we control SubstituteComplete arrival explicitly.
+    store.state.substitutable.write().unwrap().push(dep_out);
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![dep, tgt],
+        vec![make_test_edge("sub-chain-tgt", "sub-chain-dep")],
+        false,
+    )
+    .await?;
+    wait_for_status(&handle, "sub-chain-dep", DerivationStatus::Substituting).await;
+    assert_eq!(
+        expect_drv(&handle, "sub-chain-tgt").await.status,
+        DerivationStatus::Queued,
+        "precondition: tgt waits on dep"
+    );
+
+    // Seed tgt; explicitly post SubstituteComplete{dep,ok=true}. The
+    // parked real fetch will later post a duplicate that the
+    // `status!=Substituting` guard drops.
+    store.state.substitutable.write().unwrap().push(tgt_out);
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "sub-chain-dep".into(),
+            ok: true,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let tgt_status = expect_drv(&handle, "sub-chain-tgt").await.status;
+    assert_ne!(
+        tgt_status,
+        DerivationStatus::Ready,
+        "SubstituteComplete must inline-probe promoted dependents \
+         (got Ready ⇒ only dispatch_dirty=true, deferred to next Tick)"
+    );
+    Ok(())
+}
+
 /// `compute_spawn_intents` emits one SpawnIntent per Ready derivation,
 /// with `intent_id == drv_hash` and `cores ≈ solve_mvp(c_star)` for a
 /// fitted key. Unfitted keys (no SlaEstimator entry) get probe defaults.

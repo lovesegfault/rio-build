@@ -173,6 +173,7 @@ impl DagActor {
     pub(crate) fn compute_spawn_intents(&self, req: &SpawnIntentsRequest) -> SpawnIntentsSnapshot {
         let mut intents = Vec::new();
         let mut queued_by_system: HashMap<String, u64> = HashMap::new();
+        let probe_gate = self.store_client.is_some();
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {
@@ -183,6 +184,23 @@ impl DagActor {
             // (the ComponentScaler reads this independent of which
             // pool asked).
             *queued_by_system.entry(state.system.clone()).or_default() += 1;
+
+            // r[impl sched.admin.spawn-intents.probed-gate]
+            // SubstituteComplete{ok=true} promotes dependents
+            // Queued→Ready then defers their probe to next Tick. A
+            // poll in that ≤1s window would spawn pods that get
+            // reaped 10s later when the probe finds them
+            // substitutable. probed_generation==0 ⇔ "never probed
+            // since insert/recovery"; the inline-dispatch carve-out
+            // in `handle_substitute_complete` keeps this window
+            // narrow (≤BECAME_IDLE_INLINE_CAP per Tick fall-through).
+            // The gate is moot when there is no store (test-only;
+            // `batch_probe_cached_ready` early-returns without
+            // stamping) or when the node is unprobeable (floating-CA
+            // / no expected_output_paths — probe never stamps it).
+            if probe_gate && state.probed_generation == 0 && state.output_paths_probeable() {
+                continue;
+            }
 
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
             // r[impl sched.admin.spawn-intents.feature-filter]
