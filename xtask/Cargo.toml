@@ -25,6 +25,10 @@ tokio = { workspace = true, features = ["full"] }
 futures-util.workspace = true
 async-trait.workspace = true
 
+# gRPC (qa scenarios: i026 health probe)
+tonic = { workspace = true, features = ["transport"] }
+tonic-health.workspace = true
+
 # Shell-out
 xshell.workspace = true
 

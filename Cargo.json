@@ -30311,6 +30311,14 @@
           "packageId": "aws-smithy-runtime"
         },
         {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
+          "name": "axum-core",
+          "packageId": "axum-core"
+        },
+        {
           "name": "base16ct",
           "packageId": "base16ct 0.2.0"
         },
@@ -31345,6 +31353,14 @@
         {
           "name": "toml",
           "packageId": "toml 1.1.2+spec-1.1.0"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tonic-health",
+          "packageId": "tonic-health"
         },
         {
           "name": "tracing",

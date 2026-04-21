@@ -34,36 +34,27 @@ impl Scenario for SchedulerHealth {
         // The scheduler image is intentionally minimal
         // (r[sec.image.control-plane-minimal]) — no `grpc-health-probe`
         // inside. Probe from OUTSIDE: port-forward to the leader pod's
-        // 9001 and call grpc.health.v1.Health/Check via grpcurl (in the
-        // dev shell). This is the exact probe BalancedChannel does, so
-        // it's the I-026 signature directly.
+        // 9001 and call Health/Check via tonic-health directly (same
+        // probe BalancedChannel does — the I-026 signature). grpcurl
+        // would work but the server doesn't expose reflection.
         let (port, _guard) = shared::port_forward(NS, &format!("pod/{leader}"), 0, 9001).await?;
-        let s = crate::sh::shell()?;
-        let body = format!(r#"{{"service":"{SERVICE}"}}"#);
-        let addr = format!("localhost:{port}");
-        let out = crate::sh::try_read(crate::sh::cmd!(
-            s,
-            "grpcurl -plaintext -d {body} {addr} grpc.health.v1.Health/Check"
-        ));
-        match out {
-            Ok(o) if o.contains("SERVING") => Ok(Verdict::Pass),
-            Ok(o) => Ok(Verdict::Fail(format!(
-                "leader {leader} health for {SERVICE} != SERVING: {o:?} \
+        let ch = tonic::transport::Channel::from_shared(format!("http://localhost:{port}"))?
+            .connect()
+            .await?;
+        let status = tonic_health::pb::health_client::HealthClient::new(ch)
+            .check(tonic_health::pb::HealthCheckRequest {
+                service: SERVICE.into(),
+            })
+            .await?
+            .into_inner()
+            .status();
+        if status == tonic_health::pb::health_check_response::ServingStatus::Serving {
+            Ok(Verdict::Pass)
+        } else {
+            Ok(Verdict::Fail(format!(
+                "leader {leader} health for {SERVICE} = {status:?} \
                  — leader-acquire didn't flip the per-service reporter"
-            ))),
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if msg.contains("NOT_SERVING") || msg.to_lowercase().contains("not serving") {
-                    Ok(Verdict::Fail(format!(
-                        "leader {leader} health for {SERVICE} = NOT_SERVING \
-                         — leader-acquire didn't flip the per-service reporter"
-                    )))
-                } else {
-                    // grpcurl invocation itself failed (binary missing,
-                    // port-forward race) — treat as scenario error.
-                    Err(e)
-                }
-            }
+            )))
         }
     }
 }

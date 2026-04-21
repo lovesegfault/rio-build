@@ -144,7 +144,21 @@ async fn run_inner(
         for line in out_lines.lines().chain(err_buf.lines()) {
             ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
         }
-        bail!("{argv}: {status}");
+        // Fold the last few stderr lines into the Error so callers
+        // matching on failure text (qa's gateway_build retry, anything
+        // else that needs to discriminate transient vs permanent)
+        // actually see it. Previously the error was "{argv}: exit
+        // status N" only, making the qa JWT-retry a no-op.
+        let tail: String = err_buf
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" / ");
+        bail!("{argv}: {status}: {tail}");
     }
     Ok(out_buf.trim_end().to_string())
 }
@@ -155,10 +169,9 @@ async fn run_inner(
 /// failure text means "already done" — e.g. `kubectl delete` →
 /// `NotFound`, `helm uninstall` → `cluster unreachable`.
 ///
-/// [`run`]'s error chain is `"{argv}: exit status N"` only (stderr is
-/// printed to the terminal but not folded into the `anyhow::Error`), so
-/// matching stderr substrings against a [`run`] result is dead code.
-/// This helper captures stderr into the predicate's input. Output is
+/// [`run`]'s error chain now includes the last 5 stderr lines, but only
+/// the TAIL — for matching on a specific line that may be earlier, this
+/// helper captures the FULL output into the predicate's input. Output is
 /// teed (echoed live at `info!` AND accumulated) so long `--wait
 /// --timeout=...` commands still show progress.
 pub fn run_benign_if(

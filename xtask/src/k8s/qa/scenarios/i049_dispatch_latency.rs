@@ -28,7 +28,11 @@ impl Scenario for DispatchLatency {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // 5s of busywork; everything above that is overhead.
+        // The threshold is meaningless under phase-1 contention (10+
+        // scenarios submitting concurrently → cold-start + queuing →
+        // 95s observed on a 5s build). Warm a builder first so the
+        // measured build is dispatch+execute only, not provision.
+        ctx.nix_build_via_gateway(0, "i049-warmup", 3, 1).await?;
         let start = Instant::now();
         ctx.nix_build_via_gateway(0, "i049", 5, 1).await?;
         let elapsed = start.elapsed();

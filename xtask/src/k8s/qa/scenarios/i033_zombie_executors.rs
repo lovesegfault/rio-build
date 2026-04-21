@@ -76,7 +76,8 @@ impl Scenario for ZombieExecutors {
         // The DebugListExecutors RPC is exposed via `rio-cli workers
         // --actor` (not a separate subcommand). JSON shape is
         // DebugListExecutorsResponse: {"executors":[{executor_id,
-        // has_stream, ...}]}.
+        // has_stream, ...}]}. The original CliCtx's port-forward points
+        // at the leader we just killed → transport error. Re-open.
         #[derive(serde::Deserialize)]
         struct DebugExecutor {
             executor_id: String,
@@ -86,7 +87,10 @@ impl Scenario for ZombieExecutors {
         struct DebugList {
             executors: Vec<DebugExecutor>,
         }
-        let dl: DebugList = ctx.cli_json(&["workers", "--actor"])?;
+        let cli2 = crate::k8s::eks::smoke::CliCtx::open(&ctx.kube, 0, 0).await?;
+        let out = cli2.run(&["--json", "workers", "--actor"])?;
+        let dl: DebugList = serde_json::from_str(&out)
+            .map_err(|e| anyhow::anyhow!("workers --actor json: {e}: {out}"))?;
         let zombies: Vec<_> = dl
             .executors
             .iter()
