@@ -59,10 +59,6 @@ impl StoreServiceImpl {
         let Some(tid) = tenant_id else {
             return Ok(true); // anonymous → unfiltered
         };
-        // No substituter → no substituted paths to gate.
-        if self.substituter.is_none() {
-            return Ok(true);
-        }
         // r[impl gw.jwt.anon-drv-lookup]
         // .drv files are build INPUTS, not tenant-owned outputs — exempt
         // from tenant-scoped visibility. Gateway-side `jwt_unless_drv`
@@ -92,15 +88,26 @@ impl StoreServiceImpl {
         .map(|(o, a): (Option<bool>, bool)| (o.unwrap_or(false), a))
         .status_internal("sig_visibility_gate: path_tenants")?;
 
-        if owned || any_built {
-            // Built path (someone `path_tenants`'d it). Not
-            // substitution-only → skip gate. The freshly-PutPath'd
-            // case (count=0) falls through to the cluster-key union
-            // below — NOT this branch.
+        if owned {
             return Ok(true);
         }
+        if any_built {
+            // I-217: built by ANOTHER tenant only. Previously this
+            // returned `true` (any-built ⇒ visible), leaking every
+            // tenant's outputs to every other tenant. Isolation is the
+            // policy: not-owned ⇒ not-visible. The chunks underneath
+            // are still shared (dedup) — only narinfo visibility is
+            // gated, so B building the SAME drv later gets its own
+            // `path_tenants` row and becomes `owned`.
+            return Ok(false);
+        }
 
-        // Zero path_tenants rows → substitution-only path. Gate it.
+        // Zero path_tenants rows → substitution-only OR freshly-PutPath
+        // (scheduler hasn't yet upserted). Sig-verify against the
+        // tenant's trusted set ∪ cluster key. With no substituter
+        // configured, the trusted set is just the cluster key (and
+        // tenant's own keypair) — a path the tenant just PutPath'd is
+        // rio-signed and passes; anything else is invisible.
         let trusted = self.tenant_trusted_set(tid).await?;
         if trusted.is_empty() {
             // Tenant trusts no upstream keys AND no signer configured
@@ -182,33 +189,44 @@ impl StoreServiceImpl {
         present: &[String],
     ) -> Result<HashSet<String>, Status> {
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
-        // No substituter → no substituted paths exist to gate.
-        if tenant_id.is_none() || self.substituter.is_none() || present.is_empty() {
+        if tenant_id.is_none() || present.is_empty() {
             return Ok(present.iter().cloned().collect());
         }
         let tid = tenant_id.unwrap();
 
-        // Built set: any path with ≥1 path_tenants row skips the gate.
-        // One round-trip via UNNEST + GROUP BY HAVING count>0. Compute
-        // path hashes here (same digest as ValidatedPathInfo::
-        // sha256_digest — sha256(full path string)).
+        // I-217: per-path (owned, any_built) in one round-trip. Pre-fix
+        // this was "any path with ≥1 row → visible to ALL", leaking
+        // every tenant's outputs. Now: owned → visible; any_built &&
+        // !owned → hidden; neither → sig-verify.
         use sha2::{Digest, Sha256};
         let hashes: Vec<Vec<u8>> = present
             .iter()
             .map(|p| Sha256::digest(p.as_bytes()).to_vec())
             .collect();
-        let built_hashes: HashSet<Vec<u8>> = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT pt.store_path_hash \
+        #[derive(sqlx::FromRow)]
+        struct OwnBuilt {
+            h: Vec<u8>,
+            owned: bool,
+        }
+        let rows: Vec<OwnBuilt> = sqlx::query_as(
+            "SELECT pt.store_path_hash AS h, \
+                    bool_or(pt.tenant_id = $2) AS owned \
              FROM path_tenants pt \
              JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h \
              GROUP BY pt.store_path_hash",
         )
         .bind(&hashes)
+        .bind(tid)
         .fetch_all(&self.pool)
         .await
-        .status_internal("sig_visibility_gate_batch: path_tenants")?
-        .into_iter()
-        .collect();
+        .status_internal("sig_visibility_gate_batch: path_tenants")?;
+        let owned_hashes: HashSet<Vec<u8>> = rows
+            .iter()
+            .filter(|r| r.owned)
+            .map(|r| r.h.clone())
+            .collect();
+        let built_not_owned: HashSet<Vec<u8>> =
+            rows.into_iter().filter(|r| !r.owned).map(|r| r.h).collect();
 
         let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
         let mut subst_only: Vec<String> = Vec::new();
@@ -219,8 +237,11 @@ impl StoreServiceImpl {
             // (mirrors gateway-side `jwt_unless_drv`). Without this,
             // `wopQueryValidPaths` reports a .drv missing while
             // `wopIsValidPath` reports it valid for the same path/JWT.
-            if built_hashes.contains(h) || p.ends_with(".drv") {
+            if p.ends_with(".drv") || owned_hashes.contains(h) {
                 visible.insert(p.clone());
+            } else if built_not_owned.contains(h) {
+                // I-217: built by another tenant → hidden (NOT visible,
+                // NOT sig-verified).
             } else {
                 subst_only.push(p.clone());
             }
@@ -613,8 +634,10 @@ mod tests {
             "anonymous → unfiltered"
         );
 
-        // — Built-path exemption: once ANY tenant has a path_tenants
-        //   row, the gate is bypassed (built paths are trusted) —
+        // — I-217: built-path isolation. A's `path_tenants` row makes the
+        //   path visible to A (owner) and HIDDEN from C (not owner, sig
+        //   doesn't verify). Pre-I-217 this was an "any-built ⇒ visible"
+        //   bypass that leaked every tenant's outputs to every other.
         sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
             .bind(stored.store_path.sha256_digest().as_slice())
             .bind(tid_a)
@@ -622,12 +645,90 @@ mod tests {
             .await
             .unwrap();
 
-        // Now even C (who doesn't trust K) sees it — built paths skip
-        // the gate.
         assert!(
-            svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
-            "built path (any path_tenants row) → gate bypassed"
+            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            "A owns the path → visible to A"
         );
+        assert!(
+            !svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
+            "I-217: A built it, C didn't → HIDDEN from C (was leak pre-fix)"
+        );
+        // B also doesn't own it but trusts K (the sig). With any_built
+        // taking precedence over sig-verify (built-by-another ⇒ hidden,
+        // full stop), B is also hidden — correct: a substituted-then-
+        // built path is now tenant-owned, not "still public via sig".
+        assert!(
+            !svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            "I-217: built-by-another takes precedence over sig-trust"
+        );
+    }
+
+    // r[verify store.tenant.narinfo-filter]
+    /// I-217 regression: with NO substituter configured, the gate must
+    /// still isolate. Pre-fix, `substituter.is_none()` short-circuited
+    /// to visible-for-all.
+    #[tokio::test]
+    async fn sig_visibility_gate_isolates_without_substituter() {
+        use crate::test_helpers::seed_tenant;
+        use rio_test_support::TestDb;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // NO .with_substituter() — this is the I-217 trigger.
+        let svc = StoreServiceImpl::new(db.pool.clone());
+
+        let tid_a = seed_tenant(&db.pool, "i217-a").await;
+        let tid_b = seed_tenant(&db.pool, "i217-b").await;
+
+        let path = test_store_path("i217-output");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"i217");
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = info.clone();
+        stored.store_path_hash = path_hash.to_vec();
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into())
+            .await
+            .unwrap();
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A built it.
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(stored.store_path.sha256_digest().as_slice())
+            .bind(tid_a)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            "A owns it → visible to A (substituter=None)"
+        );
+        assert!(
+            !svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            "I-217: B does NOT own it → hidden (substituter=None must not bypass)"
+        );
+        assert!(
+            svc.sig_visibility_gate(None, &stored).await.unwrap(),
+            "anonymous → unfiltered (spec carve-out)"
+        );
+
+        // Batch variant must agree.
+        let vis_a = svc
+            .sig_visibility_gate_batch(Some(tid_a), &[path.clone()])
+            .await
+            .unwrap();
+        assert!(vis_a.contains(&path), "batch: A owns it → visible");
+        let vis_b = svc
+            .sig_visibility_gate_batch(Some(tid_b), &[path.clone()])
+            .await
+            .unwrap();
+        assert!(!vis_b.contains(&path), "batch: B doesn't own it → hidden");
     }
 
     // r[verify store.tenant.sign-key]
