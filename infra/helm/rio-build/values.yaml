@@ -229,11 +229,12 @@ store:
   # DNS + postgres + S3 VPC endpoint).
   upstreamCaches: []
   # - host: cache.nixos.org
-  # Max concurrent S3 PutObject calls per put_chunked. With
-  # scheduler.substituteMaxConcurrent=16 (below), 16*32=512 in-flight
-  # S3 puts under full substitution burst — kept under the aws-sdk
-  # ~1024 default pool. Lower if DispatchFailure appears in store
-  # logs during large-NAR ingest (but try s3MaxAttempts first).
+  # Max concurrent S3 PutObject calls per put_chunked. Per-replica
+  # admission (r[store.substitute.admission]) bounds how many
+  # put_chunked calls run at once; this bounds fan-out WITHIN one.
+  # Product `substituteAdmissionPermits × this` should sit under the
+  # aws-sdk connection pool. Lower if DispatchFailure appears in
+  # store logs during large-NAR ingest (try s3MaxAttempts first).
   chunkUploadMaxConcurrent: 32
   # aws-sdk retry ceiling per S3 op. Raised from sdk default (3) —
   # S3-compatible backends (Rook RGW, MinIO) recycle idle connections
@@ -260,6 +261,10 @@ store:
   # Pools also set idle_timeout=60s so a burst-grown pool shrinks back;
   # live pg_pool_util ≈ 0.01 ⇒ ~0.5 conns actually in use (I-171).
   pgMaxConnections: 20
+  # Per-replica r[store.substitute.admission] gate. Unset → derived as
+  # (pgMaxConnections × 3).clamp(64, 256). Override only when the
+  # derived value mis-tracks the upstream-fetch bottleneck.
+  # substituteAdmissionPermits: 128
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
@@ -318,11 +323,11 @@ scheduler:
   # Build logs flush to S3 from the scheduler (log aggregation lives here,
   # not the store). Empty → logs stay in PG only.
   logS3Bucket: ""
-  # Max concurrent substitute eager-fetch calls at merge time. Bounds the
-  # QueryPathInfo fan-out so the store's S3 connection pool doesn't
-  # saturate. Raise if the store runs with a larger aws-sdk pool; lower
-  # if you see "dispatch failure" demotes in scheduler logs.
-  substituteMaxConcurrent: 16
+  # Scheduler-side substitute fan-out is DEFAULT_SUBSTITUTE_CONCURRENCY=256
+  # (a memory-safety bound on detached tokio tasks, NOT a throughput knob).
+  # Per-replica throttling lives in the store: r[store.substitute.admission].
+  # RIO_SUBSTITUTE_MAX_CONCURRENT remains an operator escape hatch (env)
+  # but is intentionally not chart-set.
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =

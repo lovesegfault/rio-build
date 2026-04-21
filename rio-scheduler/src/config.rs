@@ -69,9 +69,11 @@ pub(super) struct Config {
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
     pub(super) retry: rio_scheduler::RetryPolicy,
-    /// Max concurrent detached substitute-fetch tasks
-    /// (r[sched.substitute.detached]). Sizes `DagActor.substitute_sem`.
-    /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 256.
+    /// In-flight detached substitute-fetch task bound
+    /// (r[sched.substitute.detached]) — memory-safety only; per-replica
+    /// throttling is `r[store.substitute.admission]`. Sizes
+    /// `DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`
+    /// (operator escape hatch — not chart-set). Default 256.
     #[serde(default = "default_substitute_concurrency")]
     pub(super) substitute_max_concurrent: usize,
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`

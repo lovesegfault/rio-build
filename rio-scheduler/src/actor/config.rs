@@ -33,8 +33,11 @@ pub struct DagActorConfig {
     /// QueryPathInfo). Tests that arm a hung MockStore override to 3s
     /// for the wrapper-exists proof.
     pub grpc_timeout: std::time::Duration,
-    /// Max in-flight `QueryPathInfo` calls during merge-time eager
-    /// substitute fetch. Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
+    /// In-flight detached substitute-fetch task bound — memory-safety
+    /// only, NOT a throughput throttle. Per-replica admission is
+    /// `r[store.substitute.admission]`; saturation surfaces as
+    /// `ResourceExhausted` → handled by `SUBSTITUTE_FETCH_BACKOFF`.
+    /// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
     pub substitute_max_concurrent: usize,
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is

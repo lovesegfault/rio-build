@@ -100,13 +100,14 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// of dropping the receiver (see `bridge_build_events`).
 pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 
-/// Default cap on concurrent detached substitute-fetch tasks. Each
-/// task acquires a `DagActor.substitute_sem` permit before its
-/// `QueryPathInfo`; the store's `try_substitute` walks the runtime
-/// closure recursively, so 256 in-flight tasks share substantially
-/// fewer concurrent NAR downloads (hub paths singleflight). Per-call
-/// transient failures retry with [`SUBSTITUTE_FETCH_BACKOFF`].
-/// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
+/// Default cap on concurrent detached substitute-fetch tasks: an
+/// in-flight detached-task MEMORY bound, NOT a throughput throttle.
+/// Per-replica admission is `r[store.substitute.admission]` (the store
+/// owns the gate); saturation surfaces here as `ResourceExhausted` and
+/// is handled by [`SUBSTITUTE_FETCH_BACKOFF`]. Each task acquires a
+/// `DagActor.substitute_sem` permit before its `QueryPathInfo`.
+/// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT` (operator escape
+/// hatch — not chart-set).
 pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
 
 /// Retry policy for the detached substitute fetch's `QueryPathInfo`.

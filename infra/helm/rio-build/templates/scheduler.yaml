@@ -92,8 +92,6 @@ spec:
             - name: RIO_LOG_S3_BUCKET
               value: {{ $s.logS3Bucket | quote }}
             {{- end }}
-            - name: RIO_SUBSTITUTE_MAX_CONCURRENT
-              value: {{ $s.substituteMaxConcurrent | quote }}
             # D3: scheduler serves gRPC-Web natively; CORS allow-origins
             # come from values.yaml dashboard.cors.allowOrigins (the same
             # list previously rendered into the Envoy SecurityPolicy CRD).

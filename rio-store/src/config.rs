@@ -96,13 +96,12 @@ pub(crate) struct Config {
     /// Default: `["rio-gateway", "rio-scheduler"]`.
     pub service_bypass_callers: Vec<String>,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
-    /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT` (scheduler
-    /// side; helm-default 16, code-default 256, P0473) this caps
-    /// total in-flight S3 puts at ~512 under helm settings, under
-    /// the aws-sdk's ~1024 default pool. Raise if the
-    /// store runs with a larger aws-sdk pool; lower (min 1) if you see
-    /// `DispatchFailure` in store logs during large-NAR ingest.
-    /// Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
+    /// Default 32. Per-replica `r[store.substitute.admission]` bounds
+    /// concurrent `put_chunked` calls; `substitute_admission_permits
+    /// × this` is the per-replica in-flight PutObject ceiling. Raise
+    /// if the store runs with a larger aws-sdk pool; lower (min 1)
+    /// if you see `DispatchFailure` in store logs during large-NAR
+    /// ingest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
     pub chunk_upload_max_concurrent: usize,
     /// Max aws-sdk retry attempts per S3 operation (PutObject,
     /// GetObject, HeadObject). Default 10 — raised from the aws-sdk

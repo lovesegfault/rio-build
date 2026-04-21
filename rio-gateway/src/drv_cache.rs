@@ -84,8 +84,8 @@ pub(crate) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Max in-flight `GetPath` calls during BFS .drv resolution. The store's
 /// `inline_blob` reads are tiny (.drv NARs are KB-range) so the bound is
-/// mostly to cap connection-pool fan-out, same rationale as the
-/// scheduler's `DEFAULT_SUBSTITUTE_CONCURRENCY`. 32 matches I-052's
+/// a gateway-side connection-pool fan-out cap — independent of the
+/// store's per-replica admission. 32 matches I-052's
 /// `wopAddMultipleToStore` pipeline depth.
 pub(crate) const BFS_FETCH_CONCURRENCY: usize = 32;
 
