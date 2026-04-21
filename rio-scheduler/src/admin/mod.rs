@@ -29,16 +29,16 @@ use rio_proto::types::{
     AckSpawnedIntentsRequest, AppendInterruptSampleRequest, BuildLogChunk, CancelBuildRequest,
     CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest, ExportSlaCorpusResponse,
-    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
-    GetSpawnIntentsRequest, GetSpawnIntentsResponse, ImportSlaCorpusRequest,
-    ImportSlaCorpusResponse, InjectBuildSampleRequest, InspectBuildDagRequest,
-    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
-    ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest, ListSlaOverridesResponse,
-    ListTenantsResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
-    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
-    SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest, SlaStatusResponse,
-    TerminationReason,
+    DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
+    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
+    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
+    ListSlaOverridesResponse, ListTenantsResponse, PoisonedDerivation,
+    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
+    SetSlaOverrideRequest, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
+    SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -587,6 +587,21 @@ impl AdminService for AdminServiceImpl {
         let req = request.into_inner();
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = tenants::create_tenant(&db, req).await?;
+        Ok(Response::new(resp))
+    }
+
+    // r[impl sched.admin.delete-tenant]
+    #[instrument(skip(self, request), fields(rpc = "DeleteTenant"))]
+    async fn delete_tenant(
+        &self,
+        request: Request<DeleteTenantRequest>,
+    ) -> Result<Response<DeleteTenantResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
+        self.ensure_leader()?;
+        let req = request.into_inner();
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let resp = tenants::delete_tenant(&db, req).await?;
         Ok(Response::new(resp))
     }
 

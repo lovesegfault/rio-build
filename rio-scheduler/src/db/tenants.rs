@@ -85,4 +85,15 @@ impl SchedulerDb {
         .fetch_optional(&self.pool)
         .await
     }
+
+    /// Delete a tenant by name. Returns rows_affected > 0. FK CASCADE
+    /// (tenant_keys/upstreams/path_tenants/chunk_tenants) and SET NULL
+    /// (builds/derivations) handle the rest — see migrations 009/012/
+    /// 017/018/026.
+    pub(crate) async fn delete_tenant(&self, name: &str) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query!("DELETE FROM tenants WHERE tenant_name = $1", name)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
 }

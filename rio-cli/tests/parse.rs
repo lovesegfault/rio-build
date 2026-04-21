@@ -60,6 +60,7 @@ fn assert_rejected(args: &[&str]) {
 /// fails CI instead of silently losing coverage.
 const ALL_SUBCOMMANDS: &[&str] = &[
     "create-tenant",
+    "delete-tenant",
     "list-tenants",
     "status",
     "workers",

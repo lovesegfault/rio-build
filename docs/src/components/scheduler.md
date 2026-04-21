@@ -176,6 +176,9 @@ r[sched.admin.list-tenants]
 r[sched.admin.create-tenant]
 `AdminService.CreateTenant` inserts a new tenant row. `tenant_name` is required (empty → `INVALID_ARGUMENT`). On name collision or cache_token collision, returns `ALREADY_EXISTS`. On success, returns the created `TenantInfo` including the generated UUID.
 
+r[sched.admin.delete-tenant]
+`AdminService.DeleteTenant` removes a tenant row by name. FK constraints handle the rest: `tenant_keys`/`tenant_upstreams`/`path_tenants`/`chunk_tenants` `ON DELETE CASCADE`; `builds.tenant_id`/`derivations.tenant_id` `ON DELETE SET NULL` (content-addressed, shared across tenants — they outlive the tenant). Unknown name → `NOT_FOUND`. Primary use case is `xtask k8s qa --scenarios` ephemeral-tenant cleanup; no soft-delete or audit trail.
+
 r[sched.admin.spawn-intents]
 `AdminService.GetSpawnIntents` returns one `SpawnIntent` per Ready derivation, optionally filtered server-side by `{kind, systems, features}`. `intent_id == drv_hash`; `(cores, mem_bytes, disk_bytes, deadline_secs)` are computed by `solve_intent_for` so the controller spawns and the scheduler dispatches the SAME shape. `queued_by_system` carries the unfiltered per-system Ready breakdown (sum == `ClusterStatus.queued_derivations`) for the ComponentScaler's predictive signal.
 

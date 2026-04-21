@@ -63,6 +63,7 @@ export const adminMock = {
   debugListExecutors: vi.fn(),
   listTenants: vi.fn(),
   createTenant: vi.fn(),
+  deleteTenant: vi.fn(),
   // Empty-default so pages embedding Graph (which calls
   // getBuildGraph at mount) don't crash on undefined.nodes. Per-test
   // overrides via .mockResolvedValueOnce(...) still work.

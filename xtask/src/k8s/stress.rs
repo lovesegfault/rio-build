@@ -1,16 +1,9 @@
-//! `xtask k8s stress` — stress-build harness.
-//!
-//! Fire N parallel `nix build --store ssh-ng://…` clients through SSM
-//! tunnels and wait for them. Foreground: tunnels + builds are
-//! [`ProcessGuard`]-/kill_on_drop-wrapped, so Ctrl-C or panic tears
-//! everything down (including session-manager-plugin grandchildren —
-//! I-158). Per-build logs land in `.stress-test/{ts}/build-{port}.log`.
-//!
-//! The previous design detached (`setsid` + `mem::forget`) and
-//! persisted PIDs to `.stress-test/sessions/{ts}/pids.json` for
-//! `watch`/`list`/`cleanup` across xtask invocations. Over-engineered
-//! for a dev tool; the original motivation (REPL-timeout SIGKILL
-//! orphans) is moot when run interactively.
+//! `qa --load` implementation: fire N parallel `nix build --store
+//! ssh-ng://…` clients through SSM tunnels and wait for them.
+//! Foreground: tunnels + builds are [`ProcessGuard`]-/kill_on_drop-
+//! wrapped, so Ctrl-C or panic tears everything down (including
+//! session-manager-plugin grandchildren — I-158). Per-build logs land
+//! in `.stress-test/{ts}/build-{port}.log`.
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -18,105 +11,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Subcommand;
 use console::style;
 use tracing::{info, warn};
 
-use super::chaos::{self, ChaosFrom, ChaosKind, ChaosTarget};
 use super::provider::{Provider, ProviderKind};
 use super::shared::ProcessGuard;
 use crate::config::XtaskConfig;
 use crate::sh::repo_root;
 
-#[derive(Subcommand)]
-pub enum StressCmd {
-    /// Fire N builds through SSM tunnels and wait for them. Tunnels +
-    /// builds tear down on Ctrl-C / exit.
-    Run {
-        /// nix-bench target (e.g. hello-shallow-32x, medium-mixed-16x).
-        #[arg(long)]
-        target: String,
-        /// Number of parallel builds (each gets its own SSM tunnel + port).
-        #[arg(long, default_value_t = 1)]
-        parallel: u8,
-        /// Base local port. Each build uses base_port + index.
-        #[arg(long, default_value_t = 2250)]
-        base_port: u16,
-        /// Path to the nix-bench flake. Default: ~/src/nix-bench/main.
-        #[arg(long)]
-        bench_flake: Option<PathBuf>,
-        /// Print active-build count + key scheduler gauges every 30s
-        /// while waiting.
-        #[arg(long)]
-        watch: bool,
-    },
-    /// Inject a network fault. BLOCKS for `--duration` (or until
-    /// Ctrl-C) and cleans up on exit. State written to
-    /// `.stress-test/chaos/chaos.json` BEFORE the rules go in, so a
-    /// SIGKILL'd run is remediated by the NEXT chaos invocation.
-    ///
-    /// `--kind blackhole`: privileged hostNetwork pod nsenters the
-    /// host and inserts iptables DROP rules for `--target`'s pod IP.
-    /// No FIN, no RST — only h2 keepalive can detect (I-048c).
-    Chaos {
-        #[arg(long, value_enum)]
-        kind: ChaosKind,
-        #[arg(long, value_parser = clap::value_parser!(ChaosTarget))]
-        target: ChaosTarget,
-        #[arg(long, value_parser = clap::value_parser!(ChaosFrom),
-              default_value = "all-workers")]
-        from: ChaosFrom,
-        #[arg(long, value_parser = chaos::parse_duration_secs)]
-        duration: Duration,
-    },
-}
-
-pub async fn run(
-    cmd: StressCmd,
-    p: &dyn Provider,
-    p_kind: ProviderKind,
-    cfg: &XtaskConfig,
-) -> Result<()> {
-    match cmd {
-        StressCmd::Run {
-            target,
-            parallel,
-            base_port,
-            bench_flake,
-            watch,
-        } => {
-            cmd_run(
-                p,
-                p_kind,
-                cfg,
-                &target,
-                parallel,
-                base_port,
-                bench_flake,
-                watch,
-            )
-            .await
-        }
-        StressCmd::Chaos {
-            kind,
-            target,
-            from,
-            duration,
-        } => {
-            let dir = repo_root().join(".stress-test/chaos");
-            fs::create_dir_all(&dir)?;
-            // Remediate any prior SIGKILL'd run before starting.
-            // Best-effort — kube errors warn, don't abort.
-            if let Err(e) = chaos::remediate(&dir).await {
-                warn!("stale-chaos remediation: {e:#}");
-            }
-            chaos::run(&dir, kind, target, from, duration).await
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments, clippy::print_stderr)]
-async fn cmd_run(
+pub(super) async fn cmd_run(
     p: &dyn Provider,
     kind: ProviderKind,
     cfg: &XtaskConfig,

@@ -5,7 +5,8 @@ use tonic::Status;
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 use rio_proto::types::{
-    CreateTenantRequest, CreateTenantResponse, ListTenantsResponse, TenantInfo,
+    CreateTenantRequest, CreateTenantResponse, DeleteTenantRequest, DeleteTenantResponse,
+    ListTenantsResponse, TenantInfo,
 };
 
 use crate::db::{SchedulerDb, TenantRow};
@@ -77,6 +78,24 @@ pub(super) async fn create_tenant(
     Ok(CreateTenantResponse {
         tenant: Some(tenant_row_to_proto(row)),
     })
+}
+
+pub(super) async fn delete_tenant(
+    db: &SchedulerDb,
+    req: DeleteTenantRequest,
+) -> Result<DeleteTenantResponse, Status> {
+    let name = req.tenant_name.trim();
+    if name.is_empty() {
+        return Err(Status::invalid_argument("tenant_name is required"));
+    }
+    let deleted = db
+        .delete_tenant(name)
+        .await
+        .status_internal("delete_tenant")?;
+    if !deleted {
+        return Err(Status::not_found(format!("tenant '{name}' does not exist")));
+    }
+    Ok(DeleteTenantResponse { deleted })
 }
 
 pub(super) fn tenant_row_to_proto(row: TenantRow) -> TenantInfo {

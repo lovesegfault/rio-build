@@ -109,6 +109,17 @@ pkgs.testers.runNixOSTest {
             f"list-tenants should include the tenant we just created:\n{out!r}"
         )
 
+        # delete-tenant — DeleteTenant round-trip + FK CASCADE (the
+        # upstream rows we'd add later in the suite for this tenant
+        # would be cascaded; here just assert the tenant disappears).
+        cli("delete-tenant cli-smoke-tenant")
+        out = cli("list-tenants")
+        assert "cli-smoke-tenant" not in out, (
+            f"list-tenants should NOT include deleted tenant:\n{out!r}"
+        )
+        # Re-create so downstream subtests still see it.
+        cli("create-tenant cli-smoke-tenant --gc-retention-hours=48")
+
     # ══════════════════════════════════════════════════════════════════
     # workers — standalone ListWorkers (detailed view) + --json
     # ══════════════════════════════════════════════════════════════════

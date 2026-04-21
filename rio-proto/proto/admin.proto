@@ -89,6 +89,10 @@ service AdminService {
   // Create a new tenant.
   rpc CreateTenant(rio.types.CreateTenantRequest) returns (rio.types.CreateTenantResponse);
 
+  // Delete a tenant by name. FK CASCADE handles tenant_keys/upstreams/
+  // path_tenants/chunk_tenants; builds/derivations get tenant_id SET NULL.
+  rpc DeleteTenant(rio.types.DeleteTenantRequest) returns (rio.types.DeleteTenantResponse);
+
   // PG-backed DAG snapshot (derivations + derivation_edges + build_derivations JOIN).
   // Dashboard polls 5s for live status colors. Not actor-snapshot — completed
   // builds have no actor state, but PG persists the full graph.

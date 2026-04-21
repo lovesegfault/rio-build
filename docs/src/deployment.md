@@ -124,7 +124,7 @@ kubectl -n rio-system rollout restart deployment/rio-gateway
 nix build --store "ssh-ng://rio@rio-gateway.example.com?ssh-key=$HOME/.ssh/rio_key" nixpkgs#hello
 ```
 
-For a complete scripted walkthrough against EKS, run `cargo xtask k8s smoke -p eks`.
+For a complete scripted walkthrough against EKS, run `cargo xtask k8s qa --health -p eks`.
 
 <details>
 <summary>Without xtask (kubectl exec fallback)</summary>

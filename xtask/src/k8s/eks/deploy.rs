@@ -289,7 +289,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // hook smoke-tests through the gateway, which needs working
             // builder nodes, which need a validated AMI, which is what
             // we're trying to deploy to test. --deploy-no-hooks skips
-            // the hook so the chart lands; operator runs `k8s smoke`
+            // the hook so the chart lands; operator runs `k8s qa --health`
             // manually once nodes are up.
             .no_hooks(no_hooks)
             .run()

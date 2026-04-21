@@ -160,3 +160,66 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// r[verify sched.admin.delete-tenant]
+#[tokio::test]
+async fn test_delete_tenant() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+
+    svc.create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+        tenant_name: "ephemeral".into(),
+        ..Default::default()
+    }))
+    .await?;
+
+    // Seed an upstream row so we exercise FK CASCADE.
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = 'ephemeral'")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO tenant_upstreams (tenant_id, url, priority) VALUES ($1, 'https://x', 0)",
+    )
+    .bind(tenant_id)
+    .execute(&db.pool)
+    .await?;
+
+    let resp = svc
+        .delete_tenant(Request::new(rio_proto::types::DeleteTenantRequest {
+            tenant_name: "ephemeral".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.deleted);
+
+    // Gone from tenants AND cascaded.
+    let n_tenants: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tenants WHERE tenant_name = 'ephemeral'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(n_tenants, 0);
+    let n_upstreams: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tenant_upstreams WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(n_upstreams, 0, "tenant_upstreams should ON DELETE CASCADE");
+
+    // Unknown name → NotFound.
+    let nf = svc
+        .delete_tenant(Request::new(rio_proto::types::DeleteTenantRequest {
+            tenant_name: "never-existed".into(),
+        }))
+        .await;
+    assert_eq!(nf.unwrap_err().code(), tonic::Code::NotFound);
+
+    // Empty name → InvalidArgument.
+    let empty = svc
+        .delete_tenant(Request::new(
+            rio_proto::types::DeleteTenantRequest::default(),
+        ))
+        .await;
+    assert_eq!(empty.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}

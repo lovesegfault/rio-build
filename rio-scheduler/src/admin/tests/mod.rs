@@ -312,6 +312,10 @@ async fn mutating_rpcs_require_service_token() {
         svc.create_tenant(Request::new(CreateTenantRequest::default()))
     );
     assert_gated!(
+        "DeleteTenant",
+        svc.delete_tenant(Request::new(DeleteTenantRequest::default()))
+    );
+    assert_gated!(
         "SetSlaOverride",
         svc.set_sla_override(Request::new(SetSlaOverrideRequest::default()))
     );

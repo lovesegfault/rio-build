@@ -2,7 +2,7 @@
 
 use crate::AdminClient;
 use anyhow::anyhow;
-use rio_proto::types::{CreateTenantRequest, TenantInfo};
+use rio_proto::types::{CreateTenantRequest, DeleteTenantRequest, TenantInfo};
 
 use crate::{emit, json, rpc};
 
@@ -46,6 +46,23 @@ pub(crate) async fn run_create(
         return json(&t);
     }
     print_tenant(&t);
+    Ok(())
+}
+
+pub(crate) async fn run_delete(
+    as_json: bool,
+    client: &mut AdminClient,
+    name: String,
+) -> anyhow::Result<()> {
+    let req = DeleteTenantRequest { tenant_name: name };
+    let resp = rpc("DeleteTenant", async || {
+        client.delete_tenant(req.clone()).await
+    })
+    .await?;
+    if as_json {
+        return json(&serde_json::json!({ "deleted": resp.deleted }));
+    }
+    println!("deleted");
     Ok(())
 }
 

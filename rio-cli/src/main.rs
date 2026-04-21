@@ -265,6 +265,9 @@ enum Cmd {
     /// Create a tenant. The name maps to the SSH authorized_keys comment
     /// field — builds from keys with this comment are attributed here.
     CreateTenant(tenants::CreateArgs),
+    /// Delete a tenant by name. FK CASCADE removes its keys/upstreams/
+    /// path+chunk attribution; builds/derivations get tenant_id SET NULL.
+    DeleteTenant { name: String },
     /// List all tenants.
     ListTenants,
     /// Cluster status summary: workers, builds, queue depth.
@@ -394,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
             let mut c = cfg.connect_admin().await?;
             match admin {
                 Cmd::CreateTenant(a) => tenants::run_create(as_json, &mut c, a).await,
+                Cmd::DeleteTenant { name } => tenants::run_delete(as_json, &mut c, name).await,
                 Cmd::ListTenants => tenants::run_list(as_json, &mut c).await,
                 Cmd::Status => status::run(as_json, &mut c).await,
                 Cmd::Workers(a) => workers::run(as_json, &mut c, a).await,

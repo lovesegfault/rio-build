@@ -1,4 +1,4 @@
-//! `xtask k8s stress chaos` — structured network fault injection.
+//! `xtask k8s qa --fault` — structured network fault injection.
 //!
 //! **Why this exists (I-048c).** The h2 keepalive path on the balanced
 //! channel only fires when the peer's IP goes blackhole — packets
@@ -24,7 +24,7 @@
 //!
 //! **SIGKILL-safe.** Pod identity is flushed to
 //! `.stress-test/chaos/chaos.json` BEFORE the iptables rules go in.
-//! The next `stress chaos` invocation [`remediate`]s any stale entries
+//! The next `qa --fault` invocation [`remediate`]s any stale entries
 //! first: deletes the chaos pod, then spawns a one-shot remediation
 //! pod on each affected node that flushes/deletes the chain
 //! (idempotent — `iptables -F` on a missing chain is a no-op with
@@ -542,7 +542,7 @@ pub async fn run(
     // Delete the chaos pods. Their TERM trap fires → iptables cleaned.
     // We DON'T spawn a remediation pod here — the trap is reliable for
     // graceful delete. Remediation is for the SIGKILL-recovery path
-    // (next `stress chaos` invocation calls `remediate` first).
+    // (next `qa --fault` invocation calls `remediate` first).
     let mut all_clean = true;
     for entry in &state.entries {
         match pods.delete(&entry.pod_name, &DeleteParams::default()).await {
@@ -588,7 +588,7 @@ pub async fn run(
     } else {
         eprintln!();
         eprintln!(
-            "{} cleanup incomplete — next `stress chaos` will remediate via one-shot pod",
+            "{} cleanup incomplete — next `qa --fault` will remediate via one-shot pod",
             style("!").yellow()
         );
     }
@@ -599,7 +599,7 @@ pub async fn run(
 // ─── cleanup integration ────────────────────────────────────────────
 
 /// Remediate any chaos entries in `<session>/chaos.json`. Called at
-/// the start of `stress chaos`. For each entry: delete the chaos pod (404 is
+/// the start of `qa --fault`. For each entry: delete the chaos pod (404 is
 /// fine), then spawn a one-shot remediation pod on its node that
 /// flushes the chain. Idempotent — if the chain doesn't exist (the
 /// chaos pod's trap already cleaned), the remediation script is a

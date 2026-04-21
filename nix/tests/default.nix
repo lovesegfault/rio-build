@@ -722,6 +722,7 @@ in
   };
 
   # r[verify sched.admin.create-tenant]
+  # r[verify sched.admin.delete-tenant]
   # r[verify sched.admin.list-tenants]
   # r[verify sched.admin.list-executors]
   # r[verify sched.admin.list-builds]

@@ -9,12 +9,13 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::config::XtaskConfig;
 use crate::{helm, sh, ui};
 
-mod chaos;
+pub(crate) mod chaos;
 pub mod client;
-mod eks;
+pub(crate) mod eks;
 mod k3s;
 mod phases;
 pub mod provider;
+pub(crate) mod qa;
 pub mod shared;
 pub(crate) mod status;
 mod stress;
@@ -227,8 +228,9 @@ pub enum K8sCmd {
     /// Bring up the cluster: ami ∥ (bootstrap → provision → kubeconfig
     /// → push), then deploy. Phase flags select a subset.
     Up(UpOpts),
-    /// EKS-unique e2e: NLB health, SSM tunnel, S3-chunked build (IRSA).
-    Smoke,
+    /// Live-cluster QA: lint → health → scenarios → load → fault.
+    /// Stage flags select a subset (mirrors `up`).
+    Qa(qa::QaOpts),
     /// helm rollback to REV (0 = previous).
     Rollback {
         #[arg(default_value_t = 0)]
@@ -304,10 +306,6 @@ pub enum K8sCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
-    /// Stress-build harness: N parallel builds through SSM tunnels.
-    /// Foreground — Ctrl-C tears down tunnels + builds.
-    #[command(subcommand)]
-    Stress(stress::StressCmd),
     /// NixOS node AMI management (ADR-021). EKS-only — `up --ami`
     /// builds + registers; this is the maintenance side.
     #[command(subcommand)]
@@ -388,7 +386,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     let p = provider::get(kind);
     match args.cmd {
         K8sCmd::Up(opts) => run_up(p, kind, cfg, opts).await,
-        K8sCmd::Smoke => p.smoke(cfg).await,
+        K8sCmd::Qa(opts) => qa::run(opts, &*p, kind, cfg).await,
         K8sCmd::Rollback { rev } => {
             let rev = if rev > 0 {
                 rev
@@ -466,7 +464,6 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             tenant,
             restart,
         } => shared::grant(&pubkey, &tenant, restart).await,
-        K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
         K8sCmd::Ami(cmd) => {
             if !matches!(kind, ProviderKind::Eks) {
                 bail!("`ami` is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
@@ -580,7 +577,7 @@ async fn run_up(
                 .context("auto ami-gc failed; re-run with --skip-ami-gc to bypass")?;
         }
         if !explicit {
-            info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
+            info!("all phases done — run `cargo xtask k8s -p {kind} qa --health` to verify");
         }
         Ok(())
     })

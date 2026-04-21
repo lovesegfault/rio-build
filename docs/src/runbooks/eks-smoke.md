@@ -1,6 +1,6 @@
 # EKS Smoke Test Runbook
 
-Manual walkthrough of `cargo xtask k8s smoke -p eks`. Use this when the
+Manual walkthrough of `cargo xtask k8s qa --health -p eks`. Use this when the
 automated run fails or for first-time setup validation.
 
 ## Prerequisites
