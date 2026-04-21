@@ -176,7 +176,41 @@ async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
         "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
         key.display()
     );
-    smoke::build_expr(&expr, &store).await
+    // Retry on transient gateway→scheduler reconnect: phase-2 scenarios
+    // kill the scheduler-leader; the gateway's BalancedChannel needs a
+    // few probe ticks to find the new leader, during which ResolveTenant
+    // fails → no JWT minted → SubmitBuild rejected with
+    // "requires x-rio-tenant-token in JWT mode". The component-disjoint
+    // scheduler serializes scheduler-mutators with each other but a
+    // *finished* scenario's after-effects (gateway reconnect lag) can
+    // bleed into the next one's first build.
+    let mut attempts = 0;
+    loop {
+        match smoke::build_expr(&expr, &store).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempts < 5 && is_transient_gateway_err(&e) => {
+                attempts += 1;
+                tracing::info!(
+                    "gateway_build: transient ({}); retry {}/5 in 5s",
+                    one_line(&e),
+                    attempts
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_transient_gateway_err(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("requires x-rio-tenant-token")
+        || s.contains("Connection refused")
+        || s.contains("transport error")
+}
+
+fn one_line(e: &anyhow::Error) -> String {
+    format!("{e:#}").lines().next().unwrap_or("").to_owned()
 }
 
 // ─── PG handle ─────────────────────────────────────────────────────────

@@ -73,17 +73,32 @@ pub async fn run(
     })
     .await?;
 
-    Arc::into_inner(pool)
-        .expect("all leases released")
-        .cleanup(&kube, &cli)
-        .await?;
-    drop(pg);
-
+    // Report BEFORE cleanup — a cleanup failure (e.g. cli-tunnel
+    // port-forward died after a scheduler-kill scenario) must not
+    // swallow the verdicts.
     report(&outcomes);
     let fails = outcomes
         .iter()
         .filter(|o| matches!(o.verdict, Verdict::Fail(_)))
         .count();
+
+    // Best-effort cleanup. Phase-2 scenarios may have killed the
+    // scheduler-leader the original cli-tunnel was forwarded to —
+    // re-open a fresh CliCtx so DeleteTenant reaches the new leader.
+    // Cleanup failures warn rather than override the run's verdict.
+    if let Err(e) = (async {
+        let cli2 = CliCtx::open(&kube, 0, 0).await?;
+        Arc::into_inner(pool)
+            .expect("all leases released")
+            .cleanup(&kube, &cli2)
+            .await
+    })
+    .await
+    {
+        tracing::warn!("tenant cleanup failed (ephemeral tenants left behind): {e:#}");
+    }
+    drop(pg);
+
     if fails > 0 {
         anyhow::bail!("{fails} scenario(s) failed");
     }
