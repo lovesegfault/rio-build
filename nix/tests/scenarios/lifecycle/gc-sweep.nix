@@ -292,7 +292,9 @@ scope: with scope; ''
       )
       # Belt-and-suspenders: path still resolvable.
       client.succeed(
-          f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
+          # I-217: must query as gc-tenant-test (the owning tenant);
+          # the default key now correctly gets NotFound.
+          f"nix path-info --store 'ssh-ng://k3s-server-tenant' {out_tenant}"
       )
       print("tenant-retention CONTROL PASS: out_tenant past global "
             "grace but inside tenant window → survived sweep")
@@ -318,7 +320,9 @@ scope: with scope; ''
           f"WHERE clause may be inverted or retention default drifted."
       )
       client.fail(
-          f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
+          # I-217: must query as gc-tenant-test (the owning tenant);
+          # the default key now correctly gets NotFound.
+          f"nix path-info --store 'ssh-ng://k3s-server-tenant' {out_tenant}"
       )
       print("tenant-retention EXPIRED PASS: both windows expired → "
             "out_tenant swept")
