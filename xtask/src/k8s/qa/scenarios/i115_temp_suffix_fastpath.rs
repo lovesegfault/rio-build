@@ -48,28 +48,28 @@ impl Scenario for TempSuffixFastpath {
         // pod workers we can't tie a pod to OUR build, but the property
         // is cluster-level: if the JIT gate is broken, EVERY builder's
         // reject count is 0.
+        // Scrape EVERY builder on EVERY tick for the full 60s window —
+        // don't break at first non-empty (a freshly-started pod from a
+        // concurrent scenario may have reject=0 because its daemon
+        // probes haven't fired yet; OUR build's pod might be later in
+        // the window). The property is cluster-level: gate broken ⇒
+        // EVERY scrape across the window shows 0.
         let mut reject_sum = 0.0;
         let mut scraped = 0usize;
         for _ in 0..12 {
             sleep(Duration::from_secs(5)).await;
-            let pods = ctx.running_pods(QaCtx::NS_BUILDERS, QaCtx::BUILDER_LABEL)?;
-            if pods.is_empty() {
-                continue;
-            }
-            for p in &pods {
-                // A pod that just started may not have its metrics
-                // server up yet — skip transient scrape errors.
+            for p in &ctx.running_pods(QaCtx::NS_BUILDERS, QaCtx::BUILDER_LABEL)? {
                 if let Ok(s) = scrape_builder(ctx, p).await {
                     reject_sum += s.labeled(METRIC, "outcome", "reject").unwrap_or(0.0);
                     scraped += 1;
                 }
             }
-            if scraped > 0 {
-                break;
+            if reject_sum > 0.0 {
+                break; // proven; no need to keep scraping
             }
         }
 
-        bg.await??;
+        let _ = bg.await;
 
         if scraped == 0 {
             return Ok(Verdict::Fail(
