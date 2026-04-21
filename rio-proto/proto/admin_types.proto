@@ -32,6 +32,9 @@ message ClusterStatusResponse {
   // so an aarch64 pool doesn't scale on x86_64 backlog (I-107). Empty
   // map from old schedulers → controller falls back to the scalar.
   map<string, uint32> queued_by_system = 11;
+  // Count of DAG nodes in Substituting (upstream fetch in flight).
+  // Feeds r[ctrl.scaler.signal-substituting].
+  uint32 substituting_derivations = 12;
 }
 
 message ListExecutorsRequest {

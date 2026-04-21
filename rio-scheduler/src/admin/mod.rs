@@ -291,6 +291,7 @@ impl AdminService for AdminServiceImpl {
             active_builds: snap.active_builds,
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
+            substituting_derivations: snap.substituting_derivations,
             queued_by_system: snap.queued_by_system.clone(),
             store_size_bytes: self
                 .store_size_bytes

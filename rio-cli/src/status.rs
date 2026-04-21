@@ -94,8 +94,8 @@ fn print_status(s: &ClusterStatusResponse) {
         s.pending_builds, s.active_builds
     );
     println!(
-        "queue:   {} queued derivations, {} running",
-        s.queued_derivations, s.running_derivations
+        "queue:   {} queued, {} running, {} substituting",
+        s.queued_derivations, s.running_derivations, s.substituting_derivations
     );
     println!("store:   {} bytes", s.store_size_bytes);
 }

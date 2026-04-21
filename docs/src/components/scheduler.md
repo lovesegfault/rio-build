@@ -244,6 +244,12 @@ The dispatch-time store-check (`batch_probe_cached_ready` and the per-derivation
 r[sched.merge.reconcile-order]
 In `reconcile_merged_state`, all dep-state corrections (cache-hit→Completed, stale-Completed reset, reprobe-Poisoned→Substituting) MUST complete before any dependent-verdict computation (reprobe-unlocked Queued→Ready, `seed_initial_states`). A pending-substitute reprobe node MUST transition →Substituting before `seed_initial_states` reads `any_dep_terminally_failed` for its dependents.
 
+r[sched.admin.snapshot-substituting]
+
+`ClusterStatus` MUST report `substituting_derivations`. The snapshot match over
+`DerivationStatus` MUST be exhaustive so future status additions are
+compile-time caught, not silently-zero.
+
 r[sched.substitute.detached]
 The upstream-substitute fetch (`QueryPathInfo` triggers store-side `try_substitute` which recursively walks the runtime closure) MUST run outside the actor event loop. Awaiting it inline blocks `MergeDag`/dispatch for the duration of the slowest closure walk --- a single ghc-sized NAR (1.9 GB) exceeds the 30s `grpc_timeout` and the 16-way concurrent fan-out blocked the actor for >100s in production. Instead: at each merge-time and dispatch-time substitution call site the scheduler MUST transition the derivation to `DerivationStatus::Substituting`, spawn a background task that does the `QueryPathInfo` per output path with a separate `SUBSTITUTE_FETCH_TIMEOUT` (minutes, not seconds), and post `ActorCommand::SubstituteComplete{drv_hash, ok}` back into the mailbox. `Substituting` is NOT terminal (`all_deps_completed` returns false → dependents stay gated); on `ok=true` the handler transitions `Substituting → Completed` (safe even if inputDrvs aren't yet Completed in the DAG --- the store-side closure walk fetched the full reference set); on `ok=false` it reverts to `Ready`/`Queued` for normal scheduling and sets `substitute_tried` so subsequent dispatch passes skip substitution and route to a worker (one-shot fall-through --- a `FindMissingPaths` HEAD probe that disagrees with `QueryPathInfo` GET would otherwise loop at Tick cadence and never reach `find_executor`). On scheduler restart, recovery MUST reset `Substituting` nodes via the same dep-walk as `Created`/`Queued` (the spawned task is gone). A cancelled build's orphan task is benign: its fetch still populates the store, the `SubstituteComplete` is dropped by the not-Substituting guard.
 

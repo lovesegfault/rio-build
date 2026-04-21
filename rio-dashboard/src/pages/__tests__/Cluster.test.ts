@@ -34,6 +34,7 @@ describe('Cluster', () => {
       activeBuilds: 4,
       queuedDerivations: 200,
       runningDerivations: 8,
+      substitutingDerivations: 17,
       storeSizeBytes: 0n,
     });
 
@@ -43,7 +44,7 @@ describe('Cluster', () => {
     const dl = screen.getByTestId('cluster-status');
     expect(dl).toHaveTextContent('3 active / 5 total');
     expect(dl).toHaveTextContent('12 pending / 4 active');
-    expect(dl).toHaveTextContent('200 queued / 8 running');
+    expect(dl).toHaveTextContent('200 queued / 8 running / 17 substituting');
   });
 
   it('surfaces transport errors via role=alert', async () => {
@@ -66,6 +67,7 @@ describe('Cluster', () => {
       activeBuilds: 0,
       queuedDerivations: 0,
       runningDerivations: 0,
+      substitutingDerivations: 0,
       storeSizeBytes: 0n,
     });
 

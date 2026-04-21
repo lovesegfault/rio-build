@@ -120,7 +120,15 @@ impl DagActor {
         // Assigned hasn't acked yet but the slot is reserved; for "how
         // busy are workers" they're equivalent.
         let mut running_derivations = 0u32;
+        let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
+        // r[impl sched.admin.snapshot-substituting]
+        // Exhaustive over DerivationStatus so a future variant addition
+        // is a compile-time break here, not a silently-zero autoscaler
+        // input. The `_ => {}` this replaces dropped Substituting on
+        // the floor — substitution cascades read as `builders=0` to
+        // the ComponentScaler and the store scaled DOWN exactly when
+        // it was the bottleneck.
         for (_, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -133,7 +141,20 @@ impl DagActor {
                     // semantics — sum across keys equals the scalar.
                     *queued_by_system.entry(s.system.clone()).or_default() += 1;
                 }
-                _ => {}
+                // r[impl ctrl.scaler.signal-substituting]
+                DerivationStatus::Substituting => substituting_derivations += 1,
+                // Pre-ready: not yet store/builder load. Created has no
+                // deps probed; Queued has unmet deps. Neither drives
+                // any RPC traffic.
+                DerivationStatus::Created | DerivationStatus::Queued => {}
+                // Terminal (or transient-mid-retry for Failed): no
+                // ongoing load.
+                DerivationStatus::Completed
+                | DerivationStatus::Failed
+                | DerivationStatus::Poisoned
+                | DerivationStatus::DependencyFailed
+                | DerivationStatus::Cancelled
+                | DerivationStatus::Skipped => {}
             }
         }
 
@@ -145,6 +166,7 @@ impl DagActor {
             active_builds,
             queued_derivations: self.ready_queue.len() as u32,
             running_derivations,
+            substituting_derivations,
             queued_by_system,
         }
     }

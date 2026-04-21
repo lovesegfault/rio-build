@@ -1323,6 +1323,49 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
+/// `substituting_derivations` counts DAG nodes in `Substituting` and is
+/// disjoint from queued/running. Regression: the previous `_ => {}`
+/// match arm dropped Substituting on the floor → ComponentScaler saw
+/// `builders=0` during a substitution cascade and scaled the store
+/// DOWN exactly when it was the bottleneck. The match is now
+/// exhaustive over `DerivationStatus` so a future variant addition is
+/// a compile-time break, not a silently-zero autoscaler input.
+// r[verify sched.admin.snapshot-substituting]
+#[tokio::test]
+async fn snapshot_counts_substituting() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    // 3 Substituting, 1 Ready, 1 Running — disjoint counts.
+    for h in ["s1", "s2", "s3"] {
+        actor.test_inject_ready(h, None, "x86_64-linux", false);
+        actor
+            .dag
+            .node_mut(h)
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Substituting);
+    }
+    actor.test_inject_ready("q1", None, "x86_64-linux", false);
+    actor.push_ready("q1".to_string().into());
+    actor.test_inject_ready("r1", None, "x86_64-linux", false);
+    actor
+        .dag
+        .node_mut("r1")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Running);
+
+    let snap = actor.compute_cluster_snapshot();
+
+    assert_eq!(snap.substituting_derivations, 3);
+    assert_eq!(snap.queued_derivations, 1, "Substituting is NOT queued");
+    assert_eq!(snap.running_derivations, 1, "Substituting is NOT running");
+    assert_eq!(
+        snap.queued_by_system.values().sum::<u32>(),
+        1,
+        "Substituting does NOT enter queued_by_system"
+    );
+}
+
 /// D2/D5: FODs and non-FODs go through the SAME `compute_spawn_intents`
 /// path; `intent.kind` carries the ADR-019 boundary. `kind=Builder`
 /// excludes FODs; `kind=Fetcher` excludes non-FODs; unfiltered emits

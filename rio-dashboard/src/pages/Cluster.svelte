@@ -41,7 +41,10 @@
     <dt>Builds</dt>
     <dd>{status.pendingBuilds} pending / {status.activeBuilds} active</dd>
     <dt>Derivations</dt>
-    <dd>{status.queuedDerivations} queued / {status.runningDerivations} running</dd>
+    <dd
+      >{status.queuedDerivations} queued / {status.runningDerivations} running / {status.substitutingDerivations}
+      substituting</dd
+    >
   </dl>
   <!-- Management actions. GC is on its own page because TriggerGC is a
        server-stream — the progress UI needs space and unmount-cancel.

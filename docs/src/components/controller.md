@@ -246,7 +246,7 @@ status:
 
 Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
 in-cluster, and the controller already has the demand signal
-(`ClusterStatus`). See `r[ctrl.scaler.component]` /
+(`ClusterStatus`). See `r[ctrl.scaler.component+2]` /
 `r[ctrl.scaler.ratio-learn]` for reconciler behavior.
 
 ## Reconciliation Loops
@@ -386,8 +386,15 @@ r[ctrl.drain.disruption-target]
 
 ## ComponentScaler
 
-r[ctrl.scaler.component]
-The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.ClusterStatus` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
+r[ctrl.scaler.component+2]
+The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running+substituting) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running+substituting)` comes from `AdminService.ClusterStatus` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
+
+r[ctrl.scaler.signal-substituting]
+
+The predictive `builders` signal MUST include `substituting_derivations` at 1:1
+weight with `queued`/`running`. A substitution cascade with zero queued/running
+MUST NOT produce `builders=0` — that scales the store toward `min` exactly when
+it is the bottleneck.
 
 r[ctrl.scaler.ratio-learn+2]
 `status.learnedRatio` self-calibrates against `max(StoreAdminService.GetLoad().pg_pool_utilization)` over the `spec.loadEndpoint` headless-service endpoints (the **observed** signal). Asymmetric correction: `load > spec.loadThresholds.high` (default 0.8) → immediate `current+1` AND `learnedRatio *= 0.95` (under-provisioning is dangerous — I-105 cascade); `load < spec.loadThresholds.low` (default 0.3) for 30 consecutive ticks → `learnedRatio *= 1.02` (over-provisioning is cheap). Growth is gated on `builders > 0 && current > min` (idle ≠ over-provisioned) and the ratio is clamped to `[RATIO_FLOOR, RATIO_CEILING]`. The ratio persists in `.status` so a controller restart resumes from the learned value, not `spec.seedRatio`.

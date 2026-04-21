@@ -96,12 +96,19 @@ pub struct Decision {
     pub scaled_up: bool,
 }
 
-/// Sum queued + running derivations from `ClusterStatus`.
+/// Sum queued + running + substituting derivations from `ClusterStatus`.
 ///
 /// queued (Ready-only) and running weigh the same for store load:
 /// FUSE input reads + output PutPath happen across the build's
 /// lifetime, and I-110's batching made the per-builder RPC count
 /// roughly constant from queued through done.
+///
+/// substituting weighs 1:1 with queued/running: each Substituting
+/// derivation drives a store-side `try_substitute` (closure walk +
+/// upstream NAR ingest), which is roughly one builder's worth of
+/// FUSE-read + PutPath load on the store. A substitution cascade with
+/// zero queued/running MUST NOT read as `builders=0` — that scales
+/// the store toward `min` exactly when it is the bottleneck.
 ///
 /// 0 → "scale to min" — correct for idle, and a misconfigured cluster
 /// is caught by the high-load reactive path (`current + 1`).
@@ -111,9 +118,12 @@ pub struct Decision {
 /// set), so the cheap scalar suffices and the scheduler avoids a
 /// per-drv `solve_intent_for` + full intent-vec serialization just to
 /// produce a count.
-// r[impl ctrl.scaler.component]
+// r[impl ctrl.scaler.component+2]
+// r[impl ctrl.scaler.signal-substituting]
 pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
-    u64::from(cs.queued_derivations).saturating_add(u64::from(cs.running_derivations))
+    u64::from(cs.queued_derivations)
+        .saturating_add(u64::from(cs.running_derivations))
+        .saturating_add(u64::from(cs.substituting_derivations))
 }
 
 /// Compute the next replica count + ratio adjustment.
@@ -280,28 +290,30 @@ mod tests {
         }
     }
 
-    /// Σ(queued+running) from ClusterStatus; saturates instead of
-    /// wrapping. The parameter type IS the assertion: predictive
-    /// signal sources from the cheap `ClusterStatus` scalar, not a
-    /// full `GetSpawnIntents` stream.
-    // r[verify ctrl.scaler.component]
+    /// Σ(queued+running+substituting) from ClusterStatus; saturates
+    /// instead of wrapping. The parameter type IS the assertion:
+    /// predictive signal sources from the cheap `ClusterStatus`
+    /// scalar, not a full `GetSpawnIntents` stream.
+    // r[verify ctrl.scaler.component+2]
     #[test]
     fn total_builders_from_cluster_status() {
         let cs = ClusterStatusResponse {
             queued_derivations: 110,
             running_derivations: 12,
+            substituting_derivations: 30,
             ..Default::default()
         };
-        assert_eq!(total_builders(&cs), 122);
+        assert_eq!(total_builders(&cs), 152);
 
         let cs = ClusterStatusResponse {
             queued_derivations: u32::MAX,
             running_derivations: u32::MAX,
+            substituting_derivations: u32::MAX,
             ..Default::default()
         };
         assert_eq!(
             total_builders(&cs),
-            2 * u64::from(u32::MAX),
+            3 * u64::from(u32::MAX),
             "u32→u64 widen, no wrap"
         );
 
@@ -312,11 +324,71 @@ mod tests {
         );
     }
 
+    /// Substitution cascade with zero queued/running MUST NOT produce
+    /// `builders=0` — that scales the store toward `min` exactly when
+    /// substitution (store-side closure walk + NAR ingest) is the
+    /// bottleneck. Regression: pre-fix the `_ => {}` snapshot match
+    /// dropped Substituting → predictive=0 → scale-down during a
+    /// fresh-cluster cascade.
+    // r[verify ctrl.scaler.signal-substituting]
+    #[test]
+    fn substituting_only_does_not_scale_down() {
+        let cs = ClusterStatusResponse {
+            queued_derivations: 0,
+            running_derivations: 0,
+            substituting_derivations: 200,
+            ..Default::default()
+        };
+        assert_eq!(
+            total_builders(&cs),
+            200,
+            "substituting weighs 1:1 with queued/running"
+        );
+
+        // decide(): builders=200, current=5, in-band load → predicted
+        // = ceil(200/50) = 4. 4 < 5 → scale-down arm; with no last-
+        // scale-up record (None) the −1 step applies → desired=4. The
+        // load-bearing assertion is `desired >= 4` (predicted), NOT
+        // `desired == min`: pre-fix builders=0 → predicted=0 → clamped
+        // to min=2 → walked down. Post-fix the predictive signal holds
+        // it near current.
+        let s = spec(2, 14);
+        let d = decide(
+            &s,
+            &status(None, 0),
+            5,
+            total_builders(&cs),
+            Some(0.5),
+            None,
+        );
+        assert_eq!(
+            d.desired, 4,
+            "substitution cascade must not scale toward min (pre-fix → 2)"
+        );
+        // And with builders=200 the `builders > 0` low-load growth
+        // gate is satisfied, so a sustained low streak DOES grow ratio
+        // — substitution counts as "work" for over-provisioning
+        // detection too.
+        let d = decide(
+            &s,
+            &status(Some(50.0), LOW_LOAD_TICKS_FOR_RATIO_GROWTH - 1),
+            5,
+            total_builders(&cs),
+            Some(0.1),
+            None,
+        );
+        assert_eq!(
+            d.learned_ratio,
+            50.0 * RATIO_GROWTH_ON_LOW,
+            "substituting>0 satisfies the builders>0 idle gate"
+        );
+    }
+
     /// Core predictive path: builders / seedRatio, clamped. No load
     /// reading → no ratio change. This is the "scheduler knows N
     /// builders are about to exist BEFORE they exist" path the plan
     /// design calls predictive.
-    // r[verify ctrl.scaler.component]
+    // r[verify ctrl.scaler.component+2]
     #[test]
     fn predictive_path_no_load() {
         let s = spec(2, 14);
@@ -509,7 +581,7 @@ mod tests {
     /// Scale-down: 5m stabilization since last UP, then max −1/tick.
     /// I-125a/b made mid-PutPath termination correct; this keeps it
     /// cheap.
-    // r[verify ctrl.scaler.component]
+    // r[verify ctrl.scaler.component+2]
     #[test]
     fn scale_down_stabilization_and_step() {
         let s = spec(2, 14);

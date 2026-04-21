@@ -21,10 +21,9 @@
 # stabilization, ratio decay/growth curves, max −1/tick. Those are
 # pure-function behaviour proven in scaling/component.rs::tests.
 #
-# Tracey: r[verify ctrl.scaler.component] / r[verify
-# ctrl.scaler.ratio-learn] / r[verify store.admin.get-load] /
-# r[verify obs.metric.store-pg-pool] live at the default.nix wiring
-# point per the convention.
+# Tracey: ctrl.scaler.component / ctrl.scaler.ratio-learn /
+# store.admin.get-load / obs.metric.store-pg-pool — verify markers live
+# at the default.nix wiring point per the convention.
 {
   pkgs,
   common,

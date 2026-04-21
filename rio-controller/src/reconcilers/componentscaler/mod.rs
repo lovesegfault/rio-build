@@ -60,7 +60,7 @@ const MANAGER: &str = "rio-controller-componentscaler";
 /// children (the Deployment is helm's). Delete = the apiserver GCs
 /// the CR; the Deployment keeps its last-patched replica count
 /// until the next `helm upgrade` (or another scaler) sets it.
-// r[impl ctrl.scaler.component]
+// r[impl ctrl.scaler.component+2]
 pub async fn reconcile(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action> {
     timed("componentscaler", cs, ctx, reconcile_inner).await
 }
