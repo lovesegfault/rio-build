@@ -240,6 +240,18 @@ async fn poll_max_load(
     poll_max_load_addrs(addrs, service_interceptor).await
 }
 
+/// Per-pod load fold: `max(pg_pool_utilization,
+/// substitute_admission_utilization)`. Substitution admission can
+/// saturate independently of PG (upstream HTTP bottleneck — permits
+/// held across the NAR fetch, PG connection released per-query), so a
+/// replica is "loaded" if EITHER dimension is high. `decide()` then
+/// sees one scalar per pod and its 0.8/0.3 thresholds need no change.
+/// Extracted from the `poll_max_load_addrs` closure so the
+/// 2-dimension fold is unit-testable without a mock gRPC server.
+fn fold_load(r: &rio_proto::types::GetLoadResponse) -> f64 {
+    (r.pg_pool_utilization as f64).max(r.substitute_admission_utilization as f64)
+}
+
 /// Concurrent per-pod `GetLoad` fan-out → max. Split from
 /// [`poll_max_load`] so the timeout-aggregate behavior is
 /// unit-testable without DNS.
@@ -262,7 +274,7 @@ async fn poll_max_load_addrs(
                     .get_load(rio_proto::types::GetLoadRequest {})
                     .await?
                     .into_inner();
-                anyhow::Ok(r.pg_pool_utilization as f64)
+                anyhow::Ok(fold_load(&r))
             };
             (addr, tokio::time::timeout(LOAD_RPC_TIMEOUT, load).await)
         });
@@ -426,6 +438,42 @@ pub fn error_policy(cs: Arc<ComponentScaler>, err: &Error, ctx: Arc<Ctx>) -> Act
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_proto::types::GetLoadResponse;
+
+    /// `fold_load` per-pod = `max(pg, substitute_admission)`; the
+    /// across-pod aggregate (the loop in `poll_max_load_addrs`) is
+    /// `max` over those. Two pods with the saturated dimension on
+    /// opposite axes: the result is the global max regardless of
+    /// which axis carries it.
+    // r[verify store.admin.get-load+2]
+    #[test]
+    fn fold_load_max_of_dimensions_then_pods() {
+        let pod_a = GetLoadResponse {
+            pg_pool_utilization: 0.2,
+            substitute_admission_utilization: 0.9,
+        };
+        let pod_b = GetLoadResponse {
+            pg_pool_utilization: 0.7,
+            substitute_admission_utilization: 0.1,
+        };
+        // Per-pod fold picks the saturated dimension.
+        assert!((fold_load(&pod_a) - 0.9).abs() < 1e-6);
+        assert!((fold_load(&pod_b) - 0.7).abs() < 1e-6);
+        // Across-pod aggregate: same `f64::max` reduction the
+        // `poll_max_load_addrs` JoinSet loop applies.
+        let agg = [&pod_a, &pod_b]
+            .into_iter()
+            .map(fold_load)
+            .fold(None::<f64>, |m, l| Some(m.map_or(l, |m| m.max(l))));
+        assert_eq!(agg, Some(0.9_f32 as f64));
+        // Old behavior (pg-only) would have returned 0.7 — proving
+        // the new dimension is load-bearing.
+        let pg_only = [&pod_a, &pod_b]
+            .into_iter()
+            .map(|r| r.pg_pool_utilization as f64)
+            .fold(f64::MIN, f64::max);
+        assert!(agg.unwrap() > pg_only);
+    }
 
     /// bug_213 regression: status writes rate-limited to once per
     /// REQUEUE window. First reconcile (no last) → due; immediately
