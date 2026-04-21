@@ -355,6 +355,7 @@ pub struct TenantPool {
 impl TenantPool {
     pub async fn new(kube_client: &kube::Client, cli: &CliCtx, size: usize) -> Result<Self> {
         let (nonce, key_dir, tenants, pubkeys) = alloc_tenants(cli, size).await?;
+        Self::sweep_stale_keys(kube_client, nonce).await?;
         // Batch-install: one Secret read + one write for all N keys, then
         // ONE gateway rollout-restart so they take effect immediately
         // (vs ~70s hot-reload × 1).
@@ -384,11 +385,16 @@ impl TenantPool {
         let tenants = Arc::into_inner(self.slots)
             .expect("all leases released before cleanup")
             .into_inner();
+        // Best-effort per-tenant: a delete-tenant failure (cli-tunnel
+        // race, scheduler still recovering from phase-2) MUST NOT skip
+        // key removal — bailing here is what let stale keys accumulate
+        // across runs and broke i109's count expectations.
+        let mut deleted = 0usize;
         for t in &tenants {
             match cli.run(&["delete-tenant", &t.name]) {
-                Ok(_) => {}
+                Ok(_) => deleted += 1,
                 Err(e) if format!("{e:#}").to_lowercase().contains("not found") => {}
-                Err(e) => return Err(e.context(format!("delete-tenant {}", t.name))),
+                Err(e) => tracing::warn!("delete-tenant {}: {e:#} (continuing)", t.name),
             }
         }
         shared::remove_authorized_keys_by_comment_prefix(
@@ -396,7 +402,43 @@ impl TenantPool {
             &format!("qa-{}-", self.nonce),
         )
         .await?;
-        info!("cleaned up {} ephemeral tenants + keys", tenants.len());
+        info!(
+            "cleaned up {}/{} ephemeral tenants + keys (nonce={})",
+            deleted,
+            tenants.len(),
+            self.nonce
+        );
+        Ok(())
+    }
+
+    /// Sweep stale `qa-{ts}-*` keys from PRIOR crashed runs. Called at
+    /// the start of `new()` so accumulation self-heals. A key is stale
+    /// if its `qa-{ts}-` prefix has `ts < this run's nonce` (nonce is
+    /// unix-secs, monotone). Concurrent qa runs would have ts ≥ ours;
+    /// those are left alone.
+    async fn sweep_stale_keys(kube_client: &kube::Client, nonce: u64) -> Result<()> {
+        let existing = kube::get_secret_key(kube_client, NS, "rio-gateway-ssh", "authorized_keys")
+            .await?
+            .unwrap_or_default();
+        let stale: Vec<_> = existing
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(2))
+            .filter_map(|c| {
+                c.strip_prefix("qa-")
+                    .and_then(|s| s.split('-').next())
+                    .and_then(|ts| ts.parse::<u64>().ok())
+                    .filter(|&ts| ts < nonce)
+                    .map(|ts| format!("qa-{ts}-"))
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for prefix in &stale {
+            shared::remove_authorized_keys_by_comment_prefix(kube_client, prefix).await?;
+        }
+        if !stale.is_empty() {
+            info!("swept {} stale qa key prefix(es): {:?}", stale.len(), stale);
+        }
         Ok(())
     }
 
