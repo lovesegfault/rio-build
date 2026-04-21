@@ -13,7 +13,7 @@ use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
 mod config;
-use config::{CliArgs, Config, init_chunk_backend};
+use config::{CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -123,6 +123,17 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Substitute admission gate: ONE instance, cloned into both
+    // StoreServiceImpl (acquires) and StoreAdminServiceImpl (reports
+    // via GetLoad). Constructed before either builder chain so the
+    // share is explicit — two `AdmissionGate::new()` calls would
+    // compile but GetLoad would always read 0.0.
+    let admission_cap = cfg
+        .substitute_admission_permits
+        .unwrap_or_else(|| derive_substitute_admission_cap(cfg.pg_max_connections));
+    info!(admission_cap, "substitute admission gate");
+    let substitute_admission = rio_store::admission::AdmissionGate::new(admission_cap);
+
     // StoreServiceImpl: one constructor + builder chain. Unconditional
     // builders chain directly; Option<T> from config applies via
     // `if let` so each builder keeps its concrete-argument signature
@@ -131,7 +142,8 @@ async fn main() -> anyhow::Result<()> {
     // overrides when explicitly set.
     let mut store_service = StoreServiceImpl::new(pool.clone())
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
-        .with_max_batch_paths(cfg.max_batch_paths);
+        .with_max_batch_paths(cfg.max_batch_paths)
+        .with_substitute_admission(substitute_admission.clone());
     if let Some(cache) = &chunk_cache {
         store_service = store_service.with_chunk_cache(Arc::clone(cache));
     }
@@ -190,7 +202,8 @@ async fn main() -> anyhow::Result<()> {
         chunk_cache.as_ref().map(|c| c.backend());
     let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
         .with_shutdown(shutdown.clone())
-        .with_service_verifier(service_verifier);
+        .with_service_verifier(service_verifier)
+        .with_substitute_admission(substitute_admission);
     rio_store::gc::orphan::spawn_scanner(
         pool.clone(),
         chunk_backend_for_gc.clone(),

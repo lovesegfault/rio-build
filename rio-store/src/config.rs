@@ -123,6 +123,15 @@ pub(crate) struct Config {
     /// instance; raise this with `replicas` for thousands-of-builds
     /// scale. Set via `RIO_PG_MAX_CONNECTIONS`.
     pub pg_max_connections: u32,
+    /// Per-replica cap on concurrent `try_substitute` calls. Excess
+    /// queue server-side up to `SUBSTITUTE_ADMISSION_WAIT` (30 s),
+    /// then `RESOURCE_EXHAUSTED` (transient; client retries). Additive
+    /// to `nar_buffer_budget_bytes` — this bounds COUNT, that bounds
+    /// BYTES. `None` (default) derives from the PG pool via
+    /// [`derive_substitute_admission_cap`]: `(pg_max × 3).clamp(64,
+    /// 256)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
+    #[serde(default)]
+    pub substitute_admission_permits: Option<usize>,
 }
 
 impl Default for Config {
@@ -146,6 +155,7 @@ impl Default for Config {
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
+            substitute_admission_permits: None,
         }
     }
 }
@@ -155,6 +165,18 @@ impl Default for Config {
 /// drove `acquired_after_secs=16` on QueryPathInfo. The query is a PK
 /// lookup; the bottleneck is connection acquisition.
 pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
+
+/// Derive the default `substitute_admission_permits` from the PG pool
+/// size. Spike 0.2 verified the substitute path holds a PG connection
+/// only per-query (via `&PgPool`), never across the upstream HTTP/NAR
+/// fetch — so admitted callers >> `pg_max` doesn't starve the pool. 3×
+/// gives headroom for the (typical) case where most admitted calls are
+/// parked on upstream I/O; the `[64, 256]` clamp keeps tiny dev pools
+/// from throttling to single digits and huge pools from admitting
+/// unbounded HTTP fan-out.
+pub(crate) fn derive_substitute_admission_cap(pg_max: u32) -> usize {
+    (pg_max as usize * 3).clamp(64, 256)
+}
 
 #[derive(Parser, Serialize, Default)]
 #[command(
@@ -313,6 +335,21 @@ mod tests {
         assert!(!d.jwt.required);
         assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
         assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
+        // None → main.rs derives via derive_substitute_admission_cap.
+        assert!(d.substitute_admission_permits.is_none());
+    }
+
+    #[test]
+    fn derive_admission_cap_clamps() {
+        // (pg_max × 3).clamp(64, 256). DEFAULT_PG_MAX_CONNECTIONS=50
+        // → 150, mid-range.
+        assert_eq!(derive_substitute_admission_cap(50), 150);
+        // Floor: tiny dev pool doesn't throttle to single digits.
+        assert_eq!(derive_substitute_admission_cap(1), 64);
+        assert_eq!(derive_substitute_admission_cap(21), 64);
+        // Ceiling: huge pool doesn't admit unbounded HTTP fan-out.
+        assert_eq!(derive_substitute_admission_cap(100), 256);
+        assert_eq!(derive_substitute_admission_cap(10_000), 256);
     }
 
     /// `chunk_upload_max_concurrent=0` → `buffer_unordered(0)` hangs

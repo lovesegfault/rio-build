@@ -36,6 +36,8 @@ pub mod realisations;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "server")]
+pub mod admission;
+#[cfg(feature = "server")]
 pub mod backend;
 #[cfg(feature = "server")]
 pub mod cas;
@@ -275,6 +277,20 @@ pub fn describe_metrics() {
          converges on retry."
     );
 
+    describe_gauge!(
+        "rio_store_substitute_admission_utilization",
+        "try_substitute admission-gate utilization: (capacity - available) / \
+         capacity. Updated on each acquire AND each GetLoad call. Can saturate \
+         independently of pg_pool_utilization (upstream HTTP bottleneck)."
+    );
+    describe_counter!(
+        "rio_store_substitute_admission_rejected_total",
+        "try_substitute calls rejected with ResourceExhausted after waiting \
+         SUBSTITUTE_ADMISSION_WAIT (30s) for a permit. Sustained non-zero = \
+         genuine per-replica overload; ComponentScaler should already be \
+         reacting via the GetLoad utilization signal."
+    );
+
     // r[impl obs.metric.store-pg-pool]
     describe_gauge!(
         "rio_store_pg_pool_utilization",
@@ -298,6 +314,9 @@ pub fn describe_metrics() {
     // forever, if no ComponentScaler is deployed) the gauge would be
     // absent. 0.0 is the correct initial value (idle pool at boot).
     metrics::gauge!("rio_store_pg_pool_utilization").set(0.0);
+    // Same: until the first try_substitute_on_miss (or forever, if no
+    // tenant has upstreams configured). 0.0 = no permits held at boot.
+    metrics::gauge!("rio_store_substitute_admission_utilization").set(0.0);
     // Same pre-register reasoning: between sweeps (or on a store that
     // never GCs) the gauge would be absent. 0.0 = no sweep in progress.
     metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);

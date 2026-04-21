@@ -37,6 +37,7 @@ use rio_proto::validated::ValidatedPathInfo;
 use rio_common::grpc::StatusExt;
 use rio_common::limits::MAX_NAR_SIZE;
 
+use crate::admission::AdmissionGate;
 use crate::backend::ChunkBackend;
 use crate::cas::{self, ChunkCache};
 use crate::metadata;
@@ -237,6 +238,14 @@ pub struct StoreServiceImpl {
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
     // r[impl store.put.nar-bytes-budget+3]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
+    /// Per-replica gate on concurrent [`Self::try_substitute_on_miss`]
+    /// calls. Additive to `nar_bytes_budget` — admission bounds COUNT,
+    /// the byte-budget bounds buffered BYTES. main.rs clones this same
+    /// gate into [`StoreAdminServiceImpl`] so `GetLoad` reports the
+    /// utilization the ComponentScaler reacts to. Default
+    /// `AdmissionGate::new(128)` for tests (mid-clamp); production
+    /// derives from `pg_max_connections`.
+    substitute_admission: AdmissionGate,
     /// Upstream binary-cache substituter. `None` disables substitution
     /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462
     /// behavior). `Some` → on miss, try each of the requesting tenant's
@@ -274,6 +283,7 @@ impl StoreServiceImpl {
             service_verifier: None,
             service_bypass_callers: vec!["rio-gateway".to_string(), "rio-scheduler".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
+            substitute_admission: AdmissionGate::new(128),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
@@ -355,6 +365,16 @@ impl StoreServiceImpl {
     /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
     pub fn with_nar_budget(mut self, bytes: usize) -> Self {
         self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(bytes));
+        self
+    }
+
+    /// Set the substitute admission gate. Builder-style. main.rs
+    /// constructs ONE [`AdmissionGate`], clones it here AND into
+    /// [`StoreAdminServiceImpl::with_substitute_admission`] — both
+    /// observe the same `Arc<Semaphore>`, so `GetLoad`'s utilization
+    /// reflects permits this service holds.
+    pub fn with_substitute_admission(mut self, gate: AdmissionGate) -> Self {
+        self.substitute_admission = gate;
         self
     }
 
@@ -477,6 +497,19 @@ impl StoreServiceImpl {
         let (Some(sub), Some(tid)) = (&self.substituter, tenant_id) else {
             return Ok(None);
         };
+        // r[impl store.substitute.admission]
+        // Whole-call gate (spike 0.2): one permit covers the full
+        // closure walk, dropped on any return path. Acquired AFTER the
+        // no-substituter early-return so disabled/tenant-less calls
+        // don't burn permits. The moka singleflight inside
+        // `try_substitute` means same-path coalesced waiters each hold
+        // a permit while only the leader does work — acceptable: the
+        // gate's purpose is bounding N DISTINCT paths (the burst that
+        // singleflight can't coalesce); same-path duplicates are rare
+        // relative to the cap.
+        let _permit = self.substitute_admission.acquire_bounded().await?;
+        metrics::gauge!("rio_store_substitute_admission_utilization")
+            .set(f64::from(self.substitute_admission.utilization()));
         sub.try_substitute(tid, store_path).await.map_err(|e| {
             tracing::warn!(error = %e, store_path, "substitution failed");
             // HashMismatch is intentionally NOT mapped here: per-upstream

@@ -29,6 +29,7 @@ use rio_proto::types::{
     VerifyChunksProgress, VerifyChunksRequest,
 };
 
+use crate::admission::AdmissionGate;
 use crate::backend::ChunkBackend;
 use crate::gc;
 use crate::metadata;
@@ -56,6 +57,15 @@ pub struct StoreAdminServiceImpl {
     /// trusted_keys: [attacker_key]}` and poison every other tenant's
     /// substitution path. See `r[store.admin.service-gate]`.
     service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    /// SAME [`AdmissionGate`] instance as
+    /// [`super::StoreServiceImpl::substitute_admission`] (main.rs
+    /// clones one gate into both). [`get_load`](Self::get_load) reads
+    /// its utilization so the ComponentScaler sees substitution
+    /// saturation independently of PG-pool saturation — upstream HTTP
+    /// can bottleneck while PG sits idle. Default is a fresh 128-slot
+    /// gate that nothing acquires (tests without substitution wired
+    /// see 0.0 utilization, which is truthful).
+    substitute_admission: AdmissionGate,
 }
 
 impl StoreAdminServiceImpl {
@@ -65,6 +75,7 @@ impl StoreAdminServiceImpl {
             chunk_backend,
             shutdown: rio_common::signal::Token::new(),
             service_verifier: None,
+            substitute_admission: AdmissionGate::new(128),
         }
     }
 
@@ -85,6 +96,15 @@ impl StoreAdminServiceImpl {
         verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     ) -> Self {
         self.service_verifier = verifier;
+        self
+    }
+
+    /// Share the substitute admission gate with [`super::StoreServiceImpl`].
+    /// Builder-style. main.rs passes the SAME `AdmissionGate` clone to
+    /// both impls; without this call `GetLoad` reports a fresh
+    /// never-acquired gate (always 0.0).
+    pub fn with_substitute_admission(mut self, gate: AdmissionGate) -> Self {
+        self.substitute_admission = gate;
         self
     }
 
@@ -547,7 +567,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// deployed, the gauge stays at its pre-registered 0.0 (which is
     /// truthful: with `replicas` chart-fixed there's nothing acting
     /// on it anyway).
-    // r[impl store.admin.get-load]
+    // r[impl store.admin.get-load+2]
     // r[impl obs.metric.store-pg-pool]
     #[instrument(skip(self, request), fields(rpc = "GetLoad"))]
     async fn get_load(
@@ -558,9 +578,16 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         self.ensure_service_caller(&request, &["rio-controller"])?;
         let util = Self::pg_pool_utilization(&self.pool);
         metrics::gauge!("rio_store_pg_pool_utilization").set(util as f64);
-        debug!(pg_pool_utilization = util, "GetLoad");
+        let sub_util = self.substitute_admission.utilization();
+        metrics::gauge!("rio_store_substitute_admission_utilization").set(f64::from(sub_util));
+        debug!(
+            pg_pool_utilization = util,
+            substitute_admission_utilization = sub_util,
+            "GetLoad"
+        );
         Ok(Response::new(GetLoadResponse {
             pg_pool_utilization: util,
+            substitute_admission_utilization: sub_util,
         }))
     }
 }
@@ -626,7 +653,7 @@ mod tests {
     /// HELD, utilization is at least `2/max`. The "in-use, not size
     /// or num_idle" property is documented at `pg_pool_utilization`
     /// and follows from the formula by inspection.
-    // r[verify store.admin.get-load]
+    // r[verify store.admin.get-load+2]
     // r[verify obs.metric.store-pg-pool]
     #[tokio::test]
     async fn get_load_tracks_in_use_connections() {
@@ -659,6 +686,42 @@ mod tests {
         assert!(busy <= 1.0, "utilization must not exceed 1.0; got {busy}");
         drop((c1, c2));
     }
+
+    /// `GetLoad.substitute_admission_utilization` reflects permits held
+    /// on the SHARED gate. The store-service side (which acquires) and
+    /// the admin-service side (which reports) MUST be the same
+    /// `AdmissionGate` clone — main.rs wires it; this test proves the
+    /// admin side reads through.
+    // r[verify store.substitute.admission]
+    // r[verify store.admin.get-load+2]
+    #[tokio::test]
+    async fn get_load_tracks_substitute_admission() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let gate = AdmissionGate::new(4);
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None)
+            .with_substitute_admission(gate.clone());
+
+        async fn sub_util(svc: &StoreAdminServiceImpl) -> f32 {
+            svc.get_load(Request::new(GetLoadRequest {}))
+                .await
+                .expect("get_load")
+                .into_inner()
+                .substitute_admission_utilization
+        }
+
+        assert_eq!(sub_util(&svc).await, 0.0, "idle gate → 0.0");
+        // Hold 3/4 via the SAME gate clone (modelling StoreServiceImpl
+        // acquiring on the shared instance).
+        let _p1 = gate.semaphore().clone().acquire_owned().await.unwrap();
+        let _p2 = gate.semaphore().clone().acquire_owned().await.unwrap();
+        let _p3 = gate.semaphore().clone().acquire_owned().await.unwrap();
+        let u = sub_util(&svc).await;
+        assert!(
+            (u - 0.75).abs() < f32::EPSILON,
+            "3/4 held → 0.75; got {u} (admin side not reading the shared gate?)"
+        );
+    }
+
     /// Concurrent TriggerGC calls are serialized via advisory
     /// lock. Second call returns immediately with "already running".
     #[tokio::test]

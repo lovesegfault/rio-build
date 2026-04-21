@@ -354,6 +354,12 @@ message GetLoadResponse {
   // races num_idle() (separate non-atomic loads) — the consumer
   // compares against a 0.8 threshold so a transient >1.0 is harmless.
   float pg_pool_utilization = 1;
+  // (capacity - available_permits) / capacity for the per-replica
+  // try_substitute admission gate. Range [0, 1]. Can saturate
+  // independently of pg_pool_utilization (upstream HTTP bottleneck —
+  // permits held across the NAR fetch, PG connection released
+  // per-query). The ComponentScaler folds max(pg, this) per pod.
+  float substitute_admission_utilization = 2;
 }
 
 // VerifyChunks audit: head-object every non-deleted chunk in PG, report
