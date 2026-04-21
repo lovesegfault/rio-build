@@ -3194,3 +3194,168 @@ async fn substitute_fail_with_poisoned_dep_goes_dependency_failed() -> TestResul
     );
     Ok(())
 }
+
+/// Spike 0.1 — admission backpressure: with the store returning
+/// `ResourceExhausted` for `hold_s` of wall-clock, does the detached
+/// substitute-fetch's 5-attempt × ~3.75s retry curve absorb it, or does
+/// it demote to build-from-source (Substituting→Ready)?
+///
+/// One PG/actor setup; matrix loops `hold_s ∈ {2, 8, 20, 60}` with 50
+/// fresh substitutable nodes per case. Each detached task attempts at
+/// t≈{0, 0.25, 0.75, 1.75, 3.75}s (±20% jitter); if RE persists past
+/// the last attempt the path demotes. So the boundary is the
+/// cumulative-backoff window (~3.0-4.5s with jitter), not `hold_s`
+/// itself — `hold=8/20/60` all resolve at ~5s.
+///
+/// Real-time (not `start_paused`): ephemeral-PG setup + tokio paused
+/// time don't compose (see merge.rs `transient_retry`). Per-case wait
+/// is bounded at ~6s (max cumulative backoff + slack), so the full
+/// matrix is ~24s wall-clock regardless of the largest `hold_s`.
+///
+/// Prints the `(hold_s, demoted_count)` table — the architectural
+/// decision (bounded-wait `sem.acquire` vs. `try_acquire`) is read
+/// from that table, not from a single pass/fail.
+#[tokio::test]
+async fn spike_substitute_backpressure_matrix() -> TestResult {
+    use crate::state::DerivationStatus;
+    const N: usize = 50;
+    const HOLDS: &[u64] = &[2, 8, 20, 60];
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let mut table: Vec<(u64, usize, usize)> = Vec::new();
+    for (case, &hold_s) in HOLDS.iter().enumerate() {
+        // 50 leaf nodes, aarch64 so they can't dispatch to a worker
+        // (no worker connected anyway). One output each, all seeded
+        // substitutable BEFORE merge so merge-time check_cached_outputs
+        // → spawn_substitute_fetches transitions all 50 to Substituting
+        // and spawns 50 detached fetch tasks.
+        let mut nodes = Vec::with_capacity(N);
+        let mut hashes = Vec::with_capacity(N);
+        let mut outs = Vec::with_capacity(N);
+        for i in 0..N {
+            let tag = format!("spike-bp-c{case}-n{i}");
+            let out = test_store_path(&format!("spike-bp-c{case}-n{i}-out"));
+            let mut n = make_node(&tag);
+            n.system = "aarch64-linux".into();
+            n.expected_output_paths = vec![out.clone()];
+            hashes.push(n.drv_hash.clone());
+            outs.push(out);
+            nodes.push(n);
+        }
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .extend(outs.iter().cloned());
+
+        // Arm RE-until-deadline. Real Instant; the mock checks
+        // `now() < until` on every QPI call.
+        *store
+            .faults
+            .fail_qpi_resource_exhausted_until
+            .write()
+            .unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(hold_s));
+
+        let build_id = Uuid::new_v4();
+        let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
+        barrier(&handle).await;
+
+        // All 50 detached tasks resolve within max-jittered cumulative
+        // backoff (4× 1.2× = 4.5s) + actor mailbox drain. Poll status
+        // until none are Substituting; cap at 8s (6s budget + slack)
+        // — independent of hold_s, since demote/succeed both happen at
+        // the retry-budget boundary, not the hold deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            barrier(&handle).await;
+            let mut any_sub = false;
+            for h in &hashes {
+                if expect_drv(&handle, h).await.status == DerivationStatus::Substituting {
+                    any_sub = true;
+                    break;
+                }
+            }
+            if !any_sub {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hold_s={hold_s}: detached fetches did not resolve within 8s \
+                 (retry budget ~4.5s + mailbox drain); hung task?"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Disarm for the next case so its merge-time FindMissingPaths
+        // (different RPC, but belt-and-braces) and any straggler don't
+        // see RE.
+        *store
+            .faults
+            .fail_qpi_resource_exhausted_until
+            .write()
+            .unwrap() = None;
+
+        let mut demoted = 0usize;
+        let mut completed = 0usize;
+        for h in &hashes {
+            match expect_drv(&handle, h).await.status {
+                DerivationStatus::Ready | DerivationStatus::Queued => demoted += 1,
+                DerivationStatus::Completed => completed += 1,
+                other => panic!(
+                    "hold_s={hold_s}: {h} in unexpected terminal status {other:?} \
+                     (expected Ready/Queued=demoted or Completed)"
+                ),
+            }
+        }
+        table.push((hold_s, demoted, completed));
+    }
+
+    // ── Print the matrix (the spike's actual output) ────────────────
+    println!("\n  spike 0.1 — substitute backpressure matrix");
+    println!("  hold_s  demoted  completed");
+    for (hold_s, demoted, completed) in &table {
+        println!("  {hold_s:>6}  {demoted:>7}  {completed:>9}");
+    }
+    // SUBSTITUTE_FETCH_BACKOFF: 250+500+1000+2000 = 3750ms ±20% jitter
+    // → cumulative window [3000, 4500]ms. The matrix-derived verdict:
+    let demoted_at_2 = table[0].1;
+    let demoted_at_8 = table[1].1;
+    if demoted_at_8 > 0 {
+        println!(
+            "\n  VERDICT: FAIL at hold≥8s ({demoted_at_8}/{N} demoted). \
+             P2 design = bounded-wait: tokio::time::timeout(30s, sem.acquire_owned()), \
+             RE only after 30s."
+        );
+    } else {
+        println!(
+            "\n  VERDICT: PASS at all holds (0 demoted at 8s). \
+             try_acquire_owned() acceptable."
+        );
+    }
+    println!();
+
+    // Structural assertions (the spike's exit criterion: assertion
+    // EXECUTED, not just "compiles"). hold=2s is below the min-jitter
+    // cumulative (3.0s) → attempt 4 always sees a cleared fault → 0
+    // demoted. hold=8s is above max-jitter cumulative (4.5s) → all
+    // attempts see RE → 50 demoted. hold=20/60 same as 8.
+    assert_eq!(
+        demoted_at_2, 0,
+        "hold=2s < 3.0s min retry budget: every node should reach a \
+         cleared store on attempt ≤4 → 0 demoted, got {demoted_at_2}"
+    );
+    assert_eq!(
+        demoted_at_8, N,
+        "hold=8s > 4.5s max retry budget: every node exhausts 5 attempts \
+         under RE → all {N} demoted, got {demoted_at_8}. \
+         CONFIRMS Q1: current curve does NOT absorb store-side backpressure."
+    );
+    for &(hold_s, demoted, _) in &table[2..] {
+        assert_eq!(
+            demoted, N,
+            "hold={hold_s}s: same as hold=8s (>4.5s) → all {N} demoted, got {demoted}"
+        );
+    }
+    Ok(())
+}

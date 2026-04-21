@@ -105,6 +105,16 @@ pub struct MockStoreFaults {
     /// At 0, falls through to normal behavior. For retry-then-succeed
     /// tests (transient overload absorbed by backoff).
     pub fail_query_path_info_n_times: Arc<std::sync::atomic::AtomicU32>,
+    /// While `std::time::Instant::now() < deadline`, query_path_info
+    /// returns `ResourceExhausted`. At/after the deadline, falls
+    /// through to normal behavior. Time-based (not count-based) so
+    /// tests can model "store is overloaded for N seconds" against the
+    /// caller's wall-clock retry budget — the count-based knob above
+    /// can't express that with concurrent callers (each decrements).
+    /// `std::time::Instant` (not tokio's) because the scheduler's
+    /// substitute-fetch tests run on real time (ephemeral PG + paused
+    /// time don't compose; see merge.rs `transient_retry`).
+    pub fail_qpi_resource_exhausted_until: Arc<RwLock<Option<std::time::Instant>>>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
@@ -605,6 +615,17 @@ impl StoreService for MockStore {
         {
             return Err(Status::unavailable(
                 "mock: injected query_path_info transient failure (n_times)",
+            ));
+        }
+        if let Some(until) = *self
+            .faults
+            .fail_qpi_resource_exhausted_until
+            .read()
+            .unwrap()
+            && std::time::Instant::now() < until
+        {
+            return Err(Status::resource_exhausted(
+                "mock: injected query_path_info ResourceExhausted (time-gated)",
             ));
         }
         let store_path = request.into_inner().store_path;
