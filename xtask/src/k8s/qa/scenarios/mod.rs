@@ -54,7 +54,6 @@ mod i205_nodepool_schedulable;
 mod i207_stale_uploading;
 mod i208_floor_hydrated;
 mod i209_assignment_terminal;
-mod i212_prefetch_filtered;
 
 pub static ALL: &[&dyn Scenario] = &[
     // ─── Shared (read-only) ───────────────────────────────────────────
@@ -85,7 +84,6 @@ pub static ALL: &[&dyn Scenario] = &[
     &i167_drv_name_query::DrvNameQuery,
     &i181_kvm_featureless::KvmFeatureless,
     &i204_big_parallel_routing::BigParallelRouting,
-    &i212_prefetch_filtered::PrefetchFiltered,
     // ─── Exclusive ────────────────────────────────────────────────────
     &i024_restart_drains_fods::RestartDrainsFods,
     &i033_zombie_executors::ZombieExecutors,

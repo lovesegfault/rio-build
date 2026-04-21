@@ -50,39 +50,42 @@ impl Scenario for AssignmentTerminal {
         // Expected to fail — swallow the Err (it's the success case).
         let _ = ctx.nix_build_expr_via_gateway(0, &expr).await;
 
-        // Find the derivation by name fragment, then its assignments.
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM assignments a \
-             JOIN derivations d ON d.derivation_id = a.derivation_id \
-             WHERE d.drv_path LIKE $1 AND a.status = 'pending'",
-        )
-        .bind(format!("%{name}%"))
-        .fetch_one(ctx.pg())
-        .await?;
+        // The gateway returns the failure as soon as the builder
+        // reports it; the scheduler's actor commits the assignment
+        // status update on its own tick. Poll until the row appears.
+        let pat = format!("%{name}%");
+        let q = |pred: &'static str| {
+            let pat = pat.clone();
+            let pg = ctx.pg().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM assignments a \
+                     JOIN derivations d ON d.derivation_id = a.derivation_id \
+                     WHERE d.drv_path LIKE $1 AND a.status {pred}"
+                ))
+                .bind(pat)
+                .fetch_one(&pg)
+                .await
+            }
+        };
+        let row =
+            super::common::poll_until(Duration::from_secs(30), Duration::from_secs(2), || async {
+                let pending = q("= 'pending'").await?;
+                let terminal = q("<> 'pending'").await?;
+                Ok((pending + terminal > 0).then_some((pending, terminal)))
+            })
+            .await?;
 
-        let terminal: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM assignments a \
-             JOIN derivations d ON d.derivation_id = a.derivation_id \
-             WHERE d.drv_path LIKE $1 AND a.status <> 'pending'",
-        )
-        .bind(format!("%{name}%"))
-        .fetch_one(ctx.pg())
-        .await?;
-
-        if terminal == 0 && pending == 0 {
-            return Ok(Verdict::Skip(
-                "no assignment row found for failing drv — dispatch path \
-                 didn't reach assignment (FOD-only? check name match)"
-                    .into(),
-            ));
-        }
-        if pending == 0 {
-            Ok(Verdict::Pass)
-        } else {
-            Ok(Verdict::Fail(format!(
-                "{pending} assignment row(s) left status='pending' for a \
+        match row {
+            None => Ok(Verdict::Fail(format!(
+                "no assignment row for {name} within 30s of build failure — \
+                 dispatch never wrote one (check derivations.drv_path match)"
+            ))),
+            Some((0, _)) => Ok(Verdict::Pass),
+            Some((pending, _)) => Ok(Verdict::Fail(format!(
+                "{pending} assignment row(s) still status='pending' for a \
                  PermanentFailure derivation — failure path not terminal-ing"
-            )))
+            ))),
         }
     }
 }
