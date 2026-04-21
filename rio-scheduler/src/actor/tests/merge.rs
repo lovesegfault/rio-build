@@ -2753,3 +2753,131 @@ async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestRe
     );
     Ok(())
 }
+
+// ===========================================================================
+// r[sched.substitute.fanout-bound]: cd83a9b2-cannot-recur structural assertion
+// ===========================================================================
+
+/// cd83a9b2 regression: with the store now owning admission
+/// (`r[store.substitute.admission]`), the scheduler-side
+/// `DEFAULT_SUBSTITUTE_CONCURRENCY` is purely a memory bound. Under
+/// store-side `ResourceExhausted` backpressure on a wide substitutable
+/// DAG, the detached fetch tasks MUST retry-then-succeed and the
+/// semaphore MUST not leak permits.
+///
+/// 500 leaf nodes (5000 dominates the suite — see plan §7 R6; with 256
+/// permits and 3× per-path RE → ~1.75 s held permit × ⌈500/256⌉ = ~4 s
+/// real-time), 3 `ResourceExhausted` per path then success
+/// (`SUBSTITUTE_FETCH_MAX_ATTEMPTS=8`, so 3 sits well inside the budget;
+/// the plan's "10 per path" exceeds 8 and would assert the wrong thing).
+///
+/// STRUCTURAL — no wall-clock assertions:
+///   (a) every node → `Completed` (zero demotions to build-from-source);
+///   (b) `substitute_sem.available_permits()` returns to the configured
+///       cap (no leaked permits — the cap held);
+///   (c) every path saw exactly N+1 QPI attempts (N retries + 1 success
+///       — proxies `rio_scheduler_substitute_fetch_retries_total` without
+///       a process-global recorder);
+///   (d) zero failures: implied by (a) + `qpi_calls.len() == N` (every
+///       path reached the success arm exactly once).
+// r[verify sched.substitute.fanout-bound]
+#[tokio::test]
+async fn cd83a9b2_cannot_recur() -> TestResult {
+    use crate::state::DerivationStatus;
+    const N: usize = 500;
+    const RE_PER_PATH: u32 = 3;
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let mut nodes = Vec::with_capacity(N);
+    let mut hashes = Vec::with_capacity(N);
+    let mut outs = Vec::with_capacity(N);
+    for i in 0..N {
+        let tag = format!("fanout-n{i}");
+        let out = test_store_path(&format!("fanout-n{i}-out"));
+        let mut n = make_node(&tag);
+        n.expected_output_paths = vec![out.clone()];
+        hashes.push(n.drv_hash.clone());
+        outs.push(out);
+        nodes.push(n);
+    }
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .extend(outs.iter().cloned());
+    store
+        .faults
+        .fail_qpi_resource_exhausted_per_path_n
+        .store(RE_PER_PATH, std::sync::atomic::Ordering::SeqCst);
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // Drain: poll until none Substituting. The 30 s cap is hang-detection
+    // (real-time backoff = ~4 s expected), NOT the assertion.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        barrier(&handle).await;
+        let any = {
+            let mut any = false;
+            for h in &hashes {
+                if expect_drv(&handle, h).await.status == DerivationStatus::Substituting {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        };
+        if !any {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached fetches did not drain in 30 s (expected ~4 s); hung task?"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // (a) all Completed — zero demotions / zero failures.
+    for h in &hashes {
+        let st = expect_drv(&handle, h).await.status;
+        assert_eq!(
+            st,
+            DerivationStatus::Completed,
+            "{h}: store ResourceExhausted must be retried, not demoted; got {st:?}"
+        );
+    }
+
+    // (b) semaphore returned to cap — no leaked permits across N tasks.
+    let snap = handle.debug_counters().await?;
+    assert_eq!(
+        snap.substitute_sem_permits,
+        crate::actor::DEFAULT_SUBSTITUTE_CONCURRENCY,
+        "substitute_sem leaked permits: {} available, expected {}",
+        snap.substitute_sem_permits,
+        crate::actor::DEFAULT_SUBSTITUTE_CONCURRENCY,
+    );
+
+    // (c) every path retried exactly RE_PER_PATH times then succeeded.
+    // Structural proxy for substitute_fetch_retries_total ≥ N×RE_PER_PATH
+    // and substitute_fetch_failures_total == 0.
+    let attempts = store.calls.qpi_attempts_by_path.read().unwrap();
+    for out in &outs {
+        assert_eq!(
+            attempts.get(out).copied(),
+            Some(RE_PER_PATH + 1),
+            "{out}: expected {RE_PER_PATH} ResourceExhausted retries + 1 success"
+        );
+    }
+
+    // (d) every path reached the success arm exactly once.
+    assert_eq!(
+        store.calls.qpi_calls.read().unwrap().len(),
+        N,
+        "every path should record one successful QPI"
+    );
+    Ok(())
+}

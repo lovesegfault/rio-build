@@ -145,6 +145,9 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     };
 
     let jwt = jwt_unless_drv(jwt_token, &path);
+    // TODO: retry on ResourceExhausted (R9). Store's admission gate
+    // bounded-waits 30s before RE so this only fires under sustained
+    // overload; today degrades to "path unavailable" → build-from-source.
     let info = match grpc_query_path_info(store_client, jwt, path.as_str()).await {
         Ok(info) => info,
         Err(e) => stderr_err!(stderr, "store error: {e}"),

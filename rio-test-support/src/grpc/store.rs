@@ -57,6 +57,12 @@ pub struct MockStoreCalls {
     /// Records every `query_path_info` call's requested path. For
     /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
+    /// Per-path `query_path_info` attempt count, INCLUDING calls that
+    /// fault-short-circuit (the early-return knobs above all skip
+    /// `qpi_calls`). For r[sched.substitute.fanout-bound] structural
+    /// retry assertions: `attempts[p] == N+1` proves N retries + 1
+    /// success without a process-global metrics recorder.
+    pub qpi_attempts_by_path: Arc<RwLock<HashMap<String, u32>>>,
     /// Number of `batch_query_path_info` calls received. For I-110
     /// tests proving the builder uses one batch RPC per BFS layer
     /// (not N per-path RPCs).
@@ -115,6 +121,14 @@ pub struct MockStoreFaults {
     /// substitute-fetch tests run on real time (ephemeral PG + paused
     /// time don't compose; see scheduler `merge.rs::transient_retry`).
     pub fail_qpi_resource_exhausted_until: Arc<RwLock<Option<std::time::Instant>>>,
+    /// While > 0, query_path_info returns `ResourceExhausted` for the
+    /// first N attempts PER PATH (tracked via
+    /// [`MockStoreCalls::qpi_attempts_by_path`]); attempt N+1 falls
+    /// through. Count-based per-path (vs the time-gated knob above) so
+    /// the r[sched.substitute.fanout-bound] regression test asserts
+    /// structurally — every path retried exactly N times — without a
+    /// wall-clock window.
+    pub fail_qpi_resource_exhausted_per_path_n: Arc<std::sync::atomic::AtomicU32>,
     /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
     pub fail_get_path: Arc<AtomicBool>,
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
@@ -592,6 +606,24 @@ impl StoreService for MockStore {
             .load(Ordering::SeqCst)
         {
             self.faults.query_path_info_gate.notified().await;
+        }
+        // Per-path attempt count — recorded BEFORE any fault
+        // short-circuit so retry tests can assert on it structurally.
+        let attempt = {
+            let path = &request.get_ref().store_path;
+            let mut m = self.calls.qpi_attempts_by_path.write().unwrap();
+            let n = m.entry(path.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let per_path_n = self
+            .faults
+            .fail_qpi_resource_exhausted_per_path_n
+            .load(Ordering::SeqCst);
+        if per_path_n > 0 && attempt <= per_path_n {
+            return Err(Status::resource_exhausted(
+                "mock: injected query_path_info ResourceExhausted (per-path-n)",
+            ));
         }
         if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
             return Err(Status::unavailable(

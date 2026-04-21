@@ -108,6 +108,7 @@ pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 /// `DagActor.substitute_sem` permit before its `QueryPathInfo`.
 /// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT` (operator escape
 /// hatch — not chart-set).
+// r[impl sched.substitute.fanout-bound]
 pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
 
 /// Retry policy for the detached substitute fetch's `QueryPathInfo`.
@@ -443,6 +444,9 @@ impl TestCounters {
         TestCountersSnapshot {
             dispatch_ready_calls: self.dispatch_ready_calls.load(SeqCst),
             persist_status_calls: self.persist_status_calls.load(SeqCst),
+            // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
+            // lives on `DagActor`, not here.
+            substitute_sem_permits: 0,
         }
     }
 }
@@ -456,6 +460,11 @@ impl TestCounters {
 pub struct TestCountersSnapshot {
     pub dispatch_ready_calls: u64,
     pub persist_status_calls: u64,
+    /// `DagActor.substitute_sem.available_permits()` at snapshot time.
+    /// Filled by the [`DebugCmd::Counters`] handler (not
+    /// [`TestCounters::snapshot`] — the semaphore lives on the actor).
+    /// For r[sched.substitute.fanout-bound]'s no-permit-leak assertion.
+    pub substitute_sem_permits: usize,
 }
 
 impl DagActor {

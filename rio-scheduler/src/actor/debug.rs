@@ -125,7 +125,10 @@ impl DagActor {
                 let _ = reply.send(());
             }
             DebugCmd::Counters { reply } => {
-                let _ = reply.send(self.test_counters.snapshot());
+                let _ = reply.send(super::TestCountersSnapshot {
+                    substitute_sem_permits: self.substitute_sem.available_permits(),
+                    ..self.test_counters.snapshot()
+                });
             }
             DebugCmd::SeedSchedHint {
                 drv_hash,
