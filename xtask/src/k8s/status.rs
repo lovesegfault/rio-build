@@ -25,8 +25,8 @@ use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
 
 /// Scheduler metrics container port (scheduler.yaml `name: metrics`).
 /// The Service spec only exposes 9001 (gRPC) — must target the pod.
-const SCHED_METRICS_PORT: u16 = 9091;
-const STORE_METRICS_PORT: u16 = 9092;
+pub(crate) const SCHED_METRICS_PORT: u16 = 9091;
+pub(crate) const STORE_METRICS_PORT: u16 = 9092;
 /// Per-scrape timeout. Anything slower means bigger problems.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -334,7 +334,12 @@ pub(crate) async fn gather_scheduler_metrics(client: &k::Client) -> Option<Sched
 /// In-process port-forward + minimal HTTP/1.0 GET /metrics. kube's
 /// portforward hands back a duplex stream; pulling hyper for one
 /// request is heavier than 10 lines.
-async fn scrape_pod(client: &k::Client, ns: &str, pod: &str, port: u16) -> Result<String> {
+pub(crate) async fn scrape_pod(
+    client: &k::Client,
+    ns: &str,
+    pod: &str,
+    port: u16,
+) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
     let fut = async {
@@ -356,12 +361,12 @@ async fn scrape_pod(client: &k::Client, ns: &str, pod: &str, port: u16) -> Resul
 /// `(label-set, value)`. Label set is the raw `{…}` string (empty for
 /// unlabelled scalars) — good enough for display and for matching
 /// `_sum` against `_count` of the same series.
-struct Scrape {
+pub(crate) struct Scrape {
     by_name: BTreeMap<String, Vec<(String, f64)>>,
 }
 
 impl Scrape {
-    fn parse(body: &str) -> Self {
+    pub(crate) fn parse(body: &str) -> Self {
         let mut by_name: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
         for line in body.lines() {
             let line = line.trim();
@@ -390,11 +395,16 @@ impl Scrape {
         Self { by_name }
     }
 
-    fn series(&self, name: &str) -> &[(String, f64)] {
+    /// Sum of all series for `name` — what most counter-asserts want.
+    pub(crate) fn sum(&self, name: &str) -> f64 {
+        self.series(name).iter().map(|(_, v)| *v).sum()
+    }
+
+    pub(crate) fn series(&self, name: &str) -> &[(String, f64)] {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    fn first(&self, name: &str) -> Option<f64> {
+    pub(crate) fn first(&self, name: &str) -> Option<f64> {
         self.series(name).first().map(|(_, v)| *v)
     }
 

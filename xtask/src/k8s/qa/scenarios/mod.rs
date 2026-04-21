@@ -7,10 +7,29 @@
 
 use super::Scenario;
 
+mod i032_relay_loop;
 mod i048c_blackhole_self_test;
+mod i056_stale_draining;
+mod i078_narinfo_seqscan;
+mod i095_ghost_dispatch;
+mod i114_liveness_kill;
+mod i163_mailbox_under_load;
+mod i165_fuse_dstate;
+mod i201_stranded_chunks;
+mod i205_nodepool_schedulable;
 
 pub static ALL: &[&dyn Scenario] = &[
+    // ─── Shared (read-only) ───────────────────────────────────────────
+    &i056_stale_draining::StaleDraining,
+    &i078_narinfo_seqscan::NarinfoSeqScan,
+    &i205_nodepool_schedulable::NodepoolSchedulable,
+    // ─── Tenant ───────────────────────────────────────────────────────
+    &i032_relay_loop::RelayLoop,
+    &i095_ghost_dispatch::GhostDispatch,
+    &i114_liveness_kill::LivenessKill,
+    &i163_mailbox_under_load::MailboxUnderLoad,
+    // ─── Exclusive ────────────────────────────────────────────────────
     &i048c_blackhole_self_test::BlackholeSelfTest,
-    // top-10 seeds (i095, i163, i056, i043, i165, i201, i032, i078,
-    // i114) follow once the scheduler compiles end-to-end.
+    &i165_fuse_dstate::FuseDState,
+    &i201_stranded_chunks::StrandedChunks,
 ];

@@ -143,7 +143,7 @@ impl QaOpts {
 /// What a scenario touches. Coarse — refine to per-arch / per-replica
 /// only when the Exclusive set's serial wall-clock proves it matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // variants populated as seed scenarios land
+#[allow(dead_code)] // unused variants are API for the remaining 108 candidates
 pub enum Component {
     Scheduler,
     Store,
@@ -156,7 +156,6 @@ pub enum Component {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // variants populated as seed scenarios land
 pub enum Isolation {
     /// Read-only. Phase 1, unbounded.
     Shared,
@@ -187,7 +186,6 @@ pub trait Scenario: Send + Sync {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Pass constructed by scenario impls
 pub enum Verdict {
     Pass,
     /// Precondition not met (e.g., no aarch64 nodes). Reported but
@@ -213,7 +211,7 @@ pub async fn run(
             Stage::Lint => lint::run()?,
             Stage::Health => p.smoke(cfg).await?,
             Stage::Scenarios => {
-                scheduler::run(scenarios::ALL, &opts.only, opts.tenant_pool, kind).await?
+                scheduler::run(scenarios::ALL, &opts.only, opts.tenant_pool, kind, cfg).await?
             }
             Stage::Load => {
                 super::stress::cmd_run(

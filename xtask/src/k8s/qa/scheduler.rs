@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use super::ctx::{QaCtx, TenantPool};
 use super::{Component, Isolation, Scenario, ScenarioMeta, Verdict};
+use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
 use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::ProviderKind;
@@ -34,6 +35,7 @@ pub async fn run(
     only: &[String],
     tenant_pool_size: usize,
     _kind: ProviderKind,
+    cfg: &XtaskConfig,
 ) -> Result<()> {
     let scenarios: Vec<_> = registry
         .iter()
@@ -46,6 +48,7 @@ pub async fn run(
 
     let kube = kube::Client::try_default().await?;
     let cli = Arc::new(CliCtx::open(&kube, 0, 0).await?);
+    let cfg = Arc::new(cfg.clone());
     let pool = Arc::new(TenantPool::new(&cli, tenant_pool_size).await?);
 
     let (p1, p2): (Vec<_>, Vec<_>) = scenarios
@@ -55,13 +58,13 @@ pub async fn run(
     let mut outcomes = Vec::new();
 
     ui::step("qa scenarios — phase 1 (shared + tenant)", || async {
-        outcomes.extend(run_phase1(p1, &kube, &cli, &pool).await);
+        outcomes.extend(run_phase1(p1, &kube, &cli, &cfg, &pool).await);
         Ok::<_, anyhow::Error>(())
     })
     .await?;
 
     ui::step("qa scenarios — phase 2 (exclusive)", || async {
-        outcomes.extend(run_phase2(p2, &kube, &cli).await);
+        outcomes.extend(run_phase2(p2, &kube, &cli, &cfg).await);
         Ok::<_, anyhow::Error>(())
     })
     .await?;
@@ -86,12 +89,14 @@ async fn run_phase1(
     scenarios: Vec<&'static dyn Scenario>,
     kube: &kube::Client,
     cli: &Arc<CliCtx>,
+    cfg: &Arc<XtaskConfig>,
     pool: &Arc<TenantPool>,
 ) -> Vec<Outcome> {
     let mut set = JoinSet::new();
     for s in scenarios {
         let kube = kube.clone();
         let cli = cli.clone();
+        let cfg = cfg.clone();
         let pool = pool.clone();
         set.spawn(async move {
             let meta = s.meta();
@@ -103,7 +108,7 @@ async fn run_phase1(
                 .as_ref()
                 .map(|l| l.names().to_vec())
                 .unwrap_or_default();
-            let out = exec(s, &meta, kube, cli, tenants).await;
+            let out = exec(s, &meta, kube, cli, cfg, tenants).await;
             if let Some(l) = lease {
                 l.release().await;
             }
@@ -118,6 +123,7 @@ async fn run_phase2(
     scenarios: Vec<&'static dyn Scenario>,
     kube: &kube::Client,
     cli: &Arc<CliCtx>,
+    cfg: &Arc<XtaskConfig>,
 ) -> Vec<Outcome> {
     let mut pending: VecDeque<_> = scenarios.into_iter().collect();
     let mut held: HashSet<Component> = HashSet::new();
@@ -137,8 +143,9 @@ async fn run_phase2(
                 let s = pending.remove(i).expect("i < len");
                 let kube = kube.clone();
                 let cli = cli.clone();
+                let cfg = cfg.clone();
                 set.spawn(async move {
-                    let o = exec(s, &meta, kube, cli, Vec::new()).await;
+                    let o = exec(s, &meta, kube, cli, cfg, Vec::new()).await;
                     (o, mutates)
                 });
             } else {
@@ -165,10 +172,16 @@ async fn exec(
     meta: &ScenarioMeta,
     kube: kube::Client,
     cli: Arc<CliCtx>,
+    cfg: Arc<XtaskConfig>,
     tenants: Vec<String>,
 ) -> Outcome {
     let start = Instant::now();
-    let mut ctx = QaCtx { kube, cli, tenants };
+    let mut ctx = QaCtx {
+        kube,
+        cli,
+        cfg,
+        tenants,
+    };
     let verdict = match tokio::time::timeout(meta.timeout, s.run(&mut ctx)).await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => Verdict::Fail(format!("error: {e:#}")),
