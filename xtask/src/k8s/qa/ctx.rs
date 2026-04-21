@@ -1,44 +1,56 @@
-//! Per-scenario execution context + ephemeral tenant pool.
+//! Per-scenario execution context + ephemeral tenant pool + PG handle.
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::future::try_join_all;
 use serde::de::DeserializeOwned;
+use sqlx::PgPool;
+use tempfile::TempDir;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
-use crate::config::XtaskConfig;
-use crate::k8s::eks::smoke::{self, CliCtx, step_tenant, step_upstream};
+use crate::k8s::eks::smoke::{self, CliCtx, step_restart_gateway, step_tenant, step_upstream};
+use crate::k8s::shared::{self, ProcessGuard};
 use crate::k8s::status::{SCHED_METRICS_PORT, Scrape, scrape_pod};
-use crate::k8s::{NS, NS_BUILDERS, client as kube, shared};
+use crate::k8s::{NS, NS_BUILDERS, client as kube};
 use crate::sh::{self, cmd};
+use crate::ssh;
 
-/// What every `Scenario::run()` receives. `cli`/`kube`/`cfg` are shared
-/// across the whole run (cheap clones); `tenants` is per-scenario for
-/// `Isolation::Tenant { count }` — `count` names allocated from the pool.
+// ─── per-scenario context ──────────────────────────────────────────────
+
+/// What every `Scenario::run()` receives. `cli`/`kube`/`cfg`/`pg` are
+/// shared across the whole run (cheap clones); `tenants` is per-scenario
+/// for `Isolation::Tenant { count }` — `count` slots allocated from the
+/// pool.
 pub struct QaCtx {
     pub kube: kube::Client,
     pub cli: Arc<CliCtx>,
-    pub cfg: Arc<XtaskConfig>,
-    /// `count` tenant names for `Isolation::Tenant`; empty otherwise.
-    /// Index 0 is the "primary" — single-tenant scenarios just use
-    /// `ctx.tenant()`. Seed scenarios don't yet read this — see the
-    /// attribution caveat on [`QaCtx::nix_build_via_gateway`].
-    #[allow(dead_code)]
-    pub tenants: Vec<String>,
+    pub pg: Arc<PgPool>,
+    /// `count` tenant slots for `Isolation::Tenant`; empty otherwise.
+    /// Index 0 is the "primary" — single-tenant scenarios use
+    /// `ctx.tenant(0)` / `ctx.nix_build_via_gateway(0, ...)`.
+    pub tenants: Vec<Tenant>,
 }
 
 impl QaCtx {
-    /// Primary tenant. Panics if isolation isn't `Tenant` — that's a
-    /// scenario-author bug, not a runtime condition.
-    #[allow(dead_code)] // see field doc above
-    pub fn tenant(&self) -> &str {
+    /// Tenant at `idx`. Panics if out of range — that's a scenario-author
+    /// bug (asked for fewer in `Isolation::Tenant{count}` than indexed),
+    /// not a runtime condition.
+    pub fn tenant(&self, idx: usize) -> &Tenant {
         self.tenants
-            .first()
-            .map(String::as_str)
-            .expect("tenant() called on non-Tenant scenario")
+            .get(idx)
+            .expect("tenant(idx) out of range for declared Isolation::Tenant{count}")
+    }
+
+    /// Direct PG pool. Runtime queries only — `sqlx::query!` macros
+    /// can't be used (the cluster's schema isn't known at xtask build
+    /// time). See [`PgHandle::open`] for connection setup.
+    pub fn pg(&self) -> &PgPool {
+        &self.pg
     }
 
     /// One scrape of the scheduler-leader's `/metrics`. Covers every
@@ -51,8 +63,7 @@ impl QaCtx {
         Ok(Scrape::parse(&body))
     }
 
-    /// `rio-cli --json <args>` parsed into `T`. The CLI's `--json` flag
-    /// is the global flag, so it's prepended here.
+    /// `rio-cli --json <args>` parsed into `T`.
     pub fn cli_json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
         let mut full = vec!["--json"];
         full.extend_from_slice(args);
@@ -60,17 +71,14 @@ impl QaCtx {
         serde_json::from_str(&out).with_context(|| format!("rio-cli {args:?}: {out}"))
     }
 
-    /// Shell out to `kubectl`. Thin escape hatch for asserts that the
-    /// kube crate doesn't cover (pod exec, logs --since, raw resource
-    /// inspection). Stdout returned; non-zero exit propagates as Err.
+    /// Shell out to `kubectl`. Thin escape hatch for asserts the kube
+    /// crate doesn't cover (pod exec, logs --since).
     pub fn kubectl(&self, args: &[&str]) -> Result<String> {
         let s = sh::shell()?;
         sh::try_read(cmd!(s, "kubectl {args...}"))
     }
 
-    /// List running pods in `ns` matching `label_selector`. Convenience
-    /// for builder/fetcher fan-out asserts (i165 D-state probe, i114
-    /// log grep).
+    /// List running pods in `ns` matching `label_selector`.
     pub fn running_pods(&self, ns: &str, label_selector: &str) -> Result<Vec<String>> {
         let out = self.kubectl(&[
             "-n",
@@ -86,128 +94,214 @@ impl QaCtx {
         Ok(out.split_whitespace().map(String::from).collect())
     }
 
-    /// Submit a trivial busybox build via the gateway (port-forward +
-    /// ssh-ng), block until it completes. Reuses [`smoke::smoke_build`]
-    /// — `secs` of `read /dev/zero` plus `out_kb` KiB of output.
-    ///
-    /// **Tenant attribution caveat:** the SSH key is the operator's
-    /// `RIO_SSH_PUBKEY`, NOT the ephemeral `qa-{nonce}-{i}` tenant.
-    /// Builds attribute to whichever tenant that key maps to. Scenarios
-    /// asserting per-tenant behavior must account for this; scenarios
-    /// asserting cluster-level behavior (mailbox depth, log relay,
-    /// liveness-kill) don't care.
-    pub async fn nix_build_via_gateway(&self, tag: &str, secs: u32, out_kb: u32) -> Result<()> {
-        let key = crate::ssh::privkey_path(&self.cfg)?;
-        let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
-        // ssh_banner readiness — same poll as gateway_port_forward.
-        crate::ui::poll(
-            "gateway SSH banner",
-            Duration::from_secs(2),
-            20,
-            || async move {
-                Ok(
-                    tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
-                        .await
-                        .ok()
-                        .flatten(),
-                )
-            },
-        )
-        .await?;
-        let store = format!(
-            "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
-            key.display()
-        );
-        smoke::smoke_build(tag, secs, out_kb, &store).await
+    /// Submit a trivial busybox build via the gateway as
+    /// `self.tenants[tenant_idx]`, block until it completes. The build
+    /// authenticates with that tenant's ephemeral SSH key, so it's
+    /// attributed to the right tenant.
+    pub async fn nix_build_via_gateway(
+        &self,
+        tenant_idx: usize,
+        tag: &str,
+        secs: u32,
+        out_kb: u32,
+    ) -> Result<()> {
+        let key = self.tenant(tenant_idx).key.clone();
+        gateway_build(key, tag.to_owned(), secs, out_kb).await
     }
 
-    /// Spawn `nix_build_via_gateway` in the background; returns a handle
-    /// the scenario can `.await` later (or drop to abort). For asserts
-    /// that observe scheduler state WHILE a build runs (i095, i163).
+    /// Spawn `nix_build_via_gateway` in the background. For asserts that
+    /// observe scheduler state WHILE a build runs (i095, i163).
     pub fn nix_build_via_gateway_bg(
         &self,
+        tenant_idx: usize,
         tag: &str,
         secs: u32,
         out_kb: u32,
     ) -> tokio::task::JoinHandle<Result<()>> {
-        let cfg = self.cfg.clone();
-        let tag = tag.to_string();
-        tokio::spawn(async move {
-            let key = crate::ssh::privkey_path(&cfg)?;
-            let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
-            crate::ui::poll(
-                "gateway SSH banner",
-                Duration::from_secs(2),
-                20,
-                || async move {
-                    Ok(
-                        tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
-                            .await
-                            .ok()
-                            .flatten(),
-                    )
-                },
-            )
-            .await?;
-            let store = format!(
-                "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
-                key.display()
-            );
-            smoke::smoke_build(&tag, secs, out_kb, &store).await
-        })
+        let key = self.tenant(tenant_idx).key.clone();
+        let tag = tag.to_owned();
+        tokio::spawn(gateway_build(key, tag, secs, out_kb))
     }
 
-    /// Convenience: scheduler-leader pod name. Several scenarios need
-    /// this for log inspection independent of metric scraping.
+    /// Scheduler-leader pod name. Several scenarios need this for log
+    /// inspection independent of metric scraping.
     pub async fn scheduler_leader(&self) -> Result<String> {
         kube::scheduler_leader(&self.kube, NS).await
     }
 
-    /// Label selector for builder pods. Centralized so a future
-    /// chart-side label rename touches one place.
     pub const BUILDER_LABEL: &str = "app.kubernetes.io/name=rio-builder";
-
-    /// Namespace builders run in.
     pub const NS_BUILDERS: &str = NS_BUILDERS;
 }
 
+/// Port-forward gateway:22, wait for SSH banner, run `smoke_build`.
+/// Shared body of `nix_build_via_gateway[_bg]` so the bg variant doesn't
+/// duplicate the readiness poll.
+async fn gateway_build(key: PathBuf, tag: String, secs: u32, out_kb: u32) -> Result<()> {
+    let (port, _guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
+    crate::ui::poll(
+        "gateway SSH banner",
+        Duration::from_secs(2),
+        20,
+        || async move {
+            Ok(
+                tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
+                    .await
+                    .ok()
+                    .flatten(),
+            )
+        },
+    )
+    .await?;
+    let store = format!(
+        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+        key.display()
+    );
+    smoke::smoke_build(&tag, secs, out_kb, &store).await
+}
+
+// ─── PG handle ─────────────────────────────────────────────────────────
+
+/// Process-lifetime PG connection. Built once in `scheduler::run()`;
+/// scenarios get `Arc<PgPool>` via `QaCtx`. Guard (k3s in-cluster PG
+/// only) drops with the handle.
+pub struct PgHandle {
+    pub pool: PgPool,
+    _guard: Option<ProcessGuard>,
+}
+
+impl PgHandle {
+    /// Fetch the `rio-postgres` Secret URL, port-forward if it points at
+    /// an in-cluster service, connect.
+    ///
+    /// On EKS the host is RDS (`*.rds.amazonaws.com`) — reachable
+    /// directly, no port-forward. On k3s the host is `rio-postgresql.
+    /// rio-system` — port-forward `svc/rio-postgresql:5432` and rewrite
+    /// the host to `localhost:{bound}`.
+    pub async fn open(kube_client: &kube::Client) -> Result<Self> {
+        let url = kube::get_secret_key(kube_client, NS, "rio-postgres", "url")
+            .await?
+            .context("Secret rio-postgres/url not found — was `up --deploy` run?")?;
+
+        let (host, _port) = pg_host_port(&url)?;
+        let in_cluster = host.ends_with(&format!(".{NS}")) || host == "rio-postgresql";
+
+        let (url, guard) = if in_cluster {
+            let (bound, g) = shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?;
+            (
+                rewrite_pg_host(&url, &format!("localhost:{bound}")),
+                Some(g),
+            )
+        } else {
+            (url, None)
+        };
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .context("connect to cluster PG")?;
+        info!(
+            "qa pg handle open ({}, {})",
+            if in_cluster { "port-forward" } else { "direct" },
+            host
+        );
+        Ok(Self {
+            pool,
+            _guard: guard,
+        })
+    }
+}
+
+/// Parse `host` and `port` from a `postgres://user:pass@host:port/db`
+/// URL. Hand-rolled (no `url` crate dep) — the format is fixed
+/// (`ensure_pg_secrets` / RDS).
+fn pg_host_port(url: &str) -> Result<(String, u16)> {
+    let after_at = url.split_once('@').map(|(_, r)| r).unwrap_or(url);
+    let host_port = after_at.split_once('/').map(|(l, _)| l).unwrap_or(after_at);
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .context("PG URL missing host:port")?;
+    Ok((host.to_owned(), port.parse().context("PG URL bad port")?))
+}
+
+fn rewrite_pg_host(url: &str, new_host_port: &str) -> String {
+    let (pre, post) = url.split_once('@').expect("validated by pg_host_port");
+    let (_, db) = post.split_once('/').unwrap_or((post, ""));
+    format!("{pre}@{new_host_port}/{db}")
+}
+
+// ─── ephemeral tenants ─────────────────────────────────────────────────
+
+/// One ephemeral tenant: name + path to its private key. The key's
+/// `authorized_keys` line has comment = `name`, so the gateway maps
+/// builds with this key to this tenant.
+#[derive(Clone, Debug)]
+pub struct Tenant {
+    pub name: String,
+    pub key: PathBuf,
+}
+
 /// Ephemeral tenant pool. `new()` creates `size` fresh tenants
-/// (`qa-{nonce}-{i}`) via rio-cli; `acquire(n)` hands out `n` names
-/// under one semaphore reservation; `release()` returns them.
+/// (`qa-{nonce}-{i}`) each with its own ed25519 keypair, batch-installs
+/// the keys into the gateway's `authorized_keys`, restarts the gateway
+/// once. `acquire(n)` hands out `n` slots; `cleanup()` removes the keys
+/// and tenants.
 pub struct TenantPool {
     sem: Arc<Semaphore>,
-    slots: Arc<Mutex<Vec<String>>>,
+    slots: Arc<Mutex<Vec<Tenant>>>,
+    nonce: u64,
+    /// Privkey tempdir. Held until cleanup; drop deletes the keys.
+    _key_dir: TempDir,
 }
 
 impl TenantPool {
-    pub async fn new(cli: &CliCtx, size: usize) -> Result<Self> {
-        let names = alloc_tenants(cli, size).await?;
+    pub async fn new(kube_client: &kube::Client, cli: &CliCtx, size: usize) -> Result<Self> {
+        let (nonce, key_dir, tenants, pubkeys) = alloc_tenants(cli, size).await?;
+        // Batch-install: one Secret read + one write for all N keys, then
+        // ONE gateway rollout-restart so they take effect immediately
+        // (vs ~70s hot-reload × 1).
+        shared::merge_authorized_keys_batch(
+            kube_client,
+            &pubkeys.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await?;
+        step_restart_gateway(kube_client).await?;
+        info!(
+            "provisioned {} ephemeral tenants (qa-{nonce}-*) with per-tenant keys",
+            tenants.len()
+        );
         Ok(Self {
-            sem: Arc::new(Semaphore::new(names.len())),
-            slots: Arc::new(Mutex::new(names)),
+            sem: Arc::new(Semaphore::new(tenants.len())),
+            slots: Arc::new(Mutex::new(tenants)),
+            nonce,
+            _key_dir: key_dir,
         })
     }
 
-    /// Delete every tenant the pool created. Called once after both
-    /// scheduler phases drain. NotFound is swallowed (a scenario may
-    /// have deleted its own tenant); any other error is propagated so a
-    /// half-cleaned pool is loud.
-    pub async fn cleanup(self, cli: &CliCtx) -> Result<()> {
-        let names = Arc::into_inner(self.slots)
+    /// Delete every tenant the pool created, strip their keys from the
+    /// gateway Secret, drop the privkey tempdir. Called once after both
+    /// scheduler phases drain. NotFound is swallowed (scenario may have
+    /// deleted its own tenant).
+    pub async fn cleanup(self, kube_client: &kube::Client, cli: &CliCtx) -> Result<()> {
+        let tenants = Arc::into_inner(self.slots)
             .expect("all leases released before cleanup")
             .into_inner();
-        for n in &names {
-            match cli.run(&["delete-tenant", n]) {
+        for t in &tenants {
+            match cli.run(&["delete-tenant", &t.name]) {
                 Ok(_) => {}
                 Err(e) if format!("{e:#}").to_lowercase().contains("not found") => {}
-                Err(e) => return Err(e.context(format!("delete-tenant {n}"))),
+                Err(e) => return Err(e.context(format!("delete-tenant {}", t.name))),
             }
         }
-        info!("cleaned up {} ephemeral tenants", names.len());
+        shared::remove_authorized_keys_by_comment_prefix(
+            kube_client,
+            &format!("qa-{}-", self.nonce),
+        )
+        .await?;
+        info!("cleaned up {} ephemeral tenants + keys", tenants.len());
         Ok(())
     }
 
-    /// Borrow `n` tenants. Awaits if fewer than `n` are free.
     pub async fn acquire(&self, n: usize) -> TenantLease {
         let permit = self
             .sem
@@ -217,52 +311,96 @@ impl TenantPool {
             .expect("never closed");
         let mut slots = self.slots.lock().await;
         let at = slots.len() - n;
-        let names = slots.split_off(at);
+        let tenants = slots.split_off(at);
         TenantLease {
             slots: self.slots.clone(),
-            names,
+            tenants,
             _permit: permit,
         }
     }
 }
 
 pub struct TenantLease {
-    slots: Arc<Mutex<Vec<String>>>,
-    names: Vec<String>,
+    slots: Arc<Mutex<Vec<Tenant>>>,
+    tenants: Vec<Tenant>,
     _permit: OwnedSemaphorePermit,
 }
 
 impl TenantLease {
-    pub fn names(&self) -> &[String] {
-        &self.names
+    pub fn tenants(&self) -> &[Tenant] {
+        &self.tenants
     }
 
     pub async fn release(mut self) {
-        self.slots.lock().await.append(&mut self.names);
+        self.slots.lock().await.append(&mut self.tenants);
     }
 }
 
-/// Create `size` fresh tenants and configure their upstream cache.
-/// Names are `qa-{unix-secs}-{i}` so concurrent/repeated runs don't
-/// collide. CreateTenant + upstream are issued concurrently — neither
-/// touches the gateway, so no 70s hot-reload wait (scenarios submit via
-/// the cli-tunnel SubmitBuild path, not ssh-ng).
-async fn alloc_tenants(cli: &CliCtx, size: usize) -> Result<Vec<String>> {
+/// Create `size` fresh tenants, each with an ed25519 keypair written to
+/// a tempdir. Returns (nonce, tempdir, tenants, pubkey-lines).
+async fn alloc_tenants(
+    cli: &CliCtx,
+    size: usize,
+) -> Result<(u64, TempDir, Vec<Tenant>, Vec<String>)> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("post-1970")
         .as_secs();
-    let names: Vec<String> = (0..size).map(|i| format!("qa-{nonce}-{i}")).collect();
 
-    try_join_all(names.iter().map(|n| async move {
-        step_tenant(cli, n).await?;
-        step_upstream(cli, n).await
+    let key_dir = tempfile::Builder::new().prefix("rio-qa-keys-").tempdir()?;
+    let mut tenants = Vec::with_capacity(size);
+    let mut pubkeys = Vec::with_capacity(size);
+
+    for i in 0..size {
+        let name = format!("qa-{nonce}-{i}");
+        let (priv_pem, pub_line) = ssh::generate(&name)?;
+        let key = key_dir.path().join(&name);
+        std::fs::write(&key, priv_pem)?;
+        // ssh refuses keys with group/other-readable perms.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        tenants.push(Tenant {
+            name: name.clone(),
+            key,
+        });
+        pubkeys.push(pub_line);
+    }
+
+    // CreateTenant + upstream concurrently (independent of key install).
+    try_join_all(tenants.iter().map(|t| async {
+        step_tenant(cli, &t.name).await?;
+        step_upstream(cli, &t.name).await
     }))
     .await?;
 
-    info!(
-        "provisioned {} ephemeral tenants (qa-{nonce}-*)",
-        names.len()
-    );
-    Ok(names)
+    Ok((nonce, key_dir, tenants, pubkeys))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_url_roundtrip() {
+        let u = "postgres://rio:secret@rio-postgresql.rio-system:5432/rio";
+        let (h, p) = pg_host_port(u).unwrap();
+        assert_eq!(h, "rio-postgresql.rio-system");
+        assert_eq!(p, 5432);
+        assert_eq!(
+            rewrite_pg_host(u, "localhost:54321"),
+            "postgres://rio:secret@localhost:54321/rio"
+        );
+    }
+
+    #[test]
+    fn pg_url_rds() {
+        let u = "postgres://rio:x@rio-abc.cluster-xyz.us-west-2.rds.amazonaws.com:5432/rio";
+        let (h, _) = pg_host_port(u).unwrap();
+        assert!(h.contains("rds.amazonaws.com"));
+        assert!(!h.ends_with(".rio-system"));
+    }
+
+    #[test]
+    fn pg_url_bad() {
+        assert!(pg_host_port("postgres://rio@hostonly/db").is_err());
+    }
 }

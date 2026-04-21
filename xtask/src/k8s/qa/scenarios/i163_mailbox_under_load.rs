@@ -31,7 +31,7 @@ impl Scenario for MailboxUnderLoad {
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // One trivial build to nudge the actor; the assert is post-build.
-        ctx.nix_build_via_gateway("i163", 5, 1).await?;
+        ctx.nix_build_via_gateway(0, "i163", 5, 1).await?;
 
         // Mailbox should drain to 0 within 30s after the build finishes.
         // Tolerate transient spikes — fail only if EVERY sample over the

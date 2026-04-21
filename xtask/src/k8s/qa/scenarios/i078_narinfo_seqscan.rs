@@ -1,15 +1,16 @@
-//! I-078: narinfo lookup missing index on `store_path` → Seq Scan.
+//! I-078: narinfo lookup missing index → Seq Scan.
 //!
-//! The store's QPI hit `narinfo` per path; without the index it was
-//! ~400ms/query. Fixed by adding the index, but a future migration
-//! could regress it. The robust check is `pg_stat_statements` mean
-//! exec time, but that extension may not be enabled — fall back to a
-//! direct EXPLAIN probe if so.
+//! The store hits `narinfo` per path; without the PK index it was
+//! ~400ms/query. Fixed, but a future migration could regress it. The
+//! structurally-correct check is the planner output: any plan that
+//! shows `Seq Scan` on `narinfo` is the regression, regardless of
+//! current row count.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use sqlx::Row;
 
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
 
@@ -26,14 +27,56 @@ impl Scenario for NarinfoSeqScan {
         }
     }
 
-    async fn run(&self, _ctx: &mut QaCtx) -> Result<Verdict> {
-        // Needs PG access (psql via tunnel or rio-cli admin SQL passthrough).
-        // Neither exists today; QaCtx doesn't expose a postgres handle.
-        // The structurally-correct assert (EXPLAIN on the narinfo lookup,
-        // reject if "Seq Scan on narinfo" appears) is documented here so
-        // wiring is mechanical once a `ctx.psql(q)` helper lands.
-        Ok(Verdict::Skip(
-            "needs QaCtx::psql() — pg_stat_statements / EXPLAIN probe not wired".into(),
-        ))
+    async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
+        // Runtime query (not `query!`) — the cluster's schema isn't
+        // visible to xtask's offline cache. EXPLAIN doesn't bind $1,
+        // so use a literal placeholder hash.
+        let plan: serde_json::Value = sqlx::query(
+            "EXPLAIN (FORMAT JSON) \
+             SELECT * FROM narinfo WHERE store_path_hash = '\\x00'::bytea",
+        )
+        .fetch_one(ctx.pg())
+        .await?
+        .try_get(0)?;
+
+        // EXPLAIN JSON is `[{"Plan": {...}}]`. Walk for any `"Seq Scan"`
+        // node whose `"Relation Name"` is `narinfo`. A Seq Scan elsewhere
+        // (e.g., a tiny lookup table) is fine.
+        if seq_scan_on(&plan, "narinfo") {
+            return Ok(Verdict::Fail(format!(
+                "narinfo PK lookup uses Seq Scan — index missing/dropped:\n{plan}"
+            )));
+        }
+        Ok(Verdict::Pass)
+    }
+}
+
+fn seq_scan_on(v: &serde_json::Value, rel: &str) -> bool {
+    match v {
+        serde_json::Value::Object(m) => {
+            let hit = m.get("Node Type").and_then(|n| n.as_str()) == Some("Seq Scan")
+                && m.get("Relation Name").and_then(|n| n.as_str()) == Some(rel);
+            hit || m.values().any(|c| seq_scan_on(c, rel))
+        }
+        serde_json::Value::Array(a) => a.iter().any(|c| seq_scan_on(c, rel)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_seq_scan() {
+        let bad = serde_json::json!([{"Plan": {
+            "Node Type": "Seq Scan", "Relation Name": "narinfo"
+        }}]);
+        assert!(seq_scan_on(&bad, "narinfo"));
+        let good = serde_json::json!([{"Plan": {
+            "Node Type": "Index Scan", "Relation Name": "narinfo",
+            "Plans": [{"Node Type": "Seq Scan", "Relation Name": "other"}]
+        }}]);
+        assert!(!seq_scan_on(&good, "narinfo"));
     }
 }

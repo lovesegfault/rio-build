@@ -1,20 +1,24 @@
-//! I-201: stranded chunks — `chunks.refcount > 0` but the S3 object
-//! is absent. Race: SIGKILL mid-upload leaves the PG row at refcount=1
-//! while S3 PutObject never completed; a concurrent dedup sees the row,
-//! skips its own upload, and the chunk is permanently missing.
+//! I-201: stranded chunks — `chunks.refcount > 0 AND NOT deleted` but
+//! the S3 object is absent. Race: SIGKILL mid-upload leaves the PG row
+//! at refcount=1 while PutObject never completed; a concurrent dedup
+//! sees the row, skips its own upload, chunk permanently missing.
 //!
-//! The full check (`SELECT blake3_hash FROM chunks WHERE refcount > 0`
-//! sampled, then S3 HeadObject each) needs PG + S3 access from xtask.
-//! Neither is wired in QaCtx yet.
+//! Direct probe: sample referenced chunks from PG, S3 HeadObject each.
+//! S3 key layout is `chunks/{aa}/{blake3-hex}` (rio-store/backend.rs).
 
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use sqlx::Row;
 
+use crate::k8s::eks::TF_DIR;
 use crate::k8s::qa::{Component, Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
+use crate::sh::{self, cmd};
 
 pub struct StrandedChunks;
+
+const SAMPLE: i64 = 1000;
 
 #[async_trait]
 impl Scenario for StrandedChunks {
@@ -25,46 +29,53 @@ impl Scenario for StrandedChunks {
             isolation: Isolation::Exclusive {
                 mutates: &[Component::Store, Component::Postgres],
             },
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_secs(180),
         }
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
-        // The store exposes `rio_store_stranded_chunks` if the orphan
-        // scanner found any on its last sweep — that's the cheap proxy.
-        // If the metric is absent (older store, scanner disabled), Skip.
-        let leader = ctx.kubectl(&[
-            "-n",
-            crate::k8s::NS_STORE,
-            "get",
-            "pods",
-            "-l",
-            "app.kubernetes.io/name=rio-store",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ])?;
-        if leader.is_empty() {
-            return Ok(Verdict::Skip("no rio-store pod found".into()));
-        }
-        let body = crate::k8s::status::scrape_pod(
-            &ctx.kube,
-            crate::k8s::NS_STORE,
-            &leader,
-            crate::k8s::status::STORE_METRICS_PORT,
-        )
-        .await?;
-        let scrape = crate::k8s::status::Scrape::parse(&body);
+        // Bucket name from tofu output (EKS only — k3s uses an
+        // in-cluster MinIO whose creds aren't on the operator's box).
+        let Ok(bucket) = crate::tofu::output(TF_DIR, "chunk_bucket_name") else {
+            return Ok(Verdict::Skip(
+                "chunk_bucket_name tofu output unavailable (k3s?)".into(),
+            ));
+        };
 
-        match scrape.first("rio_store_stranded_chunks") {
-            None => Ok(Verdict::Skip(
-                "rio_store_stranded_chunks gauge not exported \
-                 — needs QaCtx::psql() + S3 HeadObject for direct probe"
-                    .into(),
-            )),
-            Some(n) if n > 0.0 => Ok(Verdict::Fail(format!(
-                "{n} stranded chunks (refcount>0, S3 absent) per orphan-scanner"
-            ))),
-            Some(_) => Ok(Verdict::Pass),
+        let rows = sqlx::query(
+            "SELECT encode(blake3_hash, 'hex') AS h FROM chunks \
+             WHERE refcount > 0 AND NOT deleted \
+             ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(SAMPLE)
+        .fetch_all(ctx.pg())
+        .await?;
+        if rows.is_empty() {
+            return Ok(Verdict::Skip("no referenced chunks in PG".into()));
         }
+
+        let s = sh::shell()?;
+        for r in &rows {
+            let hex: String = r.try_get("h")?;
+            let key = format!("chunks/{}/{hex}", &hex[..2]);
+            // `aws s3api head-object` exits non-zero with "Not Found"
+            // (404) or "Forbidden" (403 — bucket policy treats missing
+            // as 403 sometimes). Either way, stderr names the code.
+            let res = sh::try_read(cmd!(
+                s,
+                "aws s3api head-object --bucket {bucket} --key {key}"
+            ));
+            if let Err(e) = res {
+                let msg = format!("{e:#}");
+                if msg.contains("Not Found") || msg.contains("NoSuchKey") || msg.contains("404") {
+                    return Ok(Verdict::Fail(format!(
+                        "stranded chunk: PG refcount>0 for {hex} but s3://{bucket}/{key} → 404"
+                    )));
+                }
+                // Other errors (auth, throttle) propagate.
+                return Err(e.context(format!("head-object {key}")));
+            }
+        }
+        Ok(Verdict::Pass)
     }
 }

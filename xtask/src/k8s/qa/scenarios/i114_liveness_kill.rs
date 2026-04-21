@@ -35,7 +35,7 @@ impl Scenario for LivenessKill {
         // CPU). A true stress-ng workload would be tighter.
         let before = builder_restarts(ctx)?;
 
-        ctx.nix_build_via_gateway("i114", BUILD_SECS, 1).await?;
+        ctx.nix_build_via_gateway(0, "i114", BUILD_SECS, 1).await?;
 
         let after = builder_restarts(ctx)?;
         if after > before {

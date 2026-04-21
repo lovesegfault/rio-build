@@ -35,7 +35,7 @@ impl Scenario for GhostDispatch {
         // "completed-builder still in dispatch table" window.
         let mut bg = Vec::new();
         for i in 0..5 {
-            bg.push(ctx.nix_build_via_gateway_bg(&format!("i095-{i}"), 5, 1));
+            bg.push(ctx.nix_build_via_gateway_bg(0, &format!("i095-{i}"), 5, 1));
             sleep(Duration::from_secs(2)).await;
         }
         for h in bg {

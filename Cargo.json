@@ -30790,10 +30790,6 @@
           "packageId": "typenum"
         },
         {
-          "name": "unicode-normalization",
-          "packageId": "unicode-normalization"
-        },
-        {
           "name": "uuid",
           "packageId": "uuid"
         },
@@ -31088,10 +31084,6 @@
           "packageId": "typenum"
         },
         {
-          "name": "unicode-normalization",
-          "packageId": "unicode-normalization"
-        },
-        {
           "name": "uuid",
           "packageId": "uuid"
         },
@@ -31333,6 +31325,10 @@
         {
           "name": "sha2",
           "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
         },
         {
           "name": "ssh-key",

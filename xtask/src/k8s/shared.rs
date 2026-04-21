@@ -170,15 +170,52 @@ pub async fn ensure_gateway_ssh_secret(
 /// granting the same key under a different tenant replaces its line).
 /// All other existing lines are preserved IN ORDER.
 pub async fn merge_authorized_key(client: &kube::Client, key_line: &str) -> Result<()> {
+    merge_authorized_keys_batch(client, &[key_line]).await
+}
+
+/// Batch [`merge_authorized_key`]: ONE Secret read + ONE write for N
+/// keys. The qa tenant pool installs ~8 keys at once; the single-key
+/// path would be 8 round-trips with last-write-wins races.
+pub async fn merge_authorized_keys_batch(client: &kube::Client, lines: &[&str]) -> Result<()> {
     let existing = kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
         .await?
         .unwrap_or_default();
-    let merged = merge_authorized_key_lines(&existing, key_line);
+    let merged = lines
+        .iter()
+        .fold(existing, |acc, l| merge_authorized_key_lines(&acc, l));
     kube::apply_secret(
         client,
         NS,
         "rio-gateway-ssh",
         BTreeMap::from([("authorized_keys".into(), merged)]),
+    )
+    .await
+}
+
+/// Remove every `authorized_keys` line whose comment (third field)
+/// starts with `prefix`. ONE Secret read + ONE write. qa cleanup uses
+/// this with `qa-{nonce}-` so only this run's keys are stripped.
+pub async fn remove_authorized_keys_by_comment_prefix(
+    client: &kube::Client,
+    prefix: &str,
+) -> Result<()> {
+    let existing = kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
+        .await?
+        .unwrap_or_default();
+    let kept: String = existing
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .nth(2)
+                .is_none_or(|c| !c.starts_with(prefix))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    kube::apply_secret(
+        client,
+        NS,
+        "rio-gateway-ssh",
+        BTreeMap::from([("authorized_keys".into(), kept)]),
     )
     .await
 }

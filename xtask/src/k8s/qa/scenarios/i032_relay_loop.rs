@@ -34,7 +34,7 @@ impl Scenario for RelayLoop {
                 .unwrap()
                 .as_micros()
         );
-        ctx.nix_build_via_gateway(&tag, 3, 1).await?;
+        ctx.nix_build_via_gateway(0, &tag, 3, 1).await?;
 
         // The builder's stdout is relayed via scheduler→gateway. The
         // direct user-facing assert (captured `nix build` stdout)
