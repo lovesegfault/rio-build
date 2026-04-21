@@ -406,6 +406,72 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
+    # built-path-cross-tenant-gate — I-217: BUILT path tenant isolation
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("built-path-cross-tenant-gate: B can't see A's BUILT path (I-217)"):
+        # The subtest above proves the gate for SUBSTITUTED paths (zero
+        # path_tenants rows → sig-verify). I-217: once a path has a
+        # path_tenants row (built locally), it MUST be visible only to
+        # owning tenants — NOT to "anyone, since it's built" (the pre-
+        # I-217 leak), and NOT via sig-trust fallback (built-by-another
+        # takes precedence over sig-verify).
+        #
+        # Seed a path_tenants row for sub_path under tenant A. In a full
+        # k3s fixture this happens via scheduler upsert_path_tenants on
+        # build-completion; the standalone fixture has no scheduler, so
+        # we INSERT directly. The store-side gate (what I-217 fixes) is
+        # the same either way.
+        psql(
+            ${gatewayHost},
+            "INSERT INTO path_tenants (store_path_hash, tenant_id) "
+            f"VALUES (sha256('{sub_path}'::bytea), '{tid_a}')",
+        )
+
+        # Fresh tenant D: no upstream, trusts nothing. The pre-I-217
+        # any_built bypass would have made sub_path visible to D anyway.
+        tid_d = mk_tenant("sub-tenant-d")
+        jwt_d = jwt_for(tid_d)
+
+        # A owns it → visible.
+        rc, out = query_path_info(jwt_a, sub_path)
+        assert rc == 0, (
+            f"owner A must see its own built path; gate over-broad:\n{out}"
+        )
+
+        # D doesn't own it, trusts no sig → HIDDEN.
+        rc, out = query_path_info(jwt_d, sub_path)
+        assert rc != 0 and ("NotFound" in out or "not found" in out.lower()), (
+            f"I-217: D (not owner, no trust) must get NotFound for A's "
+            f"BUILT path. Pre-fix any_built bypass leaked this:\n{out}"
+        )
+
+        # B/C trust test-cache-1 AND have it as upstream. The gate hides
+        # A's row from them (built-by-another), but QueryPathInfo then
+        # tries try_substitute_on_miss → B/C's upstream HAS sub_path →
+        # they get it via THEIR OWN substitution. Correct isolation: B
+        # substitutes independently, not via A's build leak. The I-217
+        # regression is D's case above (no upstream → no fallback).
+        rc, out = query_path_info(jwt_b, sub_path)
+        assert rc == 0, (
+            f"B (has upstream test-cache-1) gets sub_path via own "
+            f"substitution fallback (gate hides A's row, B substitutes "
+            f"independently):\n{out}"
+        )
+
+        # Anonymous → unfiltered (spec carve-out, unchanged by I-217).
+        rc, out = ${gatewayHost}.execute(
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f'-d \'{{"store_path":"{sub_path}"}}\' '
+            "localhost:9002 rio.store.StoreService/QueryPathInfo 2>&1"
+        )
+        assert rc == 0, (
+            f"anonymous (no x-rio-tenant-token) → unfiltered per "
+            f"r[store.tenant.narinfo-filter]:\n{out}"
+        )
+        print("built-path cross-tenant gate PASS: A sees, B/C/D blocked")
+
+    # ══════════════════════════════════════════════════════════════════
     # substitute-ssh-ng — gateway JWT propagation end-to-end
     # ══════════════════════════════════════════════════════════════════
     with subtest("substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo"):

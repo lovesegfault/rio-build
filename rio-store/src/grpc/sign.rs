@@ -720,12 +720,12 @@ mod tests {
 
         // Batch variant must agree.
         let vis_a = svc
-            .sig_visibility_gate_batch(Some(tid_a), &[path.clone()])
+            .sig_visibility_gate_batch(Some(tid_a), std::slice::from_ref(&path))
             .await
             .unwrap();
         assert!(vis_a.contains(&path), "batch: A owns it → visible");
         let vis_b = svc
-            .sig_visibility_gate_batch(Some(tid_b), &[path.clone()])
+            .sig_visibility_gate_batch(Some(tid_b), std::slice::from_ref(&path))
             .await
             .unwrap();
         assert!(!vis_b.contains(&path), "batch: B doesn't own it → hidden");

@@ -334,9 +334,12 @@ in
   #   PermissionDenied via BatchGetManifest (builder-internal). Tenant
   #   B (trusts same key) → visible. Dynamic re-trust proves per-request
   #   trusted_keys read.
+  # r[verify store.tenant.narinfo-filter]
+  #   built-path-cross-tenant-gate: I-217 — gate hides A's BUILT path
+  #   from non-owners. D (no upstream) → NotFound. B (has upstream) →
+  #   visible via try_substitute_on_miss (B substitutes independently).
   # r[verify gw.opcode.query-missing]
   # r[verify gw.opcode.query-path-info]
-  # r[verify store.tenant.narinfo-filter]
   #   substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo
   #   → store's try_substitute_on_miss fires → path substitutable via
   #   the real ssh-ng protocol path (not grpcurl backdoor).
