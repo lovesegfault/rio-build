@@ -143,6 +143,50 @@ impl QaCtx {
         tokio::spawn(gateway_build(key, expr.to_owned()))
     }
 
+    /// Port-forward gateway:22 and return the ssh-ng store URL for
+    /// `tenants[tenant_idx]`, plus the guard. For scenarios that need
+    /// to run arbitrary nix commands (`copy --from`, `path-info`,
+    /// `store ping`) under a specific tenant's identity rather than
+    /// the busybox-build helpers.
+    pub async fn gateway_tunnel(&self, tenant_idx: usize) -> Result<(String, ProcessGuard)> {
+        let key = self.tenant(tenant_idx).key.clone();
+        let (port, guard) = shared::port_forward(NS, "svc/rio-gateway", 0, 22).await?;
+        crate::ui::poll(
+            "gateway SSH banner",
+            Duration::from_secs(2),
+            20,
+            || async move {
+                Ok(
+                    tokio::time::timeout(Duration::from_secs(2), smoke::ssh_banner(port))
+                        .await
+                        .ok()
+                        .flatten(),
+                )
+            },
+        )
+        .await?;
+        Ok((
+            format!(
+                "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+                key.display()
+            ),
+            guard,
+        ))
+    }
+
+    /// Resolve `tenants[tenant_idx]`'s name → UUID via `rio-cli
+    /// list-tenants --json`. Cross-tenant scenarios need the UUID to
+    /// match against `BuildInfo.tenant_id`.
+    pub fn tenant_uuid(&self, tenant_idx: usize) -> Result<String> {
+        let name = &self.tenant(tenant_idx).name;
+        let ts: Vec<serde_json::Value> = self.cli_json(&["list-tenants"])?;
+        ts.iter()
+            .find(|t| t.get("tenant_name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|t| t.get("tenant_id").and_then(|v| v.as_str()))
+            .map(str::to_owned)
+            .with_context(|| format!("tenant '{name}' not in list-tenants"))
+    }
+
     /// Scheduler-leader pod name. Several scenarios need this for log
     /// inspection independent of metric scraping.
     pub async fn scheduler_leader(&self) -> Result<String> {

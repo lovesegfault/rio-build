@@ -27,6 +27,7 @@ mod i048a_stale_realisation;
 mod i048c_blackhole_self_test;
 mod i049_dispatch_latency;
 mod i050_metrics_reachable;
+mod i052_addmultiple_sequential;
 mod i056_stale_draining;
 mod i058_recovery_transitions;
 mod i059_orphan_derivations;
@@ -38,6 +39,7 @@ mod i095_ghost_dispatch;
 mod i098_pool_arch_match;
 mod i102_cli_builds_latency;
 mod i109_authorized_keys_hot_reload;
+mod i110_batch_rpc_scale;
 mod i114_liveness_kill;
 mod i115_temp_suffix_fastpath;
 mod i116_idle_exit;
@@ -54,6 +56,9 @@ mod i205_nodepool_schedulable;
 mod i207_stale_uploading;
 mod i208_floor_hydrated;
 mod i209_assignment_terminal;
+mod iso01_cross_tenant_listbuilds;
+mod iso02_cross_tenant_same_drv;
+mod iso03_cross_tenant_path_read;
 
 pub static ALL: &[&dyn Scenario] = &[
     // ─── Shared (read-only) ───────────────────────────────────────────
@@ -84,6 +89,12 @@ pub static ALL: &[&dyn Scenario] = &[
     &i167_drv_name_query::DrvNameQuery,
     &i181_kvm_featureless::KvmFeatureless,
     &i204_big_parallel_routing::BigParallelRouting,
+    &i052_addmultiple_sequential::AddMultipleSequential,
+    &i110_batch_rpc_scale::BatchRpcScale,
+    // ─── Tenant{count:2} (cross-tenant isolation) ─────────────────────
+    &iso01_cross_tenant_listbuilds::CrossTenantListBuilds,
+    &iso02_cross_tenant_same_drv::CrossTenantSameDrv,
+    &iso03_cross_tenant_path_read::CrossTenantPathRead,
     // ─── Exclusive ────────────────────────────────────────────────────
     &i024_restart_drains_fods::RestartDrainsFods,
     &i033_zombie_executors::ZombieExecutors,
