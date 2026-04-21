@@ -13,19 +13,31 @@ mod i006_irsa_denied;
 mod i011_builds_tenant_name;
 mod i013_cancel_on_disconnect;
 mod i023_nodepool_arch;
+mod i024_restart_drains_fods;
 mod i026_scheduler_health;
 mod i032_relay_loop;
+mod i033_zombie_executors;
 mod i037_cordoned_control_plane;
+mod i039_store_kill_survives;
+mod i040_chunk_verify;
 mod i043_shared_input_enoent;
+mod i046_drain_reaches_leader;
+mod i047_missing_input_redispatch;
+mod i048a_stale_realisation;
 mod i048c_blackhole_self_test;
 mod i049_dispatch_latency;
 mod i050_metrics_reachable;
 mod i056_stale_draining;
+mod i058_recovery_transitions;
+mod i059_orphan_derivations;
+mod i064_gateway_drain;
 mod i078_narinfo_seqscan;
 mod i085_controller_ipfamilies;
+mod i086_reconcile_error_loud;
 mod i095_ghost_dispatch;
 mod i098_pool_arch_match;
 mod i102_cli_builds_latency;
+mod i109_authorized_keys_hot_reload;
 mod i114_liveness_kill;
 mod i115_temp_suffix_fastpath;
 mod i116_idle_exit;
@@ -35,9 +47,13 @@ mod i163_mailbox_under_load;
 mod i165_fuse_dstate;
 mod i167_drv_name_query;
 mod i181_kvm_featureless;
+mod i183_pending_reaped;
 mod i201_stranded_chunks;
 mod i204_big_parallel_routing;
 mod i205_nodepool_schedulable;
+mod i207_stale_uploading;
+mod i208_floor_hydrated;
+mod i209_assignment_terminal;
 mod i212_prefetch_filtered;
 
 pub static ALL: &[&dyn Scenario] = &[
@@ -71,7 +87,23 @@ pub static ALL: &[&dyn Scenario] = &[
     &i204_big_parallel_routing::BigParallelRouting,
     &i212_prefetch_filtered::PrefetchFiltered,
     // ─── Exclusive ────────────────────────────────────────────────────
+    &i024_restart_drains_fods::RestartDrainsFods,
+    &i033_zombie_executors::ZombieExecutors,
+    &i039_store_kill_survives::StoreKillSurvives,
+    &i040_chunk_verify::ChunkVerify,
+    &i046_drain_reaches_leader::DrainReachesLeader,
+    &i047_missing_input_redispatch::MissingInputRedispatch,
+    &i048a_stale_realisation::StaleRealisation,
     &i048c_blackhole_self_test::BlackholeSelfTest,
+    &i058_recovery_transitions::RecoveryTransitions,
+    &i059_orphan_derivations::OrphanDerivations,
+    &i064_gateway_drain::GatewayDrain,
+    &i086_reconcile_error_loud::ReconcileErrorLoud,
+    &i109_authorized_keys_hot_reload::AuthorizedKeysHotReload,
     &i165_fuse_dstate::FuseDState,
+    &i183_pending_reaped::PendingReaped,
     &i201_stranded_chunks::StrandedChunks,
+    &i207_stale_uploading::StaleUploading,
+    &i208_floor_hydrated::FloorHydrated,
+    &i209_assignment_terminal::AssignmentTerminal,
 ];

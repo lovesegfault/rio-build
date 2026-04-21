@@ -68,13 +68,13 @@ pub async fn run(
     .await?;
 
     ui::step("qa scenarios — phase 2 (exclusive)", || async {
-        outcomes.extend(run_phase2(p2, &kube, &cli, &pg_pool).await);
+        outcomes.extend(run_phase2(p2, &kube, &cli, &pg_pool, &pool).await);
         Ok::<_, anyhow::Error>(())
     })
     .await?;
 
     Arc::into_inner(pool)
-        .expect("all phase-1 leases released")
+        .expect("all leases released")
         .cleanup(&kube, &cli)
         .await?;
     drop(pg);
@@ -123,12 +123,17 @@ async fn run_phase1(
     collect(set).await
 }
 
-/// Greedy disjoint-mutates scheduler.
+/// Greedy disjoint-mutates scheduler. Each Exclusive gets ONE tenant
+/// from the pool — phase 1 has drained so the pool is full; pool size
+/// (default 8) ≥ max concurrent Exclusives (~3-4 by component-disjoint
+/// distribution), so `acquire(1)` never blocks in practice. Scenarios
+/// that don't need the tenant just ignore `ctx.tenants[0]`.
 async fn run_phase2(
     scenarios: Vec<&'static dyn Scenario>,
     kube: &kube::Client,
     cli: &Arc<CliCtx>,
     pg: &Arc<sqlx::PgPool>,
+    pool: &Arc<TenantPool>,
 ) -> Vec<Outcome> {
     let mut pending: VecDeque<_> = scenarios.into_iter().collect();
     let mut held: HashSet<Component> = HashSet::new();
@@ -149,8 +154,12 @@ async fn run_phase2(
                 let kube = kube.clone();
                 let cli = cli.clone();
                 let pg = pg.clone();
+                let pool = pool.clone();
                 set.spawn(async move {
-                    let o = exec(s, &meta, kube, cli, pg, Vec::new()).await;
+                    let lease = pool.acquire(1).await;
+                    let tenants = lease.tenants().to_vec();
+                    let o = exec(s, &meta, kube, cli, pg, tenants).await;
+                    lease.release().await;
                     (o, mutates)
                 });
             } else {
