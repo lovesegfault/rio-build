@@ -12,8 +12,11 @@ use async_trait::async_trait;
 
 use crate::k8s::NS;
 use crate::k8s::qa::{Isolation, QaCtx, Scenario, ScenarioMeta, Verdict};
+use crate::k8s::shared;
 
 pub struct SchedulerHealth;
+
+const SERVICE: &str = "rio.scheduler.SchedulerService";
 
 #[async_trait]
 impl Scenario for SchedulerHealth {
@@ -28,27 +31,39 @@ impl Scenario for SchedulerHealth {
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         let leader = ctx.scheduler_leader().await?;
-        // grpc-health-probe is in the scheduler image; exec it in-pod
-        // so we don't need a local binary or a tunnel.
-        let out = ctx.kubectl(&[
-            "-n",
-            NS,
-            "exec",
-            &leader,
-            "--",
-            "grpc-health-probe",
-            "-addr=localhost:9001",
-            "-service=rio.scheduler.SchedulerService",
-        ]);
+        // The scheduler image is intentionally minimal
+        // (r[sec.image.control-plane-minimal]) — no `grpc-health-probe`
+        // inside. Probe from OUTSIDE: port-forward to the leader pod's
+        // 9001 and call grpc.health.v1.Health/Check via grpcurl (in the
+        // dev shell). This is the exact probe BalancedChannel does, so
+        // it's the I-026 signature directly.
+        let (port, _guard) = shared::port_forward(NS, &format!("pod/{leader}"), 0, 9001).await?;
+        let s = crate::sh::shell()?;
+        let body = format!(r#"{{"service":"{SERVICE}"}}"#);
+        let addr = format!("localhost:{port}");
+        let out = crate::sh::try_read(crate::sh::cmd!(
+            s,
+            "grpcurl -plaintext -d {body} {addr} grpc.health.v1.Health/Check"
+        ));
         match out {
             Ok(o) if o.contains("SERVING") => Ok(Verdict::Pass),
             Ok(o) => Ok(Verdict::Fail(format!(
-                "leader {leader} health for SchedulerService != SERVING: {o:?} \
+                "leader {leader} health for {SERVICE} != SERVING: {o:?} \
                  — leader-acquire didn't flip the per-service reporter"
             ))),
-            Err(e) => Ok(Verdict::Skip(format!(
-                "grpc-health-probe not in scheduler image or exec denied: {e:#}"
-            ))),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("NOT_SERVING") || msg.to_lowercase().contains("not serving") {
+                    Ok(Verdict::Fail(format!(
+                        "leader {leader} health for {SERVICE} = NOT_SERVING \
+                         — leader-acquire didn't flip the per-service reporter"
+                    )))
+                } else {
+                    // grpcurl invocation itself failed (binary missing,
+                    // port-forward race) — treat as scenario error.
+                    Err(e)
+                }
+            }
         }
     }
 }

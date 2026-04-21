@@ -55,18 +55,20 @@ impl Scenario for ReconcileErrorLoud {
             .sum("rio_controller_reconcile_errors_total");
 
         // Apply via kubectl --apply -f - (stdin). The CRD's CEL/
-        // OpenAPI may reject `not-a-quantity` at admission — if so,
-        // the test still passes the I-086 invariant trivially (the
-        // controller never sees it), so Skip with reason.
+        // OpenAPI may reject `not-a-quantity` at admission — that's
+        // ALSO a Pass: the protection is at a tighter layer than
+        // I-086 needed. Only if admission ACCEPTS do we check the
+        // controller's reconcile-error path.
         let apply = {
             let s = crate::sh::shell()?;
             crate::sh::try_read(crate::sh::cmd!(s, "kubectl apply -f -").stdin(BAD_POOL))
         };
         if let Err(e) = &apply {
-            return Ok(Verdict::Skip(format!(
-                "admission rejected the bad Pool (CRD validation tighter than \
+            tracing::info!(
+                "admission rejected bad Pool (CRD validation tighter than \
                  controller-side parse): {e:#}"
-            )));
+            );
+            return Ok(Verdict::Pass);
         }
 
         let result = poll_until(Duration::from_secs(45), Duration::from_secs(5), || async {

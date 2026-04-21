@@ -39,11 +39,23 @@ impl Scenario for ChunkVerify {
             ));
         };
 
-        // Pick a chunk that's referenced AND not deleted. Prefer one
-        // with refcount==1 so we minimize blast radius (only one
-        // manifest depends on it). On a dev cluster the I-201 scenario
-        // already covers the inverse direction (PG row, S3 absent —
-        // pre-existing); here we CAUSE one and assert detection.
+        // Self-setup: seed a fresh refcount=1 chunk by building a
+        // unique-content output (>256 KiB so it's chunked, not
+        // inline-PG). currentTime in the body ensures the chunk hash
+        // is unique to this run, so we never delete a shared chunk.
+        let expr = format!(
+            r#"{BUSYBOX_LET} builtins.derivation {{
+              name = "rio-qa-i040-seed-${{toString builtins.currentTime}}";
+              system = "x86_64-linux";
+              builder = "${{busybox}}";
+              args = ["sh" "-c" "for i in $(busybox seq 1 300); do echo i040-${{toString builtins.currentTime}}-$i-{CHUNK}; done > $out"];
+            }}"#,
+            CHUNK = "x".repeat(1020),
+            BUSYBOX_LET = crate::k8s::eks::smoke::BUSYBOX_LET,
+        );
+        ctx.nix_build_expr_via_gateway(0, &expr).await?;
+
+        // Pick a chunk with refcount==1 (the one we just made).
         let row = sqlx::query(
             "SELECT encode(blake3_hash, 'hex') AS h FROM chunks \
              WHERE refcount = 1 AND NOT deleted ORDER BY created_at DESC LIMIT 1",
@@ -51,7 +63,11 @@ impl Scenario for ChunkVerify {
         .fetch_optional(ctx.pg())
         .await?;
         let Some(row) = row else {
-            return Ok(Verdict::Skip("no refcount=1 chunk to test against".into()));
+            return Ok(Verdict::Fail(
+                "seeded a unique ~300KiB output but no refcount=1 chunk appeared \
+                 — chunked PutPath path not taken (output inlined?)"
+                    .into(),
+            ));
         };
         let hex: String = row.try_get("h")?;
         let key = format!("chunks/{}/{hex}", &hex[..2]);

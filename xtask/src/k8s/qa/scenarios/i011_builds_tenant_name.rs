@@ -1,8 +1,5 @@
-//! I-011: `rio-cli builds` shows `tenant=` (empty) for valid builds.
-//!
-//! Either a cli formatting bug or the builds row has a NULL tenant_id —
-//! the latter is a SubmitBuild data-integrity issue (SSH-key-comment →
-//! tenant resolution failed silently).
+//! I-011: builds submitted with a tenant SSH key end up with NULL
+//! `tenant_id` — SubmitBuild's tenant resolution silently dropped.
 
 use std::time::Duration;
 
@@ -26,16 +23,28 @@ impl Scenario for BuildsTenantName {
     }
 
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
+        // BuildInfo has no name/drv_path field — only build_id,
+        // tenant_id, submitted_at, etc. So scope by tenant_id == this
+        // tenant's UUID. Look that up via list-tenants (json is the raw
+        // TenantInfo array). FK SET NULL after DeleteTenant means OTHER
+        // tenants' orphaned builds correctly have empty tenant_id; we
+        // only assert OUR submission resolved.
+        let tenant_name = ctx.tenant(0).name.clone();
+        let tenants: Vec<Value> = ctx.cli_json(&["list-tenants"])?;
+        let Some(my_uuid) = tenants
+            .iter()
+            .find(|t| t.get("tenant_name").and_then(Value::as_str) == Some(&tenant_name))
+            .and_then(|t| t.get("tenant_id").and_then(Value::as_str))
+            .map(str::to_owned)
+        else {
+            return Ok(Verdict::Fail(format!(
+                "tenant '{tenant_name}' not in list-tenants — alloc_tenants \
+                 CreateTenant didn't persist?"
+            )));
+        };
+
         ctx.nix_build_via_gateway(0, "i011", 5, 1).await?;
 
-        // I-011 is about SubmitBuild dropping tenant resolution — the
-        // probe is "did the build I JUST submitted get my tenant_id?".
-        // builds.tenant_id IS NULL is also a valid state for orphans
-        // (FK ON DELETE SET NULL after DeleteTenant — every prior qa
-        // run's cleanup orphans its builds), so checking ALL builds
-        // false-positives. Find THIS build by matching the unique
-        // smoke-tag in its name.
-        let tag = "i011";
         let resp: Value = ctx.cli_json(&["builds"])?;
         let builds = resp
             .get("builds")
@@ -44,36 +53,20 @@ impl Scenario for BuildsTenantName {
             .unwrap_or_default();
         let mine: Vec<_> = builds
             .iter()
-            .filter(|b| {
-                b.get("name")
-                    .or_else(|| b.get("display_name"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.contains(tag))
-            })
+            .filter(|b| b.get("tenant_id").and_then(Value::as_str) == Some(my_uuid.as_str()))
             .collect();
+
         if mine.is_empty() {
-            return Ok(Verdict::Skip(format!(
-                "no build with tag '{tag}' in `rio-cli builds` output — \
-                 name field missing or build not listed"
-            )));
-        }
-        let empty: Vec<String> = mine
-            .iter()
-            .filter(|b| {
-                b.get("tenant_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|s| s.trim().is_empty())
-            })
-            .filter_map(|b| b.get("build_id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        if empty.is_empty() {
-            Ok(Verdict::Pass)
-        } else {
+            // The build we submitted isn't attributed to our tenant
+            // UUID — either it has empty/NULL tenant_id (the I-011
+            // bug) or a DIFFERENT id (impossible — our key's comment
+            // is our tenant name).
             Ok(Verdict::Fail(format!(
-                "build(s) {empty:?} submitted as tenant '{}' have empty \
-                 tenant_id — SubmitBuild resolution silently dropped",
-                ctx.tenant(0).name
+                "no build with tenant_id={my_uuid} ({tenant_name}) after \
+                 submitting one — SubmitBuild tenant resolution dropped"
             )))
+        } else {
+            Ok(Verdict::Pass)
         }
     }
 }

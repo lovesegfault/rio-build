@@ -73,9 +73,10 @@ impl Scenario for ZombieExecutors {
         tokio::time::sleep(Duration::from_secs(45)).await;
         bg.abort();
 
-        // r[sched.admin.debug-list-executors] is exempt from leader-
-        // guard, so this hits whoever is leader now. JSON shape:
-        // { executors: [{executor_id, has_stream, ...}] }.
+        // The DebugListExecutors RPC is exposed via `rio-cli workers
+        // --actor` (not a separate subcommand). JSON shape is
+        // DebugListExecutorsResponse: {"executors":[{executor_id,
+        // has_stream, ...}]}.
         #[derive(serde::Deserialize)]
         struct DebugExecutor {
             executor_id: String,
@@ -85,16 +86,7 @@ impl Scenario for ZombieExecutors {
         struct DebugList {
             executors: Vec<DebugExecutor>,
         }
-        // Fall back to a Skip if the cli subcommand isn't wired (older
-        // images), rather than a hard error.
-        let dl: DebugList = match ctx.cli_json(&["debug-list-executors"]) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Verdict::Skip(format!(
-                    "debug-list-executors unavailable: {e:#}"
-                )));
-            }
-        };
+        let dl: DebugList = ctx.cli_json(&["workers", "--actor"])?;
         let zombies: Vec<_> = dl
             .executors
             .iter()
