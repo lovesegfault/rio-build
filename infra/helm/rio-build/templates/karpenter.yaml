@@ -62,17 +62,15 @@ spec:
   securityGroupSelectorTerms:
     - tags:
         karpenter.sh/discovery: {{ $k.clusterName }}
-  # IMDSv2 hop limit 2: limit 1 was the "pods can't reach IMDS" defense,
-  # but vpc-cni installs an iptables SNAT rule for 169.254.169.254 that
-  # adds a hop even for hostNetwork agents — so limit 1 also breaks
-  # ssm-agent / ecr-credential-provider after aws-node starts. Limit 2
-  # keeps the defense for non-hostNetwork pods (vpc-cni veth = +1 hop →
-  # TTL 0 at IMDS) while letting hostNetwork agents through. IRSA
-  # remains the actual pod credential path; this is belt-and-braces.
+  # IMDSv2 hop limit 1. Pods can't reach IMDS regardless: no v4 route in
+  # the pod netns and httpProtocolIpv6 defaults disabled — so hop-limit
+  # isn't load-bearing. Kept at 1 for defense-in-depth. (The old
+  # limit-2 rationale was vpc-cni's SNAT hop; Cilium adds no such hop,
+  # and hostNetwork agents work fine at limit 1.)
   metadataOptions:
     httpEndpoint: enabled
     httpTokens: required
-    httpPutResponseHopLimit: 2
+    httpPutResponseHopLimit: 1
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:

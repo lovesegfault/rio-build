@@ -212,10 +212,9 @@ module "eks" {
   enable_irsa = true
 
   # Public endpoint for kubectl from outside the VPC. Private-only would
-  # require running kubectl from inside the VPC (bastion) or via an
-  # SSM tunnel to the API server, which is more friction than the
-  # cluster being a dev/test deployment warrants. Lock down with
-  # endpoint_public_access_cidrs if this bothers you.
+  # require running kubectl from inside the VPC, which is more friction
+  # than the cluster being a dev/test deployment warrants. Lock down
+  # with endpoint_public_access_cidrs if this bothers you.
   endpoint_public_access = true
 
   # API authentication mode. CONFIG_MAP = legacy aws-auth only.

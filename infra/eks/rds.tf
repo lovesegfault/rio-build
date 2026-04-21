@@ -69,9 +69,9 @@ resource "aws_rds_cluster" "rio" {
   db_subnet_group_name   = aws_db_subnet_group.rio.name
   vpc_security_group_ids = [aws_security_group.aurora.id]
   # DUAL: cluster endpoint gets both A and AAAA. v6-only pods (the
-  # cluster_ip_family above) connect via AAAA; the bastion and any
-  # v4-only tooling still resolve A. Subnets must have v6 CIDRs
-  # (enable_ipv6 in the vpc module).
+  # cluster_ip_family above) connect via AAAA; any v4-only tooling
+  # still resolves A. Subnets must have v6 CIDRs (enable_ipv6 in the
+  # vpc module).
   network_type = "DUAL"
 
   serverlessv2_scaling_configuration {

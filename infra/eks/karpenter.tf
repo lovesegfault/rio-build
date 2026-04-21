@@ -25,7 +25,7 @@ module "karpenter" {
   node_iam_role_name            = "${var.cluster_name}-karpenter-node"
 
   # SSM access so Karpenter-provisioned nodes show up in Session
-  # Manager (same as the bastion). Not required, useful for debugging.
+  # Manager. Not required, useful for debugging.
   #
   # Cilium cluster-pool IPAM does NOT call the EC2 API from nodes —
   # pod IPs come from a Cilium-managed ULA pool, no per-ENI

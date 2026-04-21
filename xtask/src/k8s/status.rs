@@ -5,12 +5,12 @@
 //! error. The command should be useful precisely when things are
 //! broken.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use console::style;
-use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret};
+use k8s_openapi::api::core::v1::{Event, Pod, Secret};
 use kube::api::{Api, DeleteParams, ListParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use rio_crds::pool::Pool;
@@ -48,9 +48,6 @@ pub struct Report {
     /// rio-builders, fetchers in rio-fetchers.
     namespaces: Vec<NsReport>,
     pools: Vec<PlStatus>,
-    /// Per-subnet IP health. EKS-only (aws-sdk-ec2 describe-subnets);
-    /// None for k3s (no subnet concept).
-    subnets: Option<Vec<SubnetHealth>>,
     /// Cilium DaemonSet readiness + encryption mode + KPR. None if the
     /// DS is absent (cluster not yet provisioned, or non-Cilium CNI).
     cilium: Option<CiliumStatus>,
@@ -85,18 +82,6 @@ pub struct PlStatus {
     desired: i32,
     /// `SchedulerUnreachable` condition is True.
     scheduler_unreachable: bool,
-}
-
-#[derive(Serialize)]
-pub struct SubnetHealth {
-    az: String,
-    cidr: String,
-    available_ips: i32,
-    node_count: usize,
-    /// Heuristic: free IPs > 50 but ip_assign_failures is nonempty
-    /// on nodes in this subnet → subnet is fragmented, prefix
-    /// delegation can't find a contiguous /28. I-027.
-    possibly_fragmented: bool,
 }
 
 #[derive(Serialize)]
@@ -173,14 +158,14 @@ pub async fn run(
     }
     let ctx = k::current_context()?;
     let client = k::client().await?;
-    let report = gather(&client, ctx, kind).await;
+    let report = gather(&client, ctx).await;
 
     if reap_stuck_nodes {
         render_human(&report);
         reap(&client, &report).await?;
         // Re-gather and render the post-reap state.
         let ctx = k::current_context()?;
-        let after = gather(&client, ctx, kind).await;
+        let after = gather(&client, ctx).await;
         eprintln!();
         eprintln!("{}", style("── post-reap ──────────────────").dim());
         if json {
@@ -203,7 +188,7 @@ pub async fn run(
     Ok(())
 }
 
-pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKind) -> Report {
+pub(crate) async fn gather(client: &k::Client, context: String) -> Report {
     let mut namespaces = Vec::with_capacity(NAMESPACES.len());
     for &(ns, _) in NAMESPACES {
         namespaces.push(NsReport {
@@ -218,17 +203,6 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         });
     }
 
-    // Node → AZ map, used by subnet gathering.
-    let node_zones = node_zones(client).await;
-
-    let ip_assign_failures = gather_ip_assign_failures(client).await;
-
-    // Subnets last: possibly_fragmented needs ip_assign_failures + node_zones.
-    let subnets = match kind {
-        ProviderKind::Eks => gather_subnets(&node_zones, &ip_assign_failures).await,
-        _ => None,
-    };
-
     Report {
         context,
         release: helm::release_status("rio", NS).ok().flatten(),
@@ -238,11 +212,10 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
             v.extend(list_pools(client, NS_FETCHERS).await.unwrap_or_default());
             v
         },
-        subnets,
         cilium: gather_cilium(client).await,
         stuck_nodeclaims: gather_stuck_nodeclaims(client).await,
         scheduler_metrics: gather_scheduler_metrics(client).await,
-        ip_assign_failures,
+        ip_assign_failures: gather_ip_assign_failures(client).await,
         // Lease lives in rio-system (scheduler's own namespace).
         scheduler_leader: k::scheduler_leader(client, NS).await.ok(),
         // Local rio-cli via port-forward + fetched mTLS — NOT in-pod
@@ -263,98 +236,6 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
 }
 
 // -- gather helpers (all best-effort) -----------------------------------
-
-/// Map of node name → `topology.kubernetes.io/zone` label. Used by
-/// subnet gathering. Zone-match is CNI-agnostic — the previous
-/// IP-in-CIDR match broke under Cilium-on-IPv6-EKS where node
-/// InternalIP is the v6 GUA but subnet `cidr_block` is v4.
-async fn node_zones(client: &k::Client) -> HashMap<String, String> {
-    let api: Api<Node> = Api::all(client.clone());
-    let Ok(nodes) = api.list(&ListParams::default()).await else {
-        debug!("node list failed");
-        return HashMap::new();
-    };
-    nodes
-        .into_iter()
-        .filter_map(|n| {
-            let name = n.metadata.name?;
-            let zone = n
-                .metadata
-                .labels?
-                .get("topology.kubernetes.io/zone")?
-                .clone();
-            Some((name, zone))
-        })
-        .collect()
-}
-
-/// EC2 describe-subnets filtered by karpenter.sh/discovery tag.
-/// `available_ips` matters for NODE provisioning (Karpenter needs a
-/// VPC IP per ENI); pod IPs come from Cilium's overlay pool, so
-/// `possibly_fragmented` (an aws-cni prefix-delegation heuristic) no
-/// longer fires in practice but is kept for the failure-event signal.
-async fn gather_subnets(
-    node_zones: &HashMap<String, String>,
-    ip_failures: &[IpAssignFailure],
-) -> Option<Vec<SubnetHealth>> {
-    use crate::k8s::eks::TF_DIR;
-    let tf = crate::tofu::outputs(TF_DIR)
-        .inspect_err(|e| debug!("tofu outputs: {e:#}"))
-        .ok()?;
-    let cluster = tf.get("cluster_name").ok()?;
-    let region = tf.get("region").ok()?;
-
-    let conf = crate::aws::config(Some(&region)).await;
-    let ec2 = aws_sdk_ec2::Client::new(conf);
-
-    let subnets = ec2
-        .describe_subnets()
-        .filters(
-            aws_sdk_ec2::types::Filter::builder()
-                .name("tag:karpenter.sh/discovery")
-                .values(&cluster)
-                .build(),
-        )
-        .send()
-        .await
-        .inspect_err(|e| debug!("ec2 describe-subnets: {e}"))
-        .ok()?
-        .subnets?;
-
-    // Nodes whose pods had IP-assign failures, by name.
-    let failing_nodes: std::collections::HashSet<&str> =
-        ip_failures.iter().map(|f| f.node.as_str()).collect();
-
-    let mut out: Vec<_> = subnets
-        .into_iter()
-        .filter_map(|s| {
-            let cidr = s.cidr_block?;
-            let az = s.availability_zone.unwrap_or_default();
-            let available_ips = s.available_ip_address_count.unwrap_or(0);
-            // Count nodes whose zone label matches this subnet's AZ,
-            // and note whether any of them had IP-assign failures.
-            let mut node_count = 0;
-            let mut has_failing_node = false;
-            for (name, zone) in node_zones {
-                if *zone == az {
-                    node_count += 1;
-                    if failing_nodes.contains(name.as_str()) {
-                        has_failing_node = true;
-                    }
-                }
-            }
-            Some(SubnetHealth {
-                az,
-                cidr,
-                available_ips,
-                node_count,
-                possibly_fragmented: available_ips > 50 && has_failing_node,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.az.cmp(&b.az));
-    Some(out)
-}
 
 /// NodeClaims whose Ready condition is Unknown with lastTransitionTime
 /// >2min ago. Karpenter CRD — no k8s-openapi type, use DynamicObject.
@@ -875,20 +756,6 @@ async fn reap(client: &k::Client, r: &Report) -> Result<()> {
 /// `helm upgrade` will likely wedge (stuck on pending pods that will
 /// never get IPs, blocked on a prior pending-upgrade, etc).
 pub(crate) fn preflight_check(r: &Report) -> Result<()> {
-    if let Some(subnets) = &r.subnets {
-        for s in subnets {
-            if s.available_ips <= 20 {
-                bail!(
-                    "Subnet {} ({}) has {} free IPs — pods will likely fail IP assignment. \
-                     Scale down workers or add secondary CIDR. Bypass: --deploy-skip-preflight",
-                    s.az,
-                    s.cidr,
-                    s.available_ips
-                );
-            }
-        }
-    }
-
     if !r.ip_assign_failures.is_empty() {
         let nodes: std::collections::BTreeSet<&str> = r
             .ip_assign_failures
@@ -1043,29 +910,6 @@ fn render_human(r: &Report) {
         );
     }
 
-    if let Some(subnets) = &r.subnets {
-        eprintln!();
-        header("Subnets (EKS)");
-        let w = col_width(subnets, |s| &s.az);
-        for s in subnets {
-            let ok = s.available_ips > 20 && !s.possibly_fragmented;
-            let frag = if s.possibly_fragmented {
-                style(" fragmented?").yellow().to_string()
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "  {} {:w$}  {:>5} free IPs  {:>2} nodes  {}{}",
-                glyph(ok),
-                s.az,
-                s.available_ips,
-                s.node_count,
-                style(&s.cidr).dim(),
-                frag
-            );
-        }
-    }
-
     if let Some(c) = &r.cilium {
         eprintln!();
         header("Cilium");
@@ -1200,33 +1044,6 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
     }
 
     #[test]
-    fn preflight_blocks_on_low_ips() {
-        let r = Report {
-            context: String::new(),
-            release: None,
-            namespaces: vec![],
-            pools: vec![],
-            subnets: Some(vec![SubnetHealth {
-                az: "us-east-2a".into(),
-                cidr: "10.0.32.0/19".into(),
-                available_ips: 5,
-                node_count: 3,
-                possibly_fragmented: false,
-            }]),
-            cilium: None,
-            stuck_nodeclaims: vec![],
-            scheduler_metrics: None,
-            ip_assign_failures: vec![],
-            scheduler_leader: None,
-            rio_cli: RioCli::Error(String::new()),
-        };
-        let err = preflight_check(&r).unwrap_err().to_string();
-        assert!(err.contains("us-east-2a"), "{err}");
-        assert!(err.contains("5 free IPs"), "{err}");
-        assert!(err.contains("--deploy-skip-preflight"), "{err}");
-    }
-
-    #[test]
     fn preflight_blocks_on_pending_helm() {
         let r = Report {
             context: String::new(),
@@ -1240,7 +1057,6 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
             }),
             namespaces: vec![],
             pools: vec![],
-            subnets: None,
             cilium: None,
             stuck_nodeclaims: vec![],
             scheduler_metrics: None,
@@ -1267,13 +1083,6 @@ Encryption:              Wireguard       [NodeEncryption: Disabled, cilium_wg0 (
             }),
             namespaces: vec![],
             pools: vec![],
-            subnets: Some(vec![SubnetHealth {
-                az: "us-east-2a".into(),
-                cidr: "10.0.32.0/19".into(),
-                available_ips: 4000,
-                node_count: 3,
-                possibly_fragmented: false,
-            }]),
             cilium: None,
             stuck_nodeclaims: vec![],
             scheduler_metrics: None,

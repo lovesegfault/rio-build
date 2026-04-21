@@ -48,11 +48,6 @@ output "db_secret_arn" {
   value       = aws_rds_cluster.rio.master_user_secret[0].secret_arn
 }
 
-output "bastion_instance_id" {
-  description = "SSM bastion instance ID (xtask smoke uses this for the port-forward session)"
-  value       = aws_instance.bastion.id
-}
-
 output "vpc_id" {
   description = "VPC ID — destroy.rs ENI/SG sweep filters on this (was missing → sweep silently no-op'd)"
   value       = module.vpc.vpc_id

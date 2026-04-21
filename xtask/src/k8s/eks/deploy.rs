@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::client as kube;
-use crate::k8s::provider::{DeployOpts, ProviderKind};
+use crate::k8s::provider::DeployOpts;
 use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::{git, helm, tofu, ui};
 
@@ -98,13 +98,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let client = kube::client().await?;
 
     // Preflight: bail early if the cluster is in a state where helm
-    // upgrade will likely wedge (IP-starved subnets, stuck NodeClaims,
-    // pending-upgrade from a prior failed deploy). Cheap compared to
-    // the helm --wait timeout. Bypass: --deploy-skip-preflight.
+    // upgrade will likely wedge (stuck NodeClaims, pending-upgrade
+    // from a prior failed deploy). Cheap compared to the helm --wait
+    // timeout. Bypass: --deploy-skip-preflight.
     if !skip_preflight {
         let ctx = kube::current_context().unwrap_or_default();
         let report = ui::step("preflight", || async {
-            Ok::<_, anyhow::Error>(status::gather(&client, ctx, ProviderKind::Eks).await)
+            Ok::<_, anyhow::Error>(status::gather(&client, ctx).await)
         })
         .await?;
         status::preflight_check(&report)?;

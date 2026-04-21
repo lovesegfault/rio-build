@@ -15,14 +15,11 @@ nix-built images pushed to ECR, helm chart applied, smoke-test verified.
 | ECR repos | 8 (gateway/scheduler/store/controller/builder/fetcher/bootstrap/dashboard) | immutable tags, keep-last-30 lifecycle |
 | cilium | helm_release | CNI + WireGuard encryption + Gateway API + kube-proxy replacement |
 | aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
-| SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
 
 ## Prerequisites
 
 - `AWS_PROFILE` with admin-ish permissions in the target account
   (EKS, RDS, EC2, IAM, S3, ECR, Secrets Manager — it's a lot)
-- [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
-  for `aws ssm start-session` (separate binary from awscli)
 - `nix develop` in the repo root gives you everything else
   (opentofu, kubectl, awscli2, skopeo, helm, jq)
 
@@ -104,8 +101,7 @@ Five NodePools (weighted priority): `rio-builder-preferred` (c6a/c7a, weight 100
 | Karpenter worker nodes | $0 idle; ~$55/mo per c6a.large while building |
 | Aurora Serverless v2 @ 0.5 ACU | ~$44 |
 | NAT Gateway | ~$35 + data |
-| t3.micro bastion | ~$8 |
-| **Total (idle, no builds)** | **~$370/mo** |
+| **Total (idle, no builds)** | **~$362/mo** |
 
 Worker cost scales with build load. Ephemeral Jobs exit on completion + Karpenter consolidation means an hour of intermittent builds ≈ 1h of node time. Aurora at 2 ACU adds ~$130/mo.
 
@@ -143,10 +139,3 @@ Check the rio-postgres Secret: `kubectl -n rio-system get secret
 rio-postgres -o jsonpath='{.data.url}' | base64 -d`. If it's
 missing `?sslmode=require`, Aurora (rds.force_ssl=1) rejects the
 connection. Check the rio-postgres ExternalSecret status.
-
-**smoke-test SSM tunnel times out:**
-Check `aws ssm describe-instance-information --region us-east-2`
-— the bastion should show `PingStatus: Online`. If not, the SSM
-agent isn't connecting (usually NAT gateway routing or instance
-profile misconfiguration). `/tmp/ssm-session.log` has the client
-side.
