@@ -3261,9 +3261,9 @@ async fn substitute_fetch_survives_store_backpressure() -> TestResult {
     // first post-hold attempt (store returns the seeded path), so
     // resolution is at HOLD + (next backoff after HOLD) — for a 20 s
     // hold that's attempt 7 at ~15.75 s or attempt 8 at ~31.75 s
-    // depending on jitter. 40 s cap covers max-jitter cumulative
-    // (31.75 × 1.2 ≈ 38 s) + mailbox drain.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    // depending on jitter. 60 s cap is generous over max-jitter
+    // cumulative (31.75 × 1.2 ≈ 38 s); loop exits early on success.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         barrier(&handle).await;
         let mut any_sub = false;

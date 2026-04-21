@@ -505,8 +505,9 @@ impl StoreServiceImpl {
         // `try_substitute` means same-path coalesced waiters each hold
         // a permit while only the leader does work — acceptable: the
         // gate's purpose is bounding N DISTINCT paths (the burst that
-        // singleflight can't coalesce); same-path duplicates are rare
-        // relative to the cap.
+        // singleflight can't coalesce). TODO: acquire inside the moka
+        // init future so only the leader holds a permit (wide-fanout
+        // glibc on cold store can otherwise pin cap on one path).
         let _permit = self.substitute_admission.acquire_bounded().await?;
         metrics::gauge!("rio_store_substitute_admission_utilization")
             .set(f64::from(self.substitute_admission.utilization()));
