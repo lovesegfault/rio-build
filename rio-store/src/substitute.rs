@@ -973,13 +973,14 @@ impl Substituter {
         let reader = StreamReader::new(stream);
 
         let cap = SUBSTITUTE_NAR_DECOMPRESSED_CAP;
+        use async_compression::tokio::bufread as ac;
+        // r[impl store.substitute.compression]
         let mut capped: Box<dyn AsyncRead + Unpin + Send> = match compression {
-            "xz" => {
-                Box::new(async_compression::tokio::bufread::XzDecoder::new(reader).take(cap + 1))
-            }
-            "zstd" => {
-                Box::new(async_compression::tokio::bufread::ZstdDecoder::new(reader).take(cap + 1))
-            }
+            "xz" => Box::new(ac::XzDecoder::new(reader).take(cap + 1)),
+            "zstd" => Box::new(ac::ZstdDecoder::new(reader).take(cap + 1)),
+            "bzip2" => Box::new(ac::BzDecoder::new(reader).take(cap + 1)),
+            "br" => Box::new(ac::BrotliDecoder::new(reader).take(cap + 1)),
+            "gzip" => Box::new(ac::GzipDecoder::new(reader).take(cap + 1)),
             "none" | "" => Box::new(reader.take(cap + 1)),
             other => {
                 return Err(SubstituteError::NarInfo(format!(
@@ -1489,6 +1490,94 @@ mod tests {
         }
     }
 
+    /// Compress `bytes` with the named algorithm using the same
+    /// `async_compression` backend the production decoder uses, so the
+    /// test exercises encoder→decoder round-trip per algo.
+    async fn compress(bytes: &[u8], algo: &str) -> Vec<u8> {
+        use async_compression::tokio::bufread as ac;
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match algo {
+            "xz" => Box::new(ac::XzEncoder::new(bytes)),
+            "zstd" => Box::new(ac::ZstdEncoder::new(bytes)),
+            "bzip2" => Box::new(ac::BzEncoder::new(bytes)),
+            "br" => Box::new(ac::BrotliEncoder::new(bytes)),
+            "gzip" => Box::new(ac::GzipEncoder::new(bytes)),
+            other => panic!("test helper: unknown algo {other}"),
+        };
+        r.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    /// [`spawn_fake_upstream`] variant that serves the NAR body
+    /// compressed with `compression` and advertises it in the narinfo's
+    /// `Compression:` field. `NarHash`/`NarSize` remain those of the
+    /// UNCOMPRESSED NAR per the narinfo spec.
+    async fn spawn_fake_upstream_compressed(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        compression: &'static str,
+    ) -> FakeUpstream {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let nar_size = nar_bytes.len() as u64;
+        let fp = fingerprint(store_path, &nar_hash, nar_size, &[]);
+        let sig = signer.sign(&fp);
+
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash_part = sp.hash_part();
+        let body = compress(&nar_bytes, compression).await;
+
+        let narinfo = format!(
+            "StorePath: {store_path}\n\
+             URL: nar/{hash_part}.nar\n\
+             Compression: {compression}\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {nar_size}\n\
+             References: \n\
+             Sig: {sig}\n",
+        );
+
+        let narinfo_path = format!("/{hash_part}.narinfo");
+        let nar_path = format!("/nar/{hash_part}.nar");
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(&narinfo_path, get(move || async move { narinfo }))
+            .route(&nar_path, get(move || async move { body }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        FakeUpstream {
+            url: format!("http://{addr}"),
+            trusted_key,
+            _task: task,
+        }
+    }
+
     /// Sandbox-safe reqwest client: empty root-cert store. The fake
     /// upstream is plaintext `http://localhost` so TLS never engages.
     /// `Client::new()` panics in the nix sandbox because
@@ -1555,6 +1644,44 @@ mod tests {
             .expect("path should be in narinfo table");
         assert_eq!(stored.nar_size, nar.len() as u64);
         assert_eq!(stored.signatures.len(), 1);
+    }
+
+    // r[verify store.substitute.compression]
+    /// `fetch_nar` decodes every `Compression:` value reference Nix's
+    /// `libutil/compression.cc` accepts, end-to-end through
+    /// `try_substitute` so the NarHash check proves the decompressed
+    /// bytes match exactly. cache.nixos.org still serves bzip2 for
+    /// pre-2016 paths.
+    #[tokio::test]
+    async fn substitute_handles_all_nar_compressions() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sub = test_substituter(db.pool.clone());
+
+        for algo in ["xz", "zstd", "bzip2", "br", "gzip"] {
+            let tid = seed_tenant(&db.pool, &format!("sub-compress-{algo}")).await;
+            let path = rio_test_support::fixtures::test_store_path(&format!("comp-{algo}"));
+            let (nar, _hash) = rio_test_support::fixtures::make_nar(algo.as_bytes());
+            let fake =
+                spawn_fake_upstream_compressed(&path, nar.clone(), "cache.compress-1", algo).await;
+
+            metadata::upstreams::insert(
+                &db.pool,
+                tid,
+                &fake.url,
+                50,
+                std::slice::from_ref(&fake.trusted_key),
+                SigMode::Keep,
+            )
+            .await
+            .unwrap();
+
+            let got = sub
+                .try_substitute(tid, &path)
+                .await
+                .unwrap_or_else(|e| panic!("{algo}: try_substitute failed: {e}"))
+                .unwrap_or_else(|| panic!("{algo}: upstream should have the path"));
+            assert_eq!(got.nar_size, nar.len() as u64, "{algo}: nar_size mismatch");
+        }
     }
 
     #[tokio::test]

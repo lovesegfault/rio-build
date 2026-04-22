@@ -322,6 +322,42 @@
         "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
+    "alloc-no-stdlib": {
+      "crateName": "alloc-no-stdlib",
+      "version": "2.0.4",
+      "edition": "2015",
+      "sha256": "1cy6r2sfv5y5cigv86vms7n5nlwhx1rbyxwcraqnmm1rxiib2yyc",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Daniel Reiter Horn <danielrh@dropbox.com>"
+      ]
+    },
+    "alloc-stdlib": {
+      "crateName": "alloc-stdlib",
+      "version": "0.2.2",
+      "edition": "2015",
+      "sha256": "1kkfbld20ab4165p29v172h8g0wvq8i06z8vnng14whw0isq5ywl",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "alloc-no-stdlib",
+          "packageId": "alloc-no-stdlib"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Daniel Reiter Horn <danielrh@dropbox.com>"
+      ]
+    },
     "allocator-api2": {
       "crateName": "allocator-api2",
       "version": "0.2.21",
@@ -714,6 +750,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "brotli",
+        "bzip2",
+        "gzip",
         "lzma",
         "tokio",
         "xz",
@@ -3668,6 +3707,71 @@
         "RustCrypto Developers"
       ]
     },
+    "brotli": {
+      "crateName": "brotli",
+      "version": "8.0.2",
+      "edition": "2015",
+      "sha256": "0q25r00z3gm5wzvv4vfxvlx5zjb8i4jwyznrvdcp7abs7ihbkn2b",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "alloc-no-stdlib",
+          "packageId": "alloc-no-stdlib"
+        },
+        {
+          "name": "alloc-stdlib",
+          "packageId": "alloc-stdlib"
+        },
+        {
+          "name": "brotli-decompressor",
+          "packageId": "brotli-decompressor"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc-stdlib",
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Daniel Reiter Horn <danielrh@dropbox.com>",
+        "The Brotli Authors"
+      ]
+    },
+    "brotli-decompressor": {
+      "crateName": "brotli-decompressor",
+      "version": "5.0.0",
+      "edition": "2015",
+      "sha256": "00yyswj1rj20ma4wr4wcci4r9ywlgvxa87nqsv5rik5y588vhjw7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "alloc-no-stdlib",
+          "packageId": "alloc-no-stdlib"
+        },
+        {
+          "name": "alloc-stdlib",
+          "packageId": "alloc-stdlib"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc-stdlib",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Daniel Reiter Horn <danielrh@dropbox.com>",
+        "The Brotli Authors"
+      ]
+    },
     "bs58": {
       "crateName": "bs58",
       "version": "0.5.1",
@@ -3813,6 +3917,27 @@
       ],
       "authors": [
         "Michal 'vorner' Vaner <vorner@vorner.cz>"
+      ]
+    },
+    "bzip2": {
+      "crateName": "bzip2",
+      "version": "0.6.1",
+      "edition": "2021",
+      "sha256": "0v1lgjxy944fdvsl97wmqs7f288crv7xddalk6y82jpk4jn3z9gk",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libbz2-rs-sys",
+          "packageId": "libbz2-rs-sys"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "cbc 0.1.2": {
@@ -4513,12 +4638,28 @@
       },
       "dependencies": [
         {
+          "name": "brotli",
+          "packageId": "brotli"
+        },
+        {
+          "name": "bzip2",
+          "packageId": "bzip2"
+        },
+        {
           "name": "compression-core",
           "packageId": "compression-core"
         },
         {
+          "name": "flate2",
+          "packageId": "flate2"
+        },
+        {
           "name": "liblzma",
           "packageId": "liblzma"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
         },
         {
           "name": "zstd",
@@ -4531,8 +4672,13 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "brotli",
+        "bzip2",
+        "flate2",
+        "gzip",
         "libzstd",
         "lzma",
+        "memchr",
         "xz",
         "zstd",
         "zstd-safe"
@@ -14309,6 +14455,21 @@
       ],
       "authors": [
         "Bryant Luk <code@bryantluk.com>"
+      ]
+    },
+    "libbz2-rs-sys": {
+      "crateName": "libbz2-rs-sys",
+      "version": "0.2.3",
+      "edition": "2021",
+      "sha256": "0psnjha3lzksi5padx4y6a5s38d61v2k85cp7a7zqzh7cp0si9mk",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "rust-allocator"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "libc": {

@@ -41,6 +41,9 @@ allow = [
   # CDLA-Permissive-2.0 is used by webpki-roots' bundled root certs.
   # It's permissive (no copyleft); allowing it is uncontroversial.
   "CDLA-Permissive-2.0",
+  # libbz2-rs-sys (pure-Rust bzip2 port pulled by async-compression) keeps
+  # the original libbzip2 license. BSD-like, attribution-only, no copyleft.
+  "bzip2-1.0.6",
 ]
 # Fail if cargo-deny's confidence in a license detection is below this.
 # 0.8 catches most ambiguous cases without excessive false positives.
