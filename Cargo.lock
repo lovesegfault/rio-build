@@ -6667,6 +6667,7 @@ dependencies = [
  "figment",
  "futures-util",
  "hex",
+ "httpdate",
  "metrics",
  "moka",
  "proptest",

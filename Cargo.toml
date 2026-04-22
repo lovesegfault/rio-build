@@ -224,6 +224,10 @@ http-body-util = "0.1"
 # start_paused tests don't see spurious auto-advance on real TCP.
 hyper-util = "0.1"
 http = "1"
+# RFC 9110 Retry-After HTTP-date parsing (substitute.rs 429 handling).
+# Already transitive via hyper; pinned direct so rio-store's parser
+# doesn't break if hyper's deptree shifts.
+httpdate = "1"
 
 # Crypto
 sha1 = "0.11"

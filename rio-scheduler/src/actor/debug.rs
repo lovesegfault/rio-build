@@ -322,7 +322,7 @@ impl DagActor {
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
             .expect("test_drv_path generates valid StorePath");
         self.dag.insert_recovered_node(state);
-        // r[sched.admin.spawn-intents.probed-gate]: injected nodes
+        // r[sched.admin.spawn-intents.probed-gate+2]: injected nodes
         // model "probed, not substitutable" so existing
         // compute_spawn_intents filter tests stay focused on
         // kind/system/feature logic. Reset via

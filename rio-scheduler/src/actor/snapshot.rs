@@ -207,7 +207,7 @@ impl DagActor {
             // pool asked).
             *queued_by_system.entry(state.system.clone()).or_default() += 1;
 
-            // r[impl sched.admin.spawn-intents.probed-gate]
+            // r[impl sched.admin.spawn-intents.probed-gate+2]
             // SubstituteComplete{ok=true} promotes dependents
             // Queued→Ready then defers their probe to next Tick. A
             // poll in that ≤1s window would spawn pods that get

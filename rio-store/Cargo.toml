@@ -68,6 +68,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # realisations.rs hex-encodes drv_hash for instrument span fields.
 hex = { workspace = true }
+# RFC 9110 Retry-After HTTP-date parsing (substitute.rs 429 handling).
+httpdate = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # --- server-only (gated via the `server` feature) ---------------------

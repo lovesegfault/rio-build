@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let hmac_for_grpc = hmac_signer.clone();
     // Service-identity signer (SEPARATE key). Lets the dispatch-time
     // FOD store-check assert tenant context via x-rio-probe-tenant-id
-    // — see r[sched.dispatch.fod-substitute].
+    // — see r[sched.dispatch.fod-substitute+2].
     let service_signer = rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?;
     if service_signer.is_some() {

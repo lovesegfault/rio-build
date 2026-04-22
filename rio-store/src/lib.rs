@@ -93,10 +93,19 @@ const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
 /// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
 /// histograms not listed fall through to the global `[0.005..10.0]` default.
 #[cfg(feature = "server")]
-pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
-    "rio_store_substitute_duration_seconds",
-    SUBSTITUTE_DURATION_BUCKETS,
-)];
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        "rio_store_substitute_duration_seconds",
+        SUBSTITUTE_DURATION_BUCKETS,
+    ),
+    (
+        // Same range: ⌈N_uncached/128⌉ × RTT spans the 0.01-120s
+        // envelope (153k paths @ 30ms ≈ 36s; the 60-120s tail is
+        // 429-retry sleeps).
+        "rio_store_check_available_duration_seconds",
+        SUBSTITUTE_DURATION_BUCKETS,
+    ),
+];
 
 /// Register `# HELP` descriptions for all store metrics.
 ///
@@ -267,14 +276,19 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_substitute_probe_cache_misses_total",
         "check_available HEAD-probe cache misses (path uncached; an upstream \
-         HEAD was issued, or the batch hit the 4096-uncached cap)."
+         HEAD was issued)."
     );
     describe_counter!(
-        "rio_store_substitute_probe_skipped_total",
-        "check_available batches that exceeded SUBSTITUTE_PROBE_MAX_PATHS and \
-         were truncated to the first 4096 paths for HEAD probing. Non-zero \
-         means large merges get partial coverage this tick; the 1h probe_cache \
-         converges on retry."
+        "rio_store_substitute_probe_ratelimited_total",
+        "check_available HEAD probes that returned 429, labeled by upstream. \
+         The rate-limited subset is retried (≤3 passes) after honoring \
+         Retry-After; concurrency is halved when >10% of a pass 429s."
+    );
+    describe_histogram!(
+        "rio_store_check_available_duration_seconds",
+        "check_available wall-clock (HEAD-probe phase of FindMissingPaths). \
+         ⌈N_uncached/128⌉ × RTT plus any 429 retry sleeps. p99 informs \
+         the scheduler's MERGE_FMP_TIMEOUT."
     );
 
     describe_gauge!(

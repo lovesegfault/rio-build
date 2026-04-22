@@ -25,7 +25,7 @@ use bytes::Bytes;
 use moka::future::Cache;
 use sqlx::PgPool;
 use tokio::io::AsyncReadExt;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use rio_nix::narinfo::NarInfo;
@@ -64,21 +64,30 @@ pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// thrashing the pool when a `FindMissingPaths` batch is large.
 pub const SUBSTITUTE_PROBE_CONCURRENCY: usize = 128;
 
-/// Maximum number of uncached paths [`Substituter::check_available`]
-/// will probe in a single call. Oversized batches are TRUNCATED to the
-/// first `SUBSTITUTE_PROBE_MAX_PATHS` (not skipped) — the 1h
-/// `probe_cache` means a retry sees the probed prefix as cached, so
-/// repeated calls converge to full coverage. `substitutable_paths` is a
-/// scheduler optimization hint; even bounded-concurrency probing of
-/// hundreds of thousands of paths blocks the originating RPC for too
-/// long.
-pub const SUBSTITUTE_PROBE_MAX_PATHS: usize = 4096;
-
 /// Conservative HEAD-probe concurrency for upstreams that do NOT
 /// advertise `WantMassQuery: 1` in `/nix-cache-info` (or whose
 /// cache-info fetch failed). Matches Nix's own conservative default
 /// for non-mass-query caches.
 pub const SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE: usize = 8;
+
+/// Default deadline budget for [`Substituter::check_available`]'s
+/// 429-retry loop when the originating RPC carries no narrower bound.
+/// Matches the scheduler's `MERGE_FMP_TIMEOUT` (90s) less 2s headroom
+/// for the HEADs themselves — the widest caller. Dispatch-time
+/// callers (30s `grpc_timeout`) cancel the RPC client-side first; the
+/// store-side budget only bites when the caller's timeout is ≥ this.
+pub const CHECK_AVAILABLE_DEFAULT_BUDGET: Duration = Duration::from_secs(88);
+
+/// Max retry passes [`Substituter::check_available`] makes over the
+/// rate-limited subset before giving up and returning the remainder as
+/// `Indeterminate` (not cached; next call re-probes).
+const SUBSTITUTE_PROBE_429_MAX_PASSES: u32 = 3;
+
+/// Fraction of a pass's batch that must come back `RateLimited` to
+/// trigger adaptive concurrency halving for the retry pass. Below this,
+/// the next pass keeps the same concurrency (a handful of 429s on a
+/// 17k-path batch is per-object noise, not edge-wide backpressure).
+const SUBSTITUTE_PROBE_429_ADAPT_THRESHOLD: f64 = 0.1;
 
 /// TTL for both the per-upstream `/nix-cache-info` cache and the
 /// per-path HEAD-probe result cache.
@@ -168,13 +177,16 @@ pub enum SubstituteError {
     #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
     SizeMismatch { declared: u64, actual: u64 },
 
-    /// `claim_placeholder` returned `Concurrent` — another uploader
-    /// holds the slot. Transient: returned as `Err` (not `Ok(None)`)
-    /// so moka's `try_get_with` does NOT cache it; the caller's retry
-    /// re-runs `do_substitute` and reaches `AlreadyComplete` once the
-    /// concurrent upload finishes.
-    #[error("concurrent uploader holds placeholder")]
-    Busy,
+    /// Transient: returned as `Err` (not `Ok(None)`) so moka's
+    /// `try_get_with` does NOT cache it; the caller's retry re-runs
+    /// `do_substitute`. `retry_after = None` is the placeholder-claim
+    /// case (`Concurrent` — another uploader holds the slot; retry
+    /// reaches `AlreadyComplete` once it finishes). `Some(d)` is the
+    /// upstream-429 case (`r[store.substitute.probe-429-retry]`): the
+    /// admission permit is dropped on return so the wait happens
+    /// caller-side without holding per-replica capacity.
+    #[error("transient busy (retry after {retry_after:?})")]
+    Busy { retry_after: Option<Duration> },
 
     /// Per-replica admission gate timed out (or closed). Transient —
     /// `Err` so moka does NOT cache it; the next caller after the
@@ -217,13 +229,38 @@ enum UpstreamOutcome {
 
 /// Result of one HEAD probe across the tenant's upstreams. Only `Hit`
 /// and `Miss` are cached; `Indeterminate` (network error / 5xx on every
-/// non-hit base) is left uncached so the next call re-probes instead of
-/// pinning a transient failure for the full 1h TTL.
+/// non-hit base) and `RateLimited` are left uncached so the next call
+/// re-probes instead of pinning a transient failure for the full 1h TTL.
 #[derive(Clone, Copy)]
 enum ProbeOutcome {
     Hit,
     Miss,
     Indeterminate,
+    /// At least one upstream returned 429; `retry_after` is the parsed
+    /// `Retry-After` (delta-seconds OR HTTP-date) if any. Distinct from
+    /// `Indeterminate` so [`Substituter::check_available`] can sleep +
+    /// retry instead of falling through to a build.
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Parse an RFC 9110 `Retry-After` header from a 429 response.
+/// Accepts both forms: delta-seconds (`"120"`) and HTTP-date
+/// (`"Wed, 21 Oct 2026 07:28:00 GMT"`). Returns the raw duration —
+/// NO clamping; the caller's deadline budget decides whether to honor
+/// it (`r[store.substitute.probe-429-retry]`).
+fn parse_retry_after(r: &reqwest::Response) -> Option<Duration> {
+    let s = r
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = httpdate::parse_http_date(s).ok()?;
+    when.duration_since(std::time::SystemTime::now()).ok()
 }
 
 /// HTTP narinfo + NAR fetcher with per-tenant upstream lookup.
@@ -483,7 +520,10 @@ impl Substituter {
                 // (concurrent uploader / local backpressure); skip the
                 // error metric so they don't show up as upstream
                 // failure. Admission has its own dedicated counter.
-                if !matches!(*e, SubstituteError::Busy | SubstituteError::Admission(_)) {
+                if !matches!(
+                    *e,
+                    SubstituteError::Busy { .. } | SubstituteError::Admission(_)
+                ) {
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "error",
@@ -663,7 +703,17 @@ impl Substituter {
                     // as a definitive miss; caller's retry re-runs and
                     // reaches `AlreadyComplete` once the upload lands.
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
-                    return Err(SubstituteError::Busy);
+                    return Err(SubstituteError::Busy { retry_after: None });
+                }
+                Err(e @ SubstituteError::Busy { .. }) => {
+                    // Upstream 429'd the narinfo GET. STOP — moka must
+                    // not cache this as a miss, and the admission
+                    // permit must drop NOW so the caller's retry curve
+                    // can wait without holding per-replica capacity
+                    // (r[store.substitute.probe-429-retry]). Trying
+                    // remaining upstreams would only burn more rate.
+                    debug!(upstream = %upstream.url, ?e, "upstream 429, stopping");
+                    return Err(e);
                 }
                 Err(e) => {
                     // This upstream failed (down, hash mismatch, parse
@@ -722,6 +772,22 @@ impl Substituter {
             .map_err(|e| SubstituteError::Fetch(format!("{narinfo_url}: {e}")))?;
         if is_not_found(resp.status()) {
             return Ok(UpstreamOutcome::Miss);
+        }
+        // r[impl store.substitute.probe-429-retry]
+        // 429 on the GET path: return Busy{retry_after} immediately.
+        // The AdmissionGate permit drops on return so the wait happens
+        // caller-side without holding per-replica capacity. NO inline
+        // sleep+retry: the scheduler's existing 8-attempt backoff
+        // (250ms→16s, ~32s total) absorbs short Retry-Afters; long
+        // ones fall through to the next dispatch-time probe pass.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = parse_retry_after(&resp);
+            metrics::counter!(
+                "rio_store_substitute_probe_ratelimited_total",
+                "upstream" => base.to_string(),
+            )
+            .increment(1);
+            return Err(SubstituteError::Busy { retry_after });
         }
         if !resp.status().is_success() {
             return Err(SubstituteError::Fetch(format!(
@@ -1120,17 +1186,29 @@ impl Substituter {
     /// [`SUBSTITUTE_PROBE_CONCURRENCY`] if all upstreams advertise it,
     /// [`SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE`] otherwise.
     /// Fails-open on individual HEAD errors (a down upstream shouldn't
-    /// hide paths that OTHER upstreams have). Uncached batches larger
-    /// than [`SUBSTITUTE_PROBE_MAX_PATHS`] are TRUNCATED to the first
-    /// `SUBSTITUTE_PROBE_MAX_PATHS` — see that constant's doc.
+    /// hide paths that OTHER upstreams have). 429 responses are retried
+    /// (≤ `SUBSTITUTE_PROBE_429_MAX_PASSES`) with `Retry-After`
+    /// honored and concurrency adaptively halved — see
+    /// `r[store.substitute.probe-429-retry]`. No batch-size truncation:
+    /// the originating RPC's wall-clock is `⌈N_uncached/128⌉ × RTT`;
+    /// the scheduler's merge-time caller carries a wider timeout
+    /// (`r[sched.substitute.eager-probe]`).
+    ///
+    /// `deadline` bounds the 429-retry sleep: if the upstream's
+    /// `Retry-After` would push past it (with 2s headroom for the
+    /// HEADs themselves), the retry pass is skipped and the
+    /// rate-limited paths are returned as not-substitutable for THIS
+    /// call (uncached; they get re-probed at dispatch time).
     #[instrument(skip(self, paths), fields(tenant = %tenant_id, n = paths.len()))]
     pub async fn check_available(
         &self,
         tenant_id: Uuid,
         paths: &[String],
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<String>, SubstituteError> {
         use futures_util::StreamExt;
 
+        let started = std::time::Instant::now();
         let Some(http) = &self.http else {
             return Ok(Vec::new()); // sandbox: client build failed
         };
@@ -1169,24 +1247,6 @@ impl Substituter {
         if uncached.is_empty() {
             return Ok(hits);
         }
-        if uncached.len() > SUBSTITUTE_PROBE_MAX_PATHS {
-            // Latency guard: probing N>4096 paths even at bounded
-            // concurrency would block the originating FindMissingPaths
-            // RPC (and the scheduler's actor event loop) for too long.
-            // Probe the FIRST 4096 (not zero) — the 1h probe_cache
-            // means a retry/subsequent merge sees those as cached,
-            // leaving fewer uncached → eventually full coverage. The
-            // dispatch-time re-check (r[sched.dispatch.fod-substitute])
-            // covers FODs in the truncated tail per-tick.
-            warn!(
-                uncached = uncached.len(),
-                max = SUBSTITUTE_PROBE_MAX_PATHS,
-                cached_hits = hits.len(),
-                "check_available: uncached batch exceeds probe cap; truncating to first {SUBSTITUTE_PROBE_MAX_PATHS}"
-            );
-            metrics::counter!("rio_store_substitute_probe_skipped_total").increment(1);
-            uncached.truncate(SUBSTITUTE_PROBE_MAX_PATHS);
-        }
 
         let bases: Vec<String> = upstreams
             .iter()
@@ -1216,7 +1276,7 @@ impl Substituter {
         // doesn't reparse N×M times. Owned strings (not borrows) so the
         // per-path futures don't borrow from the iterator item —
         // buffer_unordered's HRTB inference can't see through that.
-        let parsed: Vec<(String, String)> = uncached
+        let mut pending: Vec<(String, String)> = uncached
             .into_iter()
             .filter_map(|p| {
                 let h = StorePath::parse(&p).ok()?.hash_part();
@@ -1225,13 +1285,14 @@ impl Substituter {
             .collect();
 
         let bases = &bases;
-        let futs = parsed.into_iter().map(move |(path, hash_part)| async move {
+        let probe_one = |path: String, hash_part: String| async move {
             // `Hit` if any base 2xx; `Miss` if EVERY base returned a
-            // clean 404; `Indeterminate` if no hit and ≥1 base errored
-            // or returned non-404 — caching that as `false` would route
-            // a substitutable derivation to `willBuild` for 1h after a
-            // transient 503.
+            // clean 404; `RateLimited` if no hit and ≥1 base 429'd;
+            // `Indeterminate` if no hit and ≥1 base errored / non-404 —
+            // caching that as `false` would route a substitutable
+            // derivation to `willBuild` for 1h after a transient 503.
             let mut any_indeterminate = false;
+            let mut rate_limited: Option<Option<Duration>> = None;
             for base in bases {
                 let url = format!("{base}/{hash_part}.narinfo");
                 match http
@@ -1240,39 +1301,115 @@ impl Substituter {
                     .send()
                     .await
                 {
-                    Ok(r) if r.status().is_success() => return (path, ProbeOutcome::Hit),
+                    Ok(r) if r.status().is_success() => {
+                        return ((path, hash_part), ProbeOutcome::Hit);
+                    }
                     Ok(r) if is_not_found(r.status()) => {}
+                    Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                        let retry_after = parse_retry_after(&r);
+                        metrics::counter!(
+                            "rio_store_substitute_probe_ratelimited_total",
+                            "upstream" => base.clone(),
+                        )
+                        .increment(1);
+                        // Max across upstreams that 429'd this path.
+                        rate_limited = Some(match rate_limited.flatten() {
+                            Some(prev) => Some(prev.max(retry_after.unwrap_or_default())),
+                            None => retry_after,
+                        });
+                    }
                     Ok(_) | Err(_) => any_indeterminate = true,
                 }
             }
-            let outcome = if any_indeterminate {
-                ProbeOutcome::Indeterminate
-            } else {
-                ProbeOutcome::Miss
+            let outcome = match rate_limited {
+                Some(retry_after) => ProbeOutcome::RateLimited { retry_after },
+                None if any_indeterminate => ProbeOutcome::Indeterminate,
+                None => ProbeOutcome::Miss,
             };
-            (path, outcome)
-        });
-        // r[impl store.substitute.probe-bounded+3]
-        let probed: Vec<(String, ProbeOutcome)> = futures_util::stream::iter(futs)
+            ((path, hash_part), outcome)
+        };
+
+        // r[impl store.substitute.probe-bounded+4]
+        // r[impl store.substitute.probe-429-retry]
+        // 429-aware retry loop. Pass 0 covers the full uncached set;
+        // each retry pass re-probes only the RateLimited subset after
+        // sleeping max(Retry-After) (Fastly's 429 is edge-wide, not
+        // per-object — sleeping per-path would serialize). Concurrency
+        // halves when >SUBSTITUTE_PROBE_429_ADAPT_THRESHOLD of a pass
+        // came back 429: that's the actual feedback signal the old
+        // synthetic 4096 cap was a static proxy for.
+        for pass in 0..=SUBSTITUTE_PROBE_429_MAX_PASSES {
+            let batch_len = pending.len();
+            let probed: Vec<_> = futures_util::stream::iter(
+                std::mem::take(&mut pending)
+                    .into_iter()
+                    .map(|(p, h)| probe_one(p, h)),
+            )
             .buffer_unordered(concurrency)
             .collect()
             .await;
 
-        for (path, outcome) in probed {
-            match outcome {
-                ProbeOutcome::Hit => {
-                    self.probe_cache
-                        .insert((tenant_id, path.clone()), true)
-                        .await;
-                    hits.push(path);
+            let mut max_retry_after: Option<Duration> = None;
+            for ((path, hash_part), outcome) in probed {
+                match outcome {
+                    ProbeOutcome::Hit => {
+                        self.probe_cache
+                            .insert((tenant_id, path.clone()), true)
+                            .await;
+                        hits.push(path);
+                    }
+                    ProbeOutcome::Miss => {
+                        self.probe_cache.insert((tenant_id, path), false).await;
+                    }
+                    // Don't cache: next call re-probes.
+                    ProbeOutcome::Indeterminate => {}
+                    ProbeOutcome::RateLimited { retry_after } => {
+                        max_retry_after = max_retry_after
+                            .max(Some(retry_after.unwrap_or(Duration::from_secs(1))));
+                        pending.push((path, hash_part));
+                    }
                 }
-                ProbeOutcome::Miss => {
-                    self.probe_cache.insert((tenant_id, path), false).await;
-                }
-                // Don't cache: next call re-probes.
-                ProbeOutcome::Indeterminate => {}
             }
+
+            if pending.is_empty() || pass == SUBSTITUTE_PROBE_429_MAX_PASSES {
+                break;
+            }
+            if pending.len() as f64 / batch_len as f64 > SUBSTITUTE_PROBE_429_ADAPT_THRESHOLD {
+                concurrency = (concurrency / 2).max(SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE);
+            }
+            let sleep = max_retry_after.unwrap_or(Duration::from_secs(1));
+            // Budget check: if Retry-After would push past the
+            // caller's deadline (with 2s headroom for the HEADs
+            // themselves), skip the retry pass — the rate-limited
+            // remainder gets re-probed at dispatch time. The actual
+            // constraint is the RPC timeout above us, not an
+            // arbitrary clamp on what the upstream said.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if sleep > remaining.saturating_sub(Duration::from_secs(2)) {
+                info!(
+                    retry_after = ?sleep,
+                    remaining_budget = ?remaining,
+                    deferred = pending.len(),
+                    "check_available: upstream Retry-After exceeds probe budget; \
+                     deferring rate-limited paths to dispatch-time"
+                );
+                break;
+            }
+            debug!(
+                pass,
+                rate_limited = pending.len(),
+                ?sleep,
+                next_concurrency = concurrency,
+                "check_available: 429 retry pass"
+            );
+            tokio::time::sleep(sleep).await;
         }
+        // Remainder (still 429 after MAX_PASSES, or Retry-After exceeded
+        // budget) → Indeterminate: not cached, returned as
+        // not-substitutable for THIS call only.
+
+        metrics::histogram!("rio_store_check_available_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
         Ok(hits)
     }
 }
@@ -1594,6 +1731,13 @@ mod tests {
         Substituter::new(pool, None).with_http_client(sandbox_http())
     }
 
+    /// `check_available` deadline for tests that don't exercise the
+    /// 429-budget path. Far enough out that the budget check never
+    /// trips on local-loopback HEAD latency.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + CHECK_AVAILABLE_DEFAULT_BUDGET
+    }
+
     fn make_path() -> (String, Vec<u8>) {
         let path = rio_test_support::fixtures::test_store_path("substituted");
         let (nar, _hash) = rio_test_support::fixtures::make_nar(b"hi");
@@ -1851,7 +1995,116 @@ mod tests {
         spawn_status_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await
     }
 
-    // r[verify store.substitute.probe-bounded+3]
+    /// Config for [`spawn_mass_probe_upstream`].
+    #[derive(Default)]
+    struct ProbeCfg {
+        /// First N HEAD requests return 429; subsequent ones 200.
+        head_429_first_n: usize,
+        /// Literal `Retry-After` header value on 429 responses.
+        /// `None` → no header (caller's 1s default applies). May be
+        /// delta-seconds (`"1"`) or an HTTP-date.
+        retry_after: Option<String>,
+    }
+
+    struct ProbeUpstream {
+        url: String,
+        /// Total HEAD requests served (across all passes).
+        head_hits: Arc<AtomicUsize>,
+        /// Max concurrent in-flight HEADs observed AFTER the
+        /// `head_429_first_n`-th request — i.e. during retry passes.
+        max_concurrent_after: Arc<AtomicUsize>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Axum upstream that 200s any `*.narinfo` HEAD (no per-path
+    /// routing — every path is "present"). Serves `WantMassQuery: 1`
+    /// so `check_available` runs at 128-wide. For the no-truncation /
+    /// 429-retry / adaptive-concurrency tests where the FlexUpstream's
+    /// single-seeded-path shape doesn't fit.
+    async fn spawn_mass_probe_upstream(cfg: ProbeCfg) -> ProbeUpstream {
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use axum::{
+            Router,
+            routing::{get, head},
+        };
+
+        let head_hits = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_after = Arc::new(AtomicUsize::new(0));
+        let hh = head_hits.clone();
+        let mca = max_concurrent_after.clone();
+        let ProbeCfg {
+            head_429_first_n,
+            retry_after,
+        } = cfg;
+
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(
+                "/{hash}",
+                head(move || {
+                    let hh = hh.clone();
+                    let in_flight = in_flight.clone();
+                    let mca = mca.clone();
+                    let ra = retry_after.clone();
+                    async move {
+                        let n = hh.fetch_add(1, Ordering::SeqCst);
+                        let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        // Track max-concurrent only for requests past
+                        // the 429 window (i.e. retry passes).
+                        if n >= head_429_first_n {
+                            mca.fetch_max(cur, Ordering::SeqCst);
+                        }
+                        // Yield so concurrent in-flight requests pile
+                        // up enough for fetch_max to observe the peak.
+                        tokio::task::yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        if n < head_429_first_n {
+                            let mut h = HeaderMap::new();
+                            if let Some(s) = ra {
+                                h.insert(
+                                    reqwest::header::RETRY_AFTER,
+                                    HeaderValue::from_str(&s).unwrap(),
+                                );
+                            }
+                            (StatusCode::TOO_MANY_REQUESTS, h)
+                        } else {
+                            (StatusCode::OK, HeaderMap::new())
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ProbeUpstream {
+            url: format!("http://{addr}"),
+            head_hits,
+            max_concurrent_after,
+            _task: task,
+        }
+    }
+
+    async fn insert_probe(pool: &PgPool, tid: Uuid, fake: &ProbeUpstream) {
+        metadata::upstreams::insert(
+            pool,
+            tid,
+            &fake.url,
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+    }
+
+    // r[verify store.substitute.probe-bounded+4]
     /// HTTP 403 (S3 without public `s3:ListBucket`) MUST be treated as
     /// a miss, not an error: emits `result=miss`, and `check_available`
     /// caches it as a definitive negative so the truncation-convergence
@@ -1907,7 +2160,7 @@ mod tests {
         // second call MUST hit the probe_cache (proving 403 was cached
         // as a definitive negative, not left Indeterminate).
         let hits = sub
-            .check_available(tid, std::slice::from_ref(&path))
+            .check_available(tid, std::slice::from_ref(&path), far_deadline())
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -1915,7 +2168,7 @@ mod tests {
         let rec2 = CountingRecorder::default();
         let _g2 = metrics::set_default_local_recorder(&rec2);
         let hits2 = sub
-            .check_available(tid, std::slice::from_ref(&path))
+            .check_available(tid, std::slice::from_ref(&path), far_deadline())
             .await
             .unwrap();
         assert!(hits2.is_empty());
@@ -1997,38 +2250,31 @@ mod tests {
         );
         let sub = test_substituter(db.pool.clone());
         let missing = vec![path.clone(), absent];
-        let available = sub.check_available(tid, &missing).await.unwrap();
+        let available = sub
+            .check_available(tid, &missing, far_deadline())
+            .await
+            .unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
     }
 
-    // r[verify store.substitute.probe-bounded+3]
-    /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
-    /// to 4096 (not skipped to zero). Uses a local fake upstream that
-    /// 404s everything except its one seeded path → 4096 instant HEADs
-    /// at WantMassQuery=128 concurrency. The 4097th path is never
-    /// probed → its `probe_cache` entry stays absent.
+    // r[verify store.substitute.probe-bounded+4]
+    /// No batch-size truncation: a 5000-path batch (>old 4096 cap)
+    /// MUST probe every path. Uses a local fake upstream that 200s
+    /// every `*.narinfo` HEAD → all 5000 land in `hits` and the
+    /// `probe_cache`. Regression guard: pre-change, the tail past
+    /// 4096 stayed unprobed → `hits.len() ≤ 4096`.
     #[tokio::test]
-    async fn check_available_truncates_oversized_batch() {
+    async fn check_available_no_truncation() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, "sub-head-cap").await;
-        let (dummy, nar) = make_path();
-        let fake = spawn_fake_upstream(&dummy, nar, "cache.cap-test").await;
+        let tid = seed_tenant(&db.pool, "sub-head-nocap").await;
+        let fake = spawn_mass_probe_upstream(ProbeCfg::default()).await;
+        insert_probe(&db.pool, tid, &fake).await;
 
-        metadata::upstreams::insert(
-            &db.pool,
-            tid,
-            &fake.url,
-            50,
-            std::slice::from_ref(&fake.trusted_key),
-            SigMode::Keep,
-        )
-        .await
-        .unwrap();
-
-        let paths: Vec<String> = (0..SUBSTITUTE_PROBE_MAX_PATHS + 1)
+        const N: usize = 5000;
+        let paths: Vec<String> = (0..N)
             .map(|i| {
                 format!(
-                    "/nix/store/{}-oversized-{i}",
+                    "/nix/store/{}-nocap-{i}",
                     rio_test_support::fixtures::rand_store_hash()
                 )
             })
@@ -2036,33 +2282,305 @@ mod tests {
 
         let sub = test_substituter(db.pool.clone());
         let available = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            sub.check_available(tid, &paths),
+            std::time::Duration::from_secs(30),
+            sub.check_available(tid, &paths, far_deadline()),
         )
         .await
-        .expect("4096 local-404 HEADs at 128 conc should complete in ~100ms")
+        .expect("5000 local-200 HEADs at 128 conc should complete in ~1s")
         .unwrap();
-        assert!(
-            available.is_empty(),
-            "fake upstream 404s all generated paths → 0 substitutable"
-        );
-        assert!(
-            sub.probe_cache
-                .get(&(tid, paths[0].clone()))
-                .await
-                .is_some(),
-            "head of batch must be probed and cached"
+        assert_eq!(
+            available.len(),
+            N,
+            "every path must be probed and hit (no truncation)"
         );
         assert!(
             sub.probe_cache
                 .get(&(tid, paths.last().unwrap().clone()))
                 .await
-                .is_none(),
-            "tail past truncation point must NOT be probed"
+                .is_some(),
+            "tail of batch must be probed and cached"
         );
     }
 
-    // r[verify store.substitute.probe-bounded+3]
+    // r[verify store.substitute.probe-429-retry]
+    /// 429 + `Retry-After` honored: upstream 429s the first
+    /// `head_429_first_n` HEADs then 200s. All paths MUST end up in
+    /// `hits` (the rate-limited subset is retried, not dropped to
+    /// `Indeterminate`), the ratelimited counter increments, and
+    /// wall-clock ≥ the `Retry-After` value (proves we slept).
+    #[tokio::test]
+    async fn check_available_429_retry() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-429").await;
+        // 50 paths; first 20 HEADs 429+Retry-After:1, rest 200.
+        let fake = spawn_mass_probe_upstream(ProbeCfg {
+            head_429_first_n: 20,
+            retry_after: Some("1".into()),
+        })
+        .await;
+        insert_probe(&db.pool, tid, &fake).await;
+
+        let paths: Vec<String> = (0..50)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-429-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let sub = test_substituter(db.pool.clone());
+        let t0 = tokio::time::Instant::now();
+        let available = sub
+            .check_available(tid, &paths, far_deadline())
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            available.len(),
+            50,
+            "rate-limited paths must be retried to Hit, not lost"
+        );
+        assert!(
+            rec.get(&format!(
+                "rio_store_substitute_probe_ratelimited_total{{upstream={}}}",
+                fake.url
+            )) > 0,
+            "ratelimited counter must increment; keys={:?}",
+            rec.all_keys()
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "must sleep ≥ Retry-After before retry pass; elapsed={elapsed:?}"
+        );
+        // Retry pass re-probes only the rate-limited subset, not the
+        // whole batch (Hit/Miss are cached after pass 0).
+        assert!(
+            fake.head_hits.load(Ordering::SeqCst) <= 50 + 20,
+            "retry pass must only re-probe the 429'd subset; total HEADs={}",
+            fake.head_hits.load(Ordering::SeqCst)
+        );
+    }
+
+    // r[verify store.substitute.probe-429-retry]
+    /// >10% rate-limited → concurrency halves for the retry pass.
+    /// 200 paths at 128 concurrency; ALL of pass-0 429s. Retry pass
+    /// MUST observe max-concurrent ≤ 64.
+    #[tokio::test]
+    async fn check_available_429_adaptive() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-429-adapt").await;
+        // 200 HEADs 429 (no Retry-After → 1s default), rest 200. 200 >
+        // batch size so EVERY pass-0 request 429s → 100% > 10%
+        // threshold → concurrency halves 128→64.
+        let fake = spawn_mass_probe_upstream(ProbeCfg {
+            head_429_first_n: 200,
+            retry_after: None,
+        })
+        .await;
+        insert_probe(&db.pool, tid, &fake).await;
+
+        let paths: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-429a-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        // Reset the high-water mark AFTER pass 0's 128-wide burst so
+        // we measure pass 1's concurrency. Can't intercept between
+        // passes, so instead: arm `track_after_n` to start tracking
+        // max-concurrent only once `head_429_first_n` requests have
+        // been served (i.e. once pass 0 is done).
+        let available = sub
+            .check_available(tid, &paths, far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(available.len(), 200, "all eventually hit after retry");
+
+        let pass1_max = fake.max_concurrent_after.load(Ordering::SeqCst);
+        assert!(
+            pass1_max > 0 && pass1_max <= SUBSTITUTE_PROBE_CONCURRENCY / 2,
+            "retry pass concurrency must be ≤ {}/2 (halved); observed max={pass1_max}",
+            SUBSTITUTE_PROBE_CONCURRENCY
+        );
+    }
+
+    // r[verify store.substitute.probe-429-retry]
+    /// `Retry-After` exceeding the caller's deadline budget → retry
+    /// pass is SKIPPED (no sleep), rate-limited paths returned as
+    /// not-substitutable for this call (uncached → re-probed next time).
+    #[tokio::test]
+    async fn check_available_429_exceeds_budget() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-429-budget").await;
+        let fake = spawn_mass_probe_upstream(ProbeCfg {
+            head_429_first_n: 10,
+            retry_after: Some("300".into()),
+        })
+        .await;
+        insert_probe(&db.pool, tid, &fake).await;
+
+        let paths: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-429b-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        let t0 = tokio::time::Instant::now();
+        // 10s budget; Retry-After=300s — must skip the retry pass.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let available = sub.check_available(tid, &paths, deadline).await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            available.is_empty(),
+            "Retry-After > budget → no retry → 0 hits"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must NOT sleep 300s (budget skip); elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            fake.head_hits.load(Ordering::SeqCst),
+            10,
+            "exactly one pass; no retry"
+        );
+        // Not cached as Miss — next call re-probes.
+        assert!(
+            sub.probe_cache
+                .get(&(tid, paths[0].clone()))
+                .await
+                .is_none(),
+            "rate-limited paths must NOT be cached"
+        );
+    }
+
+    // r[verify store.substitute.probe-429-retry]
+    /// `Retry-After` as an RFC 9110 HTTP-date (not delta-seconds):
+    /// parsed via `httpdate` and honored. Upstream sends a date ~2s
+    /// in the future; assert wall-clock ≥ ~1s (slept) and all hit.
+    #[tokio::test]
+    async fn check_available_429_http_date() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-429-date").await;
+        let when = std::time::SystemTime::now() + Duration::from_secs(2);
+        let fake = spawn_mass_probe_upstream(ProbeCfg {
+            head_429_first_n: 5,
+            retry_after: Some(httpdate::fmt_http_date(when)),
+        })
+        .await;
+        insert_probe(&db.pool, tid, &fake).await;
+
+        let paths: Vec<String> = (0..5)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-429d-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        let t0 = tokio::time::Instant::now();
+        let available = sub
+            .check_available(tid, &paths, far_deadline())
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(available.len(), 5, "HTTP-date Retry-After → retried to Hit");
+        // ~2s minus parse/round-trip slack; assert ≥1s proves the
+        // HTTP-date branch was taken (vs the 1s default for None).
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "must sleep per HTTP-date Retry-After; elapsed={elapsed:?}"
+        );
+    }
+
+    // r[verify store.substitute.probe-429-retry]
+    /// 429 on the narinfo GET path (`try_upstream`) → returns
+    /// `Err(Busy{retry_after: Some})` IMMEDIATELY (no inline sleep).
+    /// The admission permit drops on return so per-replica capacity
+    /// isn't held across the wait.
+    #[tokio::test]
+    async fn try_upstream_429_returns_busy_no_sleep() {
+        use axum::http::HeaderValue;
+        use axum::{Router, routing::get};
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-get-429").await;
+
+        // GET on any narinfo → 429 + Retry-After: 30. (Distinct from
+        // spawn_mass_probe_upstream which only routes HEAD.)
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\n" }),
+            )
+            .fallback(get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [(reqwest::header::RETRY_AFTER, HeaderValue::from_static("30"))],
+                )
+            }));
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &url,
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let gate = AdmissionGate::new(4);
+        let sub = test_substituter(db.pool.clone()).with_admission_gate(gate.clone());
+        let (path, _) = make_path();
+
+        let t0 = tokio::time::Instant::now();
+        let got = sub.try_substitute(tid, &path).await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            matches!(
+                got,
+                Err(SubstituteError::Busy {
+                    retry_after: Some(_)
+                })
+            ),
+            "narinfo GET 429 → Err(Busy{{retry_after: Some}}); got {got:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must NOT sleep inline (admission permit held); elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            gate.utilization(),
+            0.0,
+            "admission permit must be released on Busy return"
+        );
+    }
+
+    // r[verify store.substitute.probe-bounded+4]
     /// Probe results are cached: a second `check_available` for the
     /// same path returns the cached answer without touching the
     /// upstream. Verified by aborting the fake upstream between calls.
@@ -2090,7 +2608,10 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let batch = vec![path.clone(), absent.clone()];
 
-        let first = sub.check_available(tid, &batch).await.unwrap();
+        let first = sub
+            .check_available(tid, &batch, far_deadline())
+            .await
+            .unwrap();
         assert_eq!(first, vec![path.clone()]);
 
         // Kill the upstream. Second call must answer from cache —
@@ -2098,7 +2619,10 @@ mod tests {
         fake._task.abort();
         let _ = fake._task.await;
 
-        let second = sub.check_available(tid, &batch).await.unwrap();
+        let second = sub
+            .check_available(tid, &batch, far_deadline())
+            .await
+            .unwrap();
         assert_eq!(second, vec![path], "cached positive + negative results");
     }
 
@@ -2141,16 +2665,25 @@ mod tests {
         let batch = std::slice::from_ref(&path);
 
         // B probes first → caches `(B, path) = false`.
-        let b = sub.check_available(tid_b, batch).await.unwrap();
+        let b = sub
+            .check_available(tid_b, batch, far_deadline())
+            .await
+            .unwrap();
         assert!(b.is_empty(), "B's upstream is dead → miss");
 
         // A probes second → MUST hit A's upstream, not return B's
         // cached miss. With a path-only key this would be `[]`.
-        let a = sub.check_available(tid_a, batch).await.unwrap();
+        let a = sub
+            .check_available(tid_a, batch, far_deadline())
+            .await
+            .unwrap();
         assert_eq!(a, vec![path.clone()], "A's upstream serves the path");
 
         // Reverse leakage: A's hit must not leak to B.
-        let b2 = sub.check_available(tid_b, batch).await.unwrap();
+        let b2 = sub
+            .check_available(tid_b, batch, far_deadline())
+            .await
+            .unwrap();
         assert!(b2.is_empty(), "B still misses (cached per-tenant)");
     }
 
@@ -2257,7 +2790,7 @@ mod tests {
         // Young placeholder → PlaceholderClaim::Concurrent → `Err(Busy)`
         // so moka does NOT cache. Caller retries on the next request.
         assert!(
-            matches!(got, Err(SubstituteError::Busy)),
+            matches!(got, Err(SubstituteError::Busy { retry_after: None })),
             "young placeholder should yield Err(Busy), got {got:?}"
         );
 
@@ -2785,7 +3318,7 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await;
         assert!(
-            matches!(got, Err(SubstituteError::Busy)),
+            matches!(got, Err(SubstituteError::Busy { retry_after: None })),
             "Raced → Err(Busy), got {got:?}"
         );
         assert_eq!(
@@ -3018,7 +3551,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-bounded+3]
+    // r[verify store.substitute.probe-bounded+4]
     /// bug_251: HEAD 503 → `Indeterminate` → not cached as `false`;
     /// next call re-probes.
     #[tokio::test]
@@ -3041,7 +3574,10 @@ mod tests {
         let sub = test_substituter(db.pool.clone());
         let batch = std::slice::from_ref(&path);
 
-        let first = sub.check_available(tid, batch).await.unwrap();
+        let first = sub
+            .check_available(tid, batch, far_deadline())
+            .await
+            .unwrap();
         assert!(first.is_empty(), "503 → no hit");
         assert!(
             sub.probe_cache.get(&(tid, path.clone())).await.is_none(),
@@ -3107,7 +3643,7 @@ mod tests {
         gate.notify_one(); // unblock the server task
     }
 
-    // r[verify store.substitute.probe-bounded+3]
+    // r[verify store.substitute.probe-bounded+4]
     /// bug_204: `connect_timeout`-only client + dead upstream must not
     /// hang `check_available` / `try_substitute`. Routes through
     /// PRODUCTION code (not a hand-rolled reqwest call) so deleting
@@ -3149,7 +3685,9 @@ mod tests {
         // that as slack (two sequential timeouts + scheduler jitter).
         let slack = SUBSTITUTE_SMALL_FETCH_TIMEOUT * 3;
         let start = Instant::now();
-        let _ = sub.check_available(tid, std::slice::from_ref(&path)).await;
+        let _ = sub
+            .check_available(tid, std::slice::from_ref(&path), far_deadline())
+            .await;
         assert!(
             start.elapsed() < slack,
             "check_available must abort hung cache-info+HEAD via per-request timeout; took {:?}",

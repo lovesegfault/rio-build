@@ -21429,6 +21429,10 @@
           "packageId": "hex"
         },
         {
+          "name": "httpdate",
+          "packageId": "httpdate"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },

@@ -421,7 +421,7 @@ impl StoreServiceImpl {
         {
             return Some(jwt);
         }
-        // r[impl sched.dispatch.fod-substitute]
+        // r[impl sched.dispatch.fod-substitute+2]
         if self.verified_service_caller(request).is_some()
             && let Some(hdr) = request
                 .metadata()
@@ -495,12 +495,14 @@ impl StoreServiceImpl {
                 SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
                     "upstream substitute {what} exceeds {limit}-byte cap"
                 )),
-                // Transient: another uploader holds the placeholder.
-                // Same observable client behavior as a miss on the
-                // FIRST call; the SECOND call re-runs `do_substitute`
-                // (moka didn't cache `Err`) and reaches `AlreadyComplete`.
-                SubstituteError::Busy => {
-                    Status::not_found("path not found (concurrent upload in progress)")
+                // Transient: another uploader holds the placeholder
+                // (`retry_after = None`) or upstream returned 429
+                // (`Some`). Map to `Unavailable` so the scheduler's
+                // 8-attempt backoff retries instead of treating it as
+                // a permanent miss; moka didn't cache `Err`, so the
+                // retry re-runs `do_substitute`.
+                SubstituteError::Busy { .. } => {
+                    Status::unavailable("substitute busy (concurrent upload or upstream 429)")
                 }
                 SubstituteError::Admission(a) => a.into(),
                 SubstituteError::HashMismatch { .. }
@@ -755,7 +757,7 @@ mod tests {
         assert_eq!(status.message(), "storage operation failed");
     }
 
-    // r[verify sched.dispatch.fod-substitute]
+    // r[verify sched.dispatch.fod-substitute+2]
     /// `x-rio-probe-tenant-id` is honoured ONLY behind a valid
     /// allowlisted service-token. An unauthenticated request (or one
     /// from a non-allowlisted caller) cannot self-select a tenant.

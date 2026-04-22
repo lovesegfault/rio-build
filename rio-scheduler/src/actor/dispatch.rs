@@ -527,7 +527,7 @@ impl DagActor {
     /// batch). On RPC error/timeout this is the tail only — the
     /// stamped head is protected via `probed_generation`, so neither
     /// hits the per-drv fallback.
-    // r[impl sched.dispatch.fod-substitute]
+    // r[impl sched.dispatch.fod-substitute+2]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
@@ -1102,7 +1102,7 @@ impl DagActor {
                 store.clone(),
             )
         };
-        // r[impl sched.dispatch.fod-substitute] — same probe-tenant
+        // r[impl sched.dispatch.fod-substitute+2] — same probe-tenant
         // wiring as batch_probe_cached_ready.
         let probe = self.probe_tenant_meta(std::iter::once(drv_hash));
         let probe_meta: Vec<(&'static str, &str)> =

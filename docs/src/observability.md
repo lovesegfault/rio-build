@@ -196,7 +196,9 @@ r[obs.metric.store]
 | `rio_store_substitute_integrity_failures_total` | Counter | Upstream substitution NAR hash or size mismatches, labeled by `tenant`. Nonzero is security-relevant: upstream served corrupt/tampered bytes or a lying `NarSize`. |
 | `rio_store_substitute_closure_truncated_total` | Counter | `try_substitute` closure walks that hit `MAX_SUBSTITUTE_CLOSURE` and were truncated. Nonzero is security-relevant: a tenant-configured upstream is serving an implausibly deep reference chain. |
 | `rio_store_substitute_probe_cache_hits_total` | Counter | `check_available` HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path). |
-| `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued — or the batch hit the 4096-uncached cap). |
+| `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued). |
+| `rio_store_substitute_probe_ratelimited_total` | Counter | `check_available` HEAD probes that returned 429, labeled by `upstream`. The rate-limited subset is retried (≤3 passes) after honoring `Retry-After`; concurrency halves when >10% of a pass 429s. |
+| `rio_store_check_available_duration_seconds` | Histogram | `check_available` wall-clock (HEAD-probe phase of `FindMissingPaths`). `⌈N_uncached/128⌉ × RTT` plus any 429 retry sleeps. p99 informs the scheduler's `MERGE_FMP_TIMEOUT`. |
 | `rio_store_substitute_stale_reclaimed_total` | Counter | Stale `'uploading'` placeholders reclaimed on the substitution hot path (crashed prior fetch left the placeholder; `try_substitute` deleted + re-inserted rather than waiting for the 15-minute orphan sweep). Nonzero is expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts. |
 | `rio_store_substitute_admission_utilization` | Gauge | `try_substitute` admission-gate utilization: `(capacity − available_permits) / capacity`. Updated on each acquire and each `GetLoad` call. Can saturate independently of `pg_pool_utilization` (upstream HTTP bottleneck — permit held across the NAR fetch, PG connection released per-query). Folded into the ComponentScaler's per-pod load via `max(pg, this)`. |
 | `rio_store_substitute_admission_rejected_total` | Counter | `try_substitute` calls rejected with `RESOURCE_EXHAUSTED` after waiting `SUBSTITUTE_ADMISSION_WAIT` (25 s) for a permit. Sustained non-zero = genuine per-replica overload; the ComponentScaler should already be reacting via the utilization gauge. |
@@ -278,7 +280,7 @@ r[obs.metric.controller]
 | `rio_scheduler_dispatch_wait_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
 | `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
 | `rio_builder_upload_references_count` | `[1, 5, 10, 25, 50, 100, 250, 500]` (count) |
-| `rio_builder_fuse_fetch_duration_seconds`, `rio_store_substitute_duration_seconds` | `[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (NAR fetch + drain; GB-scale paths via I-212 JIT span 60-127s) |
+| `rio_builder_fuse_fetch_duration_seconds`, `rio_store_substitute_duration_seconds`, `rio_store_check_available_duration_seconds` | `[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (NAR fetch + drain; GB-scale paths via I-212 JIT span 60-127s) |
 
 Histograms not listed here (e.g., `rio_gateway_opcode_duration_seconds`, `rio_store_put_path_duration_seconds`) use the default buckets — those are genuinely sub-second request latencies.
 

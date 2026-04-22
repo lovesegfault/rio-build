@@ -1145,7 +1145,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fod-substitute]
+// r[verify sched.dispatch.fod-substitute+2]
 /// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
 /// whose output becomes substitutable AFTER merge (so merge-time
 /// `check_cached_outputs` missed it) is completed by
@@ -1417,7 +1417,7 @@ async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
 ///
 /// `queued_by_system` is intentionally NOT gated — it must match
 /// `ClusterSnapshot.queued_by_system` (snapshot.rs).
-// r[verify sched.admin.spawn-intents.probed-gate]
+// r[verify sched.admin.spawn-intents.probed-gate+2]
 #[tokio::test]
 async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -3015,7 +3015,7 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute]
+// r[verify sched.dispatch.fod-substitute+2]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =

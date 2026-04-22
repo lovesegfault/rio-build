@@ -222,7 +222,11 @@ impl StoreServiceImpl {
         // substituter / no tenant / no upstreams — the normal case.
         let substitutable = match (&self.substituter, tenant_id) {
             (Some(sub), Some(tid)) if !missing.is_empty() => sub
-                .check_available(tid, &missing)
+                .check_available(
+                    tid,
+                    &missing,
+                    tokio::time::Instant::now() + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
+                )
                 .await
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "check_available failed; empty substitutable_paths");
