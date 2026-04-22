@@ -103,6 +103,11 @@ let
   clippyFlags = [
     "-Dwarnings"
     "-Wclippy::all"
+    # Clippy output is discarded; skip the release-default codegen.
+    # Later -C flags override buildRustCrate's base opt-level=3 cgu=1.
+    "-Copt-level=0"
+    "-Ccodegen-units=16"
+    "-Cdebuginfo=0"
   ];
 
   # ──────────────────────────────────────────────────────────────────
@@ -285,6 +290,9 @@ let
   testMember = mkTestVariant {
     suffix = "test";
     devDeps = devDepsFor;
+    extraOverride = {
+      extraRustcOpts = [ "-Ccodegen-units=16" ];
+    };
   };
 
   # Clippy check on TEST targets: same driver as clippyMember, but
@@ -345,6 +353,9 @@ let
   covTestMember = mkTestVariant {
     suffix = "cov-test";
     devDeps = devDepsForCov;
+    extraOverride = {
+      extraRustcOpts = [ "-Ccodegen-units=16" ];
+    };
   };
 
   # ──────────────────────────────────────────────────────────────────
