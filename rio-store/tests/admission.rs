@@ -123,3 +123,18 @@ async fn admission_utilization_tracks_held() {
     // capacity=0 doesn't divide-by-zero (clamped).
     assert_eq!(AdmissionGate::new(0).utilization(), 0.0);
 }
+
+// r[verify store.substitute.admission]
+#[test]
+fn admission_wait_below_grpc_timeout() {
+    // If SUBSTITUTE_ADMISSION_WAIT ≥ DEFAULT_GRPC_TIMEOUT, callers see
+    // DeadlineExceeded (NOT in is_transient) instead of ResourceExhausted
+    // and the retry contract breaks. Same precedent as
+    // breaker.rs::open_duration_covers_merge_fmp_timeout.
+    assert!(
+        SUBSTITUTE_ADMISSION_WAIT < rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        "SUBSTITUTE_ADMISSION_WAIT ({SUBSTITUTE_ADMISSION_WAIT:?}) must stay below \
+         DEFAULT_GRPC_TIMEOUT ({:?})",
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT
+    );
+}
