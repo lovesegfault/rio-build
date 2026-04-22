@@ -25,6 +25,11 @@ resource "aws_route53_zone" "gateway" {
   count   = local.dns_route53 && var.gateway_dns.create_route53_zone ? 1 : 0
   name    = local.gateway_dns_fqdn
   comment = "rio-gateway NLB ALIAS target (external-dns managed)"
+  # Allow tofu destroy even when external-dns has written records.
+  # Without this, destroy fails with HostedZoneNotEmpty and requires
+  # manual `aws route53 delete-resource-record-sets` first. Same
+  # convention as s3.tf / ecr.tf.
+  force_destroy = true
 }
 
 # create_route53_zone=false → zone must already exist (created
@@ -101,7 +106,10 @@ resource "helm_release" "external_dns" {
   # on both arms.
   values = concat(
     [yamlencode({
-      provider = { name = var.gateway_dns.provider }
+      # external-dns calls the Route53 provider "aws", not "route53".
+      # var.gateway_dns.provider is OUR knob (route53|cloudflare|"");
+      # map it to external-dns's vocabulary here.
+      provider = { name = local.dns_route53 ? "aws" : var.gateway_dns.provider }
       sources  = ["service"]
       # domainFilters = parent zone (what the provider hosts).
       # external-dns matches the Service's hostname annotation against
