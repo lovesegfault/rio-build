@@ -13,13 +13,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
 /// How long [`AdmissionGate::acquire_bounded`] queues server-side
-/// before returning `RESOURCE_EXHAUSTED`. 30 s sits inside the
+/// before returning `RESOURCE_EXHAUSTED`. 25 s sits inside the
 /// scheduler's detached-fetch retry window (8 attempts × backoff ≈
 /// 90 s; see `r[sched.substitute.detached]`), so a transient burst
 /// is absorbed in ONE store-side wait rather than N client retries.
 /// Spike 0.1 proved the prior immediate-RE design demoted 50/50
 /// derivations to build-from-source under any hold ≥ 8 s.
-pub const SUBSTITUTE_ADMISSION_WAIT: Duration = Duration::from_secs(30);
+///
+/// MUST stay below `DEFAULT_GRPC_TIMEOUT` (30 s,
+/// `rio_common::grpc`) so callers observe `ResourceExhausted`
+/// (transient → retry) and not the client-side `DeadlineExceeded`
+/// — at 30 s the two timers race and the client's fires first.
+pub const SUBSTITUTE_ADMISSION_WAIT: Duration = Duration::from_secs(25);
 
 /// Per-replica admission gate for `try_substitute_on_miss`. Wraps a
 /// [`Semaphore`] + its capacity (tokio's `Semaphore` doesn't expose

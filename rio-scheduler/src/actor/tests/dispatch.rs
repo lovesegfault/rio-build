@@ -3197,7 +3197,7 @@ async fn substitute_fail_with_poisoned_dep_goes_dependency_failed() -> TestResul
 
 /// `r[store.substitute.admission]` regression: with the store returning
 /// `ResourceExhausted` for 20 s of wall-clock (modelling a saturated
-/// per-replica admission gate that exhausts its 30 s bounded-wait), the
+/// per-replica admission gate that exhausts its 25 s bounded-wait), the
 /// detached substitute-fetch's 8-attempt retry curve MUST absorb it —
 /// zero demotions to build-from-source.
 ///
@@ -3210,7 +3210,7 @@ async fn substitute_fail_with_poisoned_dep_goes_dependency_failed() -> TestResul
 /// time don't compose) and 60 s would dominate the suite.
 ///
 /// Real-time, so the test costs ~22 s wall-clock (20 s hold + ~2 s
-/// drain). Polls until none are `Substituting`; capped at 40 s
+/// drain). Polls until none are `Substituting`; capped at 60 s
 /// (cumulative backoff to attempt 7 is ~31.75 s ±20 % jitter + slack).
 // r[verify store.substitute.admission]
 #[tokio::test]
@@ -3278,7 +3278,7 @@ async fn substitute_fetch_survives_store_backpressure() -> TestResult {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "detached fetches did not resolve within 40 s (8-attempt budget \
+            "detached fetches did not resolve within 60 s (8-attempt budget \
              ~31.75 s ±20 % + drain); hung task?"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

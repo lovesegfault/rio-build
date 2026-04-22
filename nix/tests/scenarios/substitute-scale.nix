@@ -483,9 +483,9 @@ pkgs.testers.runNixOSTest {
         # mod.rs effective_load(). NON-EMPTY proves the GetLoad fan-out
         # reached a store pod and the P2 admission-util field
         # deserialized into the CR.status pipeline. NOT asserted > 0:
-        # 30 tiny NARs over a local vlan drain through the 4-permit
-        # gate in ~1s — faster than the controller's 10s reconcile
-        # tick can sample. A `> 0` check is a wall-clock race
+        # 30 tiny NARs over a local vlan drain through the 1-permit
+        # gate (200ms netem ⇒ ~6s serial) — still racing the
+        # controller's 10s reconcile tick. A `> 0` check is a wall-clock race
         # (ci-failure-patterns "structural > retry > widen"); the
         # structural proof of P2 is unit-level (decide.rs::tests
         # max-of-two), and the e2e proof of the WIRE is field-present.

@@ -12,8 +12,8 @@ use tonic::Code;
 
 /// At capacity, the (cap+1)th caller queues for the full
 /// `SUBSTITUTE_ADMISSION_WAIT`, then returns `ResourceExhausted`
-/// (transient — caller retries). Paused time: advancing past 30 s
-/// resolves the timeout deterministically without a 30 s wall-clock
+/// (transient — caller retries). Paused time: advancing past 25 s
+/// resolves the timeout deterministically without a 25 s wall-clock
 /// test.
 // r[verify store.substitute.admission]
 #[tokio::test(start_paused = true)]
@@ -27,7 +27,7 @@ async fn admission_returns_re_after_wait() {
     assert_eq!(gate.semaphore().available_permits(), 0);
 
     // Third caller: tokio's auto-advance (start_paused=true) jumps
-    // straight to the 30 s timeout once the runtime is otherwise idle.
+    // straight to the 25 s timeout once the runtime is otherwise idle.
     let started = tokio::time::Instant::now();
     let err = gate.acquire_bounded().await.expect_err("must reject");
     assert_eq!(
@@ -51,7 +51,7 @@ async fn admission_returns_re_after_wait() {
 }
 
 /// Under capacity for less than the wait window, callers QUEUE rather
-/// than fail. Releasing the holder before the 30 s deadline lets the
+/// than fail. Releasing the holder before the 25 s deadline lets the
 /// waiter acquire — proving `acquire_bounded` is `sem.acquire` under
 /// timeout, not `try_acquire` (the rejected-at-spike-0.1 design).
 // r[verify store.substitute.admission]
@@ -67,7 +67,7 @@ async fn admission_queues_under_wait() {
     let g = gate.clone();
     let waiter = tokio::spawn(async move { g.acquire_bounded().await });
 
-    // Release after 5 s of virtual time — well under the 30 s wait.
+    // Release after 5 s of virtual time — well under the 25 s wait.
     tokio::time::sleep(Duration::from_secs(5)).await;
     drop(p1);
 

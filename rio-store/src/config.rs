@@ -123,7 +123,7 @@ pub(crate) struct Config {
     /// scale. Set via `RIO_PG_MAX_CONNECTIONS`.
     pub pg_max_connections: u32,
     /// Per-replica cap on concurrent `try_substitute` calls. Excess
-    /// queue server-side up to `SUBSTITUTE_ADMISSION_WAIT` (30 s),
+    /// queue server-side up to `SUBSTITUTE_ADMISSION_WAIT` (25 s),
     /// then `RESOURCE_EXHAUSTED` (transient; client retries). Additive
     /// to `nar_buffer_budget_bytes` — this bounds COUNT, that bounds
     /// BYTES. `None` (default) derives from the PG pool via
@@ -240,6 +240,14 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             self.max_batch_paths >= 1,
             "max_batch_paths must be >= 1; set RIO_MAX_BATCH_PATHS"
+        );
+        // 0 → Semaphore::new(0) → every try_substitute_on_miss queues
+        // for SUBSTITUTE_ADMISSION_WAIT then ResourceExhausted; store
+        // never substitutes. None is fine (derived from pg_max).
+        anyhow::ensure!(
+            self.substitute_admission_permits.is_none_or(|n| n >= 1),
+            "substitute_admission_permits must be >= 1; unset \
+             RIO_SUBSTITUTE_ADMISSION_PERMITS to derive from pg_max_connections"
         );
         Ok(())
     }
@@ -435,6 +443,27 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max_batch_paths"), "got: {err}");
+    }
+
+    /// `substitute_admission_permits=Some(0)` → `Semaphore::new(0)` →
+    /// every `try_substitute_on_miss` queues for the full wait then
+    /// returns `ResourceExhausted`; store silently never substitutes.
+    #[test]
+    fn validate_rejects_zero_admission_permits() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_admission_permits: Some(0),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("substitute_admission_permits"), "got: {err}");
+        // None (unset) is fine — derived from pg_max_connections.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            substitute_admission_permits: None,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     // r[verify store.cas.s3-retry]
