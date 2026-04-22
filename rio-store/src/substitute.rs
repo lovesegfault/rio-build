@@ -547,7 +547,7 @@ impl Substituter {
         // runtime closures, so this is the only place the closure can be
         // completed.
         if let Some(info) = &result {
-            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await?;
+            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await;
         }
         Ok(result)
     }
@@ -591,16 +591,18 @@ impl Substituter {
     /// the gRPC caller cannot help: their retry of
     /// `QueryPathInfo(seed)` short-circuits at
     /// `metadata::query_path_info → Some` without re-entering
-    /// `try_substitute_on_miss`. Propagation after the inline retry
-    /// exhausts is a degraded-mode signal (logged at WARN) — the seed
-    /// is already persisted so caller-retry can't recover it, but
-    /// surfacing beats silently returning `Ok(Some)` with refs absent.
+    /// `try_substitute_on_miss`; and at depth ≥ 2 the parent's own
+    /// PG-presence check at the top of this loop short-circuits the
+    /// whole subtree. So on inline-retry exhaust we WARN and CONTINUE
+    /// to the remaining siblings — propagation would only abandon
+    /// them without giving the caller any way to retry. The build
+    /// still fails with a clear ENOENT naming the missing ref.
     async fn ensure_references(
         &self,
         tenant_id: Uuid,
         refs: &[StorePath],
         budget: &Arc<AtomicUsize>,
-    ) -> Result<(), SubstituteError> {
+    ) {
         for r in refs {
             let r = r.as_str();
             match metadata::query_path_info(&self.pool, r).await {
@@ -629,9 +631,9 @@ impl Substituter {
                             warn!(
                                 reference = %r, attempts = attempt, error = %e,
                                 "closure: backpressure past inline retry budget; \
-                                 seed already persisted — propagating as degraded-partial"
+                                 seed already persisted — continuing siblings best-effort"
                             );
-                            return Err(e);
+                            break;
                         }
                         // Busy honors the upstream hint (capped at the
                         // backoff cap so a hostile `Retry-After: 3600`
@@ -662,7 +664,6 @@ impl Substituter {
                 }
             }
         }
-        Ok(())
     }
 
     /// One full fetch cycle — the singleflight body. `http` and
@@ -3016,7 +3017,7 @@ mod tests {
         );
     }
 
-    /// Shared setup for the two `ensure_references` admission tests:
+    /// Setup for `ensure_references_retries_admission_then_succeeds`:
     /// pre-seed the moka `inflight` slot with a result carrying one
     /// ref, so the seed call is a cache hit (no permit needed) and
     /// goes straight to `ensure_references`. Upstream config must be
@@ -3202,38 +3203,116 @@ mod tests {
     }
 
     // r[verify store.substitute.admission]
+    // r[verify store.substitute.probe-429-retry]
     /// After `ENSURE_REFS_ADMISSION_MAX_ATTEMPTS` inline retries
-    /// exhaust, `Admission` propagates as a degraded-mode signal with
-    /// a WARN. Swallowing it would let the seed return `Ok(Some)`
-    /// with refs missing → scheduler marks Completed → builder
-    /// ENOENTs.
+    /// exhaust on ref A, the closure walk WARNs and CONTINUES to
+    /// siblings B, C — it does NOT propagate. Propagation can't help
+    /// (seed already in PG → caller's retry short-circuits at
+    /// `query_path_info`; depth ≥ 2 → grandparent short-circuits at
+    /// the top-of-loop presence check) and would only abandon B/C.
     ///
-    /// `Semaphore::close()` makes every `acquire_bounded` fail
-    /// instantly with `Admission(Closed)` — same `Admission(_)` arm
-    /// as production `Saturated` without the 25 s wait. Real time
-    /// (NOT paused: auto-advance through the backoff sleeps races
-    /// sqlx's pool-acquire timeout, which surfaces as a non-Admission
-    /// `Persist` error and short-circuits the loop). The 4 backoff
-    /// sleeps total 9.25 s wall-clock — slow, but the only way to
-    /// prove all 5 attempts ran without `#[cfg(test)]` const surgery.
+    /// Three refs, two flex upstreams: fake_a serves ref_a with
+    /// `narinfo_429_first_n` ≫ 5 (always-Busy for our purposes) and
+    /// fake_b serves ref_b + ref_c normally. ref_a: A=429, B/C=404 →
+    /// `Err(Busy{None})` ×5 → exhaust → break → continue. ref_b,
+    /// ref_c: A=404, B/C=Hit → persisted. Real time (NOT paused:
+    /// auto-advance through the backoff sleeps races sqlx's
+    /// pool-acquire timeout). 4 backoff sleeps total 9.25 s
+    /// wall-clock — slow, but proves all 5 attempts ran.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn ensure_references_propagates_after_inline_retry_exhausted() {
-        let (_db, tid, gate, sub, seed) =
-            admission_refs_fixture("sub-admission-refs-exhaust").await;
+    async fn ensure_references_exhausts_then_continues_siblings() {
+        use rio_test_support::fixtures::rand_store_hash;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-refs-exhaust-siblings").await;
 
-        let _held = gate.semaphore().clone().acquire_owned().await.unwrap();
-        gate.semaphore().close();
+        // Distinct hash parts so each flex upstream's narinfo route is
+        // disjoint — cross-probes 404 instead of identity-mismatching.
+        let ref_a = format!("/nix/store/{}-ref-exhaust-a", rand_store_hash());
+        let ref_b = format!("/nix/store/{}-ref-exhaust-b", rand_store_hash());
+        let ref_c = format!("/nix/store/{}-ref-exhaust-c", rand_store_hash());
+        let (nar_a, _) = rio_test_support::fixtures::make_nar(b"a");
+        let (nar_b, _) = rio_test_support::fixtures::make_nar(b"b");
+        let (nar_c, _) = rio_test_support::fixtures::make_nar(b"c");
+        // ref_a: 429 forever (well past 5 attempts).
+        let fake_a = spawn_flex_upstream(
+            &ref_a,
+            nar_a,
+            "cache.exhaust-a",
+            FlexCfg {
+                narinfo_429_first_n: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+        // ref_b, ref_c: served normally from separate upstreams (each
+        // flex instance serves exactly one path; cross-probes 404).
+        let fake_b =
+            spawn_flex_upstream(&ref_b, nar_b, "cache.exhaust-b", FlexCfg::default()).await;
+        let fake_c =
+            spawn_flex_upstream(&ref_c, nar_c, "cache.exhaust-c", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake_a, 50).await;
+        insert_flex(&db.pool, tid, &fake_b, 50).await;
+        insert_flex(&db.pool, tid, &fake_c, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let seed = rio_test_support::fixtures::test_store_path("seed-exhaust");
+        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
+            store_path: seed.clone(),
+            store_path_hash: Vec::new(),
+            deriver: String::new(),
+            nar_hash: vec![0u8; 32],
+            nar_size: 1,
+            references: vec![ref_a.clone(), ref_b.clone(), ref_c.clone()],
+            registration_time: 0,
+            ultimate: false,
+            signatures: Vec::new(),
+            content_address: String::new(),
+        })
+        .unwrap();
+        sub.inflight
+            .insert((tid, seed.clone()), Some(Arc::new(info)))
+            .await;
 
         let got = sub.try_substitute(tid, &seed).await;
+
         assert!(
-            matches!(got, Err(SubstituteError::Admission(_))),
-            "exhausted inline retry must propagate Admission, not \
-             swallow into Ok(Some); got {got:?}"
+            matches!(got, Ok(Some(_))),
+            "exhaust on one ref must NOT propagate (caller-retry can't \
+             re-enter the closure walk); got {got:?}"
+        );
+        // Structural: ref_a probed exactly 5× (all attempts ran).
+        assert_eq!(
+            fake_a.narinfo_hits.load(Ordering::SeqCst),
+            Substituter::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS as usize,
+            "all inline-retry attempts must run before exhaust"
         );
         assert!(
-            logs_contain("propagating as degraded-partial"),
-            "exhaustion must WARN that the seed is already persisted"
+            logs_contain("continuing siblings best-effort"),
+            "exhaustion must WARN that siblings continue best-effort"
+        );
+        // Structural: siblings B, C WERE fetched after A exhausted.
+        assert!(
+            metadata::query_path_info(&db.pool, &ref_b)
+                .await
+                .unwrap()
+                .is_some(),
+            "sibling ref_b must be fetched despite ref_a exhausting"
+        );
+        assert!(
+            metadata::query_path_info(&db.pool, &ref_c)
+                .await
+                .unwrap()
+                .is_some(),
+            "sibling ref_c must be fetched despite ref_a exhausting"
+        );
+        // ref_a was NOT persisted (every attempt 429'd).
+        assert!(
+            metadata::query_path_info(&db.pool, &ref_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "ref_a must remain absent (all attempts Busy)"
         );
     }
 
