@@ -86,15 +86,51 @@ let
       args = [ "-c" "''${bb} cat ''${toString leaves} > $out" ];
     }
   '';
+
+  # Depth-50 linear chain. Each link cats the previous output → IA so
+  # out-paths are deterministic and identical between upstream_v6's
+  # local build and the client's submit. Proves
+  # sched.substitute.eager-probe end-to-end: links 0..48 are seeded on
+  # upstream_v6, the root (49) is NOT — so r[sched.merge.substitute-
+  # topdown] does NOT prune (root unsubstitutable → fall through), the
+  # full DAG is merged, and check_cached_outputs probes all 50 in one
+  # FindMissingPaths → 49 enter Substituting in one merge-time burst.
+  # Without eager-probe, only the depth-0 leaf is Ready at merge →
+  # cascade promotes ~BECAME_IDLE_INLINE_CAP=4 per tick.
+  chainDepth = 50;
+  subChain = pkgs.writeText "sub-chain.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      link = i:
+        derivation {
+          name = "rio-subchain-''${toString i}";
+          system = builtins.currentSystem;
+          builder = sh;
+          args = [
+            "-c"
+            (
+              if i == 0 then
+                "''${bb} echo subchain-seed-v1 > $out"
+              else
+                "''${bb} cat ''${link (i - 1)} > $out; ''${bb} echo ''${toString i} >> $out"
+            )
+          ];
+        };
+    in
+    link ${toString (chainDepth - 1)}
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "rio-substitute-scale";
   skipTypeCheck = true;
   # k3s bring-up ~240s + cache-seed ~20s + scale-up wait ≤90s + drain
-  # ≤90s + slack. The 30-leaf substitute is serialized (admission=1)
-  # over a 200ms tc-netem upstream → ~24s, so the controller's 10s
-  # reconcile tick observes substituting>0 deterministically.
-  globalTimeout = 900 + common.covTimeoutHeadroom;
+  # ≤90s + chain seed ~10s + chain submit ≤120s + slack. The 30-leaf
+  # substitute is serialized (admission=1) over a 200ms tc-netem
+  # upstream → ~24s, so the controller's 10s reconcile tick observes
+  # substituting>0 deterministically.
+  globalTimeout = 1100 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -547,6 +583,236 @@ pkgs.testers.runNixOSTest {
         print("substitute-cascade: no demote-to-cache-miss ✓")
 
     k3s_server.execute("systemctl stop subscale-submit 2>/dev/null || true")
+
+    # ══════════════════════════════════════════════════════════════════
+    # substitute-deep-chain — depth-50 linear chain → eager whole-DAG
+    # ══════════════════════════════════════════════════════════════════
+    # Tracey: sched.substitute.eager-probe — verify marker at the
+    # default.nix wiring per the convention.
+    with subtest("substitute-deep-chain: 49 links enter Substituting at merge"):
+        # ── seed all 50 chain outputs on upstream_v6 ──────────────────
+        # Same mechanism as the fanout seed above (busybox already
+        # registered, signing key already at /tmp/sec). netem was
+        # removed at the end of the cascade subtest.
+        upstream_v6.succeed(
+            "nix-build --no-out-link --option substituters ''' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${subChain} 2>&1"
+        )
+        chain_drv = upstream_v6.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${subChain} 2>/dev/null"
+        ).strip()
+        # Seed links 0..48 ONLY — NOT the root (subchain-49). With the
+        # root seeded, r[sched.merge.substitute-topdown] fires (chain
+        # has edges → topdown runs → root substitutable → submission
+        # pruned to 1 node → spawned_total delta=1, deterministically).
+        # The eager-probe property under test is the FALL-THROUGH case:
+        # root not substitutable → full DAG merged → check_cached_outputs
+        # probes all 50 → 49 substitutable spawned in one merge burst.
+        chain_root_out = upstream_v6.succeed(
+            f"nix-store -q --outputs {chain_drv}"
+        ).strip()
+        chain_paths = [
+            p for p in upstream_v6.succeed(
+                f"nix-store -qR --include-outputs {chain_drv}"
+            ).splitlines()
+            if "rio-subchain-" in p and not p.endswith(".drv")
+            and p != chain_root_out
+        ]
+        assert len(chain_paths) == ${toString (chainDepth - 1)}, (
+            f"expected ${toString (chainDepth - 1)} non-root chain out-paths, "
+            f"got {len(chain_paths)}: {chain_paths!r}"
+        )
+        chain_sh = " ".join(chain_paths)
+        upstream_v6.succeed(f"{NIX} store sign --key-file /tmp/sec {chain_sh}")
+        upstream_v6.succeed(
+            f"{NIX} copy --no-check-sigs "
+            f"--to 'file:///srv?compression=none' {chain_sh}"
+        )
+        # Seed sanity: 30 cascade leaves + 49 chain links = 79 narinfos.
+        # `nix copy --to file:` is synchronous (local dir write) so no
+        # race with SubmitBuild — this guards against future async drift.
+        ni = int(upstream_v6.succeed("ls /srv/*.narinfo | wc -l").strip())
+        assert ni == 79, f"/srv has {ni} narinfos, expected 79 (30+49)"
+
+        # ── instantiate on client, build SubmitBuild payload ──────────
+        # Same expectedOutputPaths population pattern as the cascade
+        # subtest. Edges: link i depends on link i-1 (linear chain).
+        chain_drvs = sorted(
+            p for p in client.succeed(
+                "nix-instantiate "
+                "--arg busybox '(builtins.storePath ${common.busybox})' "
+                "${subChain} 2>/dev/null | xargs nix-store -qR"
+            ).splitlines()
+            if "rio-subchain-" in p and p.endswith(".drv")
+        )
+        assert len(chain_drvs) == ${toString chainDepth}, chain_drvs
+        chain_outs = dict(
+            l.split(" ", 1)
+            for l in client.succeed(
+                "for d in " + " ".join(chain_drvs) + "; do "
+                'echo "$d $(nix-store -q --outputs $d)"; done'
+            ).splitlines()
+        )
+        # drv → its single inputDrv (the previous link). Depth-0 has no
+        # rio-subchain inputDrv (only busybox).
+        chain_deps = {}
+        for d in chain_drvs:
+            refs = [
+                r for r in client.succeed(
+                    f"nix-store -q --references {d}"
+                ).splitlines()
+                if "rio-subchain-" in r and r.endswith(".drv")
+            ]
+            chain_deps[d] = refs
+        client.succeed(
+            "nix copy --derivation --no-check-sigs "
+            "--to 'ssh-ng://k3s-server' " + " ".join(chain_drvs)
+        )
+        nodes = [
+            {"drvPath": d, "drvHash": d,
+             "system": "${pkgs.stdenv.hostPlatform.system}",
+             "outputNames": ["out"],
+             "expectedOutputPaths": [chain_outs[d]]}
+            for d in chain_drvs
+        ]
+        edges = [
+            {"parentDrvPath": d, "childDrvPath": dep}
+            for d, deps in chain_deps.items() for dep in deps
+        ]
+        payload = json.dumps({"nodes": nodes, "edges": edges})
+        k3s_server.succeed(
+            f"cat > /tmp/subchain-dag.json <<'EOF'\n{payload}\nEOF"
+        )
+
+        # Re-resolve leader pf — same staleness concern as the cascade
+        # subtest after the cascade ran (~90s of activity). Forward
+        # metrics (9091) too: scheduler image is distroless (no curl
+        # in-pod), so scrape via host-side port-forward.
+        pf_close("pf-sched")
+        leader = leader_pod()
+        pf_open(leader, 19001, 9001, tag="pf-sched")
+        pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
+
+        # ── (1) eager burst: substitute_spawned_total jumps by 49 at merge ──
+        # Counter increments inside spawn_substitute_fetches at merge
+        # time — NOT subject to WatchBuild stream serialization (gRPC
+        # stream → grpcurl → journalctl trickles events serially even
+        # when the actor dispatches all 49 in one burst, so an anchored
+        # `grep -c` sees only the first 1-2 under .#ci contention).
+        # Eager: one MergeDag burst → +49. Lazy: depth-50 chain at
+        # ~1/tick → +1-4 at first sighting. cache_check_failures /
+        # topdown_prune are diagnostic deltas printed on failure.
+        m_before = scrape_metrics(k3s_server, 19091)
+        spawned_before = metric_value(
+            m_before, "rio_scheduler_substitute_spawned_total"
+        ) or 0.0
+        prune_before = metric_value(
+            m_before, "rio_scheduler_topdown_prune_total"
+        ) or 0.0
+        ccf_before = metric_value(
+            m_before, "rio_scheduler_cache_check_failures_total"
+        ) or 0.0
+
+        k3s_server.succeed(
+            "systemd-run --unit=subchain-submit "
+            "sh -c "
+            f"'${grpcurl} -plaintext -max-time 180 "
+            f'-H "x-rio-tenant-token: {tenant_jwt}" '
+            "-protoset ${protoset}/rio.protoset "
+            "-d @ "
+            "localhost:19001 rio.scheduler.SchedulerService/SubmitBuild "
+            "< /tmp/subchain-dag.json'"
+        )
+
+        # Anchor: first SUBSTITUTING event in the WatchBuild stream —
+        # proves MergeDag completed (absorbs SubmitBuild + merge-phase
+        # latency under .#ci builder contention). The counter scrape
+        # AFTER this point sees the full burst.
+        k3s_server.wait_until_succeeds(
+            "journalctl -u subchain-submit --no-pager "
+            "  | grep -q DERIVATION_EVENT_KIND_SUBSTITUTING",
+            timeout=90,
+        )
+        m_after = scrape_metrics(k3s_server, 19091)
+        spawned_delta = (
+            metric_value(m_after, "rio_scheduler_substitute_spawned_total")
+            or 0.0
+        ) - spawned_before
+        prune_delta = (
+            metric_value(m_after, "rio_scheduler_topdown_prune_total") or 0.0
+        ) - prune_before
+        ccf_delta = (
+            metric_value(m_after, "rio_scheduler_cache_check_failures_total")
+            or 0.0
+        ) - ccf_before
+        if spawned_delta < 45 or prune_delta != 0:
+            print("=== scheduler leader (since=60s, merge/probe lines) ===")
+            print(k3s_server.execute(
+                f"k3s kubectl -n ${ns} logs {leader} --since=60s 2>&1 "
+                "| grep -Ei 'find_missing|breaker|top-?down|check_cached"
+                "|substitute|probe' | tail -60"
+            )[1])
+        # Root NOT seeded → topdown-prune MUST NOT fire. If it did,
+        # check_available reported subchain-49 substitutable (a real
+        # bug) or the seed-exclusion above is broken.
+        assert prune_delta == 0, (
+            f"rio_scheduler_topdown_prune_total delta={prune_delta} — "
+            f"topdown pruned despite root not seeded on upstream"
+        )
+        assert spawned_delta >= 45, (
+            f"eager-probe burst: rio_scheduler_substitute_spawned_total "
+            f"delta={spawned_delta} at first event (expected ≥45; lazy "
+            f"mode shows ~1-4). cache_check_failures Δ={ccf_delta}, "
+            f"topdown_prune Δ={prune_delta}"
+        )
+        print(
+            f"substitute-deep-chain: spawned_total Δ={spawned_delta} "
+            f"topdown_prune Δ={prune_delta} ccf Δ={ccf_delta} ✓"
+        )
+
+        # ── (2) all 49 links entered Substituting ─────────────────────
+        # The root is NOT substitutable (not seeded) so it will dispatch
+        # to a builder; we don't wait for that — the eager-probe proof
+        # is the 49-link merge-time verdict, not root completion. Poll
+        # the WatchBuild stream until all 49 SUBSTITUTING events have
+        # serialized through journalctl (admission=1 + tiny NARs ≈ 2s;
+        # 60s slack), then assert exactly 49. Build cancelled after.
+        k3s_server.wait_until_succeeds(
+            "n=$(journalctl -u subchain-submit --no-pager "
+            "  | grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true); "
+            'test "$n" -ge ${toString (chainDepth - 1)}',
+            timeout=60,
+        )
+        sub_n = int(k3s_server.succeed(
+            "journalctl -u subchain-submit --no-pager "
+            "| grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true"
+        ).strip() or "0")
+        build_n = int(k3s_server.succeed(
+            "journalctl -u subchain-submit --no-pager "
+            "| grep -c DERIVATION_EVENT_KIND_BUILDING || true"
+        ).strip() or "0")
+        assert sub_n == ${toString (chainDepth - 1)}, (
+            f"{sub_n} SUBSTITUTING events, expected "
+            f"${toString (chainDepth - 1)} — some chain links were NOT "
+            f"probed at merge time"
+        )
+        # Only the unseeded root may dispatch; ≥2 means a LINK was
+        # built instead of substituted. ≤1 (not ==1) — the root may
+        # not have provisioned a builder yet at this point.
+        assert build_n <= 1, (
+            f"{build_n} BUILDING events — chain LINKS were dispatched, "
+            f"not substituted (eager-probe regressed)"
+        )
+        print(f"substitute-deep-chain: {sub_n} substituted, {build_n} built ✓")
+
+        # Stop the WatchBuild stream. The root's build is left in-flight
+        # scheduler-side; harmless (test is ending, collectCoverage next).
+        k3s_server.execute("systemctl stop subchain-submit 2>/dev/null || true")
+        pf_close("pf-sched-metrics")
+
     pf_close("pf-sched")
     pf_close("pf-store")
 

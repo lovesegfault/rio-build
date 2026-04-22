@@ -703,6 +703,7 @@ in
   # derived default (pg_max×3≥64), tiny NARs drain in <1s and
   # desiredReplicas never moves. Set via the chart key (not extraEnv)
   # so the values.yaml → store.yaml templating is exercised.
+  # r[verify sched.substitute.eager-probe]
   vm-substitute-scale-k3s = substitute-scale {
     inherit pkgs common;
     fixture = k3sFull {
