@@ -20,7 +20,7 @@ let
 in
 {
   # Chart 18.x bundles PostgreSQL 18. deployment.md requires PG 15+;
-  # Aurora prod is PG 15, so dev stays ahead (catches forward-compat
+  # Aurora prod is PG 17, so dev stays ahead (catches forward-compat
   # issues early).
   inherit (charts.bitnami) postgresql;
 

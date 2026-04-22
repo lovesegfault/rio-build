@@ -21,8 +21,9 @@
 # these as `000-cilium-*` to sort before everything.
 #
 # Airgap: image.useDigest=false makes the chart render bare tags
-# (quay.io/cilium/cilium:v1.19.2) so containerd's exact-string image
-# lookup matches the pullImage finalImageName/Tag in docker-pulled.nix.
+# (quay.io/cilium/cilium:v<pins.cilium_version>) so containerd's
+# exact-string image lookup matches the pullImage finalImageName/Tag
+# in docker-pulled.nix.
 #
 # devices=eth1: NixOS test VMs are dual-NIC — eth0 is QEMU user-net
 # (10.0.2.x slirp, mgmt-only, no inter-VM routing), eth1 is the vde
@@ -61,18 +62,18 @@
   gatewayEnabled ? false,
 }:
 let
+  pins = import ./pins.nix;
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
   chart = subcharts.cilium;
   split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
 
   # Upstream Gateway API standard-channel CRDs. Cilium does NOT vendor
-  # these (it expects them pre-installed). v1.4.0 matches what Cilium
-  # 1.19's CI tests against. Standard channel = Gateway, GatewayClass,
-  # HTTPRoute, GRPCRoute, ReferenceGrant — exactly what dashboard-
-  # gateway.yaml uses; no experimental/TLSRoute needed.
+  # these (it expects them pre-installed). Standard channel = Gateway,
+  # GatewayClass, HTTPRoute, GRPCRoute, ReferenceGrant — exactly what
+  # dashboard-gateway.yaml uses; no experimental/TLSRoute needed.
   gatewayApiCrds = pkgs.fetchurl {
-    url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml";
-    sha256 = "1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a";
+    url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/${pins.gateway_api_version}/standard-install.yaml";
+    sha256 = pins.gateway_api_crds_hash;
   };
 
   # Cilium creates per-Gateway Services as type:LoadBalancer. With k3s

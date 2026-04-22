@@ -212,7 +212,7 @@ mod tests {
                         h[..8].copy_from_slice(&(i as u64).to_le_bytes());
                         h
                     },
-                    size: crate::chunker::CHUNK_MIN,
+                    size: crate::chunker::CHUNK_MIN as u32,
                 })
                 .collect(),
         };

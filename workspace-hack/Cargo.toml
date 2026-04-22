@@ -18,11 +18,11 @@ publish = false
 [dependencies]
 ahash = { version = "0.8" }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-sdk-ec2 = { version = "1", features = ["test-util"] }
-aws-sdk-s3 = { version = "1", features = ["test-util"] }
-aws-sdk-sts = { version = "1" }
-aws-smithy-http-client = { version = "1", default-features = false, features = ["legacy-rustls-ring", "legacy-test-util", "rustls-aws-lc"] }
-aws-smithy-runtime = { version = "1", default-features = false, features = ["client", "default-https-client", "rt-tokio", "test-util", "tls-rustls"] }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a", "test-util"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["hyper-014", "legacy-test-util", "rustls-aws-lc"] }
+aws-smithy-runtime = { version = "1", default-features = false, features = ["client", "default-https-client", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base16ct = { version = "0.2", default-features = false, features = ["alloc"] }
@@ -70,7 +70,6 @@ kube-core = { version = "3", default-features = false, features = ["jsonpatch", 
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5 = { version = "0.10" }
 memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "std", "u64_digit", "zeroize"] }
@@ -93,7 +92,7 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "prefer-post-quantum", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 scopeguard = { version = "1" }
@@ -154,10 +153,8 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5 = { version = "0.10" }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }

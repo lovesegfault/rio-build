@@ -50,10 +50,11 @@ resource "aws_security_group" "aurora" {
 resource "aws_rds_cluster" "rio" {
   cluster_identifier = "${var.cluster_name}-pg"
   engine             = "aurora-postgresql"
-  # 16.x: latest Aurora-supported major as of writing. Aurora lags
+  # 17.x: latest Aurora-supported major as of writing. Aurora lags
   # upstream PG by ~6 months. Check `aws rds describe-db-engine-
   # versions --engine aurora-postgresql` if this errors on apply.
-  engine_version = "16.4"
+  engine_version              = "17.9"
+  allow_major_version_upgrade = true
   # "provisioned" + serverlessv2_scaling_configuration = Serverless v2.
   # engine_mode "serverless" is Serverless V1 (deprecated, don't use).
   engine_mode   = "provisioned"

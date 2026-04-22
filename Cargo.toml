@@ -74,8 +74,19 @@ sqlx = { version = "0.8", default-features = false, features = [
 uuid = { version = "1", features = ["v4", "v7"] }
 
 # S3
-aws-sdk-s3 = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.130", default-features = false, features = [
+  "sigv4a",
+  "http-1x",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-config = { version = "1", default-features = false, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+  "credentials-process",
+  "sso",
+] }
 
 # FUSE
 fuser = "0.17"
@@ -127,7 +138,7 @@ governor = "0.10"
 # Content-defined chunking. v2020 algorithm — Chunker::new(data, min, avg, max)
 # slices at statistically-stable boundaries so small edits only perturb the
 # chunk they touch (dedup-friendly).
-fastcdc = "3"
+fastcdc = "4"
 # Chunk addressing (internal only — never exposed to Nix).
 blake3 = "1"
 # In-process chunk cache. Lock-free, weight-based eviction — moka tracks
@@ -245,7 +256,7 @@ thiserror = "2"
 anyhow = "1"
 # strum::EnumCount: pin variant counts so test arrays can't drift
 # silently from `_exhaustive` match arms (guards_tests.rs).
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -269,7 +280,7 @@ parking_lot = "0.12"
 # Dense linear algebra for the NNLS (non-negative least squares) solver
 # that fits mem=M(cores) per (pname,system) key. default-features off drops
 # rand/serde/macros — we only need DMatrix/DVector + decompositions.
-nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 # Normal/Student-t CDF (Φ, t.ppf) for the SLA quantile bounds.
 statrs = "0.18"
 
@@ -309,13 +320,25 @@ gix = { version = "0.81", default-features = false, features = [
   "sha1",
   "parallel",
 ] }
-aws-sdk-ec2 = "1"
-aws-sdk-ecr = "1"
-aws-sdk-elasticloadbalancingv2 = "1"
-aws-sdk-sts = "1"
+aws-sdk-ec2 = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-ecr = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-sts = { version = "1", default-features = false, features = [
+  "sigv4a",
+  "default-https-client",
+  "rt-tokio",
+] }
 reqwest = { version = "0.13", default-features = false, features = [
   "rustls",
-  "rustls-native-certs",
   "json",
 ] }
 dotenvy = "0.15"

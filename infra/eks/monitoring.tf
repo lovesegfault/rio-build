@@ -20,9 +20,17 @@ resource "helm_release" "kube_prometheus_stack" {
   # Hardcoded (not nix/pins.nix) — same as external-secrets: not exercised
   # by VM tests, so no nix↔tofu pin to keep in sync. Bump alongside
   # kubernetes_version; check chart's kubeVersion constraint.
-  version = "75.6.0"
+  version = "83.7.0"
 
   set = [
+    # Chart-managed CRD migration. The Job runs `kubectl apply -f` of
+    # the bundled CRDs at the new version before the operator starts —
+    # without this, helm leaves CRDs at whatever version first installed
+    # them and Prometheus 3's new CR fields silently no-op.
+    {
+      name  = "crds.upgradeJob.enabled"
+      value = "true"
+    },
     # hostNetwork: EKS API server can't route to overlay pod IPs for
     # admission webhooks (kube-prometheus-stack-admission). The
     # operator pod serves the webhook; hostNetwork puts it on a node

@@ -69,7 +69,7 @@ resource "helm_release" "external_secrets" {
   # storedVersions are already ["v1"] only and the rio chart's
   # ExternalSecret/ClusterSecretStore manifests use external-secrets.io/v1,
   # so no migration needed. installCRDs defaults true (helm-managed).
-  version = "2.2.0"
+  version = "2.3.0"
 
   # IRSA annotation on the chart's SA. The chart creates the SA; we just
   # annotate it (unlike aws-lbc where we created the SA ourselves).

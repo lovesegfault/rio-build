@@ -17,19 +17,20 @@
   # cilium: chart version == app version. 1.19+ required (IPv6 tunnel
   # underlay first-class only since PR #40324). Same pin as
   # nix/cilium-render.nix (k3s VM tests) and infra/eks/addons.tf.
-  cilium_version = "1.19.2";
+  cilium_version = "1.19.3";
 
   # Gateway API CRDs (standard channel). Cilium chart's gatewayAPI.
   # enabled gates on `.Capabilities.APIVersions.Has` — must be
   # installed before cilium or the feature silently no-ops.
-  gateway_api_version = "v1.2.1";
+  gateway_api_version = "v1.4.0";
+  gateway_api_crds_hash = "sha256:1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a";
 
   # aws-load-balancer-controller: v3.0+ aligns chart with app version.
-  aws_lbc_version = "3.1.0";
+  aws_lbc_version = "3.2.2";
 
   # Karpenter chart (AWS provider, OCI-published). Must stay within
   # the EKS module's karpenter submodule compat range (~> 21.0).
-  karpenter_version = "1.10.0";
+  karpenter_version = "1.11.1";
 
   # external-dns chart (kubernetes-sigs.github.io/external-dns). Chart
   # version, NOT app version (chart 1.N.0 ships app 0.N.0). Only used
@@ -53,8 +54,8 @@
   # =true so nodeadm-init skips the EC2 DescribeInstances call (only
   # IMDS is mocked). If a bump removes that gate, vm-nixos-node will
   # hang ~10min on a DescribeInstances retry loop — check there first.
-  nodeadm_rev = "v20260318";
-  nodeadm_src_hash = "sha256-lrkifYFc9XXBienp15gZ2gJkeFqcJH21cGl7SWyj+Qw=";
+  nodeadm_rev = "v20260415";
+  nodeadm_src_hash = "sha256-RsxQVcOfiRSO+/X6WCcj5XJTL5P5GToZUwnT0LbiPiw=";
 
   # kubernetes/cloud-provider-aws → ecr-credential-provider binary.
   # nodeadm REQUIRES this on disk before it will finish kubelet config

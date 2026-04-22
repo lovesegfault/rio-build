@@ -92,16 +92,6 @@ ignore = [
   # Re-audit when russh bumps its rsa dep or a fixed release lands.
   { id = "RUSTSEC-2023-0071", reason = "russh->rsa: we use ed25519 host keys + ed25519 client auth; no RSA private key is ever held by rio-gateway. Advisory concerns private-key timing leaks — does not apply." },
 
-  # RUSTSEC-2026-0044/0048/0049: AWS-LC X.509/CRL validation bugs.
-  # Path: rustls → aws-lc-rs → aws-lc-sys. We use rustls for mTLS
-  # between rio components (self-issued CA, no CRLs, no wildcard CNs)
-  # and for aws-sdk-s3 (trusted AWS endpoints). Low exposure but
-  # should be fixed by bumping aws-lc-sys when upstream patches land.
-  # TODO(followup): bump aws-lc-sys to patched version.
-  { id = "RUSTSEC-2026-0044", reason = "aws-lc-sys X.509 wildcard/unicode CN bypass. Low exposure: no wildcard CNs in our self-issued mTLS CA; aws-sdk-s3 targets trusted AWS endpoints. Bump aws-lc-sys when patched." },
-  { id = "RUSTSEC-2026-0048", reason = "aws-lc-sys CRL distribution point scope. Low exposure: our mTLS CA doesn't use CRLs. Bump aws-lc-sys when patched." },
-  { id = "RUSTSEC-2026-0049", reason = "aws-lc-sys CRL authority matching. Low exposure: our mTLS CA doesn't use CRLs. Bump aws-lc-sys when patched." },
-
   # RUSTSEC-2025-0068: serde_yml unsound + unmaintained. Used by
   # rio-controller crdgen (write-only: Rust → YAML serialization, no
   # untrusted YAML parsing). The unsound paths are in deserialization.

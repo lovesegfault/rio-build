@@ -29,14 +29,14 @@
 use fastcdc::v2020::FastCDC;
 
 /// Minimum chunk size. FastCDC won't cut before this many bytes.
-pub const CHUNK_MIN: u32 = 16 * 1024;
+pub const CHUNK_MIN: usize = 16 * 1024;
 
 /// Average chunk size. The "expected" boundary spacing.
-pub const CHUNK_AVG: u32 = 64 * 1024;
+pub const CHUNK_AVG: usize = 64 * 1024;
 
 /// Maximum chunk size. Hard cap — FastCDC forces a cut at this length
 /// even if no content-defined boundary is found.
-pub const CHUNK_MAX: u32 = 256 * 1024;
+pub const CHUNK_MAX: usize = 256 * 1024;
 
 /// A single chunk: its BLAKE3 hash and a borrowed slice into the source.
 ///
@@ -147,14 +147,14 @@ mod tests {
             // nothing to enforce it (can't cut past EOF).
             if i < chunks.len() - 1 {
                 assert!(
-                    chunk.data.len() >= CHUNK_MIN as usize,
+                    chunk.data.len() >= CHUNK_MIN,
                     "chunk {i} is {} bytes, below CHUNK_MIN {}",
                     chunk.data.len(),
                     CHUNK_MIN
                 );
             }
             assert!(
-                chunk.data.len() <= CHUNK_MAX as usize,
+                chunk.data.len() <= CHUNK_MAX,
                 "chunk {i} is {} bytes, above CHUNK_MAX {}",
                 chunk.data.len(),
                 CHUNK_MAX

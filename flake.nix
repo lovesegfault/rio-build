@@ -3,7 +3,7 @@
 
   inputs = {
     nix = {
-      url = "github:NixOS/Nix/2.34.2";
+      url = "github:NixOS/Nix/2.34.6";
       inputs = {
         flake-compat.follows = "flake-compat";
         flake-parts.follows = "flake-parts";

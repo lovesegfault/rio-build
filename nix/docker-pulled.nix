@@ -18,7 +18,7 @@
 { pkgs }:
 {
   # Bitnami PostgreSQL 18.3.0 for the k3s-full fixture (bitnami subchart
-  # v18.5.6 via nixhelm, appVersion=18.3.0). Chart's values.yaml uses
+  # v18.6.1 via nixhelm, appVersion=18.3.0). Chart's values.yaml uses
   # tag:latest — k3s-full.nix passes `postgresql.image.tag` via extraSet
   # DERIVED from this FOD's imageTag passthru (no drift window).
   #
@@ -45,27 +45,27 @@
 
   # Cilium L7 proxy (standalone DaemonSet). Only loaded when
   # cilium-render.nix gatewayEnabled=true — provides the envoy that
-  # Cilium spawns per-Gateway. Tag is the chart 1.19.2 default
+  # Cilium spawns per-Gateway. Tag is the chart 1.19.3 default
   # (envoy.image.tag in the chart's values.yaml). envoy.image.
   # useDigest=false in cilium-render.nix → bare-tag match.
   cilium-envoy = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/cilium-envoy";
-    imageDigest = "sha256:60031f39669542b21aedf05a3317d14e8d3ea48255790af039b315a1c9637361";
+    imageDigest = "sha256:ba0ab8adac082d50d525fd2c5ba096c8facea3a471561b7c61c7a5b9c2e0de0d";
     finalImageName = "quay.io/cilium/cilium-envoy";
-    finalImageTag = "v1.35.9-1773656288-7b052e66eb2cfc5ac130ce0a5be66202a10d83be";
-    hash = "sha256-u0jUNs9GWsPAaEjlPrPhCCEWWTo9AIPjt82moeAyADM=";
+    finalImageTag = "v1.36.6-1776000132-2437d2edeaf4d9b56ef279bd0d71127440c067aa";
+    hash = "sha256-WXKS6yly9bjVTwCBHhdZn754XSwPJvzfWH2RNPOQjfI=";
     os = "linux";
     arch = "amd64";
   };
 
-  # Cilium agent (DaemonSet). Chart 1.19.2. image.useDigest=false in
+  # Cilium agent (DaemonSet). Chart 1.19.3. image.useDigest=false in
   # cilium-render.nix → chart renders bare tag, must match finalImageTag.
   cilium-agent = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/cilium";
-    imageDigest = "sha256:7bc7e0be845cae0a70241e622cd03c3b169001c9383dd84329c59ca86a8b1341";
+    imageDigest = "sha256:2e61680593cddca8b6c055f6d4c849d87a26a1c91c7e3b8b56c7fb76ab7b7b10";
     finalImageName = "quay.io/cilium/cilium";
-    finalImageTag = "v1.19.2";
-    hash = "sha256-lXN5D2G9nuk3isd01SFoYY02ckjKAPcJ/zZqf3ibf9A=";
+    finalImageTag = "v1.19.3";
+    hash = "sha256-5idFC5Ep/bVC2qvblX38jI1STzwMEKgVYwUioFRnegs=";
     os = "linux";
     arch = "amd64";
   };
@@ -74,10 +74,10 @@
   # defaults to "-generic" when no cloud provider is set.
   cilium-operator-generic = pkgs.dockerTools.pullImage {
     imageName = "quay.io/cilium/operator-generic";
-    imageDigest = "sha256:e363f4f634c2a66a36e01618734ea17e7b541b949b9a5632f9c180ab16de23f0";
+    imageDigest = "sha256:205b09b0ed6accbf9fe688d312a9f0fcfc6a316fc081c23fbffb472af5dd62cd";
     finalImageName = "quay.io/cilium/operator-generic";
-    finalImageTag = "v1.19.2";
-    hash = "sha256-7w75MJ0AFGfRAzmg3beRea7b/lAE/dIr2wpgtmgyiE0=";
+    finalImageTag = "v1.19.3";
+    hash = "sha256-UKGlhslatXOawVR/soWCOqtYJaDOnNF6QogHMwe3eYU=";
     os = "linux";
     arch = "amd64";
   };
