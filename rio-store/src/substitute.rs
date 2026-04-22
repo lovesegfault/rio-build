@@ -614,19 +614,16 @@ impl Substituter {
             // r[impl store.substitute.admission]
             // r[impl store.substitute.probe-429-retry]
             // Transient backpressure (local Admission OR upstream
-            // Busy{Some}) → retry HERE. Propagation alone is
-            // ineffective (see fn doc): the seed is in PG, so the
-            // caller's retry never re-enters this closure walk.
+            // Busy) → retry HERE. Propagation alone is ineffective
+            // (see fn doc): the seed is in PG, so the caller's retry
+            // never re-enters this closure walk. `Busy{None}` (CDN
+            // 429 without Retry-After) is still backpressure — falls
+            // through to the standard backoff curve.
             let mut attempt = 0u32;
             loop {
                 match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
                     Ok(_) => break,
-                    Err(
-                        e @ (SubstituteError::Admission(_)
-                        | SubstituteError::Busy {
-                            retry_after: Some(_),
-                        }),
-                    ) => {
+                    Err(e @ (SubstituteError::Admission(_) | SubstituteError::Busy { .. })) => {
                         attempt += 1;
                         if attempt >= Self::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS {
                             warn!(
@@ -639,7 +636,7 @@ impl Substituter {
                         // Busy honors the upstream hint (capped at the
                         // backoff cap so a hostile `Retry-After: 3600`
                         // can't pin the singleflight slot); Admission
-                        // uses the standard curve.
+                        // and Busy{None} use the standard curve.
                         let delay = match &e {
                             SubstituteError::Busy {
                                 retry_after: Some(ra),
@@ -650,6 +647,12 @@ impl Substituter {
                             reference = %r, attempt, ?delay, error = %e,
                             "closure: transient backpressure; retrying inline"
                         );
+                        // Refund the budget slot the failed attempt
+                        // consumed at try_substitute_inner's entry —
+                        // the retry re-decrements, so without this a
+                        // backpressured ref burns up to
+                        // ENSURE_REFS_ADMISSION_MAX_ATTEMPTS slots.
+                        budget.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(delay).await;
                     }
                     Err(e) => {
@@ -957,7 +960,9 @@ impl Substituter {
         let persist = async {
             // — Step 4: GET NAR + decompress —
             let nar_url = format!("{base}/{}", ni.url);
-            let (nar_bytes, _permits) = self.fetch_nar(http, &nar_url, &ni.compression).await?;
+            let (nar_bytes, _permits) = self
+                .fetch_nar(http, tenant_id, &nar_url, &ni.compression)
+                .await?;
 
             // r[impl store.substitute.untrusted-upstream+2]
             // Size check: actual decompressed length MUST equal the
@@ -1049,6 +1054,7 @@ impl Substituter {
     async fn fetch_nar(
         &self,
         http: &reqwest::Client,
+        tenant_id: Uuid,
         nar_url: &str,
         compression: &str,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
@@ -1064,6 +1070,11 @@ impl Substituter {
         // surfaced as a generic `Fetch` error, was logged as
         // `result=error`, and let `Ok(None)` cache a miss for 30s.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            metrics::counter!(
+                "rio_store_substitute_probe_ratelimited_total",
+                "tenant" => tenant_id.to_string(),
+            )
+            .increment(1);
             return Err(SubstituteError::Busy {
                 retry_after: parse_retry_after(&resp),
             });
@@ -3093,6 +3104,94 @@ mod tests {
         );
     }
 
+    // r[verify store.substitute.probe-429-retry]
+    /// `ensure_references` MUST retry `Busy{retry_after: None}` (429
+    /// without a `Retry-After` header — common from CDN edges) inline
+    /// via the `_ =>` backoff arm. Prior to merged_bug_001 the match
+    /// arm was `Busy{retry_after: Some(_)}` only, so a bare 429 fell
+    /// through to the non-retried error arm and the ref was skipped
+    /// (seed returned `Ok(Some)` with refs absent → builder ENOENT).
+    ///
+    /// Upstream serves the closure ref's narinfo as 429 (no header)
+    /// for the first 2 GETs, then 200. Seed is pre-inserted in moka
+    /// so `try_substitute_inner` goes straight to the closure walk.
+    /// Budget seeded at 3 also proves the per-retry refund: without
+    /// it, seed(1) + 3 ref-attempts would exhaust to 0 and the third
+    /// attempt would truncate to `Ok(None)`.
+    #[tokio::test]
+    async fn ensure_references_retries_busy_without_retry_after() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-refs-429-none").await;
+
+        let ref_path = rio_test_support::fixtures::test_store_path("ref-429-none");
+        let (ref_nar, _) = rio_test_support::fixtures::make_nar(b"ref-body");
+        let fake = spawn_flex_upstream(
+            &ref_path,
+            ref_nar,
+            "cache.ref-429-none",
+            FlexCfg {
+                narinfo_429_first_n: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let seed = rio_test_support::fixtures::test_store_path("seed-429-none");
+        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
+            store_path: seed.clone(),
+            store_path_hash: Vec::new(),
+            deriver: String::new(),
+            nar_hash: vec![0u8; 32],
+            nar_size: 1,
+            references: vec![ref_path.clone()],
+            registration_time: 0,
+            ultimate: false,
+            signatures: Vec::new(),
+            content_address: String::new(),
+        })
+        .unwrap();
+        sub.inflight
+            .insert((tid, seed.clone()), Some(Arc::new(info)))
+            .await;
+
+        let budget = Arc::new(AtomicUsize::new(3));
+        let t0 = tokio::time::Instant::now();
+        let got = sub.try_substitute_inner(tid, &seed, &budget).await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            matches!(got, Ok(Some(_))),
+            "Busy{{None}} must be retried inline, not propagated; got {got:?}"
+        );
+        // Structural: 2×429 + 1×200 on the narinfo GET.
+        assert_eq!(
+            fake.narinfo_hits.load(Ordering::SeqCst),
+            3,
+            "two 429 retries + one success"
+        );
+        // Ref actually persisted (not skipped via the old non-retried arm).
+        assert!(
+            metadata::query_path_info(&db.pool, &ref_path)
+                .await
+                .unwrap()
+                .is_some(),
+            "closure ref must be persisted, not skipped"
+        );
+        // Budget refund: 3 - seed - ref = 1 (without refund: 3 - 1 - 3 → 0).
+        assert_eq!(
+            budget.load(Ordering::SeqCst),
+            1,
+            "transient retries must refund their budget slot"
+        );
+        // `_ =>` backoff arm: 250ms + 1s = 1.25s of sleep.
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "Busy{{None}} uses standard backoff (250ms+1s); elapsed={elapsed:?}"
+        );
+    }
+
     // r[verify store.substitute.admission]
     /// After `ENSURE_REFS_ADMISSION_MAX_ATTEMPTS` inline retries
     /// exhaust, `Admission` propagates as a degraded-mode signal with
@@ -3147,6 +3246,9 @@ mod tests {
         narinfo_fail_first: bool,
         /// First `/nix-cache-info` GET returns 503; subsequent succeed.
         cache_info_fail_first: bool,
+        /// First N narinfo GETs return 429 with NO `Retry-After`
+        /// header; subsequent ones succeed.
+        narinfo_429_first_n: usize,
         /// HEAD on narinfo returns 503 (every time).
         head_503: bool,
         /// `/nix-cache-info` GET returns 404 (every time).
@@ -3219,6 +3321,7 @@ mod tests {
         let ni_failed = Arc::new(AtomicBool::new(false));
         let ci_failed = Arc::new(AtomicBool::new(false));
         let narinfo_fail_first = cfg.narinfo_fail_first;
+        let narinfo_429_first_n = cfg.narinfo_429_first_n;
         let cache_info_fail_first = cfg.cache_info_fail_first;
         let cache_info_404 = cfg.cache_info_404;
         let head_503 = cfg.head_503;
@@ -3254,7 +3357,11 @@ mod tests {
                     let ni_failed = ni_failed.clone();
                     let body = narinfo_body.clone();
                     async move {
-                        ni_hits.fetch_add(1, Ordering::SeqCst);
+                        let n = ni_hits.fetch_add(1, Ordering::SeqCst);
+                        if narinfo_429_first_n > 0 && n < narinfo_429_first_n {
+                            // Bare 429, no Retry-After header.
+                            return (StatusCode::TOO_MANY_REQUESTS, String::new()).into_response();
+                        }
                         if narinfo_fail_first && !ni_failed.swap(true, Ordering::SeqCst) {
                             return (StatusCode::SERVICE_UNAVAILABLE, String::new())
                                 .into_response();
