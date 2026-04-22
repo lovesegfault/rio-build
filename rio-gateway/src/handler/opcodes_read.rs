@@ -19,6 +19,18 @@ use super::grpc::{
 use super::{PROGRAM_NAME, SessionContext, read_store_path, with_jwt};
 use crate::drv_cache::resolve_derivation;
 
+/// Timeout for `FindMissingPaths` RPCs from wire-protocol handlers.
+///
+/// `FindMissingPaths` HEAD-probes every missing path against the
+/// tenant's upstreams (no batch truncation since
+/// `r[store.substitute.probe-bounded+4]`). The store self-bounds at
+/// `CHECK_AVAILABLE_DEFAULT_BUDGET` (88s); this gives 2s headroom on
+/// top so a fully-consumed budget surfaces as the store's deferred-
+/// to-dispatch result, not a gateway-side `DeadlineExceeded` that the
+/// Nix client renders as a hard error. Matches the scheduler's
+/// `MERGE_FMP_TIMEOUT`.
+const GATEWAY_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// JWT for store lookups — but NOT for `.drv` paths.
 ///
 /// `.drv` files are build INPUTS, not tenant-owned OUTPUTS. A `.drv`
@@ -201,7 +213,14 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 
     debug!(count = path_strs.len(), "wopQueryValidPaths");
 
-    // Use FindMissingPaths and invert to get valid paths
+    // Use FindMissingPaths and invert to get valid paths.
+    //
+    // We discard `substitutable_paths` here, but the JWT MUST stay:
+    // dropping it would also bypass `sig_visibility_gate_batch` (the
+    // I-217 cross-tenant isolation gate) and leak other tenants'
+    // built outputs as "valid". The store-side `check_available`
+    // self-bounds at 88s, so `GATEWAY_FMP_TIMEOUT` (90s) covers the
+    // worst-case probe latency without a client-visible timeout.
     let req = with_jwt(
         types::FindMissingPathsRequest {
             store_paths: path_strs.clone(),
@@ -210,7 +229,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     )?;
     let resp = rio_common::grpc::with_timeout(
         "FindMissingPaths",
-        DEFAULT_GRPC_TIMEOUT,
+        GATEWAY_FMP_TIMEOUT,
         store_client.find_missing_paths(req),
     )
     .await;
@@ -901,7 +920,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         jwt_token,
     )?;
     let (missing_set, substitutable_set): (HashSet<String>, HashSet<String>) =
-        match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.find_missing_paths(req)).await
+        match tokio::time::timeout(GATEWAY_FMP_TIMEOUT, store_client.find_missing_paths(req)).await
         {
             Ok(Ok(r)) => {
                 let resp = r.into_inner();
@@ -913,7 +932,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
             Ok(Err(e)) => stderr_err!(stderr, "gRPC FindMissingPaths: {e}"),
             Err(_) => stderr_err!(
                 stderr,
-                "gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"
+                "gRPC FindMissingPaths timed out after {GATEWAY_FMP_TIMEOUT:?}"
             ),
         };
 
