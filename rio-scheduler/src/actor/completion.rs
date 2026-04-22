@@ -1031,6 +1031,11 @@ impl DagActor {
         phase!("5-newly-ready+per-build-counts");
         let _ = &mut t_phase;
         let total = t_total.elapsed();
+        // IA-branch parity with the CA `info!` in `ca_insert_realisations`:
+        // without this, an IA dependency's INFO-level trace is
+        // `worker registered → assignment ACKed → worker disconnected`
+        // with no success marker — indistinguishable from a crash.
+        info!(drv_hash = %drv_hash, elapsed = ?total, "derivation built");
         if total >= std::time::Duration::from_secs(1) {
             debug!(elapsed = ?total, drv_hash = %drv_hash, "handle_success_completion total");
         }
