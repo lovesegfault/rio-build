@@ -300,7 +300,7 @@ impl DagActor {
     /// prior outputs. Bounded by MAX_CASCADE_NODES on both the in-mem
     /// DAG walk AND the PG realisation_deps walk.
     async fn verify_cutoff_candidates(
-        &self,
+        &mut self,
         trigger: &DrvHash,
         prior_seeds: &[(Vec<u8>, String)],
     ) -> HashMap<DrvHash, Vec<CaCutoffVerified>> {
@@ -441,10 +441,10 @@ impl DagActor {
         // single-threaded actor loop from blocking on a known-down
         // store; without this gate, the timeout below blocks for up to
         // `grpc_timeout` (30s) per CA completion during an outage even
-        // when the breaker is already open. Read-only: completion.rs
-        // trusts the merge-time probe rather than re-feeding `record_*`
-        // (avoids `&mut self` plumbing into a `&self`-ish path; merge.rs
-        // half-open-probe model already covers recovery).
+        // when the breaker is already open. Read-only on the breaker:
+        // completion.rs trusts the merge-time probe rather than
+        // re-feeding `record_*` (merge.rs half-open-probe model already
+        // covers recovery). `&mut self` is for the heartbeat credit.
         if self.cache_breaker.is_open() {
             debug!("CA cutoff verify: cache breaker open; skipping cascade");
             return HashMap::new();
@@ -457,6 +457,7 @@ impl DagActor {
             store_paths: check_paths,
         });
         rio_proto::interceptor::inject_current(req.metadata_mut());
+        let fmp_start = Instant::now();
         let missing: HashSet<String> = match tokio::time::timeout(
             self.grpc_timeout,
             store_client.clone().find_missing_paths(req),
@@ -465,14 +466,17 @@ impl DagActor {
         {
             Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
             Ok(Err(e)) => {
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!(error = %e, "CA cutoff verify: FindMissingPaths failed; skipping cascade");
                 return HashMap::new();
             }
             Err(_elapsed) => {
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!("CA cutoff verify: FindMissingPaths timed out; skipping cascade");
                 return HashMap::new();
             }
         };
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         // Verified = candidates where ALL prior outputs are present.
         cand_to_prior

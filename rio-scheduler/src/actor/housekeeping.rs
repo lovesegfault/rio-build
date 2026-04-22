@@ -306,11 +306,12 @@ impl DagActor {
     /// No `stall ≤ HEARTBEAT_TIMEOUT_SECS` early-return: Tick and
     /// Heartbeat queue independently in the FIFO mailbox, so a Tick
     /// enqueued BEFORE the next heartbeat lands first and reaps a live
-    /// worker after a 25–29s stall. Worse, one MergeDag runs
-    /// `find_missing_with_breaker` then `verify_preexisting_completed`
-    /// sequentially; with a per-call early-return, two 25s stalls each
-    /// short-circuit and the cumulative 50s of actor silence reaps the
-    /// fleet. Shifting unconditionally is O(N_workers), already
+    /// worker after a 25–29s stall. Worse, the actor has eight inline
+    /// `FindMissingPaths` await sites (four in MergeDag alone, plus
+    /// dispatch/completion/recovery), several of which run
+    /// sequentially per message; with a per-call early-return,
+    /// sub-threshold stalls compound and the cumulative actor silence
+    /// reaps the fleet. Shifting unconditionally is O(N_workers), already
     /// `.min(now)`-capped, and per-call shifts compound to the same
     /// result a single cumulative credit would.
     pub(super) fn credit_heartbeats_for_stall(&mut self, stall: std::time::Duration) {

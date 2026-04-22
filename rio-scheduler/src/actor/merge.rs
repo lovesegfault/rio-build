@@ -1166,9 +1166,11 @@ impl DagActor {
     /// **Fail-open:** if the store is unreachable, skip verification
     /// and treat existing `Completed` as valid. The bug is rare (GC
     /// race); blocking merge on store availability would be a worse
-    /// regression than the original bug. No circuit-breaker
-    /// interaction — this is a best-effort correctness check, not an
-    /// availability gate like `check_cached_outputs`.
+    /// regression than the original bug. Feeds the circuit-breaker so
+    /// a stall here counts toward opening, but the fail-open RETURN
+    /// is unconditional per `r[sched.breaker.cache-check]` — this is
+    /// a best-effort correctness check, not an availability gate like
+    /// `check_cached_outputs`.
     async fn verify_preexisting_completed(
         &mut self,
         nodes: &[crate::domain::DerivationNode],
@@ -1767,8 +1769,11 @@ impl DagActor {
     /// through (handled by the path-based lane). Best-effort — PG
     /// blip degrades to cache-miss; store unreachable degrades to
     /// fail-open (keep realisation hits).
+    ///
+    /// `&mut self` for `credit_heartbeats_for_stall` — the
+    /// store-existence verify can block the actor up to `grpc_timeout`.
     async fn check_ca_realisation_hits(
-        &self,
+        &mut self,
         probe_set: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &crate::domain::DerivationNode>,
     ) -> HashMap<DrvHash, Vec<String>> {
@@ -1865,6 +1870,7 @@ impl DagActor {
                 store_paths: ca_check_paths,
             });
             rio_proto::interceptor::inject_current(req.metadata_mut());
+            let fmp_start = Instant::now();
             let missing: Option<HashSet<String>> = match tokio::time::timeout(
                 self.grpc_timeout,
                 store_client.clone().find_missing_paths(req),
@@ -1884,6 +1890,10 @@ impl DagActor {
                     None
                 }
             };
+            // Actor was unresponsive for the FMP duration — credit
+            // executor heartbeats so a 30s verify here doesn't compound
+            // with the other merge-time FMP stalls toward a fleet reap.
+            self.credit_heartbeats_for_stall(fmp_start.elapsed());
             if let Some(missing) = missing
                 && !missing.is_empty()
             {
@@ -1975,10 +1985,12 @@ impl DagActor {
         // (sustained outage; this call is the half-open probe) use
         // grpc_timeout (30s) so a tiny submission isn't held 90s
         // against a dead store and the probe stays inside
-        // OPEN_DURATION. The other two merge-time FMP callers:
+        // OPEN_DURATION. The other three merge-time FMP callers:
         // `verify_preexisting_completed` (submission-sized; same
-        // conditional below) and the top-down roots-only FMP
-        // (root-count-bounded; stays on grpc_timeout).
+        // conditional below), the top-down roots-only FMP
+        // (root-count-bounded; stays on grpc_timeout), and
+        // `check_ca_realisation_hits`' store-existence verify
+        // (CA-hit-count-bounded; stays on grpc_timeout).
         let fmp_timeout = if self.cache_breaker.is_open() {
             self.grpc_timeout
         } else {
@@ -2129,6 +2141,7 @@ impl DagActor {
                 .insert(rio_proto::TENANT_TOKEN_HEADER, v);
         }
         let grpc_timeout = self.grpc_timeout;
+        let fmp_start = Instant::now();
         let resp = match tokio::time::timeout(
             grpc_timeout,
             store_client.clone().find_missing_paths(fmp_req),
@@ -2142,14 +2155,20 @@ impl DagActor {
             Ok(Err(e)) => {
                 debug!(error = %e, "top-down FindMissingPaths failed; falling through");
                 self.cache_breaker.record_failure();
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 return None;
             }
             Err(_) => {
                 debug!(timeout = ?grpc_timeout, "top-down FindMissingPaths timed out; falling through");
                 self.cache_breaker.record_failure();
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 return None;
             }
         };
+        // This runs FIRST in handle_merge_dag; a 30s stall here is
+        // not yet covered by find_missing_with_breaker's credit and
+        // compounds with the later FMP calls toward fleet reap.
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         debug!(
             roots = root_paths.len(),

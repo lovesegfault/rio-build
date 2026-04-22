@@ -593,6 +593,7 @@ impl DagActor {
         // admission only — here the call IS the work.
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
+        let fmp_start = Instant::now();
         let resp =
             match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
                 .await
@@ -607,6 +608,7 @@ impl DagActor {
                     );
                     // Tail already in `checked`; head protected via the
                     // probed_generation stamp at `ready_check_or_spawn`.
+                    self.credit_heartbeats_for_stall(fmp_start.elapsed());
                     return checked;
                 }
                 Err(_) => {
@@ -616,9 +618,13 @@ impl DagActor {
                         "batched Ready store-check timed out; \
                          dispatching fail-open (next pass batch-retries)"
                     );
+                    self.credit_heartbeats_for_stall(fmp_start.elapsed());
                     return checked;
                 }
             };
+        // Actor was unresponsive for the FMP duration — credit so the
+        // queued Tick doesn't reap the fleet on a slow store.
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         // r[impl sched.substitute.detached]
         // Partition: locally-present (not in missing_paths) → complete
@@ -1113,8 +1119,10 @@ impl DagActor {
             store_paths: paths.clone(),
         });
         Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
+        let fmp_start = Instant::now();
         match tokio::time::timeout(self.grpc_timeout, store.find_missing_paths(req)).await {
             Ok(Ok(r)) => {
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 let resp = r.into_inner();
                 if resp.missing_paths.is_empty() {
                     self.complete_ready_from_store(drv_hash).await;
@@ -1131,11 +1139,13 @@ impl DagActor {
                 false
             }
             Ok(Err(e)) => {
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!(drv_hash = %drv_hash, error = %e,
                        "Ready store-check FindMissingPaths failed; will dispatch");
                 false
             }
             Err(_) => {
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
                        "Ready store-check FindMissingPaths timed out; will dispatch");
                 false

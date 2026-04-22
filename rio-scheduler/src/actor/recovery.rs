@@ -1030,14 +1030,27 @@ impl DagActor {
         };
         let mut fmp_req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-        match client.find_missing_paths(fmp_req).await {
-            Ok(resp) => resp.into_inner().missing_paths.is_empty(),
-            Err(e) => {
+        // Per-orphan in `handle_reconcile_assignments`' loop — without
+        // the timeout, a dead store stalls reconcile unbounded × N
+        // orphans; without the credit, even a bounded 30s × N reaps
+        // every executor that DID reconnect.
+        let grpc_timeout = self.grpc_timeout;
+        let fmp_start = Instant::now();
+        let r = match tokio::time::timeout(grpc_timeout, client.find_missing_paths(fmp_req)).await {
+            Ok(Ok(resp)) => resp.into_inner().missing_paths.is_empty(),
+            Ok(Err(e)) => {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "reconcile: FindMissingPaths failed, assuming incomplete");
                 false
             }
-        }
+            Err(_) => {
+                warn!(drv_hash = %drv_hash, timeout = ?grpc_timeout,
+                      "reconcile: FindMissingPaths timed out, assuming incomplete");
+                false
+            }
+        };
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
+        r
     }
 
     /// Reconcile path for an orphaned assignment whose outputs ARE in
