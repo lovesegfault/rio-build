@@ -366,8 +366,10 @@ pub async fn batch_get_manifest(
 /// GetPath with timeout, full NAR collection, and NotFound handling.
 ///
 /// Combines the `GetPath → collect_nar_stream → NotFound-branch` pattern.
-/// The whole operation (initial call + stream drain) is bounded by `timeout`.
-/// Returns `None` if the path doesn't exist or the stream contains no PathInfo.
+/// `timeout` is a per-chunk IDLE bound (I-211): it gates the initial RPC
+/// and then each `stream.message()` independently — NOT a wall-clock cap
+/// on the whole drain. Returns `None` if the path doesn't exist or the
+/// stream contains no PathInfo.
 ///
 /// `extra_metadata`: see [`query_path_info_opt`]. DO NOT inline this
 /// function's await structure at callsites — under

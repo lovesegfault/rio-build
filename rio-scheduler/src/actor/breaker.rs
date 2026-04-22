@@ -62,7 +62,7 @@ impl Clock for SystemClock {
 /// only close via timeout. A successful probe is a faster, more responsive
 /// signal that the store is back. The probe costs one RPC per SubmitBuild
 /// — same as the closed state — so there's no extra load.
-// r[impl sched.breaker.cache-check+2]
+// r[impl sched.breaker.cache-check+3]
 #[derive(Debug)]
 pub(crate) struct CacheCheckBreaker<C: Clock = SystemClock> {
     /// Consecutive cache-check failures. Reset to 0 on any success.
@@ -110,7 +110,7 @@ impl<C: Clock + Default> CacheCheckBreaker<C> {
 impl<C: Clock> CacheCheckBreaker<C> {
     /// Lazy-reset on auto-close: if `open_until` has elapsed, return to
     /// true Closed semantics (5 fresh failures to re-trip; no duplicate
-    /// open-transition metric). r[sched.breaker.cache-check+2] defines
+    /// open-transition metric). r[sched.breaker.cache-check+3] defines
     /// auto-close as returning to **Closed** — without this, the first
     /// post-timeout failure sees `consecutive_failures` still ≥5 and
     /// re-trips immediately, double-counting the same outage.
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(b.consecutive_failures, u32::MAX);
     }
 
-    // r[verify sched.breaker.cache-check+2]
+    // r[verify sched.breaker.cache-check+3]
     /// Auto-close returns to true Closed semantics: after `OPEN_DURATION`
     /// elapses with no probe, a single failure does NOT re-trip — it
     /// takes [`OPEN_THRESHOLD`] fresh failures.
@@ -306,7 +306,7 @@ mod tests {
         assert!(b.record_failure(), "5th fresh failure trips again");
     }
 
-    // r[verify sched.breaker.cache-check+2]
+    // r[verify sched.breaker.cache-check+3]
     /// Auto-close + single failure does NOT double-count
     /// `circuit_open_total` (observability.md: counts open transitions
     /// (outages), not 30s windows).

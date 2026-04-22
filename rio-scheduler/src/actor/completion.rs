@@ -435,7 +435,7 @@ impl DagActor {
             return HashMap::new();
         }
 
-        // r[impl sched.breaker.cache-check+2]
+        // r[impl sched.breaker.cache-check+3]
         // Same store, same unavailability signal as merge.rs's
         // `find_missing_with_breaker`. The breaker exists to protect the
         // single-threaded actor loop from blocking on a known-down

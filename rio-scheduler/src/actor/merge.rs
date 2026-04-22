@@ -1919,7 +1919,7 @@ impl DagActor {
     ///
     /// This call is ALSO the half-open probe: when the breaker is open
     /// the call still fires; success closes it.
-    // r[impl sched.breaker.cache-check+2]
+    // r[impl sched.breaker.cache-check+3]
     async fn find_missing_with_breaker(
         &mut self,
         check_paths: Vec<String>,

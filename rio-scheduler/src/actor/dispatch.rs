@@ -2052,7 +2052,8 @@ impl DagActor {
         /// real-world `.drv`. Avoids pulling a multi-GB closure if
         /// the store path was mis-resolved.
         const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
-        /// End-to-end `GetPath` + stream-drain timeout. ~10-50 ms
+        /// Per-chunk idle bound for `GetPath` (initial RPC + each
+        /// stream.message() — I-211, not whole-call). ~10-50 ms
         /// typical; 2 s covers a slow store without blocking
         /// dispatch for long. On timeout we degrade to unresolved
         /// dispatch (same as store-unconfigured).
