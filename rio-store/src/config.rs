@@ -128,7 +128,7 @@ pub(crate) struct Config {
     /// to `nar_buffer_budget_bytes` — this bounds COUNT, that bounds
     /// BYTES. `None` (default) derives from the PG pool via
     /// [`derive_substitute_admission_cap`]: `(pg_max × 3).clamp(64,
-    /// 256)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
+    /// 128)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
     #[serde(default)]
     pub substitute_admission_permits: Option<usize>,
 }
@@ -170,11 +170,13 @@ pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 /// only per-query (via `&PgPool`), never across the upstream HTTP/NAR
 /// fetch — so admitted callers >> `pg_max` doesn't starve the pool. 3×
 /// gives headroom for the (typical) case where most admitted calls are
-/// parked on upstream I/O; the `[64, 256]` clamp keeps tiny dev pools
+/// parked on upstream I/O; the `[64, 128]` clamp keeps tiny dev pools
 /// from throttling to single digits and huge pools from admitting
-/// unbounded HTTP fan-out.
+/// unbounded HTTP fan-out. 128 (not 256) keeps the per-replica S3
+/// fan-out self-consistent: 128 admitted × `S3_PUT_CONCURRENCY` (8) =
+/// 1024, the S3 single-prefix steady-state ceiling.
 pub(crate) fn derive_substitute_admission_cap(pg_max: u32) -> usize {
-    (pg_max as usize * 3).clamp(64, 256)
+    (pg_max as usize * 3).clamp(64, 128)
 }
 
 #[derive(Parser, Serialize, Default)]
@@ -348,15 +350,16 @@ mod tests {
 
     #[test]
     fn derive_admission_cap_clamps() {
-        // (pg_max × 3).clamp(64, 256). DEFAULT_PG_MAX_CONNECTIONS=50
-        // → 150, mid-range.
-        assert_eq!(derive_substitute_admission_cap(50), 150);
+        // (pg_max × 3).clamp(64, 128). DEFAULT_PG_MAX_CONNECTIONS=50
+        // → 150 → ceil-clamped to 128.
+        assert_eq!(derive_substitute_admission_cap(50), 128);
         // Floor: tiny dev pool doesn't throttle to single digits.
         assert_eq!(derive_substitute_admission_cap(1), 64);
         assert_eq!(derive_substitute_admission_cap(21), 64);
         // Ceiling: huge pool doesn't admit unbounded HTTP fan-out.
-        assert_eq!(derive_substitute_admission_cap(100), 256);
-        assert_eq!(derive_substitute_admission_cap(10_000), 256);
+        // 128 × S3_PUT_CONCURRENCY(8) = 1024 = S3 prefix ceiling.
+        assert_eq!(derive_substitute_admission_cap(100), 128);
+        assert_eq!(derive_substitute_admission_cap(10_000), 128);
     }
 
     /// `chunk_upload_max_concurrent=0` → `buffer_unordered(0)` hangs

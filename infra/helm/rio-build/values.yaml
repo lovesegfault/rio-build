@@ -263,7 +263,7 @@ store:
   # live pg_pool_util ≈ 0.01 ⇒ ~0.5 conns actually in use (I-171).
   pgMaxConnections: 20
   # Per-replica r[store.substitute.admission] gate. Unset → derived as
-  # (pgMaxConnections × 3).clamp(64, 256). Override only when the
+  # (pgMaxConnections × 3).clamp(64, 128). Override only when the
   # derived value mis-tracks the upstream-fetch bottleneck.
   # substituteAdmissionPermits: 128
   resources:

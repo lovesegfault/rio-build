@@ -340,7 +340,7 @@ Figment env-vars (`RIO_<FIELD>`) that bound fan-out at known saturation points. 
 | Env var | Component | Default | Description |
 |---------|-----------|---------|-------------|
 | `RIO_SUBSTITUTE_MAX_CONCURRENT` | scheduler | 256 | In-flight detached substitution-fetch tokio tasks. Memory bound only — per-replica throughput is `r[store.substitute.admission]`. |
-| `RIO_SUBSTITUTE_ADMISSION_PERMITS` | store | `(pg_max × 3).clamp(64, 256)` | Per-replica cap on concurrent `try_substitute_on_miss`. Excess queue server-side up to 25s, then `ResourceExhausted` (transient). |
+| `RIO_SUBSTITUTE_ADMISSION_PERMITS` | store | `(pg_max × 3).clamp(64, 128)` | Per-replica cap on concurrent `try_substitute_on_miss`. Excess queue server-side up to 25s, then `ResourceExhausted` (transient). |
 | `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` | store | 8 | Max concurrent S3 `PutObject` calls per `put_chunked`. Bounds store→S3 fan-out within a single large-NAR ingest. |
 | `RIO_S3_MAX_ATTEMPTS` | store | 10 | aws-sdk retry ceiling per S3 operation. Raised from the sdk default (3) to absorb connection churn from S3-compatible backends that recycle idle connections aggressively. |
 
