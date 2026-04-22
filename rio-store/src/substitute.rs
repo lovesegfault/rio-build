@@ -512,6 +512,22 @@ impl Substituter {
         Ok(result)
     }
 
+    /// Inline-retry budget for [`SubstituteError::Admission`] inside
+    /// [`ensure_references`](Self::ensure_references). 250 ms ×4, 4 s
+    /// cap, no jitter (single sequential walker — no herd to desync),
+    /// 5 attempts → ≤ 9.25 s of backoff sleep. Kept short: the seed
+    /// ingest already consumed wall-clock under the caller's gRPC
+    /// timeout, and each attempt also queues server-side for
+    /// [`SUBSTITUTE_ADMISSION_WAIT`](crate::admission::SUBSTITUTE_ADMISSION_WAIT).
+    const ENSURE_REFS_ADMISSION_MAX_ATTEMPTS: u32 = 5;
+    const ENSURE_REFS_ADMISSION_BACKOFF: rio_common::backoff::Backoff =
+        rio_common::backoff::Backoff {
+            base: Duration::from_millis(250),
+            mult: 4.0,
+            cap: Duration::from_secs(4),
+            jitter: rio_common::backoff::Jitter::None,
+        };
+
     /// Ensure every reference is present locally, substituting misses.
     /// Depth-first via mutual recursion with
     /// [`try_substitute_inner`](Self::try_substitute_inner) (which
@@ -523,13 +539,19 @@ impl Substituter {
     /// Best-effort for UPSTREAM failures: a 5xx/hash-mismatch on a
     /// ref logs + continues so a partial closure doesn't poison the
     /// seed (the build still fails with a clear ENOENT naming the
-    /// missing ref). LOCAL backpressure is NOT swallowed:
-    /// [`SubstituteError::Admission`] propagates so the caller's
-    /// retry re-walks the closure once permits free up. Swallowing it
-    /// would let the seed return `Ok(Some)` with refs missing — the
-    /// scheduler then marks the path Completed and the builder
-    /// ENOENTs on the absent ref. The seed is already in S3, so the
-    /// retry is a cheap moka/PG hit.
+    /// missing ref).
+    ///
+    /// LOCAL backpressure ([`SubstituteError::Admission`]) is retried
+    /// INLINE (5 attempts, 250 ms ×4 backoff, 4 s cap). By the time
+    /// this runs, [`do_substitute`](Self::do_substitute) has already
+    /// persisted the seed to PG inside the moka init future, so
+    /// propagating to the gRPC caller cannot help: their retry of
+    /// `QueryPathInfo(seed)` short-circuits at
+    /// `metadata::query_path_info → Some` without re-entering
+    /// `try_substitute_on_miss`. Propagation after the inline retry
+    /// exhausts is a degraded-mode signal (logged at WARN) — the seed
+    /// is already persisted so caller-retry can't recover it, but
+    /// surfacing beats silently returning `Ok(Some)` with refs absent.
     async fn ensure_references(
         &self,
         tenant_id: Uuid,
@@ -546,14 +568,35 @@ impl Substituter {
                     continue;
                 }
             }
-            match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
-                Ok(_) => {}
-                // r[impl store.substitute.admission]
-                // Transient local backpressure → propagate. Caller
-                // retries the whole substitute (seed is moka-cached).
-                Err(e @ SubstituteError::Admission(_)) => return Err(e),
-                Err(e) => {
-                    warn!(reference = %r, error = %e, "closure: reference substitution failed");
+            // r[impl store.substitute.admission]
+            // Transient local backpressure → retry HERE. Propagation
+            // alone is ineffective (see fn doc): the seed is in PG, so
+            // the caller's retry never re-enters this closure walk.
+            let mut attempt = 0u32;
+            loop {
+                match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
+                    Ok(_) => break,
+                    Err(SubstituteError::Admission(ae)) => {
+                        attempt += 1;
+                        if attempt >= Self::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS {
+                            warn!(
+                                reference = %r, attempts = attempt,
+                                "closure: admission saturated past inline retry budget; \
+                                 seed already persisted — propagating as degraded-partial"
+                            );
+                            return Err(SubstituteError::Admission(ae));
+                        }
+                        let delay = Self::ENSURE_REFS_ADMISSION_BACKOFF.duration(attempt - 1);
+                        debug!(
+                            reference = %r, attempt, ?delay,
+                            "closure: admission saturated; retrying inline"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        warn!(reference = %r, error = %e, "closure: reference substitution failed");
+                        break;
+                    }
                 }
             }
         }
@@ -2190,31 +2233,17 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.admission]
-    /// `ensure_references` MUST propagate `SubstituteError::Admission`
-    /// instead of swallowing it. The leader-permit refactor moved
-    /// `acquire_bounded()` inside `try_substitute_inner`, which the
-    /// closure walk re-enters per ref; with the old best-effort
-    /// `warn!`-and-continue, a saturated gate meant the seed returned
-    /// `Ok(Some)` while its refs were silently skipped — scheduler
-    /// marks Completed → builder ENOENTs on the missing closure.
-    ///
-    /// Setup: pre-seed the moka `inflight` slot with a result carrying
-    /// two refs, so the seed call is a cache hit (no permit needed)
-    /// and goes straight to `ensure_references`. cap=1 gate; the one
-    /// permit is held externally, then the semaphore is closed so
-    /// `acquire_bounded` fails INSTANTLY with `Admission(Closed)` —
-    /// same `Admission(_)` propagation arm as production `Saturated`,
-    /// without the 25 s wait (PG + paused-time don't compose here).
-    #[tokio::test]
-    async fn ensure_references_propagates_admission_saturated() {
+    /// Shared setup for the two `ensure_references` admission tests:
+    /// pre-seed the moka `inflight` slot with a result carrying one
+    /// ref, so the seed call is a cache hit (no permit needed) and
+    /// goes straight to `ensure_references`. Upstream config must be
+    /// non-empty so the ref's init future proceeds past the hoisted
+    /// no-upstreams check to `acquire_bounded`.
+    async fn admission_refs_fixture(
+        slug: &str,
+    ) -> (TestDb, Uuid, AdmissionGate, Substituter, String) {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let tid = seed_tenant(&db.pool, "sub-admission-refs").await;
-
-        // Upstream config must be non-empty so the ref's init future
-        // proceeds past the hoisted no-upstreams check to
-        // `acquire_bounded`. The URL is never reached (permit fails
-        // first).
+        let tid = seed_tenant(&db.pool, slug).await;
         metadata::upstreams::insert(
             &db.pool,
             tid,
@@ -2225,18 +2254,11 @@ mod tests {
         )
         .await
         .unwrap();
-
         let gate = AdmissionGate::new(1);
         let sub = test_substituter(db.pool.clone()).with_admission_gate(gate.clone());
-
-        // Seed result: two refs that aren't in PG (fresh DB).
         let seed = rio_test_support::fixtures::test_store_path("adm-seed");
         let ref_a = format!(
             "/nix/store/{}-adm-ref-a",
-            rio_test_support::fixtures::rand_store_hash()
-        );
-        let ref_b = format!(
-            "/nix/store/{}-adm-ref-b",
             rio_test_support::fixtures::rand_store_hash()
         );
         let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
@@ -2245,7 +2267,7 @@ mod tests {
             deriver: String::new(),
             nar_hash: vec![0u8; 32],
             nar_size: 1,
-            references: vec![ref_a, ref_b],
+            references: vec![ref_a],
             registration_time: 0,
             ultimate: false,
             signatures: Vec::new(),
@@ -2255,17 +2277,92 @@ mod tests {
         sub.inflight
             .insert((tid, seed.clone()), Some(Arc::new(info)))
             .await;
+        (db, tid, gate, sub, seed)
+    }
 
-        // Hold the only permit, then close: `acquire_bounded` now
-        // returns `Admission(Closed)` immediately.
+    // r[verify store.substitute.admission]
+    /// `ensure_references` MUST retry `SubstituteError::Admission`
+    /// inline. By the time the closure walk runs, `do_substitute` has
+    /// already persisted the seed to PG, so propagating to the gRPC
+    /// caller is ineffective: their `QueryPathInfo(seed)` retry hits
+    /// `metadata::query_path_info → Some` and never re-enters
+    /// substitution. The inline retry is the only place the closure
+    /// can be completed.
+    ///
+    /// cap=1, the only permit held externally. Paused time so
+    /// `acquire_bounded`'s 25 s queue auto-advances to `Saturated`; a
+    /// spawned task drops the permit at virtual t=+51 s — past two
+    /// 25 s waits + the 250 ms first backoff — so attempts 1-2 see
+    /// `Saturated` and attempt 3 proceeds. Structural assertion is on
+    /// virtual elapsed (≥ 50 s ⇒ ≥ 2 inline retries ran), NOT on the
+    /// ref's eventual outcome: attempt 3's `do_substitute` may fail
+    /// for unrelated reasons (sqlx pool-acquire under auto-advance is
+    /// brittle past two cycles; 127.0.0.1:1 is unreachable anyway),
+    /// but either way the call returns `Ok(Some(seed))` instead of
+    /// propagating — which is exactly the regression bar.
+    ///
+    /// `pause()` is called AFTER PG setup; the first two attempts'
+    /// real-socket PG reads don't trip auto-advance.
+    #[tokio::test]
+    async fn ensure_references_retries_admission_then_succeeds() {
+        let (_db, tid, gate, sub, seed) = admission_refs_fixture("sub-admission-refs-retry").await;
+
+        let held = gate.semaphore().clone().acquire_owned().await.unwrap();
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(51)).await;
+            drop(held);
+        });
+
+        let got = sub.try_substitute(tid, &seed).await;
+        let elapsed = start.elapsed();
+        releaser.await.unwrap();
+        assert!(
+            matches!(got, Ok(Some(_))),
+            "inline retry must absorb transient admission backpressure \
+             instead of propagating; got {got:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(50),
+            "virtual elapsed {elapsed:?} < 50 s ⇒ fewer than 2 \
+             `Saturated` cycles ran — inline retry did not engage"
+        );
+    }
+
+    // r[verify store.substitute.admission]
+    /// After `ENSURE_REFS_ADMISSION_MAX_ATTEMPTS` inline retries
+    /// exhaust, `Admission` propagates as a degraded-mode signal with
+    /// a WARN. Swallowing it would let the seed return `Ok(Some)`
+    /// with refs missing → scheduler marks Completed → builder
+    /// ENOENTs.
+    ///
+    /// `Semaphore::close()` makes every `acquire_bounded` fail
+    /// instantly with `Admission(Closed)` — same `Admission(_)` arm
+    /// as production `Saturated` without the 25 s wait. Real time
+    /// (NOT paused: auto-advance through the backoff sleeps races
+    /// sqlx's pool-acquire timeout, which surfaces as a non-Admission
+    /// `Persist` error and short-circuits the loop). The 4 backoff
+    /// sleeps total 9.25 s wall-clock — slow, but the only way to
+    /// prove all 5 attempts ran without `#[cfg(test)]` const surgery.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn ensure_references_propagates_after_inline_retry_exhausted() {
+        let (_db, tid, gate, sub, seed) =
+            admission_refs_fixture("sub-admission-refs-exhaust").await;
+
         let _held = gate.semaphore().clone().acquire_owned().await.unwrap();
         gate.semaphore().close();
 
         let got = sub.try_substitute(tid, &seed).await;
         assert!(
             matches!(got, Err(SubstituteError::Admission(_))),
-            "closure-walk admission backpressure must propagate, not be \
-             swallowed into Ok(Some); got {got:?}"
+            "exhausted inline retry must propagate Admission, not \
+             swallow into Ok(Some); got {got:?}"
+        );
+        assert!(
+            logs_contain("propagating as degraded-partial"),
+            "exhaustion must WARN that the seed is already persisted"
         );
     }
 
