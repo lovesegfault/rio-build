@@ -103,3 +103,44 @@ impl XtaskConfig {
             .extract::<Self>()?)
     }
 }
+
+#[cfg(test)]
+// figment::Error is 208B, API-fixed — Jail closure signature is set
+// by the library (same allow as rio-test-support's macros).
+#[allow(clippy::result_large_err)]
+mod tests {
+    use super::*;
+
+    /// Regression: with no `RIO_LOG_LEVEL` set, `log_level` must
+    /// resolve to `RIO_DEBUG` (per-crate debug), not empty/"info".
+    /// Live cluster on 2026-04-22 showed `global.logLevel: info`
+    /// despite no flag/env override — this test pins the default.
+    #[test]
+    fn log_level_defaults_to_rio_debug_when_unset() {
+        figment::Jail::expect_with(|jail| {
+            // Other RIO_* vars present (typical `.env.local` shape),
+            // RIO_LOG_LEVEL deliberately absent.
+            jail.set_env("RIO_K8S_PROVIDER", "eks");
+            jail.set_env("RIO_PUBLIC_CIDRS", "192.0.2.1/32");
+            // Exercise the same figment path as load() (minus the
+            // dotenvy side-effect, which Jail can't sandbox).
+            let cfg: XtaskConfig = Figment::new().merge(Env::prefixed("RIO_")).extract()?;
+            assert_eq!(
+                cfg.log_level, RIO_DEBUG,
+                "serde default_log_level should fire when RIO_LOG_LEVEL is unset"
+            );
+            assert_eq!(cfg.tfstate_region, "us-east-2");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_level_honors_explicit_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_LOG_LEVEL", "warn");
+            let cfg: XtaskConfig = Figment::new().merge(Env::prefixed("RIO_")).extract()?;
+            assert_eq!(cfg.log_level, "warn");
+            Ok(())
+        });
+    }
+}

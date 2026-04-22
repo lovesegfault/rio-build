@@ -159,6 +159,18 @@ impl Helm {
         self
     }
 
+    /// Escape a `--set` VALUE for helm's strvals parser. Helm splits
+    /// `--set a=b,c=d` on `,` into separate key=value pairs, so a value
+    /// like `RIO_DEBUG` (`"info,rio_gateway=debug,..."`) silently
+    /// becomes `a=info` plus ignored top-level keys — which is how
+    /// `global.logLevel` ended up as bare `info` in production despite
+    /// xtask defaulting to per-crate debug. Escapes `\` first (so the
+    /// escape char itself round-trips), then `,`. Keys are not escaped
+    /// — every `.set()` caller passes a literal dotted path.
+    fn escape_set_value(v: &str) -> String {
+        v.replace('\\', r"\\").replace(',', r"\,")
+    }
+
     pub fn set_json(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.set_jsons.push((key.into(), val.into()));
         self
@@ -178,8 +190,7 @@ impl Helm {
         self
     }
 
-    pub fn run(self) -> Result<()> {
-        let sh = shell()?;
+    fn into_args(self) -> Vec<String> {
         let mut args = vec![
             "upgrade".into(),
             "--install".into(),
@@ -196,7 +207,10 @@ impl Helm {
             args.extend(["-f".into(), v]);
         }
         for (k, v) in self.sets {
-            args.extend(["--set".into(), format!("{k}={v}")]);
+            args.extend([
+                "--set".into(),
+                format!("{k}={}", Self::escape_set_value(&v)),
+            ]);
         }
         for (k, v) in self.set_jsons {
             args.extend(["--set-json".into(), format!("{k}={v}")]);
@@ -211,6 +225,12 @@ impl Helm {
         if self.no_hooks {
             args.push("--no-hooks".into());
         }
+        args
+    }
+
+    pub fn run(self) -> Result<()> {
+        let sh = shell()?;
+        let args = self.into_args();
         sh::run_sync(cmd!(sh, "helm {args...}"))
     }
 }
@@ -240,7 +260,42 @@ pub fn history(release: &str, namespace: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Revision;
+    use super::{Helm, Revision};
+    use crate::config::RIO_DEBUG;
+
+    /// Regression for the `global.logLevel=info` production drift:
+    /// `RIO_DEBUG` contains commas, and an unescaped `--set k=v` lets
+    /// helm split on them, truncating the value to `info`.
+    #[test]
+    fn set_escapes_commas_for_rio_debug() {
+        let args = Helm::upgrade_install("rio", "chart")
+            .set("global.logLevel", RIO_DEBUG)
+            .into_args();
+        let set_arg = args
+            .iter()
+            .position(|a| a == "--set")
+            .map(|i| args[i + 1].as_str())
+            .unwrap();
+        assert!(
+            set_arg.starts_with(r"global.logLevel=info\,rio_gateway=debug\,"),
+            "got: {set_arg}"
+        );
+        // Every comma is escaped: stripping `\,` leaves none.
+        assert!(!set_arg.replace(r"\,", "").contains(','));
+    }
+
+    #[test]
+    fn set_passthrough_for_plain_values() {
+        let args = Helm::upgrade_install("rio", "chart")
+            .set("global.image.tag", "745efb0a")
+            .into_args();
+        assert!(args.contains(&"global.image.tag=745efb0a".into()));
+    }
+
+    #[test]
+    fn escape_backslash_before_comma() {
+        assert_eq!(Helm::escape_set_value(r"a\,b"), r"a\\\,b");
+    }
 
     fn rev(secs_ago: i64) -> Revision {
         Revision {
