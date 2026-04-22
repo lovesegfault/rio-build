@@ -692,7 +692,7 @@
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #   vm-security-nonpriv-k3s — privileged-hardening e2e
           #   vm-cli-k3s — rio-cli integration
-          #   vm-dashboard-k3s, vm-dashboard-gateway-k3s — gRPC-Web + envoy
+          #   vm-dashboard-k3s — gRPC-Web via Gateway + nginx
           #   vm-netpol-k3s — NetworkPolicy enforcement
           #
           # mkVmTests: build the attrset for a given (workspace,
@@ -786,9 +786,7 @@
                 # k3s nonpriv e2e (base_runtime_spec /dev/fuse +
                 # cgroup rw-remount).
                 vm-security-nonpriv-k3s = 8;
-                # k3s + Cilium Gateway API (+cilium-envoy image). No builds.
-                vm-dashboard-gateway-k3s = 8;
-                # Same fixture + rio-dashboard nginx image. curl via
+                # k3s + Cilium Gateway API + rio-dashboard nginx. curl via
                 # nginx → Cilium Gateway → scheduler (tonic-web).
                 vm-dashboard-k3s = 8;
                 # k3s base fixture. rio-cli AdminService smoke.

@@ -818,7 +818,7 @@ rec {
       pkgs.nginx
       rioDashboard
       # busybox+curl for from-pod gRPC-Web test assertions
-      # (vm-dashboard-gateway-k3s exec's into this pod to curl the
+      # (vm-dashboard-k3s exec's into this pod to curl the
       # cilium-gateway Service from pod-netns — Cilium's selectorless
       # per-Gateway Service has no host-netns reachability path).
       pkgs.busybox

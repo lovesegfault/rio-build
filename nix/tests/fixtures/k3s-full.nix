@@ -9,9 +9,10 @@
 # Topology mirrors EKS (v6-only private subnets + NLB + NAT64):
 #   k3s-server (8GB) + k3s-agent (6GB) — v6-only k8s nodes
 #   edge (512MB)                       — dual-stack: Jool NAT64 + socat v4→v6
-#   client-v6 / client-v4 (1GB each)   — single-family SSH users
-#   upstream-v6 / upstream-v4 (512MB)  — single-family http.server :8080
-# ~18GB total (normal), ~22GB coverage — use withMinCpu 8 in flake.nix.
+#   client-v6 (1GB)                    — v6-only SSH user (aliased `client`)
+#   upstream-v6 (512MB)                — v6-only http.server :8080
+#   client-v4 + upstream-v4 (1.5GB)    — only with `withV4Nodes = true`
+# ~16.5GB base (normal), ~18GB +v4, ~22GB coverage — withMinCpu 8.
 #
 # Airgapped: every image preloaded via services.k3s.images on BOTH
 # nodes (pods can schedule on either). NodePort gateway → client
@@ -137,6 +138,11 @@ in
   # — the Gateway is plain HTTP routing. ~400MB extra image; only
   # enable for dashboard-specific scenarios.
   gatewayEnabled ? false,
+  # client-v4 + upstream-v4 nodes (~1.5GB total) for the NAT64/DNS64
+  # ingress/egress path. Only ingress-v4v6 + fetcher-split touch them;
+  # everything else uses the v6-direct path via the `client = client_v6`
+  # alias in waitReady.
+  withV4Nodes ? false,
 }:
 let
   ciliumRender = mkCiliumRender gatewayEnabled;
@@ -586,9 +592,9 @@ let
               dns64.override: |
                 dns64 64:ff9b::/96
               test-vms.server: |
-                upstream-v4 upstream-v6 edge {
+                ${pkgs.lib.optionalString withV4Nodes "upstream-v4 "}upstream-v6 edge {
                   hosts {
-                    ${nodes.upstream-v4.networking.primaryIPAddress} upstream-v4
+                    ${pkgs.lib.optionalString withV4Nodes "${nodes.upstream-v4.networking.primaryIPAddress} upstream-v4"}
                     ${nodes.upstream-v6.networking.primaryIPv6Address} upstream-v6
                     ${nodes.edge.networking.primaryIPv6Address} edge
                   }
@@ -726,6 +732,9 @@ rec {
       gatewayUser = "rio";
       addressFamily = "v6";
     };
+    upstream-v6 = common.mkUpstreamNode { addressFamily = "v6"; };
+  }
+  // pkgs.lib.optionalAttrs withV4Nodes {
     # v4 client → edge:22 socat → gateway NodePort over v6 (proves
     # r[gw.ingress.v4-via-nat]). gatewayHost="edge" so mkClientNode's
     # ssh_config routes ssh-ng://edge to the proxy.
@@ -735,7 +744,6 @@ rec {
       gatewayUser = "rio";
       addressFamily = "v4";
     };
-    upstream-v6 = common.mkUpstreamNode { addressFamily = "v6"; };
     upstream-v4 = common.mkUpstreamNode { addressFamily = "v4"; };
   };
 
@@ -847,7 +855,7 @@ rec {
 
     # ── Infra nodes up ──────────────────────────────────────────────
     edge.wait_for_unit("jool-nat64-default.service")
-    upstream_v4.wait_for_unit("upstream-http.service")
+    ${pkgs.lib.optionalString withV4Nodes ''upstream_v4.wait_for_unit("upstream-http.service")''}
     upstream_v6.wait_for_unit("upstream-http.service")
 
     # ── Both k3s units running ──────────────────────────────────────

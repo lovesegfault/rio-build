@@ -4,7 +4,7 @@
 # Gateway envoy. gRPC-Web translation is in-process at rio-scheduler
 # (tonic-web layer, D3) — the Gateway is plain HTTP/2 routing. Two
 # curl assertions direct-to-scheduler (r[verify dash.envoy.grpc-web-
-# translate] at default.nix:vm-dashboard-gateway-k3s):
+# translate] at default.nix:vm-dashboard-k3s):
 #
 #   1. Unary ClusterStatus: DATA frame starts 0x00 (compression flag 0)
 #   2. Server-streaming GetBuildLogs: trailer frame has 0x80 byte
@@ -24,15 +24,18 @@
   pkgs,
   common,
   fixture,
+  withDashboardCurls ? false,
 }:
 let
   inherit (fixture) ns;
+  dashboardCurls = import ./dashboard.nix { inherit pkgs ns; };
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-dashboard-gateway";
+  name = "rio-dashboard";
   skipTypeCheck = true;
 
-  # Bring-up ~4min + Cilium Gateway reconcile ~30s + curl <10s.
+  # Bring-up ~4min + Cilium Gateway reconcile ~30s + curl <10s
+  # (+nginx subtests ~90s when withDashboardCurls).
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
@@ -166,6 +169,8 @@ pkgs.testers.runNixOSTest {
             raise
         finally:
             k3s_server.execute("kill $(cat /tmp/pf-sched.pid) 2>/dev/null || true")
+
+    ${pkgs.lib.optionalString withDashboardCurls dashboardCurls}
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

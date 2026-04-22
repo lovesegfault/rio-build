@@ -26,6 +26,8 @@ let
   trivialV6 = drvs.mkTrivial { marker = "ingress-v6-direct"; };
   trivialV4 = drvs.mkTrivial { marker = "ingress-v4-via-edge"; };
 
+  ciliumEncrypt = import ./cilium-encrypt.nix { inherit pkgs; };
+
   curl = "${pkgs.curl}/bin/curl";
   dig = "${pkgs.dnsutils}/bin/dig";
 in
@@ -33,7 +35,8 @@ pkgs.testers.runNixOSTest {
   name = "rio-ingress-v4v6";
   skipTypeCheck = true;
 
-  # k3s bring-up ~4min + two trivial builds + a handful of curl probes.
+  # k3s bring-up ~4min + cilium-encrypt assertions ~10s + two trivial
+  # builds + a handful of curl probes.
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
@@ -46,6 +49,11 @@ pkgs.testers.runNixOSTest {
       # it manually below.
       withSsh = false;
     }}
+
+    # ══════════════════════════════════════════════════════════════════
+    # cilium WireGuard + NodePort GUA-v6 (post-waitReady assertions)
+    # ══════════════════════════════════════════════════════════════════
+    ${ciliumEncrypt}
 
     # ══════════════════════════════════════════════════════════════════
     # SSH key setup — both clients share one authorized_keys Secret

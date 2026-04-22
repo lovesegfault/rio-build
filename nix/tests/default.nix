@@ -51,9 +51,7 @@ let
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
-  dashboard = import ./scenarios/dashboard.nix;
   netpol = import ./scenarios/netpol.nix;
-  cilium-encrypt = import ./scenarios/cilium-encrypt.nix;
   ingress-v4v6 = import ./scenarios/ingress-v4v6.nix;
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
@@ -616,6 +614,13 @@ in
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
+      # r[verify ctrl.pool.reconcile]
+      # r[verify ctrl.crd.pool]
+      #   pool-lifecycle: apply Pool CRD → wait status → delete
+      #   --wait=false. Non-disruptive (no shared-state interference
+      #   with the subtests above), so it folds into core rather than
+      #   paying a separate k3s boot.
+      "pool-lifecycle"
     ];
   };
 
@@ -645,8 +650,8 @@ in
       # Pool first so it doesn't steal dispatch.
       "ephemeral-pool"
     ];
-    # ephemeral ~180s.
-    globalTimeout = 1400;
+    # ephemeral ~180s + ~240s k3s bring-up ≈ 420s expected.
+    globalTimeout = 700;
   };
 
   #
@@ -716,15 +721,6 @@ in
         "store.substituteAdmissionPermits" = 1;
       };
     };
-  };
-
-  vm-lifecycle-pool-k3s = lifecycleMod.mkTest {
-    name = "pool";
-    subtests = [
-      # r[verify ctrl.pool.reconcile]
-      # r[verify ctrl.crd.pool]
-      "pool-lifecycle"
-    ];
   };
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
@@ -798,9 +794,16 @@ in
   #   works through the nginx→Cilium Gateway→scheduler chain. Handler
   #   returns errors as in-stream items (not tonic Trailers-Only) so
   #   tonic-web encodes them as 0x80 body frames browser fetch can read.
-  vm-dashboard-gateway-k3s = dashboard-gateway {
+  #
+  #   Appended (when `dockerImages ? dashboard`): the nginx-pod curl
+  #   assertions from dashboard.nix — SPA served + try_files fallback
+  #   + gRPC-Web 0x00/0x80 THROUGH nginx + method-gate 404. Coverage
+  #   mode (no rio-dashboard image) runs the gateway/EDS/tonic-web
+  #   subtests only; the nginx pod is absent so its curls are skipped.
+  vm-dashboard-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull { gatewayEnabled = true; };
+    withDashboardCurls = dockerImages ? dashboard;
   };
 
   # Builder + store egress NetworkPolicy: IMDS + public internet + k8s
@@ -826,28 +829,21 @@ in
     };
   };
 
-  # Cilium WireGuard transparent encryption: cilium_wg0 peers + encrypt
-  # status on both nodes. Data-plane property the security model leans
-  # on (rio components speak plaintext gRPC). Also asserts the GUA-v6 NodePort
-  # frontend exists (regression guard for the EKS NLB RST bug — auto-
-  # detect skips global-unicast; in-cluster tests are socket-LB false
-  # positives).
-  # r[verify sec.transport.cilium-wireguard]
-  vm-cilium-encrypt-k3s = cilium-encrypt {
-    inherit pkgs common;
-    fixture = k3sFull { };
-  };
-
   # 2×2 ingress/egress on the v6-only k3s fixture. client-v6 → NodePort
   # direct, client-v4 → edge:22 socat → NodePort over v6; both nix-build
   # over ssh-ng. Then egress: k3s host reaches upstream-v4 via 64:ff9b::
   # (Jool), pod resolves upstream-v4 → 64:ff9b:: AAAA (CoreDNS dns64).
   # ~6min (k3s bring-up + two trivial builds + curl probes).
+  #
+  # Prepended: cilium WireGuard encrypt + GUA-v6 NodePort frontend
+  # (regression guard for the EKS NLB RST bug). ~10s of post-waitReady
+  # assertions on the same bare k3sFull{} — folded in to save a boot.
+  # r[verify sec.transport.cilium-wireguard]
   # r[verify gw.ingress.v6-direct]
   # r[verify gw.ingress.v4-via-nat]
   vm-ingress-v4v6-k3s = ingress-v4v6 {
     inherit pkgs common;
-    fixture = k3sFull { };
+    fixture = k3sFull { withV4Nodes = true; };
   };
 
   # ADR-019 builder/fetcher split end-to-end. FIRST test running both
@@ -901,6 +897,7 @@ in
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
+      withV4Nodes = true;
       extraValues = {
         "networkPolicy.enabled" = "true";
         "nixConf.hashedMirrors" = "http://upstream-v4/";
@@ -964,28 +961,5 @@ in
       #   bootstrap-job-ran since both exercise prod-config-only.
       "bootstrap-tenant"
     ];
-  };
-}
-# r[verify dash.journey.build-to-logs]
-#   nginx → Envoy Gateway → scheduler chain end-to-end. Four curl
-#   assertions against the rio-dashboard Service (the nginx pod the
-#   browser actually talks to, not the envoy Service directly):
-#     SPA served (id="app") + SPA routing fallback (try_files) +
-#     unary gRPC-Web 0x00 + streaming 0x80 trailer THROUGH nginx's
-#     proxy_buffering-off location block.
-#   vm-dashboard-gateway-k3s proves the envoy half; this proves the
-#   nginx half AND the full chain. ~6min (same fixture cost).
-#
-# optionalAttrs gate: dockerImages.dashboard doesn't exist in
-# coverage mode (mkDockerImages passes rioDashboard=null → docker.nix
-# elides the attr). Gating the scenario registration on `?` keeps
-# vmTestsCov consistent — the coverage pipeline never sees this test,
-# perTestLcov doesn't include it, codecov after_n_builds stays at
-# its current count. (The nginx pod has no LLVM instrumentation
-# anyway — coverage would yield zero profraws.)
-// pkgs.lib.optionalAttrs (dockerImages ? dashboard) {
-  vm-dashboard-k3s = dashboard {
-    inherit pkgs common;
-    fixture = k3sFull { gatewayEnabled = true; };
   };
 }
