@@ -58,74 +58,37 @@ let
   # Clippy wrapper
   # ──────────────────────────────────────────────────────────────────
   #
-  # buildRustCrate's lib.sh hardcodes `--cap-lints allow` (line 18 +
-  # 55). rustc treats --cap-lints as non-overridable (later
-  # occurrences are ignored — verified empirically: `rustc ...
-  # --cap-lints allow --cap-lints warn` ≡ `--cap-lints allow`).
+  # buildRustCrate has no "use clippy-driver instead of rustc" knob,
+  # so we substitute one via the `rust` override. clippy-driver IS
+  # rustc internally (it calls rustc_driver with extra lint passes),
+  # so the rlib output is compatible with deps built by regular rustc
+  # — same rmeta format, same metadata hash machinery. Dependencies
+  # stay on regular rustc (cached, capped); only workspace members
+  # get this via .override.
   #
-  # To run clippy on workspace members without patching lib.sh, we
-  # wrap clippy-driver in a fake "rustc" that strips `--cap-lints
-  # allow` before forwarding. clippy-driver IS rustc internally (it
-  # calls rustc_driver with extra lint passes), so the rlib output is
-  # compatible with deps built by regular rustc — same rmeta format,
-  # same metadata hash machinery.
-  #
-  # Dependencies stay on regular rustc (cached, --cap-lints allow —
-  # we don't want a transitive dep's clippy pedantry blocking the
-  # build). Only workspace members get this wrapper via .override.
-  #
-  # The wrapper also needs rustc itself in PATH because clippy-driver
-  # resolves the sysroot from `rustc --print sysroot` at startup.
-  # symlinkJoin bin/ with BOTH rustc (real) and cargo from the stable
-  # toolchain, then override the rustc name with the wrapper script.
-  # runCommand is simpler than wrapProgram here because we need the
-  # arg-filtering logic, not just env injection.
+  # The wrapper needs the real toolchain in PATH because clippy-driver
+  # resolves the sysroot from `rustc --print sysroot` at startup, and
+  # buildRustCrate's configure phase calls `cargo metadata`. Symlink
+  # the full bin/ then replace the `rustc` name with the wrapper.
   clippyRustc = pkgs.runCommand "clippy-rustc-wrapper" { } ''
     mkdir -p $out/bin
-    # Real binaries first: clippy-driver's sysroot resolution calls
-    # `rustc --print sysroot`, and buildRustCrate's configure phase
-    # calls `cargo metadata`. Symlinking preserves the $out/lib
-    # relative lookup those binaries do.
     ln -s ${rustStable}/bin/* $out/bin/
-    # Now override rustc with the wrapper. rm -f in case the star
-    # glob already linked a `rustc` (it will — rustStable/bin has it).
     rm -f $out/bin/rustc
     cat > $out/bin/rustc <<'EOF'
     #!${pkgs.runtimeShell}
-    # Strip --cap-lints and its argument. buildRustCrate's lib.sh
-    # hardcodes `--cap-lints allow`; clippy can't fire through that.
-    # We re-inject `--cap-lints warn` at the end so clippy lints fire
-    # as warnings (which -Dwarnings in extraRustcOpts then promotes
-    # to errors for workspace members only).
-    #
-    # buildRustCrate also passes a build-script compilation through
-    # this same `rustc` — we DON'T want clippy on build.rs (it's
-    # build-time throwaway, often auto-generated). Detect via
-    # --crate-name build_script_build and fall through to real rustc.
-    args=()
-    skip_next=0
-    is_build_script=0
+    # build.rs gets real rustc (no clippy — build-time throwaway, often
+    # auto-generated). Everything else gets clippy-driver. The member
+    # override sets `capLints = "forbid"`, so lib.sh emits
+    # `--cap-lints forbid` and -Dwarnings (extraRustcOpts) fires.
+    # build.rs does NOT receive extraRustcOpts (buildRustCrate has a
+    # separate extraRustcOptsForBuildRs we don't set), so it just gets
+    # rustc defaults — warnings are warnings, no failure.
     for arg in "$@"; do
-      if [[ "$skip_next" == 1 ]]; then skip_next=0; continue; fi
-      if [[ "$arg" == "--cap-lints" ]]; then skip_next=1; continue; fi
-      if [[ "$arg" == "build_script_build" ]]; then is_build_script=1; fi
-      args+=("$arg")
+      if [[ "$arg" == "build_script_build" ]]; then
+        exec ${rustStable}/bin/rustc "$@"
+      fi
     done
-    if [[ "$is_build_script" == 1 ]]; then
-      # Build scripts: no clippy. Restore the cap-lints allow that
-      # lib.sh intended — build.rs often has #[allow]-style noise
-      # that's not worth linting.
-      exec ${rustStable}/bin/rustc "''${args[@]}" --cap-lints allow
-    fi
-    # Library/binary: clippy, NO cap. Workspace members get
-    # `-Dwarnings` via extraRustcOpts which promotes all warnings
-    # (including clippy's) to errors. cap-lints=warn would
-    # DOWNGRADE those back to warnings (rc=0 even with lints) —
-    # verified empirically. We strip the cap entirely so
-    # -Dwarnings takes effect. This wrapper only runs on workspace
-    # members (deps use regular rustc, already cap-lints=allow from
-    # lib.sh), so no cap = "treat our own code strictly."
-    exec ${rustStable}/bin/clippy-driver "''${args[@]}"
+    exec ${rustStable}/bin/clippy-driver "$@"
     EOF
     chmod +x $out/bin/rustc
   '';
@@ -133,19 +96,13 @@ let
   # Lint flags for workspace members. Together with clippyTestMember
   # below, matches `cargo clippy --all-targets -- --deny warnings`:
   # clippyMember lints lib/bin, clippyTestMember lints #[cfg(test)]
-  # and tests/*.rs. The workspace Cargo.toml [lints]
-  # table is NOT read by buildRustCrate (cargo construct); lints must
-  # be passed as rustc flags directly.
-  #
-  # -Dwarnings promotes all warn-level lints to errors. clippy::all is
-  # the default lint group (style, complexity, correctness, perf,
-  # suspicious). pedantic/nursery stay advisory-only.
+  # and tests/*.rs. -Dwarnings promotes all warn-level lints to
+  # errors. clippy::all is the default lint group (style, complexity,
+  # correctness, perf, suspicious). pedantic/nursery stay
+  # advisory-only.
   clippyFlags = [
     "-Dwarnings"
     "-Wclippy::all"
-    # Individual lints that the workspace [lints.rust] table would set
-    # (buildRustCrate doesn't read Cargo.toml [lints]). Keep in sync
-    # with the workspace Cargo.toml lint config if one exists.
   ];
 
   # ──────────────────────────────────────────────────────────────────
@@ -275,13 +232,14 @@ let
   devDepsForCov = mkDevDepsFor crateBuildCov.cargoNix;
 
   # Clippy check: rebuild the member with clippy-driver as "rustc".
-  # The wrapper strips --cap-lints allow, re-injects --cap-lints warn,
-  # and -Dwarnings in extraRustcOpts promotes findings to errors.
-  # Deps are untouched (regular rustc, cached).
+  # `capLints = "forbid"` lifts buildRustCrate's default `allow` cap
+  # so -Dwarnings takes effect. Deps are untouched (regular rustc,
+  # cached, still capped at allow).
   clippyMember =
     _name: base:
     (base.override {
       rust = clippyRustc;
+      capLints = "forbid";
       extraRustcOpts = clippyFlags;
     }).overrideAttrs
       (old: {
@@ -322,16 +280,6 @@ let
     )).overrideAttrs
       (old: {
         name = "${old.name}-${suffix}";
-        # Cargo sets CARGO_BIN_EXE_<bin> for integration tests so they
-        # can `env!("CARGO_BIN_EXE_foo")` the crate's own binary.
-        # buildRustCrate doesn't — the test build (buildTests=true)
-        # produces only test harnesses, not the bin target. Point at
-        # `base` (the non-test build) which DOES have $out/bin/<name>.
-        # Hyphenated attr names become env vars fine (POSIX allows
-        # them; only bash's $VAR syntax rejects hyphens, and rustc
-        # reads env directly). Lib-only crates get a dangling path
-        # here — harmless, nothing reads it.
-        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
   testMember = mkTestVariant {
@@ -348,6 +296,7 @@ let
     devDeps = devDepsFor;
     extraOverride = {
       rust = clippyRustc;
+      capLints = "forbid";
       extraRustcOpts = clippyFlags;
     };
   };
@@ -393,9 +342,6 @@ let
   # crate2nix.nix. devDepsForCov (defined alongside devDepsFor above)
   # dereferences crateBuildCov's builtCrates so instrumented rlibs
   # link together.
-  #
-  # `base` for this variant is the instrumented build (crateBuildCov
-  # tree), so the CARGO_BIN_EXE_ subprocess emits profraws too.
   covTestMember = mkTestVariant {
     suffix = "cov-test";
     devDeps = devDepsForCov;
