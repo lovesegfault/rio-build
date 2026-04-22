@@ -147,7 +147,32 @@ scope: with scope; ''
       # → NOT a cache hit. Proves dispatch is unblocked AFTER the
       # lease re-acquire + recover_from_pg sequence (if recovery
       # failed or never ran, dispatch_ready stays false forever).
-      out_recovery = build("${recoveryDrv}", capture_stderr=False).strip()
+      #
+      # wait_until_succeeds (not one-shot build()): each nix-build is
+      # a FRESH SSH connect → gateway runs resolve_and_mint() per
+      # connection. Its scheduler client is a BalancedChannel that
+      # health-probes rio.scheduler.SchedulerService every
+      # DEFAULT_PROBE_INTERVAL=3s and only routes to SERVING (=
+      # is_leader, see spawn_health_toggle). During the failover gap
+      # the old leader is gone, the standby reports NOT_SERVING, and
+      # the replacement is not yet probed → 0 endpoints →
+      # resolve_and_mint times out (500ms). With jwt.required=false
+      # the gateway DEGRADES to tokenless (rio_gateway_jwt_mint_
+      # degraded_total++); the JWT-mode scheduler then rejects
+      # SubmitBuild with Unauthenticated. The very next 3s probe tick
+      # discovers the new leader and the next connect mints fine.
+      # 30s budget covers ≤2 probe ticks + nix-build dispatch (~15s).
+      #
+      # Structural (convergence wait), not retry-on-error: same
+      # pattern as sched_metric_wait above. The probe-interval gap is
+      # the only window; a sustained mint failure exhausts 30s and
+      # raises.
+      out_recovery = client.wait_until_succeeds(
+          "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
+          "--arg busybox '(builtins.storePath ${common.busybox})' "
+          "${recoveryDrv}",
+          timeout=30,
+      ).strip()
       assert out_recovery.startswith("/nix/store/"), (
           f"post-recovery build should succeed: {out_recovery!r}"
       )
