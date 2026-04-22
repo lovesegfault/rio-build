@@ -96,19 +96,19 @@ async fn test_query_path_info_exists() -> anyhow::Result<()> {
 }
 
 // r[verify gw.store.transient-retry]
-/// Store returns `ResourceExhausted` for the first 2 attempts (modelling
+/// Store returns `ResourceExhausted` for the first attempt (modelling
 /// `r[store.substitute.admission]` saturation), then succeeds. Gateway's
-/// `grpc_query_path_info` retry absorbs both → client sees a normal
+/// `grpc_query_path_info` single retry absorbs it → client sees a normal
 /// `valid=true` response, not `STDERR_ERROR`.
 #[tokio::test(start_paused = true)]
 async fn test_query_path_info_retries_transient_resource_exhausted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.store.seed_with_content(TEST_PATH_A, b"retry-me");
-    // First 2 per-path attempts → ResourceExhausted; 3rd → real PathInfo.
+    // First per-path attempt → ResourceExhausted; 2nd → real PathInfo.
     h.store
         .faults
         .fail_qpi_resource_exhausted_per_path_n
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+        .store(1, std::sync::atomic::Ordering::SeqCst);
 
     wire_send!(&mut h.stream;
         u64: 26,                            // wopQueryPathInfo
@@ -119,7 +119,7 @@ async fn test_query_path_info_retries_transient_resource_exhausted() -> anyhow::
     let valid = wire::read_bool(&mut h.stream).await?;
     assert!(valid, "transient RE should be retried → valid=true");
 
-    // Structural: gateway hit the store exactly 3 times (2 RE + 1 ok).
+    // Structural: gateway hit the store exactly 2 times (1 RE + 1 ok).
     let attempts = *h
         .store
         .calls
@@ -128,7 +128,7 @@ async fn test_query_path_info_retries_transient_resource_exhausted() -> anyhow::
         .unwrap()
         .get(TEST_PATH_A)
         .unwrap();
-    assert_eq!(attempts, 3, "2 transient failures + 1 success");
+    assert_eq!(attempts, 2, "1 transient failure + 1 success");
 
     h.finish().await;
     Ok(())

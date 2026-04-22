@@ -13,7 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, error, info, instrument, warn};
 
 use super::grpc::{
-    grpc_is_valid_path, grpc_query_path_info, grpc_query_realisation, resolve_floating_outputs,
+    grpc_get_path, grpc_is_valid_path, grpc_query_path_info, grpc_query_realisation,
+    resolve_floating_outputs,
 };
 use super::{PROGRAM_NAME, SessionContext, read_store_path, with_jwt};
 use crate::drv_cache::resolve_derivation;
@@ -347,42 +348,15 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     // copyNAR() with a truncated NAR and no way to signal the error (it's
     // already past the stderr loop). The Nix protocol has no framing for
     // this opcode — raw NAR bytes follow STDERR_LAST directly — so buffering
-    // is the only correct behavior.
-    let req = with_jwt(
-        types::GetPathRequest {
-            store_path: path.to_string(),
-            manifest_hint: None,
-        },
-        jwt_unless_drv(jwt_token, &path),
-    )?;
-    let mut stream =
-        match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req)).await {
-            Ok(Ok(resp)) => resp.into_inner(),
-            Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
-                stderr_err!(stderr, "path '{path_str}' is not valid");
-            }
-            Ok(Err(e)) => stderr_err!(stderr, "gRPC GetPath failed: {e}"),
-            Err(_) => stderr_err!(
-                stderr,
-                "gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"
-            ),
-        };
-
-    // Per-chunk idle timeout: DEFAULT_GRPC_TIMEOUT above only bounds
-    // obtaining the Streaming handle, not the per-message reads. h2
-    // keepalive PINGs are answered transport-side regardless of
-    // application progress, and OPCODE_IDLE_TIMEOUT covers only
-    // inter-opcode reads — without this, a store stalled mid-stream
-    // holds ≤4 GiB of buffered NAR + the SSH session indefinitely.
-    let (_info, nar_data) = match rio_proto::client::collect_nar_stream(
-        &mut stream,
-        rio_common::limits::MAX_NAR_SIZE,
-        Some(rio_common::grpc::GRPC_STREAM_TIMEOUT),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => stderr_err!(stderr, "gRPC GetPath for {path_str}: {e}"),
+    // is the only correct behavior. `grpc_get_path` retries transient
+    // status (`r[gw.store.transient-retry]`) and applies
+    // GRPC_STREAM_TIMEOUT per-chunk so a stalled store can't pin
+    // ≤4 GiB of buffered NAR + the SSH session indefinitely.
+    let jwt = jwt_unless_drv(jwt_token, &path);
+    let nar_data = match grpc_get_path(store_client, jwt, path.as_str()).await {
+        Ok(Some((_info, nar))) => nar,
+        Ok(None) => stderr_err!(stderr, "path '{path_str}' is not valid"),
+        Err(e) => stderr_err!(stderr, "{e}"),
     };
 
     // STDERR_LAST first, then raw NAR bytes. Client's copyNAR reads until

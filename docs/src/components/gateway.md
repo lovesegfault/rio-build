@@ -815,11 +815,13 @@ r[gw.store.transient-retry]
 Gateway→store RPCs that traverse `r[store.substitute.admission]`
 (`QueryPathInfo`, `GetPath`) MUST retry on transient gRPC status
 (`ResourceExhausted`, `Unavailable`, `Unknown`, `Aborted` per
-`rio_common::grpc::is_transient`). Retry budget is bounded: 3 attempts,
-250 ms base ×4 backoff (≤ ~5 s total). Gateway clients are interactive;
-a sustained overload should surface to the user rather than block
-indefinitely. Non-transient status (`NotFound`, `Internal`,
-`DeadlineExceeded`) surfaces on the first attempt.
+`rio_common::grpc::is_transient`). Retry budget is 2 attempts (one
+retry). Under sustained admission saturation each attempt blocks
+`SUBSTITUTE_ADMISSION_WAIT` (25 s) server-side, so worst-case latency
+before surfacing to the user is ~50 s — bounded, but operators should
+treat sustained `RESOURCE_EXHAUSTED` here as a scaling signal.
+Non-transient status (`NotFound`, `Internal`, `DeadlineExceeded`)
+surfaces on the first attempt.
 
 r[gw.put.aborted-retry]
 The buffered `grpc_put_path` helper (used by `wopAddToStore`, `wopAddTextToStore`, and the `.drv`-buffered branch of `wopAddToStoreNar`/`wopAddMultipleToStore`) MUST retry on store `Code::Aborted` up to `PUT_PATH_ABORTED_MAX_ATTEMPTS` (8) with full-jitter exponential backoff (50 ms base, ×2, 2 s cap → ≤ ~6 s total budget). The store returns `Aborted` when another upload holds the placeholder row for the same path (I-068) or on PG serialization conflicts. Each retry rebuilds the request stream from the `Arc<[u8]>`-held NAR without copying. Emits `rio_gateway_putpath_aborted_retries_total{attempt}` per retry. The streaming `grpc_put_path_streaming` helper is **not** retried on `Aborted` — its reader is consumed and the bytes were forwarded as they arrived, so there is nothing to replay; in practice that path only fires for oversize non-`.drv` entries where the I-068 collision case does not apply.

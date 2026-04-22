@@ -52,8 +52,9 @@ pub fn should_chunk(
 /// `put_chunked` calls run at once; this bounds fan-out WITHIN one.
 /// `substitute_admission_permits × this` is the per-replica in-flight
 /// PutObject ceiling — keep it under the aws-sdk's ~1024 connection
-/// pool with headroom. 8 keeps `admission(≤256) × 8 = 2048` ceiling
-/// reasonable; at the helm-default `admission=64` that's 512.
+/// pool with headroom. At helm-default `pg_max=20` → admission=64 →
+/// 64×8=512. Operators raising admission past ~128 should lower this
+/// proportionally.
 ///
 /// Unbounded fan-out on large NARs (python3: 374 MB → ~1900 chunks)
 /// saturates the pool → `DispatchFailure` cascades → substitution

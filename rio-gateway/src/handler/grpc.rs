@@ -22,12 +22,16 @@ use tonic::transport::Channel;
 use super::{GatewayError, attach_service_token, jwt_metadata, with_jwt};
 use crate::translate;
 
-/// Max attempts + backoff for [`retry_transient`]. 250 ms base, ×4, 4 s
-/// cap, ±25% jitter. 3 attempts → ≤ ~1.25 s of sleep (250 ms + 1 s) +
-/// 3 RPCs. Gateway clients are interactive (`nix copy`, IFD evals), so
-/// the retry budget is short — sustained `r[store.substitute.admission]`
-/// saturation past ~5 s should surface to the user, not block.
-const STORE_TRANSIENT_MAX_ATTEMPTS: u32 = 3;
+/// Max attempts + backoff for [`transient_retry_after`]. 250 ms base,
+/// ×4, 4 s cap, ±25% jitter. Retry budget is 2 attempts (one retry).
+/// Under sustained admission saturation each attempt blocks
+/// `SUBSTITUTE_ADMISSION_WAIT` (25 s) server-side, so worst-case
+/// latency before surfacing to the user is ~50 s — bounded, but
+/// operators should treat sustained `RESOURCE_EXHAUSTED` here as a
+/// scaling signal. Gateway clients are interactive (`nix copy`, IFD
+/// evals); the single retry covers transient blips without masking
+/// genuine overload.
+const STORE_TRANSIENT_MAX_ATTEMPTS: u32 = 2;
 const STORE_TRANSIENT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
     base: std::time::Duration::from_millis(250),
     mult: 4.0,
