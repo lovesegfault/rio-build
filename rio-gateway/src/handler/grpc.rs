@@ -22,20 +22,93 @@ use tonic::transport::Channel;
 use super::{GatewayError, attach_service_token, jwt_metadata, with_jwt};
 use crate::translate;
 
+/// Max attempts + backoff for [`retry_transient`]. 250 ms base, ×4, 4 s
+/// cap, ±25% jitter. 3 attempts → ≤ ~1.25 s of sleep (250 ms + 1 s) +
+/// 3 RPCs. Gateway clients are interactive (`nix copy`, IFD evals), so
+/// the retry budget is short — sustained `r[store.substitute.admission]`
+/// saturation past ~5 s should surface to the user, not block.
+const STORE_TRANSIENT_MAX_ATTEMPTS: u32 = 3;
+const STORE_TRANSIENT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(250),
+    mult: 4.0,
+    cap: std::time::Duration::from_secs(4),
+    jitter: rio_common::backoff::Jitter::Proportional(0.25),
+};
+
+/// `Some(delay)` if `status` is transient (per
+/// [`rio_common::grpc::is_transient`]) and `attempt <
+/// STORE_TRANSIENT_MAX_ATTEMPTS`; `None` if the caller should surface
+/// the error. Logs the retry/surface decision. Shared by
+/// [`grpc_query_path_info`] and [`grpc_get_path`] — both traverse
+/// `r[store.substitute.admission]` server-side, which returns
+/// `ResourceExhausted` after its bounded wait under saturation. The
+/// scheduler already retries this (`r[sched.substitute.detached]`);
+/// without it the gateway surfaced a hard `STDERR_ERROR` → client sees
+/// "store error: ResourceExhausted" on a momentary overload.
+///
+/// NOT a closure-taking `retry(op)` wrapper: `impl AsyncFnMut`
+/// capturing `&mut StoreServiceClient` hits the HRTB-`Send` limitation
+/// when the calling future is `tokio::spawn`ed (the gateway proto-task
+/// is). Same restriction noted at `rio_common::backoff::retry`'s test.
+// r[impl gw.store.transient-retry]
+fn transient_retry_after(
+    rpc: &'static str,
+    attempt: u32,
+    status: &tonic::Status,
+) -> Option<std::time::Duration> {
+    if !rio_common::grpc::is_transient(status.code()) {
+        return None;
+    }
+    if attempt >= STORE_TRANSIENT_MAX_ATTEMPTS {
+        tracing::warn!(
+            rpc, attempts = attempt, code = ?status.code(),
+            "store transient status exhausted retry budget; surfacing"
+        );
+        return None;
+    }
+    let delay = STORE_TRANSIENT_BACKOFF.duration(attempt - 1);
+    tracing::debug!(
+        rpc, attempt, backoff = ?delay, code = ?status.code(), msg = %status.message(),
+        "store transient status; retrying"
+    );
+    Some(delay)
+}
+
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
+///
+/// Retries transient status per [`transient_retry_after`] — store-side
+/// `QueryPathInfo` traverses `try_substitute_on_miss`
+/// (`r[store.substitute.admission]`).
 pub(crate) async fn grpc_query_path_info(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<ValidatedPathInfo>> {
-    rio_proto::client::query_path_info_opt(
-        store_client,
-        store_path,
-        DEFAULT_GRPC_TIMEOUT,
-        &jwt_metadata(jwt_token),
-    )
-    .await
-    .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
+    let md = jwt_metadata(jwt_token);
+    let mut attempt = 0u32;
+    loop {
+        match rio_proto::client::query_path_info_opt(
+            store_client,
+            store_path,
+            DEFAULT_GRPC_TIMEOUT,
+            &md,
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(status) => {
+                attempt += 1;
+                match transient_retry_after("QueryPathInfo", attempt, &status) {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => {
+                        return Err(
+                            GatewayError::Store(format!("QueryPathInfo failed: {status}")).into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// QueryRealisation with NotFound→None mapping. Any non-NotFound status
@@ -389,14 +462,40 @@ pub(crate) async fn grpc_get_path(
     jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
-    rio_proto::client::get_path_nar(
-        store_client,
-        store_path,
-        GRPC_STREAM_TIMEOUT,
-        MAX_NAR_SIZE,
-        None,
-        &jwt_metadata(jwt_token),
-    )
-    .await
-    .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")).into())
+    use rio_proto::client::NarCollectError;
+    let md = jwt_metadata(jwt_token);
+    // r[impl gw.store.transient-retry]
+    // Store-side `GetPath` traverses `try_substitute_on_miss` on a local
+    // miss; admission rejection arrives as `NarCollectError::Stream(RE)`
+    // before any chunks flow, so a retry replays cleanly (no bytes
+    // consumed). `SizeExceeded`/`Validation`/`Io` are non-transient.
+    let mut attempt = 0u32;
+    loop {
+        match rio_proto::client::get_path_nar(
+            store_client,
+            store_path,
+            GRPC_STREAM_TIMEOUT,
+            MAX_NAR_SIZE,
+            None,
+            &md,
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(NarCollectError::Stream(s)) => {
+                attempt += 1;
+                match transient_retry_after("GetPath", attempt, &s) {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => {
+                        return Err(
+                            GatewayError::Store(format!("GetPath for {store_path}: {s}")).into(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(GatewayError::Store(format!("GetPath for {store_path}: {e}")).into());
+            }
+        }
+    }
 }
