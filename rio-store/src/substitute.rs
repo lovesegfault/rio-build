@@ -581,11 +581,14 @@ impl Substituter {
     /// seed (the build still fails with a clear ENOENT naming the
     /// missing ref).
     ///
-    /// LOCAL backpressure ([`SubstituteError::Admission`]) is retried
-    /// INLINE (5 attempts, 250 ms ×4 backoff, 4 s cap). By the time
-    /// this runs, [`do_substitute`](Self::do_substitute) has already
-    /// persisted the seed to PG inside the moka init future, so
-    /// propagating to the gRPC caller cannot help: their retry of
+    /// LOCAL backpressure ([`SubstituteError::Admission`]) AND
+    /// upstream backpressure ([`SubstituteError::Busy`] with a
+    /// `retry_after` hint) are retried INLINE (5 attempts; admission
+    /// uses 250 ms ×4 backoff, 4 s cap; `Busy` honors `retry_after`
+    /// capped at the same 4 s). By the time this runs,
+    /// [`do_substitute`](Self::do_substitute) has already persisted
+    /// the seed to PG inside the moka init future, so propagating to
+    /// the gRPC caller cannot help: their retry of
     /// `QueryPathInfo(seed)` short-circuits at
     /// `metadata::query_path_info → Some` without re-entering
     /// `try_substitute_on_miss`. Propagation after the inline retry
@@ -609,27 +612,43 @@ impl Substituter {
                 }
             }
             // r[impl store.substitute.admission]
-            // Transient local backpressure → retry HERE. Propagation
-            // alone is ineffective (see fn doc): the seed is in PG, so
-            // the caller's retry never re-enters this closure walk.
+            // r[impl store.substitute.probe-429-retry]
+            // Transient backpressure (local Admission OR upstream
+            // Busy{Some}) → retry HERE. Propagation alone is
+            // ineffective (see fn doc): the seed is in PG, so the
+            // caller's retry never re-enters this closure walk.
             let mut attempt = 0u32;
             loop {
                 match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
                     Ok(_) => break,
-                    Err(SubstituteError::Admission(ae)) => {
+                    Err(
+                        e @ (SubstituteError::Admission(_)
+                        | SubstituteError::Busy {
+                            retry_after: Some(_),
+                        }),
+                    ) => {
                         attempt += 1;
                         if attempt >= Self::ENSURE_REFS_ADMISSION_MAX_ATTEMPTS {
                             warn!(
-                                reference = %r, attempts = attempt,
-                                "closure: admission saturated past inline retry budget; \
+                                reference = %r, attempts = attempt, error = %e,
+                                "closure: backpressure past inline retry budget; \
                                  seed already persisted — propagating as degraded-partial"
                             );
-                            return Err(SubstituteError::Admission(ae));
+                            return Err(e);
                         }
-                        let delay = Self::ENSURE_REFS_ADMISSION_BACKOFF.duration(attempt - 1);
+                        // Busy honors the upstream hint (capped at the
+                        // backoff cap so a hostile `Retry-After: 3600`
+                        // can't pin the singleflight slot); Admission
+                        // uses the standard curve.
+                        let delay = match &e {
+                            SubstituteError::Busy {
+                                retry_after: Some(ra),
+                            } => (*ra).min(Self::ENSURE_REFS_ADMISSION_BACKOFF.cap),
+                            _ => Self::ENSURE_REFS_ADMISSION_BACKOFF.duration(attempt - 1),
+                        };
                         debug!(
-                            reference = %r, attempt, ?delay,
-                            "closure: admission saturated; retrying inline"
+                            reference = %r, attempt, ?delay, error = %e,
+                            "closure: transient backpressure; retrying inline"
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -669,6 +688,11 @@ impl Substituter {
 
         let start = Instant::now();
         let tenant_label = tenant_id.to_string();
+        // Track 429 across the iteration: only fail with `Busy` if NO
+        // upstream had the path. This mirrors the HEAD-probe semantics
+        // (`probe_one`): a tenant with [rate-limited-A, healthy-B]
+        // configured should hit B, not propagate A's 429.
+        let mut any_429: Option<Option<Duration>> = None;
         for upstream in &upstreams {
             match self
                 .try_upstream(http, tenant_id, upstream, store_path, &hash_part)
@@ -705,15 +729,21 @@ impl Substituter {
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
                     return Err(SubstituteError::Busy { retry_after: None });
                 }
-                Err(e @ SubstituteError::Busy { .. }) => {
-                    // Upstream 429'd the narinfo GET. STOP — moka must
-                    // not cache this as a miss, and the admission
-                    // permit must drop NOW so the caller's retry curve
-                    // can wait without holding per-replica capacity
-                    // (r[store.substitute.probe-429-retry]). Trying
-                    // remaining upstreams would only burn more rate.
-                    debug!(upstream = %upstream.url, ?e, "upstream 429, stopping");
-                    return Err(e);
+                Err(SubstituteError::Busy { retry_after }) => {
+                    // Upstream 429'd the narinfo or NAR GET. CONTINUE
+                    // to the next upstream — only return `Busy` after
+                    // the loop if no other upstream had it. moka will
+                    // not cache the eventual `Err(Busy)`, and the
+                    // admission permit drops on return so the wait
+                    // happens caller-side
+                    // (r[store.substitute.probe-429-retry]).
+                    debug!(upstream = %upstream.url, ?retry_after,
+                           "upstream 429, trying next");
+                    // Max across upstreams that 429'd (matches probe_one).
+                    any_429 = Some(match any_429.flatten() {
+                        Some(prev) => Some(prev.max(retry_after.unwrap_or_default())),
+                        None => retry_after,
+                    });
                 }
                 Err(e) => {
                     // This upstream failed (down, hash mismatch, parse
@@ -743,6 +773,13 @@ impl Substituter {
             }
         }
 
+        // No upstream had it. If ≥1 upstream 429'd, propagate `Busy`
+        // so moka does NOT cache a definitive miss (the rate-limited
+        // upstream may have it on retry). Clean miss only when every
+        // upstream gave a definitive verdict.
+        if let Some(retry_after) = any_429 {
+            return Err(SubstituteError::Busy { retry_after });
+        }
         Ok(None)
     }
 
@@ -782,9 +819,10 @@ impl Substituter {
         // ones fall through to the next dispatch-time probe pass.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = parse_retry_after(&resp);
+            debug!(upstream = %base, ?retry_after, "narinfo GET 429");
             metrics::counter!(
                 "rio_store_substitute_probe_ratelimited_total",
-                "upstream" => base.to_string(),
+                "tenant" => tenant_id.to_string(),
             )
             .increment(1);
             return Err(SubstituteError::Busy { retry_after });
@@ -1019,6 +1057,17 @@ impl Substituter {
             .send()
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{nar_url}: {e}")))?;
+        // r[impl store.substitute.probe-429-retry]
+        // 429 on the NAR body GET maps to `Busy` (same as the narinfo
+        // GET) so `do_substitute` continues to the next upstream and
+        // moka doesn't cache the result. Without this, a body-level 429
+        // surfaced as a generic `Fetch` error, was logged as
+        // `result=error`, and let `Ok(None)` cache a miss for 30s.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(SubstituteError::Busy {
+                retry_after: parse_retry_after(&resp),
+            });
+        }
         if !resp.status().is_success() {
             return Err(SubstituteError::Fetch(format!(
                 "{nar_url}: HTTP {}",
@@ -1285,6 +1334,8 @@ impl Substituter {
             .collect();
 
         let bases = &bases;
+        let tenant_label = tenant_id.to_string();
+        let tenant_label = &tenant_label;
         let probe_one = |path: String, hash_part: String| async move {
             // `Hit` if any base 2xx; `Miss` if EVERY base returned a
             // clean 404; `RateLimited` if no hit and ≥1 base 429'd;
@@ -1307,9 +1358,10 @@ impl Substituter {
                     Ok(r) if is_not_found(r.status()) => {}
                     Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                         let retry_after = parse_retry_after(&r);
+                        debug!(upstream = %base, ?retry_after, "HEAD probe 429");
                         metrics::counter!(
                             "rio_store_substitute_probe_ratelimited_total",
-                            "upstream" => base.clone(),
+                            "tenant" => tenant_label.clone(),
                         )
                         .increment(1);
                         // Max across upstreams that 429'd this path.
@@ -2197,6 +2249,58 @@ mod tests {
         assert!(got.is_none(), "no upstreams → None");
     }
 
+    // r[verify store.substitute.probe-429-retry]
+    /// First upstream 429s the narinfo GET; second upstream has the
+    /// path. `do_substitute` MUST continue to the second (matching the
+    /// HEAD-probe semantics) and return a hit, not stop at the first
+    /// 429. If both miss-or-429, the loop falls through to `Err(Busy)`
+    /// so moka doesn't cache a definitive miss.
+    #[tokio::test]
+    async fn do_substitute_429_first_upstream_tries_second() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-429-then-hit").await;
+        let (path, nar) = make_path();
+        // Upstream A: every request → 429.
+        let a = spawn_status_upstream(axum::http::StatusCode::TOO_MANY_REQUESTS).await;
+        // Upstream B: serves the path.
+        let b = spawn_fake_upstream(&path, nar, "cache.429-b").await;
+        // Priority: A=10 (tried first), B=50 (tried second).
+        metadata::upstreams::insert(&db.pool, tid, &a.url, 10, &[], SigMode::Keep)
+            .await
+            .unwrap();
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &b.url,
+            50,
+            std::slice::from_ref(&b.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(
+            got.is_some(),
+            "429 from first upstream must NOT stop iteration; \
+             second upstream has the path"
+        );
+
+        // Now invert: only the 429 upstream configured → no hit, but
+        // the result MUST be `Err(Busy)` (uncached), not `Ok(None)`
+        // (cached miss).
+        let tid2 = seed_tenant(&db.pool, "sub-429-only").await;
+        metadata::upstreams::insert(&db.pool, tid2, &a.url, 10, &[], SigMode::Keep)
+            .await
+            .unwrap();
+        let got2 = sub.try_substitute(tid2, &path).await;
+        assert!(
+            matches!(got2, Err(SubstituteError::Busy { .. })),
+            "all-429 must propagate Busy (uncached), not Ok(None); got {got2:?}"
+        );
+    }
+
     #[tokio::test]
     async fn substitute_rejects_bad_sig() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -2348,8 +2452,7 @@ mod tests {
         );
         assert!(
             rec.get(&format!(
-                "rio_store_substitute_probe_ratelimited_total{{upstream={}}}",
-                fake.url
+                "rio_store_substitute_probe_ratelimited_total{{tenant={tid}}}"
             )) > 0,
             "ratelimited counter must increment; keys={:?}",
             rec.all_keys()

@@ -280,7 +280,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_probe_ratelimited_total",
-        "check_available HEAD probes that returned 429, labeled by upstream. \
+        "Upstream HEAD/GET probes that returned 429, labeled by tenant. \
          The rate-limited subset is retried (≤3 passes) after honoring \
          Retry-After; concurrency is halved when >10% of a pass 429s."
     );
