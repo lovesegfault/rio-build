@@ -1243,8 +1243,13 @@ impl DagActor {
         // batch (every pre-existing Completed/Skipped output) so it
         // needs MERGE_FMP_TIMEOUT when the store is healthy, but the
         // short grpc_timeout during an outage so a fail-open path
-        // doesn't pin the actor 90s. The breaker is read-only here
-        // (this is a best-effort check, not an availability gate).
+        // doesn't pin the actor 90s. The breaker is fed but not gated
+        // on: record_failure/success so a 90s dead stall here counts
+        // toward opening, and a success here closes it; but the
+        // fail-open RETURN (HashSet::new()) is unconditional —
+        // `r[sched.breaker.cache-check]` reserves fail-CLOSED
+        // rejection for new submissions, never for an already-admitted
+        // DAG's re-verify.
         let fmp_timeout = if self.cache_breaker.is_open() {
             self.grpc_timeout
         } else {
@@ -1255,15 +1260,20 @@ impl DagActor {
             match tokio::time::timeout(fmp_timeout, store_client.clone().find_missing_paths(req))
                 .await
             {
-                Ok(Ok(r)) => r.into_inner(),
+                Ok(Ok(r)) => {
+                    self.cache_breaker.record_success();
+                    r.into_inner()
+                }
                 Ok(Err(e)) => {
                     self.credit_heartbeats_for_stall(fmp_start.elapsed());
+                    self.cache_breaker.record_failure();
                     warn!(error = %e, "stale-completed verify: store FindMissingPaths failed; \
                        treating pre-existing Completed as valid (fail-open)");
                     return HashSet::new();
                 }
                 Err(_) => {
                     self.credit_heartbeats_for_stall(fmp_start.elapsed());
+                    self.cache_breaker.record_failure();
                     warn!(timeout = ?fmp_timeout,
                       "stale-completed verify: store FindMissingPaths timed out; \
                        treating pre-existing Completed as valid (fail-open)");

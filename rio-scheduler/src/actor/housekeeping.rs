@@ -302,12 +302,19 @@ impl DagActor {
     /// still > `HEARTBEAT_TIMEOUT_SECS` behind `now`); detection is
     /// merely delayed by ≤ `stall`. Live workers' queued heartbeats
     /// then overwrite with `Instant::now()` as they drain.
+    ///
+    /// No `stall ≤ HEARTBEAT_TIMEOUT_SECS` early-return: Tick and
+    /// Heartbeat queue independently in the FIFO mailbox, so a Tick
+    /// enqueued BEFORE the next heartbeat lands first and reaps a live
+    /// worker after a 25–29s stall. Worse, one MergeDag runs
+    /// `find_missing_with_breaker` then `verify_preexisting_completed`
+    /// sequentially; with a per-call early-return, two 25s stalls each
+    /// short-circuit and the cumulative 50s of actor silence reaps the
+    /// fleet. Shifting unconditionally is O(N_workers), already
+    /// `.min(now)`-capped, and per-call shifts compound to the same
+    /// result a single cumulative credit would.
     pub(super) fn credit_heartbeats_for_stall(&mut self, stall: std::time::Duration) {
-        if stall <= std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS) {
-            // stall ≤ threshold means a fully-live worker
-            // (last_heartbeat ≈ now-at-stall-start) won't cross the
-            // threshold. A worker already partly stale might, but its
-            // queued heartbeat lands before the reap Tick.
+        if stall.is_zero() {
             return;
         }
         let now = Instant::now();

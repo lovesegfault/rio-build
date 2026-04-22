@@ -714,8 +714,8 @@ async fn test_heartbeat_timeout_fires_at_timeout_secs_not_2x() -> TestResult {
 /// `last_heartbeat` forward by the stall duration (capped at `now`),
 /// preserving relative liveness order: a live worker ends up at `now`
 /// (capped), a borderline worker at `now` (capped), a stale worker
-/// shifted but STILL past threshold (stays reapable). A stall ≤
-/// threshold short-circuits (no shift).
+/// shifted but STILL past threshold (stays reapable). Any non-zero
+/// stall shifts (no `≤ threshold` early-return — see fn doc).
 #[tokio::test]
 async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
     use crate::actor::debug::backdate;
@@ -770,13 +770,23 @@ async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
         "stale worker must remain reapable post-shift; age={stale2_age:?} threshold={threshold:?}"
     );
 
-    // — case 2: stall ≤ threshold → early return, no shift —
-    actor.executors.insert("noop".into(), mk("noop", 5));
-    let before = actor.executors["noop"].last_heartbeat;
+    // — case 2: sub-threshold stall STILL shifts (no early-return) —
+    // A 20s stall on a 5s-ago heartbeat → 5+20=25s in the future →
+    // capped at now. The previous early-return left this at 5s-ago,
+    // which a queued-before-heartbeat Tick could then reap after a
+    // second sub-threshold stall in the same MergeDag.
+    actor.executors.insert("small".into(), mk("small", 5));
+    let before = actor.executors["small"].last_heartbeat;
     actor.credit_heartbeats_for_stall(Duration::from_secs(20));
-    assert_eq!(
-        actor.executors["noop"].last_heartbeat, before,
-        "stall ≤ threshold must early-return without shifting"
+    let now = std::time::Instant::now();
+    let small_age = now.duration_since(actor.executors["small"].last_heartbeat);
+    assert!(
+        actor.executors["small"].last_heartbeat > before,
+        "sub-threshold stall must still shift forward"
+    );
+    assert!(
+        small_age < Duration::from_secs(2),
+        "5s-ago + 20s shift caps at now; age={small_age:?}"
     );
     Ok(())
 }
