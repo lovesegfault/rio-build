@@ -1402,16 +1402,41 @@ impl Substituter {
         // halves when >SUBSTITUTE_PROBE_429_ADAPT_THRESHOLD of a pass
         // came back 429: that's the actual feedback signal the old
         // synthetic 4096 cap was a static proxy for.
+        //
+        // Each pass — including pass 0 — is hard-bounded by `deadline`.
+        // The sleep-budget check below only gates the SLEEP; without
+        // this wrap, a 153k-path pass-0 (36s) followed by a halved-
+        // concurrency pass-1 (72s) runs 109s and trips the scheduler's
+        // 90s `MERGE_FMP_TIMEOUT` → spurious breaker failure. On
+        // timeout the un-probed batch is Indeterminate (uncached, not
+        // returned) — same disposition as the sleep-doesn't-fit path.
         for pass in 0..=SUBSTITUTE_PROBE_429_MAX_PASSES {
             let batch_len = pending.len();
-            let probed: Vec<_> = futures_util::stream::iter(
-                std::mem::take(&mut pending)
-                    .into_iter()
-                    .map(|(p, h)| probe_one(p, h)),
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let probed: Vec<_> = match tokio::time::timeout(
+                remaining,
+                futures_util::stream::iter(
+                    std::mem::take(&mut pending)
+                        .into_iter()
+                        .map(|(p, h)| probe_one(p, h)),
+                )
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>(),
             )
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    info!(
+                        pass,
+                        deferred = batch_len,
+                        budget = ?remaining,
+                        "check_available: probe pass exceeded deadline; \
+                         deferring un-probed paths to dispatch-time"
+                    );
+                    break;
+                }
+            };
 
             let mut max_retry_after: Option<Duration> = None;
             for ((path, hash_part), outcome) in probed {
@@ -2068,6 +2093,10 @@ mod tests {
         /// `None` → no header (caller's 1s default applies). May be
         /// delta-seconds (`"1"`) or an HTTP-date.
         retry_after: Option<String>,
+        /// Artificial per-HEAD latency (after the concurrency yield).
+        /// Default ZERO. Non-zero lets a test push a pass past the
+        /// caller's `deadline` without needing huge path counts.
+        head_delay: Duration,
     }
 
     struct ProbeUpstream {
@@ -2100,6 +2129,7 @@ mod tests {
         let ProbeCfg {
             head_429_first_n,
             retry_after,
+            head_delay,
         } = cfg;
 
         let app = Router::new()
@@ -2125,6 +2155,9 @@ mod tests {
                         // Yield so concurrent in-flight requests pile
                         // up enough for fetch_max to observe the peak.
                         tokio::task::yield_now().await;
+                        if !head_delay.is_zero() {
+                            tokio::time::sleep(head_delay).await;
+                        }
                         in_flight.fetch_sub(1, Ordering::SeqCst);
                         if n < head_429_first_n {
                             let mut h = HeaderMap::new();
@@ -2434,6 +2467,7 @@ mod tests {
         let fake = spawn_mass_probe_upstream(ProbeCfg {
             head_429_first_n: 20,
             retry_after: Some("1".into()),
+            ..Default::default()
         })
         .await;
         insert_probe(&db.pool, tid, &fake).await;
@@ -2495,7 +2529,7 @@ mod tests {
         // threshold → concurrency halves 128→64.
         let fake = spawn_mass_probe_upstream(ProbeCfg {
             head_429_first_n: 200,
-            retry_after: None,
+            ..Default::default()
         })
         .await;
         insert_probe(&db.pool, tid, &fake).await;
@@ -2540,6 +2574,7 @@ mod tests {
         let fake = spawn_mass_probe_upstream(ProbeCfg {
             head_429_first_n: 10,
             retry_after: Some("300".into()),
+            ..Default::default()
         })
         .await;
         insert_probe(&db.pool, tid, &fake).await;
@@ -2583,6 +2618,62 @@ mod tests {
         );
     }
 
+    // r[verify store.substitute.probe-bounded+4]
+    /// Probe PASS itself (not just the inter-pass sleep) exceeding the
+    /// caller's deadline → pass is truncated, un-probed paths
+    /// Indeterminate (uncached). Covers the gap the sleep-budget check
+    /// alone left: 153k-path pass-0 + halved pass-1 = 109s > 90s
+    /// `MERGE_FMP_TIMEOUT` despite each Retry-After fitting the budget.
+    #[tokio::test]
+    async fn check_available_pass_exceeds_deadline() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-pass-deadline").await;
+        // No 429s — exercise the pass-0 deadline bound directly. 200ms
+        // per HEAD; 50ms budget → timeout fires before any HEAD
+        // completes.
+        let fake = spawn_mass_probe_upstream(ProbeCfg {
+            head_delay: Duration::from_millis(200),
+            ..Default::default()
+        })
+        .await;
+        insert_probe(&db.pool, tid, &fake).await;
+
+        let paths: Vec<String> = (0..50)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-dl-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        let t0 = tokio::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let available = sub.check_available(tid, &paths, deadline).await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            available.is_empty(),
+            "pass truncated at deadline → 0 hits; got {}",
+            available.len()
+        );
+        // Pass-0 must have been cut off well before any 200ms HEAD
+        // returned. Slack for setup (nix-cache-info GET, parse).
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "must return at deadline, not wait out the HEADs; elapsed={elapsed:?}"
+        );
+        // Indeterminate → not cached; next call re-probes.
+        assert!(
+            sub.probe_cache
+                .get(&(tid, paths[0].clone()))
+                .await
+                .is_none(),
+            "deadline-truncated paths must NOT be cached"
+        );
+    }
+
     // r[verify store.substitute.probe-429-retry]
     /// `Retry-After` as an RFC 9110 HTTP-date (not delta-seconds):
     /// parsed via `httpdate` and honored. Upstream sends a date ~3s
@@ -2597,6 +2688,7 @@ mod tests {
         let fake = spawn_mass_probe_upstream(ProbeCfg {
             head_429_first_n: 5,
             retry_after: Some(httpdate::fmt_http_date(when)),
+            ..Default::default()
         })
         .await;
         insert_probe(&db.pool, tid, &fake).await;
