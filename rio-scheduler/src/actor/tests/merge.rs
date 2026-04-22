@@ -2881,3 +2881,66 @@ async fn cd83a9b2_cannot_recur() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.substitute.eager-probe]
+/// Merge-time substitution covers the WHOLE submission in one
+/// `FindMissingPaths`: with the store-side 4096-path truncation
+/// removed, 5000 IA leaves whose outputs are all
+/// upstream-substitutable MUST all transition to `Substituting` at
+/// merge time. Regression guard: pre-change, only the first 4096 (the
+/// store's truncated `substitutable_paths`) hit; the tail fell through
+/// to dispatch-time layer-by-layer.
+#[tokio::test]
+async fn merge_probe_whole_dag_substituting() -> TestResult {
+    const N: usize = 5000;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Arm the QPI gate so the detached substitute-fetch tasks park
+    // (don't post SubstituteComplete) — keeps every node IN
+    // Substituting at snapshot time. The assertion is on the
+    // merge-time verdict COUNT, not on fetch completion.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 5000 IA leaves, each with a known expected_output_path. Seed
+    // ALL outputs as substitutable in the mock store so
+    // FindMissingPaths returns the full set in substitutable_paths.
+    let mut nodes = Vec::with_capacity(N);
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.reserve(N);
+        for i in 0..N {
+            let tag = format!("eager-{i}");
+            let out = format!(
+                "/nix/store/{}-{tag}-out",
+                rio_test_support::fixtures::rand_store_hash()
+            );
+            let mut n = make_node(&tag);
+            n.expected_output_paths = vec![out.clone()];
+            nodes.push(n);
+            subs.push(out);
+        }
+    }
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, nodes, vec![], false).await?;
+
+    // Tick refreshes the cached snapshot.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.substituting_derivations as usize, N,
+        "all {N} leaves must receive a merge-time substitutable verdict \
+         (would be ≤4096 with store-side truncation)"
+    );
+    // Release parked fetches so test teardown doesn't wait on them.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    Ok(())
+}

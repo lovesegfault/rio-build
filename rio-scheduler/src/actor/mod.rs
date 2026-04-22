@@ -144,6 +144,19 @@ pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 /// doesn't head-of-line block. r[sched.substitute.detached]
 pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Timeout for the merge-time `FindMissingPaths` only
+/// (`find_missing_with_breaker`). Separate from `grpc_timeout` (30s):
+/// with the store-side 4096-path truncation removed
+/// (`r[store.substitute.probe-bounded+4]`), `check_available` runs the
+/// FULL uncached set at 128-wide. Envelope: `⌈N_uncached/128⌉ × RTT` —
+/// 153k paths at 30ms ≈ 36s, which the default 30s would clip. 90s
+/// covers that with headroom for one 429-retry sleep; the merge phase
+/// already sits inside the actor for a 153k-node submission, so the
+/// extra 60s is acceptable for that (rare, inherently slow) shape.
+/// Dispatch-time FMP stays on `grpc_timeout` (its batch is bounded by
+/// `DISPATCH_PROBE_BATCH_CAP`).
+pub const MERGE_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Delay before cleaning up terminal build state. Allows late WatchBuild
 /// subscribers to receive the terminal event before the broadcast sender
 /// is dropped.
@@ -163,11 +176,11 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
 
 /// Max Ready candidates per dispatch-time `FindMissingPaths` batch.
-/// Belt-and-suspenders under the store-side `SUBSTITUTE_PROBE_MAX_PATHS`
-/// (4096): keeps the FMP RPC in the actor's ~100ms budget for very wide
-/// DAG layers. The truncated tail is picked up on the next inline
-/// `dispatch_ready` (same `probe_generation`, so the window advances
-/// rather than re-probing the head).
+/// Keeps the FMP RPC in the actor's ~100ms budget for very wide DAG
+/// layers — dispatch-time runs under `grpc_timeout` (30s), not
+/// [`MERGE_FMP_TIMEOUT`]. The truncated tail is picked up on the next
+/// inline `dispatch_ready` (same `probe_generation`, so the window
+/// advances rather than re-probing the head).
 pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 
 /// The DAG actor state.

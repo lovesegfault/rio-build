@@ -1943,9 +1943,14 @@ impl DagActor {
                 }
             }
         }
-        let grpc_timeout = self.grpc_timeout;
+        // r[impl sched.substitute.eager-probe]
+        // MERGE_FMP_TIMEOUT (90s), not self.grpc_timeout (30s): the
+        // store-side check_available no longer truncates, so a
+        // 153k-uncached probe legitimately runs ~36s. Dispatch-time
+        // and the topdown roots-only FMP stay on grpc_timeout (their
+        // batches are small).
         let resp = match tokio::time::timeout(
-            grpc_timeout,
+            super::MERGE_FMP_TIMEOUT,
             store_client.clone().find_missing_paths(fmp_req),
         )
         .await
@@ -1971,7 +1976,7 @@ impl DagActor {
             }
             Err(_) => {
                 warn!(
-                    timeout = ?grpc_timeout,
+                    timeout = ?super::MERGE_FMP_TIMEOUT,
                     "store FindMissingPaths timed out"
                 );
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
