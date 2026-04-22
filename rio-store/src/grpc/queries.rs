@@ -184,6 +184,11 @@ impl StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Capture before PG work: `find_missing_paths` (ANY over ≤153k)
+        // + `sig_visibility_gate_batch` (3 PG round-trips) eat into the
+        // 2s slack vs scheduler's 90s `MERGE_FMP_TIMEOUT` if the
+        // budget is computed AFTER them.
+        let entry = tokio::time::Instant::now();
         let tenant_id = self.request_tenant_id(&request);
         let req = request.into_inner();
 
@@ -225,7 +230,7 @@ impl StoreServiceImpl {
                 .check_available(
                     tid,
                     &missing,
-                    tokio::time::Instant::now() + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
+                    entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
                 )
                 .await
                 .unwrap_or_else(|e| {

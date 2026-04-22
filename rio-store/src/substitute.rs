@@ -1412,31 +1412,26 @@ impl Substituter {
         // returned) — same disposition as the sleep-doesn't-fit path.
         for pass in 0..=SUBSTITUTE_PROBE_429_MAX_PASSES {
             let batch_len = pending.len();
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let probed: Vec<_> = match tokio::time::timeout(
-                remaining,
-                futures_util::stream::iter(
-                    std::mem::take(&mut pending)
-                        .into_iter()
-                        .map(|(p, h)| probe_one(p, h)),
-                )
-                .buffer_unordered(concurrency)
-                .collect::<Vec<_>>(),
+            // `take_until` yields items until the deadline future
+            // resolves, then stops — completed Hit/Miss results from
+            // this pass survive. `tokio::time::timeout(.., collect())`
+            // is all-or-nothing: it drops the partially-accumulated
+            // Vec on expiry, and since `pending` was already
+            // `mem::take`n the completed results land in neither
+            // `hits` nor `probe_cache` nor `pending` — a regression vs
+            // the old 4096-truncation which at least returned 4096.
+            // Un-yielded paths are implicitly Indeterminate (uncached,
+            // re-probed at dispatch time).
+            let probed: Vec<_> = futures_util::stream::iter(
+                std::mem::take(&mut pending)
+                    .into_iter()
+                    .map(|(p, h)| probe_one(p, h)),
             )
-            .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    info!(
-                        pass,
-                        deferred = batch_len,
-                        budget = ?remaining,
-                        "check_available: probe pass exceeded deadline; \
-                         deferring un-probed paths to dispatch-time"
-                    );
-                    break;
-                }
-            };
+            .buffer_unordered(concurrency)
+            .take_until(tokio::time::sleep_until(deadline))
+            .collect()
+            .await;
+            let completed = probed.len();
 
             let mut max_retry_after: Option<Duration> = None;
             for ((path, hash_part), outcome) in probed {
@@ -1460,6 +1455,16 @@ impl Substituter {
                 }
             }
 
+            if completed < batch_len {
+                info!(
+                    pass,
+                    completed,
+                    deferred = batch_len - completed,
+                    "check_available: probe pass exceeded deadline; \
+                     deferring un-probed paths to dispatch-time"
+                );
+                break;
+            }
             if pending.is_empty() || pass == SUBSTITUTE_PROBE_429_MAX_PASSES {
                 break;
             }
@@ -2621,24 +2626,28 @@ mod tests {
     // r[verify store.substitute.probe-bounded+4]
     /// Probe PASS itself (not just the inter-pass sleep) exceeding the
     /// caller's deadline → pass is truncated, un-probed paths
-    /// Indeterminate (uncached). Covers the gap the sleep-budget check
-    /// alone left: 153k-path pass-0 + halved pass-1 = 109s > 90s
+    /// Indeterminate (uncached), AND results that completed before the
+    /// deadline survive. Covers the gap the sleep-budget check alone
+    /// left: 153k-path pass-0 + halved pass-1 = 109s > 90s
     /// `MERGE_FMP_TIMEOUT` despite each Retry-After fitting the budget.
     #[tokio::test]
     async fn check_available_pass_exceeds_deadline() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-head-pass-deadline").await;
-        // No 429s — exercise the pass-0 deadline bound directly. 200ms
-        // per HEAD; 50ms budget → timeout fires before any HEAD
-        // completes.
+        // No 429s — exercise the pass-0 deadline bound directly. 400ms
+        // per HEAD, 200 paths, concurrency=128 (WantMassQuery): wave-1
+        // (128) lands ~setup+400ms; wave-2 (72) would land ~setup+800ms
+        // but the deadline (set below, AFTER setup) cuts it. Asserts
+        // the take_until semantics: wave-1 hits survive, wave-2 is
+        // deferred (Indeterminate). Wide margins for builder variance.
         let fake = spawn_mass_probe_upstream(ProbeCfg {
-            head_delay: Duration::from_millis(200),
+            head_delay: Duration::from_millis(400),
             ..Default::default()
         })
         .await;
         insert_probe(&db.pool, tid, &fake).await;
 
-        let paths: Vec<String> = (0..50)
+        let paths: Vec<String> = (0..200)
             .map(|i| {
                 format!(
                     "/nix/store/{}-dl-{i}",
@@ -2648,26 +2657,61 @@ mod tests {
             .collect();
 
         let sub = test_substituter(db.pool.clone());
+        // Warm `list_for_tenant` PG query + `/nix-cache-info` cache so
+        // the deadline budget below covers the HEAD pass itself, not
+        // setup. One throwaway path; result discarded.
+        let warm = format!(
+            "/nix/store/{}-warm",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        sub.check_available(
+            tid,
+            std::slice::from_ref(&warm),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let t0 = tokio::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let deadline = t0 + Duration::from_millis(600);
         let available = sub.check_available(tid, &paths, deadline).await.unwrap();
         let elapsed = t0.elapsed();
 
+        // Partial-pass results survive the deadline (regression: the
+        // old timeout(.., collect()) dropped them all). Structural
+        // assertion — "some survived AND some deferred" — not exact
+        // wave boundaries (builder CPU variance).
         assert!(
-            available.is_empty(),
-            "pass truncated at deadline → 0 hits; got {}",
+            !available.is_empty(),
+            "completed-before-deadline hits must survive truncation; got 0"
+        );
+        assert!(
+            available.len() < paths.len(),
+            "deadline must truncate the pass; got all {} hits",
             available.len()
         );
-        // Pass-0 must have been cut off well before any 200ms HEAD
-        // returned. Slack for setup (nix-cache-info GET, parse).
+        // Returned near deadline, not after wave-2 (~800ms+). Loose
+        // upper bound; the structural asserts above are primary.
         assert!(
-            elapsed < Duration::from_millis(150),
-            "must return at deadline, not wait out the HEADs; elapsed={elapsed:?}"
+            elapsed < Duration::from_secs(2),
+            "must return at deadline, not wait out wave-2; elapsed={elapsed:?}"
         );
-        // Indeterminate → not cached; next call re-probes.
+        // Survived hits ARE cached.
+        assert_eq!(
+            sub.probe_cache.get(&(tid, available[0].clone())).await,
+            Some(true),
+            "completed hits must be cached as Hit"
+        );
+        // Deferred paths (Indeterminate) are NOT cached; next call
+        // re-probes.
+        let deferred: Vec<_> = paths
+            .iter()
+            .filter(|p| !available.contains(p))
+            .cloned()
+            .collect();
+        assert!(!deferred.is_empty());
         assert!(
             sub.probe_cache
-                .get(&(tid, paths[0].clone()))
+                .get(&(tid, deferred[0].clone()))
                 .await
                 .is_none(),
             "deadline-truncated paths must NOT be cached"
