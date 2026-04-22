@@ -29,8 +29,15 @@
   # Workspace root — must match what `crate2nix generate` ran against.
   # Fileset-filtered to avoid rebuilds on .claude/ or doc churn.
   workspaceSrc,
+  # Per-member filesets for src isolation. Each entry's value is a
+  # `lib.fileset` rooted under `../<name>`. Members not listed fall
+  # back to `workspaceSrc + "/<name>"` (the build-from-json default).
+  memberFilesets ? { },
   # Path to the pre-resolved JSON (checked in at repo root).
   resolvedJson ? ../Cargo.json,
+  # Whether to strip binaries in workspaceBins/memberBins. Coverage
+  # builds set false so __llvm_covfun/__llvm_covmap survive.
+  stripBins ? true,
   # sys-crate env-var escape hatches + system libs. Passed from
   # flake.nix's sysCrateEnv — single source of truth so devShell
   # and crate2nix see the same linkage.
@@ -95,17 +102,27 @@ let
       #
       # NOTE: this must intercept `crate_` here, not via
       # `defaultCrateOverrides` below — buildRustCrate threads
-      # `dependencies`/`buildDependencies` through makeOverridable
+      # `dependencies`/`buildDependencies`/`src` through makeOverridable
       # defaults from the original `crate_` (build-rust-crate
       # default.nix:506-507), so the crateOverrides merge at
       # default.nix:238 never reaches them.
+      #
+      # Per-crate src: build-from-json.nix resolves local members as
+      # `workspaceSrc + "/<name>"` — a subpath of ONE store hash, so
+      # any workspace edit invalidates every member. Replace with the
+      # per-member fileset from flake.nix; content-identical, hash-
+      # independent. memberFilesets keys must match Cargo.json's
+      # source.path (= crate dir name, which == crateName here).
       crate_' =
         if crate_.crateName == "workspace-hack" then
           crate_
           // {
             dependencies = [ ];
             buildDependencies = [ ];
+            src = memberSrcs.workspace-hack or crate_.src;
           }
+        else if memberSrcs ? ${crate_.crateName} then
+          crate_ // { src = memberSrcs.${crate_.crateName}; }
         else
           crate_;
     in
@@ -149,27 +166,27 @@ let
   # parent, which doesn't exist. Workaround: postUnpack symlinks the
   # migrations dir next to the crate src. Same trick Naersk users apply;
   # crate2nix issue #17 tracks the upstream limitation.
+  #
   # ──────────────────────────────────────────────────────────────────
-  # Source granularity
+  # Per-crate source isolation
   # ──────────────────────────────────────────────────────────────────
   #
   # build-from-json.nix resolves local crate srcs as
-  # `workspaceSrc + "/<crate>"` — a subpath of ONE store hash. Touching
-  # rio-common/src/lib.rs rehashes workspaceSrc, invalidating all 10
-  # workspace members even when only one's content changed.
-  #
-  # The naive fix (per-crate fileset.toSource via crateOverride.src)
-  # runs into buildRustCrate's unpackPhase expecting sourceRoot to be
-  # the crate name. Rather than fight that here, we accept the rebuild
-  # floor for the PoC and document the fix in the assessment: patch
-  # build-from-json.nix to accept a `workspaceMemberSrcs` attrset that
-  # maps crate name → fileset, so local paths resolve to independent
-  # store paths. ~20-line upstream patch; tracked in the assessment.
-  #
-  # The `migrations/` symlink below DOES use a dedicated fileset so
-  # rio-scheduler/rio-store don't rebuild when a sibling crate's src
-  # changes — they'd rebuild anyway (most crates depend on rio-common)
-  # but at least the migrations hash is stable.
+  # `workspaceSrc + "/<crate>"` — a subpath of ONE store hash. Editing
+  # rio-cli rehashes workspaceSrc → invalidates every member. We
+  # intercept at buildRustCrateForPkgs (above) and replace `src` with
+  # a per-member `lib.fileset.toSource` rooted at the crate dir.
+  # buildRustCrate's unpack copies the store path to $NIX_BUILD_TOP
+  # and `workspace_member` defaults to "." (Cargo.toml at root), so a
+  # crate-root-shaped src works without sourceRoot games.
+  memberSrcs = lib.mapAttrs (
+    name: fileset:
+    lib.fileset.toSource {
+      root = ../. + "/${name}";
+      inherit fileset;
+    }
+  ) memberFilesets;
+
   migrationsFileset = pkgs.lib.fileset.toSource {
     root = ../migrations;
     fileset = ../migrations;
@@ -272,6 +289,15 @@ let
     '';
   };
 
+  # Crates whose build.rs invokes `protoc` (directly or via prost-build/
+  # tonic-prost-build). nixpkgs' prost-build override sets PROTOC on
+  # prost-build itself, but the env var must be on the CONSUMER that
+  # runs `tonic_prost_build::configure()`.
+  protoCrate = {
+    nativeBuildInputs = [ pkgs.protobuf ];
+    PROTOC = "${pkgs.protobuf}/bin/protoc";
+  };
+
   # ──────────────────────────────────────────────────────────────────
   # sys-crate policy: system-link over vendored C
   # ──────────────────────────────────────────────────────────────────
@@ -338,36 +364,22 @@ let
         buildInputs = sysCrateEnv.crates.libsqlite3-sys.libs;
       };
 
-    # ring's build.rs drives `cc` with its own assembly. Needs a
-    # working C toolchain which stdenv already provides; on some
-    # platforms it also wants `perl` for the asm preprocessor. Linux
-    # glibc stdenv has perl in nativeBuildInputs transitively. No-op
-    # override kept as a doc marker — ring has no system-lib
-    # equivalent, vendoring is by design.
-    ring = _: { };
-
-    # rio-proto: PROTOC + proto files are inside rio-proto/proto/, so
-    # no cross-directory issue. But prost-build's build.rs needs
-    # `protoc` in PATH or $PROTOC set. nixpkgs' prost-build override
-    # sets PROTOC on the *prost-build* crate — but that runs at
-    # prost-build's build time, not at rio-proto's. The env var must be
-    # on the CONSUMER that runs `tonic_prost_build::configure()`.
-    rio-proto = _: {
-      nativeBuildInputs = [ pkgs.protobuf ];
-      PROTOC = "${pkgs.protobuf}/bin/protoc";
-    };
+    rio-proto = _: protoCrate;
+    tonic-health = _: protoCrate;
+    opentelemetry-proto = _: protoCrate;
 
     # rio-test-support: build.rs runs protoc --descriptor_set_out on
     # ../rio-proto/proto/admin.proto (MockAdmin codegen). Needs PROTOC
-    # same as rio-proto, plus the proto files symlinked into place.
-    rio-test-support = _: {
-      nativeBuildInputs = [ pkgs.protobuf ];
-      PROTOC = "${pkgs.protobuf}/bin/protoc";
-      postUnpack = ''
-        mkdir -p $NIX_BUILD_TOP/rio-proto
-        ln -sf ${protoFileset}/proto $NIX_BUILD_TOP/rio-proto/proto
-      '';
-    };
+    # plus the proto files symlinked into place.
+    rio-test-support =
+      _:
+      protoCrate
+      // {
+        postUnpack = ''
+          mkdir -p $NIX_BUILD_TOP/rio-proto
+          ln -sf ${protoFileset}/proto $NIX_BUILD_TOP/rio-proto/proto
+        '';
+      };
 
     # sqlx::migrate!("../migrations") compile-time file read. See
     # `withMigrations` above. rio-gateway only uses it in tests/
@@ -379,30 +391,8 @@ let
     rio-gateway = withMigrations;
 
     # include_str!("../../../../../nix/nixos-node/seccomp/...") in
-    # pool tests — compile-time file read crossing crate
-    # boundary. See `withSeccompProfiles` above.
+    # pool tests — compile-time file read crossing crate boundary.
     rio-controller = withSeccompProfiles;
-
-    # tonic-health ships a bundled .proto and its build.rs compiles it.
-    # Same PROTOC need as rio-proto.
-    tonic-health = _: {
-      nativeBuildInputs = [ pkgs.protobuf ];
-      PROTOC = "${pkgs.protobuf}/bin/protoc";
-    };
-
-    # opentelemetry-proto also compiles bundled .proto files.
-    # nixpkgs has an override but it may not set PROTOC in the form
-    # tonic-prost-build expects; belt+braces.
-    opentelemetry-proto = _: {
-      nativeBuildInputs = [ pkgs.protobuf ];
-      PROTOC = "${pkgs.protobuf}/bin/protoc";
-    };
-
-    # tonic-prost-build is prost-build plus tonic plumbing; the nixpkgs
-    # override on prost-build sets PROTOC but only for prost-build's
-    # own build script. tonic-prost-build's build is trivial (no .rs
-    # gen) so no override needed — this comment exists because it's the
-    # obvious-but-wrong place to put the PROTOC var.
   };
 
   cargoNix = import "${crate2nixSrc}/lib/build-from-json.nix" {
@@ -425,45 +415,21 @@ let
   # Binary-only, closure-shrunk. `remapOpts` above already scrubs all
   # toolchain references at compile time (verified: 2.16GB → 56MB,
   # zero rust-default closure refs). RUNPATH is glibc/lib:gcc-lib/lib
-  # from stdenv's fixupPhase — no post-processing needed. We just
-  # strip for docker image size and guard with disallowedReferences
-  # to catch any future remap gap.
-  workspaceBins = pkgs.runCommand "rio-bins" { disallowedReferences = [ rustStable ]; } ''
-    mkdir -p $out/bin
-    cp -L ${workspace}/bin/* $out/bin/
-    chmod -R u+w $out/bin
-    ${pkgs.binutils}/bin/strip $out/bin/*
-  '';
-
-  # Coverage variant — skip strip so __llvm_covfun/__llvm_covmap
-  # sections survive for llvm-cov. Debug info stays intact with
-  # /rustc paths (remap-path-prefix), which lcov filters cleanly.
-  # Same disallowedReferences guard; closure is glibc + syslibs,
-  # binaries are ~5× larger from the debug info.
-  workspaceBinsCov = pkgs.runCommand "rio-bins-cov" { disallowedReferences = [ rustStable ]; } ''
-    mkdir -p $out/bin
-    cp -L ${workspace}/bin/* $out/bin/
-  '';
-
-  # Per-member binary-only derivations — same closure-scrub treatment as
-  # workspaceBins/workspaceBinsCov but one derivation per crate, so each
-  # docker image can include only the binary it ships instead of the full
-  # workspace bundle. lib-only members (rio-common, rio-nix, …) have no
-  # bin/ and will fail at build if referenced here — correct, only bin
-  # crates belong in image contents.
-  mkMemberBins =
-    strip:
-    lib.mapAttrs (
-      name: m:
-      pkgs.runCommand "${name}-bin" { disallowedReferences = [ rustStable ]; } ''
-        mkdir -p $out/bin
-        cp -L ${m.build}/bin/* $out/bin/
-        ${lib.optionalString strip ''
-          chmod -R u+w $out/bin
-          ${pkgs.binutils}/bin/strip $out/bin/*
-        ''}
-      ''
-    ) cargoNix.workspaceMembers;
+  # from stdenv's fixupPhase — no post-processing needed. Stripping is
+  # gated on `stripBins`: coverage builds set false so __llvm_covfun/
+  # __llvm_covmap sections survive for llvm-cov (binaries ~5× larger,
+  # closure unchanged). disallowedReferences guards both modes.
+  binSuffix = if stripBins then "" else "-cov";
+  scrubBins =
+    name: drvBin:
+    pkgs.runCommand name { disallowedReferences = [ rustStable ]; } ''
+      mkdir -p $out/bin
+      cp -L ${drvBin}/* $out/bin/
+      ${lib.optionalString stripBins ''
+        chmod -R u+w $out/bin
+        ${pkgs.binutils}/bin/strip $out/bin/*
+      ''}
+    '';
 in
 {
   inherit cargoNix;
@@ -473,14 +439,11 @@ in
   # closure-scrubbed). Use `workspaceBins` for docker/VM tests.
   inherit workspace;
 
-  # Stripped binary-only variant — bin/crdgen bin/rio-cli
-  # bin/rio-{controller,gateway,scheduler,store,worker}, closure
-  # ~glibc+syslibs. What docker.nix, nix/tests/, nix/modules/ consume.
-  inherit workspaceBins;
-
-  # Unstripped variant for coverage builds that need __llvm_covfun
-  # intact. Same closure as workspaceBins; binaries ~5× larger.
-  inherit workspaceBinsCov;
+  # Binary-only variant — bin/crdgen bin/rio-cli bin/rio-{controller,
+  # gateway,scheduler,store,worker}, closure ~glibc+syslibs. Stripped
+  # iff `stripBins`. What docker.nix / nix/tests/ / nix/modules/
+  # consume.
+  workspaceBins = scrubBins "rio-bins${binSuffix}" "${workspace}/bin";
 
   # Per-member outputs for fine-grained targets:
   #   nix build .#rio-scheduler
@@ -489,11 +452,11 @@ in
   # per-crate caching.
   members = lib.mapAttrs (_: m: m.build) cargoNix.workspaceMembers;
 
-  # Per-member stripped bins (docker.nix consumer). Same shape as
-  # `members` but each is a scrubbed bin/ only — closure ~glibc+syslibs.
-  memberBins = mkMemberBins true;
-
-  # Unstripped variant for coverage-mode docker images (see
-  # workspaceBinsCov).
-  memberBinsCov = mkMemberBins false;
+  # Per-member scrubbed bins (docker.nix consumer). Same shape as
+  # `members` but each is bin/ only — closure ~glibc+syslibs. lib-only
+  # members (rio-common, rio-nix, …) have no bin/ and fail at build if
+  # referenced — correct, only bin crates belong in image contents.
+  memberBins = lib.mapAttrs (
+    name: m: scrubBins "${name}-bin${binSuffix}" "${m.build}/bin"
+  ) cargoNix.workspaceMembers;
 }
