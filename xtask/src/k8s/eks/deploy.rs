@@ -92,6 +92,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let vpc_ipv6_cidr = tf.get("vpc_ipv6_cidr_block")?;
     let cluster = tf.get("cluster_name")?;
     let node_role = tf.get("karpenter_node_role_name")?;
+    let gateway_dns_fqdn = tf.get_opt("gateway_dns_fqdn");
 
     info!("deploy tag={tag} ami={ami_tag} registry={ecr} cluster={cluster}");
 
@@ -156,7 +157,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     } else {
         "internet-facing"
     };
-    let nlb_ann = json!({
+    let mut nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": scheme,
@@ -182,6 +183,11 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
+    // external-dns (dns.tf) reconciles this annotation → DNS record.
+    // Absent when gateway_dns is disabled or the state predates it.
+    if let Some(fqdn) = &gateway_dns_fqdn {
+        nlb_ann["external-dns.alpha.kubernetes.io/hostname"] = json!(fqdn);
+    }
 
     ui::step("helm upgrade rio", || async {
         helm::Helm::upgrade_install("rio", "infra/helm/rio-build")

@@ -58,6 +58,11 @@ output "vpc_ipv6_cidr_block" {
   value       = module.vpc.vpc_ipv6_cidr_block
 }
 
+output "gateway_dns_fqdn" {
+  description = "Stable FQDN for rio-gateway (xtask annotates the Service with this for external-dns). Empty when gateway_dns is disabled."
+  value       = local.dns_enabled ? local.gateway_dns_fqdn : ""
+}
+
 output "karpenter_node_role_name" {
   description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — xtask passes as --set karpenter.nodeRoleName)"
   value       = module.karpenter.node_iam_role_name

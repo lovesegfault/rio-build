@@ -42,7 +42,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
             backend.bucket
         );
         tofu::init(DIR, &backend)?;
-        tofu::apply(DIR, false, &vars).await?;
+        tofu::apply(DIR, false, &vars, &[]).await?;
     } else {
         info!("no state in S3 — first-time setup (local apply → migrate)");
         let sh = shell()?;
@@ -64,7 +64,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
         std::fs::write(&*override_tf, "terraform {\n  backend \"local\" {}\n}\n")?;
 
         sh::run_sync(cmd!(sh, "tofu -chdir={DIR} init -upgrade"))?;
-        tofu::apply(DIR, false, &vars).await?;
+        tofu::apply(DIR, false, &vars, &[]).await?;
 
         info!("bucket created — migrating local state → S3");
         // Drop override BEFORE migrate so tofu sees the s3 backend again.

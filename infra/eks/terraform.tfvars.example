@@ -19,6 +19,26 @@
 # Override here only for a hotfix; *.auto.tfvars.json loads AFTER
 # terraform.tfvars so the generated values win unless you delete that file.
 
+# Stable DNS for the gateway NLB (optional). Uncomment ONE block.
+#
+# Route53 — zone hosted in this account (create_route53_zone=true to
+# have terraform create it; false means it must already exist):
+# gateway_dns = {
+#   provider            = "route53"
+#   zone                = "rio.example.test"
+#   prefix              = "gw"          # "" → apex
+#   create_route53_zone = true
+# }
+#
+# Cloudflare — zone hosted at Cloudflare; set TF_VAR_cloudflare_api_token
+# in your env (Zone:DNS:Edit scope on `zone`):
+# gateway_dns = {
+#   provider           = "cloudflare"
+#   zone               = "rio.example.test"
+#   prefix             = "gw"
+#   cloudflare_zone_id = "..."          # optional scoping
+# }
+
 # System node sizing (scheduler/store/gateway/controller).
 # system_instance_type  = "m5.large"
 #

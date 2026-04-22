@@ -31,6 +31,11 @@
   # the EKS module's karpenter submodule compat range (~> 21.0).
   karpenter_version = "1.10.0";
 
+  # external-dns chart (kubernetes-sigs.github.io/external-dns). Chart
+  # version, NOT app version (chart 1.N.0 ships app 0.N.0). Only used
+  # by infra/eks/dns.tf — no VM-test consumer yet.
+  external_dns_version = "1.20.0";
+
   # NixOS node AMI kernel minor (ADR-021). String form ("6_19") so
   # minimal.nix can do `pkgs."linuxPackages_${node_kernel_minor}"`.
   # Pinned (not linuxPackages_latest) so a nixpkgs flake-input bump

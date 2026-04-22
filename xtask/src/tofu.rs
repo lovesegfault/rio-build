@@ -35,7 +35,15 @@ pub fn init(dir: &str, backend: &Backend) -> Result<()> {
 /// Plan then apply. Skips apply (and its noisy output) if the plan
 /// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
 /// no-diff, 2 for diff, 1 for error.
-pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
+///
+/// `envs` are set on the spawned process (not passed as `-var=`), so
+/// secrets routed through `TF_VAR_*` stay out of `ps` listings.
+pub async fn apply(
+    dir: &str,
+    auto: bool,
+    vars: &[(&str, &str)],
+    envs: &[(&str, &str)],
+) -> Result<()> {
     let varflags: Vec<String> = vars.iter().map(|(k, v)| format!("-var={k}={v}")).collect();
 
     let plan = tempfile::NamedTempFile::new()?;
@@ -53,6 +61,7 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
             sh,
             "tofu -chdir={dir} plan -detailed-exitcode -out={pp} {vf...}"
         )
+        .envs(envs.iter().copied())
         .quiet()
         .ignore_status()
         .output()?;
@@ -113,6 +122,14 @@ impl Outputs {
                  run `cargo xtask k8s -p eks up --provision` first?"
             )
         })
+    }
+
+    /// Optional output: `None` if absent from state OR present-but-empty
+    /// (terraform's idiom for "feature disabled" — see
+    /// `gateway_dns_fqdn`). Lets deploy run against a state file that
+    /// predates the output without forcing a re-provision.
+    pub fn get_opt(&self, name: &str) -> Option<String> {
+        self.0.get(name).filter(|v| !v.is_empty()).cloned()
     }
 }
 

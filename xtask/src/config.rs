@@ -44,6 +44,24 @@ pub struct XtaskConfig {
     /// Overridden by `--public-cidr` on `k8s up`.
     #[serde(default, deserialize_with = "csv")]
     pub public_cidrs: Vec<String>,
+
+    /// external-dns provider for the gateway's stable hostname
+    /// (`"route53"` / `"cloudflare"` / unset). Passed to tofu as
+    /// `var.gateway_dns.provider`; unset → external-dns not installed.
+    pub dns_provider: Option<String>,
+
+    /// Parent zone for the gateway hostname (e.g. `rio.example.test`).
+    /// Passed to tofu as `var.gateway_dns.zone`.
+    pub dns_zone: Option<String>,
+
+    /// Subdomain prefix (e.g. `gw` → `gw.<zone>`); empty/unset → apex.
+    /// Passed to tofu as `var.gateway_dns.prefix`.
+    pub dns_prefix: Option<String>,
+
+    /// Cloudflare API token (Zone:DNS:Edit scope). Passed to tofu via
+    /// `TF_VAR_cloudflare_api_token` env (never CLI) so it stays out
+    /// of process listings.
+    pub cloudflare_token: Option<String>,
 }
 
 /// Deserialize a comma-separated string into `Vec<String>`. figment's

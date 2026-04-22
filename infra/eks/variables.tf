@@ -53,6 +53,48 @@ variable "karpenter_version" {
   type        = string
 }
 
+variable "external_dns_version" {
+  description = "external-dns chart version (kubernetes-sigs.github.io/external-dns). Sourced from nix/pins.nix via generated.auto.tfvars.json."
+  type        = string
+}
+
+variable "gateway_dns" {
+  description = <<-EOT
+    Stable DNS for the rio-gateway NLB (see dns.tf). external-dns
+    watches the Service and keeps `prefix.zone` (or `zone` when
+    prefix="") pointed at whatever NLB currently exists.
+      provider — "route53", "cloudflare", or "" (disabled; default)
+      zone     — DNS zone the provider hosts (e.g. "rio.example.test")
+      prefix   — record label under zone ("gw"), or "" for apex
+      create_route53_zone — provision the zone (route53 only); false
+        means it must already exist (data lookup fails plan if not)
+      cloudflare_zone_id  — optional --zone-id-filter scoping
+  EOT
+  type = object({
+    provider            = string
+    zone                = string
+    prefix              = string
+    create_route53_zone = optional(bool, false)
+    cloudflare_zone_id  = optional(string, "")
+  })
+  default = { provider = "", zone = "", prefix = "" }
+  validation {
+    condition     = contains(["", "route53", "cloudflare"], var.gateway_dns.provider)
+    error_message = "gateway_dns.provider must be \"route53\", \"cloudflare\", or \"\" (disabled)."
+  }
+  validation {
+    condition     = var.gateway_dns.provider == "" || var.gateway_dns.zone != ""
+    error_message = "gateway_dns.zone is required when gateway_dns.provider is set."
+  }
+}
+
+variable "cloudflare_api_token" {
+  description = "Cloudflare API token with Zone:DNS:Edit on gateway_dns.zone. Only read when gateway_dns.provider == \"cloudflare\". Prefer TF_VAR_cloudflare_api_token in env over committing to a tfvars file."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "system_instance_type" {
   description = "Instance type for system nodegroup (scheduler/store/gateway/controller)"
   type        = string
