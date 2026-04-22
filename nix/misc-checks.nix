@@ -135,20 +135,21 @@ in
   # include files. Does NOT fail on uncovered/untested — those
   # are informational.
   #
-  # Uses cleanSource because tracey needs docs/**/*.md and
-  # .config/tracey/config.styx. tracey's daemon writes
-  # .tracey/daemon.sock under the working dir, so we cp to a
-  # writable tmpdir first.
-  #
-  # .claude/ is excluded via fileset.difference — tracey's config
-  # doesn't scan it, so including it in the drv src causes spurious
-  # rebuilds on every tooling-file edit.
+  # tracey scans docs/**/*.md (spec) + .rs/.nix/.py for
+  # `r[impl/verify ...]` annotations + .config/tracey/config.styx.
+  # tracey's daemon writes .tracey/daemon.sock under the working
+  # dir, so we cp to a writable tmpdir first.
   tracey-validate =
     pkgs.runCommand "rio-tracey-validate"
       {
         src = pkgs.lib.fileset.toSource {
           root = ../.;
-          fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fromSource (pkgs.lib.cleanSource ../.)) ../.claude;
+          fileset = pkgs.lib.fileset.unions [
+            ../docs
+            ../.config/tracey
+            ../nix/tests/default.nix
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs" || f.hasExt "nix" || f.hasExt "py") unfilteredRoot)
+          ];
         };
         nativeBuildInputs = [ traceyPkg ];
       }

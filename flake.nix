@@ -277,14 +277,6 @@
             # rio-controller tests — build-time presence check so a
             # missing profile fails compile, not silently at deploy).
             ./nix/nixos-node/seccomp
-            # observability.md — metrics_registered tests grep the
-            # per-component metrics tables at runtime for the
-            # spec→describe check (see rio-test-support
-            # grep_spec_names). nextest sets CARGO_MANIFEST_DIR to
-            # <this fileset>/<crate>/, so ../docs/ must resolve.
-            # Adding a row must break the nextest drv hash so drift
-            # is caught.
-            ./docs/src/observability.md
           ];
           workspaceSrc = pkgs.lib.fileset.toSource {
             root = unfilteredRoot;
@@ -383,7 +375,7 @@
           # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
           traceyPkg = import ./nix/tracey.nix {
             inherit pkgs;
-            rustPlatform = rustPlatformStable;
+            rustPlatform = rustPlatformNightly;
             inherit (inputs) tracey-src;
           };
 
@@ -405,7 +397,9 @@
           # this does break on a nixpkgs bump: pin
           # `inputs.crate2nix-nixpkgs` separately and pass that
           # through as `pkgs` here.
-          crate2nixCli = pkgs.callPackage "${inputs.crate2nix}/crate2nix/default.nix" { };
+          crate2nixCli = pkgs.callPackage "${inputs.crate2nix}/crate2nix/default.nix" {
+            cargo = rustStable;
+          };
 
           # ──────────────────────────────────────────────────────────
           # crate2nix JSON-mode build
@@ -438,7 +432,13 @@
           # derivation count (645 normal + 645 instrumented), but each
           # half caches independently — touching a workspace crate only
           # rebuilds that crate's two variants + dependents.
-          crateBuildCov = mkCrateBuild { globalExtraRustcOpts = [ "-Cinstrument-coverage" ]; };
+          crateBuildCov = mkCrateBuild {
+            globalExtraRustcOpts = [
+              "-Cinstrument-coverage"
+              "-Ccodegen-units=16"
+              "-Cdebuginfo=line-tables-only"
+            ];
+          };
 
           # ──────────────────────────────────────────────────────────
           # crate2nix check backends: clippy, tests, doc
@@ -500,6 +500,12 @@
               fileset = pkgs.lib.fileset.unions [
                 workspaceFileset
                 ./.config/nextest.toml
+                # metrics_registered tests grep the per-component
+                # metrics tables at runtime (rio-test-support
+                # grep_spec_names reads ../docs/src/observability.md
+                # via fs::read_to_string). Adding a row breaks the
+                # nextest drv hash, not the build/clippy/doc hashes.
+                ./docs/src/observability.md
               ];
             };
             nextestExtraArgs = [
@@ -986,7 +992,6 @@
               checks = builtins.removeAttrs config.checks (
                 [
                   "build"
-                  "coverage"
                 ]
                 ++ builtins.attrNames fuzz.runs
                 ++ builtins.attrNames vmTests
@@ -1034,11 +1039,15 @@
             programs = {
               nixfmt.enable = true;
 
-              # Rust formatting (stable rustfmt — nightly rustfmt can
-              # produce different output, and we want CI/dev parity here)
+              # Rust formatting. Uses the nightly toolchain so the
+              # default (nightly) devshell doesn't pull in a second
+              # full stable toolchain just for rustfmt. CI/dev parity
+              # is preserved because both run THIS treefmtEval —
+              # `nix develop .#stable -c cargo fmt` (raw stable
+              # rustfmt) may diverge; use `treefmt` instead.
               rustfmt = {
                 enable = true;
-                package = rustStable;
+                package = rustNightly;
               };
 
               # TOML formatting
@@ -1219,17 +1228,13 @@
             # I-205: x86 .metal NodePool only — see nodeAmi comment.
             node-ami-x86_64-bios = nodeAmi "x86_64-linux" { efi = false; };
 
-            # CRD YAML for kustomize. runCommand invokes the crdgen
-            # binary (serde_yaml write-only) and dumps two YAML
-            # documents (Pool + ComponentScaler) to $out. Kustomize
-            # references this via `nix build .#crds` → result is a
-            # file; `cargo xtask regen crds` splits it into
-            # one-file-per-CRD under infra/helm/crds/.
-            #
-            # NOT a derivation that the chart depends on directly
-            # (helm needs real files, not /nix/store paths). It's a
-            # convenience for regeneration — `cargo xtask regen crds`
-            # wraps this and splits one-file-per-CRD.
+            # CRD YAML for the crds-drift check. runCommand invokes
+            # the crdgen binary and dumps Pool + ComponentScaler to
+            # $out; misc-checks.nix:crds-drift splits it via
+            # split-crds.py and diffs against infra/helm/crds/.
+            # `cargo xtask regen crds` does NOT use this — it runs
+            # `cargo run --bin crdgen` directly to avoid a nix build
+            # in the dev loop.
             #
             # Why not auto-regenerate in CI: the committed YAML is
             # what operators `kubectl apply`. Regenerating on every
@@ -1352,7 +1357,7 @@
             build = rio-workspace;
             clippy = crateChecks.clippyCheck;
             doc = crateChecks.docCheck;
-            inherit (crateChecks) nextest coverage;
+            inherit (crateChecks) nextest;
             dashboard = rioDashboard;
           }
           // miscChecks
