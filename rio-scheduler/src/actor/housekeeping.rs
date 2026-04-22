@@ -287,6 +287,35 @@ impl DagActor {
         )
     }
 
+    /// Credit every executor's `last_heartbeat` for an actor-side
+    /// stall. The merge-time `FindMissingPaths` runs inside the actor
+    /// loop and can legitimately take up to `MERGE_FMP_TIMEOUT` (90s)
+    /// for a 153k-node submission; during that window heartbeats and
+    /// Ticks queue up. The first queued Tick after the stall would
+    /// otherwise compute `now - last_heartbeat > 30s` against
+    /// PRE-stall timestamps and reap the entire fleet.
+    ///
+    /// Shifting `last_heartbeat` forward by the stall duration (capped
+    /// at `now`) makes `tick_check_heartbeats` measure only WORKER
+    /// silence, not actor unresponsiveness. A worker that was already
+    /// stale before the stall stays stale (its shifted timestamp is
+    /// still > `HEARTBEAT_TIMEOUT_SECS` behind `now`); detection is
+    /// merely delayed by ≤ `stall`. Live workers' queued heartbeats
+    /// then overwrite with `Instant::now()` as they drain.
+    pub(super) fn credit_heartbeats_for_stall(&mut self, stall: std::time::Duration) {
+        if stall <= std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS) {
+            // stall ≤ threshold means a fully-live worker
+            // (last_heartbeat ≈ now-at-stall-start) won't cross the
+            // threshold. A worker already partly stale might, but its
+            // queued heartbeat lands before the reap Tick.
+            return;
+        }
+        let now = Instant::now();
+        for w in self.executors.values_mut() {
+            w.last_heartbeat = (w.last_heartbeat + stall).min(now);
+        }
+    }
+
     /// Scan workers for heartbeat timeouts; disconnect any that have
     /// been silent past `HEARTBEAT_TIMEOUT_SECS`. The constant is
     /// `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` (limits.rs:63)

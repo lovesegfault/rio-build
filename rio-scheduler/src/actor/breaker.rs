@@ -85,8 +85,17 @@ impl Default for CacheCheckBreaker {
 /// Trip open after this many consecutive failures.
 const OPEN_THRESHOLD: u32 = 5;
 
-/// Stay open for this long before auto-closing (even without a probe success).
-const OPEN_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+/// Stay open for this long before auto-closing (even without a probe
+/// success). Derived as `MERGE_FMP_TIMEOUT + 10 s` so a half-open
+/// probe (which is the same FMP call) cannot outlive the open window —
+/// otherwise the breaker auto-closes mid-probe, the probe's eventual
+/// timeout sees `is_open()==false` → `lazy_reset_if_auto_closed`
+/// resets the failure counter → only 1-in-`OPEN_THRESHOLD` submits is
+/// rejected during a sustained outage. `find_missing_with_breaker`
+/// further uses `grpc_timeout` (30 s) for the half-open probe so this
+/// coupling is belt-and-suspenders.
+const OPEN_DURATION: std::time::Duration =
+    std::time::Duration::from_secs(super::MERGE_FMP_TIMEOUT.as_secs() + 10);
 
 impl<C: Clock + Default> CacheCheckBreaker<C> {
     pub(super) fn new() -> Self {
@@ -321,6 +330,21 @@ mod tests {
             recorder.get("rio_scheduler_cache_check_circuit_open_total{}"),
             1,
             "auto-close + 1 failure must NOT re-increment open_total"
+        );
+    }
+
+    /// `OPEN_DURATION` MUST cover the merge-time FMP timeout. If the
+    /// half-open probe (same FMP call) can outlive the open window,
+    /// the breaker auto-closes mid-probe and the probe's timeout
+    /// resets the failure counter → only 1-in-OPEN_THRESHOLD submits
+    /// is rejected during a sustained outage.
+    #[test]
+    fn open_duration_covers_merge_fmp_timeout() {
+        assert!(
+            OPEN_DURATION >= super::super::MERGE_FMP_TIMEOUT,
+            "OPEN_DURATION ({OPEN_DURATION:?}) must be >= MERGE_FMP_TIMEOUT \
+             ({:?}) so the half-open probe cannot outlive the open window",
+            super::super::MERGE_FMP_TIMEOUT
         );
     }
 }

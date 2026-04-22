@@ -710,6 +710,77 @@ async fn test_heartbeat_timeout_fires_at_timeout_secs_not_2x() -> TestResult {
     Ok(())
 }
 
+/// `credit_heartbeats_for_stall` shifts every executor's
+/// `last_heartbeat` forward by the stall duration (capped at `now`),
+/// preserving relative liveness order: a live worker ends up at `now`
+/// (capped), a borderline worker at `now` (capped), a stale worker
+/// shifted but STILL past threshold (stays reapable). A stall ≤
+/// threshold short-circuits (no shift).
+#[tokio::test]
+async fn credit_heartbeats_for_stall_preserves_liveness_order() -> TestResult {
+    use crate::actor::debug::backdate;
+    use crate::state::{ExecutorState, HEARTBEAT_TIMEOUT_SECS};
+    use std::time::Duration;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let threshold = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+
+    let mk = |id: &str, secs_ago: u64| {
+        let mut w = ExecutorState::new(id.into());
+        w.last_heartbeat = backdate(secs_ago);
+        w
+    };
+    actor.executors.insert("live".into(), mk("live", 5));
+    actor
+        .executors
+        .insert("borderline".into(), mk("borderline", 28));
+    actor.executors.insert("stale".into(), mk("stale", 50));
+
+    // — case 1: large stall (>threshold) shifts —
+    actor.credit_heartbeats_for_stall(Duration::from_secs(60));
+    let now = std::time::Instant::now();
+
+    let age = |id: &str| now.duration_since(actor.executors[id].last_heartbeat);
+    // live: 5s → 5+60=65s in future → capped at now (≈0).
+    assert!(
+        age("live") < Duration::from_secs(2),
+        "live worker must cap at now; age={:?}",
+        age("live")
+    );
+    // borderline: 28s → 28+60=88s in future → capped at now (≈0).
+    assert!(
+        age("borderline") < Duration::from_secs(2),
+        "borderline worker must cap at now; age={:?}",
+        age("borderline")
+    );
+    // stale: 50s → shifted by 60s → would be 10s in the future → capped
+    // at now. Under a 60s stall every pre-stall timestamp ends up at
+    // now (60 > 50). To prove "stays reapable", use a stall that does
+    // NOT cover the stale gap: re-seed and shift by exactly threshold+5
+    // so a 50s-stale worker remains past threshold post-shift.
+    actor
+        .executors
+        .insert("stale2".into(), mk("stale2", HEARTBEAT_TIMEOUT_SECS + 50));
+    actor.credit_heartbeats_for_stall(threshold + Duration::from_secs(5));
+    let now = std::time::Instant::now();
+    let stale2_age = now.duration_since(actor.executors["stale2"].last_heartbeat);
+    assert!(
+        stale2_age > threshold,
+        "stale worker must remain reapable post-shift; age={stale2_age:?} threshold={threshold:?}"
+    );
+
+    // — case 2: stall ≤ threshold → early return, no shift —
+    actor.executors.insert("noop".into(), mk("noop", 5));
+    let before = actor.executors["noop"].last_heartbeat;
+    actor.credit_heartbeats_for_stall(Duration::from_secs(20));
+    assert_eq!(
+        actor.executors["noop"].last_heartbeat, before,
+        "stall ≤ threshold must early-return without shifting"
+    );
+    Ok(())
+}
+
 // ===========================================================================
 // Poison-TTL expiry (POISON_TTL is cfg(test)-shadowed to 100ms in state/mod.rs)
 // ===========================================================================

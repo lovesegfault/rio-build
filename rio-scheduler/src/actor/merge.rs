@@ -1238,25 +1238,39 @@ impl DagActor {
             req.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
         }
 
-        let resp = match tokio::time::timeout(
-            self.grpc_timeout,
-            store_client.clone().find_missing_paths(req),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r.into_inner(),
-            Ok(Err(e)) => {
-                warn!(error = %e, "stale-completed verify: store FindMissingPaths failed; \
+        // Conditional timeout — same pattern as
+        // `find_missing_with_breaker`: this is a submission-sized
+        // batch (every pre-existing Completed/Skipped output) so it
+        // needs MERGE_FMP_TIMEOUT when the store is healthy, but the
+        // short grpc_timeout during an outage so a fail-open path
+        // doesn't pin the actor 90s. The breaker is read-only here
+        // (this is a best-effort check, not an availability gate).
+        let fmp_timeout = if self.cache_breaker.is_open() {
+            self.grpc_timeout
+        } else {
+            super::MERGE_FMP_TIMEOUT
+        };
+        let fmp_start = Instant::now();
+        let resp =
+            match tokio::time::timeout(fmp_timeout, store_client.clone().find_missing_paths(req))
+                .await
+            {
+                Ok(Ok(r)) => r.into_inner(),
+                Ok(Err(e)) => {
+                    self.credit_heartbeats_for_stall(fmp_start.elapsed());
+                    warn!(error = %e, "stale-completed verify: store FindMissingPaths failed; \
                        treating pre-existing Completed as valid (fail-open)");
-                return HashSet::new();
-            }
-            Err(_) => {
-                warn!(timeout = ?self.grpc_timeout,
+                    return HashSet::new();
+                }
+                Err(_) => {
+                    self.credit_heartbeats_for_stall(fmp_start.elapsed());
+                    warn!(timeout = ?fmp_timeout,
                       "stale-completed verify: store FindMissingPaths timed out; \
                        treating pre-existing Completed as valid (fail-open)");
-                return HashSet::new();
-            }
-        };
+                    return HashSet::new();
+                }
+            };
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         if resp.missing_paths.is_empty() {
             return HashSet::new();
@@ -1944,13 +1958,25 @@ impl DagActor {
             }
         }
         // r[impl sched.substitute.eager-probe]
-        // MERGE_FMP_TIMEOUT (90s), not self.grpc_timeout (30s): the
+        // Conditional timeout: when the breaker is CLOSED (store
+        // believed healthy) use MERGE_FMP_TIMEOUT (90s) — the
         // store-side check_available no longer truncates, so a
-        // 153k-uncached probe legitimately runs ~36s. Dispatch-time
-        // and the topdown roots-only FMP stay on grpc_timeout (their
-        // batches are small).
+        // 153k-uncached probe legitimately runs ~36s. When OPEN
+        // (sustained outage; this call is the half-open probe) use
+        // grpc_timeout (30s) so a tiny submission isn't held 90s
+        // against a dead store and the probe stays inside
+        // OPEN_DURATION. The other two merge-time FMP callers:
+        // `verify_preexisting_completed` (submission-sized; same
+        // conditional below) and the top-down roots-only FMP
+        // (root-count-bounded; stays on grpc_timeout).
+        let fmp_timeout = if self.cache_breaker.is_open() {
+            self.grpc_timeout
+        } else {
+            super::MERGE_FMP_TIMEOUT
+        };
+        let fmp_start = Instant::now();
         let resp = match tokio::time::timeout(
-            super::MERGE_FMP_TIMEOUT,
+            fmp_timeout,
             store_client.clone().find_missing_paths(fmp_req),
         )
         .await
@@ -1964,6 +1990,7 @@ impl DagActor {
             Ok(Err(e)) => {
                 warn!(error = %e, "store FindMissingPaths failed");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 // record_failure() returns true if this trips the breaker
                 // open (or it was already open from a prior trip).
                 if self.cache_breaker.record_failure() {
@@ -1976,16 +2003,22 @@ impl DagActor {
             }
             Err(_) => {
                 warn!(
-                    timeout = ?super::MERGE_FMP_TIMEOUT,
+                    timeout = ?fmp_timeout,
                     "store FindMissingPaths timed out"
                 );
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
+                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
                 return Ok(None);
             }
         };
+        // Actor was unresponsive for `fmp_start.elapsed()` — don't
+        // count that against workers (queued Tick would otherwise
+        // reap the fleet on a 36–90 s probe). See
+        // `credit_heartbeats_for_stall`.
+        self.credit_heartbeats_for_stall(fmp_start.elapsed());
         Ok(Some(resp))
     }
 
