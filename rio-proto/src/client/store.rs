@@ -65,9 +65,9 @@ impl NarCollectError {
     /// when the peer goes away without a gRPC-level status).
     ///
     /// `DeadlineExceeded` is NOT transient: that's [`get_path_nar`]'s
-    /// own timeout firing — the store hung past `fetch_timeout`.
-    /// Retrying with the same timeout won't help, and the next retry
-    /// would compound the wait on a FUSE-thread caller.
+    /// per-chunk idle timeout firing — the store stalled (no chunk for
+    /// `timeout`). Retrying with the same idle bound won't help, and
+    /// the next retry would compound the wait on a FUSE-thread caller.
     pub fn is_transient(&self) -> bool {
         matches!(self, NarCollectError::Stream(s) if rio_common::grpc::is_transient(s.code()))
     }
@@ -90,8 +90,8 @@ impl NarCollectError {
 /// `idle_timeout`: when `Some`, bounds the time between successive stream
 /// messages — a stalled store (no chunks arriving) trips at the timeout,
 /// but a healthy-but-slow store (steady chunks) completes regardless of
-/// total NAR size. `None` = unbounded (caller wraps the whole call, as
-/// [`get_path_nar`] does). Mirrors [`collect_nar_stream_to_writer`].
+/// total NAR size. `None` = unbounded. Mirrors
+/// [`collect_nar_stream_to_writer`].
 pub async fn collect_nar_stream(
     stream: &mut Streaming<GetPathResponse>,
     max_size: u64,
@@ -392,28 +392,26 @@ pub async fn get_path_nar(
     });
     crate::interceptor::inject_current(req.metadata_mut());
     inject_metadata(req.metadata_mut(), extra_metadata).map_err(NarCollectError::Stream)?;
-    let fut = async {
-        let mut stream = match client.get_path(req).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
-            Err(status) => return Err(NarCollectError::Stream(status)),
-        };
-        // Whole-call wrap below already bounds this; `None` preserves
-        // existing await structure (test-timing-sensitive — see fn doc).
-        let (info, nar) = collect_nar_stream(&mut stream, max_nar_size, None).await?;
-        match info {
-            Some(raw) => {
-                let validated = ValidatedPathInfo::try_from(raw)?;
-                Ok(Some((validated, nar)))
-            }
-            None => Ok(None),
-        }
+    // I-211 / merged_014: `timeout` is an IDLE bound, not a wall-clock
+    // bound on the whole fetch. It applies twice: (1) the initial RPC
+    // (covers connect + server-side first-response — a hung store still
+    // trips at `timeout`); (2) each subsequent `stream.message()` inside
+    // the collector. A 4 GiB NAR completes as long as the store yields a
+    // chunk every <`timeout`. The previous whole-call wrap meant
+    // `nar_from_path` on a 4 GiB NAR at <13.7 MB/s hit DeadlineExceeded
+    // at 300s. Mirrors [`get_path_nar_to_file`].
+    let mut stream = match with_timeout_status("GetPath", timeout, client.get_path(req)).await {
+        Ok(resp) => resp.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => return Err(NarCollectError::Stream(status)),
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
-            format!("GetPath({store_path}) timed out after {timeout:?}"),
-        ))),
+    let (info, nar) = collect_nar_stream(&mut stream, max_nar_size, Some(timeout)).await?;
+    match info {
+        Some(raw) => {
+            let validated = ValidatedPathInfo::try_from(raw)?;
+            Ok(Some((validated, nar)))
+        }
+        None => Ok(None),
     }
 }
 

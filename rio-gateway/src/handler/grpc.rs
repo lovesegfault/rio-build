@@ -461,6 +461,9 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 /// auto-advance fires the GRPC_STREAM_TIMEOUT before in-process gRPC
 /// I/O completes (observed in wire_opcodes::build reconnect tests when
 /// P0465 initially inlined this; reverted to delegation).
+/// `GRPC_STREAM_TIMEOUT` is a per-chunk IDLE bound (I-211), not a
+/// whole-call deadline — a 4 GiB NAR completes as long as chunks keep
+/// arriving.
 pub(crate) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
