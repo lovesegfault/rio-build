@@ -444,6 +444,21 @@ impl Substituter {
         let cached = self
             .inflight
             .try_get_with(key, async {
+                // Cheap no-work checks BEFORE the admission permit. A
+                // tenant with no upstreams (the common case) must get
+                // an immediate `Ok(None)`, not queue behind saturated
+                // substituters for up to SUBSTITUTE_ADMISSION_WAIT.
+                // `list_for_tenant` is one indexed PG read; far cheaper
+                // than the permit's potential 25 s queue.
+                let Some(http) = &self.http else {
+                    return Ok(None); // sandbox: client build failed
+                };
+                let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
+                if upstreams.is_empty() {
+                    // Normal — most tenants don't configure upstreams.
+                    // No metric; this isn't a miss, it's a no-op.
+                    return Ok(None);
+                }
                 // r[impl store.substitute.admission]
                 // Leader-only permit: this init future runs ONCE per
                 // `(tenant, path)` per TTL window; coalesced waiters
@@ -458,7 +473,7 @@ impl Substituter {
                     Some(g) => Some(g.acquire_bounded().await?),
                     None => None,
                 };
-                self.do_substitute(tenant_id, store_path)
+                self.do_substitute(http, upstreams, tenant_id, store_path)
                     .await
                     .map(|v| v.map(Arc::new))
             })
@@ -492,7 +507,7 @@ impl Substituter {
         // runtime closures, so this is the only place the closure can be
         // completed.
         if let Some(info) = &result {
-            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await;
+            Box::pin(self.ensure_references(tenant_id, &info.references, budget)).await?;
         }
         Ok(result)
     }
@@ -503,15 +518,24 @@ impl Substituter {
     /// singleflights per-ref and walks each ref's own closure). The
     /// local `query_path_info` check short-circuits already-present
     /// paths so the recursion converges; self-references hit the
-    /// just-ingested row and skip. Best-effort: a failed ref logs +
-    /// continues so a partial closure doesn't poison the seed (the
-    /// build still fails with a clear ENOENT naming the missing ref).
+    /// just-ingested row and skip.
+    ///
+    /// Best-effort for UPSTREAM failures: a 5xx/hash-mismatch on a
+    /// ref logs + continues so a partial closure doesn't poison the
+    /// seed (the build still fails with a clear ENOENT naming the
+    /// missing ref). LOCAL backpressure is NOT swallowed:
+    /// [`SubstituteError::Admission`] propagates so the caller's
+    /// retry re-walks the closure once permits free up. Swallowing it
+    /// would let the seed return `Ok(Some)` with refs missing — the
+    /// scheduler then marks the path Completed and the builder
+    /// ENOENTs on the absent ref. The seed is already in S3, so the
+    /// retry is a cheap moka/PG hit.
     async fn ensure_references(
         &self,
         tenant_id: Uuid,
         refs: &[StorePath],
         budget: &Arc<AtomicUsize>,
-    ) {
+    ) -> Result<(), SubstituteError> {
         for r in refs {
             let r = r.as_str();
             match metadata::query_path_info(&self.pool, r).await {
@@ -522,28 +546,32 @@ impl Substituter {
                     continue;
                 }
             }
-            if let Err(e) = Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
-                warn!(reference = %r, error = %e, "closure: reference substitution failed");
+            match Box::pin(self.try_substitute_inner(tenant_id, r, budget)).await {
+                Ok(_) => {}
+                // r[impl store.substitute.admission]
+                // Transient local backpressure → propagate. Caller
+                // retries the whole substitute (seed is moka-cached).
+                Err(e @ SubstituteError::Admission(_)) => return Err(e),
+                Err(e) => {
+                    warn!(reference = %r, error = %e, "closure: reference substitution failed");
+                }
             }
         }
+        Ok(())
     }
 
-    /// One full fetch cycle — the singleflight body.
+    /// One full fetch cycle — the singleflight body. `http` and
+    /// `upstreams` are hoisted by the caller (the moka init future)
+    /// so the no-upstreams fast-path returns BEFORE the admission
+    /// permit is acquired; this body only runs when there is real
+    /// upstream work.
     async fn do_substitute(
         &self,
+        http: &reqwest::Client,
+        upstreams: Vec<Upstream>,
         tenant_id: Uuid,
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
-        let Some(http) = &self.http else {
-            return Ok(None); // sandbox: client build failed
-        };
-        let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
-        if upstreams.is_empty() {
-            // Normal — most tenants don't configure upstreams. No
-            // metric increment; this isn't a miss, it's a no-op.
-            return Ok(None);
-        }
-
         let sp = StorePath::parse(store_path)
             .map_err(|e| SubstituteError::NarInfo(format!("bad store path: {e}")))?;
         let hash_part = sp.hash_part();
@@ -2159,6 +2187,85 @@ mod tests {
             gate.semaphore().available_permits(),
             2,
             "permit released after leader completes"
+        );
+    }
+
+    // r[verify store.substitute.admission]
+    /// `ensure_references` MUST propagate `SubstituteError::Admission`
+    /// instead of swallowing it. The leader-permit refactor moved
+    /// `acquire_bounded()` inside `try_substitute_inner`, which the
+    /// closure walk re-enters per ref; with the old best-effort
+    /// `warn!`-and-continue, a saturated gate meant the seed returned
+    /// `Ok(Some)` while its refs were silently skipped — scheduler
+    /// marks Completed → builder ENOENTs on the missing closure.
+    ///
+    /// Setup: pre-seed the moka `inflight` slot with a result carrying
+    /// two refs, so the seed call is a cache hit (no permit needed)
+    /// and goes straight to `ensure_references`. cap=1 gate; the one
+    /// permit is held externally, then the semaphore is closed so
+    /// `acquire_bounded` fails INSTANTLY with `Admission(Closed)` —
+    /// same `Admission(_)` propagation arm as production `Saturated`,
+    /// without the 25 s wait (PG + paused-time don't compose here).
+    #[tokio::test]
+    async fn ensure_references_propagates_admission_saturated() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-admission-refs").await;
+
+        // Upstream config must be non-empty so the ref's init future
+        // proceeds past the hoisted no-upstreams check to
+        // `acquire_bounded`. The URL is never reached (permit fails
+        // first).
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "http://127.0.0.1:1",
+            50,
+            &["dummy:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let gate = AdmissionGate::new(1);
+        let sub = test_substituter(db.pool.clone()).with_admission_gate(gate.clone());
+
+        // Seed result: two refs that aren't in PG (fresh DB).
+        let seed = rio_test_support::fixtures::test_store_path("adm-seed");
+        let ref_a = format!(
+            "/nix/store/{}-adm-ref-a",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let ref_b = format!(
+            "/nix/store/{}-adm-ref-b",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let info = ValidatedPathInfo::try_from(rio_proto::types::PathInfo {
+            store_path: seed.clone(),
+            store_path_hash: Vec::new(),
+            deriver: String::new(),
+            nar_hash: vec![0u8; 32],
+            nar_size: 1,
+            references: vec![ref_a, ref_b],
+            registration_time: 0,
+            ultimate: false,
+            signatures: Vec::new(),
+            content_address: String::new(),
+        })
+        .unwrap();
+        sub.inflight
+            .insert((tid, seed.clone()), Some(Arc::new(info)))
+            .await;
+
+        // Hold the only permit, then close: `acquire_bounded` now
+        // returns `Admission(Closed)` immediately.
+        let _held = gate.semaphore().clone().acquire_owned().await.unwrap();
+        gate.semaphore().close();
+
+        let got = sub.try_substitute(tid, &seed).await;
+        assert!(
+            matches!(got, Err(SubstituteError::Admission(_))),
+            "closure-walk admission backpressure must propagate, not be \
+             swallowed into Ok(Some); got {got:?}"
         );
     }
 
