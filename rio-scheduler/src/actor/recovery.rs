@@ -912,14 +912,36 @@ impl DagActor {
             "reconciling orphaned assignments (worker didn't reconnect)"
         );
 
+        // Batch-probe ALL orphans' outputs in ONE FindMissingPaths
+        // before the loop. Per-orphan calls were N×grpc_timeout against
+        // a dead store (every orphan paid the full 30s); the per-orphan
+        // decision below is then a hashset lookup. Floating-CA `[""]`
+        // placeholders filtered (translate.rs convention) so they don't
+        // trip FMP's InvalidArgument.
+        let all_outputs: Vec<String> = orphaned
+            .iter()
+            .flat_map(|(_, _, outs)| outs.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+        let missing = self.batch_probe_orphan_outputs(all_outputs).await;
+
         for (drv_hash, executor_id, expected_outputs) in orphaned {
-            // Query store: did the build complete while the scheduler
-            // was down (orphan completion)? Else the worker died
-            // mid-build → reset to Ready for retry.
-            if self
-                .outputs_present_in_store(&drv_hash, &expected_outputs)
-                .await
-            {
+            // Did the build complete while the scheduler was down
+            // (orphan completion)? All-present = none in `missing`.
+            // Conservative reset for: empty verifiable set (CA
+            // pre-completion), or no missing-set (RPC failed/timed
+            // out).
+            let verifiable: Vec<&str> = expected_outputs
+                .iter()
+                .map(String::as_str)
+                .filter(|p| !p.is_empty())
+                .collect();
+            let present = !verifiable.is_empty()
+                && missing
+                    .as_ref()
+                    .is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)));
+            if present {
                 self.adopt_orphan_completion(&drv_hash, &executor_id, expected_outputs)
                     .await;
             } else {
@@ -1004,49 +1026,44 @@ impl DagActor {
             .collect()
     }
 
-    /// `FindMissingPaths` against `expected_outputs`: store returns
-    /// paths NOT in its index, so empty response = all present.
-    /// Conservative `false` for empty `expected_outputs` (can't verify
-    /// orphan completion), no store client (tests), or RPC error.
-    async fn outputs_present_in_store(
+    /// One `FindMissingPaths` over the union of all orphans' expected
+    /// outputs. `Some(missing_set)` on success; `None` on no-client
+    /// (tests) / RPC error / timeout — caller treats `None` as "all
+    /// orphans incomplete" (conservative reset_to_ready). Wrapped in
+    /// `grpc_timeout` + `credit_heartbeats_for_stall` so a dead store
+    /// stalls reconcile at most ONCE (not N×) and doesn't reap
+    /// executors that DID reconnect; feeds `cache_breaker` like the
+    /// merge-time FMP path so a 30s stall here counts toward opening.
+    async fn batch_probe_orphan_outputs(
         &mut self,
-        drv_hash: &DrvHash,
-        expected_outputs: &[String],
-    ) -> bool {
-        // Floating-CA carries `[""]` pre-completion (translate.rs
-        // convention) — filter so a CA orphan doesn't send `""` to
-        // FMP and get a misleading InvalidArgument warn. Empty after
-        // filter ⇒ nothing verifiable ⇒ conservative `false`.
-        let store_paths: Vec<String> = expected_outputs
-            .iter()
-            .filter(|p| !p.is_empty())
-            .cloned()
-            .collect();
+        store_paths: Vec<String>,
+    ) -> Option<HashSet<String>> {
         if store_paths.is_empty() {
-            return false;
+            return Some(HashSet::new());
         }
         let Some(client) = &mut self.store_client else {
-            return false;
+            return None;
         };
-        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest { store_paths });
-        rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-        // Per-orphan in `handle_reconcile_assignments`' loop — without
-        // the timeout, a dead store stalls reconcile unbounded × N
-        // orphans; without the credit, even a bounded 30s × N reaps
-        // every executor that DID reconnect.
+        let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+        rio_proto::interceptor::inject_current(req.metadata_mut());
         let grpc_timeout = self.grpc_timeout;
         let fmp_start = Instant::now();
-        let r = match tokio::time::timeout(grpc_timeout, client.find_missing_paths(fmp_req)).await {
-            Ok(Ok(resp)) => resp.into_inner().missing_paths.is_empty(),
+        let r = match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
+            Ok(Ok(resp)) => {
+                self.cache_breaker.record_success();
+                Some(resp.into_inner().missing_paths.into_iter().collect())
+            }
             Ok(Err(e)) => {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "reconcile: FindMissingPaths failed, assuming incomplete");
-                false
+                self.cache_breaker.record_failure();
+                warn!(error = %e,
+                      "reconcile: FindMissingPaths failed, assuming all orphans incomplete");
+                None
             }
             Err(_) => {
-                warn!(drv_hash = %drv_hash, timeout = ?grpc_timeout,
-                      "reconcile: FindMissingPaths timed out, assuming incomplete");
-                false
+                self.cache_breaker.record_failure();
+                warn!(timeout = ?grpc_timeout,
+                      "reconcile: FindMissingPaths timed out, assuming all orphans incomplete");
+                None
             }
         };
         self.credit_heartbeats_for_stall(fmp_start.elapsed());

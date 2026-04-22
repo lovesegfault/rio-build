@@ -1571,7 +1571,7 @@ async fn test_reset_orphan_does_not_record_failure() -> TestResult {
     .await?;
     let (db, handle) = (f.db, f.handle);
 
-    // No store client → outputs_present_in_store=false → reset path.
+    // No store client → batch_probe_orphan_outputs=None → reset path.
     handle
         .send_unchecked(ActorCommand::ReconcileAssignments)
         .await?;
