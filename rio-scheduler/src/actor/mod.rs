@@ -128,8 +128,8 @@ pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::b
 /// breaks before the final sleep — the 30 s `cap` limits the 7th
 /// backoff to 16 s, not 32 s) before demoting to cache-miss. Raised
 /// 5→8 alongside `r[store.substitute.admission]`: the store now queues
-/// up to `SUBSTITUTE_ADMISSION_WAIT` (30 s) before returning
-/// `RESOURCE_EXHAUSTED`, so each attempt is itself a 30 s server-side
+/// up to `SUBSTITUTE_ADMISSION_WAIT` (25 s) before returning
+/// `RESOURCE_EXHAUSTED`, so each attempt is itself a 25 s server-side
 /// wait under saturation; 8 attempts give a ~90 s window
 /// (≥1 attempt's bounded-wait + backoffs) for the burst to clear
 /// before demoting. Belt-and-suspenders — under normal load the

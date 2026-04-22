@@ -199,7 +199,7 @@ r[obs.metric.store]
 | `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued — or the batch hit the 4096-uncached cap). |
 | `rio_store_substitute_stale_reclaimed_total` | Counter | Stale `'uploading'` placeholders reclaimed on the substitution hot path (crashed prior fetch left the placeholder; `try_substitute` deleted + re-inserted rather than waiting for the 15-minute orphan sweep). Nonzero is expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts. |
 | `rio_store_substitute_admission_utilization` | Gauge | `try_substitute` admission-gate utilization: `(capacity − available_permits) / capacity`. Updated on each acquire and each `GetLoad` call. Can saturate independently of `pg_pool_utilization` (upstream HTTP bottleneck — permit held across the NAR fetch, PG connection released per-query). Folded into the ComponentScaler's per-pod load via `max(pg, this)`. |
-| `rio_store_substitute_admission_rejected_total` | Counter | `try_substitute` calls rejected with `RESOURCE_EXHAUSTED` after waiting `SUBSTITUTE_ADMISSION_WAIT` (30 s) for a permit. Sustained non-zero = genuine per-replica overload; the ComponentScaler should already be reacting via the utilization gauge. |
+| `rio_store_substitute_admission_rejected_total` | Counter | `try_substitute` calls rejected with `RESOURCE_EXHAUSTED` after waiting `SUBSTITUTE_ADMISSION_WAIT` (25 s) for a permit. Sustained non-zero = genuine per-replica overload; the ComponentScaler should already be reacting via the utilization gauge. |
 | `rio_store_pg_pool_utilization` | Gauge | PG connection-pool utilization: `(size - num_idle) / max_connections`. Updated on each `StoreAdminService.GetLoad` call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching); the ComponentScaler reacts at 0.8 with an immediate +1 and ratio decay. |
 
 r[obs.metric.store-pg-pool]
@@ -339,7 +339,7 @@ Figment env-vars (`RIO_<FIELD>`) that bound fan-out at known saturation points. 
 |---------|-----------|---------|-------------|
 | `RIO_SUBSTITUTE_MAX_CONCURRENT` | scheduler | 256 | In-flight detached substitution-fetch tokio tasks. Memory bound only — per-replica throughput is `r[store.substitute.admission]`. |
 | `RIO_SUBSTITUTE_ADMISSION_PERMITS` | store | `(pg_max × 3).clamp(64, 256)` | Per-replica cap on concurrent `try_substitute_on_miss`. Excess queue server-side up to 25s, then `ResourceExhausted` (transient). |
-| `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` | store | 32 | Max concurrent S3 `PutObject` calls per `put_chunked`. Bounds store→S3 fan-out within a single large-NAR ingest. |
+| `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` | store | 8 | Max concurrent S3 `PutObject` calls per `put_chunked`. Bounds store→S3 fan-out within a single large-NAR ingest. |
 | `RIO_S3_MAX_ATTEMPTS` | store | 10 | aws-sdk retry ceiling per S3 operation. Raised from the sdk default (3) to absorb connection churn from S3-compatible backends that recycle idle connections aggressively. |
 
 The per-replica in-flight S3 PutObject ceiling is `RIO_SUBSTITUTE_ADMISSION_PERMITS × RIO_CHUNK_UPLOAD_MAX_CONCURRENT` — keep it under the aws-sdk's ~1024 default connection pool with headroom for other store traffic. If `DispatchFailure` appears in store logs during large-NAR ingest, raise `RIO_S3_MAX_ATTEMPTS` first (cheap, retries absorb transient connection churn); lower `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` only if retries don't clear it (reduces throughput).

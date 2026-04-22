@@ -233,9 +233,10 @@ store:
   # admission (r[store.substitute.admission]) bounds how many
   # put_chunked calls run at once; this bounds fan-out WITHIN one.
   # Product `substituteAdmissionPermits × this` should sit under the
-  # aws-sdk connection pool. Lower if DispatchFailure appears in
+  # aws-sdk's ~1024 connection pool with headroom — at the default
+  # admission=64 that's 512. Lower if DispatchFailure appears in
   # store logs during large-NAR ingest (try s3MaxAttempts first).
-  chunkUploadMaxConcurrent: 32
+  chunkUploadMaxConcurrent: 8
   # aws-sdk retry ceiling per S3 op. Raised from sdk default (3) —
   # S3-compatible backends (Rook RGW, MinIO) recycle idle connections
   # more aggressively than AWS S3; closed-pool-connection surfaces as

@@ -245,7 +245,7 @@ pub struct StoreServiceImpl {
     /// Max concurrent S3 chunk uploads per `put_chunked` call. Bounds
     /// the PutPath→S3 fan-out so a single large NAR (>1000 chunks)
     /// doesn't saturate the aws-sdk connection pool. Default
-    /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`] (32); override via
+    /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`] (8); override via
     /// `.with_chunk_upload_max_concurrent()`.
     chunk_upload_max_concurrent: usize,
     /// Cap on paths in a FindMissingPaths request (DoS guard). Default

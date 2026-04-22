@@ -96,7 +96,7 @@ pub(crate) struct Config {
     /// Default: `["rio-gateway", "rio-scheduler"]`.
     pub service_bypass_callers: Vec<String>,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
-    /// Default 32. Per-replica `r[store.substitute.admission]` bounds
+    /// Default 8. Per-replica `r[store.substitute.admission]` bounds
     /// concurrent `put_chunked` calls; `substitute_admission_permits
     /// × this` is the per-replica in-flight PutObject ceiling. Raise
     /// if the store runs with a larger aws-sdk pool; lower (min 1)

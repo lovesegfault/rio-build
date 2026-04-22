@@ -51,16 +51,18 @@ pub fn should_chunk(
 /// Per-replica `r[store.substitute.admission]` bounds how many
 /// `put_chunked` calls run at once; this bounds fan-out WITHIN one.
 /// `substitute_admission_permits × this` is the per-replica in-flight
-/// PutObject ceiling — keep it under the aws-sdk connection pool.
+/// PutObject ceiling — keep it under the aws-sdk's ~1024 connection
+/// pool with headroom. 8 keeps `admission(≤256) × 8 = 2048` ceiling
+/// reasonable; at the helm-default `admission=64` that's 512.
 ///
 /// Unbounded fan-out on large NARs (python3: 374 MB → ~1900 chunks)
 /// saturates the pool → `DispatchFailure` cascades → substitution
 /// rolls back and the rsb user sees `nix build` fail on a path that
-/// exists upstream. The 32 bound keeps throughput without the spike.
+/// exists upstream. The 8 bound keeps throughput without the spike.
 ///
 /// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (figment env).
 // r[impl store.cas.upload-bounded]
-pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 32;
+pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 8;
 
 /// Run CPU-bound work without stalling the tokio worker. Uses
 /// `block_in_place` on the multi-thread runtime (production); falls

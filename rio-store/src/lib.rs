@@ -286,7 +286,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_substitute_admission_rejected_total",
         "try_substitute calls rejected with ResourceExhausted after waiting \
-         SUBSTITUTE_ADMISSION_WAIT (30s) for a permit. Sustained non-zero = \
+         SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = \
          genuine per-replica overload; ComponentScaler should already be \
          reacting via the GetLoad utilization signal."
     );
