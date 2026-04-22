@@ -590,6 +590,14 @@ pub struct DerivationState {
     /// path, still works). Forwarded verbatim into WorkAssignment.
     /// ≤256 KB bound enforced at gRPC ingress.
     pub drv_content: Vec<u8>,
+    /// `inputSrcs` from the derivation ATerm — already-built store
+    /// paths this derivation reads (NOT in the DAG as child nodes).
+    /// Parsed once at merge time so `approx_input_closure` can
+    /// include them without re-parsing per dispatch. Empty when
+    /// `drv_content` is empty/unparseable (recovered derivation,
+    /// or gateway didn't inline) — prefetch falls back to DAG-
+    /// children-only, same as before.
+    pub input_srcs: Vec<String>,
     /// Retry / failure-tracking state.
     pub retry: RetryState,
     /// Realized output store paths (filled on completion).
@@ -655,6 +663,17 @@ impl DerivationState {
         node: &crate::domain::DerivationNode,
     ) -> Result<Self, rio_nix::store_path::StorePathError> {
         let drv_path = rio_nix::store_path::StorePath::parse(&node.drv_path)?;
+        // Best-effort: parse inputSrcs from the inlined ATerm so
+        // `approx_input_closure` covers shallow DAGs (drv with no
+        // child nodes but many already-built inputs). Swallow parse
+        // errors — `drv_content` is empty for store-hit nodes the
+        // gateway didn't inline, and recovered nodes; both fall
+        // back to DAG-children-only prefetch.
+        let input_srcs: Vec<String> = std::str::from_utf8(&node.drv_content)
+            .ok()
+            .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
+            .map(|d| d.input_srcs().iter().cloned().collect())
+            .unwrap_or_default();
         Ok(Self {
             drv_hash: node.drv_hash.as_str().into(),
             drv_path,
@@ -689,6 +708,7 @@ impl DerivationState {
             // visible "not yet set" marker.
             sched: SchedHint::default(),
             drv_content: node.drv_content.clone(),
+            input_srcs,
             retry: RetryState::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
@@ -769,6 +789,7 @@ impl DerivationState {
                 ..Default::default()
             },
             drv_content: Vec::new(), // worker fetches from store
+            input_srcs: Vec::new(),  // unparsed (no drv_content); DAG-children-only prefetch
             retry: RetryState {
                 count: row.retry_count.max(0) as u32,
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
@@ -848,6 +869,7 @@ impl DerivationState {
             assigned_executor: None,
             sched: SchedHint::default(),
             drv_content: Vec::new(),
+            input_srcs: Vec::new(),
             retry: RetryState {
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
                 failure_count: row.failed_builders.len() as u32,
@@ -1105,6 +1127,33 @@ mod tests {
 
     fn dummy_node() -> crate::domain::DerivationNode {
         rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux").into()
+    }
+
+    /// `try_from_node` parses `inputSrcs` from inlined ATerm
+    /// `drv_content` so `approx_input_closure` covers shallow DAGs.
+    /// Best-effort: empty/malformed content → empty `input_srcs`,
+    /// node creation still succeeds.
+    #[test]
+    fn try_from_node_parses_input_srcs() {
+        let mut node = dummy_node();
+        // Minimal valid ATerm with two inputSrcs (3rd Derive field).
+        node.drv_content = br#"Derive([("out","/nix/store/abc-out","","")],[],["/nix/store/abc-gcc","/nix/store/abc-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/abc-out")])"#.to_vec();
+        let state = DerivationState::try_from_node(&node).unwrap();
+        assert_eq!(
+            state.input_srcs,
+            vec!["/nix/store/abc-gcc", "/nix/store/abc-glibc"],
+        );
+
+        // Empty drv_content (gateway didn't inline / store-hit) → empty,
+        // not an error.
+        let empty = DerivationState::try_from_node(&dummy_node()).unwrap();
+        assert!(empty.input_srcs.is_empty());
+
+        // Malformed ATerm → empty, not an error.
+        let mut bad = dummy_node();
+        bad.drv_content = b"not a derivation".to_vec();
+        let bad_state = DerivationState::try_from_node(&bad).unwrap();
+        assert!(bad_state.input_srcs.is_empty());
     }
 
     /// `drv_name()` strips the `.drv` suffix from the store-path

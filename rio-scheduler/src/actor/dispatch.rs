@@ -1796,17 +1796,17 @@ impl DagActor {
     /// cache. Best-effort: `try_send`, failure logs at debug.
     ///
     /// Paths come from [`approx_input_closure`] (DAG children's
-    /// expected outputs), truncated to `MAX_PREFETCH_PATHS`. Under
-    /// ephemeral one-build-per-pod the worker's cache is always
-    /// empty, so the full closure is always sent — no per-worker
-    /// filtering. Empty closure (leaf derivation) = don't send.
+    /// expected outputs ∪ the drv's own `inputSrcs`), truncated to
+    /// `MAX_PREFETCH_PATHS`. Under ephemeral one-build-per-pod the
+    /// worker's cache is always empty, so the full set is always
+    /// sent — no per-worker filtering. Empty = don't send.
     ///
     /// [`approx_input_closure`]: crate::assignment::approx_input_closure
     fn send_prefetch_hint(&self, executor_id: &ExecutorId, drv_hash: &DrvHash) {
         let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
         if input_paths.is_empty() {
-            // Leaf derivation (no DAG children). Nothing to prefetch.
-            // Common for .drv fetches and source tarballs.
+            // No DAG children AND no parsed inputSrcs (drv_content
+            // empty/unparseable). Nothing to prefetch.
             return;
         }
 

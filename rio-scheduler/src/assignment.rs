@@ -200,23 +200,29 @@ pub fn best_executor(
 }
 
 /// Approximate input closure: the derivation's DAG children's
-/// expected output paths.
+/// expected output paths PLUS its own `inputSrcs` (already-built
+/// store paths declared in the ATerm, not represented as DAG nodes).
 ///
 /// This is what the derivation NEEDS as inputs — its dependencies'
-/// outputs. Not perfect (misses `input_srcs` and transitive closure),
-/// but covers the bulk of what the worker's FUSE will actually fetch.
+/// outputs and direct sources. Not perfect (misses transitive
+/// closure of `inputSrcs`), but covers the bulk of what the
+/// worker's FUSE will actually fetch. For a shallow DAG (leaf drv
+/// with substituted/cached deps) `inputSrcs` is the ONLY signal —
+/// without it the prefetch hint is empty and the worker
+/// serial-fetches every input on first `lstat()`.
 ///
 /// Used by dispatch.rs for [`PrefetchHint`] — tell the chosen worker
 /// to warm these before the build starts.
 ///
-/// Cheap: DAG iteration only, no store RPCs, no ATerm parse. The
-/// scheduler has all this state in memory already (populated at
-/// merge time). For a derivation with 20 dependencies each with
-/// 2 outputs: 40 string clones, ~1μs.
+/// Cheap: DAG iteration only, no store RPCs, no ATerm parse (the
+/// parse happened once at merge time → `DerivationState.input_srcs`).
+/// For a derivation with 20 dependencies each with 2 outputs +
+/// 30 `inputSrcs`: ~70 string clones, ~1μs.
 ///
 /// [`PrefetchHint`]: rio_proto::types::PrefetchHint
 pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> Vec<String> {
-    dag.get_children(drv_hash)
+    let from_children = dag
+        .get_children(drv_hash)
         .into_iter()
         .filter_map(|child| dag.node(&child))
         .flat_map(|child| {
@@ -233,7 +239,19 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
             } else {
                 child.output_paths.iter()
             }
-        })
+        });
+    let from_srcs = dag
+        .node(drv_hash)
+        .map(|s| s.input_srcs.iter())
+        .into_iter()
+        .flatten();
+    // inputSrcs first: they're declared in the ATerm (exact), while
+    // dag-children outputs are an approximation (may over-include
+    // unused multi-output siblings). `send_prefetch_hint` truncates
+    // to MAX_PREFETCH_PATHS via `Vec::truncate` (keeps FIRST N), so
+    // putting srcs first sheds the heuristic paths under cap.
+    from_srcs
+        .chain(from_children)
         // Filter empties: a floating-CA child that hasn't completed yet
         // has expected_output_paths=[""] and output_paths=[]. The ""
         // would be a no-op PrefetchHint entry; cleaner to drop it here.
@@ -882,6 +900,54 @@ mod tests {
             Some("warm-ready"),
             "a cold worker's presence must not block dispatch to a warm one"
         );
+    }
+
+    /// Shallow DAG: leaf node (no DAG children) with `inputSrcs` —
+    /// `approx_input_closure` must return the inputSrcs, not empty.
+    /// This is the `nix-bench#hello-shallow` shape: deps substituted/
+    /// cached so they're not DAG nodes, only listed in the ATerm.
+    #[test]
+    fn approx_input_closure_includes_input_srcs_for_leaf() {
+        let mut dag = DerivationDag::new();
+        let mut leaf =
+            DerivationState::try_from_node(&make_derivation_node("leaf", "x86_64-linux").into())
+                .unwrap();
+        let src_a = rio_test_support::fixtures::test_store_path("gcc-13.2.0");
+        let src_b = rio_test_support::fixtures::test_store_path("glibc-2.39");
+        leaf.input_srcs = vec![src_a.clone(), src_b.clone()];
+        dag.insert_recovered_node(leaf);
+
+        let got = approx_input_closure(&dag, &"leaf".into());
+        assert_eq!(got.len(), 2, "leaf with 2 inputSrcs → 2 prefetch paths");
+        assert!(got.contains(&src_a));
+        assert!(got.contains(&src_b));
+    }
+
+    /// Node with BOTH a DAG child and inputSrcs → union of child's
+    /// outputs and own inputSrcs. Order is srcs-then-children:
+    /// `send_prefetch_hint` truncates to `MAX_PREFETCH_PATHS` keeping
+    /// the FIRST N, so declared inputs (exact) survive the cap over
+    /// dag-children outputs (approximation, may over-include).
+    #[test]
+    fn approx_input_closure_unions_children_and_srcs() {
+        let mut dag = DerivationDag::new();
+        let child_out = rio_test_support::fixtures::test_store_path("child-out");
+        let mut child =
+            DerivationState::try_from_node(&make_derivation_node("child", "x86_64-linux").into())
+                .unwrap();
+        child.expected_output_paths = vec![child_out.clone()];
+        dag.insert_recovered_node(child);
+
+        let src = rio_test_support::fixtures::test_store_path("source-tarball");
+        let mut parent =
+            DerivationState::try_from_node(&make_derivation_node("parent", "x86_64-linux").into())
+                .unwrap();
+        parent.input_srcs = vec![src.clone()];
+        dag.insert_recovered_node(parent);
+        dag.insert_recovered_edge("parent".into(), "child".into());
+
+        let got = approx_input_closure(&dag, &"parent".into());
+        assert_eq!(got, vec![src, child_out]);
     }
 
     /// I-095 regression: a closed-channel executor must NOT be picked.
