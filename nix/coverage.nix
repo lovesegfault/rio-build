@@ -153,14 +153,12 @@ let
     lcov $args -o $out
   '';
 
-  # Unit-test lcov, path-normalized the same way. Same `-a` trick.
-  # --ignore-errors unused: crate2nix's unit lcov is already
-  # repo-relative (nix/checks.nix does `lcov --substitute 's|^/||'`)
-  # so this pattern may not match — harmless, skip the error.
-  unitLcov = pkgs.runCommand "rio-cov-unit-clean" { nativeBuildInputs = [ pkgs.lcov ]; } ''
-    lcov --ignore-errors unused \
-      --substitute '${stripPrefix}' \
-      -a ${unitCoverage}/lcov.info -o $out
+  # Unit-test lcov. checks.nix already path-normalized it
+  # (`lcov --substitute 's|^/||'`), so no re-parse needed — but keep
+  # a file-shaped derivation (not a dir/lcov.info path) so the GHA
+  # coverage matrix sees the same shape as perTestLcov entries.
+  unitLcov = pkgs.runCommand "rio-cov-unit" { } ''
+    ln -s ${unitCoverage}/lcov.info $out
   '';
   # Smoke scenario for the cov-smoke gate. Picked for broadest
   # coverage-infrastructure surface per minute: protocol-warm

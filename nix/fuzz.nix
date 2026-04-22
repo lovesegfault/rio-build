@@ -22,19 +22,31 @@
   rustNightly,
   rustPlatformNightly,
   unfilteredRoot,
-  # Shared workspace source fileset (Cargo.toml, Cargo.lock, all
-  # workspace crate directories). Fuzz builds compose this with the
-  # fuzz/ subtree since the fuzz crate path-deps its parent crate,
-  # which in turn uses workspace deps.
+  # Full workspace fileset. Narrowed below to manifests-only for crates
+  # outside each fuzz workspace's path-dep closure — cargo's resolver
+  # needs every [workspace.members] entry's Cargo.toml present (sqlx-
+  # macros runs `cargo metadata` to find the workspace root, and that
+  # validates all members), but not their source.
   workspaceFileset,
 }:
 let
+  inherit (pkgs.lib) fileset;
   rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+
+  # All Cargo.toml files in the workspace. Gives cargo metadata what
+  # it needs without dragging in full crate source.
+  manifestFiles = fileset.intersection workspaceFileset (
+    fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot
+  );
 
   # Builder for a fuzz-workspace build derivation.
   # `fuzzDir` is relative to the repo root (e.g., "rio-nix/fuzz").
   # `cargoLock` is the Nix path to that workspace's lockfile.
   # `targets` is the list of `[[bin]]` names in its Cargo.toml.
+  # `pathDeps` is the transitive in-tree path-dep closure (filesets,
+  #   relative to unfilteredRoot) — narrowing src to this set instead
+  #   of the full workspace means edits to unrelated crates don't
+  #   invalidate the ~540-crate sancov-instrumented monolith.
   # `extraNativeBuildInputs` / `extraBuildInputs` extend the base
   #   (rio-store fuzz needs protobuf+cmake+fuse3 because rio-store
   #   transitively builds rio-proto's build.rs and links fuse3).
@@ -43,6 +55,7 @@ let
       fuzzDir,
       cargoLock,
       targets,
+      pathDeps,
       extraNativeBuildInputs ? [ ],
       extraBuildInputs ? [ ],
     }:
@@ -55,18 +68,34 @@ let
       pname = "rio-fuzz-${builtins.replaceStrings [ "/" ] [ "-" ] fuzzDir}";
       version = "0.0.0";
 
-      src = pkgs.lib.fileset.toSource {
+      src = fileset.toSource {
         root = unfilteredRoot;
-        fileset = pkgs.lib.fileset.unions [
-          # workspaceFileset already includes ./.sqlx + ./migrations
-          # (rio-store fuzz transitively compiles rio-store which needs
-          # the sqlx offline query cache + sqlx::migrate! embeddings).
-          workspaceFileset
-          (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
-          (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
-          (unfilteredRoot + "/${fuzzDir}/fuzz_targets")
-        ];
+        fileset = fileset.unions (
+          [
+            (unfilteredRoot + "/Cargo.toml")
+            (unfilteredRoot + "/Cargo.lock")
+            manifestFiles
+            (unfilteredRoot + "/workspace-hack")
+            (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
+            (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
+            (unfilteredRoot + "/${fuzzDir}/fuzz_targets")
+          ]
+          ++ pathDeps
+        );
       };
+
+      # cargo metadata also validates each member's auto-detected
+      # targets (src/lib.rs / src/main.rs) exist. Stub them for
+      # members whose source we excluded — those crates aren't in the
+      # fuzz dep graph so the stubs are never compiled.
+      postPatch = ''
+        for m in */Cargo.toml; do
+          d=''${m%/Cargo.toml}
+          [ -d "$d/src" ] && continue
+          mkdir -p "$d/src"
+          touch "$d/src/lib.rs" "$d/src/main.rs"
+        done
+      '';
 
       inherit cargoDeps;
       # cargoSetupHook validates $src/$cargoRoot/Cargo.lock against
@@ -147,21 +176,40 @@ let
     "stderr_message_parsing"
   ];
 
-  # rio-nix fuzz: wire/protocol parsers. Lean — rio-nix has few deps.
+  # rio-nix fuzz: wire/protocol parsers. Lean — rio-nix has zero
+  # in-tree path-deps beyond workspace-hack.
   rio-nix-fuzz-build = mkFuzzWorkspace {
     fuzzDir = "rio-nix/fuzz";
     cargoLock = unfilteredRoot + "/rio-nix/fuzz/Cargo.lock";
     targets = rioNixFuzzTargets;
+    pathDeps = [
+      (unfilteredRoot + "/rio-nix/src")
+      (unfilteredRoot + "/rio-nix/Cargo.toml")
+    ];
   };
 
   # rio-store fuzz: manifest parser. Heavy — pulls in the full
   # rio-store dep tree (it's path = ".." in the fuzz Cargo.toml).
-  # Needs the same native deps as the main workspace build.
+  # Needs the same native deps as the main workspace build. pathDeps
+  # closure derived from rio-store/fuzz/Cargo.lock's `name = "rio-*"`
+  # entries. .sqlx + migrations: rio-store unconditionally compiles
+  # sqlx::query! / sqlx::migrate! which read these at compile time.
   rio-store-fuzz-build = mkFuzzWorkspace {
     fuzzDir = "rio-store/fuzz";
     cargoLock = unfilteredRoot + "/rio-store/fuzz/Cargo.lock";
     targets = [
       "manifest_deserialize"
+    ];
+    pathDeps = [
+      (unfilteredRoot + "/rio-store/src")
+      (unfilteredRoot + "/rio-store/Cargo.toml")
+      (unfilteredRoot + "/rio-auth")
+      (unfilteredRoot + "/rio-common")
+      (unfilteredRoot + "/rio-proto")
+      (unfilteredRoot + "/rio-nix/src")
+      (unfilteredRoot + "/rio-nix/Cargo.toml")
+      (unfilteredRoot + "/migrations")
+      (fileset.maybeMissing (unfilteredRoot + "/.sqlx"))
     ];
     extraNativeBuildInputs = with pkgs; [
       protobuf
