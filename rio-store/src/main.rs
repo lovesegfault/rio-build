@@ -142,8 +142,7 @@ async fn main() -> anyhow::Result<()> {
     // overrides when explicitly set.
     let mut store_service = StoreServiceImpl::new(pool.clone())
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
-        .with_max_batch_paths(cfg.max_batch_paths)
-        .with_substitute_admission(substitute_admission.clone());
+        .with_max_batch_paths(cfg.max_batch_paths);
     if let Some(cache) = &chunk_cache {
         store_service = store_service.with_chunk_cache(Arc::clone(cache));
     }
@@ -176,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
     let substituter = {
         let mut s = Substituter::new(pool.clone(), chunk_backend)
             .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
-            .with_nar_bytes_budget(store_service.nar_bytes_budget().clone());
+            .with_nar_bytes_budget(store_service.nar_bytes_budget().clone())
+            .with_admission_gate(substitute_admission.clone());
         if let Some(signer) = store_service.signer() {
             s = s.with_signer(Arc::clone(signer));
         }

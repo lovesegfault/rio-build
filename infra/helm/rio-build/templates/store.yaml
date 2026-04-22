@@ -59,7 +59,7 @@ spec:
               value: {{ $s.maxBatchPaths | int | quote }}
             - name: RIO_PG_MAX_CONNECTIONS
               value: {{ $s.pgMaxConnections | quote }}
-            {{- if $s.substituteAdmissionPermits }}
+            {{- if not (kindIs "invalid" $s.substituteAdmissionPermits) }}
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use rio_store::admission::{AdmissionGate, SUBSTITUTE_ADMISSION_WAIT};
+use rio_store::admission::{AdmissionError, AdmissionGate, SUBSTITUTE_ADMISSION_WAIT};
 use tonic::Code;
 
 /// At capacity, the (cap+1)th caller queues for the full
@@ -30,24 +30,20 @@ async fn admission_returns_re_after_wait() {
     // straight to the 25 s timeout once the runtime is otherwise idle.
     let started = tokio::time::Instant::now();
     let err = gate.acquire_bounded().await.expect_err("must reject");
-    assert_eq!(
-        err.code(),
-        Code::ResourceExhausted,
-        "post-wait rejection must be ResourceExhausted (transient → caller \
-         retries per is_transient); got {:?}: {}",
-        err.code(),
-        err.message()
+    assert!(
+        matches!(err, AdmissionError::Saturated),
+        "post-wait rejection must be Saturated; got {err:?}"
     );
     assert!(
         started.elapsed() >= SUBSTITUTE_ADMISSION_WAIT,
         "must queue for the full wait before rejecting; elapsed={:?}",
         started.elapsed()
     );
-    assert!(
-        rio_common::grpc::is_transient(err.code()),
-        "ResourceExhausted must classify as transient so the scheduler's \
-         detached-fetch retry loop absorbs it"
-    );
+    // gRPC mapping: Saturated → ResourceExhausted, which classifies
+    // as transient so the scheduler's detached-fetch retry absorbs it.
+    let status = tonic::Status::from(err);
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(rio_common::grpc::is_transient(status.code()));
 }
 
 /// Under capacity for less than the wait window, callers QUEUE rather
@@ -90,14 +86,12 @@ async fn admission_queues_under_wait() {
 async fn admission_permit_released_on_error() {
     let gate = AdmissionGate::new(1);
 
-    // Model `try_substitute_on_miss`'s shape: acquire → do work →
+    // Model the moka init-future's shape: acquire → do work →
     // return. The work errors; the `_permit` binding lives to
     // end-of-scope regardless.
-    async fn body(gate: &AdmissionGate) -> Result<(), tonic::Status> {
-        let _permit = gate.acquire_bounded().await?;
-        Err(tonic::Status::unavailable(
-            "upstream substitute fetch failed",
-        ))
+    async fn body(gate: &AdmissionGate) -> Result<(), &'static str> {
+        let _permit = gate.acquire_bounded().await.map_err(|_| "unreachable")?;
+        Err("upstream substitute fetch failed")
     }
 
     assert_eq!(gate.semaphore().available_permits(), 1);

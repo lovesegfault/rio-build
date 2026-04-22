@@ -37,6 +37,7 @@ use rio_common::limits::{
     MAX_SUBSTITUTE_CLOSURE, MIN_NAR_CHUNK_CHARGE,
 };
 
+use crate::admission::{AdmissionError, AdmissionGate};
 use crate::backend::ChunkBackend;
 use crate::cas;
 use crate::ingest::{self, IngestHooks, PersistError, PlaceholderClaim};
@@ -175,6 +176,12 @@ pub enum SubstituteError {
     #[error("concurrent uploader holds placeholder")]
     Busy,
 
+    /// Per-replica admission gate timed out (or closed). Transient —
+    /// `Err` so moka does NOT cache it; the next caller after the
+    /// burst clears retries cleanly.
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
+
     /// Metadata-layer failure during ingest (write-ahead,
     /// complete_manifest, chunked S3/refcount).
     #[error("ingest failed: {0}")]
@@ -275,6 +282,13 @@ pub struct Substituter {
     /// same `(tenant, path)`). [`fetch_nar`](Self::fetch_nar) acquires
     /// per read-chunk; permits drop after `persist_nar` returns.
     nar_bytes_budget: Arc<Semaphore>,
+    /// Per-replica admission gate on concurrent singleflight LEADERS.
+    /// `None` (tests / no-op) skips gating. main.rs wires the SAME
+    /// [`AdmissionGate`] clone here and into `StoreAdminServiceImpl`
+    /// so `GetLoad` reports the utilization the ComponentScaler
+    /// reacts to. Acquired inside the moka init future — coalesced
+    /// waiters on the same `(tenant, path)` do NOT consume permits.
+    admission: Option<AdmissionGate>,
 }
 
 /// Default NAR-buffer budget when no shared semaphore is wired:
@@ -327,6 +341,7 @@ impl Substituter {
                 .time_to_live(SUBSTITUTE_PROBE_CACHE_TTL)
                 .build(),
             nar_bytes_budget: Arc::new(Semaphore::new(DEFAULT_SUBSTITUTE_NAR_BUDGET)),
+            admission: None,
         }
     }
 
@@ -342,6 +357,16 @@ impl Substituter {
     /// aggregate bound the budget exists to enforce.
     pub fn with_nar_bytes_budget(mut self, budget: Arc<Semaphore>) -> Self {
         self.nar_bytes_budget = budget;
+        self
+    }
+
+    /// Set the per-replica admission gate. Builder-style. main.rs
+    /// constructs ONE [`AdmissionGate`], clones it here AND into
+    /// `StoreAdminServiceImpl::with_substitute_admission` — both
+    /// observe the same `Arc<Semaphore>`, so `GetLoad`'s utilization
+    /// reflects permits the singleflight leaders hold.
+    pub fn with_admission_gate(mut self, gate: AdmissionGate) -> Self {
+        self.admission = Some(gate);
         self
     }
 
@@ -419,16 +444,31 @@ impl Substituter {
         let cached = self
             .inflight
             .try_get_with(key, async {
+                // r[impl store.substitute.admission]
+                // Leader-only permit: this init future runs ONCE per
+                // `(tenant, path)` per TTL window; coalesced waiters
+                // block on the moka future without entering this body,
+                // so they consume no permits. The recursive closure
+                // walk in `ensure_references` runs AFTER this future
+                // returns (permit dropped) and re-enters via fresh
+                // `try_substitute_inner` calls — each closure node
+                // acquires its own permit sequentially, never more
+                // than one at a time per call chain.
+                let _permit = match &self.admission {
+                    Some(g) => Some(g.acquire_bounded().await?),
+                    None => None,
+                };
                 self.do_substitute(tenant_id, store_path)
                     .await
                     .map(|v| v.map(Arc::new))
             })
             .await
             .map_err(|e: Arc<SubstituteError>| {
-                // `Busy` is the not-an-error transient (concurrent
-                // uploader); skip the error metric so a normal cross-
-                // tenant race doesn't show up as upstream failure.
-                if !matches!(*e, SubstituteError::Busy) {
+                // `Busy`/`Admission` are not-an-error transients
+                // (concurrent uploader / local backpressure); skip the
+                // error metric so they don't show up as upstream
+                // failure. Admission has its own dedicated counter.
+                if !matches!(*e, SubstituteError::Busy | SubstituteError::Admission(_)) {
                     metrics::counter!(
                         "rio_store_substitute_total",
                         "result" => "error",
@@ -1297,6 +1337,19 @@ mod tests {
         nar_bytes: Vec<u8>,
         key_name: &str,
     ) -> FakeUpstream {
+        spawn_fake_upstream_with_delay(store_path, nar_bytes, key_name, Duration::ZERO).await
+    }
+
+    /// [`spawn_fake_upstream`] with a `nar_delay` sleep injected before
+    /// the NAR body is returned. The leader-only-permit test uses this
+    /// to hold the singleflight init future open long enough to sample
+    /// `available_permits()` while waiters are coalesced.
+    async fn spawn_fake_upstream_with_delay(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        nar_delay: Duration,
+    ) -> FakeUpstream {
         use axum::{Router, routing::get};
         use base64::Engine;
 
@@ -1342,7 +1395,13 @@ mod tests {
                 get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
             )
             .route(&narinfo_path, get(move || async move { narinfo_c }))
-            .route(&nar_path, get(move || async move { nar_c }));
+            .route(
+                &nar_path,
+                get(move || async move {
+                    tokio::time::sleep(nar_delay).await;
+                    nar_c
+                }),
+            );
 
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -2024,6 +2083,83 @@ mod tests {
         let got2 = sub.try_substitute(tid, &path).await.unwrap();
         let got2 = got2.expect("second call after Busy must re-run and hit (not cached None)");
         assert_eq!(got2.nar_size, nar.len() as u64);
+    }
+
+    // r[verify store.substitute.admission]
+    /// N concurrent `try_substitute` calls for the SAME `(tenant, path)`
+    /// coalesce on the moka singleflight; only the leader's init future
+    /// runs and only IT acquires an admission permit. With cap=2 and 5
+    /// waiters, `available_permits()` floors at 1 (leader holds one),
+    /// not 0 (which the pre-refactor whole-call gate produced — every
+    /// waiter held a permit before reaching moka).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_path_waiters_share_one_permit() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-admission-leader").await;
+        let (path, nar) = make_path();
+        // 300 ms NAR delay holds the leader inside the init future long
+        // enough for the sampler to observe the permit floor.
+        let fake = spawn_fake_upstream_with_delay(
+            &path,
+            nar.clone(),
+            "cache.adm-1",
+            Duration::from_millis(300),
+        )
+        .await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let gate = AdmissionGate::new(2);
+        let sub = Arc::new(test_substituter(db.pool.clone()).with_admission_gate(gate.clone()));
+
+        // 5 concurrent same-path callers.
+        let calls: Vec<_> = (0..5)
+            .map(|_| {
+                let sub = Arc::clone(&sub);
+                let path = path.clone();
+                tokio::spawn(async move { sub.try_substitute(tid, &path).await })
+            })
+            .collect();
+
+        // Sample the floor while the leader is parked on the slow NAR
+        // GET. Structural assertion: the floor is the count, not a
+        // wall-clock bound — robust under builder load.
+        let sem = gate.semaphore().clone();
+        let sampler = tokio::spawn(async move {
+            let mut min = sem.available_permits();
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                min = min.min(sem.available_permits());
+            }
+            min
+        });
+
+        for call in calls {
+            let got = call.await.unwrap().unwrap();
+            assert_eq!(
+                got.expect("upstream has the path").nar_size,
+                nar.len() as u64
+            );
+        }
+        let floor = sampler.await.unwrap();
+        assert_eq!(
+            floor, 1,
+            "only the singleflight leader may hold a permit: cap=2 → floor=1; \
+             floor=0 means waiters acquired (pre-refactor behavior)"
+        );
+        assert_eq!(
+            gate.semaphore().available_permits(),
+            2,
+            "permit released after leader completes"
+        );
     }
 
     // — flexible fixture for the regression tests below —
