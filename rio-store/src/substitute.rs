@@ -2584,13 +2584,15 @@ mod tests {
 
     // r[verify store.substitute.probe-429-retry]
     /// `Retry-After` as an RFC 9110 HTTP-date (not delta-seconds):
-    /// parsed via `httpdate` and honored. Upstream sends a date ~2s
-    /// in the future; assert wall-clock ≥ ~1s (slept) and all hit.
+    /// parsed via `httpdate` and honored. Upstream sends a date ~3s
+    /// in the future (`fmt_http_date` truncates sub-second, so +2s
+    /// could format to as little as 1.001s ahead and race the ≥1s
+    /// gate); assert wall-clock ≥ ~1s (slept) and all hit.
     #[tokio::test]
     async fn check_available_429_http_date() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tid = seed_tenant(&db.pool, "sub-head-429-date").await;
-        let when = std::time::SystemTime::now() + Duration::from_secs(2);
+        let when = std::time::SystemTime::now() + Duration::from_secs(3);
         let fake = spawn_mass_probe_upstream(ProbeCfg {
             head_429_first_n: 5,
             retry_after: Some(httpdate::fmt_http_date(when)),
@@ -2616,11 +2618,18 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert_eq!(available.len(), 5, "HTTP-date Retry-After → retried to Hit");
-        // ~2s minus parse/round-trip slack; assert ≥1s proves the
+        // ~3s minus parse/round-trip slack; assert ≥1s proves the
         // HTTP-date branch was taken (vs the 1s default for None).
         assert!(
             elapsed >= Duration::from_secs(1),
             "must sleep per HTTP-date Retry-After; elapsed={elapsed:?}"
+        );
+        // Structural: retry pass actually re-probed (5 first-pass +
+        // 5 retry = 10), independent of wall-clock.
+        assert_eq!(
+            fake.head_hits.load(Ordering::SeqCst),
+            10,
+            "first pass (5×429) + retry pass (5×200)"
         );
     }
 
