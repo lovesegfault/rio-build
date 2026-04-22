@@ -4349,6 +4349,7 @@ dependencies = [
  "fastcdc",
  "futures-util",
  "hex",
+ "httpdate",
  "metrics",
  "moka",
  "reqwest 0.13.1",
