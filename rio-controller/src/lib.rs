@@ -116,8 +116,8 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_controller_component_scaler_observed_load",
-        "ComponentScaler observed load: max(GetLoad.pg_pool_utilization) across \
-         loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+        "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization \
+         across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
     );
     describe_counter!(
         "rio_controller_ephemeral_jobs_reaped_total",

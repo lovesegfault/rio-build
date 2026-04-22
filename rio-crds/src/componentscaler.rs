@@ -211,9 +211,9 @@ pub struct ComponentScalerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_ratio: Option<f64>,
 
-    /// `max(GetLoad().pg_pool_utilization)` across `loadEndpoint`
-    /// pods at the last tick. The "observed" half of the predict-
-    /// then-correct loop.
+    /// Max of pg-pool utilization and substitute-admission utilization
+    /// across `loadEndpoint` pods at the last tick. The "observed" half
+    /// of the predict-then-correct loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_load_factor: Option<f64>,
 

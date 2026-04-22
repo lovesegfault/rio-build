@@ -238,7 +238,7 @@ spec:
     low: 0.3                         # f64, default 0.3
 status:
   learnedRatio: 67.3                 # f64? — EMA-adjusted; persists across controller restart
-  observedLoadFactor: 0.42           # f64? — max(GetLoad.pg_pool_utilization) at last tick
+  observedLoadFactor: 0.42           # f64? — max of pg-pool and substitute-admission utilization at last tick
   desiredReplicas: 5                 # i32 — last value patched onto deployments/scale
   lastScaleUpTime: "2026-04-08T..."  # Time? — 5min scale-down stabilization window starts here
   lowLoadTicks: 12                   # u32 — consecutive ticks with load<low (mirrored; authoritative counter in-process)
