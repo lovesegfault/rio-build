@@ -46,7 +46,7 @@ const STORE_TRANSIENT_BACKOFF: rio_common::backoff::Backoff = rio_common::backof
 /// [`grpc_query_path_info`] and [`grpc_get_path`] — both traverse
 /// `r[store.substitute.admission]` server-side, which returns
 /// `ResourceExhausted` after its bounded wait under saturation. The
-/// scheduler already retries this (`r[sched.substitute.detached]`);
+/// scheduler already retries this (`r[sched.substitute.detached+2]`);
 /// without it the gateway surfaced a hard `STDERR_ERROR` → client sees
 /// "store error: ResourceExhausted" on a momentary overload.
 ///

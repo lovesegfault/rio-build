@@ -2777,7 +2777,7 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached]
+// r[verify sched.substitute.detached+2]
 /// `SubstituteComplete{ok=false}` sets `substitute_tried` so the next
 /// dispatch pass falls through to a worker instead of re-spawning the
 /// fetch every Tick (~1/s livelock when FMP HEAD says substitutable
@@ -3301,5 +3301,131 @@ async fn substitute_fetch_survives_store_backpressure() -> TestResult {
              (8-attempt retry window covers it); got {st:?}"
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// walk_substitute_closure (Option C: scheduler-side closure BFS)
+// ---------------------------------------------------------------------------
+
+/// Seed a path into MockStore with the given references. The seeded
+/// `ValidatedPathInfo` is what `QueryPathInfo` / `BatchQueryPathInfo`
+/// return, so `walk_substitute_closure` pushes `refs` onto its frontier.
+fn seed_with_refs(store: &rio_test_support::grpc::MockStore, path: &str, refs: &[&str]) {
+    let (nar, hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
+    let mut info = rio_test_support::fixtures::make_path_info(path, &nar, hash);
+    info.references = refs
+        .iter()
+        .map(|r| rio_nix::store_path::StorePath::parse(r).unwrap())
+        .collect();
+    store.seed(info, nar);
+}
+
+// r[verify sched.substitute.detached+2]
+/// `walk_substitute_closure` MUST walk transitively. Diamond:
+/// A → [B, C]; B → [D]; C → [D]. All four end up in `state.paths`
+/// (warm) so the layer-batched `BatchQueryPathInfo` fast-path covers
+/// the whole closure. Assert ok=true and D visited once (dedup via
+/// `visited`).
+#[tokio::test]
+async fn substitute_fetch_walks_closure_transitively() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let a = test_store_path("clo-a");
+    let b = test_store_path("clo-b");
+    let c = test_store_path("clo-c");
+    let d = test_store_path("clo-d");
+    seed_with_refs(&store, &a, &[&b, &c]);
+    seed_with_refs(&store, &b, &[&d]);
+    seed_with_refs(&store, &c, &[&d]);
+    seed_with_refs(&store, &d, &[]);
+
+    let shutdown = rio_common::signal::Token::new();
+    let ok =
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+            .await;
+    assert!(
+        ok,
+        "diamond closure with all refs present must return ok=true"
+    );
+
+    // Layer-batched: 3 BatchQPI calls (layer [A], layer [B,C], layer
+    // [D]); D appears once because B and C's refs dedup. Zero per-path
+    // QPIs because every layer was warm.
+    let batches = store
+        .calls
+        .batch_qpi_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        batches, 3,
+        "warm closure: one BatchQPI per BFS layer (A; B,C; D)"
+    );
+    assert!(
+        store.calls.qpi_calls.read().unwrap().is_empty(),
+        "warm refs go through batch fast-path; no per-path QPI"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached+2]
+/// A reference miss MUST set ok=false (not silently truncate). A is
+/// seeded substitutable (per-path QPI returns it with refs=[B]); B is
+/// nowhere → batch returns None for B AND per-path QPI returns
+/// NotFound → ok=false. This is the bug class the store-side
+/// `ensure_references` couldn't surface (it returned `()`).
+#[tokio::test]
+async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let a = test_store_path("miss-a");
+    let b = test_store_path("miss-b");
+    seed_with_refs(&store, &a, &[&b]);
+    // B is NOT seeded — both BatchQPI and QPI report it absent.
+
+    let shutdown = rio_common::signal::Token::new();
+    let ok =
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+            .await;
+    assert!(
+        !ok,
+        "missing transitive ref must set ok=false → revert (not Completed)"
+    );
+    // B fell through batch → per-path QPI tried → NotFound (recorded).
+    assert!(
+        store.calls.qpi_calls.read().unwrap().contains(&b),
+        "absent ref must reach per-path QPI to attempt substitution"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached+2]
+/// Cold path: A is NOT in `state.paths` (batch returns None) but IS
+/// in `state.substitutable` (per-path QPI materializes it with
+/// refs=[B]); B is seeded warm. Asserts the absent→QPI→push-refs arm
+/// works and returns ok=true.
+#[tokio::test]
+async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let a = test_store_path("cold-a");
+    let b = test_store_path("cold-b");
+    // A: substitutable-only — batch sees None, QPI materializes it.
+    // MockStore's substitutable lane returns `..Default::default()` so
+    // refs=[] — instead, seed A in `paths` AFTER the first batch via
+    // direct seeding so the QPI arm reads refs=[B]. Simpler: A goes in
+    // `paths` (warm) with refs=[B]; B is substitutable-only (cold).
+    seed_with_refs(&store, &a, &[&b]);
+    store.state.substitutable.write().unwrap().push(b.clone());
+
+    let shutdown = rio_common::signal::Token::new();
+    let ok =
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+            .await;
+    assert!(
+        ok,
+        "cold ref substituted via per-path QPI must return ok=true"
+    );
+    // B: batch=None (not in `paths`) → QPI hit (substitutable lane).
+    assert!(
+        store.calls.qpi_calls.read().unwrap().contains(&b),
+        "cold ref B must reach per-path QPI (batch is local-only)"
+    );
     Ok(())
 }

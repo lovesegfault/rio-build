@@ -447,7 +447,7 @@ impl DagActor {
                 // Substituting included: the spawned task is gone after
                 // restart, so re-derive Ready/Queued via the same dep-
                 // walk and let the next dispatch-time batch re-probe.
-                // r[impl sched.substitute.detached]
+                // r[impl sched.substitute.detached+2]
                 let status_matches = matches!(
                     s.status(),
                     DerivationStatus::Created

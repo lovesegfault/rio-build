@@ -70,7 +70,7 @@ pub(super) struct Config {
     /// override for the same reason as `poison`.
     pub(super) retry: rio_scheduler::RetryPolicy,
     /// In-flight detached substitute-fetch task bound
-    /// (r[sched.substitute.detached]) — memory-safety only; per-replica
+    /// (r[sched.substitute.detached+2]) — memory-safety only; per-replica
     /// throttling is `r[store.substitute.admission]`. Sizes
     /// `DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`
     /// (operator escape hatch — not chart-set). Default 256.

@@ -347,8 +347,8 @@ pub(super) async fn compute_input_closure(
                 // dispatch on dep completion). Previously also hit for
                 // transitive runtime refs of substituted paths
                 // (BatchQueryPathInfo is local-only; rustc-1.94.0 via
-                // rustc-wrapper) — now closed at the source by
-                // Substituter::ensure_references walking the closure.
+                // rustc-wrapper) — now closed at the source by the
+                // scheduler's `walk_substitute_closure` BFS.
                 // A path skipped here is NOT in the JIT allowlist, so
                 // FUSE returns ENOENT (not lazy-fetch — the builder
                 // carries no tenant context to substitute on miss).

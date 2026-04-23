@@ -141,7 +141,7 @@ pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
 /// store-side `try_substitute` recursively walks the runtime closure
 /// — a single ghc-9.8.4 (1.9 GB) fetch legitimately takes minutes.
 /// The fetch runs OUTSIDE the actor loop, so a long timeout here
-/// doesn't head-of-line block. r[sched.substitute.detached]
+/// doesn't head-of-line block. r[sched.substitute.detached+2]
 pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Timeout for the merge-time `FindMissingPaths` only

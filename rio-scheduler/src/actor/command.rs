@@ -140,7 +140,7 @@ pub enum ActorCommand {
     /// `spawn_substitute_fetches`) has finished. `ok=true` → all
     /// output paths now present in rio-store; handler completes the
     /// derivation. `ok=false` → fetch failed; handler reverts to
-    /// Ready/Queued for normal scheduling. r[sched.substitute.detached]
+    /// Ready/Queued for normal scheduling. r[sched.substitute.detached+2]
     SubstituteComplete { drv_hash: DrvHash, ok: bool },
 
     /// Cancel a build.

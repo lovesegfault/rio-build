@@ -506,7 +506,7 @@ async fn test_fixed_ca_fod_path_based_lane(
 
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // r[sched.substitute.detached]: substitutable lane spawns the fetch;
+    // r[sched.substitute.detached+2]: substitutable lane spawns the fetch;
     // SubstituteComplete arrives via mailbox. barrier() alone races it.
     if substitutable {
         settle_substituting(&handle, &["ca-fod"]).await;
@@ -591,7 +591,7 @@ async fn test_substitutable_probe_matrix(
     node.expected_output_paths = vec![out_path.clone()];
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // r[sched.substitute.detached]: substitutable lane spawns the fetch;
+    // r[sched.substitute.detached+2]: substitutable lane spawns the fetch;
     // settle for the spawned task to post SubstituteComplete. The
     // not-substitutable case never enters Substituting → bare barrier.
     if substitutable {
@@ -664,7 +664,7 @@ async fn test_substitute_fetch_transient_retry() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+3]
+// r[verify sched.merge.substitute-topdown+4]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -707,7 +707,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
 
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, nodes, edges, false).await?;
-    // r[sched.substitute.detached]: top-down no longer awaits QPI inline;
+    // r[sched.substitute.detached+2]: top-down no longer awaits QPI inline;
     // the pruned root goes through pending_substitute → spawned fetch
     // → SubstituteComplete via mailbox. settle_substituting waits for
     // that round-trip; the inline-QPI code is deleted so the actor
@@ -746,7 +746,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+3]
+// r[verify sched.merge.substitute-topdown+4]
 /// Top-down + deferred-fetch failure: when the prune commits and the
 /// detached `query_path_info` then fails, the build MUST fail with a
 /// resubmit-directing error — NOT dispatch the root as a build.
@@ -841,7 +841,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+3]
+// r[verify sched.merge.substitute-topdown+4]
 /// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
 /// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
 /// pre-existing `Substituting` so `dag.merge` doesn't reset it; the
@@ -853,7 +853,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 ///
 /// Race staged deterministically via `debug_force_status`/
 /// `debug_set_topdown_pruned` + injected `SubstituteComplete{ok=false}`
-/// (see `r[sched.substitute.detached]` — the actor only checks `status
+/// (see `r[sched.substitute.detached+2]` — the actor only checks `status
 /// == Substituting`, so an injected message is indistinguishable from
 /// the spawned task's).
 #[tokio::test]
@@ -931,7 +931,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+3]
+// r[verify sched.merge.substitute-topdown+4]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -975,7 +975,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     );
 
     // Bottom-up still fires: glibc fetched via check_cached_outputs.
-    // r[sched.substitute.detached]: the bottom-up fetch is spawned; let
+    // r[sched.substitute.detached+2]: the bottom-up fetch is spawned; let
     // SubstituteComplete land before checking qpi_calls.
     settle_substituting(&handle, &["glibc-ft"]).await;
     let qpi = store.calls.qpi_calls.read().unwrap();
@@ -987,13 +987,14 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached]
+// r[verify sched.substitute.detached+2]
 /// Substitutable nodes go `Substituting` (detached fetch spawned),
 /// not synchronously `Completed` at merge. The closure-invariant
-/// gate (output references ⊆ inputDrv outputs) is now enforced by
-/// the store-side `ensure_references` walk, not by the scheduler's
-/// apply_cached_hits fixed-point: a `SubstituteComplete{ok=true}`
-/// means the full reference closure IS in store. Second half: when
+/// gate (output references ⊆ inputDrv outputs) is enforced by the
+/// detached task's `walk_substitute_closure` BFS, not by the
+/// scheduler's apply_cached_hits fixed-point: a
+/// `SubstituteComplete{ok=true}` means the full reference closure IS
+/// in store. Second half: when
 /// BOTH wrapper2 and rustc2 are substitutable, both spawn → both
 /// complete → build2 succeeds.
 #[tokio::test]
@@ -1034,10 +1035,10 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    // r[sched.substitute.detached] — substitutable nodes go to
+    // r[sched.substitute.detached+2] — substitutable nodes go to
     // Substituting (detached fetch) instead of cached_hits, so the
-    // closure gate is enforced store-side (`ensure_references`), not
-    // by the apply_cached_hits fixed-point. The mock store doesn't
+    // closure gate is enforced by the detached task's BFS, not by the
+    // apply_cached_hits fixed-point. The mock store doesn't
     // simulate closure-walk failure, so wrapper completes once the
     // spawned task lands; assert the detached path WAS taken (wrapper
     // was never synchronously Completed at merge — it's now
@@ -1101,7 +1102,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+3]
+// r[verify sched.merge.substitute-topdown+4]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
@@ -1306,7 +1307,7 @@ async fn test_preexisting_completed_gc_matrix(
     .await?;
     barrier(&handle).await;
 
-    // r[sched.substitute.detached] — the fetch is spawned, not awaited.
+    // r[sched.substitute.detached+2] — the fetch is spawned, not awaited.
     // Let the spawned task post SubstituteComplete before checking.
     if matches!(gc, GcState::Substitutable | GcState::SubFetchFail) {
         let fod_hash = make_node("fod-dep").drv_hash;
@@ -1539,7 +1540,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
 }
 
 // r[verify sched.merge.poisoned-resubmit-bounded+2]
-// r[verify sched.substitute.detached]
+// r[verify sched.substitute.detached+2]
 /// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
 /// whose output is upstream-substitutable (NOT locally present) on
 /// resubmit must transition `Poisoned → Substituting → Completed` and
@@ -2622,7 +2623,7 @@ async fn test_seed_ignores_reprobe_pending_substitute_dep() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.substitute.detached]
+// r[verify sched.substitute.detached+2]
 /// Floating-CA reprobe → re-substitute lane: `verify_preexisting_
 /// completed` finds a Completed floating-CA node's REALIZED output
 /// gone-but-substitutable, resets + spawns the detached fetch with the

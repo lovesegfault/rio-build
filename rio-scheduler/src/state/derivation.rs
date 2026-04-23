@@ -39,7 +39,7 @@ db_str_enum! {
         /// `QueryPathInfo` (which triggers store-side `try_substitute`)
         /// for this derivation's outputs. Dependents stay gated (NOT
         /// Completed/Skipped); the spawned task posts `SubstituteComplete`
-        /// when done. r[sched.substitute.detached]
+        /// when done. r[sched.substitute.detached+2]
         Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
@@ -246,7 +246,7 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
-            // r[impl sched.substitute.detached]
+            // r[impl sched.substitute.detached+2]
             // Detached upstream fetch: spawned from any pre-dispatch
             // state (merge-time) or Ready (dispatch-time). Completed →
             // fetch landed; Ready/Queued → fetch failed, fall through
@@ -1566,7 +1566,7 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
-            // Detached upstream fetch (r[sched.substitute.detached])
+            // Detached upstream fetch (r[sched.substitute.detached+2])
             (Created, Substituting),
             (Queued, Substituting),
             (Ready, Substituting),

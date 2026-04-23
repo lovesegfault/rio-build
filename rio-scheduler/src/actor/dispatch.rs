@@ -1,7 +1,9 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
+
+use rio_common::limits::MAX_SUBSTITUTE_CLOSURE;
 
 use uuid::Uuid;
 
@@ -626,7 +628,7 @@ impl DagActor {
         // queued Tick doesn't reap the fleet on a slow store.
         self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // Partition: locally-present (not in missing_paths) → complete
         // inline; substitutable → spawn detached fetch; truly-missing →
         // leave Ready (dispatches normally). The detached fetch runs
@@ -700,10 +702,11 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached]
+    // r[impl sched.substitute.detached+2]
     /// Transition each candidate to `Substituting` and spawn a
     /// background task that triggers store-side `try_substitute` (via
-    /// `QueryPathInfo`) for its output paths, then posts
+    /// `QueryPathInfo`) for its output paths AND their transitive
+    /// reference closure, then posts
     /// [`ActorCommand::SubstituteComplete`] back into the mailbox.
     ///
     /// Detaches the upstream NAR fetch from the actor event loop:
@@ -791,69 +794,14 @@ impl DagActor {
             let sem = self.substitute_sem.clone();
             let shutdown = self.shutdown.clone();
             rio_common::task::spawn_monitored("substitute-fetch", async move {
-                // Bound in-flight QPIs across ALL spawned tasks. The
-                // task is already spawned (so the actor returned), but
-                // it parks here until a slot is free — Substituting
-                // status keeps dependents gated meanwhile.
+                // Bound in-flight closure walks across ALL spawned
+                // tasks. The task is already spawned (so the actor
+                // returned), but it parks here until a slot is free —
+                // Substituting status keeps dependents gated meanwhile.
                 let _permit = sem.acquire_owned().await;
                 let meta_ref: Vec<(&'static str, &str)> =
                     meta.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                let mut ok = true;
-                'paths: for p in &paths {
-                    for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
-                        if shutdown.is_cancelled() {
-                            ok = false;
-                            break 'paths;
-                        }
-                        let mut c = store.clone();
-                        match rio_proto::client::query_path_info_opt(
-                            &mut c,
-                            p,
-                            super::SUBSTITUTE_FETCH_TIMEOUT,
-                            &meta_ref,
-                        )
-                        .await
-                        {
-                            Ok(Some(_)) => continue 'paths,
-                            Ok(None) => {
-                                warn!(path = %p, "detached substitute fetch: NotFound \
-                                       (upstream HEAD probe lied?); demoting to cache-miss");
-                                metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                                    .increment(1);
-                                ok = false;
-                                continue 'paths;
-                            }
-                            Err(e) if rio_common::grpc::is_transient(e.code()) => {
-                                debug!(path = %p, attempt, error = %e,
-                                       "substitute fetch transient error; retrying");
-                                metrics::counter!("rio_scheduler_substitute_fetch_retries_total")
-                                    .increment(1);
-                                if attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
-                                    break;
-                                }
-                                tokio::select! {
-                                    _ = shutdown.cancelled() => { ok = false; break 'paths; }
-                                    _ = tokio::time::sleep(
-                                        super::SUBSTITUTE_FETCH_BACKOFF.duration(attempt)
-                                    ) => {}
-                                }
-                            }
-                            Err(e) => {
-                                warn!(path = %p, error = %e,
-                                      "detached substitute fetch failed; demoting to cache-miss");
-                                metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
-                                    .increment(1);
-                                ok = false;
-                                continue 'paths;
-                            }
-                        }
-                    }
-                    // Exhausted retries on transient errors.
-                    warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
-                          "detached substitute fetch exhausted retries; demoting to cache-miss");
-                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-                    ok = false;
-                }
+                let ok = walk_substitute_closure(&store, paths, &meta_ref, &shutdown).await;
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx
                         .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
@@ -902,13 +850,13 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached]
+    // r[impl sched.substitute.detached+2]
     /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
     /// detached fetch task. `ok=true` → output now in rio-store with
-    /// its full reference closure (store-side `ensure_references`
-    /// walked it), so `Substituting → Completed` is safe even if
-    /// inputDrvs aren't yet Completed in the DAG. `ok=false` → revert
-    /// to `Ready`/`Queued` for normal scheduling.
+    /// its full reference closure ([`walk_substitute_closure`] walked
+    /// it), so `Substituting → Completed` is safe even if inputDrvs
+    /// aren't yet Completed in the DAG. `ok=false` → revert to
+    /// `Ready`/`Queued` for normal scheduling.
     pub(super) async fn handle_substitute_complete(&mut self, drv_hash: &DrvHash, ok: bool) {
         // r[impl sched.substitute.leader-gate]
         // `on_lose` only flips atomics; the detached `substitute-fetch`
@@ -956,7 +904,7 @@ impl DagActor {
             }
             return;
         }
-        // r[impl sched.merge.substitute-topdown+3]
+        // r[impl sched.merge.substitute-topdown+4]
         // Topdown-pruned root: the dep subgraph was dropped from this
         // submission, so a build dispatch cannot succeed (worker
         // ENOENTs on inputDrvs). Fail every interested build with a
@@ -1128,7 +1076,7 @@ impl DagActor {
                     self.complete_ready_from_store(drv_hash).await;
                     return true;
                 }
-                // r[impl sched.substitute.detached] — spawn instead of
+                // r[impl sched.substitute.detached+2] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
                 if !substitute_tried && resp.missing_paths.iter().all(|p| sub.contains(p)) {
@@ -2276,6 +2224,160 @@ impl DagActor {
         let prio = self.queue_priority(&drv_hash);
         self.ready_queue.push(drv_hash, prio);
     }
+}
+
+// r[impl sched.substitute.detached+2]
+/// BFS over `info.references` from `seeds`, issuing `QueryPathInfo`
+/// (which triggers store-side `try_substitute`) for every node. Returns
+/// `true` iff every node in the closure is present in the store on
+/// return — the contract `handle_substitute_complete{ok=true}` relies
+/// on for `Substituting → Completed`.
+///
+/// The store substitutes ONE path per call (no closure walk), so this
+/// is the only place the runtime closure can be completed. Without it,
+/// `compute_input_closure`'s `BatchQueryPathInfo` (local-only) drops a
+/// transitive ref from the JIT allowlist → ENOENT at exec time (e.g.
+/// `rustc-wrapper` execs `rustc-1.94.0`).
+///
+/// **Layer-batched fast-path:** each BFS layer is first probed via
+/// `BatchQueryPathInfo` (local-only, one PG `= ANY()` round-trip — the
+/// I-110 pattern from `compute_input_closure`). Refs already in PG
+/// contribute their `references` to the next layer without a per-path
+/// RPC; only the absent subset gets a substituting `QueryPathInfo`. For
+/// an 800-path closure that's mostly warm, this is O(depth) ≈ 10 batch
+/// RPCs instead of 800 unary ones. A `BatchQueryPathInfo` error falls
+/// through to per-path QPI for the whole layer (correctness over
+/// throughput).
+///
+/// Any `Ok(None)` (upstream miss), non-transient `Err`, retry-exhaust,
+/// or `MAX_SUBSTITUTE_CLOSURE` cap → `false`. Self-references and
+/// diamonds dedup via `visited`.
+pub(super) async fn walk_substitute_closure(
+    store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
+    seeds: Vec<String>,
+    meta: &[(&'static str, &str)],
+    shutdown: &rio_common::signal::Token,
+) -> bool {
+    let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+    let mut frontier: VecDeque<String> = seeds.into_iter().collect();
+    let mut ok = true;
+    while !frontier.is_empty() {
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        if visited.len() > MAX_SUBSTITUTE_CLOSURE {
+            warn!(
+                visited = visited.len(),
+                cap = MAX_SUBSTITUTE_CLOSURE,
+                "substitute closure walk exceeded MAX_SUBSTITUTE_CLOSURE; \
+                 demoting to cache-miss (hostile upstream reference chain?)"
+            );
+            metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+            return false;
+        }
+        // Layer-batched fast-path: drain the current frontier into one
+        // BatchQueryPathInfo. Present refs (warm in PG) push their
+        // references; absent refs go to per-path QPI to trigger
+        // substitution. Batch error → treat the whole layer as absent
+        // (per-path QPI then handles each, including retry).
+        let layer: Vec<String> = frontier.drain(..).collect();
+        let mut absent: Vec<String> = Vec::new();
+        let mut c = store.clone();
+        match rio_proto::client::batch_query_path_info(
+            &mut c,
+            layer.clone(),
+            super::SUBSTITUTE_FETCH_TIMEOUT,
+            meta,
+        )
+        .await
+        {
+            Ok(entries) => {
+                for (path, info) in entries {
+                    match info {
+                        Some(info) => {
+                            for r in &info.references {
+                                if visited.insert(r.to_string()) {
+                                    frontier.push_back(r.to_string());
+                                }
+                            }
+                        }
+                        None => absent.push(path),
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, layer = layer.len(),
+                       "substitute closure: batch probe failed; \
+                        falling through to per-path QPI");
+                absent = layer;
+            }
+        }
+        // Per-path QPI for the absent subset — triggers store-side
+        // try_substitute. Same retry/error handling as before; on
+        // success, push references for the next layer.
+        'paths: for p in absent {
+            for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
+                if shutdown.is_cancelled() {
+                    return false;
+                }
+                let mut c = store.clone();
+                match rio_proto::client::query_path_info_opt(
+                    &mut c,
+                    &p,
+                    super::SUBSTITUTE_FETCH_TIMEOUT,
+                    meta,
+                )
+                .await
+                {
+                    Ok(Some(info)) => {
+                        for r in &info.references {
+                            if visited.insert(r.to_string()) {
+                                frontier.push_back(r.to_string());
+                            }
+                        }
+                        continue 'paths;
+                    }
+                    Ok(None) => {
+                        warn!(path = %p, "detached substitute fetch: NotFound \
+                               (upstream HEAD probe lied?); demoting to cache-miss");
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                        ok = false;
+                        continue 'paths;
+                    }
+                    Err(e) if rio_common::grpc::is_transient(e.code()) => {
+                        debug!(path = %p, attempt, error = %e,
+                               "substitute fetch transient error; retrying");
+                        metrics::counter!("rio_scheduler_substitute_fetch_retries_total")
+                            .increment(1);
+                        if attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return false,
+                            _ = tokio::time::sleep(
+                                super::SUBSTITUTE_FETCH_BACKOFF.duration(attempt)
+                            ) => {}
+                        }
+                    }
+                    Err(e) => {
+                        warn!(path = %p, error = %e,
+                              "detached substitute fetch failed; demoting to cache-miss");
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                        ok = false;
+                        continue 'paths;
+                    }
+                }
+            }
+            // Exhausted retries on transient errors.
+            warn!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
+                  "detached substitute fetch exhausted retries; demoting to cache-miss");
+            metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+            ok = false;
+        }
+    }
+    ok
 }
 
 #[cfg(test)]

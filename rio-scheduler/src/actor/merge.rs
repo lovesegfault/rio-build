@@ -44,7 +44,7 @@ pub(super) struct MergeIngest {
     /// Derivations whose outputs are upstream-substitutable but not
     /// yet locally present. `reconcile_merged_state` spawns the
     /// detached fetch for these after `seed_initial_states`.
-    /// r[sched.substitute.detached]
+    /// r[sched.substitute.detached+2]
     pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
@@ -238,7 +238,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down root substitution check ===============
-        // r[impl sched.merge.substitute-topdown+3]
+        // r[impl sched.merge.substitute-topdown+4]
         // Before merging the full DAG, check if the ROOT derivations'
         // outputs are already available. If ALL roots are cached, the
         // deps are transitively unnecessary — prune the submission to
@@ -252,7 +252,7 @@ impl DagActor {
         //
         // Falls through to the full DAG on any uncertainty (store
         // unreachable, partial root cache, CA roots). The fetch
-        // itself is deferred (`r[sched.substitute.detached]`); on
+        // itself is deferred (`r[sched.substitute.detached+2]`); on
         // fetch failure the build fails fast (`r[sched.merge.
         // substitute-topdown]` — resubmit re-probes). The existing
         // check_cached_outputs at step 4 handles fall-through
@@ -306,7 +306,7 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
-        // r[impl sched.merge.substitute-topdown+3]
+        // r[impl sched.merge.substitute-topdown+4]
         // Stamp topdown_pruned on roots AFTER dag.merge (node didn't
         // exist before). Idempotent if a root pre-existed in the DAG.
         // handle_substitute_complete reads this on
@@ -586,7 +586,7 @@ impl DagActor {
             .await;
         phase!("6c-verify-preexisting");
 
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
         // output is now upstream-substitutable transitions Poisoned →
         // Substituting BEFORE seed_initial_states reads
@@ -644,7 +644,7 @@ impl DagActor {
         }
         phase!("6f-reprobe-unlocked");
 
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // Newly-inserted substitutable lane: nodes are at Created/
         // Queued/Ready (via seed_initial_states above). Nodes whose
         // transition is rejected (e.g. apply_cached_hits already
@@ -1289,7 +1289,7 @@ impl DagActor {
         }
 
         // r[impl sched.merge.stale-substitutable]
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // Missing-but-substitutable: instead of awaiting eager-fetch
         // (which blocked the actor), reset Completed→Ready and spawn
         // the detached fetch (Ready→Substituting). SubstituteComplete
@@ -1719,7 +1719,7 @@ impl DagActor {
 
         // r[impl sched.merge.substitute-probe]
         // r[impl sched.merge.substitute-fetch]
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // Locally-present → cached_hits (Created→Completed inline).
         // Upstream-substitutable → pending_substitute (caller spawns
         // the detached fetch after seed_initial_states; the actor loop
@@ -2044,7 +2044,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+3]
+    // r[impl sched.merge.substitute-topdown+4]
     /// Top-down root substitution pre-check (step 0 of `handle_merge_dag`).
     ///
     /// Returns `Some(roots)` if ALL root derivations' IA outputs are
@@ -2203,7 +2203,7 @@ impl DagActor {
             return None;
         }
 
-        // r[impl sched.substitute.detached]
+        // r[impl sched.substitute.detached+2]
         // No inline QPI: awaiting query_path_info_opt here blocked the
         // actor for the duration of the store-side closure walk
         // (ghc-sized roots take minutes; grpc_timeout = 30s) — the
