@@ -897,42 +897,6 @@
           );
 
           # --------------------------------------------------------------
-          # CI aggregate target
-          # --------------------------------------------------------------
-          #
-          # Single-target validation bundle. Built via linkFarmFromDrvs —
-          # result is a directory of symlinks to each constituent's output
-          # (inspectable with `ls result/`).
-          #
-          # Derived from config.checks — every check is a CI constituent.
-          # Before P0525 this was a manual list that had drifted to 44/45:
-          # codecov-matrix-sync (the one guarding codecov.yml drift) was
-          # missing, so after_n_builds went 2 commits stale before ee957551
-          # hand-patched it. `nix flake check` caught it; `.#ci` (the merge
-          # gate) did not. Deriving closes the class.
-          #
-          # config.checks is the flake-parts merged result: our checks
-          # attrset + git-hooks module's pre-commit. That attrset already
-          # //-merges vmTests and fuzz.runs, so they appear here without
-          # explicit addition. On non-Linux it's smaller (vmTests, fuzz,
-          # codecov-matrix-sync are all optionalAttrs isLinux upstream) —
-          # ci degrades to Rust checks + pre-commit automatically.
-          #
-          # builtins.attrValues is attr-name sorted → stable linkFarm hash.
-          ci = pkgs.linkFarmFromDrvs "rio-ci" (
-            builtins.attrValues config.checks
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-              # cov-smoke: one coverage-mode VM scenario, asserts
-              # profraw→lcov pipeline works. ~5min. Catches
-              # "coverage infra broken" at merge-gate instead of
-              # 118 commits later via backgrounded coverage-full.
-              # NOT a check (too slow for `nix flake check` on a
-              # non-KVM host) — CI-aggregate only.
-              coverage.smoke
-            ]
-          );
-
-          # --------------------------------------------------------------
           # Multi-Nix golden conformance matrix (weekly tier)
           # --------------------------------------------------------------
           #
@@ -1002,11 +966,7 @@
               # value reads githubActions.matrix.coverage, but its KEY is
               # a literal, so no recursion.
               checks = builtins.removeAttrs config.checks (
-                [
-                  "build"
-                ]
-                ++ builtins.attrNames fuzz.runs
-                ++ builtins.attrNames vmTests
+                builtins.attrNames fuzz.runs ++ builtins.attrNames vmTests ++ [ "cov-smoke" ]
               );
               # 2min fuzz runs, one matrix entry per target. Keys are
               # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
@@ -1032,10 +992,54 @@
           };
         in
         {
-          # Exported via legacyPackages (free-form, not checked by
-          # `nix flake check`). The top-level `flake.githubActions`
-          # alias above makes it accessible as `.#githubActions.*`.
-          legacyPackages = { inherit githubActions; };
+          # Free-form, not enumerated by `nix flake show`, not checked
+          # by `nix flake check`. Debug/manual targets that shouldn't
+          # bloat `packages` enumeration but stay reachable for
+          # targeted `nix build .#legacyPackages.<sys>.<path>`.
+          legacyPackages = {
+            # The top-level `flake.githubActions` alias makes this
+            # accessible as `.#githubActions.*`.
+            inherit githubActions;
+            # Per-member crate2nix bins (rio-scheduler, rio-common, ...).
+            # `packages.workspace` is the canonical aggregate.
+            member-bins = crateBuild.memberBins;
+            # Helm charts from nixhelm (unpacked dirs). xtask + the
+            # README symlink workflow consume these.
+            helm = subcharts;
+            # Compiled fuzz target binaries — `checks.fuzz-*` consume
+            # these as inputs. Debug: `nix build
+            # .#legacyPackages.<sys>.fuzz-builds.rio-nix-fuzz-build`.
+            fuzz-builds = fuzz.builds;
+            # Per-member test binaries (`rustc --test`). nextest
+            # consumes these via crateChecks.testBins; exposed here
+            # for "why is this binary 227MB" debugging.
+            test-bins = crateChecks.testBins;
+            # Toolchain wrappers — debugging the arg-filtering.
+            inherit (crateChecks)
+              clippyRustc
+              rustdocRustc
+              nextest
+              nextestMetadata
+              covProfraw
+              ;
+            # Unit-test-only lcov (5min). `packages.coverage-html`
+            # is the full unit+VM report.
+            coverage-unit = crateChecks.coverage;
+            # Instrumented workspace (symlinkJoin). Inspection:
+            #   objdump -h result/bin/rio-store | grep llvm_prf
+            workspace-cov = crateBuildCov.workspace;
+            inherit rio-workspace-cov;
+          }
+          # Coverage-mode VM test runs: cov-vm.<scenario>. Build one to
+          # get raw profraws at result/coverage/<node>/.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            cov-vm = vmTestsCov;
+            # Per-test lcovs: coverage-vm.<scenario>. Inspect one VM
+            # test's contribution in isolation.
+            coverage-vm = coverage.perTestLcov;
+            # VM-only combined lcov (no unit-test merge). Debugging.
+            coverage-vm-merged = coverage.vmLcov;
+          };
 
           # Import rust-overlay
           _module.args.pkgs = import nixpkgs {
@@ -1135,30 +1139,24 @@
           };
 
           # --------------------------------------------------------------
-          # Packages
+          # Packages — minimal set of deployable / top-level outputs.
           # --------------------------------------------------------------
+          # Per-member check derivations live in `checks` (granular,
+          # for nix-fast-build streaming). Debug/manual targets live
+          # in `legacyPackages` (not enumerated by `nix flake show`).
           packages = {
             default = rio-workspace;
-            # Instrumented build (inspection: `objdump -h result/bin/rio-store
-            # | grep llvm_prf`). Used by vmTestsCov and nix/coverage.nix.
-            inherit rio-workspace-cov;
-            # debug: nix build .#fuzz-build-nix / .#fuzz-build-store
-            fuzz-build-nix = fuzz.builds.rio-nix-fuzz-build;
-            fuzz-build-store = fuzz.builds.rio-store-fuzz-build;
-            # Helm charts from nixhelm (unpacked dirs). `cargo xtask {dev apply,
-            # eks deploy}` build these and symlink/install from the result
-            # path. PG must be in charts/ even when
-            # condition: postgresql.enabled is false — Helm validates
-            # charts/ against Chart.yaml BEFORE evaluating conditions.
-            helm-postgresql = subcharts.postgresql;
-            helm-rook-ceph = subcharts.rook-ceph;
-            helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
-            helm-cilium = subcharts.cilium;
+            workspace = rio-workspace;
+            dashboard = rioDashboard;
             # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
             # keys in pins.nix → direct toJSON passthrough, no mapping
             # layer. Regenerate the committed copy:
             #   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
             tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
+            # crate2nix CLI for the dev shell (`crate2nix generate
+            # --format json -o Cargo.json` regenerates after lockfile
+            # changes).
+            crate2nix-cli = crate2nixCli;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
@@ -1208,18 +1206,6 @@
                 )
             );
 
-            # Dev worker VM (QEMU + NixOS). Reuses nix/modules/builder.nix
-            # with SLiRP networking to reach the host's control plane.
-            # Run: result-worker-vm/bin/run-rio-builder-dev-vm
-            worker-vm =
-              (nixpkgs.lib.nixosSystem {
-                inherit system;
-                modules = [
-                  ./nix/dev-builder-vm.nix
-                  { services.rio.package = rio-workspace; }
-                ];
-              }).config.system.build.vm;
-
             # ──────────────────────────────────────────────────────────
             # NixOS EKS node AMI (ADR-021). Replaces bottlerocket@latest
             # for builder/fetcher Karpenter NodePools.
@@ -1258,7 +1244,7 @@
             '';
 
             # ──────────────────────────────────────────────────────────
-            # VM coverage targets (manual — NOT in .#ci)
+            # Coverage (manual — NOT a check)
             # ──────────────────────────────────────────────────────────
             #
             # coverage-full: unit + all VM tests merged. ~25min,
@@ -1267,147 +1253,86 @@
             #   result/html/       — genhtml report
             #   result/per-test/   — vm-<scenario>.lcov individual breakdowns
             coverage-full = coverage.full;
-            # cov-smoke: fast (~5min) one-scenario coverage-infra
-            # smoke. Also in .#ci (blocking). Manual run for
-            # debugging: `nix build .#cov-smoke && cat result/summary`.
-            cov-smoke = coverage.smoke;
-            # Same data as coverage-full, HTML-only output at result/
-            # (no lcov.info / per-test subdirs). Mirrors coverage-html's
-            # relationship to the unit-test coverage check.
-            coverage-full-html = pkgs.runCommand "rio-coverage-full-html" { } ''
+            # HTML view of coverage-full at result/ (no lcov.info /
+            # per-test subdirs). For unit-test-only lcov, see
+            # legacyPackages.coverage-unit.
+            coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
               ln -s ${coverage.full}/html $out
             '';
-            # VM-only combined (no unit-test merge). Debugging.
-            coverage-vm = coverage.vmLcov;
-          }
-          # Per-test lcovs: coverage-vm-<scenario> etc. Useful for
-          # "why is X not covered" — inspect one VM test's
-          # contribution in isolation. `or {}`: coverage is
-          # optionalAttrs isLinux → empty on Darwin → no attr error.
-          // prefixed "coverage-" (coverage.perTestLcov or { })
-          # Coverage-mode VM test runs: cov-vm-<scenario> etc. Build
-          # one to get the raw profraws at result/coverage/<node>/.
-          # Used during smoke debugging.
-          // prefixed "cov-" vmTestsCov
-          // {
-            # HTML coverage report from the unit-test lcov.
-            # crateChecks.coverage already emits repo-relative paths
-            # (`rio-*/src/...`) — no strip needed, just genhtml.
-            coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
-              cd ${workspaceSrc}
-              ${pkgs.lcov}/bin/genhtml ${crateChecks.coverage}/lcov.info \
-                --output-directory $out
-            '';
-            inherit ci;
-          }
-          # Per-member crate2nix derivations. Keys are the crate
-          # names (rio-scheduler, rio-common, ...). See
-          # .claude/notes/crate2nix-migration-assessment.md.
-          // crateBuild.members
-          # Per-member check derivations for targeted runs:
-          #   nix build .#clippy-rio-scheduler
-          #   nix build .#doc-rio-nix
-          // prefixed "clippy-" crateChecks.clippy
-          // prefixed "clippy-test-" crateChecks.clippyTest
-          // prefixed "test-bin-" crateChecks.testBins
-          // prefixed "doc-" crateChecks.doc
-          // {
-            # Raw symlinkJoin of all built crate outputs. References
-            # the intermediate .rlib tree — use workspace-bins for
-            # docker/VM tests.
-            inherit (crateBuild) workspace;
-            # Stripped binary-only variant — what VM tests/docker
-            # consume. Closure ~glibc+syslibs.
-            workspace-bins = crateBuild.workspaceBins;
-            # crate2nix CLI for the dev shell (`crate2nix generate
-            # --format json -o Cargo.json` regenerates after lockfile
-            # changes).
-            crate2nix-cli = crate2nixCli;
-            # Aggregate check derivations (same as checks.* but
-            # exposed as packages for --print-out-paths convenience).
-            clippy-all = crateChecks.clippyCheck;
-            doc-all = crateChecks.docCheck;
-            # nextest reuse-build runner — characteristic
-            # `PASS [Xs] crate::test` output, test groups, retries.
-            # Binaries synthesized from crate2nix testBinDrvs, no
-            # cargo invocation. nextest-meta is the cached metadata
-            # derivation for debugging / manual `cargo-nextest run
-            # --binaries-metadata result/binaries-metadata.json`.
-            nextest-all = crateChecks.nextest;
-            nextest-meta = crateChecks.nextestMetadata;
-            # Coverage: nextest run against instrumented binaries
-            # (raw profraws at $out/profraw/) + merged lcov.
-            cov-profraw = crateChecks.covProfraw;
-            inherit (crateChecks) coverage;
-            # Toolchain wrappers for debugging the arg-filtering:
-            #   nix build .#clippy-rustc
-            #   ./result/bin/rustc --version   # → clippy version
-            clippy-rustc = crateChecks.clippyRustc;
-            rustdoc-rustc = crateChecks.rustdocRustc;
-            # Instrumented workspace (symlinkJoin). Inspection:
-            #   objdump -h result/bin/rio-store | grep llvm_prf
-            workspace-cov = crateBuildCov.workspace;
-          }
-          # Per-test VM packages (Linux-only — mkVmTests wraps in
-          # optionalAttrs isLinux):
-          #   nix build .#vm-protocol-warm-standalone
-          #   nix build .#cov-vm-lifecycle-core-k3s
-          // vmTests
-          # Multi-Nix golden matrix (weekly). Exported Linux-only:
-          # nix-daemon needs a unix socket; macOS matrix not supported.
-          # Under `packages` not `checks` → `nix flake check` won't
-          # build the three extra Nix source trees on every push.
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+
+            # Multi-Nix golden matrix (weekly). Exported Linux-only:
+            # nix-daemon needs a unix socket; macOS matrix not
+            # supported. Under `packages` not `checks` → checks gate
+            # won't build the three extra Nix source trees on every
+            # push.
             golden-matrix = goldenMatrix;
             inherit mutants mutants-smoke;
           };
 
           # --------------------------------------------------------------
-          # Checks (run with 'nix flake check')
+          # Checks — flat granular derivations. The CI gate is
+          # `nix-fast-build --flake .#checks.<system>` which streams
+          # per-attr eval+build via nix-eval-jobs.
           # --------------------------------------------------------------
-          checks = {
-            build = rio-workspace;
-            clippy = crateChecks.clippyCheck;
-            doc = crateChecks.docCheck;
-            inherit (crateChecks) nextest;
-            dashboard = rioDashboard;
-          }
-          // miscChecks
-          # 2min fuzz runs (Linux-only). Compiled binaries shared
-          # across targets via rio-{nix,store}-fuzz-build.
-          // fuzz.runs
-          # Per-phase milestone VM tests (Linux-only, need KVM).
-          # Debug interactively:
-          #   nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive
-          #   ./result/bin/nixos-test-driver
-          // vmTests
-          # Eval-time assertion: codecov.yml after_n_builds must equal the
-          # coverage matrix length. Catches drift when vm-* fragments are
-          # added without bumping the Codecov gate.
-          # Linux-only because githubActions is optionalAttrs isLinux.
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Regression: per-node profraw extract must not drop
-            # filename-colliding profraws across multi-worker nodes.
-            # No KVM needed (synthetic tarballs).
-            cov-extract-nocollide = coverage.extractNoCollide;
-            codecov-matrix-sync =
-              let
-                expected = builtins.length (builtins.attrNames githubActions.matrix.coverage);
-                declared = pkgs.lib.toInt (
-                  builtins.head (
-                    builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./.github/codecov.yml)
-                  )
-                );
-              in
-              assert pkgs.lib.assertMsg (expected == declared) ''
-                .github/codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
-                Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
-              '';
-              # Named (not pkgs.emptyFile) so `ls result/` of .#ci shows
-              # which constituent this is — eval-time asserts are invisible
-              # otherwise once they pass.
-              pkgs.runCommand "rio-codecov-matrix-sync" { } "touch $out";
-          };
+          checks =
+            # Per-member rustc-driven checks. Each attr is one
+            # derivation depending on that member's per-crate src
+            # fileset (nix/crate2nix.nix) — editing rio-cli leaves
+            # checks.clippy-rio-scheduler cached.
+            prefixed "clippy-" crateChecks.clippy
+            // prefixed "clippy-test-" crateChecks.clippyTest
+            // prefixed "doc-" crateChecks.doc
+            // prefixed "nextest-" crateChecks.nextestRuns
+            // {
+              dashboard = rioDashboard;
+            }
+            # Workspace-level policy checks (deny, helm-lint, mdbook,
+            # tracey-validate, crds-drift, tfvars-fresh, …).
+            // miscChecks
+            # 2min fuzz runs (Linux-only). Compiled binaries shared
+            # across targets via rio-{nix,store}-fuzz-build.
+            // fuzz.runs
+            # Per-phase milestone VM tests (Linux-only, need KVM).
+            # Debug interactively:
+            #   nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive
+            #   ./result/bin/nixos-test-driver
+            // vmTests
+            # Eval-time assertion: codecov.yml after_n_builds must
+            # equal the coverage matrix length. Catches drift when
+            # vm-* fragments are added without bumping the Codecov
+            # gate. Linux-only because githubActions is optionalAttrs
+            # isLinux.
+            // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+              # cov-smoke: one coverage-mode VM scenario, asserts
+              # profraw→lcov pipeline works. ~5min. Catches "coverage
+              # infra broken" at merge-gate instead of 118 commits
+              # later via backgrounded coverage-full. Needs KVM —
+              # `nix flake check` on a non-KVM host will fail this;
+              # use nix-fast-build's --skip-cached or build the
+              # checks subset that excludes it.
+              cov-smoke = coverage.smoke;
+              # Regression: per-node profraw extract must not drop
+              # filename-colliding profraws across multi-worker nodes.
+              # No KVM needed (synthetic tarballs).
+              cov-extract-nocollide = coverage.extractNoCollide;
+              codecov-matrix-sync =
+                let
+                  expected = builtins.length (builtins.attrNames githubActions.matrix.coverage);
+                  declared = pkgs.lib.toInt (
+                    builtins.head (
+                      builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./.github/codecov.yml)
+                    )
+                  );
+                in
+                assert pkgs.lib.assertMsg (expected == declared) ''
+                  .github/codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
+                  Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
+                '';
+                # Named (not pkgs.emptyFile) so `ls result/` of .#ci shows
+                # which constituent this is — eval-time asserts are invisible
+                # otherwise once they pass.
+                pkgs.runCommand "rio-codecov-matrix-sync" { } "touch $out";
+            };
 
           # Formatter for 'nix fmt'
           formatter = config.treefmt.build.wrapper;

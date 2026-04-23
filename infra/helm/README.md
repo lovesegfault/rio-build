@@ -54,7 +54,7 @@ xtask sets this up automatically for both providers. For manual
 `helm template` outside xtask:
 ```sh
 mkdir -p charts
-ln -sfn $(nix build --no-link --print-out-paths .#helm-postgresql) charts/postgresql
+ln -sfn $(nix build --no-link --print-out-paths .#helm.postgresql) charts/postgresql
 ```
 
 To bump a chart version: edit `nix/helm-charts.nix`, build once with the

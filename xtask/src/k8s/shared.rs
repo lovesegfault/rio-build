@@ -72,7 +72,7 @@ pub async fn chart_deps() -> Result<()> {
     }
     std::fs::create_dir_all(&charts)?;
     for name in SUBCHARTS {
-        let attr = format!(".#helm-{name}");
+        let attr = format!(".#helm.{name}");
         // I-198: was sync `sh::read` — `nix build` is multi-second on a
         // cold cache; this runs inside the deploy phase (a spawned tokio
         // task). `run_read` yields. Shell scoped per call so `&Shell`

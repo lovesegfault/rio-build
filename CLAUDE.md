@@ -53,28 +53,29 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×9, all VM tests, cov-smoke (Linux+KVM only) |
-| `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 2min fuzz, VM tests) |
+| `nix-fast-build --flake .#checks.x86_64-linux` | Full CI gate: per-member clippy/doc/nextest, pre-commit, 2min fuzz ×9, all VM tests, cov-smoke (Linux+KVM only). Streams eval→build. |
+| `nix flake check` | Runs all `checks.*` (same set as nix-fast-build, but serial eval) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
 | `/nixbuild .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
-| `nix build .#cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke (also in `.#ci`) |
-| `/nixbuild .#cov-vm-protocol-warm-standalone` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
-| `nix build .#coverage-vm-protocol-warm-standalone` | Per-test lcov from one coverage-mode VM run |
+| `nix build .#checks.x86_64-linux.cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke |
+| `nix build .#legacyPackages.x86_64-linux.cov-vm.protocol-warm-standalone` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
+| `nix build .#legacyPackages.x86_64-linux.coverage-vm.protocol-warm-standalone` | Per-test lcov from one coverage-mode VM run |
 
-### CI aggregate target
+### CI gate
 
-`/nixbuild .#ci` bundles all checks + VM tests + 2min fuzz into a single build. Needs KVM for the VM tests. On non-Linux, degrades to cargo checks + pre-commit only (VM tests and fuzz are both Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
+`checks.*` is flat granular (~110 derivations: per-member clippy/clippy-test/doc/nextest, fuzz runs, VM tests, misc policy checks). `nix-fast-build` streams evaluation into builds via nix-eval-jobs — VM tests start evaluating in parallel with rust checks instead of after, and individual check failures surface immediately without waiting for the whole graph.
+
+`packages.*` is the minimal set of deployable artifacts (workspace binaries, docker images, AMIs, tfvars). `legacyPackages.*` holds debug/manual targets (per-test coverage, fuzz builds, helm charts) that shouldn't be enumerated by `nix flake show`.
 
 ### Coverage
 
 Three tiers:
 
-- **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
-- **Cov-smoke** (~5min, in `.#ci`): `nix build .#cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — coverage-full failures were triaged as individual test-gaps instead of a pipeline-level halt.
-- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — run on demand.
+- **Cov-smoke** (~5min, in checks): `nix build .#checks.x86_64-linux.cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — coverage-full failures were triaged as individual test-gaps instead of a pipeline-level halt.
+- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. HTML alone: `nix build .#coverage-html`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** a check — run on demand.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
@@ -110,11 +111,11 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ## CI gate
 
-**Every change MUST pass `.#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
+**Every change MUST pass `nix-fast-build --flake .#checks.x86_64-linux` before merge.** This is the single gate — it covers per-member clippy, nextest, docs, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
 
-From agent/subagent context, prefer `/nixbuild .#ci` over raw `nix build` — it captures the log to `/tmp/rio-dev/` and emits a JSON report instead of streaming megabytes of build output. For interactive debugging, plain `nix build -L .#ci` is fine.
+From agent/subagent context, use `/nixbuild --checks` (which wraps nix-fast-build) over raw invocation — it captures the log to `/tmp/rio-dev/` and emits a JSON report instead of streaming megabytes of build output. For a single check, `/nixbuild .#checks.x86_64-linux.<name>` still works.
 
-When `.#ci` is red and the cause isn't obvious from the log, see `.claude/rules/ci-failure-patterns.md` — it catalogs every failure signature that has bitten this project before.
+When the gate is red and the cause isn't obvious from the log, see `.claude/rules/ci-failure-patterns.md` — it catalogs every failure signature that has bitten this project before.
 
 ## Fuzzing
 

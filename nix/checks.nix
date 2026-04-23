@@ -731,6 +731,24 @@ let
 
   nextestRun = mkNextestRun { };
 
+  # Per-member nextest runners. Each gets its own meta synthesized from
+  # ONE test-binary derivation, so building checks.nextest-rio-common
+  # only depends on rio-common's testBinDrv (not the whole workspace).
+  # The package() filter is belt-and-suspenders — the single-binary meta
+  # already constrains scope, but the filter makes intent explicit and
+  # guards against a future meta-synthesis change.
+  nextestRuns = lib.mapAttrs (
+    name: bin:
+    mkNextestRun {
+      name = "rio-nextest-${name}";
+      meta = mkNextestMeta { ${name} = bin; };
+      extraArgs = [
+        "-E"
+        "package(${name})"
+      ];
+    }
+  ) testBinDrvs;
+
   # ──────────────────────────────────────────────────────────────────
   # Coverage: run instrumented tests → profraw → lcov
   # ──────────────────────────────────────────────────────────────────
@@ -823,8 +841,9 @@ let
 
 in
 {
-  # Per-member check derivations. Exposed for targeted runs:
-  #   nix build .#clippy-rio-scheduler
+  # Per-member check derivations. Exposed in checks.* for granular
+  # nix-fast-build streaming:
+  #   nix build .#checks.x86_64-linux.clippy-rio-scheduler
   clippy = clippyDrvs;
   clippyTest = clippyTestDrvs;
   testBins = testBinDrvs;
@@ -847,7 +866,9 @@ in
   # skip the nextest wiring). mkNextestRun is the parameterized form
   # — golden-matrix uses it to spin one run per daemon variant with
   # a different nix-cli in PATH and RIO_GOLDEN_DAEMON_BIN env.
+  # nextestRuns is the per-member map for granular checks.*.
   nextest = if workspaceSrc != null then nextestRun else null;
+  nextestRuns = if workspaceSrc != null then nextestRuns else { };
   nextestMetadata = if workspaceSrc != null then nextestMeta else null;
   mkNextestRun = if workspaceSrc != null then mkNextestRun else null;
 

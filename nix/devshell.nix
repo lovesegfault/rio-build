@@ -19,6 +19,11 @@
 }:
 let
   shellPackages = with pkgs; [
+    # CI gate driver — `nix-fast-build --flake .#checks.x86_64-linux`
+    # streams eval+build (per-attr nix-eval-jobs workers → builds
+    # queue as drvs become known). Replaces the old `.#ci` aggregate.
+    nix-fast-build
+
     # Cargo tools
     cargo-edit
     cargo-expand

@@ -3,7 +3,7 @@
 # agent context — emits a JSON report instead. See .claude/skills/nixbuild/.
 set -uo pipefail
 
-target="${1:?usage: nixbuild <flake-target> [extra nix args...]}"
+target="${1:?usage: nixbuild <flake-target>|--checks [extra args...]}"
 shift
 
 root="$(git rev-parse --show-toplevel)"
@@ -19,8 +19,17 @@ done
 log="${logdir}/rio-${branch}-$((iter + 1)).log"
 
 echo "nixbuild: log → $log" >&2
-out=$(nix build -L --no-link --print-out-paths "${root}#${target#*#}" "$@" 2>"$log")
-rc=$?
+if [[ "$target" == "--checks" ]]; then
+  # CI gate: stream-eval all checks via nix-eval-jobs.
+  nix-fast-build --no-nom --skip-cached \
+    --flake "${root}#checks.$(nix eval --raw --impure --expr builtins.currentSystem)" \
+    "$@" >"$log" 2>&1
+  rc=$?
+  out=""
+else
+  out=$(nix build -L --no-link --print-out-paths "${root}#${target#*#}" "$@" 2>"$log")
+  rc=$?
+fi
 store_path="${out%%$'\n'*}"
 
 drv_failed=$(grep -oP "(Cannot build|builder for|build of) '\K/nix/store/[^']+\.drv" "$log" | sort -u | jq -Rs 'split("\n") | map(select(length>0))')

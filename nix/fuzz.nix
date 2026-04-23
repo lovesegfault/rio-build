@@ -282,8 +282,8 @@ let
     '';
 in
 {
-  # Per-crate build derivations, exposed as packages.fuzz-build-{nix,store}
-  # for debugging (`nix build .#fuzz-build-nix && ls result/bin/`).
+  # Per-crate build derivations, exposed under legacyPackages.fuzz-builds
+  # for debugging (`nix build .#fuzz-builds.rio-nix-fuzz-build && ls result/bin/`).
   builds = { inherit rio-nix-fuzz-build rio-store-fuzz-build; };
 
   # 2min fuzz runs (Linux-only — libFuzzer).

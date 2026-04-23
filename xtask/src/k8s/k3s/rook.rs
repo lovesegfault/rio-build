@@ -21,11 +21,11 @@ pub async fn install() -> Result<()> {
 
     let op = crate::sh::read(cmd!(
         sh,
-        "nix build --no-link --print-out-paths .#helm-rook-ceph"
+        "nix build --no-link --print-out-paths .#helm.rook-ceph"
     ))?;
     let cl = crate::sh::read(cmd!(
         sh,
-        "nix build --no-link --print-out-paths .#helm-rook-ceph-cluster"
+        "nix build --no-link --print-out-paths .#helm.rook-ceph-cluster"
     ))?;
 
     info!("rook operator");

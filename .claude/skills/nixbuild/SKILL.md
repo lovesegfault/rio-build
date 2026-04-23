@@ -1,12 +1,12 @@
 ---
 name: nixbuild
-description: Local nix build with structured log lifecycle. Use for .#ci / .#coverage-full runs from agent context to avoid flooding it with build output.
+description: Local nix build with structured log lifecycle. Use for the full checks gate / .#coverage-full runs from agent context to avoid flooding it with build output.
 ---
 
 ## Invocation
 
 ```bash
-.claude/bin/nixbuild .#ci
+.claude/bin/nixbuild --checks                             # full CI gate via nix-fast-build
 .claude/bin/nixbuild .#checks.x86_64-linux.vm-lifecycle   # single check
 .claude/bin/nixbuild .#coverage-full --keep-going         # extra args pass through
 ```
@@ -16,10 +16,12 @@ description: Local nix build with structured log lifecycle. Use for .#ci / .#cov
 **Callers jq.** Once a build is attempted, process exit is 0 — `rc` is in the JSON. (Missing target arg exits 1 with usage.)
 
 ```bash
-report=$(.claude/bin/nixbuild .#ci)
+report=$(.claude/bin/nixbuild --checks)
 rc=$(jq -r .rc <<<"$report")
 [[ $rc -eq 0 ]] || jq -r .log_tail <<<"$report"
 ```
+
+`--checks` mode wraps `nix-fast-build --flake .#checks.<system>` (stream-evaluates ~110 granular checks via nix-eval-jobs). `store_path` is empty in this mode — there is no single aggregate output.
 
 ## Output
 

@@ -10,8 +10,8 @@
 //!   lint → health → scenarios → load → fault
 //!
 //! `--lint` is local-only (helm template + config-shape asserts) and is
-//! the one stage that could move into `.#ci`. Everything else needs a
-//! live cluster.
+//! the one stage that could move into `checks.*`. Everything else needs
+//! a live cluster.
 
 use std::time::Duration;
 

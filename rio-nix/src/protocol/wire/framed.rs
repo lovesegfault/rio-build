@@ -447,7 +447,7 @@ pub(super) mod tests {
     /// `new_unbounded()`, the read completes and `total_bytes_read ==
     /// 65 × 64 MiB > MAX_FRAMED_TOTAL`. `#[ignore]` because it moves
     /// >4 GiB through `tokio::io::repeat` (~seconds at memcpy speed);
-    /// NOT in `.#ci`. Run via `cargo nextest run -p rio-nix
+    /// NOT in checks. Run via `cargo nextest run -p rio-nix
     /// --run-ignored only -- past_4gib`.
     #[tokio::test]
     #[ignore = "moves >4 GiB; run manually"]
