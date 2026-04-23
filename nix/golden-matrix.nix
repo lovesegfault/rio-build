@@ -9,10 +9,13 @@
 # result for that daemon. `nix build .#golden-matrix && ls result/` shows
 # one dir per variant.
 #
-# This deliberately lives under `packages` (not `checks`) so `nix flake
-# check` doesn't build it — evaluating four full Nix source trees is a
-# multi-minute eval, and building the non-pinned daemons is 20-30 min each.
-# Weekly cron invokes `nix build .#golden-matrix` directly.
+# This deliberately lives under `packages` (not `checks`). Weekly cron
+# invokes `nix build .#golden-matrix` directly. Three of the four daemons
+# (nix-stable / nix-unstable / lix) come from nixpkgs rather than separate
+# flake inputs — drops 16 lock nodes and skips the 20-30 min source builds
+# the inputs would require. Trade-off: tracks nixpkgs's snapshot of each
+# daemon (days-to-weeks lag vs upstream HEAD), which is fine for a weekly
+# wire-protocol conformance check.
 #
 # crate2nix port: reuses crateChecks.mkNextestRun (reuse-build mode — the
 # test binaries are already compiled by buildRustCrate, nextest just runs
@@ -26,17 +29,18 @@
   mkNextestRun,
 }:
 let
-  # Daemon package per variant. Package attr names differ across Nix
-  # eras: 2.34+ and master expose `nix-cli` (just bin/, no functional-
-  # tests buildInput); 2.20 and Lix only have `.default`/`.nix`. The
-  # `or` fallback handles future renames without breaking the matrix.
+  # Daemon package per variant. nix-pinned is the flake's explicitly
+  # pinned `inputs.nix` (built from source at the tagged ref). The rest
+  # are nixpkgs-packaged binaries (substitutable from cache.nixos.org).
+  #
+  # nix-stable uses the oldest nixVersions.nix_2_* still in nixpkgs
+  # (2.20 was dropped). Oldest-protocol-minor coverage is provided by
+  # the lix variant (frozen at 1.35 = rio's MIN_CLIENT_VERSION).
   daemons = {
     nix-pinned = inputs.nix.packages.${system}.nix-cli or inputs.nix.packages.${system}.default;
-    nix-stable =
-      inputs.nix-stable.packages.${system}.nix-cli or inputs.nix-stable.packages.${system}.default;
-    nix-unstable =
-      inputs.nix-unstable.packages.${system}.nix-cli or inputs.nix-unstable.packages.${system}.default;
-    lix = inputs.lix.packages.${system}.nix-cli or inputs.lix.packages.${system}.default;
+    nix-stable = pkgs.nixVersions.nix_2_28;
+    nix-unstable = pkgs.nixVersions.git;
+    inherit (pkgs) lix;
   };
 
   # One nextest run per daemon. The variant's nix package is PREPENDED

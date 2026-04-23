@@ -8,39 +8,13 @@
         flake-compat.follows = "flake-compat";
         flake-parts.follows = "flake-parts";
         git-hooks-nix.follows = "git-hooks-nix";
+        nixpkgs.follows = "nixpkgs";
+        # Upstream-test-only nixpkgs pins (used by nix's own integration
+        # tests, not by the .nix-cli package we consume). Stub to drop
+        # them from flake.lock.
+        nixpkgs-23-11.follows = "";
+        nixpkgs-regression.follows = "";
       };
-    };
-
-    # Multi-version Nix compat matrix inputs (weekly tier — NOT in checks).
-    # See nix/golden-matrix.nix + docs/src/verification.md § Protocol
-    # Conformance. Each input provides a nix-daemon binary; the golden
-    # conformance suite runs once per daemon to surface protocol-version
-    # divergences early.
-    #
-    # No `nixpkgs.follows` — following our nixpkgs breaks both the 2.20
-    # and Lix builds (they pin specific nixpkgs revs for their own
-    # dependency constraints). Accepting the eval cost is cheap for a
-    # weekly-only target; the lock entries are inert until
-    # `.#golden-matrix` is built.
-    nix-stable = {
-      url = "github:NixOS/nix/2.20-maintenance";
-      # 2.20's flake predates the flake-parts split — minimal follows.
-      # Branch-deletion is survivable: the lockfile pins the rev, so
-      # only explicit `nix flake update nix-stable` breaks if upstream
-      # deletes the branch (and nixpkgs caches tarballs).
-      inputs.flake-compat.follows = "flake-compat";
-    };
-    nix-unstable = {
-      url = "github:NixOS/nix";
-      inputs = {
-        flake-compat.follows = "flake-compat";
-        flake-parts.follows = "flake-parts";
-        git-hooks-nix.follows = "git-hooks-nix";
-      };
-    };
-    lix = {
-      url = "git+https://git.lix.systems/lix-project/lix";
-      inputs.flake-compat.follows = "flake-compat";
     };
 
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -127,7 +101,8 @@
         flake-parts.follows = "flake-parts";
         treefmt-nix.follows = "treefmt-nix";
         # process-compose isn't a dep of the package build path;
-        # leave it unfollowed rather than polluting our inputs.
+        # stubbing it drops the lock node without adding a real input.
+        process-compose.follows = "";
       };
     };
 
@@ -140,7 +115,14 @@
     # one flake input.
     nixhelm = {
       url = "github:farcaller/nixhelm";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        # Only chartsDerivations is consumed; the helmupdater Python
+        # tool (which these inputs feed) is unused.
+        pyproject-nix.follows = "";
+        pyproject-build-systems.follows = "";
+        uv2nix.follows = "";
+      };
     };
   };
 
@@ -744,9 +726,9 @@
                 rioModules = inputs.self.nixosModules;
                 inherit (inputs) nixhelm;
                 # Lix-client VM test (vm-protocol-warm-lix-standalone).
-                # Same `or` fallback as nix/golden-matrix.nix — Lix
-                # exposes .default today; future renames covered.
-                lixPackage = inputs.lix.packages.${system}.nix-cli or inputs.lix.packages.${system}.default;
+                # nixpkgs-packaged (substitutable from cache.nixos.org)
+                # rather than building lix from source via a flake input.
+                lixPackage = pkgs.lix;
               };
               # Per-test builder CPU hint. withMinCpu sets
               # NIXBUILDNET_MIN_CPU (numVMs × 4 + 1) to prevent
