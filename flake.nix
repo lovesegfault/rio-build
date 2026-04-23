@@ -461,22 +461,61 @@
               crateBuildCov
               ;
             inherit (pkgs) lib;
-            # Runtime inputs for test execution. Mirrors crane's
-            # cargoNextest nativeCheckInputs — postgres for ephemeral
-            # PG bootstrap (rio-test-support), nix-cli for golden
-            # conformance tests (nix-store --dump, nix-instantiate),
-            # openssh for rio-gateway SSH accept tests.
-            runtimeTestInputs = with pkgs; [
-              inputs.nix.packages.${system}.nix
-              openssh
-              postgresql_18
-            ];
-            # Env vars for test runners. PG_BIN so rio-test-support
-            # finds initdb/postgres; RIO_GOLDEN_* so golden tests
-            # don't try to `nix build` their fixture in-sandbox.
-            testEnv = goldenTestEnv // {
-              PG_BIN = "${pkgs.postgresql_18}/bin";
-            };
+            # Runtime inputs for test execution, keyed by member (null =
+            # aggregate run = union). Per-member so nextest-rio-crds
+            # doesn't drag postgres+nix-daemon into its closure.
+            #   nix-cli — golden conformance (nix-store --dump,
+            #     nix-instantiate); rio-builder spawns nix-daemon --stdio
+            #   postgresql — rio-test-support ephemeral PG bootstrap
+            #   openssh — rio-gateway SSH accept tests
+            runtimeTestInputs =
+              let
+                needsNix = [
+                  "rio-store"
+                  "rio-scheduler"
+                  "rio-builder"
+                  "rio-gateway"
+                  "rio-test-support"
+                  "rio-cli"
+                  "xtask"
+                ];
+                needsPg = [
+                  "rio-store"
+                  "rio-scheduler"
+                  "rio-builder"
+                  "rio-gateway"
+                  "rio-test-support"
+                ];
+              in
+              member:
+              pkgs.lib.optional (
+                member == null || builtins.elem member needsNix
+              ) inputs.nix.packages.${system}.nix
+              ++ pkgs.lib.optional (member == null || builtins.elem member needsPg) pkgs.postgresql_18
+              ++ pkgs.lib.optional (member == null || member == "rio-gateway") pkgs.openssh;
+            # Env vars for test runners, keyed by member. PG_BIN so
+            # rio-test-support finds initdb/postgres; RIO_GOLDEN_* so
+            # golden tests don't try to `nix build` their fixture
+            # in-sandbox. The PG-less members get neither.
+            testEnv =
+              member:
+              pkgs.lib.optionalAttrs
+                (
+                  member == null
+                  || builtins.elem member [
+                    "rio-store"
+                    "rio-scheduler"
+                    "rio-builder"
+                    "rio-gateway"
+                    "rio-test-support"
+                  ]
+                )
+                (
+                  goldenTestEnv
+                  // {
+                    PG_BIN = "${pkgs.postgresql_18}/bin";
+                  }
+                );
             # nextest reuse-build runner. Synthesizes --cargo-metadata
             # and --binaries-metadata JSON from the crate2nix test
             # binaries; runs with the `ci` profile (retries, test
@@ -484,24 +523,88 @@
             # isolation — no PDEATHSIG/libtest thread race, so
             # wrapper-level PG bootstrap not needed. `--no-tests=warn`
             # because rio-cli has zero tests (bin-only crate).
-            #
-            # Fileset = workspaceSrc PLUS .config/nextest.toml
-            # (--workspace-remap needs to find it relative to the
-            # workspace root). The base fileset omits .config/
-            # because buildRustCrate doesn't need it.
+            # Full workspace source for the aggregate nextest run (used
+            # when member == null — golden-matrix, coverage). Per-member
+            # runs use nextestRunSrc + overlay instead.
             workspaceSrc = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
                 workspaceFileset
                 ./.config/nextest.toml
-                # metrics_registered tests grep the per-component
-                # metrics tables at runtime (rio-test-support
-                # grep_spec_names reads ../docs/src/observability.md
-                # via fs::read_to_string). Adding a row breaks the
-                # nextest drv hash, not the build/clippy/doc hashes.
                 ./docs/src/observability.md
               ];
             };
+            # Fileset for the shared cargo-metadata drv and
+            # --workspace-remap target. Excludes src/**.rs (cargo
+            # metadata only needs target-file EXISTENCE, not content;
+            # cargoMetadataJson postPatch stubs lib.rs/main.rs). DOES
+            # include */tests/ and src/bin/ — cargo's autotests +
+            # explicit [[bin]] discovery scans those by filename.
+            # Editing the bulk of src/ does not change this hash, so
+            # per-member nextest runs cache independently of unrelated
+            # source edits.
+            nextestRunSrc = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                (pkgs.lib.fileset.fileFilter (f: f.name == "Cargo.toml") unfilteredRoot)
+                ./.config/nextest.toml
+                # cargo metadata's autotests discovery scans tests/
+                # by filename. Including the (small) test files lets
+                # the per-member binaries-metadata reference cross-
+                # crate binary() filtersets in nextest.toml.
+                ./rio-builder/tests
+                ./rio-cli/tests
+                ./rio-controller/tests
+                ./rio-gateway/tests
+                ./rio-proto/tests
+                ./rio-scheduler/tests
+                ./rio-store/tests
+                # metrics_registered tests grep the per-component
+                # metrics tables at runtime (rio-test-support
+                # grep_spec_names reads ../docs/src/observability.md
+                # via fs::read_to_string).
+                ./docs/src/observability.md
+                # proptest replays known-failing inputs from these.
+                ./rio-nix/proptest-regressions
+              ];
+            };
+            # Per-member full src/ for the runtime overlay (mkNextestRun
+            # cp's the target member's real source into $ws/<member>/ so
+            # tests that scan their own crate dir — grep_emitted_names —
+            # see real content). Rooted at the member dir.
+            memberSrcs = pkgs.lib.mapAttrs (
+              name: fs:
+              pkgs.lib.fileset.toSource {
+                root = unfilteredRoot + "/${name}";
+                fileset = fs;
+              }
+            ) memberFilesets;
+            # Mirror cargo's auto-detected target files (src/lib.rs,
+            # src/main.rs, src/bin/*.rs) as empty stubs. pathExists at
+            # eval time depends on file EXISTENCE not content, so
+            # editing the bodies doesn't change this string.
+            stubTargetFiles =
+              let
+                stubIf =
+                  p:
+                  pkgs.lib.optionalString (builtins.pathExists p) ''
+                    mkdir -p "$(dirname ${pkgs.lib.removePrefix (toString unfilteredRoot + "/") (toString p)})"
+                    touch ${pkgs.lib.removePrefix (toString unfilteredRoot + "/") (toString p)}
+                  '';
+                stubBinDir =
+                  d:
+                  pkgs.lib.optionalString (builtins.pathExists d) (
+                    pkgs.lib.concatMapStrings (f: stubIf (d + "/${f}")) (builtins.attrNames (builtins.readDir d))
+                  );
+              in
+              pkgs.lib.concatMapStrings (
+                m:
+                stubIf (./. + "/${m}/src/lib.rs")
+                + stubIf (./. + "/${m}/src/main.rs")
+                + stubBinDir (./. + "/${m}/src/bin")
+              ) (builtins.attrNames memberFilesets);
             nextestExtraArgs = [
               "--profile"
               "ci"
