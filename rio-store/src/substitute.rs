@@ -1196,20 +1196,21 @@ impl Substituter {
     /// `deadline` bounds the 429-retry sleep: if the upstream's
     /// `Retry-After` would push past it (with 2s headroom for the
     /// HEADs themselves), the retry pass is skipped and the
-    /// rate-limited paths are returned as not-substitutable for THIS
-    /// call (uncached; they get re-probed at dispatch time).
+    /// rate-limited paths are returned in `indeterminate` (uncached;
+    /// the scheduler optimistically tries the substitute fetch and
+    /// falls through to build only on confirmed miss).
     #[instrument(skip(self, paths), fields(tenant = %tenant_id, n = paths.len()))]
     pub async fn check_available(
         &self,
         tenant_id: Uuid,
         paths: &[String],
         deadline: tokio::time::Instant,
-    ) -> Result<Vec<String>, SubstituteError> {
+    ) -> Result<CheckAvailableResult, SubstituteError> {
         use futures_util::StreamExt;
 
         let started = std::time::Instant::now();
         let Some(http) = &self.http else {
-            return Ok(Vec::new()); // sandbox: client build failed
+            return Ok(CheckAvailableResult::default()); // sandbox: client build failed
         };
         let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
         debug!(
@@ -1218,13 +1219,14 @@ impl Substituter {
             "check_available"
         );
         if upstreams.is_empty() || paths.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CheckAvailableResult::default());
         }
 
         // Partition into cached / uncached. Cached results (positive
         // and negative) are answered immediately; only uncached paths
         // count against the probe cap and incur HEADs.
         let mut hits = Vec::new();
+        let mut indeterminate = Vec::new();
         let mut uncached = Vec::new();
         let (mut cache_hits, mut cache_misses) = (0u64, 0u64);
         for p in paths {
@@ -1244,7 +1246,10 @@ impl Substituter {
         metrics::counter!("rio_store_substitute_probe_cache_misses_total").increment(cache_misses);
 
         if uncached.is_empty() {
-            return Ok(hits);
+            return Ok(CheckAvailableResult {
+                hits,
+                indeterminate,
+            });
         }
 
         let bases: Vec<String> = upstreams
@@ -1360,19 +1365,24 @@ impl Substituter {
             // the old 4096-truncation which at least returned 4096.
             // Un-yielded paths are implicitly Indeterminate (uncached,
             // re-probed at dispatch time).
-            let probed: Vec<_> = futures_util::stream::iter(
-                std::mem::take(&mut pending)
-                    .into_iter()
-                    .map(|(p, h)| probe_one(p, h)),
-            )
-            .buffer_unordered(concurrency)
-            .take_until(tokio::time::sleep_until(deadline))
-            .collect()
-            .await;
+            let batch = std::mem::take(&mut pending);
+            // Snapshot paths for deadline-dropped recovery. Must
+            // `into_iter` (owned) the actual probe inputs — see the
+            // HRTB note above; `batch.iter()` + clone trips the same
+            // inference failure.
+            let batch_paths: Vec<String> = batch.iter().map(|(p, _)| p.clone()).collect();
+            let probed: Vec<_> =
+                futures_util::stream::iter(batch.into_iter().map(|(p, h)| probe_one(p, h)))
+                    .buffer_unordered(concurrency)
+                    .take_until(tokio::time::sleep_until(deadline))
+                    .collect()
+                    .await;
             let completed = probed.len();
 
             let mut max_retry_after: Option<Duration> = None;
+            let mut yielded = std::collections::HashSet::<String>::with_capacity(completed);
             for ((path, hash_part), outcome) in probed {
+                yielded.insert(path.clone());
                 match outcome {
                     ProbeOutcome::Hit => {
                         self.probe_cache
@@ -1384,7 +1394,7 @@ impl Substituter {
                         self.probe_cache.insert((tenant_id, path), false).await;
                     }
                     // Don't cache: next call re-probes.
-                    ProbeOutcome::Indeterminate => {}
+                    ProbeOutcome::Indeterminate => indeterminate.push(path),
                     ProbeOutcome::RateLimited { retry_after } => {
                         max_retry_after = max_retry_after
                             .max(Some(retry_after.unwrap_or(Duration::from_secs(1))));
@@ -1394,12 +1404,22 @@ impl Substituter {
             }
 
             if completed < batch_len {
+                // `take_until` stopped yielding after the deadline; the
+                // un-yielded paths are neither hit nor miss for THIS
+                // call. Recover them via the pre-consumption snapshot
+                // — without this they were silently dropped and the
+                // scheduler treated them as confirmed-miss.
+                for path in batch_paths {
+                    if !yielded.contains(&path) {
+                        indeterminate.push(path);
+                    }
+                }
                 info!(
                     pass,
                     completed,
                     deferred = batch_len - completed,
                     "check_available: probe pass exceeded deadline; \
-                     deferring un-probed paths to dispatch-time"
+                     un-probed paths returned indeterminate"
                 );
                 break;
             }
@@ -1423,7 +1443,7 @@ impl Substituter {
                     remaining_budget = ?remaining,
                     deferred = pending.len(),
                     "check_available: upstream Retry-After exceeds probe budget; \
-                     deferring rate-limited paths to dispatch-time"
+                     rate-limited paths returned indeterminate"
                 );
                 break;
             }
@@ -1437,13 +1457,31 @@ impl Substituter {
             tokio::time::sleep(sleep).await;
         }
         // Remainder (still 429 after MAX_PASSES, or Retry-After exceeded
-        // budget) → Indeterminate: not cached, returned as
-        // not-substitutable for THIS call only.
+        // budget) → indeterminate: not cached; scheduler optimistically
+        // tries the substitute fetch.
+        indeterminate.extend(pending.into_iter().map(|(p, _)| p));
 
         metrics::histogram!("rio_store_check_available_duration_seconds")
             .record(started.elapsed().as_secs_f64());
-        Ok(hits)
+        Ok(CheckAvailableResult {
+            hits,
+            indeterminate,
+        })
     }
+}
+
+/// Result of [`Substituter::check_available`].
+#[derive(Debug, Default)]
+pub struct CheckAvailableResult {
+    /// Paths confirmed available (HEAD 2xx) on at least one upstream.
+    pub hits: Vec<String>,
+    /// Paths the probe could NOT classify (every upstream 429/5xx/timed
+    /// out, or the per-call deadline cut the pass short). NOT cached;
+    /// the scheduler MUST treat these optimistically — try the substitute
+    /// fetch (its failure path falls through to build) instead of
+    /// immediately dispatching a builder. A confirmed `Miss` is in
+    /// neither set.
+    pub indeterminate: Vec<String>,
 }
 
 /// HTTP statuses an upstream binary cache uses to signal "key not
@@ -2339,7 +2377,8 @@ mod tests {
             .check_available(tid, std::slice::from_ref(&path), far_deadline())
             .await
             .unwrap();
-        assert!(hits.is_empty());
+        assert!(hits.hits.is_empty());
+        assert!(hits.indeterminate.is_empty(), "403 is a definitive miss");
 
         let rec2 = CountingRecorder::default();
         let _g2 = metrics::set_default_local_recorder(&rec2);
@@ -2347,7 +2386,7 @@ mod tests {
             .check_available(tid, std::slice::from_ref(&path), far_deadline())
             .await
             .unwrap();
-        assert!(hits2.is_empty());
+        assert!(hits2.hits.is_empty());
         assert_eq!(
             rec2.get("rio_store_substitute_probe_cache_hits_total{}"),
             1,
@@ -2482,7 +2521,11 @@ mod tests {
             .check_available(tid, &missing, far_deadline())
             .await
             .unwrap();
-        assert_eq!(available, vec![path], "only the seeded path is available");
+        assert_eq!(
+            available.hits,
+            vec![path],
+            "only the seeded path is available"
+        );
     }
 
     // r[verify store.substitute.probe-bounded+4]
@@ -2517,7 +2560,7 @@ mod tests {
         .expect("5000 local-200 HEADs at 128 conc should complete in ~1s")
         .unwrap();
         assert_eq!(
-            available.len(),
+            available.hits.len(),
             N,
             "every path must be probed and hit (no truncation)"
         );
@@ -2571,7 +2614,7 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert_eq!(
-            available.len(),
+            available.hits.len(),
             50,
             "rate-limited paths must be retried to Hit, not lost"
         );
@@ -2632,7 +2675,7 @@ mod tests {
             .check_available(tid, &paths, far_deadline())
             .await
             .unwrap();
-        assert_eq!(available.len(), 200, "all eventually hit after retry");
+        assert_eq!(available.hits.len(), 200, "all eventually hit after retry");
 
         let pass1_max = fake.max_concurrent_after.load(Ordering::SeqCst);
         assert!(
@@ -2675,8 +2718,13 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert!(
-            available.is_empty(),
+            available.hits.is_empty(),
             "Retry-After > budget → no retry → 0 hits"
+        );
+        assert_eq!(
+            available.indeterminate.len(),
+            paths.len(),
+            "rate-limited paths past budget must be reported indeterminate"
         );
         assert!(
             elapsed < Duration::from_secs(5),
@@ -2755,13 +2803,21 @@ mod tests {
         // assertion — "some survived AND some deferred" — not exact
         // wave boundaries (builder CPU variance).
         assert!(
-            !available.is_empty(),
+            !available.hits.is_empty(),
             "completed-before-deadline hits must survive truncation; got 0"
         );
         assert!(
-            available.len() < paths.len(),
+            available.hits.len() < paths.len(),
             "deadline must truncate the pass; got all {} hits",
-            available.len()
+            available.hits.len()
+        );
+        // r[verify sched.merge.substitute-probe-indeterminate]
+        // Un-yielded paths are reported indeterminate (not silently
+        // dropped). hits ∪ indeterminate covers the full input.
+        assert_eq!(
+            available.hits.len() + available.indeterminate.len(),
+            paths.len(),
+            "every path must be in hits or indeterminate"
         );
         // Returned near deadline, not after wave-2 (~800ms+). Loose
         // upper bound; the structural asserts above are primary.
@@ -2771,17 +2827,13 @@ mod tests {
         );
         // Survived hits ARE cached.
         assert_eq!(
-            sub.probe_cache.get(&(tid, available[0].clone())).await,
+            sub.probe_cache.get(&(tid, available.hits[0].clone())).await,
             Some(true),
             "completed hits must be cached as Hit"
         );
         // Deferred paths (Indeterminate) are NOT cached; next call
         // re-probes.
-        let deferred: Vec<_> = paths
-            .iter()
-            .filter(|p| !available.contains(p))
-            .cloned()
-            .collect();
+        let deferred = &available.indeterminate;
         assert!(!deferred.is_empty());
         assert!(
             sub.probe_cache
@@ -2828,7 +2880,11 @@ mod tests {
             .unwrap();
         let elapsed = t0.elapsed();
 
-        assert_eq!(available.len(), 5, "HTTP-date Retry-After → retried to Hit");
+        assert_eq!(
+            available.hits.len(),
+            5,
+            "HTTP-date Retry-After → retried to Hit"
+        );
         // Smoke only: ≥1s does NOT distinguish a parsed HTTP-date
         // (~2-3s) from the None-default 1s floor — both satisfy the
         // gate. The HTTP-date parse branch is proven directly by
@@ -2992,7 +3048,7 @@ mod tests {
             .check_available(tid, &batch, far_deadline())
             .await
             .unwrap();
-        assert_eq!(first, vec![path.clone()]);
+        assert_eq!(first.hits, vec![path.clone()]);
 
         // Kill the upstream. Second call must answer from cache —
         // including the negative result for `absent`.
@@ -3003,7 +3059,15 @@ mod tests {
             .check_available(tid, &batch, far_deadline())
             .await
             .unwrap();
-        assert_eq!(second, vec![path], "cached positive + negative results");
+        assert_eq!(
+            second.hits,
+            vec![path],
+            "cached positive + negative results"
+        );
+        assert!(
+            second.indeterminate.is_empty(),
+            "cached negative is a confirmed miss, not indeterminate"
+        );
     }
 
     /// `probe_cache` is keyed by `(tenant_id, path)`: tenant B's miss
@@ -3049,7 +3113,7 @@ mod tests {
             .check_available(tid_b, batch, far_deadline())
             .await
             .unwrap();
-        assert!(b.is_empty(), "B's upstream is dead → miss");
+        assert!(b.hits.is_empty(), "B's upstream is dead → no hit");
 
         // A probes second → MUST hit A's upstream, not return B's
         // cached miss. With a path-only key this would be `[]`.
@@ -3057,14 +3121,14 @@ mod tests {
             .check_available(tid_a, batch, far_deadline())
             .await
             .unwrap();
-        assert_eq!(a, vec![path.clone()], "A's upstream serves the path");
+        assert_eq!(a.hits, vec![path.clone()], "A's upstream serves the path");
 
         // Reverse leakage: A's hit must not leak to B.
         let b2 = sub
             .check_available(tid_b, batch, far_deadline())
             .await
             .unwrap();
-        assert!(b2.is_empty(), "B still misses (cached per-tenant)");
+        assert!(b2.hits.is_empty(), "B still has no hit (per-tenant)");
     }
 
     #[test]
@@ -3835,7 +3899,13 @@ mod tests {
             .check_available(tid, batch, far_deadline())
             .await
             .unwrap();
-        assert!(first.is_empty(), "503 → no hit");
+        assert!(first.hits.is_empty(), "503 → no hit");
+        // r[verify sched.merge.substitute-probe-indeterminate]
+        assert_eq!(
+            first.indeterminate,
+            vec![path.clone()],
+            "503 → indeterminate, not silent confirmed-miss"
+        );
         assert!(
             sub.probe_cache.get(&(tid, path.clone())).await.is_none(),
             "503 must NOT be cached as Some(false)"

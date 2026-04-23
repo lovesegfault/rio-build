@@ -613,6 +613,44 @@ async fn test_substitutable_probe_matrix(
     Ok(())
 }
 
+/// `FindMissingPaths.indeterminate_paths` (probe got 429/5xx/deadline)
+/// is treated optimistically: drv enters Substituting and the closure
+/// walk runs. If the path IS actually upstream (probe was a transient
+/// 429), the fetch succeeds → Cached. Without this, indeterminate was
+/// treated as confirmed-miss and dispatched as a build.
+// r[verify sched.merge.substitute-probe-indeterminate]
+#[tokio::test]
+async fn test_indeterminate_probe_tries_substitute_not_build() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("indet-out");
+    // Probe says indeterminate (NOT in `substitutable`); but the
+    // closure-walk fetch DOES find it (in `substitutable` for the
+    // SubstitutePath RPC). Mirrors the live case: HEAD 429'd but the
+    // GET succeeds.
+    store.state.indeterminate.write().unwrap().push(out.clone());
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let mut node = make_node("indet-drv");
+    node.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    settle_substituting(&handle, &["indet-drv"]).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "indeterminate → optimistic fetch → Cached, not build dispatch"
+    );
+    let qpi = store.calls.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&out),
+        "closure walk must run for indeterminate paths; qpi_calls={qpi:?}"
+    );
+    Ok(())
+}
+
 /// Transient `Unavailable` from QPI is absorbed by the retry loop:
 /// 2 transient failures → 3rd attempt succeeds → SubstituteComplete
 /// `{ok=true}` → build Succeeded. Guards `SUBSTITUTE_FETCH_BACKOFF`

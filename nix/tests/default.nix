@@ -342,6 +342,14 @@ in
   #   substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo
   #   → store's try_substitute_on_miss fires → path substitutable via
   #   the real ssh-ng protocol path (not grpcurl backdoor).
+  # r[verify gw.activity.subst-progress]
+  # r[verify sched.merge.substitute-probe-indeterminate]
+  #   substitute-progress-e2e: 4-path closure submitted via ssh-ng;
+  #   captured internal-json wire stream asserts every actCopyPath
+  #   start has a matching stop, every resProgress has done≤expected,
+  #   and per-aid done is monotone non-decreasing. The store-side
+  #   indeterminate→hits unit tests cover the probe; this proves the
+  #   full scheduler→gateway→client wire path.
   vm-substitute-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
@@ -357,6 +365,13 @@ in
       inherit pkgs common;
       fixture = standalone {
         workers = { };
+        # Service-HMAC so scheduler's `walk_substitute_closure` →
+        # `SubstituteAuth::Service` mints `x-rio-service-token` +
+        # `x-rio-probe-tenant-id`; without it `SubstituteAuth::Jwt([])`
+        # → store's `request_tenant_id` returns None →
+        # `substitute_path_impl` NotFound. Only the
+        # substitute-progress-e2e subtest exercises this path.
+        withHmac = true;
         extraStoreConfig = {
           signingKeyFile = "${rioSigningKey}";
           extraConfig = ''

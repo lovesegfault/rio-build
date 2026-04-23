@@ -1744,6 +1744,7 @@ impl DagActor {
         // is NOT blocked on the NAR download).
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
         let present: HashSet<String> = check_paths
             .into_iter()
             .filter(|p| !missing.contains(p))
@@ -1752,6 +1753,13 @@ impl DagActor {
         // A derivation is cached if it has at least one non-empty
         // expected output path AND all of them are LOCALLY present.
         // Skip nodes the floating-CA lane already resolved.
+        // r[impl sched.merge.substitute-probe-indeterminate]
+        // Indeterminate (probe got 429/5xx/deadline-cut) is treated the
+        // SAME as substitutable here: optimistically try the detached
+        // fetch. The closure walk's failure path
+        // (`SubstituteComplete{ok=false}`) sets `substitute_tried` and
+        // falls through to build — so a true miss costs one extra fetch
+        // attempt, not a wrong build dispatch.
         let mut pending_substitute: Vec<(DrvHash, Vec<String>)> = Vec::new();
         for h in probe_set {
             if hits.contains_key(h) {
@@ -1768,11 +1776,12 @@ impl DagActor {
                 .all(|p| p.is_empty() || present.contains(p))
             {
                 hits.insert(h.clone(), n.expected_output_paths.clone());
-            } else if n
-                .expected_output_paths
-                .iter()
-                .all(|p| p.is_empty() || present.contains(p) || substitutable.contains(p))
-            {
+            } else if n.expected_output_paths.iter().all(|p| {
+                p.is_empty()
+                    || present.contains(p)
+                    || substitutable.contains(p)
+                    || indeterminate.contains(p)
+            }) {
                 pending_substitute.push((h.clone(), n.expected_output_paths.clone()));
             }
         }

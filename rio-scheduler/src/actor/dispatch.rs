@@ -639,6 +639,7 @@ impl DagActor {
         // when the closure walk pulled ghc-sized NARs.
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
         // I-139: collect-then-batch. The locally-present branch awaited
         // `complete_ready_from_store` per item (≥3 sequential PG RTTs
         // each); on warm-restart of a large closure ~all 2048 candidates
@@ -660,10 +661,14 @@ impl DagActor {
                     locally_present.push(drv_hash);
                 }
             } else if !substitute_tried
-                && paths
-                    .iter()
-                    .all(|p| !missing.contains(p) || substitutable.contains(p))
+                && paths.iter().all(|p| {
+                    !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+                })
             {
+                // r[impl sched.merge.substitute-probe-indeterminate]
+                // Indeterminate treated optimistically — same as
+                // merge.rs. The closure walk's failure path falls
+                // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
             }
         }
@@ -1155,8 +1160,15 @@ impl DagActor {
                 }
                 // r[impl sched.substitute.detached+2] — spawn instead of
                 // awaiting eager_substitute_fetch in the actor loop.
+                // r[impl sched.merge.substitute-probe-indeterminate]
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-                if !substitute_tried && resp.missing_paths.iter().all(|p| sub.contains(p)) {
+                let ind: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
+                if !substitute_tried
+                    && resp
+                        .missing_paths
+                        .iter()
+                        .all(|p| sub.contains(p) || ind.contains(p))
+                {
                     self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
                         .await;
                     return true;

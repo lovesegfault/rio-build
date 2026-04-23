@@ -56,6 +56,39 @@ let
     ]
   );
 
+  # 4-path closure for the substitute-progress-e2e subtest. Chain:
+  # root → mid → {leaf-a, leaf-b}. Building `root` locally on client
+  # produces 4 input-addressed store paths (busybox is static, closure
+  # of 1); copying that closure to /srv/cache and submitting the SAME
+  # expr via ssh-ng makes the scheduler see all 4 outputs as
+  # substitutable → walk_substitute_closure walks the references →
+  # actCopyPath + resProgress events on the wire.
+  #
+  # Function `{ busybox }:` so Nix tracks busybox as a build input
+  # (a literal string path has no context → "No such file" in sandbox).
+  # Same `--arg busybox '(builtins.storePath ${common.busybox})'`
+  # pattern as substitute-scale.nix.
+  progressClosure = pkgs.writeText "progress-closure.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      mk = name: deps: derivation {
+        inherit name;
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [
+          "-c"
+          "''${bb} mkdir -p $out && ''${bb} echo ''${name}-v1 ''${toString deps} > $out/x"
+        ];
+      };
+      leafA = mk "rio-progress-leaf-a" [ ];
+      leafB = mk "rio-progress-leaf-b" [ ];
+      mid = mk "rio-progress-mid" [ leafA leafB ];
+    in mk "rio-progress-root" [ mid ]
+  '';
+  bbArg = "--arg busybox '(builtins.storePath ${common.busybox})'";
+
   # Sign a JWT with the jwt-keys.nix test seed. Output on stdout so
   # testScript captures into a Python var. PyJWT's EdDSA wants a PEM
   # private key (not raw 32-byte seed), so we wrap via cryptography.
@@ -74,9 +107,9 @@ pkgs.testers.runNixOSTest {
   name = "rio-substitute";
   skipTypeCheck = true;
 
-  # ~60s boot + cache setup ~10s + three grpcurl round-trips. No builds
-  # through the scheduler, no k3s.
-  globalTimeout = 420 + common.covTimeoutHeadroom;
+  # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
+  # for substitute-progress-e2e (~40s). No worker builds, no k3s.
+  globalTimeout = 480 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -175,10 +208,13 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # covShellEnv sets LLVM_PROFILE_FILE in coverage mode so rio-cli's
     # profraws land where collectCoverage picks them up.
+    # RIO_SERVICE_HMAC_KEY_PATH: withHmac=true makes StoreAdminService
+    # require x-rio-service-token; rio-cli mints it from this key.
     def cli(args):
         return ${gatewayHost}.succeed(
             "${common.covShellEnv}"
             "RIO_STORE_ADDR=localhost:9002 "
+            "RIO_SERVICE_HMAC_KEY_PATH=${fixture.hmacKeys}/service-hmac.key "
             f"${rioCli} {args} 2>&1"
         )
 
@@ -562,6 +598,104 @@ pkgs.testers.runNixOSTest {
         assert after == "1", (
             f"expected narinfo row after ssh-ng substitute, got {after} — "
             f"did try_substitute_on_miss actually fire?"
+        )
+
+    with subtest(
+        "substitute-progress-e2e: actCopyPath stop-parity, resProgress done≤expected monotone"
+    ):
+        import json
+
+        # Build the 4-path chain locally on client → root + mid +
+        # 2 leaves (+ busybox already present). Input-addressed: same
+        # busybox path → same drvs → same output paths the gateway will
+        # compute on submit.
+        # --impure: builtins.currentSystem + builtins.storePath are
+        # impure under flakes-mode eval. Same --arg busybox pattern as
+        # substitute-scale.nix (literal string path has no context →
+        # "No such file" in sandbox).
+        root_path = client.succeed(
+            "nix build --impure --print-out-paths "
+            "${bbArg} -f ${progressClosure}"
+        ).strip()
+        client.succeed(f"nix store sign --key-file /tmp/sub/sec --recursive {root_path}")
+        client.succeed(
+            "nix copy --no-check-sigs "
+            f"--to 'file:///srv/cache?compression=none' {root_path}"
+        )
+        # Precondition: rio-store is cold for the root (no narinfo row).
+        before = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{root_path}'",
+        )
+        assert before == "0", (
+            f"precondition FAIL: {root_path} already in rio-store; "
+            f"progress events would be skipped (cache-hit lane)"
+        )
+
+        # Submit via ssh-ng with internal-json on stderr → cap.json. The
+        # tee preserves the capture even if nom/nix exits oddly. The
+        # build SUCCEEDS without any worker — all 4 drvs' outputs are
+        # in upstream → walk_substitute_closure → Cached.
+        client.succeed(
+            "nix build --impure --no-link "
+            "${bbArg} -f ${progressClosure} "
+            "  --store 'ssh-ng://${gatewayHost}' --eval-store auto "
+            "  --log-format internal-json -v "
+            "  2> >(tee /tmp/cap.json >&2)"
+        )
+        cap = client.succeed("cat /tmp/cap.json")
+        events = []
+        for line in cap.splitlines():
+            line = line.strip()
+            # nix internal-json prefixes each line with "@nix "
+            if line.startswith("@nix "):
+                line = line[5:]
+            if line.startswith("{"):
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        assert len(events) > 0, f"no JSON events captured; cap.json:\n{cap[:2000]}"
+
+        # actCopyPath = type 100. resProgress = result type 105.
+        copy_starts = {
+            e["id"] for e in events if e.get("action") == "start" and e.get("type") == 100
+        }
+        all_stops = {e["id"] for e in events if e.get("action") == "stop"}
+        leaked = copy_starts - all_stops
+        assert not leaked, (
+            f"actCopyPath stop-parity: {len(leaked)} start(s) without stop: {leaked}\n"
+            f"starts={copy_starts} stops={all_stops}"
+        )
+        assert len(copy_starts) >= 1, (
+            "expected ≥1 actCopyPath start (one per Substituting drv); "
+            "got 0 — did walk_substitute_closure run? events:\n"
+            + "\n".join(str(e) for e in events[:50])
+        )
+
+        # resProgress invariants per-aid: done≤expected, done monotone.
+        last_done: dict[int, int] = {}
+        n_progress = 0
+        for e in events:
+            if e.get("action") != "result" or e.get("type") != 105:
+                continue
+            n_progress += 1
+            aid, fields = e["id"], e["fields"]
+            done, expected = fields[0], fields[1]
+            assert done <= expected, (
+                f"resProgress >100%: aid={aid} done={done} expected={expected}\n"
+                f"full event: {e}"
+            )
+            prev = last_done.get(aid, -1)
+            assert done >= prev, (
+                f"resProgress went backward: aid={aid} {prev} → {done}\n"
+                f"full event: {e}"
+            )
+            last_done[aid] = done
+        print(
+            f"substitute-progress-e2e PASS: "
+            f"{len(copy_starts)} actCopyPath start/stop matched, "
+            f"{n_progress} resProgress events all done≤expected and monotone"
         )
 
     client.execute("systemctl stop test-cache 2>/dev/null || true")

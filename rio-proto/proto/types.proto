@@ -228,6 +228,13 @@ message FindMissingPathsResponse {
   // willSubstitute set. Additive: pre-P0461 clients ignore this field.
   // r[store.substitute.upstream] — wire surface
   repeated string substitutable_paths = 2;
+  // Subset of missing_paths the store COULD NOT probe (upstream 429,
+  // 5xx, or deadline) — neither confirmed-hit nor confirmed-miss. The
+  // scheduler MUST treat these optimistically (try the substitute fetch;
+  // its failure path falls through to build), NOT immediately dispatch a
+  // builder. Disjoint from substitutable_paths; both are subsets of
+  // missing_paths.
+  repeated string indeterminate_paths = 3;
 }
 
 // Explicit single-path upstream-substitute with byte progress streamed

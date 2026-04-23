@@ -302,7 +302,12 @@ impl StoreServiceImpl {
         // Fails-open on probe errors (a down upstream shouldn't hide
         // paths the scheduler can otherwise substitute). Empty if no
         // substituter / no tenant / no upstreams — the normal case.
-        let substitutable = match (&self.substituter, tenant_id) {
+        // r[impl sched.merge.substitute-probe-indeterminate]
+        // `indeterminate` = paths the probe couldn't classify (429,
+        // 5xx, deadline). Scheduler treats them optimistically; without
+        // this field they were silently treated as confirmed-miss and
+        // dispatched as builds even when in cache.nixos.org.
+        let (substitutable, indeterminate) = match (&self.substituter, tenant_id) {
             (Some(sub), Some(tid)) if !missing.is_empty() => sub
                 .check_available(
                     tid,
@@ -310,17 +315,19 @@ impl StoreServiceImpl {
                     entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
                 )
                 .await
+                .map(|r| (r.hits, r.indeterminate))
                 .unwrap_or_else(|e| {
-                    warn!(error = %e, "check_available failed; empty substitutable_paths");
-                    Vec::new()
+                    warn!(error = %e, "check_available failed; reporting all missing as indeterminate");
+                    (Vec::new(), missing.clone())
                 }),
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         };
 
         debug!(
             n_requested = req.store_paths.len(),
             n_missing = missing.len(),
             n_substitutable = substitutable.len(),
+            n_indeterminate = indeterminate.len(),
             tenant_id = ?tenant_id,
             substituter = self.substituter.is_some(),
             "FindMissingPaths"
@@ -329,6 +336,7 @@ impl StoreServiceImpl {
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
             substitutable_paths: substitutable,
+            indeterminate_paths: indeterminate,
         }))
     }
 

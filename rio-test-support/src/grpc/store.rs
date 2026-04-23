@@ -42,6 +42,15 @@ pub struct MockStoreState {
     /// set (not in `self.paths`) land in `substitutable_paths` — a
     /// present path is never substitutable.
     pub substitutable: Arc<RwLock<Vec<String>>>,
+    /// Paths that `find_missing_paths` reports as indeterminate
+    /// (probe got 429/5xx/deadline). Tests assert the scheduler
+    /// optimistically tries the substitute fetch instead of immediate
+    /// build dispatch. Same `⊆ missing` filter as `substitutable`;
+    /// takes precedence — a path in BOTH is reported indeterminate-
+    /// only by `find_missing_paths`, while `substitute_path` still
+    /// succeeds (mirrors "HEAD 429'd but GET works").
+    /// `r[sched.merge.substitute-probe-indeterminate]`
+    pub indeterminate: Arc<RwLock<Vec<String>>>,
     /// Per-path `SubstitutePath` shape: `(nar_size, progress_ticks)`.
     /// When present, `substitute_path` streams each `(done, expected)`
     /// as a `Progress` message before the terminal `Info`, and uses
@@ -803,14 +812,21 @@ impl StoreService for MockStore {
         // path not in this request's missing set stays out (the real
         // store only checks upstream for paths it doesn't have).
         let subs = self.state.substitutable.read().unwrap();
+        let ind = self.state.indeterminate.read().unwrap();
         let substitutable: Vec<String> = missing
             .iter()
-            .filter(|p| subs.contains(p))
+            .filter(|p| subs.contains(p) && !ind.contains(p))
+            .cloned()
+            .collect();
+        let indeterminate: Vec<String> = missing
+            .iter()
+            .filter(|p| ind.contains(p))
             .cloned()
             .collect();
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
             substitutable_paths: substitutable,
+            indeterminate_paths: indeterminate,
         }))
     }
 
