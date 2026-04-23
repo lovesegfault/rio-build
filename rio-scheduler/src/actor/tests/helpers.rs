@@ -569,6 +569,25 @@ pub(crate) async fn merge_dag(
     Ok(reply_rx.await??.state)
 }
 
+/// Subscribe to a build's LOG broadcast ring (display-only events:
+/// `Event::Log`, `Event::SubstituteProgress`). Tests asserting on
+/// state-transition events use [`merge_dag`]'s return (state ring).
+pub(crate) async fn subscribe_log(
+    handle: &ActorHandle,
+    build_id: Uuid,
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            since_sequence: 0,
+            reply: tx,
+        })
+        .await?;
+    Ok(rx.await??.0.log)
+}
+
 /// Query build status. Propagates BuildNotFound as an error.
 pub(crate) async fn query_status(
     handle: &ActorHandle,

@@ -250,6 +250,10 @@ CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv
 r[store.substitute.upstream]
 rio-store MAY be configured with per-tenant upstream binary caches (`tenant_upstreams` table). On `QueryPathInfo`/`GetPath` miss, the store queries each upstream in priority order (`ORDER BY priority ASC`), fetches the narinfo, verifies at least one `Sig:` line against the tenant's `trusted_keys`, and if valid ingests the NAR via the same chunked-CAS path as `PutPath`. Substitution is synchronous (block-and-fetch): the originating RPC waits for ingest to complete.
 
+r[store.substitute.progress-stream]
+
+`SubstitutePath` is the server-streaming variant of `QueryPathInfo`'s on-miss substitute fallback: same semantics on success/miss/error, but emits `SubstitutePathProgress{bytes_done, bytes_expected, upstream_uri}` per ~1 MiB of decompressed NAR during the download (plus a final tick at completion) before the terminal `PathInfo`. The scheduler's `walk_substitute_closure` calls this instead of unary `QueryPathInfo` and aggregates per-path progress into per-derivation `Event::SubstituteProgress` (display-only, routed via the log broadcast ring, not persisted) → gateway `actCopyPath` + `resProgress` (`r[gw.activity.subst-progress]`). Unlike `QueryPathInfo`, `SubstitutePath` skips the local-PG check (a local hit means the closure walk's batch fast-path already returned it) and bypasses moka singleflight on miss (`claim_placeholder` still serializes the actual write; the loser sees `Concurrent` before downloading).
+
 r[store.substitute.sig-mode]
 Per-upstream `sig_mode` controls post-substitution signature storage: `keep` stores the upstream's `Sig:` lines unchanged; `add` stores upstream sigs plus a fresh signature from the tenant's active key (or cluster key); `replace` discards upstream sigs and stores only the rio-generated signature.
 

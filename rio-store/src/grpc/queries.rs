@@ -11,9 +11,11 @@ use rio_proto::types::{
     BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, FindMissingPathsRequest,
     FindMissingPathsResponse, ManifestEntry, ManifestHint, PathInfo, PathInfoEntry,
     QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
-    TenantQuotaResponse,
+    RegisterRealisationRequest, RegisterRealisationResponse, SubstitutePathProgress,
+    SubstitutePathRequest, SubstitutePathResponse, TenantQuotaRequest, TenantQuotaResponse,
+    substitute_path_response,
 };
+use tokio_stream::wrappers::ReceiverStream;
 
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
@@ -21,7 +23,9 @@ use rio_common::tenant::NormalizedName;
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 
-use super::{StoreServiceImpl, metadata_status, validate_store_path};
+use super::{StoreServiceImpl, metadata_status, substitute_status, validate_store_path};
+
+pub(super) type SubstitutePathStream = ReceiverStream<Result<SubstitutePathResponse, Status>>;
 
 impl StoreServiceImpl {
     /// DoS bound + per-path format check shared by the batch read RPCs.
@@ -94,6 +98,79 @@ impl StoreServiceImpl {
         };
 
         Ok(Response::new(info.into()))
+    }
+
+    // r[impl store.substitute.progress-stream]
+    /// Single-path upstream substitute with byte progress streamed back.
+    /// Semantically [`query_path_info_impl`](Self::query_path_info_impl)'s
+    /// on-miss fallback, surfaced as its own server-streaming RPC so the
+    /// scheduler's `walk_substitute_closure` can relay
+    /// `bytes_done/expected` to the gateway → `actCopyPath` +
+    /// `resProgress` in nom.
+    ///
+    /// Unlike `QueryPathInfo`, this does NOT first check local PG: a
+    /// local hit means the closure walk's BatchQueryPathInfo fast-path
+    /// already returned it; the only callers reaching here are the
+    /// "absent" subset. Goes straight to the substituter.
+    pub(super) async fn substitute_path_impl(
+        &self,
+        request: Request<SubstitutePathRequest>,
+    ) -> Result<Response<SubstitutePathStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let tenant_id = self.request_tenant_id(&request);
+        let req = request.into_inner();
+        validate_store_path(&req.store_path)?;
+
+        let (Some(sub), Some(tid)) = (self.substituter.clone(), tenant_id) else {
+            // No substituter or no tenant context — definitive miss,
+            // same as QueryPathInfo's `try_substitute_on_miss` returning
+            // None. Unary path returns NotFound; here the stream is the
+            // contract, so return an empty stream that immediately
+            // errors.
+            return Err(Status::not_found(format!(
+                "path not found (substitution disabled): {}",
+                req.store_path
+            )));
+        };
+
+        // Buffer 8: progress emits ~per-MiB; the scheduler reads
+        // promptly. A backed-up channel just drops emits at the
+        // `try_send` (display-only — terminal Info still blocks-sends).
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let progress_tx = tx.clone();
+        let store_path = req.store_path;
+        rio_common::task::spawn_monitored("substitute-path-stream", async move {
+            let cb = move |done: u64, expected: u64, upstream: &str| {
+                let _ = progress_tx.try_send(Ok(SubstitutePathResponse {
+                    msg: Some(substitute_path_response::Msg::Progress(
+                        SubstitutePathProgress {
+                            bytes_done: done,
+                            bytes_expected: expected,
+                            upstream_uri: upstream.to_string(),
+                        },
+                    )),
+                }));
+            };
+            let terminal = match sub
+                .try_substitute_with_progress(tid, &store_path, &cb)
+                .await
+            {
+                Ok(Some(info)) => Ok(SubstitutePathResponse {
+                    msg: Some(substitute_path_response::Msg::Info(info.into())),
+                }),
+                Ok(None) => Err(Status::not_found(format!("path not found: {store_path}"))),
+                Err(e) => {
+                    warn!(error = %e, store_path, "SubstitutePath failed");
+                    Err(substitute_status(e))
+                }
+            };
+            // Terminal MUST be delivered (it carries PathInfo or the
+            // error the scheduler maps to ok=false). `send` blocks if
+            // the buffer is full; closed receiver = client gave up,
+            // ignore.
+            let _ = tx.send(terminal).await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Batch query metadata for many paths in one PG round-trip.

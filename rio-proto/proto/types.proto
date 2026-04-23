@@ -230,6 +230,30 @@ message FindMissingPathsResponse {
   repeated string substitutable_paths = 2;
 }
 
+// Explicit single-path upstream-substitute with byte progress streamed
+// back. Semantically identical to QueryPathInfo's try_substitute_on_miss
+// fallback, but server-streaming so the caller (scheduler's
+// walk_substitute_closure) sees bytes_done/bytes_expected during the NAR
+// download instead of just blocking until ingest completes. Tenant
+// context comes from the same `x-rio-tenant-jwt` / `x-rio-service-token`
+// metadata as QueryPathInfo. r[store.substitute.progress-stream]
+message SubstitutePathRequest {
+  string store_path = 1;
+}
+
+message SubstitutePathResponse {
+  oneof msg {
+    SubstitutePathProgress progress = 1;  // Periodic during fetch_nar (per ~1 MiB decompressed)
+    PathInfo info = 2;                    // Terminal: ingest succeeded; same payload as QueryPathInfo
+  }
+}
+
+message SubstitutePathProgress {
+  uint64 bytes_done = 1;                  // Decompressed bytes read so far for this path
+  uint64 bytes_expected = 2;              // narinfo NarSize (declared, hash-verified at end)
+  string upstream_uri = 3;                // Base URL of the upstream we're fetching from
+}
+
 // Resolve a store path from its nixbase32 hash part (32 chars).
 // NOT_FOUND if no path with that hash-part exists.
 message QueryPathFromHashPartRequest {

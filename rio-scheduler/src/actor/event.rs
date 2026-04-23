@@ -162,14 +162,16 @@ impl BuildEventBus {
     pub(super) fn emit(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
         use rio_proto::types::build_event::Event;
 
-        // Log isn't persisted (see below) — assigning it a fresh seq
-        // would diverge the in-memory counter from PG `MAX(sequence)`,
-        // breaking the `since_sequence < last_seq` replay guard after
-        // failover (gateway saw seq=100 via broadcast, recovery seeds
-        // last_seq=41 from PG → no replay → events 42..100 lost). Reuse
-        // the last persisted seq for Log; the gateway tracker
-        // (build.rs) overwrites, so monotonicity is preserved.
-        let seq = if matches!(event, Event::Log(_)) {
+        // Log + SubstituteProgress aren't persisted (see below) —
+        // assigning a fresh seq would diverge the in-memory counter
+        // from PG `MAX(sequence)`, breaking the `since_sequence <
+        // last_seq` replay guard after failover (gateway saw seq=100
+        // via broadcast, recovery seeds last_seq=41 from PG → no
+        // replay → events 42..100 lost). Reuse the last persisted seq
+        // for these; the gateway tracker (build.rs) overwrites, so
+        // monotonicity is preserved.
+        let display_only = matches!(event, Event::Log(_) | Event::SubstituteProgress(_));
+        let seq = if display_only {
             self.sequences.get(&build_id).copied().unwrap_or(0)
         } else {
             let s = self.sequences.entry(build_id).or_insert(0);
@@ -197,7 +199,7 @@ impl BuildEventBus {
         // state-machine events (Started/Completed/Derivation*), not
         // log lines — those it re-fetches from S3.
         if let Some(tx) = &self.persist_tx
-            && !matches!(build_event.event, Some(Event::Log(_)))
+            && !display_only
         {
             use prost::Message;
             let bytes = build_event.encode_to_vec();
@@ -214,12 +216,14 @@ impl BuildEventBus {
         }
 
         // r[impl gw.activity.stop-parity]
-        // Log → its own ring; everything else → the state ring. The
-        // bridge merges both. This is the load-bearing split: a chatty
-        // build's log volume can lag the *log* ring (acceptable — S3
-        // is authoritative) but never the *state* ring, so
-        // `DerivationEvent::Completed` is not evictable by log lines.
-        let tx = if matches!(build_event.event, Some(Event::Log(_))) {
+        // Display-only events (Log, SubstituteProgress) → log ring;
+        // state-transition events → state ring. The bridge merges
+        // both. This is the load-bearing split: a chatty build's log
+        // volume can lag the *log* ring (acceptable — S3 is
+        // authoritative for logs; the terminal Cached/Completed
+        // covers a dropped progress emit) but never the *state* ring,
+        // so `DerivationEvent::Completed` is not evictable.
+        let tx = if display_only {
             self.log_channels.get(&build_id)
         } else {
             self.channels.get(&build_id)

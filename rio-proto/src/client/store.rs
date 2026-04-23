@@ -295,6 +295,64 @@ pub async fn query_path_info_opt(
     }
 }
 
+/// `SubstitutePath` (server-streaming) with the same `Option`-on-NotFound
+/// shape as [`query_path_info_opt`]. Progress messages are forwarded to
+/// `on_progress(bytes_done, bytes_expected, upstream_uri)` as they arrive;
+/// the call returns when the terminal `PathInfo` (or error/NotFound) lands.
+///
+/// `timeout` bounds **only the initial stream-open** (the unary `await` on
+/// `client.substitute_path(req)`). The body-stream read is unbounded —
+/// progress emits per ~1 MiB so a stalled stream is observable to the
+/// caller, and the underlying h2 keepalive catches a dead connection.
+/// Mirrors `query_path_info_opt`'s contract: a long-but-healthy fetch
+/// must not be artificially cut.
+pub async fn substitute_path_with_progress(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+    timeout: Duration,
+    extra_metadata: &[(&'static str, &str)],
+    mut on_progress: impl FnMut(u64, u64, &str),
+) -> Result<Option<ValidatedPathInfo>, tonic::Status> {
+    use crate::types::substitute_path_response::Msg;
+    let mut req = tonic::Request::new(crate::types::SubstitutePathRequest {
+        store_path: store_path.to_string(),
+    });
+    crate::interceptor::inject_current(req.metadata_mut());
+    inject_metadata(req.metadata_mut(), extra_metadata)?;
+    let mut stream =
+        match with_timeout_status("SubstitutePath", timeout, client.substitute_path(req)).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(status),
+        };
+    loop {
+        match stream.message().await {
+            Ok(Some(msg)) => match msg.msg {
+                Some(Msg::Progress(p)) => {
+                    on_progress(p.bytes_done, p.bytes_expected, &p.upstream_uri);
+                }
+                Some(Msg::Info(info)) => {
+                    let validated = ValidatedPathInfo::try_from(info).map_err(|e| {
+                        tonic::Status::internal(format!("store returned malformed PathInfo: {e}"))
+                    })?;
+                    return Ok(Some(validated));
+                }
+                None => {}
+            },
+            Ok(None) => {
+                // Stream closed without a terminal Info — store task
+                // exited (panic / shutdown). Treat like a transient
+                // error so the caller's retry loop handles it.
+                return Err(tonic::Status::unavailable(
+                    "SubstitutePath stream closed without terminal",
+                ));
+            }
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(status),
+        }
+    }
+}
+
 /// BatchQueryPathInfo with timeout. I-110: builder closure-BFS uses
 /// this once per layer instead of N × [`query_path_info_opt`].
 ///

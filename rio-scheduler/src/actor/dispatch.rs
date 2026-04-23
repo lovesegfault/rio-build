@@ -819,7 +819,26 @@ impl DagActor {
                 // `auth.mint()` is deferred to inside the walk (per
                 // layer) so time parked here doesn't eat token expiry.
                 let _permit = sem.acquire_owned().await;
-                let ok = walk_substitute_closure(&store, paths, &auth, &shutdown).await;
+                // r[impl gw.activity.subst-progress]
+                // Progress emits post back into the actor mailbox.
+                // `try_send` (via the weak upgrade) — if the actor is
+                // gone or its mailbox full, drop the emit (display-
+                // only; SubstituteComplete below uses `send` so the
+                // state transition is never lost to backpressure).
+                let progress_tx = weak_tx.clone();
+                let progress_hash = h.clone();
+                let on_progress = move |done: u64, expected: u64, upstream: &str| {
+                    if let Some(tx) = progress_tx.upgrade() {
+                        let _ = tx.try_send(super::ActorCommand::SubstituteProgress {
+                            drv_hash: progress_hash.clone(),
+                            bytes_done: done,
+                            bytes_expected: expected,
+                            upstream_uri: upstream.to_string(),
+                        });
+                    }
+                };
+                let ok =
+                    walk_substitute_closure(&store, paths, &auth, &shutdown, on_progress).await;
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx
                         .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
@@ -1028,6 +1047,38 @@ impl DagActor {
         // `emit_assignment_started` so the dashboard sees the demote.
         for build_id in self.get_interested_builds(drv_hash) {
             self.emit_progress(build_id);
+        }
+    }
+
+    // r[impl gw.activity.subst-progress]
+    /// Relay byte-progress from a detached substitute fetch to every
+    /// interested build via [`Event::SubstituteProgress`]. Display-only
+    /// (routed through the log broadcast ring, not persisted, reuses
+    /// last seq); the gateway translates to `actCopyPath` +
+    /// `resProgress`. Non-leader emits are fine — this is read-only
+    /// (no DAG/PG mutation).
+    pub(super) fn handle_substitute_progress(
+        &mut self,
+        drv_hash: &DrvHash,
+        bytes_done: u64,
+        bytes_expected: u64,
+        upstream_uri: String,
+    ) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        let drv_path = state.drv_path().to_string();
+        let interested = state.interested_builds.clone();
+        let event = rio_proto::types::build_event::Event::SubstituteProgress(
+            rio_proto::types::SubstituteProgress {
+                derivation_path: drv_path,
+                bytes_done,
+                bytes_expected,
+                upstream_uri,
+            },
+        );
+        for build_id in interested {
+            self.events.emit(build_id, event.clone());
         }
     }
 
@@ -2345,10 +2396,20 @@ pub(super) async fn walk_substitute_closure(
     seeds: Vec<String>,
     auth: &SubstituteAuth,
     shutdown: &rio_common::signal::Token,
+    mut on_progress: impl FnMut(u64, u64, &str),
 ) -> bool {
     let mut visited: HashSet<String> = seeds.iter().cloned().collect();
     let mut frontier: VecDeque<String> = seeds.into_iter().collect();
     let mut ok = true;
+    // Aggregate across the closure for `r[gw.activity.subst-progress]`.
+    // `done_base` accumulates completed-path nar_sizes; the per-path
+    // callback adds its in-flight `done` on top. `expected` grows as
+    // each path's narinfo is read (first progress emit). `seen_expected`
+    // tracks which paths have already contributed to `expected` so a
+    // retry after a transient error doesn't double-count.
+    let mut done_base: u64 = 0;
+    let mut expected_total: u64 = 0;
+    let mut seen_expected: HashSet<String> = HashSet::new();
     while !frontier.is_empty() {
         if shutdown.is_cancelled() {
             return false;
@@ -2438,15 +2499,31 @@ pub(super) async fn walk_substitute_closure(
                     return false;
                 }
                 let mut c = store.clone();
-                match rio_proto::client::query_path_info_opt(
+                // r[impl gw.activity.subst-progress]
+                // Per-path progress: store streams (done, expected,
+                // upstream) per ~1 MiB. First emit for `p` adds its
+                // `expected` to the closure aggregate; subsequent emits
+                // (and retries) only update the in-flight `done` on top
+                // of `done_base`. `seen_expected` keys on path so a
+                // retry after a transient error doesn't re-add
+                // `expected`.
+                let path_progress = |done: u64, expected: u64, upstream: &str| {
+                    if seen_expected.insert(p.clone()) {
+                        expected_total = expected_total.saturating_add(expected);
+                    }
+                    on_progress(done_base.saturating_add(done), expected_total, upstream);
+                };
+                match rio_proto::client::substitute_path_with_progress(
                     &mut c,
                     &p,
                     super::SUBSTITUTE_FETCH_TIMEOUT,
                     &meta,
+                    path_progress,
                 )
                 .await
                 {
                     Ok(Some(info)) => {
+                        done_base = done_base.saturating_add(info.nar_size);
                         for r in &info.references {
                             if visited.insert(r.to_string()) {
                                 frontier.push_back(r.to_string());

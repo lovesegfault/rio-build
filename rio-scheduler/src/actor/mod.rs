@@ -919,6 +919,19 @@ impl DagActor {
                         self.handle_substitute_complete(&drv_hash, ok).await;
                     }
                 }
+                ActorCommand::SubstituteProgress {
+                    drv_hash,
+                    bytes_done,
+                    bytes_expected,
+                    upstream_uri,
+                } => {
+                    self.handle_substitute_progress(
+                        &drv_hash,
+                        bytes_done,
+                        bytes_expected,
+                        upstream_uri,
+                    );
+                }
                 #[cfg(test)]
                 ActorCommand::Debug(d) => {
                     self.handle_debug(d);

@@ -116,6 +116,22 @@ const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = MAX_NAR_SIZE;
 #[cfg(test)]
 const SUBSTITUTE_NAR_DECOMPRESSED_CAP: u64 = 64 * 1024;
 
+/// Decompressed-byte interval at which `Substituter::fetch_nar` fires
+/// the optional progress callback. 1 MiB = 16 iterations of the 64 KiB
+/// read loop. At post-T1 throughput (~90 MB/s) this is ~90/sec per path
+/// for a hot stream; the scheduler-side aggregate is debounced further
+/// (one `SubstituteProgress` BuildEvent per callback, routed via the
+/// log broadcast ring so a Lagged drop is harmless).
+pub const SUBSTITUTE_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+/// Progress callback signature for `r[store.substitute.progress-stream]`:
+/// `(bytes_done, bytes_expected, upstream_base_uri)`. Called from
+/// `Substituter::fetch_nar`'s read loop every
+/// [`SUBSTITUTE_PROGRESS_INTERVAL_BYTES`]. `bytes_expected` is the
+/// narinfo's `NarSize` (declared, hash-verified at end). The callback
+/// MUST be cheap and non-blocking — it runs on the substitute task.
+pub type SubstProgressFn = dyn Fn(u64, u64, &str) + Send + Sync;
+
 /// Parsed `/nix-cache-info` — only the field the substituter cares
 /// about. `StoreDir`/`Priority` are irrelevant here (priority comes
 /// from `tenant_upstreams`, not the upstream's self-declaration).
@@ -488,7 +504,7 @@ impl Substituter {
                     Some(g) => Some(g.acquire_bounded().await?),
                     None => None,
                 };
-                self.do_substitute(http, upstreams, tenant_id, store_path)
+                self.do_substitute(http, upstreams, tenant_id, store_path, None)
                     .await
                     .map(|v| v.map(Arc::new))
             })
@@ -517,6 +533,57 @@ impl Substituter {
         Ok(cached.map(|arc| (*arc).clone()))
     }
 
+    // r[impl store.substitute.progress-stream]
+    /// [`try_substitute`](Self::try_substitute) with byte-progress
+    /// callback. Same semantics on success/miss/error, but `progress`
+    /// fires every [`SUBSTITUTE_PROGRESS_INTERVAL_BYTES`] of
+    /// decompressed NAR during the download.
+    ///
+    /// **Cache-hit fast path** uses the same moka `inflight` cache
+    /// (a `(tenant, path)` ingested in the last 30s returns immediately
+    /// with no progress emits). **Cache-miss path bypasses moka's
+    /// singleflight** — concurrent identical calls each download. The
+    /// ingest layer's `claim_placeholder` still serializes the actual
+    /// store write (the loser sees `AlreadyComplete`/`Concurrent` and
+    /// stops before downloading), so the wasted work is at most one
+    /// extra narinfo round-trip per upstream. The scheduler's
+    /// `walk_substitute_closure` is the only caller and is serial
+    /// per-drv, so the race window is one path appearing in two drvs'
+    /// closures concurrently.
+    #[instrument(skip(self, progress), fields(tenant = %tenant_id, path = store_path))]
+    pub async fn try_substitute_with_progress(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        progress: &SubstProgressFn,
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        let key = (tenant_id, store_path.to_string());
+        if let Some(cached) = self.inflight.get(&key).await {
+            return Ok(cached.map(|arc| (*arc).clone()));
+        }
+        let Some(http) = &self.http else {
+            return Ok(None);
+        };
+        let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
+        if upstreams.is_empty() {
+            return Ok(None);
+        }
+        let _permit = match &self.admission {
+            Some(g) => Some(g.acquire_bounded().await?),
+            None => None,
+        };
+        let result = self
+            .do_substitute(http, upstreams, tenant_id, store_path, Some(progress))
+            .await;
+        // Populate moka on Ok (hit or definitive miss) so a follow-on
+        // unary `try_substitute` for the same key cache-hits. Err is
+        // not cached (matches `try_get_with` semantics).
+        if let Ok(ref v) = result {
+            self.inflight.insert(key, v.clone().map(Arc::new)).await;
+        }
+        result
+    }
+
     /// One full fetch cycle — the singleflight body. `http` and
     /// `upstreams` are hoisted by the caller (the moka init future)
     /// so the no-upstreams fast-path returns BEFORE the admission
@@ -528,6 +595,7 @@ impl Substituter {
         upstreams: Vec<Upstream>,
         tenant_id: Uuid,
         store_path: &str,
+        progress: Option<&SubstProgressFn>,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         let sp = StorePath::parse(store_path)
             .map_err(|e| SubstituteError::NarInfo(format!("bad store path: {e}")))?;
@@ -550,7 +618,7 @@ impl Substituter {
         let mut any_429: Option<Option<Duration>> = None;
         for upstream in &upstreams {
             match self
-                .try_upstream(http, tenant_id, upstream, store_path, &hash_part)
+                .try_upstream(http, tenant_id, upstream, store_path, &hash_part, progress)
                 .await
             {
                 Ok(UpstreamOutcome::Hit(info)) => {
@@ -652,6 +720,7 @@ impl Substituter {
         upstream: &Upstream,
         store_path: &str,
         hash_part: &str,
+        progress: Option<&SubstProgressFn>,
     ) -> Result<UpstreamOutcome, SubstituteError> {
         // — Step 2: GET narinfo + parse + verify_sig —
         let base = upstream.url.trim_end_matches('/');
@@ -814,7 +883,15 @@ impl Substituter {
             // — Step 4: GET NAR + decompress —
             let nar_url = format!("{base}/{}", ni.url);
             let (nar_bytes, _permits) = self
-                .fetch_nar(http, tenant_id, &nar_url, &ni.compression)
+                .fetch_nar(
+                    http,
+                    tenant_id,
+                    &nar_url,
+                    &ni.compression,
+                    ni.nar_size,
+                    base,
+                    progress,
+                )
                 .await?;
 
             // r[impl store.substitute.untrusted-upstream+3]
@@ -904,12 +981,16 @@ impl Substituter {
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
     /// full buffer but isn't here yet; TODO(P0463) tracks it.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_nar(
         &self,
         http: &reqwest::Client,
         tenant_id: Uuid,
         nar_url: &str,
         compression: &str,
+        expected_nar_size: u64,
+        upstream_base: &str,
+        progress: Option<&SubstProgressFn>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
         let resp = http
             .get(nar_url)
@@ -978,6 +1059,7 @@ impl Substituter {
         let mut out = Vec::new();
         let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut last_progress = 0u64;
         loop {
             let n = capped
                 .read(&mut buf)
@@ -1000,6 +1082,19 @@ impl Substituter {
                     limit: cap,
                 });
             }
+            // r[impl store.substitute.progress-stream]
+            if let Some(cb) = progress {
+                let done = out.len() as u64;
+                if done - last_progress >= SUBSTITUTE_PROGRESS_INTERVAL_BYTES {
+                    cb(done, expected_nar_size, upstream_base);
+                    last_progress = done;
+                }
+            }
+        }
+        // Final tick so a sub-MiB path (or the trailing partial MiB)
+        // still reports done==expected before the terminal PathInfo.
+        if let Some(cb) = progress {
+            cb(out.len() as u64, expected_nar_size, upstream_base);
         }
         Ok((Bytes::from(out), permits))
     }
@@ -1736,6 +1831,75 @@ mod tests {
             .expect("path should be in narinfo table");
         assert_eq!(stored.nar_size, nar.len() as u64);
         assert_eq!(stored.signatures.len(), 1);
+    }
+
+    // r[verify store.substitute.progress-stream]
+    /// `try_substitute_with_progress` fires the callback at least once
+    /// (the final tick) with `(nar.len(), nar.len(), upstream_base)` and
+    /// returns the same `PathInfo` as the unary path. Test NAR is below
+    /// `SUBSTITUTE_PROGRESS_INTERVAL_BYTES` so we get exactly one emit.
+    #[tokio::test]
+    async fn substitute_with_progress_emits_final_tick() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-prog").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.prog").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        // `SubstProgressFn` is `dyn Fn + 'static` (type-alias default
+        // lifetime) — closure must own its captures. Arc the collector.
+        let emits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64, String)>::new()));
+        let cb = {
+            let emits = emits.clone();
+            move |d: u64, e: u64, u: &str| emits.lock().unwrap().push((d, e, u.to_string()))
+        };
+        let got = sub
+            .try_substitute_with_progress(tid, &path, &cb)
+            .await
+            .unwrap()
+            .expect("upstream has it");
+        assert_eq!(got.nar_size, nar.len() as u64);
+
+        let emits = std::sync::Arc::try_unwrap(emits)
+            .map(|m| m.into_inner().unwrap())
+            .unwrap_or_else(|a| a.lock().unwrap().clone());
+        assert!(!emits.is_empty(), "final tick fires even for sub-MiB paths");
+        let (done, expected, uri) = emits.last().unwrap();
+        assert_eq!(*done, nar.len() as u64, "done = full nar_size");
+        assert_eq!(*expected, nar.len() as u64, "expected = narinfo NarSize");
+        assert!(
+            uri.starts_with("http://"),
+            "upstream base captured: {uri:?}"
+        );
+
+        // Cache-hit fast path: second call returns immediately, NO emits.
+        let emits2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cb2 = {
+            let emits2 = emits2.clone();
+            move |_: u64, _: u64, _: &str| {
+                emits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let _ = sub
+            .try_substitute_with_progress(tid, &path, &cb2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            emits2.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "moka cache-hit → no progress emits"
+        );
     }
 
     // r[verify store.substitute.compression]
@@ -3426,7 +3590,7 @@ mod tests {
             .unwrap();
         let hp = StorePath::parse(&path).unwrap().hash_part();
         let err = sub
-            .try_upstream(http, tid, &upstreams[0], &path, &hp)
+            .try_upstream(http, tid, &upstreams[0], &path, &hp, None)
             .await
             .unwrap_err();
         assert!(
@@ -3462,7 +3626,7 @@ mod tests {
             .unwrap();
         let hp = StorePath::parse(&path).unwrap().hash_part();
         let err = sub
-            .try_upstream(http, tid, &upstreams[0], &path, &hp)
+            .try_upstream(http, tid, &upstreams[0], &path, &hp, None)
             .await
             .unwrap_err();
         assert!(
@@ -3522,7 +3686,9 @@ mod tests {
             .await
             .unwrap();
         let hp = StorePath::parse(&path).unwrap().hash_part();
-        let first = sub.try_upstream(http, tid, &upstreams[0], &path, &hp).await;
+        let first = sub
+            .try_upstream(http, tid, &upstreams[0], &path, &hp, None)
+            .await;
         assert!(
             matches!(first, Err(SubstituteError::Fetch(_))),
             "first call must surface 503: {first:?}"

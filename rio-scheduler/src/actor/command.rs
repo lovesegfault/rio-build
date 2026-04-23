@@ -142,6 +142,19 @@ pub enum ActorCommand {
     /// Ready/Queued for normal scheduling. r[sched.substitute.detached+2]
     SubstituteComplete { drv_hash: DrvHash, ok: bool },
 
+    /// Byte-level progress from a detached substitute fetch's closure
+    /// walk. `bytes_done`/`bytes_expected` are AGGREGATE across all
+    /// paths in the closure walked so far (`walk_substitute_closure`
+    /// accumulates). Handler emits `Event::SubstituteProgress` to the
+    /// drv's interested builds via the log broadcast ring (display-only;
+    /// not persisted). r[gw.activity.subst-progress]
+    SubstituteProgress {
+        drv_hash: DrvHash,
+        bytes_done: u64,
+        bytes_expected: u64,
+        upstream_uri: String,
+    },
+
     /// Cancel a build.
     CancelBuild {
         build_id: Uuid,
@@ -627,6 +640,7 @@ impl ActorCommand {
             Self::MergeDag { .. } => "MergeDag",
             Self::ProcessCompletion { .. } => "ProcessCompletion",
             Self::SubstituteComplete { .. } => "SubstituteComplete",
+            Self::SubstituteProgress { .. } => "SubstituteProgress",
             Self::CancelBuild { .. } => "CancelBuild",
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",

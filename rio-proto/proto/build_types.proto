@@ -49,7 +49,25 @@ message BuildEvent {
     BuildCancelled cancelled = 10;
     BuildInputsResolved inputs_resolved = 11;
     BuildPhase phase = 12;                  // Per-derivation build phase change (resSetPhase)
+    SubstituteProgress substitute_progress = 13;  // Per-derivation upstream-fetch byte progress
   }
+}
+
+// Byte-level progress for a derivation's detached upstream substitute
+// fetch. Emitted by the scheduler's `walk_substitute_closure` task while
+// the store is streaming NAR bytes from cache.nixos.org / a tenant
+// upstream. Gateway translates to `actCopyPath` + `resProgress` so nom
+// renders a download bar (r[gw.activity.subst-progress]).
+//
+// Display-only: NOT persisted to PG, reuses the last persisted sequence
+// (like Event::Log), routed via the log broadcast ring so a Lagged drop
+// is harmless (the terminal Cached/Completed stop_activity covers it).
+// Throttled at the source (rio-store fetch_nar emits per 1 MiB).
+message SubstituteProgress {
+  string derivation_path = 1;              // The drv whose closure-walk is fetching
+  uint64 bytes_done = 2;                   // Decompressed NAR bytes fetched so far (aggregate across closure)
+  uint64 bytes_expected = 3;               // Sum of NarSize for paths whose narinfo has been read so far
+  string upstream_uri = 4;                 // Base URL of the upstream serving the current path
 }
 
 message BuildStarted {

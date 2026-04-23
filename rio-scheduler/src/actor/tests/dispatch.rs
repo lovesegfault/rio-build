@@ -2974,6 +2974,63 @@ async fn substitute_spawn_and_revert_emit_progress() -> TestResult {
     Ok(())
 }
 
+// r[verify gw.activity.subst-progress]
+/// `ActorCommand::SubstituteProgress` → `Event::SubstituteProgress` on
+/// the build's LOG broadcast ring (display-only; state ring untouched).
+/// Drives the actor directly — `walk_substitute_closure` is exercised
+/// against real progress in the rio-store integration tests; here we
+/// assert the scheduler-side relay wiring.
+#[tokio::test]
+async fn substitute_progress_emitted_on_log_channel() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+    let build_id = Uuid::new_v4();
+    let mut state_ev = merge_dag(
+        &handle,
+        build_id,
+        vec![make_node("sub-prog2")],
+        vec![],
+        false,
+    )
+    .await?;
+    let mut log_ev = subscribe_log(&handle, build_id).await?;
+    // Drain pre-existing events from both rings (BuildStarted etc.).
+    while state_ev.try_recv().is_ok() {}
+    while log_ev.try_recv().is_ok() {}
+
+    handle
+        .send_unchecked(ActorCommand::SubstituteProgress {
+            drv_hash: "sub-prog2".into(),
+            bytes_done: 7_000_000,
+            bytes_expected: 10_000_000,
+            upstream_uri: "https://cache.example.test".into(),
+        })
+        .await?;
+    // Barrier: any debug query round-trips the actor mailbox.
+    let _ = expect_drv(&handle, "sub-prog2").await;
+
+    // Log ring: exactly the SubstituteProgress.
+    let got = log_ev.try_recv().expect("SubstituteProgress on log ring");
+    match got.event {
+        Some(Event::SubstituteProgress(p)) => {
+            assert_eq!(p.bytes_done, 7_000_000);
+            assert_eq!(p.bytes_expected, 10_000_000);
+            assert_eq!(p.upstream_uri, "https://cache.example.test");
+            assert_eq!(p.derivation_path, test_drv_path("sub-prog2"));
+        }
+        other => panic!("expected SubstituteProgress, got {other:?}"),
+    }
+    // State ring: NO SubstituteProgress (display-only routing).
+    while let Ok(e) = state_ev.try_recv() {
+        assert!(
+            !matches!(e.event, Some(Event::SubstituteProgress(_))),
+            "SubstituteProgress must NOT route to state ring"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // I-139: locally-present completion is batched (no per-row PG awaits)
 // ---------------------------------------------------------------------------
@@ -3415,9 +3472,14 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
-            .await;
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![a.clone()],
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
     assert!(
         ok,
         "diamond closure with all refs present must return ok=true"
@@ -3457,9 +3519,14 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
-            .await;
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![a.clone()],
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
     assert!(
         !ok,
         "missing transitive ref must set ok=false → revert (not Completed)"
@@ -3492,9 +3559,14 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
-            .await;
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![a.clone()],
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
     assert!(
         ok,
         "cold ref substituted via per-path QPI must return ok=true"
@@ -3530,9 +3602,14 @@ async fn walk_closure_hostile_refs_bounds_memory() -> TestResult {
 
     let shutdown = rio_common::signal::Token::new();
     let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
-    let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
-            .await;
+    let ok = crate::actor::dispatch::walk_substitute_closure(
+        &client,
+        vec![a.clone()],
+        &auth,
+        &shutdown,
+        |_, _, _| {},
+    )
+    .await;
 
     assert!(!ok, "hostile-ref path must trip closure cap → ok=false");
     assert_eq!(

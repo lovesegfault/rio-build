@@ -200,17 +200,36 @@ async fn quota_check<W: AsyncWrite + Unpin>(
 /// otherwise the gateway can't `stop_activity` derivations whose
 /// `Started` arrived on the previous stream, and nom shows them as
 /// stuck forever.
+/// Paired activity IDs for one derivation's upstream substitute. The
+/// child `actCopyPath` carries `resProgress` (download bytes) so nom
+/// renders a bar; the parent `actSubstitute` is what nom shows in its
+/// "substituting" line. Both start on `Substituting` and stop together
+/// (child first) on the terminal `Cached`/`Started`/`Completed`/`Failed`.
+#[derive(Debug, Clone, Copy)]
+struct SubstAids {
+    subst: u64,
+    copy: u64,
+}
+
 struct BuildActivityState {
     /// Per-derivation activity IDs (for `actBuild` start/stop and for
     /// attaching `BuildLogLine`/`SetPhase` results to the right build).
     drv: HashMap<String, u64>,
-    /// Per-derivation `actSubstitute` activity IDs. Started by
-    /// `DerivationEventKind::Substituting`, stopped by `Cached`
-    /// (success) or `Started` (fetch failed → fell through to build).
-    subst: HashMap<String, u64>,
+    /// Per-derivation `actSubstitute` + child `actCopyPath` activity
+    /// IDs. Started by `DerivationEventKind::Substituting`, stopped by
+    /// `Cached` (success) or `Started` (fetch failed → fell through to
+    /// build). r[gw.activity.subst-progress]
+    subst: HashMap<String, SubstAids>,
     /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
     /// arrives. `Progress`/`SetExpected` results attach here.
     builds_root: Option<u64>,
+    /// Running count of `actCopyPath` activities started. Re-emitted as
+    /// `SetExpected{actCopyPath, N}` on the root each time it
+    /// increments so nom's "X/Y copied" denominator tracks. The
+    /// scheduler doesn't know upfront how many drvs will go
+    /// `Substituting` (it's discovered as the DAG runs), so this grows
+    /// monotonically rather than being set once.
+    subst_expected: u64,
     /// Stable cluster identifier emitted as `actBuild` field 1
     /// (`machineName`). NOT per-pod — see the comment at the
     /// `Status::Started` arm. Read once from `RIO_GATEWAY_MACHINE_NAME`.
@@ -223,9 +242,22 @@ impl Default for BuildActivityState {
             drv: HashMap::default(),
             subst: HashMap::default(),
             builds_root: None,
+            subst_expected: 0,
             machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
         }
     }
+}
+
+/// Stop both halves of a [`SubstAids`] pair, child (`actCopyPath`)
+/// before parent (`actSubstitute`). Factored out of the four
+/// `relay_derivation_status` arms that close a substitute on terminal.
+async fn stop_subst_pair<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    aids: SubstAids,
+) -> Result<(), StreamProcessError> {
+    stderr.stop_activity(aids.copy).await?;
+    stderr.stop_activity(aids.subst).await?;
+    Ok(())
 }
 
 // r[impl gw.stderr.result.build-log-line]
@@ -282,14 +314,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // actSubstitute fields per upstream
             // `substitution-goal.cc`: [storePath, substituterUri].
             // The store picks the upstream — the scheduler doesn't
-            // know which, so the URI is empty (nom omits the
-            // "from <uri>" suffix when fields[1] is empty).
+            // know which yet (S2's first SubstituteProgress carries
+            // it), so the URI starts empty (nom omits the "from
+            // <uri>" suffix when fields[1] is empty).
             let out = drv_event
                 .output_paths
                 .first()
                 .cloned()
                 .unwrap_or_else(|| drv_event.derivation_path.clone());
-            let aid = stderr
+            let subst = stderr
                 .start_activity(
                     ActivityType::Substitute,
                     &format!("substituting '{out}'"),
@@ -301,14 +334,53 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                     ],
                 )
                 .await?;
-            act.subst.insert(drv_event.derivation_path.clone(), aid);
+            // r[impl gw.activity.subst-progress]
+            // Child actCopyPath fields per upstream
+            // `store-api.cc copyStorePath`: [storePath, from, to].
+            // `to` is the cluster's stable identifier (same source as
+            // actBuild machineName); `from` is empty until the first
+            // SubstituteProgress arrives — nom renders the bar from
+            // resProgress alone, the from/to are cosmetic ("copying X
+            // from Y to Z" header line).
+            let copy = stderr
+                .start_activity(
+                    ActivityType::CopyPath,
+                    &format!("copying path '{out}'"),
+                    verbosity::INFO,
+                    subst,
+                    &[
+                        ResultField::String(out.clone()),
+                        ResultField::String(String::new()),
+                        ResultField::String(act.machine_name.clone()),
+                    ],
+                )
+                .await?;
+            act.subst
+                .insert(drv_event.derivation_path.clone(), SubstAids { subst, copy });
+            // Bump the root's CopyPath expected so nom's "X/Y copied"
+            // denominator tracks. Idempotent across reconnects: the
+            // contains_key guard above means we only count first-time
+            // Substituting per drv per gateway-session.
+            act.subst_expected += 1;
+            if let Some(root) = act.builds_root {
+                stderr
+                    .result(
+                        root,
+                        ResultType::SetExpected,
+                        &[
+                            ResultField::Int(ActivityType::CopyPath as u64),
+                            ResultField::Int(act.subst_expected),
+                        ],
+                    )
+                    .await?;
+            }
         }
         types::DerivationEventKind::Started => {
             // A failed substitute fetch reverts to Ready → may later
-            // dispatch as a build. Close the dangling actSubstitute so
-            // nom doesn't show it stuck forever.
-            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
+            // dispatch as a build. Close the dangling actSubstitute +
+            // actCopyPath pair so nom doesn't show it stuck forever.
+            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+                stop_subst_pair(stderr, aids).await?;
             }
             // Re-dispatch (in-connection reassign, or replay after a
             // gateway↔scheduler reconnect) sends Started again for a
@@ -358,12 +430,12 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             act.drv.insert(drv_event.derivation_path.clone(), aid);
         }
         types::DerivationEventKind::Completed => {
-            // Terminal: close any dangling actSubstitute. Substituting
-            // → Completed shouldn't happen via the normal scheduler
-            // FSM, but terminal-arm symmetry costs nothing and guards
-            // future scheduler changes.
-            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
+            // Terminal: close any dangling actSubstitute + actCopyPath.
+            // Substituting → Completed shouldn't happen via the normal
+            // scheduler FSM, but terminal-arm symmetry costs nothing
+            // and guards future scheduler changes.
+            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+                stop_subst_pair(stderr, aids).await?;
             }
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
@@ -391,8 +463,8 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // Failed without ever emitting Started/Cached — the subst
             // aid was never closed and nom showed a stuck
             // "substituting 'X'" line until build terminus.
-            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
+            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+                stop_subst_pair(stderr, aids).await?;
             }
             if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                 stderr.stop_activity(aid).await?;
@@ -412,10 +484,11 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 .await?;
         }
         types::DerivationEventKind::Cached => {
-            // Substituting → Cached: close the actSubstitute. Merge-
-            // time cache hits never went Substituting → no aid → no-op.
-            if let Some(aid) = act.subst.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
+            // Substituting → Cached: close the actSubstitute +
+            // actCopyPath pair. Merge-time cache hits never went
+            // Substituting → no aids → no-op.
+            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+                stop_subst_pair(stderr, aids).await?;
             }
         }
         // Queued: no activity to start/stop, no STDERR.
@@ -446,10 +519,47 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
             "draining unstopped activities at terminal (upstream event loss)"
         );
     }
-    for (drv, aid) in act.drv.drain().chain(act.subst.drain()) {
+    for (drv, aids) in act.subst.drain() {
+        stderr.stop_activity(aids.copy).await?;
+        stderr.stop_activity(aids.subst).await?;
+        debug!(subst = aids.subst, copy = aids.copy, %drv,
+               "stop_activity sent (terminal drain, subst pair)");
+    }
+    for (drv, aid) in act.drv.drain() {
         stderr.stop_activity(aid).await?;
         debug!(aid, %drv, "stop_activity sent (terminal drain)");
     }
+    Ok(())
+}
+
+// r[impl gw.activity.subst-progress]
+/// Relay one `SubstituteProgress` event as `resProgress` on the drv's
+/// `actCopyPath` child. nom renders `[done/expected]` as a download bar.
+/// No-op if no `actSubstitute` pair is tracked for this drv (the
+/// `Substituting` state event was lost or arrived after this — both
+/// display-only races, harmless).
+async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &BuildActivityState,
+    p: types::SubstituteProgress,
+) -> Result<(), StreamProcessError> {
+    let Some(aids) = act.subst.get(&p.derivation_path) else {
+        return Ok(());
+    };
+    // resProgress fields: [done, expected, running, failed]. The latter
+    // two are 0 — actCopyPath is single-transfer, not an aggregate.
+    stderr
+        .result(
+            aids.copy,
+            ResultType::Progress,
+            &[
+                ResultField::Int(p.bytes_done),
+                ResultField::Int(p.bytes_expected),
+                ResultField::Int(0),
+                ResultField::Int(0),
+            ],
+        )
+        .await?;
     Ok(())
 }
 
@@ -583,6 +693,9 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             }
             Some(Event::Derivation(drv_event)) => {
                 relay_derivation_status(stderr, act, drv_event).await?;
+            }
+            Some(Event::SubstituteProgress(p)) => {
+                relay_substitute_progress(stderr, act, p).await?;
             }
             Some(ref ev @ (Event::Started(_) | Event::Progress(_))) => {
                 relay_build_progress(stderr, act, ev).await?;
@@ -1549,7 +1662,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_nix::protocol::stderr::{STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+    use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
 
     fn ev(kind: types::DerivationEventKind, drv: &str, outs: &[&str]) -> types::DerivationEvent {
         types::DerivationEvent {
@@ -1558,6 +1671,37 @@ mod tests {
             output_paths: outs.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// Wire helper: read one full `STDERR_START_ACTIVITY` frame and
+    /// return `(aid, ActivityType)`. Consumes text + N fields + parent.
+    /// Panics if the next frame is not START_ACTIVITY.
+    async fn read_start_activity<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (u64, u64) {
+        assert_eq!(wire::read_u64(r).await.unwrap(), STDERR_START_ACTIVITY);
+        let aid = wire::read_u64(r).await.unwrap();
+        let _level = wire::read_u64(r).await.unwrap();
+        let act_type = wire::read_u64(r).await.unwrap();
+        let _text = wire::read_string(r).await.unwrap();
+        let nfields = wire::read_u64(r).await.unwrap();
+        for _ in 0..nfields {
+            match wire::read_u64(r).await.unwrap() {
+                0 => {
+                    let _ = wire::read_u64(r).await.unwrap();
+                }
+                1 => {
+                    let _ = wire::read_string(r).await.unwrap();
+                }
+                t => panic!("unknown field type {t}"),
+            }
+        }
+        let _parent = wire::read_u64(r).await.unwrap();
+        (aid, act_type)
+    }
+
+    /// Wire helper: read one `STDERR_STOP_ACTIVITY` frame and return its aid.
+    async fn read_stop_activity<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> u64 {
+        assert_eq!(wire::read_u64(r).await.unwrap(), STDERR_STOP_ACTIVITY);
+        wire::read_u64(r).await.unwrap()
     }
 
     // r[verify gw.stderr.activity+2]
@@ -1578,34 +1722,26 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[out]))
             .await
             .unwrap();
-        let aid = *act.subst.get(drv).expect("subst aid tracked");
+        let aids = *act.subst.get(drv).expect("subst aids tracked");
+        assert_eq!(act.subst_expected, 1);
 
         relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[out]))
             .await
             .unwrap();
-        assert!(act.subst.is_empty(), "Cached must remove subst aid");
+        assert!(act.subst.is_empty(), "Cached must remove subst aids");
 
-        // Wire: START(Substitute) + fields[out, ""], then STOP(aid).
+        // r[verify gw.activity.subst-progress]
+        // Wire: START(Substitute), START(CopyPath child), no SetExpected
+        // (builds_root None), then STOP(copy), STOP(subst).
         let mut r = std::io::Cursor::new(buf);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
-        let got_aid = wire::read_u64(&mut r).await.unwrap();
-        assert_eq!(got_aid, aid);
-        let _level = wire::read_u64(&mut r).await.unwrap();
-        assert_eq!(
-            wire::read_u64(&mut r).await.unwrap(),
-            ActivityType::Substitute as u64
-        );
-        let text = wire::read_string(&mut r).await.unwrap();
-        assert!(text.contains(out), "text should name the output path");
-        // fields: 2 strings — [out, ""]
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 1); // type=string
-        assert_eq!(wire::read_string(&mut r).await.unwrap(), out);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 1);
-        assert_eq!(wire::read_string(&mut r).await.unwrap(), "");
-        let _parent = wire::read_u64(&mut r).await.unwrap();
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), aid);
+        let (sa, st) = read_start_activity(&mut r).await;
+        assert_eq!(sa, aids.subst);
+        assert_eq!(st, ActivityType::Substitute as u64);
+        let (ca, ct) = read_start_activity(&mut r).await;
+        assert_eq!(ca, aids.copy);
+        assert_eq!(ct, ActivityType::CopyPath as u64);
+        assert_eq!(read_stop_activity(&mut r).await, aids.copy, "child first");
+        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
 
         // Merge-time Cached (no preceding Substituting) writes nothing.
         let mut buf2 = Vec::new();
@@ -1619,6 +1755,87 @@ mod tests {
             buf2.is_empty(),
             "Cached without prior Substituting is silent"
         );
+    }
+
+    // r[verify gw.activity.subst-progress]
+    /// Substituting → SubstituteProgress → Cached: progress emits a
+    /// `STDERR_RESULT{copy_aid, resProgress, [done, expected, 0, 0]}`
+    /// frame between START(CopyPath) and STOP(copy). This is what nom
+    /// renders as the download bar.
+    #[tokio::test]
+    async fn relay_substitute_progress_emits_res_progress_on_copy() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/pppppppppppppppppppppppppppppppc-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = *act.subst.get(drv).unwrap();
+
+        relay_substitute_progress(
+            &mut stderr,
+            &act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 12_345_678,
+                bytes_expected: 99_999_999,
+                upstream_uri: "https://cache.example.test".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+
+        let mut r = std::io::Cursor::new(buf);
+        let (_, st) = read_start_activity(&mut r).await;
+        assert_eq!(st, ActivityType::Substitute as u64);
+        let (ca, ct) = read_start_activity(&mut r).await;
+        assert_eq!(ct, ActivityType::CopyPath as u64);
+        // STDERR_RESULT{aid, type, nfields, fields...}
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), ca, "on copy aid");
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ResultType::Progress as u64
+        );
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 4);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0); // type=int
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 12_345_678);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 99_999_999);
+        // skip running, failed
+        for _ in 0..2 {
+            let _ = wire::read_u64(&mut r).await.unwrap();
+            let _ = wire::read_u64(&mut r).await.unwrap();
+        }
+        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
+        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
+
+        // Progress for an untracked drv is a silent no-op.
+        let mut buf2 = Vec::new();
+        let mut w2 = &mut buf2;
+        let mut stderr2 = StderrWriter::new(&mut w2);
+        relay_substitute_progress(
+            &mut stderr2,
+            &BuildActivityState::default(),
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 1,
+                bytes_expected: 2,
+                upstream_uri: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(buf2.is_empty(), "no aids → no resProgress");
     }
 
     /// A failed substitute fetch reverts to Ready → eventually
@@ -1637,42 +1854,25 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let subst_aid = *act.subst.get(drv).unwrap();
+        let aids = *act.subst.get(drv).unwrap();
 
         relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
             .await
             .unwrap();
-        assert!(act.subst.is_empty(), "Started must clear subst aid");
+        assert!(act.subst.is_empty(), "Started must clear subst aids");
         assert!(act.drv.contains_key(drv), "Started must track build aid");
 
-        // Wire order: START(Substitute), STOP(subst_aid), START(Build).
+        // Wire order: START(Substitute), START(CopyPath), STOP(copy),
+        // STOP(subst), START(Build).
         let mut r = std::io::Cursor::new(buf);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
-        let _ = wire::read_u64(&mut r).await.unwrap(); // aid
-        let _ = wire::read_u64(&mut r).await.unwrap(); // level
-        assert_eq!(
-            wire::read_u64(&mut r).await.unwrap(),
-            ActivityType::Substitute as u64
-        );
-        // skip text + fields(2 strings) + parent
-        let _ = wire::read_string(&mut r).await.unwrap();
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
-        for _ in 0..2 {
-            let _ = wire::read_u64(&mut r).await.unwrap();
-            let _ = wire::read_string(&mut r).await.unwrap();
-        }
-        let _ = wire::read_u64(&mut r).await.unwrap();
-
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), subst_aid);
-
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
-        let _ = wire::read_u64(&mut r).await.unwrap();
-        let _ = wire::read_u64(&mut r).await.unwrap();
-        assert_eq!(
-            wire::read_u64(&mut r).await.unwrap(),
-            ActivityType::Build as u64
-        );
+        let (_, st) = read_start_activity(&mut r).await;
+        assert_eq!(st, ActivityType::Substitute as u64);
+        let (_, ct) = read_start_activity(&mut r).await;
+        assert_eq!(ct, ActivityType::CopyPath as u64);
+        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
+        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
+        let (_, bt) = read_start_activity(&mut r).await;
+        assert_eq!(bt, ActivityType::Build as u64);
     }
 
     /// Substituting → (silent revert to Queued) → DependencyFailed
@@ -1693,7 +1893,7 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let subst_aid = *act.subst.get(drv).unwrap();
+        let aids = *act.subst.get(drv).unwrap();
 
         let mut fail_ev = ev(Failed, drv, &[]);
         fail_ev.error_message = "dependency failed".into();
@@ -1702,31 +1902,21 @@ mod tests {
             .unwrap();
         assert!(
             act.subst.is_empty(),
-            "Failed must clear subst aid (pre-fix: leaked → stuck nom line)"
+            "Failed must clear subst aids (pre-fix: leaked → stuck nom line)"
         );
         assert!(act.drv.is_empty(), "drv was never Started");
 
-        // Wire order: START(Substitute), STOP(subst_aid), STDERR_NEXT(log).
-        // STOP must precede the failure log so nom clears the
-        // substituting line before printing the error.
+        // Wire order: START(Substitute), START(CopyPath), STOP(copy),
+        // STOP(subst), STDERR_NEXT(log). STOP must precede the failure
+        // log so nom clears the substituting line before printing the
+        // error.
         let mut r = std::io::Cursor::new(buf);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_START_ACTIVITY);
-        let _ = wire::read_u64(&mut r).await.unwrap(); // aid
-        let _ = wire::read_u64(&mut r).await.unwrap(); // level
-        assert_eq!(
-            wire::read_u64(&mut r).await.unwrap(),
-            ActivityType::Substitute as u64
-        );
-        let _ = wire::read_string(&mut r).await.unwrap();
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 2);
-        for _ in 0..2 {
-            let _ = wire::read_u64(&mut r).await.unwrap();
-            let _ = wire::read_string(&mut r).await.unwrap();
-        }
-        let _ = wire::read_u64(&mut r).await.unwrap(); // parent
-
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_STOP_ACTIVITY);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), subst_aid);
+        let (_, st) = read_start_activity(&mut r).await;
+        assert_eq!(st, ActivityType::Substitute as u64);
+        let (_, ct) = read_start_activity(&mut r).await;
+        assert_eq!(ct, ActivityType::CopyPath as u64);
+        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
+        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
 
         assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_NEXT);
         let msg = wire::read_string(&mut r).await.unwrap();

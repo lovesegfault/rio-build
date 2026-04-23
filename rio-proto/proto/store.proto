@@ -50,6 +50,18 @@ service StoreService {
   // Batch check which paths are missing from the store.
   rpc FindMissingPaths(rio.types.FindMissingPathsRequest) returns (rio.types.FindMissingPathsResponse);
 
+  // r[impl store.substitute.progress-stream]
+  // Single-path upstream substitute with progress streaming. Same
+  // semantics as QueryPathInfo's on-miss substitute fallback, but
+  // server-streaming: emits SubstitutePathProgress per ~1 MiB of
+  // decompressed NAR while fetching, then a terminal PathInfo on
+  // success. NOT_FOUND if no upstream has it (definitive miss);
+  // UNAVAILABLE on transient fetch error (caller retries). The
+  // scheduler's walk_substitute_closure calls this instead of the unary
+  // QueryPathInfo so it can relay byte progress to the gateway →
+  // actCopyPath + resProgress in nom.
+  rpc SubstitutePath(rio.types.SubstitutePathRequest) returns (stream rio.types.SubstitutePathResponse);
+
   // Resolve a store path from its 32-char nixbase32 hash part.
   //
   // wopQueryPathFromHashPart (29) gives us just "abc123..." (the hash-part

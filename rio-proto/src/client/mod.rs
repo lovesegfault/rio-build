@@ -22,7 +22,7 @@ pub mod store;
 pub use store::{
     NAR_CHUNK_SIZE, NarCollectError, batch_get_manifest, batch_query_path_info, chunk_nar_for_put,
     collect_nar_stream, collect_nar_stream_to_writer, get_path_nar, get_path_nar_to_file,
-    query_path_info_opt,
+    query_path_info_opt, substitute_path_with_progress,
 };
 
 use std::time::Duration;

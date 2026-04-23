@@ -356,22 +356,6 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
 /// Subscribe to a build's *log* channel via WatchBuild. The merge
 /// helpers return only the state receiver; log-forwarding tests need
 /// the log receiver explicitly post-split.
-async fn subscribe_log(
-    handle: &ActorHandle,
-    build_id: Uuid,
-) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
-    let (tx, rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::WatchBuild {
-            build_id,
-            caller_tenant: None,
-            since_sequence: 0,
-            reply: tx,
-        })
-        .await?;
-    Ok(rx.await??.0.log)
-}
-
 /// ForwardLogBatch with a drv_path the DAG knows → BuildEvent::Log arrives
 /// on the broadcast rx for the interested build.
 ///

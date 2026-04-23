@@ -281,6 +281,68 @@ impl ChunkService for MockStore {
     }
 }
 
+impl MockStore {
+    /// Shared fault-injection block for `query_path_info` AND
+    /// `substitute_path`. Tests written against the unary QPI's
+    /// `fail_query_path_info*` knobs continue to work after the
+    /// scheduler's closure walk switched to the streaming RPC.
+    /// Records attempt under `qpi_attempts_by_path` BEFORE any short-
+    /// circuit so retry tests can assert structurally.
+    fn check_qpi_faults(&self, path: &str) -> Result<(), Status> {
+        let attempt = {
+            let mut m = self.calls.qpi_attempts_by_path.write().unwrap();
+            let n = m.entry(path.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let per_path_n = self
+            .faults
+            .fail_qpi_resource_exhausted_per_path_n
+            .load(Ordering::SeqCst);
+        if per_path_n > 0 && attempt <= per_path_n {
+            return Err(Status::resource_exhausted(
+                "mock: injected query_path_info ResourceExhausted (per-path-n)",
+            ));
+        }
+        if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "mock: injected query_path_info failure",
+            ));
+        }
+        if self
+            .faults
+            .fail_query_path_info_permanent
+            .load(Ordering::SeqCst)
+        {
+            return Err(Status::internal(
+                "mock: injected query_path_info permanent failure",
+            ));
+        }
+        if self
+            .faults
+            .fail_query_path_info_n_times
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable(
+                "mock: injected query_path_info transient failure (n_times)",
+            ));
+        }
+        if let Some(until) = *self
+            .faults
+            .fail_qpi_resource_exhausted_until
+            .read()
+            .unwrap()
+            && std::time::Instant::now() < until
+        {
+            return Err(Status::resource_exhausted(
+                "mock: injected query_path_info ResourceExhausted (time-gated)",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl StoreService for MockStore {
     async fn put_path(
@@ -607,59 +669,7 @@ impl StoreService for MockStore {
         {
             self.faults.query_path_info_gate.notified().await;
         }
-        // Per-path attempt count — recorded BEFORE any fault
-        // short-circuit so retry tests can assert on it structurally.
-        let attempt = {
-            let path = &request.get_ref().store_path;
-            let mut m = self.calls.qpi_attempts_by_path.write().unwrap();
-            let n = m.entry(path.clone()).or_insert(0);
-            *n += 1;
-            *n
-        };
-        let per_path_n = self
-            .faults
-            .fail_qpi_resource_exhausted_per_path_n
-            .load(Ordering::SeqCst);
-        if per_path_n > 0 && attempt <= per_path_n {
-            return Err(Status::resource_exhausted(
-                "mock: injected query_path_info ResourceExhausted (per-path-n)",
-            ));
-        }
-        if self.faults.fail_query_path_info.load(Ordering::SeqCst) {
-            return Err(Status::unavailable(
-                "mock: injected query_path_info failure",
-            ));
-        }
-        if self
-            .faults
-            .fail_query_path_info_permanent
-            .load(Ordering::SeqCst)
-        {
-            return Err(Status::internal(
-                "mock: injected query_path_info permanent failure",
-            ));
-        }
-        if self
-            .faults
-            .fail_query_path_info_n_times
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(Status::unavailable(
-                "mock: injected query_path_info transient failure (n_times)",
-            ));
-        }
-        if let Some(until) = *self
-            .faults
-            .fail_qpi_resource_exhausted_until
-            .read()
-            .unwrap()
-            && std::time::Instant::now() < until
-        {
-            return Err(Status::resource_exhausted(
-                "mock: injected query_path_info ResourceExhausted (time-gated)",
-            ));
-        }
+        self.check_qpi_faults(&request.get_ref().store_path)?;
         let store_path = request.into_inner().store_path;
         let _ = rio_nix::store_path::StorePath::parse(&store_path)
             .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
@@ -792,6 +802,78 @@ impl StoreService for MockStore {
             missing_paths: missing,
             substitutable_paths: substitutable,
         }))
+    }
+
+    type SubstitutePathStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::SubstitutePathResponse, Status>>;
+
+    /// Mock SubstitutePath: behaves like `query_path_info`'s on-miss
+    /// substitute fallback. If the path is seeded as `substitutable`,
+    /// inserts it into `paths` (mirroring the real store's ingest) and
+    /// streams a single terminal `Info`. Otherwise NotFound. No
+    /// progress emits — tests asserting progress must drive the real
+    /// `Substituter` with a fake upstream.
+    async fn substitute_path(
+        &self,
+        request: Request<types::SubstitutePathRequest>,
+    ) -> Result<Response<Self::SubstitutePathStream>, Status> {
+        let store_path = request.into_inner().store_path;
+        let _ = rio_nix::store_path::StorePath::parse(&store_path)
+            .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
+        // Honor the same gate + fault knobs as `query_path_info`, then
+        // record under `qpi_calls` ONLY on the success path (after the
+        // fault block) — tests asserting "every path reached success
+        // exactly once" (e.g. `cd83a9b2_cannot_recur`) rely on
+        // `qpi_calls` excluding retries. `qpi_attempts_by_path` (inside
+        // `check_qpi_faults`) records every attempt.
+        if self
+            .faults
+            .query_path_info_gate_armed
+            .load(Ordering::SeqCst)
+        {
+            self.faults.query_path_info_gate.notified().await;
+        }
+        self.check_qpi_faults(&store_path)?;
+        self.calls
+            .qpi_calls
+            .write()
+            .unwrap()
+            .push(store_path.clone());
+        let info = {
+            if !self
+                .state
+                .substitutable
+                .read()
+                .unwrap()
+                .contains(&store_path)
+            {
+                return Err(Status::not_found(format!("path not found: {store_path}")));
+            }
+            // Mirror QueryPathInfo's on-miss substitute: synthesize a
+            // PathInfo and insert it so subsequent BatchQueryPathInfo /
+            // FindMissingPaths see it as present.
+            let info = types::PathInfo {
+                store_path: store_path.clone(),
+                nar_hash: vec![0u8; 32],
+                nar_size: 1,
+                ..Default::default()
+            };
+            self.state
+                .paths
+                .write()
+                .unwrap()
+                .insert(store_path.clone(), (info.clone(), Vec::new()));
+            info
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx
+            .send(Ok(types::SubstitutePathResponse {
+                msg: Some(types::substitute_path_response::Msg::Info(info)),
+            }))
+            .await;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn query_path_from_hash_part(

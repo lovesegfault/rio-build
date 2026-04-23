@@ -29,8 +29,8 @@ use rio_proto::types::{
     BatchQueryPathInfoResponse, FindMissingPathsRequest, FindMissingPathsResponse, GetPathRequest,
     PathInfo, PutPathBatchRequest, PutPathBatchResponse, PutPathRequest, PutPathResponse,
     QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
-    TenantQuotaResponse,
+    RegisterRealisationRequest, RegisterRealisationResponse, SubstitutePathRequest,
+    TenantQuotaRequest, TenantQuotaResponse,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -522,50 +522,7 @@ impl StoreServiceImpl {
         // is the only pre-gate filter this layer needs.
         sub.try_substitute(tid, store_path).await.map_err(|e| {
             tracing::warn!(error = %e, store_path, "substitution failed");
-            // HashMismatch is intentionally NOT mapped here: per-upstream
-            // hash mismatches are caught (and the integrity metric
-            // emitted) inside `do_substitute`'s loop and swallowed as
-            // try-next-upstream — they never escape `try_substitute`.
-            // Only errors that abort the whole substitution reach this
-            // arm.
-            match e {
-                SubstituteError::Fetch(_) => {
-                    Status::unavailable("upstream substitute fetch failed")
-                }
-                SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
-                    "upstream substitute {what} exceeds {limit}-byte cap"
-                )),
-                // Raced: a concurrent uploader holds the placeholder.
-                // The NAR fetch may still be seconds–minutes away —
-                // the gateway's 2-attempt/250ms
-                // `r[gw.store.transient-retry]` budget can't outlast
-                // it, so `Unavailable` here would surface a hard error
-                // where the pre-substitute behaviour was a benign
-                // `valid=false`. Map to `NotFound` instead: gateway
-                // treats it as miss (caller re-probes later); scheduler
-                // `walk_substitute_closure` treats it as `ok=false →
-                // revert with substitute_tried` and the next dispatch
-                // pass falls through to a build (the partial-closure
-                // gate at `batch_probe_cached_ready` refuses to mark
-                // Completed on output-present-only). Moka didn't cache
-                // `Err` either way.
-                SubstituteError::Raced => {
-                    Status::not_found("substitution in progress on another replica")
-                }
-                // Upstream-429: genuinely transient — `Unavailable` so
-                // the scheduler's 8-attempt backoff retries. A bare
-                // 429 (no `Retry-After`) is STILL a rate-limit, not a
-                // miss; the previous `Busy{None}` overload conflated
-                // it with `Raced` and demoted to build-from-source.
-                SubstituteError::RateLimited { .. } => {
-                    Status::unavailable("upstream rate-limited; retry")
-                }
-                SubstituteError::Admission(a) => a.into(),
-                SubstituteError::HashMismatch { .. }
-                | SubstituteError::SizeMismatch { .. }
-                | SubstituteError::NarInfo(_)
-                | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
-            }
+            substitute_status(e)
         })
     }
 
@@ -582,6 +539,47 @@ impl StoreServiceImpl {
         )
         .await;
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
+    }
+}
+
+/// Map a [`SubstituteError`] that escaped `do_substitute`'s per-upstream
+/// loop to a gRPC `Status`. Shared by `try_substitute_on_miss`
+/// (QueryPathInfo/GetPath unary fallback) and `substitute_path_impl`
+/// (server-streaming variant).
+///
+/// HashMismatch/SizeMismatch never reach here in practice: per-upstream
+/// integrity errors are swallowed as try-next-upstream inside
+/// `do_substitute`. Only errors that abort the whole substitution reach
+/// this arm.
+pub(super) fn substitute_status(e: SubstituteError) -> Status {
+    match e {
+        SubstituteError::Fetch(_) => Status::unavailable("upstream substitute fetch failed"),
+        SubstituteError::TooLarge { what, limit } => Status::resource_exhausted(format!(
+            "upstream substitute {what} exceeds {limit}-byte cap"
+        )),
+        // Raced: a concurrent uploader holds the placeholder. The NAR
+        // fetch may still be seconds–minutes away — the gateway's
+        // 2-attempt/250ms `r[gw.store.transient-retry]` budget can't
+        // outlast it, so `Unavailable` here would surface a hard error
+        // where the pre-substitute behaviour was a benign `valid=false`.
+        // Map to `NotFound` instead: gateway treats it as miss (caller
+        // re-probes later); scheduler `walk_substitute_closure` treats
+        // it as `ok=false → revert with substitute_tried` and the next
+        // dispatch pass falls through to a build (the partial-closure
+        // gate at `batch_probe_cached_ready` refuses to mark Completed
+        // on output-present-only). Moka didn't cache `Err` either way.
+        SubstituteError::Raced => Status::not_found("substitution in progress on another replica"),
+        // Upstream-429: genuinely transient — `Unavailable` so the
+        // scheduler's 8-attempt backoff retries. A bare 429 (no
+        // `Retry-After`) is STILL a rate-limit, not a miss; the
+        // previous `Busy{None}` overload conflated it with `Raced` and
+        // demoted to build-from-source.
+        SubstituteError::RateLimited { .. } => Status::unavailable("upstream rate-limited; retry"),
+        SubstituteError::Admission(a) => a.into(),
+        SubstituteError::HashMismatch { .. }
+        | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::NarInfo(_)
+        | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
     }
 }
 
@@ -648,6 +646,16 @@ impl StoreService for StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         self.find_missing_paths_impl(request).await
+    }
+
+    type SubstitutePathStream = queries::SubstitutePathStream;
+
+    #[instrument(skip(self, request), fields(rpc = "SubstitutePath"))]
+    async fn substitute_path(
+        &self,
+        request: Request<SubstitutePathRequest>,
+    ) -> Result<Response<Self::SubstitutePathStream>, Status> {
+        self.substitute_path_impl(request).await
     }
 
     #[instrument(skip(self, request), fields(rpc = "QueryPathFromHashPart"))]
