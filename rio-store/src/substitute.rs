@@ -192,13 +192,16 @@ pub enum SubstituteError {
     #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
     SizeMismatch { declared: u64, actual: u64 },
 
-    /// Transient placeholder-claim: another uploader (concurrent
-    /// replica or closure walk) holds the slot. Returned as `Err` (not
-    /// `Ok(None)`) so moka's `try_get_with` does NOT cache it; the
-    /// caller's retry re-runs `do_substitute` and reaches
-    /// `AlreadyComplete` once the in-flight upload lands. gRPC maps to
-    /// `NotFound` (the gateway's 2-attempt budget can't outlast a
-    /// multi-second NAR fetch, so callers re-probe later).
+    /// Transient placeholder-claim: another uploader holds the slot.
+    /// Same-replica `try_substitute*` callers coalesce at the moka
+    /// `inflight` singleflight and never reach `claim_placeholder`
+    /// concurrently, so this only surfaces on **cross-replica** races
+    /// (another rio-store pod) or a concurrent `PutPath`. Returned as
+    /// `Err` (not `Ok(None)`) so moka does NOT cache it; the caller's
+    /// retry re-runs `do_substitute` and reaches `AlreadyComplete` once
+    /// the in-flight upload lands. gRPC maps to `NotFound` (the
+    /// gateway's 2-attempt budget can't outlast a multi-second NAR
+    /// fetch, so callers re-probe later).
     #[error("transient: concurrent uploader holds placeholder")]
     Raced,
 
@@ -469,14 +472,52 @@ impl Substituter {
         tenant_id: Uuid,
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        self.try_substitute_inner(tenant_id, store_path, None).await
+    }
+
+    // r[impl store.substitute.progress-stream]
+    /// [`try_substitute`](Self::try_substitute) with byte-progress
+    /// callback. Same semantics on success/miss/error, but `progress`
+    /// fires every [`SUBSTITUTE_PROGRESS_INTERVAL_BYTES`] of
+    /// decompressed NAR during the download.
+    ///
+    /// Shares the moka `inflight` singleflight with `try_substitute`:
+    /// concurrent same-`(tenant, path)` calls coalesce; only the
+    /// winner's `progress` fires. Losers wait and share the result
+    /// (no progress emits — same as the cache-hit fast path).
+    #[instrument(skip(self, progress), fields(tenant = %tenant_id, path = store_path))]
+    pub async fn try_substitute_with_progress(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        progress: &SubstProgressFn,
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        self.try_substitute_inner(tenant_id, store_path, Some(progress))
+            .await
+    }
+
+    /// Shared singleflight body for `try_substitute` /
+    /// `try_substitute_with_progress`. moka's `try_get_with`: if
+    /// another caller is already computing this key, we wait and share
+    /// its result. The init future runs at most once per
+    /// key-per-TTL-window. moka caches `Ok(v)` (both `Some` and
+    /// definitive-miss `None`) but does NOT cache `Err` — a transient
+    /// 503 propagates to every coalesced waiter without poisoning the
+    /// slot for 30s, and the next caller after they all return retries
+    /// cleanly.
+    ///
+    /// `progress` is the WINNER'S callback — coalesced losers' callbacks
+    /// never fire (they aren't reachable from inside the shared init
+    /// future). That's the same observable behavior as a cache hit:
+    /// loser sees `Ok(Some)` with no emits, and the closure-aggregate
+    /// progress at the scheduler still advances via the winner's drv.
+    async fn try_substitute_inner(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        progress: Option<&SubstProgressFn>,
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         let key = (tenant_id, store_path.to_string());
-        // moka's `try_get_with`: if another caller is already computing
-        // this key, we wait and share its result. The init future runs
-        // at most once per key-per-TTL-window. moka caches `Ok(v)` (both
-        // `Some` and definitive-miss `None`) but does NOT cache `Err` —
-        // a transient 503 propagates to every coalesced waiter without
-        // poisoning the slot for 30s, and the next caller after they all
-        // return retries cleanly.
         let cached = self
             .inflight
             .try_get_with(key, async {
@@ -504,7 +545,7 @@ impl Substituter {
                     Some(g) => Some(g.acquire_bounded().await?),
                     None => None,
                 };
-                self.do_substitute(http, upstreams, tenant_id, store_path, None)
+                self.do_substitute(http, upstreams, tenant_id, store_path, progress)
                     .await
                     .map(|v| v.map(Arc::new))
             })
@@ -531,57 +572,6 @@ impl Substituter {
                 (*e).clone()
             })?;
         Ok(cached.map(|arc| (*arc).clone()))
-    }
-
-    // r[impl store.substitute.progress-stream]
-    /// [`try_substitute`](Self::try_substitute) with byte-progress
-    /// callback. Same semantics on success/miss/error, but `progress`
-    /// fires every [`SUBSTITUTE_PROGRESS_INTERVAL_BYTES`] of
-    /// decompressed NAR during the download.
-    ///
-    /// **Cache-hit fast path** uses the same moka `inflight` cache
-    /// (a `(tenant, path)` ingested in the last 30s returns immediately
-    /// with no progress emits). **Cache-miss path bypasses moka's
-    /// singleflight** — concurrent identical calls each download. The
-    /// ingest layer's `claim_placeholder` still serializes the actual
-    /// store write (the loser sees `AlreadyComplete`/`Concurrent` and
-    /// stops before downloading), so the wasted work is at most one
-    /// extra narinfo round-trip per upstream. The scheduler's
-    /// `walk_substitute_closure` is the only caller and is serial
-    /// per-drv, so the race window is one path appearing in two drvs'
-    /// closures concurrently.
-    #[instrument(skip(self, progress), fields(tenant = %tenant_id, path = store_path))]
-    pub async fn try_substitute_with_progress(
-        &self,
-        tenant_id: Uuid,
-        store_path: &str,
-        progress: &SubstProgressFn,
-    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
-        let key = (tenant_id, store_path.to_string());
-        if let Some(cached) = self.inflight.get(&key).await {
-            return Ok(cached.map(|arc| (*arc).clone()));
-        }
-        let Some(http) = &self.http else {
-            return Ok(None);
-        };
-        let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
-        if upstreams.is_empty() {
-            return Ok(None);
-        }
-        let _permit = match &self.admission {
-            Some(g) => Some(g.acquire_bounded().await?),
-            None => None,
-        };
-        let result = self
-            .do_substitute(http, upstreams, tenant_id, store_path, Some(progress))
-            .await;
-        // Populate moka on Ok (hit or definitive miss) so a follow-on
-        // unary `try_substitute` for the same key cache-hits. Err is
-        // not cached (matches `try_get_with` semantics).
-        if let Ok(ref v) = result {
-            self.inflight.insert(key, v.clone().map(Arc::new)).await;
-        }
-        result
     }
 
     /// One full fetch cycle — the singleflight body. `http` and
@@ -1899,6 +1889,72 @@ mod tests {
             emits2.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "moka cache-hit → no progress emits"
+        );
+    }
+
+    // r[verify store.substitute.progress-stream]
+    /// N concurrent `try_substitute_with_progress` calls for the same
+    /// `(tenant, path)` coalesce at the moka singleflight: ALL return
+    /// `Ok(Some)` (none get `Raced`/`None`); only the winner's callback
+    /// fires. Regression: pre-fix the miss path bypassed `try_get_with`
+    /// → N-1 reached `claim_placeholder` → `Concurrent` → `Err(Raced)`
+    /// → gRPC `NotFound` → scheduler false build-dispatch.
+    #[tokio::test]
+    async fn substitute_with_progress_concurrent_coalesces() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-coalesce").await;
+        let (path, nar) = make_path();
+        // Delay the NAR body so all N callers enter `try_get_with`
+        // while the winner is still downloading.
+        let fake = spawn_fake_upstream_with_delay(
+            &path,
+            nar.clone(),
+            "cache.co",
+            Duration::from_millis(200),
+        )
+        .await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = std::sync::Arc::new(test_substituter(db.pool.clone()));
+        const N: usize = 4;
+        let emit_counts: Vec<_> = (0..N)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .collect();
+        let calls = emit_counts.iter().map(|c| {
+            let sub = sub.clone();
+            let path = path.clone();
+            let c = c.clone();
+            async move {
+                let cb = move |_: u64, _: u64, _: &str| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                };
+                sub.try_substitute_with_progress(tid, &path, &cb).await
+            }
+        });
+        let results = futures_util::future::join_all(calls).await;
+
+        for (i, r) in results.into_iter().enumerate() {
+            let info = r
+                .unwrap_or_else(|e| panic!("caller {i} got Err({e:?}) — singleflight regressed"))
+                .unwrap_or_else(|| panic!("caller {i} got Ok(None) — Raced→NotFound regressed"));
+            assert_eq!(info.nar_size, nar.len() as u64);
+        }
+        let winners = emit_counts
+            .iter()
+            .filter(|c| c.load(std::sync::atomic::Ordering::SeqCst) > 0)
+            .count();
+        assert_eq!(
+            winners, 1,
+            "exactly one caller's progress callback fires (the singleflight winner)"
         );
     }
 
