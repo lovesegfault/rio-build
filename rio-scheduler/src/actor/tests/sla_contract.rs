@@ -22,8 +22,8 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::collections::BTreeMap;
 
 /// The three counters `solve_intent_for` may emit. After §Third-strike
-/// + arm-on-ack, `compute_spawn_intents` is **side-effect-free except
-/// idempotent memo fill + once-per-miss emits of these** — every other
+/// and arm-on-ack, `compute_spawn_intents` is **side-effect-free except
+/// idempotent memo fill and once-per-miss emits of these** — every other
 /// counter write is a regression of merged_bug_001 / the validator's
 /// r3 BLOCKED finding (per-poll over-emission).
 const ONCE_PER_MISS: &[&str] = &[
