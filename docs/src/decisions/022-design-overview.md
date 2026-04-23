@@ -1,4 +1,4 @@
-# ADR-022 Design Overview — composefs-style lazy `/nix/store`
+# ADR-022 Design Overview — castore-FUSE lazy `/nix/store`
 
 **Status:** canonical reference for the post-ADR-022 builder filesystem and store metadata model. Decision rationale and alternatives are in [ADR-022](./022-lazy-store-fs-erofs-vs-riofs.md); sequencing is in the [implementation plan](./022-implementation-plan.md). This document describes the system as designed, not how it was arrived at.
 
@@ -6,9 +6,9 @@
 
 ## 1. What it is
 
-Each rio-builder presents `/nix/store` to the build sandbox as a three-layer read-only mount: an **EROFS metadata image** (inodes, dirents, sizes, modes — zero data bytes) stacked under **overlayfs** with a **digest-addressed FUSE** data-only lower. The build sees a complete, fully-populated store; bytes are fetched from rio-store only when a file is `open()`ed, keyed by the file's blake3 content digest.
+Each rio-builder presents `/nix/store` to the build sandbox as a two-layer mount: **overlayfs** (RW upper on local SSD) over a **content-addressed castore-FUSE** lower that serves the closure's [Directory DAG](https://snix.dev/docs/components/castore/data-model/). The build sees a complete, fully-populated store; `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-memory tree with infinite cache TTLs (so the kernel dcache absorbs all repeats), and bytes are fetched from rio-store only when a file is `open()`ed, keyed by its blake3 `file_digest`.
 
-This replaces the previous whole-path-granularity FUSE store (`rio-builder/src/fuse/`) with file-granularity lazy fetch, kernel-native metadata operations, and structural cross-path deduplication.
+This replaces the previous whole-path-granularity FUSE store (`rio-builder/src/fuse/`) with file-granularity lazy fetch, content-addressed inodes, and structural cross-path deduplication. It is the [snix-store](https://git.snix.dev/snix/snix/src/branch/canon/snix/store) filesystem model with rio's chunk backend underneath and `rio-mountd` brokering the privileged ioctls.
 
 On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, mode, file_digest}` computed at PutPath time), the **Directory merkle layer** (`dir_digest`/`root_digest` over the same index), a **tiered chunk backend** (per-AZ S3 Express One Zone cache in front of S3 standard), and a runtime-configurable **S3 binary-cache compatibility layer** (stock-Nix `.narinfo` + compressed NAR dual-written to S3-standard so the bucket substitutes without rio running).
 
@@ -16,13 +16,13 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 | Property | Statement |
 |---|---|
-| **Kernel-native metadata** | `stat`, `getattr`, `readdir`, `readlink` over `/nix/store` are served entirely by the EROFS layer in-kernel. Zero userspace crossings, regardless of cache state. |
+| **Metadata cached after first access** | `stat`, `getattr`, `readdir`, `readlink` over `/nix/store` upcall once per dirent then are dcache-served forever (`Duration::MAX` ttl). `READDIRPLUS` pre-populates the dcache so a `readdir` followed by `stat` of every entry is one upcall total, not N+1; `FOPEN_CACHE_DIR` and `FUSE_CACHE_SYMLINKS` make repeat `readdir`/`readlink` zero-upcall. |
 | **Lazy file-granular fetch** *(rio-builder only)* | A file's bytes are fetched from rio-store on first `open()`, not at mount time and not as part of a whole-store-path NAR. A build that touches 5% of its closure fetches ≈5% of the bytes. External consumers (dev laptops, CI runners) reach rio-store via the gateway substituter (§8) or the HTTP binary-cache surface (`narinfo/*.narinfo` + signed NARs), not this stack. |
 | **Cache-hit reads are kernel-direct** | Once a file is in the node-SSD backing cache, `open()` replies `FOPEN_PASSTHROUGH` with the cache fd; all reads go kernel → ext4 with zero FUSE involvement, including after page-cache eviction. The FUSE `read` path is reached only during the streaming-fill window of a large cold miss. |
-| **Structural per-file dedup** | Two store paths containing byte-identical files redirect to the same digest object. One fetch, one SSD copy, one page-cache copy — without any explicit dedup pass. |
+| **Structural per-file and per-subtree dedup** | Inode numbers are content-derived (`h(file_digest)` / `h(dir_digest)`). Two store paths containing byte-identical files share one FUSE inode, one fetch, one SSD copy, one page-cache copy. Two paths sharing a subtree share one dcache subtree. No explicit dedup pass. |
 | **Streaming open for large files** | Files above `STREAM_THRESHOLD` (default 8 MiB) return from `open()` after the first chunk arrives; the remainder fills in the background. `read()` of an unfilled range demand-fetches it. A build linking against a 200 MB `libLLVM.so` fetches only the ranges the linker touches. |
-| **Minimal privileged surface** | The only privileged component is `rio-mountd`, a node-level daemon that opens `/dev/fuse` + an EROFS superblock and hands both fds to the unprivileged builder over a Unix socket. The builder mounts overlay itself inside its own user namespace. The build sandbox has zero device exposure. |
-| **Declared-input enforcement** | The digest-FUSE handler answers `lookup()` only for digests in the build's declared input closure; everything else is `ENOENT`. The build cannot read store paths it did not declare. |
+| **Minimal privileged surface** | The only privileged component is `rio-mountd`, a node-level daemon that opens `/dev/fuse` and hands the fd to the unprivileged builder over a Unix socket, then brokers `FUSE_DEV_IOC_BACKING_OPEN` and the verified `Promote` write into the shared node cache. The builder mounts overlay itself inside its own user namespace. The build sandbox has zero device exposure. |
+| **Declared-input enforcement** | The castore-FUSE handler's tree is exactly the build's declared input closure; `lookup()` of anything outside it returns `ENOENT`. The build cannot read store paths it did not declare. |
 | **Delta-sync distribution** | `nix copy --from rio-store` and inter-region replication walk a Directory merkle DAG. Unchanged subtrees are skipped in one batch RPC; bandwidth scales with change size, not closure size. |
 | **Per-AZ chunk cache** | All rio-store replicas in an availability zone share an S3 Express One Zone directory bucket as a read-through cache. A new replica starts warm; S3 standard GET cost is once per chunk per AZ, not once per replica. |
 | **S3 self-sufficient (configurable)** | When `binary_cache_compat` is enabled, every `PutPath` additionally writes a stock-Nix `.narinfo` and compressed NAR to S3-standard. `nix copy --from s3://bucket` works with no rio process running; PostgreSQL becomes a performance tier, not a correctness tier. Disabled ("pure rio mode") halves S3 storage at the cost of PG being load-bearing for any substitution. |
@@ -36,12 +36,10 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 │                                                                                    │
 │    overlay (rw, userxattr)                                                         │
 │    ├── upper     = local SSD                 ← build outputs + db.sqlite land here │
-│    ├── lower[0]  = EROFS metadata image      ← stat/readdir/readlink served here   │
-│    │               (loop-mounted, ~5 MiB                                           │
-│    │                for a chromium closure)                                        │
-│    └── lower[1]  = digest-FUSE               ← open/read redirected here via       │
-│         (data-only, "::") at                    user.overlay.redirect xattr        │
-│         /var/rio/objects/{build_id}/                                               │
+│    └── lower     = castore-FUSE              ← lookup/getattr/readdir/readlink     │
+│         at /var/rio/castore/{build_id}/         from in-heap Directory DAG;        │
+│         (Duration::MAX ttl, READDIRPLUS,        open() → file_digest backing cache │
+│          per-digest inodes)                                                        │
 │                  │                                                                 │
 │                  │ backed by                                                       │
 │                  ▼                                                                 │
@@ -53,58 +51,51 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
                    ▼
 ┌─────────────────────────────── rio-store ──────────────────────────────────────────┐
 │                                                                                    │
-│   GetNarIndex(nar_hash) → NarIndex { entries: [{path, kind, size, exec,            │
-│                                                 file_digest, dir_digest}],         │
-│                                      root_digest }                                 │
+│   castore:  GetDirectory(root_digest, recursive) → stream<Directory>   (mount)     │
+│             HasDirectories / HasBlobs / ReadBlob                       (delta-sync)│
 │                                                                                    │
 │   GetChunks([chunk_digest]) → stream<bytes>       (batched, server-streamed)       │
 │                                                                                    │
 │   TieredChunkBackend:  S3 Express (per-AZ) ──read-through──► S3 (authoritative)    │
 │                                                                                    │
-│   castore:  GetDirectory / HasDirectories / HasBlobs / ReadBlob   (delta-sync)     │
-│                                                                                    │
 └────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌── rio-mountd (DaemonSet, hostPID, CAP_SYS_ADMIN) ──┐
 │  setup:  open("/dev/fuse") (keep dup), mount fuse  │──── SCM_RIGHTS ───► builder
-│          fsopen("erofs")/fsconfig/fsmount          │
 │          mkdir staging/{build_id} (builder uid)    │
 │  serve:  BackingOpen{fd} → ioctl BACKING_OPEN → id │◄─── per-open ─────► builder
 │          Promote{digest} → verify-copy → cache     │
 │  owns:   /var/rio/cache/ (read-only to builders)   │
 │  on UDS close: umount2(MNT_DETACH), rm staging     │
-│  on start: scan + reap orphaned objects_dir mounts │
+│  on start: scan + reap orphaned castore_mnt mounts │
 └────────────────────────────────────────────────────┘
 ```
 
 ## 4. The mount stack
 
-r[builder.fs.composefs-stack]
+r[builder.fs.castore-stack]
 
-The builder assembles `/nix/store` from three layers per build:
+The builder assembles `/nix/store` from two layers per build:
 
-1. **EROFS metadata image** — a read-only filesystem image containing every inode in the build's input closure with correct `i_size`, mode, mtime, symlink targets, and directory entries, but **zero data blocks**. Each regular file inode carries two xattrs: `user.overlay.redirect=/ab/<blake3-hex>` and a zero-length `user.overlay.metacopy`. Generated per build from the union of the closure's `NarIndex` rows via the FFI EROFS encoder; ~5 MiB / ~46 ms for a chromium-scale closure (23k files).
+1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`).
 
-2. **digest-FUSE** — a `fuser` filesystem mounted at `/var/rio/objects/{build_id}/` exposing exactly two directory levels: 256 prefix dirs `00`..`ff`, and leaf files named by the remaining 62 hex chars of `blake3(file content)`. Serves `lookup`/`open`/`read` only; everything else is `ENOSYS`.
+2. **overlayfs** — a single **RW** mount with `upperdir=<ssd>/nix/store, workdir=<ssd>/work, userxattr, lowerdir=<castore_mnt>`; the merged dir is bind-mounted at the build's `/nix/store`. **Build outputs and the synthesized `db.sqlite` land in the upper** — same shape as the pre-ADR-022 mount; P0560 swaps only what the lower serves.
 
-3. **overlayfs** — a single **RW** mount with `upperdir=<ssd>/nix/store, workdir=<ssd>/work, userxattr, lowerdir=<erofs_mnt>::<objects_dir>`; the merged dir is bind-mounted at the build's `/nix/store`. The `::` separator marks the FUSE mount as a [data-only lower layer](https://docs.kernel.org/filesystems/overlayfs.html#data-only-lower-layers): overlayfs will not path-walk into it, only follow absolute redirects from the metadata layer. **Build outputs and the synthesized `db.sqlite` land in the upper** — P0560 only swaps the `lowerdir=` value from the pre-ADR-022 FUSE mount to `<erofs>::<fuse>`.
-
-r[builder.fs.userxattr-mount]
-
-The `userxattr` mount option makes overlayfs read `user.overlay.*` xattrs (instead of `trusted.overlay.*`) and permits the mount from an unprivileged user namespace. The `metacopy=on` and `redirect_dir=on` options are **not** passed — they are rejected in combination with `userxattr`. Following redirects into the data-only lower is gated independently on the presence of a `::` layer (`ofs->numdatalayer > 0`, kernel `5ef7bcdeecc9`, ≥6.16), and that gate's safety condition — the lower is read-only and its redirect xattrs are immutable — is structurally satisfied by EROFS.
+The synthetic root (`FUSE_ROOT_ID`) is `/nix/store` itself; its children are the closure's store-path basenames mapping to each path's `root_digest`. Everything below is content-addressed.
 
 ### Per-syscall resolution
 
 | Syscall on `/nix/store/...` | Resolved by | FUSE upcalls |
 |---|---|---|
-| `stat`, `getattr`, `getxattr` | EROFS inode | 0 |
-| `readdir` | EROFS dirents | 0 |
-| `readlink` | EROFS symlink target | 0 |
-| `open()` input | overlay reads `user.overlay.redirect` → FUSE `lookup(prefix)` + `lookup(digest)` + `open` | 2 lookup + 1 open, **independent of path depth** |
+| `stat`, `getattr` | overlay → FUSE `lookup`/`getattr` | **1 cold / 0 thereafter** (`Duration::MAX` ttl) |
+| `readdir` | overlay → FUSE `readdirplus` | **1 cold / 0 thereafter** (`FOPEN_CACHE_DIR`); pre-populates dcache for children |
+| `readlink` | overlay → FUSE `readlink` | **1 cold / 0 thereafter** (`FUSE_CACHE_SYMLINKS`) |
+| `open()` input | overlay → FUSE `open` → backing-cache fetch | **1 open** |
 | `read()` / `mmap` input, file in node cache | `FOPEN_PASSTHROUGH` → kernel reads backing fd directly | **0** |
 | `read()` / `mmap` input, large file mid-fill | FUSE `read` (≈128 KiB per upcall) until fill completes | O(touched bytes / 128 KiB), once per file per node |
+| `lookup` ENOENT (configure-probe) | overlay negative dcache (I-043) | **1 cold / 0 thereafter** |
 | **write / create output** | **overlay upper (SSD)** | 0 |
-| modify input → copy-up | overlay full-data-copies from FUSE lowerdata (`metacopy=false` under `userxattr`) | as cold open+read |
+| modify input → copy-up | overlay full-data-copies from FUSE lower into upper | as cold open+read |
 
 ## 5. Store-side metadata: the NAR index
 
@@ -120,20 +111,20 @@ The index is computed eagerly during `PutPath` from the NAR stream (`nar_ls` + p
 
 r[store.index.rpc]
 
-`GetNarIndex(nar_hash) → NarIndex` is the single RPC a builder needs, per store path in its closure, to construct both the EROFS metadata image and the digest-FUSE's lookup allowlist.
+`GetNarIndex(nar_hash) → NarIndex` exposes this index. The builder no longer fetches it at mount time — the Directory DAG (§8) carries everything `lookup`/`getattr`/`readdir`/`readlink` need. `NarIndex` is consulted at `open()` time (via the `DigestResolver`, §6) to map `file_digest → (nar_hash, nar_offset) → chunk-range`, and by `ReadBlob` server-side.
 
-## 6. Builder-side data path: digest-FUSE
+## 6. Builder-side data path: castore-FUSE `open()`
 
 r[builder.fs.digest-fuse-open]
 
-The digest-FUSE handler is the **only** FUSE in the stack and is reached **only on cold `open()`**. It holds:
+The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. It holds:
 
-- A `file_digest → (size, executable)` map built from the closure's `NarIndex` rows. `lookup()` for any digest outside this map returns `ENOENT` — this is the declared-input allowlist.
+- A `HashMap<u64, Node>` keyed by content-derived inode, populated at mount from `GetDirectory(root_digest, recursive=true)` per store path (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` reads the parent's `Directory` body and returns the child's content-derived inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
 - A `DigestResolver` mapping `file_digest → (nar_hash, nar_offset, size) → chunk-range` for fetch.
 
 r[builder.fs.passthrough-on-hit]
 
-The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN` ([`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), so the ioctl is brokered by `rio-mountd` (§10), which kept a `dup()` of this build's `/dev/fuse` fd. On `open(digest)`:
+The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN` ([`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), so the ioctl is brokered by `rio-mountd` (§11), which kept a `dup()` of this build's `/dev/fuse` fd. On `open(ino → file_digest)`:
 
 1. **Cache hit** at `/var/rio/cache/ab/<digest>`: send `cache_fd` to `rio-mountd` over the UDS → receive `backing_id`; reply `FOPEN_PASSTHROUGH | backing_id`. All `read`/`mmap` on this open go kernel → backing file; the handler sees nothing further until `release` (which sends `BackingClose{id}` to mountd).
 2. **Cache miss, `size ≤ STREAM_THRESHOLD`**: fetch into `staging/{build_id}/<digest>.partial` verifying each chunk on arrival, whole-file blake3 verify, `Promote{digest}` → mountd verify-copies into cache → as (1).
@@ -146,7 +137,7 @@ r[builder.fs.shared-backing-cache]
 r[builder.fs.node-digest-cache]
 r[builder.mountd.promote-verified]
 
-The FUSE **mount point** is per-build (`/var/rio/objects/{build_id}/`) so one build's mount namespace never exposes another's. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
+The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`) so one build's mount namespace never exposes another's. The **backing cache** (`/var/rio/cache/`) is node-shared SSD, **owned by `rio-mountd` and read-only to builder pods**. Builders fetch into a per-build **staging dir** (`/var/rio/staging/{build_id}/`, builder-writable); after verify they send `Promote{digest}` to mountd, which stream-copies from staging into a fresh mountd-owned cache file while re-hashing, and renames into place only on `blake3 == digest`. The copy is the integrity boundary — the cache inode is one mountd created and verified; a sandbox-escaped build cannot poison it.
 
 r[builder.fs.node-chunk-cache]
 
@@ -178,7 +169,7 @@ r[store.castore.directory-rpc]
 r[store.castore.blob-read]
 r[gw.substitute.dag-delta-sync]
 
-The castore RPC surface is `GetDirectory(digest) → Directory`, `HasDirectories([digest]) → bitmap`, `HasBlobs([file_digest]) → bitmap`, and `ReadBlob(file_digest) → stream<bytes>`. `ReadBlob` resolves `file_digest → (nar_hash, nar_offset)` via the `file_blobs` table and streams the file content sliced from the underlying chunks — a snix-compatible client can substitute from rio-store holding only digests, without knowing rio's chunk layout. A delta-sync client (gateway substituter, inter-region replicator) syncing a closure to a target that already holds most of it:
+The castore RPC surface is `GetDirectory(digest, recursive) → stream<Directory>`, `HasDirectories([digest]) → bitmap`, `HasBlobs([file_digest]) → bitmap`, and `ReadBlob(file_digest) → stream<bytes>`. `GetDirectory` with `recursive=true` BFS-walks the subtree server-side and streams every `Directory` body in one RPC, deduped on digest. `ReadBlob` resolves `file_digest → (nar_hash, nar_offset)` via the `file_blobs` table and streams the file content sliced from the underlying chunks — a snix-compatible client can substitute from rio-store holding only digests, without knowing rio's chunk layout. A delta-sync client (gateway substituter, inter-region replicator) syncing a closure to a target that already holds most of it:
 
 1. Sends `HasDirectories([root_digest, ...])` for the closure's roots.
 2. For each `false`, fetches the `Directory`, recurses into child `dir_digest`s with another `HasDirectories` batch.
@@ -186,7 +177,7 @@ The castore RPC surface is `GetDirectory(digest) → Directory`, `HasDirectories
 
 Unchanged subtrees — typically the vast majority of a closure after an incremental rebuild — are pruned in O(1) RPCs at the subtree root. Sync bandwidth and RPC count scale with the *change*, not the closure. **Delta-sync requires a rio-aware receiver** (a rio-store replica or a host running rio-gateway as a local proxy) — a stock Nix client without `HasDirectories` falls through to the narinfo/NAR binary-cache path.
 
-This layer has zero cost on the builder serving path: the mount stack and digest-FUSE never consult `dir_digest`. It exists for rio-store as a distribution substrate.
+This layer is **load-bearing on both paths**: the builder's castore-FUSE prefetches it via `GetDirectory(recursive=true)` at mount time and serves `lookup`/`readdir` from the resulting tree (`r[builder.fs.castore-dag-source]`); delta-sync walks it via `HasDirectories`/`GetDirectory`. Same DAG, two consumers.
 
 ## 9. Tiered chunk backend
 
@@ -251,23 +242,21 @@ With compat enabled and at least one `nix-cache-info` object present at the buck
 
 ## 11. Privilege boundary
 
-r[builder.mountd.erofs-handoff]
+r[builder.mountd.fuse-handoff]
 r[builder.fs.fd-handoff-ordering]
 
-The builder pod runs unprivileged with no device mounts. EROFS lacks `FS_USERNS_MOUNT` and `/dev/fuse` is not openable from the pod, so a node-level `rio-mountd` DaemonSet (host PID namespace, `CAP_SYS_ADMIN`) does the two privileged operations and nothing else:
+The builder pod runs unprivileged with no device mounts. `/dev/fuse` is not openable from the pod and `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN`, so a node-level `rio-mountd` DaemonSet (host PID namespace, `CAP_SYS_ADMIN`) does the privileged operations and nothing else:
 
 | Step | Actor | Action |
 |---|---|---|
-| 1 | rio-mountd | `fuse_fd = open("/dev/fuse")`; **keep a `dup()`**; `mount("fuse", "/var/rio/objects/{build_id}", …, "fd=N,…")`; send fd over UDS via `SCM_RIGHTS` |
-| 2 | builder | receive fuse fd; spawn digest-FUSE server on it (`fuser::Session::from_fd`) |
-| 3 | rio-mountd | `fsopen("erofs")`; `fsconfig(FSCONFIG_SET_FLAG, "ro")`; `fsconfig(…, "source", image)`; `fsconfig(CMD_CREATE)`; `fsmount()`; send detached-mount fd |
-| 4 | builder | `move_mount(erofs_fd, "", AT_FDCWD, meta_mnt, MOVE_MOUNT_F_EMPTY_PATH)` |
-| 5 | builder (in own userns) | `mount("overlay", merged, "overlay", 0, "userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<meta_mnt>::<objects_dir>")`; bind `merged` → `/nix/store` |
+| 1 | rio-mountd | `fuse_fd = open("/dev/fuse")`; **keep a `dup()`**; `mount("fuse", "/var/rio/castore/{build_id}", …, "fd=N,allow_other,default_permissions,…")`; send fd over UDS via `SCM_RIGHTS` |
+| 2 | builder | receive fuse fd; spawn castore-FUSE server on it (`fuser::Session::from_fd`) |
+| 3 | builder (in own userns) | `mount("overlay", merged, "overlay", 0, "userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>")`; bind `merged` → `/nix/store` |
 | per-open | builder → rio-mountd | `BackingOpen{cache_fd}` over UDS (`SCM_RIGHTS`) → mountd `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` → reply `backing_id`. `BackingClose{id}` on release. mountd does not inspect the fd — the ioctl rejects depth>0 backing, and `backing_id` is conn-scoped. |
 | per-promote | builder → rio-mountd | `Promote{digest}` → mountd opens `staging/<digest>`, stream-copies into mountd-owned `cache/ab/<digest>.promoting` while hashing, verifies `blake3 == digest`, renames into place, unlinks staging. |
-| teardown | rio-mountd | on UDS close: `umount2(objects_dir, MNT_DETACH)`; `rm -rf staging/{build_id}`; `rmdir`; drop kept fuse-fd. Builder mount-ns death drops overlay+erofs. On daemon start: scan `/var/rio/objects/*` + `/var/rio/staging/*` and reap orphans (`r[builder.mountd.orphan-scan]`). |
+| teardown | rio-mountd | on UDS close: `umount2(castore_mnt, MNT_DETACH)`; `rm -rf staging/{build_id}`; `rmdir`; drop kept fuse-fd. Builder mount-ns death drops overlay. On daemon start: scan `/var/rio/castore/*` + `/var/rio/staging/*` and reap orphans (`r[builder.mountd.orphan-scan]`). |
 
-**Ordering is load-bearing:** the digest-FUSE server must be answering before step 5. overlayfs probes each lower's root at `mount(2)`; an unserved FUSE there deadlocks the mount syscall. The `fsconfig "ro"` flag must precede `CMD_CREATE` (it is a superblock flag; `MOUNT_ATTR_RDONLY` on `fsmount` is per-mount and does not stop EROFS opening the loop device read-write).
+**Ordering is load-bearing:** the castore-FUSE server must be answering before step 3. overlayfs probes the lower's root at `mount(2)`; an unserved FUSE there deadlocks the mount syscall.
 
 `rio-mountd` holds, per build, the UDS connection, a dup of that build's `/dev/fuse` fd, and the staging dirfds; ~250 LoC. Requests carry a `seq: u32` echoed in replies (so `spawn_blocking` `Promote` can reply out-of-order); errors are typed (`DigestMismatch`/`NotRegular`/`TooLarge` are build-fatal, `Retryable(..)` is infra-retry). The UDS socket is mode 0660 group `rio-builder`; mountd checks `SO_PEERCRED.gid` and rejects others. It is a strictly smaller privileged surface than the pre-ADR-022 model, where the builder pod itself held `CAP_SYS_ADMIN`. The brokered `BACKING_OPEN` registers an fd the builder already holds (conn-scoped, depth-0-only); `Promote` is the integrity boundary for the shared cache.
 
@@ -275,23 +264,23 @@ The builder pod runs unprivileged with no device mounts. EROFS lacks `FS_USERNS_
 
 r[builder.fs.file-digest-integrity]
 
-Per-file integrity is enforced in the digest-FUSE handler, not by the kernel:
+Per-file integrity is enforced in the castore-FUSE `open()` handler, not by the kernel:
 
 - **Per-chunk:** every chunk arriving from `GetChunks` is blake3-verified against its content address before its bytes are written to `.partial` or served to a `read()`. The handler never serves an unverified byte.
 - **Whole-file (builder-side):** `blake3(file) == file_digest` is checked before `Promote` (small files: before `open()` returns; streamed files: at fill completion). A mismatch fails the build with an infrastructure error and discards the staging file.
 - **Whole-file (mountd-side):** `Promote` independently re-hashes during the copy into cache and rejects on mismatch. This is the boundary that keeps the shared cache trustworthy against a compromised builder.
 
-composefs's native fs-verity-in-metacopy integrity does **not** apply here. overlayfs validates it via the in-kernel `fsverity_get_digest()` API, which reads `inode->i_verity_info`; FUSE's fs-verity support (kernel ≥6.10, [`9fe2a036`](https://git.kernel.org/linus/9fe2a036a23ceeac402c4fde8ec37c02ab25f133)) is ioctl-forwarding only and never populates that — overlayfs sees no measurement on a FUSE lower. A daemon-supplied measurement would in any case be no stronger than the daemon-side blake3 above. The threat model is unchanged from the pre-ADR-022 FUSE store: the builder is the FUSE server and is already trusted not to corrupt its own build. The path to genuine kernel-side verification is making the data-only lower a real ext4/xfs hostPath with fs-verity enabled on materialized files — see the implementation plan's deferred list.
+fs-verity is **not** used. FUSE's fs-verity support (kernel ≥6.10, [`9fe2a036`](https://git.kernel.org/linus/9fe2a036a23ceeac402c4fde8ec37c02ab25f133)) is ioctl-forwarding only and never populates `inode->i_verity_info`, so neither overlayfs's `ovl_validate_verity()` nor any other in-kernel consumer can use it; and a daemon-supplied measurement would be no stronger than the daemon-side blake3 above. The threat model is unchanged from the pre-ADR-022 FUSE store: the builder is the FUSE server and is already trusted not to corrupt its own build. The path to genuine kernel-side verification is making the backing cache a real ext4/xfs hostPath with fs-verity enabled on materialized files — see the implementation plan's deferred list.
 
 ## 13. Failure modes
 
 | Failure | Kernel/stack behavior | rio handling |
 |---|---|---|
-| digest-FUSE handler crash | next `open()` → `ENOTCONN`; **passthrough-opened files keep working** (kernel holds the backing fd); streaming-mode opens lose their `read` server | supervisor respawns; in-flight streaming build fails `EIO`. No D-state, no recovery protocol. |
-| digest-FUSE hung mid-fetch | `open()` blocks in `S` (interruptible) | per-spawn `tokio::timeout` returns `EIO`; build classified infrastructure-failure (`r[builder.result.input-eio-is-infra]`) and re-queued |
-| redirect target `ENOENT` | `open()` → `ENOENT` | only returned for digests outside the declared-input allowlist — correct behavior |
+| castore-FUSE handler crash | next `lookup`/`open()` → `ENOTCONN`; **passthrough-opened files keep working** (kernel holds the backing fd); streaming-mode opens lose their `read` server | supervisor respawns; in-flight streaming build fails `EIO`. No D-state, no recovery protocol. |
+| castore-FUSE hung mid-fetch | `open()` blocks in `S` (interruptible) | per-spawn `tokio::timeout` returns `EIO`; build classified infrastructure-failure (`r[builder.result.input-eio-is-infra]`) and re-queued |
+| `lookup` `ENOENT` | overlay caches negative dentry; subsequent probes 0-upcall | only returned for names outside the declared-input tree — correct behavior |
 | chunk integrity mismatch | n/a (userspace) | fetch aborted, `.partial` discarded, build fails infrastructure-error |
-| rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan detaches stale `objects/{build_id}` mounts |
+| rio-mountd crash | existing mounts unaffected; new build-starts block on UDS connect | DaemonSet restarts; start-up orphan scan detaches stale `castore/{build_id}` mounts |
 | Express cache tier unavailable | n/a | `TieredChunkBackend` falls back to direct S3-standard reads; metric `rio_store_tiered_local_hit_ratio` drops |
 | PostgreSQL unavailable | n/a | rio-store gRPC + HTTP surfaces fail (no manifests, no narinfo). With `binary_cache_compat` enabled, clients substitute directly from `s3://bucket` (stock-Nix path); with it disabled, nothing substitutes until PG recovers. |
 | compat S3 write fails post-commit | n/a | `PutPath` succeeds; `rio_store_compat_write_failures_total` increments; reconciler picks the path up on its next sweep |
@@ -299,19 +288,9 @@ composefs's native fs-verity-in-metacopy integrity does **not** apply here. over
 
 r[builder.fs.fetch-circuit]
 
-A circuit breaker on the digest-FUSE fetch path trips on sustained rio-store unreachability and fails the build fast rather than letting every `open()` time out individually.
+A circuit breaker on the castore-FUSE fetch path trips on sustained rio-store unreachability and fails the build fast rather than letting every `open()` time out individually.
 
-## 14. Encoder
-
-r[builder.fs.composefs-encode]
-r[builder.fs.stub-isize]
-r[builder.fs.metacopy-xattr-shape]
-
-The EROFS metadata image is produced in-process by [`libcomposefs`](https://github.com/containers/composefs) (the C library podman/ostree ship; `Apache-2.0`) via Rust FFI. rio's adapter (~80 LoC) walks the closure's merged `NarIndex` calling `lcfs_node_new()` / `lcfs_node_set_{mode,size,mtime,payload}()` / `lcfs_node_add_child()` per entry, then `lcfs_write_to(memfd)`. The library is built from a nix-patched `pkgs.composefs`: a ~25-line patch adds `LCFS_BUILD_USER_XATTR_OVERLAY` (emit `user.overlay.*` instead of `trusted.*`) and `LCFS_FLAGS_NO_ROOT_WHITEOUTS` (skip the 256 OCI whiteout chardevs + root opaque). With both flags set the output carries only `user.*` xattrs and no root chardevs — clean, no workarounds.
-
-No staging directory, no subprocess. The image is regenerable and need not be persisted; builders may cache it on node SSD keyed by closure hash.
-
-## 15. Observability
+## 14. Observability
 
 r[obs.metric.digest-fuse]
 r[obs.metric.chunk-backend-tiered]
@@ -320,9 +299,9 @@ r[obs.metric.compat]
 | Metric | Meaning |
 |---|---|
 | `rio_builder_digest_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{hit="node_ssd"\|"remote", streamed="0"\|"1"}` |
-| `rio_builder_digest_fuse_fetch_bytes_total` | bytes fetched from rio-store on behalf of digest-FUSE, labeled `{hit}` |
-| `rio_builder_digest_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"open"\|"read"}` |
-| `rio_builder_composefs_encode_seconds` | metadata-image generation time per build |
+| `rio_builder_digest_fuse_fetch_bytes_total` | bytes fetched from rio-store on behalf of castore-FUSE, labeled `{hit}` |
+| `rio_builder_digest_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
+| `rio_builder_castore_dag_prefetch_seconds` | `GetDirectory(recursive)` wall-clock per build |
 | `rio_store_tiered_local_hit_ratio` | Express-tier hits ÷ total `get()` per replica |
 | `rio_store_compat_write_seconds` (histogram) | wall-clock for the post-commit narinfo+NAR S3 write, labeled `{result="ok"\|"err"}` |
 | `rio_store_compat_write_failures_total` | compat writes that failed post-commit (reconciler backlog) |
@@ -336,35 +315,32 @@ r[obs.metric.compat]
 | `rio_mountd_connections_current` (gauge) | live UDS connections (== builds on this node) |
 | `rio_mountd_cache_free_bytes` (gauge) | `statvfs(cache_dir)` free, sampled at LRU-sweep interval |
 
-The mount stack's hot path is page cache + overlayfs + EROFS; kernel-side latency is observable via the upstream `tracepoint:{erofs,overlayfs,fuse}:*` events without rio-specific instrumentation.
+The mount stack's hot path is page cache + overlayfs; kernel-side latency is observable via the upstream `tracepoint:{overlayfs,fuse}:*` events without rio-specific instrumentation.
 
-## 16. Platform requirements
+## 15. Platform requirements
 
-r[infra.node.kernel-composefs]
+r[infra.node.kernel-fuse-passthrough]
 
-- **Kernel ≥ 6.16** — [`5ef7bcdeecc9`](https://git.kernel.org/linus/5ef7bcdeecc9) makes overlayfs honor data-only-lower redirects under `userxattr`.
-- **Kernel ≥ 5.2** — `fsopen`/`fsconfig`/`fsmount`/`move_mount` syscalls (subsumed by the above).
-- `CONFIG_EROFS_FS=y`, `CONFIG_OVERLAY_FS=y`, `CONFIG_FUSE_FS=y`, `CONFIG_FUSE_PASSTHROUGH=y`. All stock-on; the NixOS node module sets `=y` over `=m` and asserts the kernel version at boot. **No** `EROFS_FS_ONDEMAND`, no `CACHEFILES*`.
+- **Kernel ≥ 6.9** — `FUSE_PASSTHROUGH` ([`7dc4e97a4f9a`](https://git.kernel.org/linus/7dc4e97a4f9a)).
+- `CONFIG_OVERLAY_FS=y`, `CONFIG_FUSE_FS=y`, `CONFIG_FUSE_PASSTHROUGH=y`. All stock-on; the NixOS node module sets `=y` over `=m` and asserts the kernel version at boot.
 - `r[builder.fs.passthrough-stack-depth]`: the node-SSD backing cache (`/var/rio/cache/`) must be a non-stacking filesystem (ext4/xfs hostPath). FUSE with `max_stack_depth=1` under overlay reaches `FILESYSTEM_MAX_STACK_DEPTH=2`; a stacking fs as backing would exceed it.
-- Nix-patched `pkgs.composefs` providing `libcomposefs.so` (`nix/patches/libcomposefs-user-xattr.patch`); `bindgen` + `clang` at build time for the `-sys` crate.
 - `/dev/fuse` reachable by `rio-mountd` (host device); **not** mounted into builder pods.
 
-## 17. Normative requirements index
+## 16. Normative requirements index
 
 The `r[...]` markers appearing in this document and in [ADR-022 §2](./022-lazy-store-fs-erofs-vs-riofs.md) are the spec-traceability anchors for `tracey`. Each has exactly one `// r[impl ...]` site and at least one `# r[verify ...]` site; `tracey query rule <id>` lists them.
 
 | Domain | Markers |
 |---|---|
-| Mount stack | `builder.fs.composefs-stack` · `builder.fs.userxattr-mount` · `builder.fs.fd-handoff-ordering` · `builder.overlay.composefs-lower` |
-| Encoder | `builder.fs.composefs-encode` · `builder.fs.stub-isize` · `builder.fs.metacopy-xattr-shape` |
-| digest-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.digest-resolve` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` |
-| Privilege | `builder.mountd.erofs-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` |
+| Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
+| castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.digest-resolve` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` |
+| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.promote-verified` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
 | NAR index | `store.index.file-digest` · `store.index.nar-ls-offset` · `store.index.nar-ls-streaming` · `store.index.table-cascade` · `store.index.non-authoritative` · `store.index.sync-on-miss` · `store.index.putpath-eager` · `store.index.putpath-bg-warm` · `store.index.rpc` |
 | Directory DAG | `store.index.dir-digest` · `store.castore.canonical-encoding` · `store.castore.directory-rpc` · `store.castore.blob-read` · `store.castore.gc` · `store.castore.tenant-scope` · `gw.substitute.dag-delta-sync` |
 | Tiered backend | `store.backend.tiered-get-fallback` · `store.backend.tiered-put-remote-first` · `infra.express.cache-tier` · `infra.express.bounded-eviction` |
 | Transport | `store.chunk.batched-stream` · `proto.chunk.bytes-zerocopy` · `store.chunk.tonic-tuned` · `builder.fetch.batched-stream` |
-| Platform | `infra.node.kernel-composefs` |
+| Platform | `infra.node.kernel-fuse-passthrough` |
 | Observability | `obs.metric.digest-fuse` · `obs.metric.mountd` · `obs.metric.chunk-backend-tiered` · `obs.metric.express-eviction` · `obs.metric.compat` |
 | Binary-cache compat | `store.compat.runtime-toggle` · `store.compat.nar-on-put` · `store.compat.narinfo-on-put` · `store.compat.write-after-commit` · `store.compat.stock-nix-substitute` · `store.compat.gc-coupled` |
 | Chunked upload (§6) | `store.put.chunked` · `builder.upload.fused-walk` · `builder.upload.chunked-manifest` · `store.chunk.has-chunks-durable` · `store.chunk.self-verify` · `store.put.narhash-async` · `store.put.narhash-quarantine` · `store.put.builder-chunked-only` |
