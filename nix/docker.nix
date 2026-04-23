@@ -2,7 +2,7 @@
 #
 # Usage:
 #   nix build .#docker-gateway      # single image tarball at result
-#   nix build .#dockerImages        # all 6 at result/{gateway,scheduler,store,controller,builder,fetcher}.tar.zst
+#   nix build .#dockerImages        # all at result/{gateway,scheduler,store,controller,builder}.tar.zst
 #   docker load < result/gateway.tar.zst
 #   docker run rio-gateway:dev --help
 #
@@ -65,8 +65,8 @@ let
   # mismatch (e.g. 6 vs 9) silently defeats the warm — different
   # compressed bytes → different digest → full re-fetch, no error. The
   # executor-seed-layer-parity check catches drift between this and the
-  # actual builder/fetcher transcode; the push.rs cross-ref comment
-  # catches Rust↔Nix drift on review.
+  # actual builder transcode; the push.rs cross-ref comment catches
+  # Rust↔Nix drift on review.
   #
   # `-f oci` (manifest format): push.rs needs it for ECR (manifest-tool
   # builds an OCI image index from per-arch manifests). The seed's `oci:`
@@ -98,19 +98,28 @@ let
   # `oci:DIR:REF` (skopeo's oci-layout transport), then tar — NOT
   # `oci-archive:` directly. oci-archive: is single-manifest; the layout
   # transport is what supports the multi-ref dedup.
+  #
+  # gzip the tar: the OCI layout's config json blobs contain literal
+  # store paths (Env=["PATH=/nix/store/..."]) which Nix's reference
+  # scanner picks up — making the seed's closure include the full
+  # uncompressed image contents (glibc, util-linux, etc.) even though
+  # those are already INSIDE the compressed layer blobs. Compressing
+  # the outer tar masks the strings; `ctr image import` and k3s
+  # wharfie both auto-detect gzip.
   mkSeed =
     { name, images }:
-    pkgs.runCommand "rio-${name}-seed.oci.tar"
+    pkgs.runCommand "rio-${name}-seed.oci.tar.gz"
       {
         nativeBuildInputs = [
           pkgs.skopeo
           pkgs.gnutar
+          pkgs.gzip
         ];
       }
       ''
         d=$TMPDIR/oci
         ${lib.concatMapStrings ({ ref, archive }: ociSkopeoCopy archive "oci:$d:${ref}") images}
-        tar -C $d -cf $out .
+        tar -C $d -c . | gzip -1n > $out
       '';
 
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
@@ -124,8 +133,8 @@ let
   # gateway/controller/store) run unprivileged; K8s securityContext.
   # runAsUser enforces it (templates/_helpers.tpl rio.podSecurityContext
   # — PSA restricted). Image-level User is defense-in-depth for `docker
-  # run` without k8s. Builder/fetcher images do NOT set this — they need
-  # root for FUSE mount + overlay teardown (rio-builders/rio-fetchers
+  # run` without k8s. Builder image does NOT set this — it needs root
+  # for FUSE mount + overlay teardown (rio-builders/rio-fetchers
   # namespaces stay at PSA privileged per ADR-019).
   nonrootUser = "65532:65532";
   nonrootEtc = [
@@ -192,7 +201,7 @@ let
   builderExtraContents = [
     nixForBuilder # nix-daemon --stdio, spawned per-build
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
-    pkgs.util-linux # mount, umount for overlay teardown
+    pkgs.util-linuxMinimal # mount, umount for overlay teardown
 
     # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
     # It enumerates build users via getgrnam("nixbld")->gr_mem — the
@@ -232,7 +241,7 @@ let
       lib.makeBinPath [
         nixForBuilder
         pkgs.fuse3
-        pkgs.util-linux
+        pkgs.util-linuxMinimal
       ]
     }"
   ];
@@ -401,21 +410,16 @@ let
       # content-addresses layers, so shared deps (glibc, openssl, …)
       # still collapse into shared layers across images.
       bins,
-      # Override the image name independently of the entrypoint binary
-      # name. Used for the fetcher image: same rio-builder binary,
-      # different RIO_EXECUTOR_KIND env, distinct image name so k8s
-      # can pull rio-fetcher:dev separately from rio-builder:dev.
-      imageName ? "rio-${name}",
       # config.User. null → no User field (image runs as root). Control-
-      # plane images pass nonrootUser (65532:65532); builder/fetcher
-      # leave it null (need root for FUSE).
+      # plane images pass nonrootUser (65532:65532); builder leaves it
+      # null (needs root for FUSE).
       user ? null,
       extraContents ? [ ],
       extraEnv ? [ ],
       extraCommands ? "",
     }:
     buildZstd {
-      name = imageName;
+      name = "rio-${name}";
       extraCommands = derefEtc + extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
       # in K8s (never checks local store), which breaks airgap k3s.
@@ -497,7 +501,7 @@ rec {
   # them back into k8s Secrets. Public signing key goes to rio/signing-
   # key-pub so operators can read it without touching the private half.
   #
-  # Needs nix (nix-store --generate-binary-cache-key), awscli2, openssl.
+  # Needs nix-store (--generate-binary-cache-key), awscli2, openssl.
   # IRSA via the rio-bootstrap ServiceAccount gives it
   # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
   #
@@ -599,7 +603,7 @@ rec {
         pkgs.awscli2
         pkgs.openssl
         pkgs.openssh
-        pkgs.nix
+        nixForBuilder
         pkgs.bash
         pkgs.coreutils
       ];
@@ -617,7 +621,7 @@ rec {
             pkgs.awscli2
             pkgs.openssl
             pkgs.openssh
-            pkgs.nix
+            nixForBuilder
             pkgs.coreutils
           ]
         }"
@@ -640,35 +644,22 @@ rec {
     extraCommands = builderExtraCommands;
   };
 
-  # Fetcher: same rio-builder binary, RIO_EXECUTOR_KIND=fetcher env
-  # baked in per ADR-019 §Terminology. FOD-only, open egress,
-  # hash-check bounded. Same contents as builder (needs the same nix
-  # toolchain to run FOD fetchers like curl/git).
-  fetcher = mkImage {
-    name = "builder"; # Entrypoint is still /bin/rio-builder
-    imageName = "rio-fetcher";
-    bins = [ rio-crates.rio-builder ];
-    extraContents = builderExtraContents;
-    extraEnv = builderExtraEnv ++ [ "RIO_EXECUTOR_KIND=fetcher" ];
-    extraCommands = builderExtraCommands;
-  };
-
-  # ── AMI layer-cache warm: builder+fetcher as one OCI archive ──────────
+  # ── AMI layer-cache warm: builder image as an OCI archive ─────────────
   # r[impl infra.node.prebake-layer-warm]
   #
-  # PodSpec image refs stay <ECR>/rio-{builder,fetcher}:<git-sha> — this
-  # archive is NOT pulled. It's `ctr image import`ed into containerd's
-  # content store at AMI bake time (kubelet preStart, eks-node.nix) so
-  # the first pod's ECR pull finds most layer blobs already local and
-  # fetches only the delta (typically the ~10 MB rio-builder top layer,
-  # or zero if AMI and deploy are at the same commit).
+  # PodSpec image refs stay <ECR>/rio-builder:<git-sha> — this archive
+  # is NOT pulled. It's `ctr image import`ed into containerd's content
+  # store at AMI bake time (kubelet preStart, eks-node.nix) so the first
+  # pod's ECR pull finds most layer blobs already local and fetches only
+  # the delta (typically the ~10 MB rio-builder top layer, or zero if
+  # AMI and deploy are at the same commit).
   #
-  # builder and fetcher share every layer — only config.Env differs — so
-  # mkSeed's blob dedup yields ~124 MB not 2×114 MB. Ref names use
-  # seed.local/ so they're obviously not pull-addressable; the names are
-  # GC roots only (the io.cri-containerd.pinned label on them keeps
-  # kubelet image-GC from deleting the record, the record's existence
-  # keeps containerd content-GC from deleting the layer blobs).
+  # Fetcher pods use the same rio-builder image; the controller injects
+  # RIO_EXECUTOR_KIND per-pod (rio-controller pool reconciler), so one
+  # warm covers both. Ref names use seed.local/ so they're obviously not
+  # pull-addressable; the name is a GC root only (the io.cri-containerd.
+  # pinned label keeps kubelet image-GC from deleting the record, the
+  # record's existence keeps containerd content-GC from deleting blobs).
   executorSeed = mkSeed {
     name = "executor";
     images = [
@@ -676,47 +667,37 @@ rec {
         ref = "seed.local/rio-builder:prebaked";
         archive = builder;
       }
-      {
-        ref = "seed.local/rio-fetcher:prebaked";
-        archive = fetcher;
-      }
     ];
   };
 
   # The load-bearing check: executorSeed's layer-blob digests MUST equal
   # what push.rs would put in ECR, or the warm is a no-op. Re-runs the
-  # exact ociSkopeoCopy transform on builder/fetcher into a fresh dir and
-  # asserts every resulting blob digest is also in the seed. Catches:
+  # exact ociSkopeoCopy transform on builder into a fresh dir and asserts
+  # every resulting blob digest is also in the seed. Catches:
   #   - ociSkopeoCopyArgs drifted from what executorSeed used (refactor)
   #   - skopeo version bump changed zstd output (unlikely — Q9.2 verified
   #     bit-reproducible, but a defence)
   # Does NOT catch push.rs flag drift (Rust↔Nix); that's the
   # SKOPEO_OCI_ZSTD_ARGS cross-ref comment's job.
-  #
-  # Also asserts dedup actually happened: total blob count is ≤ layers+4
-  # (N shared layers + 2 configs + 2 manifests), not 2N+4. maxLayers=60
-  # bounds N; the check uses a generous ≤70 ceiling so a future
-  # maxLayers tweak doesn't spuriously fail it.
   executorSeedLayerParity =
     pkgs.runCommand "rio-executor-seed-layer-parity"
       {
         nativeBuildInputs = [
           pkgs.skopeo
           pkgs.gnutar
-          pkgs.jq
+          pkgs.gzip
         ];
       }
       # r[verify infra.node.prebake-layer-warm]
       ''
         set -euo pipefail
-        # Reference: what push.rs would produce (per-image, no dedup).
+        # Reference: what push.rs would produce.
         ${ociSkopeoCopy builder "oci:$TMPDIR/ref:builder"}
-        ${ociSkopeoCopy fetcher "oci:$TMPDIR/ref:fetcher"}
         ls $TMPDIR/ref/blobs/sha256 | sort > $TMPDIR/ref-digests
 
         # Seed: untar, list its blobs.
         mkdir $TMPDIR/seed
-        tar -C $TMPDIR/seed -xf ${executorSeed}
+        tar -C $TMPDIR/seed -xzf ${executorSeed}
         ls $TMPDIR/seed/blobs/sha256 | sort > $TMPDIR/seed-digests
 
         # Parity: every reference blob must be in the seed. comm -23
@@ -729,36 +710,17 @@ rec {
           echo "  reference transcode, or skopeo's zstd output changed." >&2
           exit 1
         fi
-
-        # Dedup: builder+fetcher share all layers, so seed blob count
-        # should be ~N+4 not ~2N+4. Reference dir (no dedup across the
-        # two copies into the SAME layout — actually it does dedup too,
-        # since blobs/sha256 is content-addressed). Compare against the
-        # manifests' declared layer counts instead.
-        n_layers=$(jq -s '[.[].layers[]] | unique | length' \
-          $(jq -r '.manifests[].digest | sub("sha256:";"")' $TMPDIR/seed/index.json \
-            | sed "s|^|$TMPDIR/seed/blobs/sha256/|"))
-        n_blobs=$(wc -l < $TMPDIR/seed-digests)
-        echo "seed: $n_blobs blobs, $n_layers unique layers across 2 manifests"
-        # N layers + 2 configs + 2 manifests. Allow slack of 2 for index
-        # blobs some skopeo versions emit.
-        if [ "$n_blobs" -gt "$((n_layers + 6))" ]; then
-          echo "FAIL: seed has $n_blobs blobs but only $n_layers unique" >&2
-          echo "  layers — dedup did not collapse builder∩fetcher." >&2
-          exit 1
-        fi
-
         echo OK > $out
       '';
 
-  # ── VM-test seed: all 6 per-component images, one OCI archive ────────
-  # k3s airgap-imports serially before kubelet starts — six per-component
+  # ── VM-test seed: all per-component images, one OCI archive ──────────
+  # k3s airgap-imports serially before kubelet starts — per-component
   # docker-archives would decompress back-to-back (~125s wall under TCG,
-  # k3s-full.nix:280) and re-expand the same shared layers six times.
-  # mkSeed packs all six manifests into ONE oci-layout tarball with
+  # k3s-full.nix:280) and re-expand the same shared layers each time.
+  # mkSeed packs all manifests into ONE oci-layout tarball with
   # blob-level dedup, so the import is one decompress pass over
   # union(layers). k3s's agent-images preload (services.k3s.images)
-  # walks index.json and registers all six refs; pods then reference
+  # walks index.json and registers all refs; pods then reference
   # `rio-<component>:dev` directly with no `command:` override.
   #
   # Replaces the former `all` aggregate (one image, all binaries, no
@@ -790,7 +752,6 @@ rec {
         (dev "store" store)
         (dev "controller" controller)
         (dev "builder" builder)
-        (dev "fetcher" fetcher)
       ];
     };
 }
@@ -817,12 +778,6 @@ rec {
     contents = [
       pkgs.nginx
       rioDashboard
-      # busybox+curl for from-pod gRPC-Web test assertions
-      # (vm-dashboard-k3s exec's into this pod to curl the
-      # cilium-gateway Service from pod-netns — Cilium's selectorless
-      # per-Gateway Service has no host-netns reachability path).
-      pkgs.busybox
-      pkgs.curl
     ];
     config = {
       Cmd = [

@@ -622,7 +622,7 @@
               system = nodeSystem;
               specialArgs = {
                 pins = import ./nix/pins.nix;
-                # Layer-cache warm for ephemeral builder/fetcher pods
+                # Layer-cache warm for ephemeral executor pods
                 # (PLAN-PREBAKE / r[infra.node.prebake-layer-warm]).
                 # self.packages.${nodeSystem} is safe inside perSystem
                 # — flake-parts resolves the cross-arch attr without
@@ -1136,15 +1136,14 @@
             docker-scheduler = dockerImages.scheduler;
             docker-store = dockerImages.store;
             docker-builder = dockerImages.builder;
-            docker-fetcher = dockerImages.fetcher;
             docker-controller = dockerImages.controller;
             docker-bootstrap = dockerImages.bootstrap;
             docker-dashboard = dockerImages.dashboard;
-            # AMI layer-cache seed (oci-archive tarball, both
-            # builder+fetcher refs). NOT pushed to ECR — baked into
-            # the NixOS node AMI's containerd content store.
+            # AMI layer-cache seed (oci-archive tarball, builder ref;
+            # fetcher pods use the same image). NOT pushed to ECR —
+            # baked into the NixOS node AMI's containerd content store.
             docker-executor-seed = dockerImages.executorSeed;
-            # k3s VM-test seed (oci-archive tarball, all 6 component
+            # k3s VM-test seed (oci-archive tarball, all component
             # refs, deduped layers). NOT pushed to ECR — preloaded via
             # services.k3s.images in nix/tests/fixtures/k3s-full.nix.
             # Replaces the former docker-all aggregate (W1: that image

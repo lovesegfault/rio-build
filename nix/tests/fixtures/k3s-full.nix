@@ -207,10 +207,10 @@ let
   # (especially scheduler.replicas=2 antiAffinity). fod-proxy/bootstrap
   # excluded (disabled in vmtest-full.yaml).
   #
-  # vmTestSeed is ONE multi-manifest oci-archive (six rio-<component>:dev
+  # vmTestSeed is ONE multi-manifest oci-archive (rio-<component>:dev
   # refs, blob-deduped layers). k3s imports serially before kubelet — one
-  # tarball decompress registers all six refs, vs six per-component
-  # docker-archives that would re-expand the same shared layers six times.
+  # tarball decompress registers all refs, vs per-component
+  # docker-archives that would re-expand the same shared layers each time.
   # Per-component refs mean vmtest-full.yaml uses each image's own
   # Entrypoint (no `command:` override). Replaces the former `all`
   # aggregate (one image, all binaries) — see nix/docker.nix vmTestSeed.

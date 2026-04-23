@@ -856,8 +856,8 @@ in
   # nonpriv overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered via systemd-tmpfiles (k3sBase, same as the NixOS
   # AMI). The kind=Fetcher pool is enabled via extraValuesFiles with
-  # name="x86-64-fetcher" and image=rio-fetcher (per-component ref
-  # from the vmTestSeed preload). Systems
+  # name="x86-64-fetcher" (default rio-builder image; controller injects
+  # RIO_EXECUTOR_KIND per-pod). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # hard_filter(). nodeSelector/tolerations left
   # at reconciler defaults — scenario labels k3s-agent at runtime.
@@ -913,7 +913,6 @@ in
               maxConcurrent: 2
             - name: x86-64-fetcher
               kind: Fetcher
-              image: rio-fetcher
               # builtin:fetchurl FOD has system=builtin.
               systems: [x86_64-linux, builtin]
               maxConcurrent: 1

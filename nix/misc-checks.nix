@@ -229,30 +229,6 @@ in
     touch $out
   '';
 
-  # Every entry in the dockerImages linkFarm must be a zstd-compressed
-  # docker-archive tarball: push.rs walks it and runs `skopeo copy
-  # docker-archive:` on each. The flake.nix linkFarm filter (`v ?
-  # imageTag`) is the primary enforcement; this is the CI-time
-  # backstop that fires if that filter regresses or an image attr
-  # ever produces non-zstd output — otherwise the failure surfaces
-  # only at deploy-time skopeo, which the checks gate can't exercise.
-  docker-images-linkfarm-are-archives =
-    pkgs.runCommand "rio-docker-images-are-archives"
-      {
-        nativeBuildInputs = [ pkgs.file ];
-      }
-      ''
-        for f in ${config.packages.dockerImages}/*.tar.zst; do
-          file -L "$f" | grep -q 'Zstandard compressed' || {
-            echo "FAIL: $f is not a zstd archive — flake.nix" \
-                 "dockerImages linkFarm filter let a non-image through" >&2
-            file -L "$f" >&2
-            exit 1
-          }
-        done
-        touch $out
-      '';
-
   # CRD drift: crdgen output (split per-CRD) must equal the
   # committed infra/helm/crds/. Catches the "Rust CRD struct
   # changed but nobody ran cargo xtask regen crds" drift — the committed

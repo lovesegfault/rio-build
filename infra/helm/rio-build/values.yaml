@@ -723,7 +723,6 @@ pools:
     systems: [x86_64-linux, i686-linux]
   - name: x86-64-fetcher
     kind: Fetcher
-    image: rio-fetcher
     # `builtin` so the spawn-signal intent is self-describing.
     systems: [x86_64-linux, i686-linux, builtin]
     # null-clear so the reconciler injects the rio.build/fetcher default
@@ -737,7 +736,7 @@ pools:
   # Multi-arch: add per-arch entries (EKS deploy.rs does this via
   # --set-json pools):
   #   - {name: aarch64, kind: Builder, systems: [aarch64-linux]}
-  #   - {name: aarch64-fetcher, kind: Fetcher, image: rio-fetcher,
+  #   - {name: aarch64-fetcher, kind: Fetcher,
   #      systems: [aarch64-linux, builtin], tolerations: null,
   #      nodeSelector: {rio.build/node-role: fetcher, kubernetes.io/arch: arm64}}
 
@@ -749,8 +748,9 @@ pools:
 #
 # kind=Fetcher entries SHOULD NOT inherit privileged/hostUsers/
 # seccompProfile (CRD CEL rejects them at admission); the reconciler
-# forces ADR-019 hardening regardless. Fetcher entries override
-# `image: rio-fetcher` and (typically) `nodeSelector`.
+# forces ADR-019 hardening regardless. Fetcher entries typically override
+# `nodeSelector`; image stays `rio-builder` (controller injects
+# RIO_EXECUTOR_KIND per-pod).
 poolDefaults:
   enabled: false
   features: []

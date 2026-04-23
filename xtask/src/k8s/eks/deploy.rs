@@ -41,11 +41,11 @@ const POOLS_JSON: &str = r#"[
    "features":["kvm","nixos-test","big-parallel"],"maxConcurrent":10},
   {"name":"aarch64-kvm","kind":"Builder","systems":["aarch64-linux"],
    "features":["kvm","nixos-test","big-parallel"],"maxConcurrent":10},
-  {"name":"x86-64-fetcher","kind":"Fetcher","image":"rio-fetcher",
+  {"name":"x86-64-fetcher","kind":"Fetcher",
    "systems":["x86_64-linux","i686-linux","builtin"],
    "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"amd64"}},
-  {"name":"aarch64-fetcher","kind":"Fetcher","image":"rio-fetcher",
+  {"name":"aarch64-fetcher","kind":"Fetcher",
    "systems":["aarch64-linux","builtin"],
    "privileged":null,"hostUsers":null,"seccompProfile":null,"tolerations":null,
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}
