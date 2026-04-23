@@ -37,3 +37,32 @@ behaviour as the feature.
       is that still the intended threat-model posture?
 - [ ] Every content-hash / `solve_relevant_hash` that covers the
       field: does it hash the per-axis trust booleans?
+
+## Witness-flag completeness
+
+A `for { if X { continue } if Y { continue } … }` loop where the
+post-loop logic depends on **which** `continue` fired is a finding.
+Convert the body to `-> Result<T, RejectReason>` and fold reasons
+explicitly.
+
+**Why:** open-coded witness flags must be set at every `continue`, and
+each new gate must remember to set one. r2 bug_039 added
+`any_lambda_gated` / `any_envelope_gated` to `solve_full`'s 5-`continue`
+per-cell loop and instrumented 2 of them; r3 merged_bug_019 found the
+other 3 (`c_lo > cap_c`, mem/disk ceiling, `smallest_fitting=None`)
+left both flags unset, mislabelling `DiskCeiling` as
+`InterruptRunaway`. Same shape as r1 merged_bug_013 ("registered ≠
+emitted") and r2 merged_bug_006 ("3/4 reasons dead"): an enum domain is
+declared, N sites must populate it, M<N do.
+
+**Structural close:** extract the loop body as `fn evaluate_one(...) ->
+Result<Ok, RejectReason>` where `RejectReason` is an exhaustive enum
+with one variant per gate. The loop becomes `match evaluate_one(...) {
+Ok(x) => oks.push(x), Err(r) => rejects.push(r) }`; the post-loop fold
+is a `fn classify(rejects: &[RejectReason]) -> Label`. A new gate = new
+variant = `classify`'s match is non-exhaustive = compile error. Pair
+with a table-driven test (`const FIXTURES: &[(&[RejectReason], Label)]`)
+that asserts each `Label` variant is reachable AND the converse (any
+`{non-target}` reject → never `{target}`). Emit-site existence tests
+(r2 CR-2) don't catch "fires when it shouldn't"; the fixture table
+does.
