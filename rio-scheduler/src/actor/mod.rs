@@ -297,10 +297,11 @@ pub struct DagActor {
     /// per-dispatch read-time mask (`A \ masked`) is applied in
     /// `solve_intent_for` AFTER reading the memo, so unmasking is free.
     pub(crate) ice: Arc<crate::sla::cost::IceBackoff>,
-    /// Per-key admissible-set memo. `solve_full` is deterministic
-    /// given `(fit_hash, override_hash, inputs_gen)` so most
-    /// `compute_spawn_intents` ticks are pure cache hits (ADR-023
-    /// L616). `bump_inputs_gen()` is called from `tick_refresh_sla`
+    /// Per-key admissible-set memo. Keyed on `(model_key_hash,
+    /// override_hash)`; `(inputs_gen, fit_content_hash)` are staleness
+    /// fields, so most `compute_spawn_intents` ticks are pure cache
+    /// hits (ADR-023 L616). `bump_inputs_gen()` is called from
+    /// `tick_refresh_sla`
     /// after `HwTable`/`CostTable` refresh and from `apply_config`
     /// on `[sla]` reload.
     pub(crate) solve_cache: Arc<crate::sla::solve::SolveCache>,

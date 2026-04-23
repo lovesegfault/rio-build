@@ -1703,11 +1703,11 @@ async fn ice_mask_is_read_time() {
     );
 }
 
-/// `r[sched.sla.hw-class.epsilon-explore]`: per-dispatch ε_h draw
-/// pins `h_explore ∈ H\A` (or `H\{argmin price}` on miss / A=H) and
-/// the resulting affinity is `⊆ {h_explore}×{spot,od}`. The memo is
-/// never overwritten.
-// r[verify sched.sla.hw-class.epsilon-explore]
+/// `r[sched.sla.hw-class.epsilon-explore]`: ε_h draw is a pure
+/// function of `(drv_hash, inputs_gen)`, pins `h_explore ∈ H\A` (or
+/// `H\{argmin price}` on miss / A=H), and the resulting affinity is
+/// `⊆ {h_explore}×{spot,od}`. The memo is never overwritten.
+// r[verify sched.sla.hw-class.epsilon-explore+2]
 #[tokio::test]
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1717,7 +1717,7 @@ async fn epsilon_h_draws_outside_a() {
     // Baseline at ε=0 (bare_actor_hw default) so the memo is the
     // unrestricted solve, not an ε_h hit.
     let baseline = actor.solve_intent_for(actor.dag.node("d").unwrap());
-    actor.sla_config.hw_explore_epsilon = 0.2; // max — high hit rate
+    actor.sla_config.hw_explore_epsilon = 0.2; // max
     let in_a: std::collections::HashSet<String> = baseline
         .node_affinity
         .iter()
@@ -1732,10 +1732,35 @@ async fn epsilon_h_draws_outside_a() {
         actor.sla_config.hw_classes.keys().cloned().collect();
     assert_ne!(in_a, h_all, "fixture: distinct factors ⇒ A⊊H");
 
-    // 200 dispatches: every ε_h hit emits ≤2 terms over a single h.
+    // ── Determinism (bug_049 regression) ───────────────────────────
+    // Same (drv_hash, inputs_gen) → identical affinity across 10
+    // calls. Before the fix, `rand::rng()` re-rolled per call →
+    // selector-drift reap churn.
+    let first = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    for _ in 0..10 {
+        let again = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        assert_eq!(
+            again.node_affinity, first.node_affinity,
+            "ε_h draw is deterministic for fixed (drv_hash, inputs_gen)"
+        );
+    }
+    // inputs_gen bump → re-roll permitted (the seed changes).
+    actor.solve_cache.bump_inputs_gen();
+    let after_bump = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    for _ in 0..10 {
+        let again = actor.solve_intent_for(actor.dag.node("d").unwrap());
+        assert_eq!(
+            again.node_affinity, after_bump.node_affinity,
+            "still deterministic at the new generation"
+        );
+    }
+    // 200 distinct drv_hashes at ε=0.2 → ~40 expected hits; every hit
+    // emits ≤2 terms over a single h ∉ A.
     let mut explore_hits = 0;
-    for _ in 0..200 {
-        let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    for i in 0..200 {
+        let dh = format!("d{i}");
+        actor.test_inject_ready(&dh, Some("test-pkg"), "x86_64-linux", false);
+        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap());
         let hs: std::collections::HashSet<String> = intent
             .node_affinity
             .iter()
@@ -1756,7 +1781,7 @@ async fn epsilon_h_draws_outside_a() {
     }
     // ε=0.2, 200 trials → ~40 expected; ≥10 with overwhelming prob.
     assert!(explore_hits >= 10, "ε_h fires: got {explore_hits}/200");
-    // Memo unchanged across all draws.
+    // Memo unchanged across all draws (one ModelKey, one override).
     assert_eq!(actor.solve_cache.len(), 1);
 
     // ── Fallback branch: in_a=∅ OR A=H → H\{argmin price} ──────────
@@ -1800,8 +1825,10 @@ async fn epsilon_h_draws_outside_a() {
     assert_eq!(in_a2, h_all, "fixture: equal factors + prices in τ ⇒ A=H");
     actor.sla_config.hw_explore_epsilon = 0.2;
     let mut hits = 0;
-    for _ in 0..200 {
-        let intent = actor.solve_intent_for(actor.dag.node("d").unwrap());
+    for i in 0..200 {
+        let dh = format!("e{i}");
+        actor.test_inject_ready(&dh, Some("test-pkg"), "x86_64-linux", false);
+        let intent = actor.solve_intent_for(actor.dag.node(dh.as_str()).unwrap());
         let hs: std::collections::HashSet<String> = intent
             .node_affinity
             .iter()

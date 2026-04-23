@@ -568,7 +568,7 @@ impl DagActor {
     /// for override/probe/explore branches — it routes through
     /// [`solve::intent_for`] (hw-agnostic `solve_mvp`) and returns an
     /// empty affinity.
-    // r[impl sched.sla.hw-class.epsilon-explore]
+    // r[impl sched.sla.hw-class.epsilon-explore+2]
     // r[impl sched.sla.hw-class.ice-mask]
     #[tracing::instrument(
         level = "debug",
@@ -626,7 +626,11 @@ impl DagActor {
         // `hints` and would multi-core a `enableParallelBuilding=false`
         // build.
         let hw = self.sla_estimator.hw_table();
-        let h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
+        // Sorted: ε_h's seeded `pool.choose()` indexes into this Vec,
+        // so HashMap iteration order would otherwise leak into the
+        // "pure function of (drv_hash, inputs_gen)" contract.
+        let mut h_all: Vec<_> = self.sla_config.hw_classes.keys().cloned().collect();
+        h_all.sort_unstable();
         let full = (self.sla_config.hw_cost_source.is_some()
             && !h_all.is_empty()
             && !hw.is_empty()
@@ -648,12 +652,14 @@ impl DagActor {
                 return None;
             }
             let cost = self.cost_table.read().clone();
-            // Memo: deterministic given (fit_hash, override_hash,
-            // inputs_gen). The ε_h draw and ICE mask are applied AFTER
-            // reading the memo — per-dispatch, never overwriting it.
+            // Memo: keyed on (model_key_hash, override_hash); hit iff
+            // (inputs_gen, fit_content_hash) both match. The ε_h draw
+            // and ICE mask are applied AFTER reading the memo — never
+            // overwriting it.
             let memo = self.solve_cache.get_or_insert_with(
-                solve::fit_hash(f),
+                solve::model_key_hash(&f.key),
                 solve::override_hash(override_.as_ref()),
+                solve::fit_content_hash(f),
                 |prev_a| match solve::solve_full(
                     f,
                     &self.sla_tiers,
@@ -668,12 +674,28 @@ impl DagActor {
                     solve::SolveFullResult::BestEffort { .. } => None,
                 },
             );
-            // ε_h draw (per-dispatch, OUTSIDE memo): pin one h ∉ A
-            // (or H \ {argmin price} on miss / A=H), restrict the
-            // solve to `(h_explore, *)`, and emit ITS A' if feasible.
-            // The cached memo's `A` is read but never overwritten.
-            use rand::RngExt as _;
-            let mut rng = rand::rng();
+            // ε_h draw (OUTSIDE memo): pin one h ∉ A (or
+            // H \ {argmin price} on miss / A=H), restrict the solve
+            // to `(h_explore, *)`, and emit ITS A' if feasible. The
+            // cached memo's `A` is read but never overwritten.
+            //
+            // The draw is a **pure function of (drv_hash,
+            // inputs_gen)** — stable across every controller poll
+            // between `inputs_gen` bumps. `compute_spawn_intents`
+            // must be deterministic given (DAG state, fit cache,
+            // inputs_gen) or `reap_stale_for_intents` reaps an
+            // explore Job the next tick on a tails coin
+            // (selector-drift churn). ε_h re-rolls on `inputs_gen`
+            // bump, which is already the legitimate "selector may
+            // drift" signal.
+            use rand::{RngExt as _, SeedableRng};
+            let seed = {
+                use std::hash::{DefaultHasher, Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                state.drv_hash.as_str().hash(&mut h);
+                h.finish() ^ self.solve_cache.inputs_gen()
+            };
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             if h_all.len() > 1 && rng.random::<f64>() < self.sla_config.hw_explore_epsilon {
                 use rand::seq::IndexedRandom;
                 let in_a: std::collections::HashSet<_> = memo

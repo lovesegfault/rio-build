@@ -13,7 +13,7 @@ use super::fit::headroom;
 use super::hw::{HW_FACTOR_SANITY_FLOOR, HwTable};
 use super::r#override::ResolvedTarget;
 use super::quantile;
-use super::types::{DiskBytes, DurationFit, FittedParams, MemBytes, RawCores};
+use super::types::{DiskBytes, DurationFit, FittedParams, MemBytes, ModelKey, RawCores};
 
 /// `prefer_local_build = true` → trivially short. Smallest pod the
 /// controller will spawn.
@@ -666,9 +666,10 @@ fn hw_factor_for(fit: &FittedParams, hw: &HwTable, h: &str) -> f64 {
 ///
 /// **Deterministic** — the ICE mask and ε_h draw are applied at
 /// dispatch time outside this function (read-time mask), so the
-/// result is memoizable on `(fit_hash, override_hash, inputs_gen)`.
-/// `prev_a` (the previous tick's admissible set for THIS key) feeds
-/// the Schmitt deadband.
+/// result is memoizable on `(model_key_hash, override_hash)` with
+/// `(inputs_gen, fit_content_hash)` as staleness fields. `prev_a`
+/// (the previous tick's admissible set for THIS key) feeds the
+/// Schmitt deadband.
 ///
 /// `h_set` is `cfg.hw_classes.keys()` for the unrestricted solve;
 /// the ε_h pin passes a singleton.
@@ -752,33 +753,37 @@ pub fn solve_full(
             continue;
         }
         // Schmitt deadband: τ_enter for cells not in prev_A, τ_exit
-        // (=1.3τ) for cells already in.
+        // (=1.3τ) for cells already in. ONE closure, used at BOTH the
+        // admission filter and the cost re-filter — the argmax-survives
+        // proof below requires the two thresholds to agree per-cell.
         let e_min = candidates
             .iter()
             .map(|c| c.e_cost_upper)
             .fold(f64::INFINITY, f64::min);
+        let thresh = |cell: &Cell| {
+            if prev_a.contains(cell) {
+                1.0 + 1.3 * tau
+            } else {
+                1.0 + tau
+            }
+        };
         let in_a: Vec<&Candidate> = candidates
             .iter()
-            .filter(|c| {
-                let thresh = if prev_a.contains(&c.cell) {
-                    1.0 + 1.3 * tau
-                } else {
-                    1.0 + tau
-                };
-                c.e_cost_upper <= thresh * e_min
-            })
+            .filter(|c| c.e_cost_upper <= thresh(&c.cell) * e_min)
             .collect();
         // c* = max over A — SLA-correct on the slowest h ∈ A.
         let c_star = in_a.iter().map(|c| c.c_star).max().expect("e_min ∈ A");
         let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
-        // Re-filter at c*: type-fit, cost-at-c* ≤ (1+τ)E_min, and
-        // capacity-ratio c*_{h,cap} ≥ c*/k. The argmax cell has
+        // Re-filter at c*: type-fit, cost-at-c* ≤ thresh(cell)·E_min,
+        // and capacity-ratio c*_{h,cap} ≥ c*/k. The argmax cell has
         // c*_{h,cap} = c*, e_cost(c*) = e_cost_upper, and was admitted
         // by smallest_fitting at its own c* ≤ c* — but a larger
         // shared c* MAY exceed its menu, so the argmax-survives proof
         // relies on the e_cost(c*) check using the candidate's OWN
-        // factor/lambda (it does) and on the menu degrading to EMA
-        // when empty. The non-empty guarantee is `debug_assert`ed.
+        // factor/lambda (it does), the menu degrading to EMA when
+        // empty, AND on this cost check using the SAME per-cell
+        // threshold as admission. The non-empty guarantee is
+        // `debug_assert`ed.
         let cells: Vec<Cell> = in_a
             .iter()
             .filter(|c| {
@@ -787,7 +792,7 @@ pub fn solve_full(
                         .smallest_fitting(&c.cell, c_star, mem)
                         .is_some_and(|price| {
                             e_cost_upper(fit, c_star, c.factor, c.lambda, price)
-                                <= (1.0 + tau) * e_min
+                                <= thresh(&c.cell) * e_min
                         })
             })
             .map(|c| c.cell.clone())
@@ -824,10 +829,18 @@ pub fn solve_full(
     }
 }
 
-/// Per-key solve memo. Keyed on `(fit_hash, override_hash)`; the stored
-/// `inputs_gen` is checked against the cache's atomic counter — a miss
-/// means the shared inputs (HwTable / CostTable / SlaConfig) changed,
-/// and the stored entry's `a.cells` becomes the Schmitt `prev_a`.
+/// Per-key solve memo. Keyed on `(model_key_hash, override_hash)` —
+/// logical identity, NOT the fit content — so each `(pname, system,
+/// tenant, override)` owns exactly one slot. The stored
+/// `(inputs_gen, fit_content_hash)` are checked as staleness fields:
+/// a mismatch on EITHER means the shared inputs changed or the fit was
+/// refitted, and the stored entry's `a.cells` becomes the Schmitt
+/// `prev_a` for the recompute (which then overwrites in place).
+///
+/// Keying on content (`fit_content_hash`) would orphan the prior entry
+/// on every refit — unbounded growth AND `prev_a = ∅` (hysteresis
+/// lost). Cache size is now bounded by `|live ModelKeys| ×
+/// |distinct overrides|`.
 ///
 /// `inputs_gen` is bumped by the actor on `HwTable`/`CostTable` refresh
 /// and `SlaConfig` reload (ADR-023 L616). ICE state is NOT in
@@ -836,7 +849,7 @@ pub fn solve_full(
 #[derive(Debug, Default)]
 pub struct SolveCache {
     inputs_gen: AtomicU64,
-    entries: DashMap<(u64, u64), (u64, SolveMemo)>,
+    entries: DashMap<(u64, u64), (u64, u64, SolveMemo)>,
 }
 
 impl SolveCache {
@@ -850,32 +863,35 @@ impl SolveCache {
         self.inputs_gen.load(Ordering::Relaxed)
     }
 
-    /// Read the memo for `(fit_hash, override_hash)` at the current
-    /// generation, or compute via `f(prev_a)` and insert. `prev_a` is
-    /// the previous generation's `A'` (Schmitt history), empty on
-    /// first sight.
+    /// Read the memo for `(model_key_hash, override_hash)` if BOTH the
+    /// current `inputs_gen` and `fit_content_hash` match the stored
+    /// values, or compute via `f(prev_a)` and overwrite. `prev_a` is
+    /// the prior entry's `A'` (Schmitt history), empty on first sight.
     pub fn get_or_insert_with(
         &self,
-        fit_hash: u64,
+        model_key_hash: u64,
         override_hash: u64,
+        fit_content_hash: u64,
         f: impl FnOnce(&HashSet<Cell>) -> Option<SolveMemo>,
     ) -> Option<SolveMemo> {
         let g = self.inputs_gen();
-        let key = (fit_hash, override_hash);
+        let key = (model_key_hash, override_hash);
         // Copy out under guard (DashMap shard non-reentrant), then
-        // decide: hit if stored gen matches; otherwise stored A' is
-        // prev_a for the recompute.
+        // decide: hit iff BOTH stored gen AND fit_content_hash match;
+        // either drift → stored A' is prev_a for the recompute.
         let prior = self.entries.get(&key).map(|e| e.clone());
-        if let Some((stored_g, memo)) = &prior
+        if let Some((stored_g, stored_fh, memo)) = &prior
             && *stored_g == g
+            && *stored_fh == fit_content_hash
         {
             return Some(memo.clone());
         }
         let prev_a: HashSet<Cell> = prior
-            .map(|(_, m)| m.a.cells.into_iter().collect())
+            .map(|(_, _, m)| m.a.cells.into_iter().collect())
             .unwrap_or_default();
         let memo = f(&prev_a)?;
-        self.entries.insert(key, (g, memo.clone()));
+        self.entries
+            .insert(key, (g, fit_content_hash, memo.clone()));
         Some(memo)
     }
 
@@ -887,9 +903,20 @@ impl SolveCache {
     }
 }
 
+/// Stable hash of the logical identity `(pname, system, tenant)` —
+/// the [`SolveCache`] key. Invariant across refits.
+pub fn model_key_hash(k: &ModelKey) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    k.pname.hash(&mut h);
+    k.system.hash(&mut h);
+    k.tenant.hash(&mut h);
+    h.finish()
+}
+
 /// Stable hash of the solve-relevant fields of `fit`. Changes whenever
-/// a refit moves the curve enough to change the solve output.
-pub fn fit_hash(fit: &FittedParams) -> u64 {
+/// a refit moves the curve enough to change the solve output. Stored
+/// as a [`SolveCache`] staleness field, NOT as part of the key.
+pub fn fit_content_hash(fit: &FittedParams) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     fit.key.pname.hash(&mut h);
     fit.key.system.hash(&mut h);
@@ -1710,6 +1737,91 @@ mod tests {
         );
     }
 
+    /// Regression (merged_bug_028): admission used per-cell Schmitt
+    /// `1.3τ` for prev_a cells but the cost re-filter unconditionally
+    /// used `τ`. A prev_a cell in the `(1+τ, 1+1.3τ]` band that is
+    /// also the c*-argmax was admitted then re-dropped → A'=∅
+    /// (debug_assert fired). Both checks now use `thresh(cell)`.
+    // r[verify sched.sla.hw-class.admissible-set]
+    #[test]
+    fn schmitt_argmax_survives_hysteresis_band() {
+        // Two h: intel-8 (factor 2.0, fast → e_min, ∉ prev_a) and
+        // intel-6 (factor 1.0, slow → c*-argmax, ∈ prev_a). Price
+        // intel-6 so its e_cost lands in (1+τ, 1+1.3τ]·e_min: it
+        // passes Schmitt admission via prev_a, becomes c*-argmax
+        // (slowest h needs most cores), and the re-filter cost check
+        // at c* MUST honor the same 1.3τ band.
+        let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
+        let cfg = cfg_hw(); // τ=0.15 → band (1.15, 1.195]
+        let hs: Vec<HwClassName> = vec!["intel-6".into(), "intel-8".into()];
+        let prev: HashSet<Cell> = [("intel-6".into(), CapacityType::Spot)].into();
+        // intel-6 (f=1, c*≈9) vs intel-8 (f=2, c*≈5): equal-price
+        // e_cost ratio ≈ 2.16. Price intel-6 at 0.545× to land at
+        // ≈1.17·e_min (mid-band). intel-8 stays at seed → e_min.
+        let seed = super::super::cost::ON_DEMAND_SEED * 0.35;
+        let mut cost = CostTable::default();
+        cost.set_price("intel-8", CapacityType::Spot, seed, 1e9);
+        cost.set_price("intel-6", CapacityType::Spot, seed * 0.545, 1e9);
+        let SolveFullResult::Feasible(memo) = solve_full(
+            &fit,
+            &[t("normal", 300.0)],
+            &hw_three(),
+            &cost,
+            &ceil(),
+            &cfg,
+            &hs,
+            &prev,
+        ) else {
+            panic!("Feasible expected")
+        };
+        // Fixture sanity: intel-6 candidate is in the (1+τ, 1+1.3τ] band
+        // and is the c*-argmax.
+        let e_min = memo
+            .all_candidates
+            .iter()
+            .map(|c| c.e_cost_upper)
+            .fold(f64::INFINITY, f64::min);
+        let i6 = memo
+            .all_candidates
+            .iter()
+            .find(|c| c.cell.0 == "intel-6" && c.cell.1 == CapacityType::Spot)
+            .unwrap();
+        let tau = cfg.hw_cost_tolerance;
+        assert!(
+            i6.e_cost_upper > (1.0 + tau) * e_min && i6.e_cost_upper <= (1.0 + 1.3 * tau) * e_min,
+            "fixture: intel-6 e_cost {} must be in ({}, {}]",
+            i6.e_cost_upper,
+            (1.0 + tau) * e_min,
+            (1.0 + 1.3 * tau) * e_min
+        );
+        let argmax = memo
+            .all_candidates
+            .iter()
+            .filter(|c| {
+                // Reconstruct A (admission set) using thresh(cell).
+                let th = if prev.contains(&c.cell) {
+                    1.0 + 1.3 * tau
+                } else {
+                    1.0 + tau
+                };
+                c.e_cost_upper <= th * e_min
+            })
+            .max_by_key(|c| c.c_star)
+            .unwrap();
+        assert_eq!(argmax.cell.0, "intel-6", "fixture: argmax is the band cell");
+        // The fix: argmax cell survives re-filter → A' non-empty AND
+        // contains it. Before the fix this was empty (debug_assert).
+        assert!(
+            memo.a.cells.contains(&argmax.cell),
+            "argmax cell {:?} (in Schmitt band via prev_a) must survive re-filter; A'={:?}",
+            argmax.cell,
+            memo.a.cells
+        );
+        // e_min cell (∉ prev_a) also survives — its threshold is 1+τ
+        // and its own cost = e_min ≤ (1+τ)·e_min trivially.
+        assert!(memo.a.cells.iter().any(|c| c.0 == "intel-8"));
+    }
+
     #[test]
     fn refilter_drops_capacity_ratio_violators() {
         // intel-8 (factor 2.0) needs ~half the cores of intel-6 (1.0)
@@ -1873,7 +1985,8 @@ mod tests {
     fn memo_key_includes_inputs_gen() {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
         let cache = SolveCache::default();
-        let fh = fit_hash(&fit);
+        let mk = model_key_hash(&fit.key);
+        let fh = fit_content_hash(&fit);
         let calls = std::cell::Cell::new(0);
         let go = |prev: &HashSet<Cell>| {
             calls.set(calls.get() + 1);
@@ -1891,22 +2004,51 @@ mod tests {
                 _ => None,
             }
         };
-        let m1 = cache.get_or_insert_with(fh, 0, go).unwrap();
-        let m1b = cache.get_or_insert_with(fh, 0, go).unwrap();
+        let m1 = cache.get_or_insert_with(mk, 0, fh, go).unwrap();
+        let m1b = cache.get_or_insert_with(mk, 0, fh, go).unwrap();
         assert_eq!(calls.get(), 1, "second call hits memo");
         assert_eq!(m1.a.cells, m1b.a.cells);
-        // Different override_hash → miss.
-        cache.get_or_insert_with(fh, 7, go).unwrap();
+        // Different override_hash → miss (separate slot).
+        cache.get_or_insert_with(mk, 7, fh, go).unwrap();
         assert_eq!(calls.get(), 2);
+        assert_eq!(cache.len(), 2);
         // bump_inputs_gen → miss; prev_a from old entry.
         cache.bump_inputs_gen();
         cache
-            .get_or_insert_with(fh, 0, |p| {
+            .get_or_insert_with(mk, 0, fh, |p| {
                 assert_eq!(p.len(), m1.a.cells.len(), "prev_a comes from old-gen entry");
                 go(p)
             })
             .unwrap();
         assert_eq!(calls.get(), 3);
+        // Regression (merged_bug_026): refit changes fit_content_hash
+        // but model_key is unchanged → miss (recompute) BUT same slot
+        // overwritten in place (no growth) AND prev_a from prior memo
+        // (hysteresis preserved across refit).
+        let mut refit = fit.clone();
+        refit.sigma_resid = 0.2;
+        let fh2 = fit_content_hash(&refit);
+        assert_ne!(fh, fh2, "refit changes content hash");
+        assert_eq!(model_key_hash(&refit.key), mk, "model_key invariant");
+        cache
+            .get_or_insert_with(mk, 0, fh2, |p| {
+                assert_eq!(
+                    p.len(),
+                    m1.a.cells.len(),
+                    "prev_a from prior fit_content_hash entry — hysteresis survives refit"
+                );
+                go(p)
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 4);
+        assert_eq!(
+            cache.len(),
+            2,
+            "refit overwrites in place — no orphaned entry"
+        );
+        // Same fh2 again → hit.
+        cache.get_or_insert_with(mk, 0, fh2, go).unwrap();
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

@@ -766,13 +766,14 @@ type-fit at c*, cost-at-c* ≤ (1+τ)·𝔼^min, and capacity-ratio
 `c*_{h,cap} ≥ c*/k` (default k=2). The argmax cell survives all three
 checks so `A' ≠ ∅` provably.
 
-r[sched.sla.hw-class.epsilon-explore]
-With probability `sla.hwExploreEpsilon` per dispatch, the scheduler
+r[sched.sla.hw-class.epsilon-explore+2]
+With probability `sla.hwExploreEpsilon` per intent, the scheduler
 pins `h_explore ~ Unif(H\A)` (or `H\{argmin_H price}` on cache-miss
 or A=H), restricts the solve to `(h_explore,*)`, and emits
-`A' ⊆ {h_explore}×{spot,od}`. The draw is per-dispatch, OUTSIDE the
-memoization — the cached A is never overwritten by an exploration
-result.
+`A' ⊆ {h_explore}×{spot,od}`. The draw is OUTSIDE the memoization and
+deterministic in `(drv_hash, inputs_gen)` — stable across controller
+polls, re-rolled on `inputs_gen` bump. The cached A is never
+overwritten by an exploration result.
 
 r[sched.sla.hw-class.ice-mask]
 ICE state is a read-time mask: the memo holds the full-H solve and is
