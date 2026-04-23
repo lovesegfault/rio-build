@@ -728,7 +728,16 @@ pub fn solve_full(
                     continue;
                 }
                 let Some(price) = cost.smallest_fitting(&cell, c_star, mem) else {
-                    continue; // menu non-empty AND no type fits → reject
+                    // Menu has no type fitting (c*, mem) → drop cell.
+                    // Memoized — fires once per (key, inputs_gen), not
+                    // per-dispatch; that's the right cardinality for a
+                    // config-drift signal.
+                    ::metrics::counter!(
+                        "rio_scheduler_sla_hw_cost_unknown_total",
+                        "tenant" => fit.key.tenant.clone()
+                    )
+                    .increment(1);
+                    continue;
                 };
                 candidates.push(Candidate {
                     cell,

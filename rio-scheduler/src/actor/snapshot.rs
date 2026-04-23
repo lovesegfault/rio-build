@@ -729,7 +729,12 @@ impl DagActor {
                     .collect();
                 let cells = if cells.is_empty() {
                     if self.ice.exhausted(&h_all) {
-                        crate::sla::metrics::hw_ladder_exhausted(&tenant, "all_masked");
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_hw_ladder_exhausted_total",
+                            "tenant" => tenant.clone(),
+                            "exit" => "all_masked",
+                        )
+                        .increment(1);
                         solve::InfeasibleReason::CapacityExhausted.emit(&tenant);
                     }
                     memo.a.cells

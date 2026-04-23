@@ -285,7 +285,11 @@ pub fn refit(
         let (f, s, a, rounds) =
             alpha::als_fit(&cs_f, &walls_f, &factors_f, &w_f, &gate, alpha_prior);
         if rounds == alpha::ALS_MAX_ROUNDS {
-            super::metrics::als_cap_hit(&key.tenant);
+            ::metrics::counter!(
+                "rio_scheduler_sla_als_round_cap_hit_total",
+                "tenant" => key.tenant.clone()
+            )
+            .increment(1);
         }
         (f, s, a)
     };
@@ -296,7 +300,11 @@ pub fn refit(
     let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
     let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff);
     if weak {
-        super::metrics::mem_fit_weak(&key.tenant);
+        ::metrics::counter!(
+            "rio_scheduler_sla_mem_fit_weak_total",
+            "tenant" => key.tenant.clone()
+        )
+        .increment(1);
     }
 
     // Shrinkage blend: w·θ_pname + (1−w)·θ_prior with w = n_eff/(n_eff+n0).
@@ -343,7 +351,11 @@ pub fn refit(
     // it's a property of the ring as a whole. ≤32 points → O(n²) dip
     // is <10µs; the metric is the operator signal, not a hard gate.
     if super::dip::is_multimodal(&log_residuals) {
-        super::metrics::residual_multimodal(&key.tenant);
+        ::metrics::counter!(
+            "rio_scheduler_sla_residual_multimodal_total",
+            "tenant" => key.tenant.clone()
+        )
+        .increment(1);
     }
 
     // r[impl sched.sla.reassign-schmitt]

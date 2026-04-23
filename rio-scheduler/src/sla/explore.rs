@@ -12,7 +12,6 @@
 
 use super::config::SlaConfig;
 use super::fit::headroom;
-use super::metrics;
 use super::solve::DrvHints;
 use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
 
@@ -72,7 +71,11 @@ pub fn next(fit: Option<&FittedParams>, cfg: &SlaConfig, hints: &DrvHints) -> Ex
     if st.saturated && st.last_wall.0 > target {
         let c_up = (st.max_c.0 * 4.0).min(cfg.max_cores);
         if st.distinct_c >= 3 && c_up >= cfg.max_cores {
-            metrics::suspicious_scaling(&f.key.tenant);
+            ::metrics::counter!(
+                "rio_scheduler_sla_suspicious_scaling_total",
+                "tenant" => f.key.tenant.clone()
+            )
+            .increment(1);
         }
         // Clamp ate the step (already at ceiling, gradient into wall)
         // → step the OPPOSITE direction once so `distinct_c` reaches 2

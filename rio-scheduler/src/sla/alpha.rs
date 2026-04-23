@@ -14,8 +14,8 @@
 //! c-residualized speedup `T_ref(c)/wall ≈ α·factor`). The alternation is
 //! heuristic — neither block is closed-form descent on a single
 //! objective — so it is hard-capped at 5 rounds; non-convergence is
-//! emitted as `rio_scheduler_sla_als_cap_hit_total` and is a §Phasing-13a
-//! empirical gate.
+//! emitted as `rio_scheduler_sla_als_round_cap_hit_total` and is a
+//! §Phasing-13a empirical gate.
 
 use super::fit::{StageGate, fit_duration_staged};
 use super::hw::{HW_FACTOR_SANITY_CEIL, HW_FACTOR_SANITY_FLOOR, K};
@@ -184,7 +184,7 @@ pub fn fit_alpha(samples: &[AlphaSample], prior: Alpha, lambda_ridge: f64) -> Al
 /// this is a strict generalization of the pre-ALS path.
 ///
 /// Returns `(T_ref fit, σ_resid, α, rounds)`. `rounds == ALS_MAX_ROUNDS`
-/// ⇔ cap hit; caller emits `als_cap_hit(tenant)`.
+/// ⇔ cap hit; caller emits `_als_round_cap_hit_total{tenant}`.
 pub fn als_fit(
     cs: &[f64],
     walls: &[f64],

@@ -1692,7 +1692,29 @@ impl DagActor {
                             peak_memory_bytes,
                             pred,
                         );
-                        crate::sla::metrics::emit_completion_score(&score);
+                        if let Some(r) = score.ratio_wall {
+                            ::metrics::histogram!(
+                                "rio_scheduler_sla_prediction_ratio",
+                                "dim" => "wall"
+                            )
+                            .record(r);
+                        }
+                        if let Some(r) = score.ratio_mem {
+                            ::metrics::histogram!(
+                                "rio_scheduler_sla_prediction_ratio",
+                                "dim" => "mem"
+                            )
+                            .record(r);
+                        }
+                        if let Some((tier, result, constraint)) = score.envelope {
+                            ::metrics::counter!(
+                                "rio_scheduler_sla_envelope_result_total",
+                                "tier" => tier,
+                                "result" => result,
+                                "constraint" => constraint,
+                            )
+                            .increment(1);
+                        }
                     }
                 }
             }

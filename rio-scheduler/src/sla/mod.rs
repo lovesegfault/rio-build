@@ -352,11 +352,24 @@ impl SlaEstimator {
     /// Insert/replace one fit, creating the per-tenant LRU on first
     /// sight. Evicts the tenant's least-recently-used key if at cap.
     fn insert(&self, key: &types::ModelKey, fit: types::FittedParams) {
-        self.cache
-            .write()
+        let mut cache = self.cache.write();
+        let lru = cache
             .entry(key.tenant.clone())
-            .or_insert_with(|| LruCache::new(self.max_keys_per_tenant))
-            .put((key.pname.clone(), key.system.clone()), fit);
+            .or_insert_with(|| LruCache::new(self.max_keys_per_tenant));
+        let k = (key.pname.clone(), key.system.clone());
+        // r[impl sched.sla.threat.corpus-clamp]
+        // Emitted BEFORE put: at-cap + key-absent ⇔ this insert evicts.
+        // `LruCache::put`'s return is the OLD value of the same key on
+        // overwrite (not the evicted entry), so checking the return
+        // would mis-count overwrites as evictions.
+        if lru.len() >= self.max_keys_per_tenant.get() && !lru.contains(&k) {
+            ::metrics::counter!(
+                "rio_scheduler_sla_keys_evicted_total",
+                "tenant" => key.tenant.clone()
+            )
+            .increment(1);
+        }
+        lru.put(k, fit);
     }
 
     /// `T_min` (**ref-seconds**, hw-normalized — NOT wall-clock) for
@@ -563,7 +576,11 @@ impl SlaEstimator {
                         && ingest::is_outlier(ref_t, r.duration_secs, c, prev, DT_POLL_SECS)
                     {
                         outlier_ids.insert(r.id);
-                        metrics::outlier_rejected(&key.tenant);
+                        ::metrics::counter!(
+                            "rio_scheduler_sla_outlier_rejected_total",
+                            "tenant" => key.tenant.clone()
+                        )
+                        .increment(1);
                     }
                 }
             }

@@ -1,11 +1,15 @@
 //! ADR-023 SLA observability. `describe_all()` is wired into
-//! `rio_scheduler::describe_metrics()`; the per-event helpers are
-//! called inline from `SlaEstimator::refresh` / `explore::next` /
-//! `solve::intent_for` so the metric names live in one place.
+//! `rio_scheduler::describe_metrics()`.
+//!
+//! Emit sites are **NOT** in this file. Each `counter!()` / `gauge!()`
+//! / `histogram!()` lives inline next to the production code path that
+//! produces the event, so an unwired metric is a `dead_code` lint
+//! failure (a `pub fn` wrapper here would suppress that). The
+//! `registered_and_emitted_are_consistent` test enforces the same
+//! invariant from the other direction by grepping the emit-site source
+//! for each `SLA_METRICS` name.
 
-use metrics::{
-    Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
-};
+use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 
 use super::solve::SlaPrediction;
 
@@ -87,80 +91,20 @@ pub fn describe_all() {
          to the helm seed."
     );
     describe_counter!(
-        "rio_scheduler_sla_resize_retry_total",
-        "penalty-bump retries on under-provisioning. Labeled `reason` ∈ \
-         {oom, enospc}. The under-provisioning signal — \
-         `_prediction_ratio` is blind to censored samples."
+        "rio_scheduler_sla_als_round_cap_hit_total",
+        "ALS alternation hit the 5-round cap without ‖Δα‖₁<10⁻² \
+         convergence (labeled `tenant`). The α/T_ref(c) joint fit \
+         failed to converge — alpha is the round-5 iterate, not a \
+         fixed point. Sustained nonzero ⇒ ALS_MAX_ROUNDS too low or \
+         the rank gate is admitting degenerate factor matrices."
     );
     describe_counter!(
-        "rio_scheduler_sla_als_cap_hit_total",
-        "ALS α-regression hit `sla.maxKeysPerTenant` and evicted a key \
-         (labeled `tenant`). Nonzero ⇒ a tenant is exhausting the \
-         per-tenant LRU; check for random-pname submissions."
+        "rio_scheduler_sla_keys_evicted_total",
+        "per-tenant LRU evicted a (pname, system) key at \
+         `sla.maxKeysPerTenant` (labeled `tenant`). Nonzero ⇒ a \
+         tenant is exhausting the fit-cache cap; check for \
+         random-pname submissions (`r[sched.sla.threat.corpus-clamp]`)."
     );
-}
-
-pub fn outlier_rejected(tenant: &str) {
-    counter!("rio_scheduler_sla_outlier_rejected_total", "tenant" => tenant.to_string())
-        .increment(1);
-}
-
-pub fn suspicious_scaling(tenant: &str) {
-    counter!("rio_scheduler_sla_suspicious_scaling_total", "tenant" => tenant.to_string())
-        .increment(1);
-}
-
-pub fn mem_fit_weak(tenant: &str) {
-    counter!("rio_scheduler_sla_mem_fit_weak_total", "tenant" => tenant.to_string()).increment(1);
-}
-
-pub fn residual_multimodal(tenant: &str) {
-    counter!("rio_scheduler_sla_residual_multimodal_total", "tenant" => tenant.to_string())
-        .increment(1);
-}
-
-pub fn hw_ladder_exhausted(tenant: &str, exit: &str) {
-    counter!(
-        "rio_scheduler_sla_hw_ladder_exhausted_total",
-        "tenant" => tenant.to_string(),
-        "exit" => exit.to_string(),
-    )
-    .increment(1);
-}
-
-pub fn hw_cost_unknown(tenant: &str) {
-    counter!("rio_scheduler_sla_hw_cost_unknown_total", "tenant" => tenant.to_string())
-        .increment(1);
-}
-
-pub fn hw_cost_fallback(reason: &'static str) {
-    counter!("rio_scheduler_sla_hw_cost_fallback_total", "reason" => reason).increment(1);
-}
-
-pub fn resize_retry(reason: &'static str) {
-    counter!("rio_scheduler_sla_resize_retry_total", "reason" => reason).increment(1);
-}
-
-pub fn als_cap_hit(tenant: &str) {
-    counter!("rio_scheduler_sla_als_cap_hit_total", "tenant" => tenant.to_string()).increment(1);
-}
-
-pub fn hw_cost_stale_seconds(age: f64) {
-    gauge!("rio_scheduler_sla_hw_cost_stale_seconds").set(age);
-}
-
-pub fn prediction_ratio(dim: &'static str, ratio: f64) {
-    histogram!("rio_scheduler_sla_prediction_ratio", "dim" => dim).record(ratio);
-}
-
-pub fn envelope_result(tier: &str, result: &'static str, constraint: &'static str) {
-    counter!(
-        "rio_scheduler_sla_envelope_result_total",
-        "tier" => tier.to_string(),
-        "result" => result,
-        "constraint" => constraint,
-    )
-    .increment(1);
 }
 
 /// Actual-vs-predicted score for one completion. Pure so the
@@ -224,26 +168,13 @@ pub fn score_completion(
     }
 }
 
-/// Emit the metric calls for [`score_completion`]'s result.
-pub fn emit_completion_score(s: &CompletionScore) {
-    if let Some(r) = s.ratio_wall {
-        prediction_ratio("wall", r);
-    }
-    if let Some(r) = s.ratio_mem {
-        prediction_ratio("mem", r);
-    }
-    if let Some((tier, result, constraint)) = &s.envelope {
-        envelope_result(tier, result, constraint);
-    }
-}
-
 /// Every `rio_scheduler_sla_*` metric name. Single source of truth for
 /// the [`tests::registered_and_emitted_are_consistent`] guard — adding
 /// a metric means adding it here AND to [`describe_all`] AND wiring an
-/// emit helper, or that test fails. Catches the "registered but never
-/// emitted" / "emitted but never registered" drift that left
-/// `_infeasible_total{reason=capacity_exhausted}` documented with zero
-/// non-test callers (see `solve_full_emits_capacity_exhausted_*`).
+/// inline emit at a production call site, or that test fails. Catches
+/// the "registered but never emitted" drift that left
+/// `_resize_retry_total` and `_hw_cost_unknown_total` documented with
+/// zero production callers for 11 commits.
 #[cfg(test)]
 pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_prediction_ratio",
@@ -258,8 +189,8 @@ pub const SLA_METRICS: &[&str] = &[
     "rio_scheduler_sla_hw_ladder_exhausted_total",
     "rio_scheduler_sla_hw_cost_unknown_total",
     "rio_scheduler_sla_hw_cost_fallback_total",
-    "rio_scheduler_sla_resize_retry_total",
-    "rio_scheduler_sla_als_cap_hit_total",
+    "rio_scheduler_sla_als_round_cap_hit_total",
+    "rio_scheduler_sla_keys_evicted_total",
 ];
 
 #[cfg(test)]
@@ -283,55 +214,103 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// Concatenated source of every file containing a `counter!` /
+    /// `gauge!` / `histogram!` call for an `SLA_METRICS` name.
+    /// Excludes THIS file: emit sites must live next to the production
+    /// code path, not in a wrapper here. Adding an emit-file means
+    /// adding it here too — but forgetting to do so fails the test
+    /// (the metric appears nowhere), which is the safe direction.
+    const SLA_SOURCE: &str = concat!(
+        include_str!("solve.rs"),
+        include_str!("ingest.rs"),
+        include_str!("cost.rs"),
+        include_str!("mod.rs"),
+        include_str!("explore.rs"),
+        include_str!("prior.rs"),
+        include_str!("../actor/snapshot.rs"),
+        include_str!("../actor/completion.rs"),
+    );
+
+    /// `src` contains `"{name}"` as the first argument of a `counter!`
+    /// / `gauge!` / `histogram!` macro (possibly across a line break).
+    /// Rejects `describe_counter!` etc. by checking the char before
+    /// the macro name is not a word-char.
+    fn has_emit(src: &str, name: &str) -> bool {
+        let needle = format!("\"{name}\"");
+        let mut at = 0;
+        while let Some(i) = src[at..].find(&needle) {
+            let pos = at + i;
+            let head = &src[pos.saturating_sub(64)..pos];
+            let head = head.trim_end();
+            for m in ["counter!(", "gauge!(", "histogram!("] {
+                if let Some(pre) = head.strip_suffix(m)
+                    && !pre
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return true;
+                }
+            }
+            at = pos + needle.len();
+        }
+        false
+    }
+
     /// Every `SLA_METRICS` name has a `describe_*!` registration AND at
-    /// least one emit-site token in this crate's source. Grep-based —
-    /// brittle by design: a rename that misses one of {describe_all,
-    /// emit helper, SLA_METRICS} fails here, which is the point.
+    /// least one production `counter!`/`gauge!`/`histogram!` emit site
+    /// in [`SLA_SOURCE`]. The previous version of this test
+    /// self-invoked the wrapper functions, which made it pass for
+    /// metrics with zero production callers — exactly the drift it was
+    /// meant to catch.
     #[test]
     fn registered_and_emitted_are_consistent() {
-        // describe_all() side: install a recorder, call it, collect
-        // the names that got `# HELP` lines.
-        let rec = metrics_util::debugging::DebuggingRecorder::new();
-        let snap = rec.snapshotter();
-        metrics::with_local_recorder(&rec, || {
-            describe_all();
-            // exercise every emit helper once so the snapshot sees the
-            // name as a live metric (not just a description).
-            outlier_rejected("t");
-            suspicious_scaling("t");
-            mem_fit_weak("t");
-            residual_multimodal("t");
-            prediction_ratio("wall", 1.0);
-            envelope_result("t", "hit", "-");
-            hw_ladder_exhausted("t", "x");
-            hw_cost_unknown("t");
-            hw_cost_fallback("api_error");
-            resize_retry("oom");
-            als_cap_hit("t");
-            hw_cost_stale_seconds(0.0);
-            InfeasibleReason::SerialFloor.emit("t");
-            gauge!("rio_scheduler_sla_prior_divergence", "param" => "S").set(1.0);
-        });
-        let seen: std::collections::HashSet<_> = snap
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(ck, _, _, _)| ck.key().name().to_string())
-            .collect();
+        // Registration side: every SLA_METRICS name must appear as a
+        // string literal in describe_all()'s source. THIS file is the
+        // only place describe_* lives, so include_str! itself.
+        let describe_src = include_str!("metrics.rs");
         for name in SLA_METRICS {
             assert!(
-                seen.contains(*name),
-                "{name} in SLA_METRICS but not emitted"
+                describe_src.contains(&format!("\"{name}\"")),
+                "{name} in SLA_METRICS but no describe_*! registration"
             );
         }
-        for name in &seen {
+        // Emit side: every SLA_METRICS name must appear as the first
+        // arg of a counter!/gauge!/histogram! macro in a production
+        // source file (NOT this one).
+        for name in SLA_METRICS {
             assert!(
-                SLA_METRICS.contains(&name.as_str()),
-                "{name} emitted but not in SLA_METRICS"
+                has_emit(SLA_SOURCE, name),
+                "{name} registered but never emitted in production code \
+                 (no counter!/gauge!/histogram! call found in SLA_SOURCE)"
             );
         }
-        // `_ice_backoff_total` is retired: must NOT appear.
-        assert!(!seen.contains("rio_scheduler_sla_ice_backoff_total"));
+        // Retired metrics must NOT appear at any emit site.
+        for retired in [
+            "rio_scheduler_sla_ice_backoff_total",
+            "rio_scheduler_sla_resize_retry_total",
+            "rio_scheduler_sla_als_cap_hit_total",
+        ] {
+            assert!(
+                !has_emit(SLA_SOURCE, retired),
+                "{retired} is retired but still emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn has_emit_distinguishes_describe_from_emit() {
+        // Guard the guard. Test data is built at runtime so the
+        // crate-wide `grep_emitted_names` source-grep (which scans
+        // THIS file for `metrics::counter!("…"` literals) doesn't
+        // pick up synthetic names.
+        let m = "metrics";
+        // `describe_counter!("X"` must NOT match — its tail is
+        // `counter!(` but the preceding `_` disqualifies.
+        assert!(!has_emit(r#"describe_counter!("X")"#, "X"));
+        assert!(has_emit(&format!(r#"::{m}::counter!("X")"#), "X"));
+        assert!(has_emit(&format!("{m}::gauge!(\n            \"X\""), "X"));
+        assert!(!has_emit(r#"// see "X" metric"#, "X"));
     }
 
     fn pred(wall: f64, mem: u64, tier: &str, target: f64) -> SlaPrediction {

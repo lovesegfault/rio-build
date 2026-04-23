@@ -325,7 +325,8 @@ impl CostTable {
         let stale = now - self.price_updated_at();
         self.stale_clamp = stale > STALE_CLAMP_AFTER_SECS;
         if self.stale_clamp {
-            super::metrics::hw_cost_fallback("stale");
+            ::metrics::counter!("rio_scheduler_sla_hw_cost_fallback_total", "reason" => "stale")
+                .increment(1);
         }
         self.stale_clamp
     }
@@ -774,7 +775,8 @@ pub async fn spot_price_poller(
         // re-emit the gauge so the leader's view doesn't lag one tick.
         let now = now_epoch();
         snap.apply_stale_clamp(now);
-        super::metrics::hw_cost_stale_seconds(now - snap.price_updated_at());
+        ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+            .set(now - snap.price_updated_at());
         *cost.write() = snap;
     }
 }
@@ -817,7 +819,8 @@ pub(crate) async fn poller_tick_prelude(
     db: &SchedulerDb,
     now: f64,
 ) -> bool {
-    super::metrics::hw_cost_stale_seconds(now - cost.read().price_updated_at());
+    ::metrics::gauge!("rio_scheduler_sla_hw_cost_stale_seconds")
+        .set(now - cost.read().price_updated_at());
     if !is_leader {
         *was_leader = false;
         return false;
