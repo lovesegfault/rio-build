@@ -184,9 +184,11 @@ impl DagActor {
     // -----------------------------------------------------------------------
 
     /// ADR-023 §2.8 Pending-watch: sweep `pending_intents` entries
-    /// older than `hw_fallback_after_secs` (jittered ±20% per-entry,
-    /// derived from drv_hash so the threshold is stable across ticks)
-    /// → mark `(band, cap)` ICE-infeasible for 60s and drop the entry.
+    /// older than the 60s window (jittered ±20% per-entry, derived
+    /// from drv_hash so the threshold is stable across ticks) → mark
+    /// `(band, cap)` ICE-infeasible for 60s and drop the entry. The
+    /// window is a literal stub pending the admissible-set rewrite,
+    /// which replaces this sweep entirely.
     /// Next `compute_spawn_intents` re-runs `solve_full` for that
     /// drv with the cell excluded.
     ///
@@ -202,7 +204,7 @@ impl DagActor {
     /// the false-positive cost. See [`crate::sla::cost::IceBackoff`].
     // r[impl sched.sla.ice-ladder-cap]
     pub(super) fn tick_sweep_pending_intents(&self, now: Instant) {
-        let fallback = self.sla_config.hw_fallback_after_secs;
+        let fallback = 60.0_f64; /* removed: A9 deletes call site */
         let ladder_cap = self.ice_ladder_cap();
         // Reap `ice_attempts` for drvs that left Ready. Keyed on dag
         // state directly — NOT parasitic on `pending_intents` membership:
@@ -268,9 +270,10 @@ impl DagActor {
     }
 
     /// `IceBackoff::ladder_cap` evaluated against the configured tier
-    /// ladder + `hw_fallback_after_secs`. Shared between the sweep and
-    /// `solve_intent_for`'s ladder-exhausted gate so both agree on the
-    /// same threshold.
+    /// ladder + the 60s Pending-watch window. Shared between the sweep
+    /// and `solve_intent_for`'s ladder-exhausted gate so both agree on
+    /// the same threshold. Literal stub pending the admissible-set
+    /// rewrite, which retires the ladder-cap concept.
     pub(crate) fn ice_ladder_cap(&self) -> u32 {
         let max_tier_bound = self
             .sla_tiers
@@ -283,7 +286,7 @@ impl DagActor {
             } else {
                 3600.0
             },
-            self.sla_config.hw_fallback_after_secs,
+            60.0_f64, /* removed: A9 deletes call site */
         )
     }
 

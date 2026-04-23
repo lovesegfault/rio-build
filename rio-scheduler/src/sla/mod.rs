@@ -587,18 +587,11 @@ mod tests {
                 mem_base: 4 << 30,
                 deadline_secs: 3600,
             },
-            feature_probes: HashMap::new(),
             max_cores: 64.0,
             max_mem: 256 << 30,
             max_disk: 200 << 30,
             default_disk: 20 << 30,
-            ring_buffer: 32,
-            halflife_secs: 7.0 * 86400.0,
-            seed_corpus: None,
-            hw_cost_source: None,
-            hw_softmax_temp: 0.3,
-            hw_fallback_after_secs: 120.0,
-            cluster: String::new(),
+            ..config::SlaConfig::test_default()
         }
     }
 

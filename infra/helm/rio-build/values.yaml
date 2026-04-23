@@ -360,22 +360,40 @@ scheduler:
   # tiers: ladder of SLA targets. solve_mvp picks the TIGHTEST feasible
   #   tier (sorted by p50→p90→p99); a tier with no targets is best-effort.
   # probe: cold-start sizing for never-seen (pname,system,tenant). cpu
-  #   MUST be in [1, maxCores] — validated at scheduler boot.
+  #   MUST be in [4, maxCores/4] — validated at scheduler boot.
   #   deadlineSecs: activeDeadlineSeconds for unfitted (probe/explore)
   #   builds; fitted keys derive from wall_p99.
   # featureProbes: per-requiredSystemFeatures override (e.g. kvm builds
   #   want a high mem floor regardless of cores).
   # max{Cores,Mem,Disk}: hard reject ceilings — solve does NOT clamp.
+  #   maxCores < 1024 (PriorityClass bucket range).
+  # hwClasses: h → node-label conjunction. Empty = static-mode (admissible-
+  #   set solve unreachable). referenceHwClass anchors ref-second
+  #   normalization — set per deployment, immutable across reloads
+  #   without --allow-reference-change.
   sla:
     tiers:
       - {name: normal, p50: 120, p90: 300, p99: 1200}
       - {name: best-effort}
     defaultTier: normal
-    probe: {cpu: 32, memPerCore: 1073741824, memBase: 34359738368, deadlineSecs: 3600}
+    probe: {cpu: 16, memPerCore: 1073741824, memBase: 34359738368, deadlineSecs: 3600}
     maxCores: 64
     maxMem: 274877906944       # 256 GiB
     maxDisk: 214748364800      # 200 GiB
     defaultDisk: 107374182400  # 100 GiB
+    hwCostTolerance: 0.15
+    hwExploreEpsilon: 0.02
+    hwBenchMemFloor: 8589934592  # 8 GiB
+    maxFleetCores: 10000
+    ladderBudget: 600
+    maxForecastCoresPerTenant: 2000
+    maxKeysPerTenant: 50000
+    maxLeadTime: 600
+    consolidateExploreEpsilon: 0.02
+    maxNodeClaimsPerCellPerTick: 8
+    # referenceHwClass set per deployment; hwClasses populated below
+    hwClasses: {}
+    leadTimeSeed: {}
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +

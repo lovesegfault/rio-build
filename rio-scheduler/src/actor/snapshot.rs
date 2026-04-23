@@ -355,7 +355,7 @@ impl DagActor {
     ///  - intents the controller TRUNCATES under `maxConcurrent` are
     ///    not armed — under sustained saturation those would never
     ///    heartbeat, so arm-on-emit false-marked their `(band, cap)`
-    ///    cells ICE every `hw_fallback_after_secs` until the solve
+    ///    cells ICE every Pending-watch window until the solve
     ///    degraded to band-agnostic.
     ///
     /// `or_insert`: the controller re-acks the FULL still-Pending set
@@ -484,7 +484,7 @@ impl DagActor {
                 &self.cost_table.read(),
                 &self.sla_ceilings,
                 &self.ice,
-                self.sla_config.hw_softmax_temp,
+                0.3_f64, /* removed: A9 deletes call site */
                 &mut rand::rng(),
             ))
         });

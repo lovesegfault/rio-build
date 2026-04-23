@@ -187,6 +187,41 @@ data:
     max_mem = {{ int64 .maxMem }}
     max_disk = {{ int64 .maxDisk }}
     default_disk = {{ int64 .defaultDisk }}
+    hw_cost_tolerance = {{ printf "%v" (float64 .hwCostTolerance) }}
+    hw_explore_epsilon = {{ printf "%v" (float64 .hwExploreEpsilon) }}
+    hw_bench_mem_floor = {{ int64 .hwBenchMemFloor }}
+    max_fleet_cores = {{ int64 .maxFleetCores }}
+    ladder_budget = {{ printf "%.1f" (float64 .ladderBudget) }}
+    max_forecast_cores_per_tenant = {{ int64 .maxForecastCoresPerTenant }}
+    max_keys_per_tenant = {{ int64 .maxKeysPerTenant }}
+    max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
+    consolidate_explore_epsilon = {{ printf "%v" (float64 .consolidateExploreEpsilon) }}
+    max_node_claims_per_cell_per_tick = {{ int64 .maxNodeClaimsPerCellPerTick }}
+    {{- with .maxConsolidationTime }}
+    max_consolidation_time = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- with .referenceHwClass }}
+    reference_hw_class = {{ . | quote }}
+    {{- end }}
+    {{- with .nodeClassRef }}
+    node_class_ref = {{ . | quote }}
+    {{- end }}
+    {{- with .leadTimeSeed }}
+
+    [sla.lead_time_seed]
+    {{- range $cell, $v := . }}
+    {{ $cell | quote }} = {{ printf "%.1f" (float64 $v) }}
+    {{- end }}
+    {{- end }}
+    {{- range $h, $def := .hwClasses }}
+
+    [sla.hw_classes.{{ $h | quote }}]
+    labels = [
+      {{- range $def.labels }}
+      { key = {{ .key | quote }}, value = {{ .value | quote }} },
+      {{- end }}
+    ]
+    {{- end }}
 
     [sla.probe]
     cpu = {{ printf "%.1f" (float64 .probe.cpu) }}

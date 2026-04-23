@@ -11,8 +11,90 @@ use serde::{Deserialize, Serialize};
 
 use super::solve::{Ceilings, Tier};
 
+// r[impl sched.sla.hw-class.config]
+/// One hw-class: a node-label conjunction. Labels are ANDed within a
+/// class; classes are OR'd across the `hw_classes` map when serialized
+/// to `nodeSelectorTerms`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HwClassDef {
+    pub labels: Vec<NodeLabelMatch>,
+}
+
+/// Single `key=value` node-label match.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLabelMatch {
+    pub key: String,
+    pub value: String,
+}
+
+/// Karpenter capacity-type axis. Serialized lowercase; `"on-demand"`
+/// accepted as alias for `od` (Karpenter's own label value).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum CapacityType {
+    Spot,
+    #[serde(alias = "on-demand")]
+    Od,
+}
+
+/// Operator-chosen hw-class identifier (key into
+/// [`SlaConfig::hw_classes`]).
+pub type HwClassName = String;
+
+/// `(hw-class, capacity-type)` cell — the unit of capacity forecasting
+/// and lead-time learning.
+pub type Cell = (HwClassName, CapacityType);
+
+/// `"intel-8-nvme:spot"` ↔ `("intel-8-nvme", Spot)` — string-keyed map
+/// so the helm template / TOML can carry [`Cell`]-keyed tables without
+/// nested objects.
+mod cell_key_serde {
+    use super::{CapacityType, Cell};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: serde::Serializer>(
+        m: &HashMap<Cell, f64>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let flat: HashMap<String, f64> = m
+            .iter()
+            .map(|((h, c), v)| {
+                let cap = match c {
+                    CapacityType::Spot => "spot",
+                    CapacityType::Od => "od",
+                };
+                (format!("{h}:{cap}"), *v)
+            })
+            .collect();
+        flat.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<HashMap<Cell, f64>, D::Error> {
+        let flat = HashMap::<String, f64>::deserialize(d)?;
+        flat.into_iter()
+            .map(|(k, v)| {
+                let (h, c) = k
+                    .rsplit_once(':')
+                    .ok_or_else(|| serde::de::Error::custom("expected h:cap"))?;
+                let cap = match c {
+                    "spot" => CapacityType::Spot,
+                    "od" | "on-demand" => CapacityType::Od,
+                    _ => return Err(serde::de::Error::custom("cap must be spot|od")),
+                };
+                Ok(((h.to_string(), cap), v))
+            })
+            .collect()
+    }
+}
+
 /// `[sla]` table. `deny_unknown_fields` so a typo'd key under `[sla]`
-/// fails loud at startup instead of silently defaulting.
+/// fails loud at startup instead of silently defaulting — this is also
+/// what makes the legacy-softmax-field-rejection test work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlaConfig {
@@ -57,16 +139,64 @@ pub struct SlaConfig {
     /// spot-price poll (lease-gated).
     #[serde(default)]
     pub hw_cost_source: Option<super::cost::HwCostSource>,
-    /// Softmax temperature for the per-`(band, cap)` cost pick.
-    /// Lower → greedier (always cheapest); higher → more spread. 0.3
-    /// gives ~85% mass on the cheapest when the runner-up is 1.5× the
-    /// price.
-    #[serde(default = "default_hw_softmax_temp")]
-    pub hw_softmax_temp: f64,
-    /// Seconds a spawned pod may sit Pending before its `(band, cap)`
-    /// is ICE-backed-off and the build re-solved excluding it.
-    #[serde(default = "default_hw_fallback_after_secs")]
-    pub hw_fallback_after_secs: f64,
+    /// h → node-label conjunction. Empty = static-mode (admissible-set
+    /// solve unreachable, every dispatch falls through to MVP solve).
+    #[serde(default)]
+    pub hw_classes: HashMap<HwClassName, HwClassDef>,
+    /// Admissible-set cost slack: a `(h, cap)` cell within
+    /// `(1 + hw_cost_tolerance)` × min-cost stays admissible. Range
+    /// `[0, 0.5]` — checked by [`SlaConfig::validate`].
+    #[serde(default = "default_hw_cost_tolerance")]
+    pub hw_cost_tolerance: f64,
+    /// ε-greedy explore rate over the admissible set. Range `[0, 0.2]`.
+    #[serde(default = "default_hw_explore_epsilon")]
+    pub hw_explore_epsilon: f64,
+    /// hw-bench pod memory floor (bytes). The K=3 STREAM-triad bench
+    /// must out-size LLC; below this the bench is not scheduled.
+    #[serde(default = "default_hw_bench_mem_floor")]
+    pub hw_bench_mem_floor: u64,
+    /// Per-`(h, cap)` cold-start lead-time prior (seconds). Keys are
+    /// `"h:cap"` strings (`cell_key_serde` handles the flatten).
+    #[serde(default, with = "cell_key_serde")]
+    pub lead_time_seed: HashMap<Cell, f64>,
+    /// Fleet-wide core ceiling for the forecast pass.
+    #[serde(default = "default_max_fleet_cores")]
+    pub max_fleet_cores: u32,
+    /// Seconds the explore ladder may spend across all rungs before
+    /// the build is forced onto the floor tier.
+    #[serde(default = "default_ladder_budget")]
+    pub ladder_budget: f64,
+    /// hw-class whose bench result anchors the ref-second normalization.
+    /// Immutable across reloads unless `--allow-reference-change` is
+    /// passed — see [`SlaConfig::validate_reload`]. MUST appear in
+    /// `hw_classes` when set.
+    #[serde(default)]
+    pub reference_hw_class: Option<HwClassName>,
+    /// §Threat-model gap (d): per-tenant cap on forecast cores so one
+    /// tenant's DAG can't crowd out the fleet forecast.
+    #[serde(default = "default_max_forecast_cores_per_tenant")]
+    pub max_forecast_cores_per_tenant: u32,
+    /// §Threat-model: per-tenant `Estimator` cache cap (LRU evicts
+    /// past this).
+    #[serde(default = "default_max_keys_per_tenant")]
+    pub max_keys_per_tenant: usize,
+    /// Part-B: NodeClaim lead-time ceiling (seconds) before the cell is
+    /// marked infeasible for the tick.
+    #[serde(default = "default_max_lead_time")]
+    pub max_lead_time: f64,
+    /// Part-B: NodeClaim consolidation grace (seconds). `None` →
+    /// Karpenter default.
+    #[serde(default)]
+    pub max_consolidation_time: Option<f64>,
+    /// Part-B: ε-greedy explore rate for the consolidation pass.
+    #[serde(default = "default_consolidate_explore_epsilon")]
+    pub consolidate_explore_epsilon: f64,
+    /// Part-B: per-tick NodeClaim creation throttle per cell.
+    #[serde(default = "default_max_node_claims_per_cell_per_tick")]
+    pub max_node_claims_per_cell_per_tick: u32,
+    /// Part-B: `EC2NodeClass` name the NodeClaim reconciler stamps.
+    #[serde(default)]
+    pub node_class_ref: Option<String>,
     /// Cluster identifier for `sla_ema_state` / `interrupt_samples`
     /// scoping. ADR-023 §2.13: under the global-DB topology multiple
     /// regions share one PG; without this every scheduler upserts the
@@ -78,11 +208,35 @@ pub struct SlaConfig {
     pub cluster: String,
 }
 
-fn default_hw_softmax_temp() -> f64 {
-    0.3
+fn default_hw_cost_tolerance() -> f64 {
+    0.15
 }
-fn default_hw_fallback_after_secs() -> f64 {
-    120.0
+fn default_hw_explore_epsilon() -> f64 {
+    0.02
+}
+fn default_hw_bench_mem_floor() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+fn default_max_fleet_cores() -> u32 {
+    10_000
+}
+fn default_ladder_budget() -> f64 {
+    600.0
+}
+fn default_max_forecast_cores_per_tenant() -> u32 {
+    2_000
+}
+fn default_max_keys_per_tenant() -> usize {
+    50_000
+}
+fn default_max_lead_time() -> f64 {
+    600.0
+}
+fn default_consolidate_explore_epsilon() -> f64 {
+    0.02
+}
+fn default_max_node_claims_per_cell_per_tick() -> u32 {
+    8
 }
 
 fn default_ring_buffer() -> u32 {
@@ -119,9 +273,11 @@ impl ProbeShape {
     /// be half-validated — there is one method, called from every
     /// `[sla]` site that holds a `ProbeShape`.
     pub fn validate(&self, label: &str, max_cores: f64) -> anyhow::Result<()> {
+        let hi = max_cores / 4.0;
         anyhow::ensure!(
-            self.cpu >= 1.0 && self.cpu <= max_cores,
-            "{label}.cpu must be in [1, max_cores={max_cores}]; got {}",
+            self.cpu >= 4.0 && self.cpu <= hi,
+            "{label}.cpu must be in [4, max_cores/4={hi}] so both explore \
+             paths reach span≥4; got {} with max_cores={max_cores}",
             self.cpu
         );
         // `solve_intent_for` floors `SpawnIntent.deadline_secs` at the
@@ -158,13 +314,13 @@ impl SlaConfig {
             }],
             default_tier: "normal".into(),
             probe: ProbeShape {
-                cpu: 1.0,
+                cpu: 4.0,
                 mem_per_core: 1 << 30,
                 mem_base: 1 << 30,
                 deadline_secs: default_probe_deadline_secs(),
             },
             feature_probes: HashMap::new(),
-            max_cores: 2.0,
+            max_cores: 16.0,
             max_mem: 2 << 30,
             max_disk: 6 << 30,
             default_disk: 2 << 30,
@@ -172,8 +328,21 @@ impl SlaConfig {
             halflife_secs: default_halflife(),
             seed_corpus: None,
             hw_cost_source: None,
-            hw_softmax_temp: default_hw_softmax_temp(),
-            hw_fallback_after_secs: default_hw_fallback_after_secs(),
+            hw_classes: HashMap::new(),
+            hw_cost_tolerance: default_hw_cost_tolerance(),
+            hw_explore_epsilon: default_hw_explore_epsilon(),
+            hw_bench_mem_floor: default_hw_bench_mem_floor(),
+            lead_time_seed: HashMap::new(),
+            max_fleet_cores: default_max_fleet_cores(),
+            ladder_budget: default_ladder_budget(),
+            reference_hw_class: None,
+            max_forecast_cores_per_tenant: default_max_forecast_cores_per_tenant(),
+            max_keys_per_tenant: default_max_keys_per_tenant(),
+            max_lead_time: default_max_lead_time(),
+            max_consolidation_time: None,
+            consolidate_explore_epsilon: default_consolidate_explore_epsilon(),
+            max_node_claims_per_cell_per_tick: default_max_node_claims_per_cell_per_tick(),
+            node_class_ref: None,
             cluster: String::new(),
         }
     }
@@ -182,12 +351,12 @@ impl SlaConfig {
     /// with [`rio_common::config::ValidateConfig::validate`]; sorting
     /// is provided separately by [`Self::solve_tiers`].
     ///
-    /// `probe.cpu ∈ [1, max_cores]`: was `[4, max_cores/4]` to give the
-    /// explore walk span≥4 on both halve and ×4 sides, but that floor
-    /// blocks VM-test pools where `max_cores < 16` from booting at all.
-    /// `explore::frozen`'s `distinct_c >= 2` guard makes a probe placed
-    /// at either boundary recoverable (the ladder walks away from the
-    /// wall within two samples); a config that won't load is not.
+    /// `probe.cpu ∈ [4, max_cores/4]`: gives the explore walk span≥4 on
+    /// both halve and ×4 sides. `max_cores < 1024` keeps the
+    /// PriorityClass-bucket index in range (Part-B packs cores into
+    /// `1..1024` PriorityClass values). The two together force
+    /// `max_cores ≥ 16` — VM-test pools satisfy this via
+    /// [`Self::test_default`].
     pub fn validate(&self) -> anyhow::Result<()> {
         let hi = self.max_cores;
         anyhow::ensure!(
@@ -205,25 +374,58 @@ impl SlaConfig {
             self.max_cores
         );
         anyhow::ensure!(
+            self.max_cores < 1024.0,
+            "sla.maxCores < 1024 required (PriorityClass bucket range), got {}",
+            self.max_cores
+        );
+        anyhow::ensure!(
             self.halflife_secs.is_finite() && self.halflife_secs > 0.0,
             "sla.halflife_secs must be finite and positive, got {}",
             self.halflife_secs
         );
         anyhow::ensure!(
-            self.hw_fallback_after_secs.is_finite() && self.hw_fallback_after_secs > 0.0,
-            "sla.hw_fallback_after_secs must be finite and positive, got {}",
-            self.hw_fallback_after_secs
+            (0.0..=0.5).contains(&self.hw_cost_tolerance),
+            "sla.hwCostTolerance must be in [0, 0.5], got {}",
+            self.hw_cost_tolerance
         );
-        // Tests deliberately set `0.0` (greedy argmin) so `>=`, not `>`.
-        // Negative/NaN would NaN the softmax weights.
         anyhow::ensure!(
-            self.hw_softmax_temp.is_finite() && self.hw_softmax_temp >= 0.0,
-            "sla.hw_softmax_temp must be finite and non-negative, got {}",
-            self.hw_softmax_temp
+            (0.0..=0.2).contains(&self.hw_explore_epsilon),
+            "sla.hwExploreEpsilon must be in [0, 0.2], got {}",
+            self.hw_explore_epsilon
         );
+        for (h, def) in &self.hw_classes {
+            anyhow::ensure!(
+                !def.labels.is_empty(),
+                "sla.hwClasses[{h}].labels must be non-empty"
+            );
+        }
+        if let Some(ref_h) = &self.reference_hw_class {
+            anyhow::ensure!(
+                self.hw_classes.contains_key(ref_h),
+                "sla.referenceHwClass={ref_h} not in sla.hwClasses"
+            );
+        }
         self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
             p.validate(&format!("sla.feature_probes[{feat}]"), hi)?;
+        }
+        Ok(())
+    }
+
+    /// Called on SIGHUP config-reload. `allow_ref_change` from CLI
+    /// flag. Runs [`Self::validate`] then rejects a
+    /// `reference_hw_class` change unless explicitly allowed —
+    /// changing the reference invalidates every stored ref-second
+    /// (corpus, EMA state, ring buffers) so it MUST be paired with
+    /// `rio-cli sla reset --all` + corpus re-import.
+    pub fn validate_reload(&self, prev: &Self, allow_ref_change: bool) -> Result<(), String> {
+        self.validate().map_err(|e| e.to_string())?;
+        if self.reference_hw_class != prev.reference_hw_class && !allow_ref_change {
+            return Err(format!(
+                "sla.referenceHwClass changed {:?}→{:?}; pass --allow-reference-change \
+                 AND run `rio-cli sla reset --all` + corpus re-import (all ref-seconds invalidated)",
+                prev.reference_hw_class, self.reference_hw_class
+            ));
         }
         Ok(())
     }
@@ -269,40 +471,27 @@ mod tests {
                 p90: Some(1200.0),
                 p99: None,
             }],
-            default_tier: "normal".into(),
             probe: ProbeShape {
                 cpu: 4.0,
                 mem_per_core: 2 << 30,
                 mem_base: 4 << 30,
                 deadline_secs: default_probe_deadline_secs(),
             },
-            feature_probes: HashMap::new(),
             max_cores: 64.0,
             max_mem: 256 << 30,
             max_disk: 200 << 30,
             default_disk: 20 << 30,
-            ring_buffer: default_ring_buffer(),
-            halflife_secs: default_halflife(),
-            seed_corpus: None,
-            hw_cost_source: None,
-            hw_softmax_temp: default_hw_softmax_temp(),
-            hw_fallback_after_secs: default_hw_fallback_after_secs(),
-            cluster: String::new(),
+            ..SlaConfig::test_default()
         }
     }
 
     #[test]
-    fn rejects_probe_cpu_gt_maxcores() {
+    fn rejects_probe_cpu_outside_span_range() {
         let mut cfg = base();
-        cfg.probe.cpu = 96.0; // max_cores=64
+        cfg.probe.cpu = 32.0; // > max_cores/4 = 16
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("[1, max_cores=64]"), "{err}");
-    }
-
-    #[test]
-    fn rejects_probe_cpu_lt_1() {
-        let mut cfg = base();
-        cfg.probe.cpu = 0.5;
+        assert!(err.contains("sla.probe.cpu"), "{err}");
+        cfg.probe.cpu = 2.0; // < 4
         assert!(cfg.validate().is_err());
     }
 
@@ -342,9 +531,9 @@ mod tests {
     #[test]
     fn accepts_probe_cpu_at_bounds() {
         let mut cfg = base();
-        cfg.probe.cpu = 1.0;
+        cfg.probe.cpu = 4.0;
         cfg.validate().unwrap();
-        cfg.probe.cpu = 64.0; // = max_cores
+        cfg.probe.cpu = 16.0; // = max_cores/4
         cfg.validate().unwrap();
     }
 
@@ -390,19 +579,9 @@ mod tests {
             err.contains("feature_probes[kvm].cpu") && err.contains("max_cores=64"),
             "{err}"
         );
-        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 0.5;
-        assert!(cfg.validate().is_err(), "<1 also rejected");
-        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 64.0;
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn accepts_tiny_pool() {
-        // pre-relaxation this was unrepresentable: max_cores=8 →
-        // [4, 2] = ∅. VM-test pools live here.
-        let mut cfg = base();
-        cfg.max_cores = 8.0;
-        cfg.probe.cpu = 2.0;
+        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 2.0;
+        assert!(cfg.validate().is_err(), "<4 also rejected");
+        cfg.feature_probes.get_mut("kvm").unwrap().cpu = 16.0;
         cfg.validate().unwrap();
     }
 
@@ -443,30 +622,7 @@ mod tests {
         );
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("feature_probes[kvm]"), "{err}");
-        assert!(err.contains("[1, max_cores=64]"), "{err}");
-    }
-
-    #[test]
-    fn rejects_hw_fallback_after_secs_nonpositive() {
-        for bad in [0.0, -1.0, f64::NAN] {
-            let mut cfg = base();
-            cfg.hw_fallback_after_secs = bad;
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("hw_fallback_after_secs"), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn rejects_hw_softmax_temp_negative_or_nan() {
-        for bad in [-0.1, f64::NAN] {
-            let mut cfg = base();
-            cfg.hw_softmax_temp = bad;
-            assert!(cfg.validate().is_err(), "{bad} should be rejected");
-        }
-        // 0.0 is the greedy-argmin sentinel — must be accepted.
-        let mut cfg = base();
-        cfg.hw_softmax_temp = 0.0;
-        cfg.validate().unwrap();
+        assert!(err.contains("[4, max_cores/4=16]"), "{err}");
     }
 
     #[test]
@@ -516,5 +672,142 @@ mod tests {
         let c = base().ceilings();
         assert_eq!(c.max_cores, 64.0);
         assert_eq!(c.default_disk, 20 << 30);
+    }
+
+    #[test]
+    fn hw_classes_parses_label_conjunction() {
+        let toml = r#"
+            tiers = [{ name = "normal" }]
+            default_tier = "normal"
+            max_cores = 64.0
+            max_mem = 1
+            max_disk = 1
+            default_disk = 1
+            hw_cost_tolerance = 0.15
+            hw_explore_epsilon = 0.02
+            reference_hw_class = "intel-8-nvme"
+            [probe]
+            cpu = 4.0
+            mem_per_core = 1
+            mem_base = 1
+            [hw_classes.intel-8-nvme]
+            labels = [
+              { key = "karpenter.k8s.aws/instance-cpu-manufacturer", value = "intel" },
+              { key = "karpenter.k8s.aws/instance-generation", value = "8" },
+              { key = "rio.build/storage", value = "nvme" },
+            ]
+            [lead_time_seed]
+            "intel-8-nvme:spot" = 45.0
+            "intel-8-nvme:od" = 38.0
+        "#;
+        let sla: SlaConfig = toml::from_str(toml).unwrap();
+        assert_eq!(sla.hw_classes.len(), 1);
+        assert_eq!(sla.hw_classes["intel-8-nvme"].labels.len(), 3);
+        assert_eq!(sla.hw_cost_tolerance, 0.15);
+        assert_eq!(
+            sla.lead_time_seed[&("intel-8-nvme".into(), CapacityType::Spot)],
+            45.0
+        );
+        assert_eq!(
+            sla.lead_time_seed[&("intel-8-nvme".into(), CapacityType::Od)],
+            38.0
+        );
+        sla.validate().unwrap();
+    }
+
+    // r[verify sched.sla.hw-class.config]
+    #[test]
+    fn rejects_reference_hw_class_change_without_flag() {
+        let mut cfg = base();
+        cfg.hw_classes.insert(
+            "intel-7-ebs".into(),
+            HwClassDef {
+                labels: vec![NodeLabelMatch {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            },
+        );
+        cfg.reference_hw_class = Some("intel-7-ebs".into());
+        let prev = SlaConfig {
+            reference_hw_class: Some("amd-8-ebs".into()),
+            ..cfg.clone()
+        };
+        let err = cfg.validate_reload(&prev, false).unwrap_err();
+        assert!(err.contains("--allow-reference-change"), "{err}");
+        assert!(cfg.validate_reload(&prev, true).is_ok());
+        // Same ref → no flag needed.
+        assert!(cfg.validate_reload(&cfg.clone(), false).is_ok());
+    }
+
+    #[test]
+    fn rejects_max_cores_ge_1024() {
+        let mut cfg = base();
+        cfg.max_cores = 1024.0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("maxCores < 1024"), "{err}");
+    }
+
+    #[test]
+    fn rejects_hw_cost_tolerance_out_of_range() {
+        for bad in [-0.01, 0.6, f64::NAN] {
+            let mut cfg = base();
+            cfg.hw_cost_tolerance = bad;
+            assert!(cfg.validate().is_err(), "{bad} should be rejected");
+        }
+        let mut cfg = base();
+        cfg.hw_explore_epsilon = 0.3;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_reference_not_in_hw_classes() {
+        let mut cfg = base();
+        cfg.reference_hw_class = Some("nope".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not in sla.hwClasses"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_hw_class_labels() {
+        let mut cfg = base();
+        cfg.hw_classes
+            .insert("h".into(), HwClassDef { labels: vec![] });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("hwClasses[h].labels"), "{err}");
+    }
+
+    #[test]
+    fn legacy_softmax_fields_rejected() {
+        // `deny_unknown_fields` makes the old keys hard-fail at
+        // deserialize, not silently ignored.
+        let toml = r#"
+            tiers = [{ name = "normal" }]
+            default_tier = "normal"
+            max_cores = 64.0
+            max_mem = 1
+            max_disk = 1
+            default_disk = 1
+            hw_softmax_temp = 0.3
+            [probe]
+            cpu = 4.0
+            mem_per_core = 1
+            mem_base = 1
+        "#;
+        let err = toml::from_str::<SlaConfig>(toml).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn cell_key_serde_roundtrip() {
+        let mut cfg = base();
+        cfg.lead_time_seed
+            .insert(("h".into(), CapacityType::Spot), 1.0);
+        cfg.lead_time_seed
+            .insert(("h".into(), CapacityType::Od), 2.0);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""h:spot":1.0"#), "{json}");
+        let back: SlaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lead_time_seed, cfg.lead_time_seed);
     }
 }

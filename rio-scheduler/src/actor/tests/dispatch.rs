@@ -1622,22 +1622,19 @@ async fn spawn_intent_from_sla_estimator() {
     assert_eq!(cold.mem_bytes, 8 << 30);
 }
 
-/// ADR-023 §2.8 Pending-watch: an entry in `pending_intents` past
-/// `hw_fallback_after_secs` marks its `(band, cap)` ICE-infeasible
-/// and is dropped; an entry whose drv left Ready is dropped without
-/// marking; a heartbeat with matching `intent_id` clears the entry.
+/// ADR-023 §2.8 Pending-watch: an entry in `pending_intents` past the
+/// 60s window marks its `(band, cap)` ICE-infeasible and is dropped;
+/// an entry whose drv left Ready is dropped without marking; a
+/// heartbeat with matching `intent_id` clears the entry.
 #[tokio::test]
 async fn pending_intent_timeout_marks_ice() {
     use crate::sla::cost::{Band, Cap};
     use std::time::{Duration, Instant};
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
-    actor.sla_config = crate::sla::config::SlaConfig {
-        hw_fallback_after_secs: 120.0,
-        ..test_sla_config()
-    };
+    actor.sla_config = test_sla_config();
 
-    // "stuck": Ready, backdated past max-jitter (1.2×120s).
+    // "stuck": Ready, backdated past max-jitter (1.2×60s).
     actor.test_inject_ready("stuck", Some("p"), "x86_64-linux", false);
     let old = Instant::now() - Duration::from_secs(200);
     actor
@@ -1700,16 +1697,14 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     actor.sla_config = crate::sla::config::SlaConfig {
         hw_cost_source: Some(cost::HwCostSource::Static),
-        hw_softmax_temp: 0.0,
-        hw_fallback_after_secs: 10.0,
         ..test_sla_config()
     };
     actor.sla_ceilings = actor.sla_config.ceilings();
-    // p90=300s, fallback=10s → ladder_cap = ⌈300/10/4⌉ = 8.
+    // p90=1920s, fallback=60s → ladder_cap = ⌈1920/60/4⌉ = 8.
     actor.sla_tiers = vec![crate::sla::solve::Tier {
         name: "normal".into(),
         p50: None,
-        p90: Some(300.0),
+        p90: Some(1920.0),
         p99: None,
     }];
     let cap = actor.ice_ladder_cap();
@@ -1758,7 +1753,7 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
     );
 
     // Simulate `cap` consecutive Pending-watch timeouts.
-    let old = Instant::now() - Duration::from_secs(20);
+    let old = Instant::now() - Duration::from_secs(100);
     for i in 0..cap {
         actor
             .pending_intents
@@ -1824,8 +1819,8 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
 /// `handle_ack_spawned_intents` is idempotent: a re-ack of an
 /// already-armed intent (the controller acks the FULL still-Pending
 /// set every tick) MUST NOT reset `armed_at` — `or_insert`, not
-/// `insert`. Otherwise a pod stuck Pending forever never crosses
-/// `hw_fallback_after_secs` because each tick re-arms it at `now`.
+/// `insert`. Otherwise a pod stuck Pending forever never crosses the
+/// Pending-watch window because each tick re-arms it at `now`.
 /// After the ICE-sweep removes a timed-out entry, a subsequent ack
 /// is a fresh insert at the new time.
 #[tokio::test]
@@ -1933,8 +1928,6 @@ async fn spawn_intent_node_selector_from_solve_full() {
     let mut actor = bare_actor_cfg(db.pool.clone(), DagActorConfig::default());
     actor.sla_config = crate::sla::config::SlaConfig {
         hw_cost_source: Some(cost::HwCostSource::Static),
-        // temp=0 → greedy argmin → deterministic pick.
-        hw_softmax_temp: 0.0,
         ..test_sla_config()
     };
     actor.sla_ceilings = actor.sla_config.ceilings();
@@ -2098,7 +2091,6 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
     let mut actor = bare_actor_sla(db.pool.clone());
     actor.sla_config = crate::sla::config::SlaConfig {
         hw_cost_source: Some(cost::HwCostSource::Static),
-        hw_softmax_temp: 0.0,
         ..test_sla_config()
     };
     actor.sla_ceilings = actor.sla_config.ceilings();

@@ -13,9 +13,10 @@
 //!   decays toward [`LAMBDA_SEED`] when exposure dries up.
 //!
 //! [`IceBackoff`] is the in-process insufficient-capacity ladder: a
-//! `(band, cap)` that left a pod Pending past `hw_fallback_after_secs`
+//! `(band, cap)` that left a pod Pending past the Pending-watch window
 //! is marked infeasible fleet-wide for 60s so the next solve excludes
-//! it.
+//! it. Superseded by the admissible-set + lead-time design; retained
+//! until that lands.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -159,9 +160,9 @@ const LAMBDA_HALFLIFE_SECS: f64 = 24.0 * 3600.0;
 /// capacity crunch.
 const LAMBDA_DECAY_TO_SEED_AFTER_SECS: f64 = 48.0 * 3600.0;
 
-/// ICE-backoff TTL. A `(band, cap)` that left a pod Pending past
-/// `hw_fallback_after_secs` is fleet-wide infeasible for this long.
-/// Short — capacity recovers in minutes; the ladder re-probes.
+/// ICE-backoff TTL. A `(band, cap)` that left a pod Pending past the
+/// Pending-watch window is fleet-wide infeasible for this long. Short
+/// — capacity recovers in minutes; the ladder re-probes.
 const ICE_TTL: Duration = Duration::from_secs(60);
 
 /// EMA-smoothed `$/vCPU·hr` with its own last-update timestamp.
@@ -557,17 +558,18 @@ fn now_epoch() -> f64 {
 }
 
 /// In-process insufficient-capacity backoff. A `(band, cap)` that left
-/// a pod Pending past `hw_fallback_after_secs` is marked here for 60s;
+/// a pod Pending past the Pending-watch window is marked here for 60s;
 /// [`super::solve::solve_full`] skips marked cells. Shared across all
-/// dispatch threads (DashMap).
+/// dispatch threads (DashMap). Superseded by the admissible-set +
+/// lead-time design; retained until that lands.
 ///
 /// # Ladder protocol
 ///
 /// 1. Dispatch picks `(b₀, c₀)` via `solve_full`, spawns.
-/// 2. Pending-watch sees the pod still `Pending` after
-///    `hw_fallback_after_secs` → [`Self::mark`]`(b₀, c₀)`, records it
-///    in the actor's per-drv `ice_attempts`, deletes the pod, re-runs
-///    `solve_full` (which now skips `(b₀, c₀)`).
+/// 2. Pending-watch sees the pod still `Pending` after the 60s window
+///    → [`Self::mark`]`(b₀, c₀)`, records it in the actor's per-drv
+///    `ice_attempts`, deletes the pod, re-runs `solve_full` (which now
+///    skips `(b₀, c₀)`).
 /// 3. Repeat up to [`Self::ladder_cap`] times. On exhaust the drv
 ///    falls through to band-agnostic dispatch (`solve_intent_for`
 ///    skips `solve_full`; emits `infeasible_total{reason=
@@ -580,8 +582,8 @@ fn now_epoch() -> f64 {
 /// cap, emitted_at))` when `solve_intent_for` first emits a
 /// band-targeted SpawnIntent, clears the entry when a heartbeat with
 /// `intent_id == drv_hash` arrives (pod made it past Pending), and on
-/// each housekeeping tick marks ICE for entries older than
-/// `hw_fallback_after_secs ± 20%`. Tradeoff vs a controller-side Pod
+/// each housekeeping tick marks ICE for entries older than the 60s
+/// window (jittered ±20%). Tradeoff vs a controller-side Pod
 /// watch: less precise (cannot distinguish `phase=Pending` from
 /// "controller hasn't spawned yet" or "container crashed before first
 /// heartbeat") — but all three cases mean the `(band, cap)` failed to

@@ -860,7 +860,6 @@ pub(crate) fn test_sla_config() -> crate::sla::config::SlaConfig {
         max_mem: 256 << 30,
         max_disk: 200 << 30,
         default_disk: 20 << 30,
-        hw_softmax_temp: 0.0,
         ..config::SlaConfig::test_default()
     }
 }

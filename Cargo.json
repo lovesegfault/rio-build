@@ -21640,6 +21640,10 @@
           "packageId": "tokio"
         },
         {
+          "name": "toml",
+          "packageId": "toml 1.1.2+spec-1.1.0"
+        },
+        {
           "name": "tracing-opentelemetry",
           "packageId": "tracing-opentelemetry"
         },

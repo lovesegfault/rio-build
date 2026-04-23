@@ -302,10 +302,10 @@ pub struct DagActor {
     /// emit time — `compute_spawn_intents` is read-only so dashboard
     /// polls and headroom-gated intents don't false-arm).
     /// `compute_spawn_intents` LOOKS UP entries to pin the returned
-    /// selector across re-emits (softmax re-roll would otherwise drift
-    /// it and trip the controller's selector-drift reaper).
+    /// selector across re-emits (a re-solve would otherwise drift it
+    /// and trip the controller's selector-drift reaper).
     /// `handle_heartbeat` removes when the pod checks in. Housekeeping
-    /// sweeps entries past `hw_fallback_after_secs` →
+    /// sweeps entries past the Pending-watch window →
     /// [`ice`](Self::ice) `.mark(band, cap)` and removes (next snapshot
     /// re-solves excluding the cell). DashMap because the snapshot
     /// lookup is `&self`.

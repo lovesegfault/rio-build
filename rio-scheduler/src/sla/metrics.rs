@@ -67,8 +67,8 @@ pub fn describe_all() {
     describe_counter!(
         "rio_scheduler_sla_ice_backoff_total",
         "(band, cap) cells marked ICE-infeasible by the Pending-watch \
-         (no heartbeat within hw_fallback_after_secs of first emitting \
-         a band-targeted SpawnIntent). 60s TTL; next solve excludes the \
+         (no heartbeat within 60s of the controller acking a \
+         band-targeted SpawnIntent). 60s TTL; next solve excludes the \
          cell. Labeled `band`, `cap`."
     );
 }
