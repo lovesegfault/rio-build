@@ -532,7 +532,11 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
             )
             .bind(h)
             .bind(format!("{h}-{p}"))
-            .bind(sqlx::types::Json(serde_json::json!({ "alu": f })))
+            // Isotropic [f;K] so `α·factor = f` regardless of the
+            // seeded α (test is about hw normalization, not α-fit).
+            .bind(sqlx::types::Json(
+                serde_json::json!({ "alu": f, "membw": f, "ioseq": f }),
+            ))
             .execute(&test_db.pool)
             .await?;
         }
@@ -574,6 +578,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
         ci_computed_at: None,
         tier: None,
         hw_bias: std::collections::HashMap::new(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
 
@@ -601,10 +606,10 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     let hw = est.hw_table();
     assert_eq!(
         hw.factor("fast"),
-        2.0,
+        Some([2.0; crate::sla::hw::K]),
         "hw_perf_samples → HwTable::aggregate"
     );
-    assert_eq!(hw.factor("ref"), 1.0);
+    assert_eq!(hw.factor("ref"), Some([1.0; crate::sla::hw::K]));
 
     let excluded: Vec<f64> = sqlx::query_scalar(
         "SELECT duration_secs FROM build_samples WHERE outlier_excluded ORDER BY duration_secs",

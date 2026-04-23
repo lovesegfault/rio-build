@@ -186,6 +186,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: Default::default(),
+            alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
         }
     }

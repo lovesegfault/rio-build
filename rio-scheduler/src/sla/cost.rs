@@ -1028,17 +1028,17 @@ async fn poll_spot_once(ec2: &aws_sdk_ec2::Client) -> anyhow::Result<HashMap<(Ba
 
 impl HwTable {
     /// Per-pname effective-slowest hw_class within `band`: the `h ∈
-    /// band` minimizing `factor[h] / bias[pname,h]`. ADR-023 §h†: the
-    /// envelope solve is conservative — it sizes for the SLOWEST
-    /// hardware the pod might land on within the band, adjusted for
-    /// this pname's per-hw bias (a mem-bandwidth-bound build that
-    /// underperforms on a fast-core class gets that class's effective
-    /// factor pulled down). Returns `(hw_class, effective_factor)`;
-    /// falls back to `("", 1.0)` if no hw_class in the band has ≥3
-    /// samples (factor=1.0 → reference timeline).
+    /// band` minimizing `(α · factor[h]) / bias[pname,h]`. ADR-023 §h†:
+    /// the envelope solve is conservative — it sizes for the SLOWEST
+    /// hardware the pod might land on within the band, scored under
+    /// THIS pname's K=3 mixture (an I/O-bound pname's `α≈[0,0,1]` makes
+    /// `storage=nvme` classes fast and `ebs` slow regardless of their
+    /// alu factor) and adjusted for the per-hw residual bias. Returns
+    /// `(hw_class, effective_factor)`; falls back to `("", 1.0)` if no
+    /// hw_class in the band has ≥3 samples.
     pub fn h_dagger(
         &self,
-        _pname: &str,
+        alpha: super::alpha::Alpha,
         band: Band,
         hw_bias: &HashMap<String, f64>,
     ) -> (String, f64) {
@@ -1046,10 +1046,10 @@ impl HwTable {
             .filter(|(h, _)| band_of_hw_class(h) == Some(band))
             .map(|(h, f)| {
                 let bias = hw_bias.get(h).copied().unwrap_or(1.0);
-                (h.clone(), f / bias)
+                (h.clone(), super::alpha::dot(alpha, *f) / bias)
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            // `f / bias` can push below [`HW_FACTOR_SANITY_FLOOR`] even
+            // `dot / bias` can push below [`HW_FACTOR_SANITY_FLOOR`] even
             // with clamped inputs (e.g. 0.25/2.0). The result is divided
             // into `T(c)` at solve_full's `feasible` gate; an unclamped
             // tiny factor blows `t = T(c)/factor` up → `feasible(cap_c)

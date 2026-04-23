@@ -270,6 +270,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: HashMap::new(),
+            alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
         });
     }

@@ -372,8 +372,14 @@ impl DagActor {
         // fires before worst-case wall completion. Same pattern as
         // snapshot.rs deadline derivation. min_factor() is clamped at
         // HW_FACTOR_SANITY_FLOOR (sla/hw.rs) so division is safe; one
-        // read-lock per tick (hoisted out of the per-node loop).
-        let min_hw = self.sla_estimator.hw_table().min_factor();
+        // read-lock per tick (hoisted out of the per-node loop). α is
+        // per-pname, but this loop covers all nodes; UNIFORM is the
+        // simplex-centroid worst-case proxy (Task A9: per-key α once
+        // est_duration carries the fitted α alongside t_min).
+        let min_hw = self
+            .sla_estimator
+            .hw_table()
+            .min_factor(crate::sla::alpha::UNIFORM);
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned

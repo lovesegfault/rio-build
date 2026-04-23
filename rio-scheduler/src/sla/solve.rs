@@ -649,7 +649,7 @@ pub fn solve_full(
                 if ice.is_infeasible(band, cap) {
                     continue;
                 }
-                let (_, factor) = hw.h_dagger(&fit.key.pname, band, &fit.hw_bias);
+                let (_, factor) = hw.h_dagger(fit.alpha, band, &fit.hw_bias);
                 let lambda = match cap {
                     Cap::Spot => cost.lambda_band(band),
                     Cap::OnDemand => 0.0,
@@ -814,6 +814,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: Default::default(),
+            alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
         }
     }
@@ -1468,13 +1469,13 @@ mod tests {
         // 1.0/1.0 → h† flips to nvme.
         let hw = hw_mid_only();
         let no_bias = HashMap::new();
-        let (h, f) = hw.h_dagger("foo", Band::Mid, &no_bias);
+        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &no_bias);
         assert_eq!(h, "aws-7-ebs-mid");
         assert!((f - 1.0).abs() < 1e-9);
 
         let mut bias = HashMap::new();
         bias.insert("aws-7-nvme-mid".into(), 1.5);
-        let (h, f) = hw.h_dagger("foo", Band::Mid, &bias);
+        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &bias);
         assert_eq!(
             h, "aws-7-nvme-mid",
             "per-pname bias flips effective-slowest"
@@ -1482,7 +1483,7 @@ mod tests {
         assert!((f - 0.8).abs() < 1e-9);
 
         // Band with no hw_classes → ("", 1.0).
-        let (h, f) = hw.h_dagger("foo", Band::Hi, &no_bias);
+        let (h, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Hi, &no_bias);
         assert_eq!(h, "");
         assert!((f - 1.0).abs() < 1e-9);
     }
@@ -1501,7 +1502,7 @@ mod tests {
         let mut bias = HashMap::new();
         bias.insert("aws-7-ebs-mid".into(), 3.0);
         // Raw 0.3/3.0 = 0.1; must floor to 0.25.
-        let (_, f) = hw.h_dagger("foo", Band::Mid, &bias);
+        let (_, f) = hw.h_dagger(crate::sla::alpha::UNIFORM, Band::Mid, &bias);
         assert_eq!(f, HW_FACTOR_SANITY_FLOOR);
     }
 

@@ -3,9 +3,10 @@
 //! `build_samples.duration_secs` is wall-clock on whatever hw_class the
 //! pod ran on. Before fitting T(c), [`super::ingest::refit`] maps each
 //! sample's wall-clock to the **reference timeline** via
-//! [`HwTable::normalize`]: `wall × factor[hw_class].alu`. A sample with
-//! no `hw_class` (NULL — old executor / non-k8s / informer race) or an
-//! hw_class with <3 distinct pod samples passes through at `factor=1.0`.
+//! `wall × (α[pname] · factor[hw_class])`, with α the per-pname K=3
+//! mixture from [`super::alpha`]. A sample with no `hw_class` (NULL —
+//! old executor / non-k8s / informer race) or an hw_class with <3
+//! distinct pod samples passes through at `factor=[1.0; K]`.
 //!
 //! `factor` is the K=3 microbench vector `[alu, membw, ioseq]` (M_054).
 //! Aggregation is **app-side median-of-medians** (ADR-023 §Threat-model
@@ -76,25 +77,33 @@ pub struct HwTable {
 }
 
 impl HwTable {
-    /// `wall_secs × factor[hw_class].alu`. Unknown / `None` hw_class →
-    /// factor 1.0 (pass-through). Time-domain only — call on
-    /// `duration_secs` and `cpu_seconds_total`, NOT on memory or disk.
-    ///
-    /// **alu-only**: the α·factor dot-product is Task A7; until then
-    /// every scalar consumer projects `factor[0]`.
-    pub fn normalize(&self, wall_secs: f64, hw_class: Option<&str>) -> f64 {
-        wall_secs * hw_class.map_or(1.0, |h| self.factor(h))
+    /// `wall_secs × (α · factor[hw_class])`. Unknown / `None` / <3-pod
+    /// hw_class → `factor := [1;K]` (pass-through). Time-domain only —
+    /// call on `duration_secs` and `cpu_seconds_total`, NOT on memory
+    /// or disk. The dot-product clamp lives in [`super::alpha::dot`].
+    pub fn normalize(
+        &self,
+        wall_secs: f64,
+        hw_class: Option<&str>,
+        alpha: super::alpha::Alpha,
+    ) -> f64 {
+        let f = hw_class.and_then(|h| self.factor(h)).unwrap_or([1.0; K]);
+        wall_secs * super::alpha::dot(alpha, f)
     }
 
-    /// `factor[hw_class].alu`, or 1.0 if unknown / <3 distinct pods.
-    /// Exposed for `ingest::hw_bias`'s per-(pname, hw_class) residual
-    /// computation. **alu-only** — see [`Self::normalize`].
-    pub fn factor(&self, hw_class: &str) -> f64 {
+    /// K=3 `factor[hw_class]`, or `None` if unknown / <3 distinct pods.
+    /// `None` callers default to `[1;K]` for the T_ref fit (bias-neutral
+    /// pass-through, ADR-023 L539) and **exclude** the row from the α-fit
+    /// (ADR-023 L541). Per-dimension clamped to `[FLOOR, CEIL]` so a
+    /// poisoned bench row's blast radius is bounded before any α-dot.
+    pub fn factor(&self, hw_class: &str) -> Option<[f64; K]> {
         self.factors
             .get(hw_class)
-            .map(|f| f.factor[0])
-            .unwrap_or(1.0)
-            .clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
+            .filter(|f| f.pod_ids >= 3)
+            .map(|f| {
+                f.factor
+                    .map(|d| d.clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL))
+            })
     }
 
     /// Distinct `pod_id` count for `hw_class` across the 7-day window,
@@ -105,24 +114,25 @@ impl HwTable {
         self.factors.get(hw_class).map(|f| f.pod_ids).unwrap_or(0)
     }
 
-    /// Iterate `(hw_class, &factor.alu)` for trusted (≥3-pod) classes.
-    /// For [`super::cost`]'s per-band `h_dagger` scan. **alu-only** —
-    /// see [`Self::normalize`].
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &f64)> {
+    /// Iterate `(hw_class, &[f64; K])` for trusted (≥3-pod) classes. For
+    /// [`super::cost`]'s per-band `h_dagger` scan. Caller dots with the
+    /// per-pname α (which lives on [`super::types::FittedParams`], not
+    /// here) via [`super::alpha::dot`].
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &[f64; K])> {
         self.factors
             .iter()
             .filter(|(_, f)| f.pod_ids >= 3)
-            .map(|(k, f)| (k, &f.factor[0]))
+            .map(|(k, f)| (k, &f.factor))
     }
 
-    /// Smallest `factor.alu` across all trusted (≥3-pod) classes, or
-    /// 1.0 when none. `ref_secs / min_factor()` is the worst-case
-    /// (slowest-node) wall-clock — used by `solve_intent_for`'s
-    /// deadline de-norm so `activeDeadlineSeconds` budgets for the
-    /// slowest band a pod could land on. **alu-only**.
-    pub fn min_factor(&self) -> f64 {
+    /// Smallest `α · factor[h]` across all trusted (≥3-pod) classes, or
+    /// 1.0 when none. `ref_secs / min_factor(α)` is the worst-case
+    /// (slowest-node) wall-clock for THIS pname's mixture — used by
+    /// `solve_intent_for`'s deadline de-norm so `activeDeadlineSeconds`
+    /// budgets for the slowest band a pod could land on.
+    pub fn min_factor(&self, alpha: super::alpha::Alpha) -> f64 {
         self.iter()
-            .map(|(_, f)| *f)
+            .map(|(_, f)| super::alpha::dot(alpha, *f))
             .min_by(f64::total_cmp)
             .unwrap_or(1.0)
             // Guard against pathological microbench rows; see const doc.
@@ -233,24 +243,25 @@ impl HwTable {
         Self { factors, reference }
     }
 
-    /// Test constructor: bypass PG. Scalar `f64` wrapped as `[v, 1.0,
-    /// 1.0]` with `pod_ids=3` (trusted). Values pass through UNCLAMPED
-    /// so tests can probe the per-consumer `[FLOOR, CEIL]` clamps; for
-    /// chokepoint testing use [`Self::from_raw`].
+    /// Test constructor: bypass PG. Scalar `f64` wrapped as the
+    /// **isotropic** vector `[v; K]` with `pod_ids=3` (trusted), so
+    /// `α · factor = v` for any α on the simplex — tests written against
+    /// the old scalar API stay correct under arbitrary α. Values pass
+    /// through UNCLAMPED so tests can probe the per-consumer `[FLOOR,
+    /// CEIL]` clamps; for chokepoint testing use [`Self::from_raw`].
     #[cfg(test)]
     pub fn from_map(factors: HashMap<String, f64>) -> Self {
+        Self::from_factors(factors.into_iter().map(|(h, v)| (h, [v; K])).collect())
+    }
+
+    /// Test constructor: bypass PG with explicit K=3 vectors at
+    /// `pod_ids=3` (trusted). Unclamped — see [`Self::from_map`].
+    #[cfg(test)]
+    pub fn from_factors(factors: HashMap<String, [f64; K]>) -> Self {
         Self::from_aggregate(
             factors
                 .into_iter()
-                .map(|(h, v)| {
-                    (
-                        h,
-                        HwFactor {
-                            factor: [v, 1.0, 1.0],
-                            pod_ids: 3,
-                        },
-                    )
-                })
+                .map(|(h, factor)| (h, HwFactor { factor, pod_ids: 3 }))
                 .collect(),
         )
     }
@@ -314,7 +325,11 @@ fn mad_reject_median(v: &[[f64; K]]) -> [f64; K] {
 
 #[cfg(test)]
 mod tests {
+    use super::super::alpha::{Alpha, UNIFORM, dot};
     use super::*;
+
+    /// Pure-alu α reproduces the pre-A7 `factor[0]` projection.
+    const ALU: Alpha = [1.0, 0.0, 0.0];
 
     fn row(hw: &str, pod: &str, tenant: Option<&str>, alu: f64) -> HwPerfSampleRow {
         HwPerfSampleRow {
@@ -328,8 +343,8 @@ mod tests {
     #[test]
     fn normalize_passes_through_unknown() {
         let t = HwTable::default();
-        assert_eq!(t.normalize(100.0, None), 100.0);
-        assert_eq!(t.normalize(100.0, Some("aws-7-ebs")), 100.0);
+        assert_eq!(t.normalize(100.0, None, UNIFORM), 100.0);
+        assert_eq!(t.normalize(100.0, Some("aws-7-ebs"), UNIFORM), 100.0);
     }
 
     #[test]
@@ -338,10 +353,10 @@ mod tests {
         m.insert("aws-5-ebs".into(), 1.0);
         m.insert("aws-8-nvme".into(), 2.0);
         let t = HwTable::from_map(m);
-        // Fast hw (factor=2.0) ran in 50s wall → 100 reference-seconds.
-        assert_eq!(t.normalize(50.0, Some("aws-8-nvme")), 100.0);
-        // Reference hw (factor=1.0) ran in 100s wall → 100 ref-seconds.
-        assert_eq!(t.normalize(100.0, Some("aws-5-ebs")), 100.0);
+        // Isotropic [2;K] · any α = 2.0 → 50s wall → 100 reference-sec.
+        assert_eq!(t.normalize(50.0, Some("aws-8-nvme"), UNIFORM), 100.0);
+        assert_eq!(t.normalize(50.0, Some("aws-8-nvme"), ALU), 100.0);
+        assert_eq!(t.normalize(100.0, Some("aws-5-ebs"), UNIFORM), 100.0);
         assert_eq!(t.reference, "aws-5-ebs");
     }
 
@@ -350,9 +365,9 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("slow".into(), 0.01);
         let t = HwTable::from_map(m);
-        assert_eq!(t.min_factor(), HW_FACTOR_SANITY_FLOOR);
+        assert_eq!(t.min_factor(UNIFORM), HW_FACTOR_SANITY_FLOOR);
         // Empty table → 1.0 (above floor, unchanged).
-        assert_eq!(HwTable::default().min_factor(), 1.0);
+        assert_eq!(HwTable::default().min_factor(UNIFORM), 1.0);
     }
 
     /// `normalize` and `factor` clamp to `[FLOOR, CEIL]` so a single
@@ -367,17 +382,18 @@ mod tests {
         m.insert("slow".into(), 1e-6);
         let t = HwTable::from_map(m);
         assert_eq!(
-            t.normalize(10.0, Some("fast")),
+            t.normalize(10.0, Some("fast"), UNIFORM),
             10.0 * HW_FACTOR_SANITY_CEIL
         );
         assert_eq!(
-            t.normalize(10.0, Some("slow")),
+            t.normalize(10.0, Some("slow"), UNIFORM),
             10.0 * HW_FACTOR_SANITY_FLOOR
         );
-        assert_eq!(t.factor("fast"), HW_FACTOR_SANITY_CEIL);
-        assert_eq!(t.factor("slow"), HW_FACTOR_SANITY_FLOOR);
+        assert_eq!(t.factor("fast"), Some([HW_FACTOR_SANITY_CEIL; K]));
+        assert_eq!(t.factor("slow"), Some([HW_FACTOR_SANITY_FLOOR; K]));
         // Unknown still passes through at 1.0 (within band).
-        assert_eq!(t.normalize(10.0, Some("unknown")), 10.0);
+        assert_eq!(t.normalize(10.0, Some("unknown"), UNIFORM), 10.0);
+        assert!(t.factor("unknown").is_none());
     }
 
     /// Regression: `aggregate` clamps at the chokepoint so `iter()`
@@ -391,7 +407,7 @@ mod tests {
         m.insert("slow".into(), 0.01);
         m.insert("fast".into(), 50.0);
         let t = HwTable::from_raw(m);
-        let by_name: HashMap<_, _> = t.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let by_name: HashMap<_, _> = t.iter().map(|(k, v)| (k.clone(), dot(ALU, *v))).collect();
         assert_eq!(by_name["slow"], HW_FACTOR_SANITY_FLOOR);
         assert_eq!(by_name["fast"], HW_FACTOR_SANITY_CEIL);
     }
@@ -437,7 +453,8 @@ mod tests {
             row("new-hw", "p1", Some("t"), 3.0),
         ];
         let t = HwTable::from_aggregate(HwTable::aggregate(&rows));
-        assert_eq!(t.factor("new-hw"), 1.0);
+        assert!(t.factor("new-hw").is_none(), "<3 pods → untrusted");
+        assert_eq!(t.normalize(10.0, Some("new-hw"), UNIFORM), 10.0);
         assert_eq!(t.distinct_pod_ids("new-hw"), 2);
         assert_eq!(t.len(), 0, "<3-pod classes excluded from len/iter");
         assert_eq!(t.distinct_pod_ids("absent"), 0);

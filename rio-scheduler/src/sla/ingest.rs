@@ -6,12 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::alpha;
 use super::bootstrap::{WeightedSample, t_min_ci};
 use super::fit::{
-    StageGate, compute_vdists, fit_duration_staged, fit_memory, kish_n_eff, sample_weight,
-    weighted_quantile,
+    StageGate, compute_vdists, fit_memory, kish_n_eff, sample_weight, weighted_quantile,
 };
-use super::hw::HwTable;
+use super::hw::{HwTable, K};
 use super::prior::{FitParams, PriorSources, partial_pool, prior_for};
 use super::solve::Tier;
 use super::types::{
@@ -199,12 +199,15 @@ pub fn refit(
         .map(|r| r.cpu_limit_cores.unwrap())
         .collect();
     // r[impl sched.sla.hw-ref-seconds]
-    // Time-domain → reference-seconds BEFORE the fit. Memory is NOT
-    // normalized (M(c) is fitted on raw bytes — peak RSS is workload-
-    // dominated, not core-throughput-dominated).
-    let ts: Vec<f64> = fit_rows
+    // Time-domain → reference-seconds is now α-dependent (ALS step A
+    // re-normalizes each round). Here we collect raw wall-clock + the
+    // per-row K=3 factor; `ts` (ref-seconds) is computed AFTER ALS at
+    // the converged α. Memory is NOT normalized (M(c) is fitted on raw
+    // bytes — peak RSS is workload-dominated, not core-throughput).
+    let walls: Vec<f64> = fit_rows.iter().map(|r| r.duration_secs).collect();
+    let factors: Vec<Option<[f64; K]>> = fit_rows
         .iter()
-        .map(|r| hw.normalize(r.duration_secs, r.hw_class.as_deref()))
+        .map(|r| r.hw_class.as_deref().and_then(|h| hw.factor(h)))
         .collect();
     let ms: Vec<u64> = fit_rows
         .iter()
@@ -215,7 +218,7 @@ pub fn refit(
     // avg_cores; entered once any sample is unsaturated (peak < 0.85·limit).
     // Samples with c > p̄ are dropped from the duration fit — their basis
     // column 1/min(c,p̄) collapses to the constant 1/p̄ (collinear with S).
-    let p_bar = observed_p_bar(&fit_rows, &w, hw);
+    let p_bar = observed_p_bar(&fit_rows, &w);
     let idx: Vec<usize> = if p_bar.is_finite() {
         let kept: Vec<usize> = (0..cs.len()).filter(|&i| cs[i] <= p_bar).collect();
         if kept.len() >= 2 {
@@ -227,7 +230,8 @@ pub fn refit(
         (0..cs.len()).collect()
     };
     let cs_f: Vec<f64> = idx.iter().map(|&i| cs[i]).collect();
-    let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
+    let walls_f: Vec<f64> = idx.iter().map(|&i| walls[i]).collect();
+    let factors_f: Vec<_> = idx.iter().map(|&i| factors[i]).collect();
     let w_f: Vec<f64> = idx.iter().map(|&i| w[i]).collect();
 
     // ExploreState reads only current-version (vdist==0) cpu_limits — the
@@ -256,26 +260,52 @@ pub fn refit(
         p_bar,
         prev_usl: matches!(prev.map(|p| &p.fit), Some(DurationFit::Usl { .. })),
     };
-    let (mut fit, sigma) = if n_eff < 3.0 || span < 4.0 {
-        (DurationFit::Probe, 0.2)
+    // r[impl sched.sla.prior-partial-pool]
+    // Resolve the prior FIRST: `als_fit` needs `θ_prior.α` (ADR L547:
+    // seed → fleet-median → uniform precedence, same machinery as the
+    // M(c) prior); the (S,P,Q,a,b) blend below needs the rest. With
+    // priors disabled (`None`) α-prior degrades to UNIFORM.
+    let theta_prior = priors.map(|src| prior_for(key, src));
+    let alpha_prior = theta_prior
+        .as_ref()
+        .map_or(alpha::UNIFORM, |(p, _)| p.alpha);
+    // r[impl sched.sla.hw-class.alpha-als]
+    // When the rank gate never passes — single hw_class, all-NULL, or
+    // isotropic factors — als_fit returns (fit_duration_staged, prior,
+    // 1): the pre-ALS behaviour. The I/O-saturation `ioseq` seed (ADR
+    // L547 first arm) is Task A9 once `io_bytes` lands in
+    // BuildSampleRow; until then the prior chain bottoms out at UNIFORM.
+    let (mut fit, sigma, alpha) = if n_eff < 3.0 || span < 4.0 {
+        (DurationFit::Probe, 0.2, alpha_prior)
     } else {
-        fit_duration_staged(&cs_f, &ts_f, &w_f, &gate)
+        let (f, s, a, rounds) =
+            alpha::als_fit(&cs_f, &walls_f, &factors_f, &w_f, &gate, alpha_prior);
+        if rounds == alpha::ALS_MAX_ROUNDS {
+            super::metrics::als_cap_hit(&key.tenant);
+        }
+        (f, s, a)
     };
+    // Reference-seconds at the converged α — feeds hw_bias / residuals /
+    // bootstrap CI below (all of which want T_ref-domain).
+    let scale = |i: usize| alpha::dot(alpha, factors[i].unwrap_or([1.0; K]));
+    let ts: Vec<f64> = (0..walls.len()).map(|i| walls[i] * scale(i)).collect();
+    let ts_f: Vec<f64> = idx.iter().map(|&i| ts[i]).collect();
     let (mut mem, weak) = fit_memory(&cs, &ms, &w, n_eff);
     if weak {
         super::metrics::mem_fit_weak(&key.tenant);
     }
 
-    // r[impl sched.sla.prior-partial-pool]
     // Shrinkage blend: w·θ_pname + (1−w)·θ_prior with w = n_eff/(n_eff+n0).
     // Probe fits have no θ_pname so they record provenance only (the
     // explore path doesn't read the curve anyway). Non-Probe fits get
     // their (S,P,Q,a,b) blended toward the prior — at n_eff=3 it's a
     // 50/50 mix; by n_eff≈30 the prior is <10% and effectively gone.
-    let prior_source = priors.map(|src| {
-        let (theta_prior, prov) = prior_for(key, src);
+    // α is NOT re-blended here: `als_fit`'s ridge already pools toward
+    // `α_prior` and its output respects the simplex constraint, which a
+    // post-hoc linear blend would not.
+    let prior_source = theta_prior.map(|(theta_prior, prov)| {
         if !matches!(fit, DurationFit::Probe) {
-            let theta_pname = extract_fit_params(&fit, &mem);
+            let theta_pname = extract_fit_params(&fit, &mem, alpha);
             let pooled = partial_pool(&theta_pname, n_eff, &theta_prior, PARTIAL_POOL_N0);
             apply_pooled(&mut fit, &mut mem, &pooled);
         }
@@ -340,13 +370,14 @@ pub fn refit(
     let tier = reassign_tier(
         prev.and_then(|p| p.tier.as_deref()),
         ci,
-        hw.min_factor(),
+        hw.min_factor(alpha),
         tiers,
     );
 
     FittedParams {
         key: key.clone(),
         hw_bias: hw_bias(&fit_rows, &cs, &ts, &fit),
+        alpha,
         fit,
         mem,
         disk_p90,
@@ -368,13 +399,20 @@ pub fn refit(
 /// Independent` has no (a, b); we substitute `(ln p90, 0)` so the pooled
 /// `a` still lands somewhere sensible if the prior is Coupled (b=0 ⇔
 /// flat M(c), which is what Independent means).
-fn extract_fit_params(fit: &DurationFit, mem: &MemFit) -> FitParams {
+fn extract_fit_params(fit: &DurationFit, mem: &MemFit, alpha: alpha::Alpha) -> FitParams {
     let (s, p, q) = fit.spq();
     let (a, b) = match mem {
         MemFit::Coupled { a, b, .. } => (*a, *b),
         MemFit::Independent { p90 } => ((p90.0.max(1) as f64).ln(), 0.0),
     };
-    FitParams { s, p, q, a, b }
+    FitParams {
+        s,
+        p,
+        q,
+        a,
+        b,
+        alpha,
+    }
 }
 
 /// Write pooled `(S, P, Q, a, b)` back into the fit/mem variants
@@ -493,7 +531,11 @@ pub fn is_outlier(
 /// **unsaturated** (`peak_cpu < 0.85·cpu_limit`): only an unsaturated
 /// sample is evidence the build can't soak the cores it was given. Rows
 /// missing `cpu_seconds_total` are skipped from the quantile.
-fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64], hw: &HwTable) -> f64 {
+///
+/// `avg_cores = cpu_seconds / wall` is hw-invariant (both terms scale by
+/// the same `α·factor`), so this is computed on raw wall — no `HwTable`
+/// dependency, and no circular α-dep into the ALS gate it feeds.
+fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64]) -> f64 {
     let any_unsat = rows.iter().any(|r| {
         matches!(
             (r.peak_cpu_cores, r.cpu_limit_cores),
@@ -503,19 +545,13 @@ fn observed_p_bar(rows: &[&BuildSampleRow], w: &[f64], hw: &HwTable) -> f64 {
     if !any_unsat {
         return f64::INFINITY;
     }
-    // avg_cores = cpu_seconds / wall is hw-invariant in principle (both
-    // numerator and denominator scale by the same factor), but normalize
-    // both for symmetry with the `ts` slice — the ratio is identical.
     let (avg, aw): (Vec<f64>, Vec<f64>) = rows
         .iter()
         .zip(w)
         .filter_map(|(r, &wi)| {
             r.cpu_seconds_total
                 .filter(|_| r.duration_secs > 0.0)
-                .map(|ct| {
-                    let h = r.hw_class.as_deref();
-                    (hw.normalize(ct, h) / hw.normalize(r.duration_secs, h), wi)
-                })
+                .map(|ct| (ct / r.duration_secs, wi))
         })
         .unzip();
     if avg.is_empty() {
@@ -654,6 +690,7 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
         ci_computed_at: None,
         tier: None,
         hw_bias: HashMap::new(),
+        alpha: alpha::UNIFORM,
         prior_source: None,
     }
 }
@@ -1153,6 +1190,7 @@ mod tests {
             ci_computed_at: Some(at),
             tier: None,
             hw_bias: HashMap::new(),
+            alpha: alpha::UNIFORM,
             prior_source: None,
         }
     }
@@ -1352,6 +1390,7 @@ mod tests {
                 q: 0.0,
                 a: ((256_u64 << 20) as f64).ln(),
                 b: 1.0,
+                alpha: alpha::UNIFORM,
             }),
             operator: super::super::config::ProbeShape {
                 cpu: 4.0,

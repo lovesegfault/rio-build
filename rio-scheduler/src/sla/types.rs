@@ -159,6 +159,11 @@ pub struct FittedParams {
     /// `bias[h] > 1.0` ⇔ this pname runs SLOWER on `h` than the fleet
     /// factor would imply. Default 1.0 if <3 samples on that hw_class.
     pub hw_bias: HashMap<String, f64>,
+    /// Per-pname K=3 hardware mixture α ∈ Δ² — the effective scalar
+    /// speedup on `h` is `α · factor[h]`. Fitted jointly with `T_ref(c)`
+    /// by [`super::alpha::als_fit`]; defaults to [`super::alpha::UNIFORM`]
+    /// (= phase-10 scalar behaviour) when the rank gate never passes.
+    pub alpha: super::alpha::Alpha,
     /// Provenance of the prior partial-pooled into this fit
     /// ([`super::prior::partial_pool`]). `None` ⇔ priors disabled (no
     /// `[sla]` config) or this fit was never blended (test seeds).

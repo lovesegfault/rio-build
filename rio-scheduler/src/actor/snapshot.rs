@@ -585,7 +585,7 @@ impl DagActor {
                 // and re-deriving the chosen band's factor when Some
                 // would duplicate `cost::h_dagger`. Empty table → 1.0
                 // (ref==wall, no normalization in effect).
-                let t = f.fit.t_at(RawCores(f64::from(cores))).0 / hw.min_factor();
+                let t = f.fit.t_at(RawCores(f64::from(cores))).0 / hw.min_factor(f.alpha);
                 (quantile::quantile(0.99, t, f.sigma_resid, 0.0, f.z_q(0.99)) * 5.0) as u32
             })
             .map_or(probe_deadline, |c| c.max(probe_deadline));

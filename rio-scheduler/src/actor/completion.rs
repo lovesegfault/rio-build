@@ -953,10 +953,27 @@ impl DagActor {
         // r[impl sched.sla.hw-ref-seconds]
         // For the critical_path_accuracy metric below: est_duration is
         // REF-seconds, result.duration() is wall. Normalize wall→ref via
-        // the reporting worker's hw_factor so the ratio is dimensionally
-        // consistent (same normalization record_build_sample applies to
-        // its T sample). Computed before the move into record_build_sample.
-        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref());
+        // the reporting worker's `α·factor[h]` so the ratio is
+        // dimensionally consistent (same normalization
+        // record_build_sample applies to its T sample). Computed before
+        // the move into record_build_sample. Per-key α from the cache;
+        // unfitted keys (and keys whose state is gone) get UNIFORM.
+        let alpha = self
+            .dag
+            .node(drv_hash)
+            .and_then(|s| Some((s.pname.clone()?, s.system.clone(), s)))
+            .map(|(pname, system, s)| crate::sla::types::ModelKey {
+                pname,
+                system,
+                tenant: s
+                    .attributed_tenant(&self.builds)
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+            })
+            .map_or(crate::sla::alpha::UNIFORM, |k| {
+                self.sla_estimator.cached_alpha(&k)
+            });
+        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref(), alpha);
 
         self.record_build_sample(
             drv_hash,
@@ -1655,7 +1672,16 @@ impl DagActor {
                         // completion's hw_class so the ratio is
                         // ref/ref. Envelope check (tier_target) stays
                         // wall-vs-wall — handled inside.
-                        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref());
+                        let key = crate::sla::types::ModelKey {
+                            pname: pname.clone(),
+                            system: state.system.clone(),
+                            tenant: state
+                                .attributed_tenant(&self.builds)
+                                .map(|u| u.to_string())
+                                .unwrap_or_default(),
+                        };
+                        let alpha = self.sla_estimator.cached_alpha(&key);
+                        let hw_factor = self.sla_estimator.hw_factor(hw_class.as_deref(), alpha);
                         let score = crate::sla::metrics::score_completion(
                             duration_secs,
                             hw_factor,

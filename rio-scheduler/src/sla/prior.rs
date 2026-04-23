@@ -11,8 +11,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::alpha::{UNIFORM, dot, simplex_project};
 use super::config::ProbeShape;
-use super::hw::HwTable;
+use super::hw::{HwTable, K};
 use super::types::ModelKey;
 
 /// (S, P, Q, a, b) flat tuple. Distinct from [`super::types::FittedParams`]
@@ -31,6 +32,12 @@ pub struct FitParams {
     pub q: f64,
     pub a: f64,
     pub b: f64,
+    /// Per-pname K=3 hardware mixture (ADR-023 §Hardware heterogeneity).
+    /// Carried alongside (S,P,Q,a,b) so the same fleet-median /
+    /// partial-pool / clamp machinery applies; consumers that need a
+    /// simplex point re-project ([`super::alpha::simplex_project`]) after
+    /// any per-component operation that can leave Σα ≠ 1.
+    pub alpha: super::alpha::Alpha,
 }
 
 /// Seed-map key: `(pname, system)`. Tenant-agnostic — a seed corpus is
@@ -168,12 +175,18 @@ impl SeedCorpus {
     ///
     /// Unknown `ref_hw_class` → factor 1.0 (pass through unscaled). The
     /// returned `f64` is the applied factor, for the RPC response.
+    /// Per-entry α (proto field 10, v2): re-projected onto Δ² since the
+    /// wire value is untrusted; v1 / empty → [`UNIFORM`]. α is NOT
+    /// rescaled — it's a mixture weight, dimensionless across fleets.
     pub fn into_seed_map(self, hw: &HwTable) -> (HashMap<SeedKey, FitParams>, f64) {
-        let scale = hw.factor(&self.ref_hw_class) / hw.factor(&hw.reference);
+        let f = |h: &str| hw.factor(h).map_or(1.0, |v| dot(UNIFORM, v));
+        let scale = f(&self.ref_hw_class) / f(&hw.reference);
         let map = self
             .entries
             .into_iter()
             .map(|e| {
+                let alpha =
+                    <[f64; K]>::try_from(e.alpha.as_slice()).map_or(UNIFORM, simplex_project);
                 (
                     (e.pname, e.system),
                     FitParams {
@@ -182,6 +195,7 @@ impl SeedCorpus {
                         q: e.q * scale,
                         a: e.a,
                         b: e.b,
+                        alpha,
                     },
                 )
             })
@@ -266,6 +280,10 @@ pub fn operator_to_spq(probe: &ProbeShape, tier_target: f64) -> FitParams {
         q: 0.0,
         a: ((probe.mem_base + probe.mem_per_core) as f64).ln(),
         b: 1.0,
+        // Operator probe has no per-pname mixture; UNIFORM is the ADR
+        // L547 last-resort fallback and the basis `clamp_to_operator`
+        // bands fleet-α against.
+        alpha: UNIFORM,
     }
 }
 
@@ -287,6 +305,8 @@ pub fn partial_pool(
         q: blend(theta_pname.q, theta_prior.q),
         a: blend(theta_pname.a, theta_prior.a),
         b: blend(theta_pname.b, theta_prior.b),
+        // Convex combination of two simplex points stays on the simplex.
+        alpha: std::array::from_fn(|d| blend(theta_pname.alpha[d], theta_prior.alpha[d])),
     }
 }
 
@@ -298,12 +318,22 @@ pub fn partial_pool(
 /// passed through unclamped: a [0.5×0, 2×0] band is degenerate.
 fn clamp_to_operator(fleet: &FitParams, op: &ProbeShape, tier_target: f64) -> FitParams {
     let basis = operator_to_spq(op, tier_target);
+    // ADR L547: per-component [0.5×, 2×] on α against the operator basis
+    // (= UNIFORM). Per-component clamp can leave Σα ≠ 1; re-project so
+    // the prior `als_fit` receives is on the simplex. The divergence
+    // gauge is reported per-dimension as `alpha_d` so a fleet drifting
+    // toward, say, ioseq-dominant is observable.
+    const DIM: [&str; K] = ["alpha_alu", "alpha_membw", "alpha_ioseq"];
+    let alpha = simplex_project(std::array::from_fn(|d| {
+        clamp_field(fleet.alpha[d], basis.alpha[d], DIM[d], false)
+    }));
     FitParams {
         s: clamp_field(fleet.s, basis.s, "s", false),
         p: clamp_field(fleet.p, basis.p, "p", false),
         q: clamp_field(fleet.q, basis.q, "q", false),
         a: clamp_field(fleet.a, basis.a, "a", true),
         b: clamp_field(fleet.b, basis.b, "b", false),
+        alpha,
     }
 }
 
@@ -341,7 +371,7 @@ pub fn fleet_median(
 /// (the five fields are independent so there's no "the median row").
 fn median_fitparams(v: &[&FitParams]) -> FitParams {
     debug_assert!(!v.is_empty());
-    let med = |proj: fn(&FitParams) -> f64| -> f64 {
+    fn med(v: &[&FitParams], proj: impl Fn(&FitParams) -> f64) -> f64 {
         let mut xs: Vec<f64> = v.iter().map(|f| proj(f)).collect();
         xs.sort_by(f64::total_cmp);
         let n = xs.len();
@@ -350,13 +380,18 @@ fn median_fitparams(v: &[&FitParams]) -> FitParams {
         } else {
             (xs[n / 2 - 1] + xs[n / 2]) / 2.0
         }
-    };
+    }
     FitParams {
-        s: med(|f| f.s),
-        p: med(|f| f.p),
-        q: med(|f| f.q),
-        a: med(|f| f.a),
-        b: med(|f| f.b),
+        s: med(v, |f| f.s),
+        p: med(v, |f| f.p),
+        q: med(v, |f| f.q),
+        a: med(v, |f| f.a),
+        b: med(v, |f| f.b),
+        // Per-dimension marginal median (the geometric median on Δ² has
+        // no closed form and the marginal is what the (S,P,Q,a,b) median
+        // already is). Re-project: marginal median of simplex points is
+        // not guaranteed Σ=1 (e.g. med{[1,0,0],[0,1,0],[0,0,1]}=[0;3]).
+        alpha: simplex_project(std::array::from_fn(|d| med(v, |f| f.alpha[d]))),
     }
 }
 
@@ -421,6 +456,7 @@ mod tests {
             q: 0.1,
             a: 20.0,
             b: 1.5,
+            alpha: UNIFORM,
         };
         let prior = FitParams {
             s: 0.0,
@@ -428,6 +464,7 @@ mod tests {
             q: 0.0,
             a: 0.0,
             b: 0.0,
+            alpha: UNIFORM,
         };
         // n_eff=1, n0=3 → w=0.25 → 0.75·prior + 0.25·θ
         let pooled = partial_pool(&theta, 1.0, &prior, 3.0);
@@ -462,6 +499,7 @@ mod tests {
             q: 3.0,
             a: 4.0,
             b: 5.0,
+            alpha: UNIFORM,
         };
         let fleet = FitParams {
             s: 10.0,
@@ -469,6 +507,7 @@ mod tests {
             q: 30.0,
             a: 40.0,
             b: 50.0,
+            alpha: UNIFORM,
         };
         let mut seed = HashMap::new();
         seed.insert(("hello".into(), "x86_64-linux".into()), seeded.clone());
@@ -511,6 +550,7 @@ mod tests {
             q: 0.3,
             a: basis.a,
             b: 0.2,
+            alpha: UNIFORM,
         };
         let clamped = clamp_to_operator(&fleet, &probe(), 300.0);
         assert!((clamped.p - 1200.0).abs() < 1e-9);
@@ -551,7 +591,112 @@ mod tests {
     }
 
     fn fp(s: f64, p: f64, q: f64, a: f64, b: f64) -> FitParams {
-        FitParams { s, p, q, a, b }
+        FitParams {
+            s,
+            p,
+            q,
+            a,
+            b,
+            alpha: UNIFORM,
+        }
+    }
+
+    fn fpa(s: f64, alpha: super::super::alpha::Alpha) -> FitParams {
+        FitParams {
+            alpha,
+            ..fp(s, 0.0, 0.0, 0.0, 0.0)
+        }
+    }
+
+    // r[verify sched.sla.hw-class.alpha-als]
+    /// ADR L547: fleet-median α is per-dimension marginal median across
+    /// fitted pnames (same machinery as the M(c) prior), re-projected
+    /// onto Δ². Median-of-tenant-medians: 2 tenants × 3 keys each;
+    /// fleet α should land at the cross-tenant per-dim median of the
+    /// per-tenant per-dim medians.
+    #[test]
+    fn fleet_median_alpha_is_per_dim_median() {
+        // t0's 3 α: [.9,.05,.05] [.7,.2,.1] [.5,.3,.2] → per-dim med [.7,.2,.1]
+        // t1's 3 α: [.1,.1,.8]   [.2,.3,.5] [.3,.4,.3] → per-dim med [.2,.3,.5]
+        // cross-tenant per-dim med: mean of {.7,.2}, {.2,.3}, {.1,.5}
+        //   = [.45, .25, .3] → Σ=1.0 already on simplex.
+        let mut all = Vec::new();
+        for (t, a) in [
+            ("t0", [0.9, 0.05, 0.05]),
+            ("t0", [0.7, 0.2, 0.1]),
+            ("t0", [0.5, 0.3, 0.2]),
+            ("t1", [0.1, 0.1, 0.8]),
+            ("t1", [0.2, 0.3, 0.5]),
+            ("t1", [0.3, 0.4, 0.3]),
+        ] {
+            all.push((tkey(t, "p"), fpa(1.0, a)));
+        }
+        let m = fleet_median(&all, 2, 2).expect("6 keys ≥ 2, 2 tenants ≥ 2");
+        let want = [0.45, 0.25, 0.3];
+        for d in 0..K {
+            assert!(
+                (m.alpha[d] - want[d]).abs() < 1e-9,
+                "α[{d}]={} want {}",
+                m.alpha[d],
+                want[d]
+            );
+        }
+        assert!((m.alpha.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        // Per-component clamp around UNIFORM=[⅓;3]: band [⅙, ⅔].
+        // [.45,.25,.3] all inside → unchanged after clamp+reproject.
+        let clamped = clamp_to_operator(&m, &probe(), 600.0);
+        for d in 0..K {
+            assert!((clamped.alpha[d] - want[d]).abs() < 1e-9);
+        }
+    }
+
+    /// Clamp pulls a vertex-heavy fleet α (e.g. fleet is all-ioseq
+    /// pnames) toward the UNIFORM band, then re-projects.
+    #[test]
+    fn fleet_alpha_clamped_to_uniform_band_then_reprojected() {
+        let f = FitParams {
+            alpha: [0.05, 0.05, 0.9],
+            ..fp(1.0, 1.0, 0.0, 1.0, 1.0)
+        };
+        let c = clamp_to_operator(&f, &probe(), 600.0);
+        // raw clamp: [.05→⅙, .05→⅙, .9→⅔] = [⅙,⅙,⅔], Σ=1.0 → projection
+        // is identity. ioseq capped at ⅔ (the band edge).
+        assert!((c.alpha[2] - 2.0 / 3.0).abs() < 1e-9, "{:?}", c.alpha);
+        assert!((c.alpha.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!(c.alpha.iter().all(|&x| x >= 0.0));
+    }
+
+    /// v2 SeedEntry α round-trips through `into_seed_map`; v1 (empty) and
+    /// malformed (wrong length) default to UNIFORM.
+    #[test]
+    fn seed_entry_alpha_projected_or_uniform() {
+        let corpus = SeedCorpus {
+            ref_hw_class: "ref".into(),
+            ref_factor_vec: vec![],
+            entries: vec![
+                SeedEntry {
+                    pname: "v2".into(),
+                    alpha: vec![0.5, 0.6, 0.2], // Σ=1.3 → projected
+                    ..Default::default()
+                },
+                SeedEntry {
+                    pname: "v1".into(),
+                    alpha: vec![], // → UNIFORM
+                    ..Default::default()
+                },
+                SeedEntry {
+                    pname: "bad".into(),
+                    alpha: vec![1.0], // len≠K → UNIFORM
+                    ..Default::default()
+                },
+            ],
+        };
+        let (map, _) = corpus.into_seed_map(&HwTable::default());
+        let v2 = &map[&("v2".into(), String::new())];
+        assert!((v2.alpha.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!(v2.alpha[0] > v2.alpha[2], "rank order survives projection");
+        assert_eq!(map[&("v1".into(), String::new())].alpha, UNIFORM);
+        assert_eq!(map[&("bad".into(), String::new())].alpha, UNIFORM);
     }
 
     fn tkey(tenant: &str, pname: &str) -> ModelKey {

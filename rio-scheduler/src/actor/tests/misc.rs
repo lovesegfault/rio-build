@@ -1009,6 +1009,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("d", Some("big"), "x86_64-linux", false);
@@ -1090,6 +1091,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("w", Some("wide"), "x86_64-linux", false);
@@ -1141,6 +1143,7 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("p", Some("exploring"), "x86_64-linux", false);
@@ -1198,6 +1201,7 @@ async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("t", Some("trivial"), "x86_64-linux", false);

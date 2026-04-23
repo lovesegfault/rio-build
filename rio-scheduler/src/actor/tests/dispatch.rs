@@ -1591,6 +1591,7 @@ async fn spawn_intent_from_sla_estimator() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
 
@@ -1748,6 +1749,7 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("d", Some("p"), "x86_64-linux", false);
@@ -1989,6 +1991,7 @@ async fn spawn_intent_node_selector_from_solve_full() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
 
@@ -2144,6 +2147,7 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
 
@@ -2270,6 +2274,7 @@ async fn work_assignment_carries_sla_cores() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
 
@@ -2352,6 +2357,7 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
         ci_computed_at: None,
         tier: None,
         hw_bias: Default::default(),
+        alpha: crate::sla::alpha::UNIFORM,
         prior_source: None,
     });
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);

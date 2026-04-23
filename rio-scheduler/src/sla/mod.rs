@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::db::{SchedulerDb, SlaOverrideRow};
 
+pub mod alpha;
 pub mod bootstrap;
 pub mod config;
 pub mod cost;
@@ -161,8 +162,9 @@ impl SlaEstimator {
             // operator_to_spq / clamp_to_operator compare against
             // ref-second fleet medians. Convert at the chokepoint where
             // hw becomes available.
-            self.priors.write().default_tier_target =
-                self.default_tier_target_wall * t.factor(&t.reference);
+            self.priors.write().default_tier_target = self.default_tier_target_wall
+                * t.factor(&t.reference)
+                    .map_or(1.0, |f| alpha::dot(alpha::UNIFORM, f));
         }
         *self.hw.write() = t;
     }
@@ -194,12 +196,25 @@ impl SlaEstimator {
         self.hw.read().clone()
     }
 
-    /// Look up the normalization factor for one `hw_class` without
-    /// cloning the whole table. `None` or unknown class → 1.0.
-    /// Hot-path equivalent of `hw_table().factor(h)` for the
-    /// per-completion ref-seconds normalization.
-    pub fn hw_factor(&self, hw_class: Option<&str>) -> f64 {
-        hw_class.map_or(1.0, |h| self.hw.read().factor(h))
+    /// Look up `α · factor[hw_class]` without cloning the whole table.
+    /// `None` / unknown / <3-pod class → 1.0. Hot-path equivalent of
+    /// `hw_table().normalize(1.0, h, α)` for the per-completion
+    /// ref-seconds normalization. Caller supplies the per-pname α (from
+    /// [`Self::cached_alpha`]).
+    pub fn hw_factor(&self, hw_class: Option<&str>, alpha: alpha::Alpha) -> f64 {
+        hw_class
+            .and_then(|h| self.hw.read().factor(h))
+            .map_or(1.0, |f| alpha::dot(alpha, f))
+    }
+
+    /// Per-pname α for `key` from the cache, or [`alpha::UNIFORM`] when
+    /// unfitted. For per-completion metrics paths that need a scalar
+    /// `α·factor` before the new sample lands in the ring.
+    pub fn cached_alpha(&self, key: &types::ModelKey) -> alpha::Alpha {
+        self.cache
+            .read()
+            .get(key)
+            .map_or(alpha::UNIFORM, |f| f.alpha)
     }
 
     /// Snapshot the prior-source inputs. For
@@ -492,7 +507,8 @@ impl SlaEstimator {
                     // wall-clock before comparing or an on-curve sample
                     // from a fast hw_class is falsely flagged by
                     // |ln(1/factor)|.
-                    let ref_t = hw_snapshot.normalize(r.duration_secs, r.hw_class.as_deref());
+                    let ref_t =
+                        hw_snapshot.normalize(r.duration_secs, r.hw_class.as_deref(), prev.alpha);
                     if let Some(c) = r.cpu_limit_cores
                         && ingest::is_outlier(ref_t, r.duration_secs, c, prev, DT_POLL_SECS)
                     {
@@ -560,7 +576,17 @@ impl SlaEstimator {
                 let types::MemFit::Coupled { a, b, .. } = f.mem else {
                     return None;
                 };
-                Some((f.key.clone(), prior::FitParams { s, p, q, a, b }))
+                Some((
+                    f.key.clone(),
+                    prior::FitParams {
+                        s,
+                        p,
+                        q,
+                        a,
+                        b,
+                        alpha: f.alpha,
+                    },
+                ))
             })
             .collect();
         self.priors.write().fleet =
@@ -635,6 +661,7 @@ mod tests {
             ci_computed_at: None,
             tier: None,
             hw_bias: HashMap::new(),
+            alpha: crate::sla::alpha::UNIFORM,
             prior_source: None,
         }
     }
