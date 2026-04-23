@@ -560,6 +560,8 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
         sigma_resid: 0.02,
         log_residuals: vec![0.02, -0.02, 0.02, -0.02, 0.02],
         n_eff: 8.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 16.0,
         explore: ExploreState {
             distinct_c: 5,

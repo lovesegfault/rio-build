@@ -89,7 +89,6 @@ pub struct SlaEstimator {
     /// to a different cluster are filtered at SQL read time.
     cluster: String,
     last_tick: RwLock<f64>,
-    halflife_secs: f64,
     ring_buffer: u32,
 }
 
@@ -141,7 +140,6 @@ impl SlaEstimator {
             default_tier_target_wall,
             cluster: cfg.cluster.clone(),
             last_tick: RwLock::new(0.0),
-            halflife_secs: cfg.halflife_secs,
             ring_buffer: cfg.ring_buffer,
         }
     }
@@ -505,7 +503,6 @@ impl SlaEstimator {
             let fit = ingest::refit(
                 key,
                 &rows,
-                self.halflife_secs,
                 prev.as_ref(),
                 tiers,
                 &hw_snapshot,
@@ -616,6 +613,8 @@ mod tests {
             sigma_resid: 0.1,
             log_residuals: vec![],
             n_eff,
+            n_distinct_c: 5,
+            sum_w: n_eff,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,

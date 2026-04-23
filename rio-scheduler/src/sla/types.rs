@@ -80,6 +80,16 @@ impl DurationFit {
             Self::Usl { s, p, q, .. } => (s.0, p.0, *q),
         }
     }
+    /// Free-parameter count for the [`super::fit::z_q`] degrees-of-
+    /// freedom calculation. `Probe` → 0 (no fit; z_q is unused on the
+    /// probe path anyway).
+    pub fn n_par(&self) -> u32 {
+        match self {
+            Self::Probe => 0,
+            Self::Amdahl { .. } | Self::Capped { .. } => 2,
+            Self::Usl { .. } => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +132,17 @@ pub struct FittedParams {
     /// entries (ring-buffer cap), so the per-key cache cost is bounded.
     pub log_residuals: Vec<f64>,
     pub n_eff: f64,
+    /// Count of distinct `cpu_limit` values in the ring (=
+    /// [`super::ingest::AnchorRing::n_distinct_c`]). Feeds the
+    /// [`super::fit::z_q`] degrees-of-freedom: post-convergence `n_eff`
+    /// can be high while every fresh sample sits at the same c, leaving
+    /// the design matrix near-rank-1 — `n_distinct_c` is the binding
+    /// quantity then.
+    pub n_distinct_c: u32,
+    /// `Σw_i` over the ring. Feeds [`super::fit::z_q`]'s `√(1 + 1/Σw)`
+    /// leverage term. NOT `n_eff`: under sub-unit weights `n_eff ≥ Σw`,
+    /// so substituting would *narrow* the interval (anti-conservative).
+    pub sum_w: f64,
     pub span: f64,
     pub explore: ExploreState,
     pub t_min_ci: Option<(RefSeconds, RefSeconds)>,
@@ -144,6 +165,23 @@ pub struct FittedParams {
     /// Surfaced via `SlaStatus.prior_source` so `rio-cli sla status`
     /// can show "this curve is 75% your seed table".
     pub prior_source: Option<super::prior::PriorSource>,
+}
+
+impl FittedParams {
+    /// Student-t prediction-interval factor at quantile `q` for THIS
+    /// fit's `(n_eff, n_distinct_c, n_par, Σw)`. Computed once per
+    /// `(fit, q)` and threaded through [`super::quantile::quantile`] —
+    /// cheap (one `inverse_cdf`) but constant across bisection steps so
+    /// callers should hoist it.
+    pub fn z_q(&self, q: f64) -> f64 {
+        super::fit::z_q(
+            q,
+            self.n_eff,
+            self.n_distinct_c,
+            self.fit.n_par(),
+            self.sum_w,
+        )
+    }
 }
 
 #[cfg(test)]

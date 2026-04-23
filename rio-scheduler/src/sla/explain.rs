@@ -225,7 +225,9 @@ mod tests {
             disk_p90: Some(DiskBytes(10 << 30)),
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
-            n_eff: 10.0,
+            n_eff: 1e6,
+            n_distinct_c: 1_000_000,
+            sum_w: 1e6,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,

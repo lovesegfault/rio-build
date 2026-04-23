@@ -438,9 +438,12 @@ pub fn solve_envelope(
     hw_factor: f64,
     lambda: f64,
 ) -> Option<RawCores> {
-    let bounds: Vec<(f64, f64)> = [(0.5, tier.p50), (0.9, tier.p90), (0.99, tier.p99)]
+    // r[impl sched.sla.hw-class.zq-inflation]
+    // z_q is constant per (fit, q) — hoist out of the bisection so each
+    // `feasible(c)` call is pure CDF arithmetic.
+    let bounds: Vec<(f64, f64, f64)> = [(0.5, tier.p50), (0.9, tier.p90), (0.99, tier.p99)]
         .into_iter()
-        .filter_map(|(q, b)| b.map(|b| (q, b)))
+        .filter_map(|(q, b)| b.map(|b| (q, b, fit.z_q(q))))
         .collect();
     if bounds.is_empty() {
         // No-bounds tier: max useful cores. Returning `c_lo` (=1 in
@@ -461,7 +464,7 @@ pub fn solve_envelope(
         }
         bounds
             .iter()
-            .all(|&(q, bound)| quantile::quantile(q, t, fit.sigma_resid, p) <= bound)
+            .all(|&(q, bound, zq)| quantile::quantile(q, t, fit.sigma_resid, p, zq) <= bound)
     };
     if !feasible(cap_c) {
         return None;
@@ -792,7 +795,13 @@ mod tests {
             disk_p90: Some(DiskBytes(10 << 30)),
             sigma_resid: sigma,
             log_residuals: Vec::new(),
-            n_eff: 10.0,
+            // Asymptotic-n so z_q → Φ⁻¹(q) and the closed-form test
+            // expectations below (which use 1.2816/2.3263) hold. Tests
+            // that exercise small-n widening or headroom set these
+            // explicitly.
+            n_eff: 1e6,
+            n_distinct_c: 1_000_000,
+            sum_w: 1e6,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,
@@ -1187,7 +1196,7 @@ mod tests {
         };
         let (c, m, d) = intent(Some(&fit), &hints);
         assert_eq!(c, 1);
-        let want = ((2u64 << 30) as f64 * headroom(10.0)) as u64;
+        let want = ((2u64 << 30) as f64 * headroom(fit.n_eff)) as u64;
         assert_eq!(m, want, "MemFit.at(1) × headroom(n_eff), not probe_mem");
         assert_eq!(d, 10 << 30, "fit.disk_p90, not default_disk");
         // No fit → probe defaults.
@@ -1240,7 +1249,7 @@ mod tests {
         );
         assert_eq!(c, 12);
         let raw = fit.mem.at(RawCores(12.0)).0;
-        assert_eq!(m, (raw as f64 * headroom(10.0)) as u64);
+        assert_eq!(m, (raw as f64 * headroom(fit.n_eff)) as u64);
         assert!(m > raw, "must include headroom factor");
     }
     #[test]

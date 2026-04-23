@@ -995,6 +995,8 @@ async fn solve_intent_for_clamps_at_ceil() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -1074,6 +1076,8 @@ async fn solve_intent_for_clamps_at_ceil() {
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
         n_eff: 2.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 2.0,
         explore: ExploreState {
             distinct_c: 2,
@@ -1123,6 +1127,8 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
         n_eff: 1.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 1.0,
         explore: ExploreState {
             distinct_c: 1,
@@ -1178,6 +1184,8 @@ async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,

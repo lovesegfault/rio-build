@@ -178,6 +178,8 @@ mod tests {
             sigma_resid: 0.2,
             log_residuals: Vec::new(),
             n_eff: 1.0,
+            n_distinct_c: 1,
+            sum_w: 1.0,
             span: 1.0,
             explore: st,
             t_min_ci: None,

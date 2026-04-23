@@ -1573,7 +1573,12 @@ async fn spawn_intent_from_sla_estimator() {
         disk_p90: Some(DiskBytes(10 << 30)),
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
-        n_eff: 10.0,
+        // Asymptotic-n so z_q ≈ Φ⁻¹(0.9)=1.2816 and the closed-form
+        // β math in the comment above holds; this test is about
+        // SpawnIntent wiring, not small-n widening.
+        n_eff: 1e6,
+        n_distinct_c: 1_000_000,
+        sum_w: 1e6,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -1729,6 +1734,8 @@ async fn ladder_cap_forces_band_agnostic_after_n_timeouts() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -1968,6 +1975,8 @@ async fn spawn_intent_node_selector_from_solve_full() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -2121,6 +2130,8 @@ async fn solve_full_gate_skips_fod_kvm_serial_and_override() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -2245,6 +2256,8 @@ async fn work_assignment_carries_sla_cores() {
         sigma_resid: 0.1,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,
@@ -2325,6 +2338,8 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
         sigma_resid: 0.0,
         log_residuals: Vec::new(),
         n_eff: 10.0,
+        n_distinct_c: 5,
+        sum_w: 10.0,
         span: 8.0,
         explore: ExploreState {
             distinct_c: 3,

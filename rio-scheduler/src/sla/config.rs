@@ -123,10 +123,6 @@ pub struct SlaConfig {
     /// [`super::SlaEstimator::new`].
     #[serde(default = "default_ring_buffer")]
     pub ring_buffer: u32,
-    /// EWMA half-life for sample ageing. Feeds
-    /// [`super::SlaEstimator::new`].
-    #[serde(default = "default_halflife")]
-    pub halflife_secs: f64,
     /// JSON [`super::prior::SeedCorpus`] loaded at startup into the
     /// seed-prior table. ADR-023 §2.10: lets a fresh deployment skip
     /// the cold-start probe ladder for known pnames. Unset → seed table
@@ -242,9 +238,6 @@ fn default_max_node_claims_per_cell_per_tick() -> u32 {
 fn default_ring_buffer() -> u32 {
     32
 }
-fn default_halflife() -> f64 {
-    7.0 * 86400.0
-}
 
 /// Cold-start probe shape: `mem = mem_base + cpu × mem_per_core`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,7 +318,6 @@ impl SlaConfig {
             max_disk: 6 << 30,
             default_disk: 2 << 30,
             ring_buffer: default_ring_buffer(),
-            halflife_secs: default_halflife(),
             seed_corpus: None,
             hw_cost_source: None,
             hw_classes: HashMap::new(),
@@ -377,11 +369,6 @@ impl SlaConfig {
             self.max_cores < 1024.0,
             "sla.maxCores < 1024 required (PriorityClass bucket range), got {}",
             self.max_cores
-        );
-        anyhow::ensure!(
-            self.halflife_secs.is_finite() && self.halflife_secs > 0.0,
-            "sla.halflife_secs must be finite and positive, got {}",
-            self.halflife_secs
         );
         anyhow::ensure!(
             (0.0..=0.5).contains(&self.hw_cost_tolerance),

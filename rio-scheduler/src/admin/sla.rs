@@ -156,6 +156,8 @@ mod tests {
             sigma_resid: 0.1,
             log_residuals: vec![],
             n_eff: 8.0,
+            n_distinct_c: 5,
+            sum_w: 10.0,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,

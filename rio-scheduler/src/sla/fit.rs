@@ -1,12 +1,42 @@
-use std::time::Duration;
-
 use nalgebra::{DMatrix, DVector};
+use statrs::distribution::{ContinuousCDF, StudentsT};
 
 use super::types::{DurationFit, MemBytes, MemFit, RawCores, RefSeconds};
 
+// r[impl sched.sla.hw-class.sample-weight-ordinal]
 // r[impl sched.sla.fit-nnls]  (weights are part of the fit contract)
-pub fn sample_weight(age: Duration, halflife_secs: f64, vdist: u32) -> f64 {
-    0.5f64.powf(age.as_secs_f64() / halflife_secs) * 0.5f64.powi(vdist as i32)
+/// Ordinal recency halflife (samples). No wall-clock arm: a key built
+/// monthly would otherwise asymptote at `n_eff ≈ 1` and never leave
+/// §Exploration. ADR-023 L142-143.
+const ORDINAL_HALFLIFE: f64 = 20.0;
+
+/// Per-sample weight `0.5^(age/20) · 0.5^vdist`. `ordinal_age` is the
+/// count of samples NEWER than this one for the key (0 = newest).
+/// `vdist` is the ordinal version-distance (count of distinct version
+/// strings between this sample and current).
+pub fn sample_weight(ordinal_age: u32, vdist: u32) -> f64 {
+    0.5f64.powf(f64::from(ordinal_age) / ORDINAL_HALFLIFE) * 0.5f64.powi(vdist as i32)
+}
+
+// r[impl sched.sla.hw-class.zq-inflation]
+/// Student-t prediction-interval factor evaluated at the design
+/// centroid (ADR-023 L193-197):
+///
+/// `z_q = t_{q, max(3, min(n_eff, n_distinct_c) − n_par)} · √(1 + 1/Σw)`
+///
+/// Both `n_eff` and `n_distinct_c` must bind: Kish n_eff measures
+/// weight dispersion, not design-point support, and post-convergence
+/// the latter is the limiting quantity. df is floored at 3 — trades
+/// small-sample conservatism against the `n_eff ≥ 3` gate already
+/// excluding df<1. At large `(n_eff, n_distinct_c, Σw)` this
+/// asymptotes to `Φ⁻¹(q)` (≈ 1.2816 at q=0.9).
+///
+/// `sum_w` is `Σw_i` over the ring — NOT `n_eff` (they coincide only
+/// under uniform unit weights).
+pub fn z_q(q: f64, n_eff: f64, n_distinct_c: u32, n_par: u32, sum_w: f64) -> f64 {
+    let df = (n_eff.min(f64::from(n_distinct_c)) - f64::from(n_par)).max(3.0);
+    let t = StudentsT::new(0.0, 1.0, df).expect("df ≥ 3").inverse_cdf(q);
+    t * (1.0 + 1.0 / sum_w.max(1.0)).sqrt()
 }
 
 pub fn kish_n_eff(w: &[f64]) -> f64 {
@@ -399,10 +429,73 @@ mod tests {
         assert!(kish_n_eff(&[100.0, 1.0, 1.0, 1.0]) < 2.0);
     }
 
+    // r[verify sched.sla.hw-class.sample-weight-ordinal]
     #[test]
-    fn sample_weight_halflife() {
-        let w = sample_weight(Duration::from_secs(7 * 86400), 7.0 * 86400.0, 1);
-        assert!((w - 0.25).abs() < 1e-6);
+    fn sample_weight_ordinal_halflife() {
+        // 20 samples ago, vdist=0 → weight 0.5
+        assert!((sample_weight(20, 0) - 0.5).abs() < 1e-9);
+        // 0 samples ago, vdist=1 → weight 0.5
+        assert!((sample_weight(0, 1) - 0.5).abs() < 1e-9);
+        // 40 samples ago, vdist=2 → 0.25 · 0.25
+        assert!((sample_weight(40, 2) - 0.0625).abs() < 1e-9);
+    }
+
+    // r[verify sched.sla.hw-class.sample-weight-ordinal]
+    #[test]
+    fn sample_weight_monthly_key_retains_neff() {
+        // The bug ordinal weighting fixes: a monthly-built key under
+        // wall-clock decay (halflife=7d) would asymptote at n_eff≈1.
+        // Ordinal: a 32-slot ring at vdist=0 gives
+        // n_eff = (Σ0.5^(i/20))² / Σ0.5^(2i/20) ≈ 18.7 — enough to
+        // reach the USL stage.
+        let w: Vec<f64> = (0..32).map(|i| sample_weight(i, 0)).collect();
+        assert!(kish_n_eff(&w) > 15.0, "n_eff = {}", kish_n_eff(&w));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+        // r[verify sched.sla.hw-class.sample-weight-ordinal]
+        #[test]
+        fn sample_weight_monotone_decreasing(age in 0u32..200, vd in 0u32..10) {
+            proptest::prop_assert!(sample_weight(age + 1, vd) <= sample_weight(age, vd));
+            proptest::prop_assert!(sample_weight(age, vd + 1) <= sample_weight(age, vd));
+        }
+    }
+
+    // r[verify sched.sla.hw-class.zq-inflation]
+    #[test]
+    fn z_q_widens_at_low_neff() {
+        // n_eff=3, n_distinct_c=3, n_par=2, sum_w=2.5.
+        // df = max(3, min(3,3)-2) = 3; t_{0.9,3}=1.638; ×√(1+1/2.5)=1.937.
+        let z = z_q(0.9, 3.0, 3, 2, 2.5);
+        assert!((z - 1.937).abs() < 0.01, "z={z}");
+    }
+
+    #[test]
+    fn z_q_asymptotes_to_ppf() {
+        // Large n_eff, n_distinct_c, sum_w → Φ⁻¹(0.9)=1.2816.
+        let z = z_q(0.9, 1e6, 1_000_000, 2, 1e6);
+        assert!((z - 1.2816).abs() < 0.001, "z={z}");
+    }
+
+    // r[verify sched.sla.hw-class.zq-inflation]
+    #[test]
+    fn z_q_n_distinct_c_binds_post_convergence() {
+        // n_eff=20 but n_distinct_c=3 (post-convergence: 20 effective
+        // samples all at the same c) → df binds on n_distinct_c, not
+        // n_eff. This is the case anchor-slots prevent from being
+        // worse: without anchors n_distinct_c→1 and df floors at 3
+        // forever.
+        let z_bound = z_q(0.9, 20.0, 3, 2, 18.0);
+        let z_unbound = z_q(0.9, 20.0, 20, 2, 18.0);
+        assert!(z_bound > z_unbound + 0.2, "{z_bound} vs {z_unbound}");
+    }
+
+    #[test]
+    fn z_q_sum_w_floored_at_1() {
+        // sum_w<1 (heavily decayed ring) must not blow up √(1+1/Σw).
+        let z = z_q(0.9, 5.0, 5, 2, 0.0);
+        assert!(z.is_finite() && z > 0.0);
     }
 
     #[test]

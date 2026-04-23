@@ -5,7 +5,6 @@
 //! so it can be unit-tested against synthetic rows.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use super::bootstrap::{WeightedSample, t_min_ci};
 use super::fit::{
@@ -30,6 +29,119 @@ const BOOTSTRAP_REPS: usize = 500;
 /// dominates.
 const PARTIAL_POOL_N0: f64 = 3.0;
 
+/// Hard floor on bootstrap-CI recompute interval. Decoupled from any
+/// halflife (ordinal weighting has none): this is purely a
+/// rate-limiter on the expensive 500×NNLS bootstrap under completion
+/// storms.
+const CI_DEBOUNCE_SECS: f64 = 30.0;
+
+// r[impl sched.sla.hw-class.anchor-slots]
+/// `cap`-slot sample ring with anchor reservation. ADR-023 L145: one
+/// slot per distinct `cpu_limit` holds the highest-weight (lowest
+/// vdist, then newest) sample at that c and is never displaced by
+/// recency; remaining slots are recency-FIFO. [`Self::weighted_rows`]
+/// applies a weight floor `0.5^vdist / n_anchors` to anchor rows so the
+/// NNLS design matrix stays full-rank after convergence (when every
+/// fresh sample lands at the same c* and the anchored explore-rows
+/// would otherwise recency-decay to numerical zero).
+///
+/// Rows must be pushed completed_at-ascending (oldest first) — matches
+/// `refit`'s input contract.
+#[derive(Debug)]
+pub struct AnchorRing {
+    cap: usize,
+    /// Push-ordered (oldest first).
+    rows: Vec<(BuildSampleRow, u32 /* vdist */)>,
+    /// `cpu_limit` (rounded) → index into `rows` of the anchor.
+    anchors: HashMap<u32, usize>,
+}
+
+impl AnchorRing {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            rows: Vec::with_capacity(cap),
+            anchors: HashMap::new(),
+        }
+    }
+
+    /// Build from a completed_at-ascending slice + parallel vdists.
+    /// `cap` here is the eviction threshold; `refit` passes the slice
+    /// length so eviction is a no-op (DB already capped).
+    // TODO(A9): DB-side `trim_build_samples_batch` is recency-only and
+    // can drop anchors; once that learns anchor-awareness, `refit` can
+    // pass `ring_buffer` here and drop the special-case.
+    pub fn from_rows(cap: usize, rows: &[&BuildSampleRow], vdists: &[u32]) -> Self {
+        debug_assert_eq!(rows.len(), vdists.len());
+        let mut ring = Self::new(cap);
+        for (r, &vd) in rows.iter().zip(vdists) {
+            ring.push((*r).clone(), vd);
+        }
+        ring
+    }
+
+    /// Append a row (newest so far). Evicts the oldest non-anchor if
+    /// over `cap`. O(n) eviction is fine for n ≤ 32+1.
+    pub fn push(&mut self, row: BuildSampleRow, vdist: u32) {
+        let c_key = row.cpu_limit_cores.map(|c| c.round() as u32);
+        let i = self.rows.len();
+        self.rows.push((row, vdist));
+        // Anchor selection: lowest-vdist (highest version-weight),
+        // tie-break newest. The newest row is always the anchor for a
+        // first-seen c, so explore-ladder probes anchor immediately.
+        if let Some(c) = c_key {
+            match self.anchors.get(&c) {
+                Some(&j) if self.rows[j].1 < vdist => {}
+                _ => {
+                    self.anchors.insert(c, i);
+                }
+            }
+        }
+        if self.rows.len() > self.cap {
+            let anchor_set: HashSet<usize> = self.anchors.values().copied().collect();
+            if let Some(victim) = (0..self.rows.len()).find(|i| !anchor_set.contains(i)) {
+                self.rows.remove(victim);
+                for v in self.anchors.values_mut() {
+                    if *v > victim {
+                        *v -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count of distinct `cpu_limit` values retained. Feeds
+    /// [`FittedParams::n_distinct_c`] → [`super::fit::z_q`] df.
+    pub fn n_distinct_c(&self) -> u32 {
+        self.anchors.len() as u32
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// `(row, vdist, weight)` over all retained rows, oldest-first.
+    /// `weight = sample_weight(ordinal_age, vdist)` with anchor floor
+    /// `max(weight, 0.5^vdist / n_anchors)`. Ordinal age is over
+    /// retained rows (newest = 0).
+    pub fn weighted_rows(&self) -> impl Iterator<Item = (&BuildSampleRow, u32, f64)> + '_ {
+        let anchor_set: HashSet<usize> = self.anchors.values().copied().collect();
+        let n = self.rows.len();
+        let n_anchors = self.anchors.len().max(1) as f64;
+        self.rows.iter().enumerate().map(move |(i, (r, vd))| {
+            let age = (n - 1 - i) as u32;
+            let mut w = sample_weight(age, *vd);
+            if anchor_set.contains(&i) {
+                w = w.max(0.5f64.powi(*vd as i32) / n_anchors);
+            }
+            (r, *vd, w)
+        })
+    }
+}
+
 /// Refit one `(pname, system, tenant)` key from its ring-buffer of recent
 /// samples (≤32 rows, completed_at-ascending — `rows.last()` is newest).
 ///
@@ -48,7 +160,6 @@ const PARTIAL_POOL_N0: f64 = 3.0;
 pub fn refit(
     key: &ModelKey,
     rows: &[BuildSampleRow],
-    halflife_secs: f64,
     prev: Option<&FittedParams>,
     tiers: &[Tier],
     hw: &HwTable,
@@ -70,15 +181,18 @@ pub fn refit(
     let current_v = fit_rows.last().and_then(|r| r.version.clone());
     let vdists = compute_vdists(&versions, current_v.as_deref());
 
-    let w: Vec<f64> = fit_rows
-        .iter()
-        .zip(&vdists)
-        .map(|(r, &vd)| {
-            let age = Duration::from_secs_f64((now - r.completed_at).max(0.0));
-            sample_weight(age, halflife_secs, vd)
-        })
-        .collect();
+    // r[impl sched.sla.hw-class.anchor-slots]
+    // r[impl sched.sla.hw-class.sample-weight-ordinal]
+    // Anchor ring: identifies one anchor per distinct cpu_limit and
+    // applies the weight floor. cap=len so eviction is a no-op here
+    // (DB already capped at `ring_buffer`); the floor is the active
+    // behaviour. Weights are ordinal — `completed_at` is no longer
+    // read for weighting (only for the CI-debounce floor below).
+    let ring = AnchorRing::from_rows(fit_rows.len(), &fit_rows, &vdists);
+    let w: Vec<f64> = ring.weighted_rows().map(|(_, _, w)| w).collect();
     let n_eff = kish_n_eff(&w);
+    let sum_w: f64 = w.iter().sum();
+    let n_distinct_c = ring.n_distinct_c();
 
     let cs: Vec<f64> = fit_rows
         .iter()
@@ -205,7 +319,7 @@ pub fn refit(
     // or it's been long enough. Probe fits skip CI entirely (no T_min).
     let (ci, ci_at) = if matches!(fit, DurationFit::Probe) {
         (None, None)
-    } else if should_recompute_ci(prev, &fit, n_eff, now, halflife_secs) {
+    } else if should_recompute_ci(prev, &fit, n_eff, now) {
         let ws: Vec<WeightedSample> = cs_f
             .iter()
             .zip(&ts_f)
@@ -239,6 +353,8 @@ pub fn refit(
         sigma_resid: sigma,
         log_residuals,
         n_eff,
+        n_distinct_c,
+        sum_w,
         span,
         explore,
         t_min_ci: ci,
@@ -439,21 +555,20 @@ fn median(v: &[f64]) -> f64 {
 ///     CI width (estimate has plausibly left the old interval).
 ///
 /// Otherwise hold the previous CI. Hard floor: never recompute within
-/// `min(30s, halflife/10)` of the last bootstrap regardless of the above
+/// [`CI_DEBOUNCE_SECS`] of the last bootstrap regardless of the above
 /// — bounds the per-key bootstrap rate under completion storms.
 pub(super) fn should_recompute_ci(
     prev: Option<&FittedParams>,
     new_fit: &DurationFit,
     new_n_eff: f64,
     now: f64,
-    halflife_secs: f64,
 ) -> bool {
     let Some(prev) = prev else { return true };
     // Floor first — it's unconditional, and `ci_computed_at` is set
     // even when bootstrap returned `None` (rank-deficient resamples), so
     // a None-CI key still rate-limits to once per 30s.
     if let Some(at) = prev.ci_computed_at
-        && now - at < 30.0_f64.min(halflife_secs / 10.0)
+        && now - at < CI_DEBOUNCE_SECS
     {
         return false;
     }
@@ -531,6 +646,8 @@ fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
         n_eff: 0.0,
+        n_distinct_c: 0,
+        sum_w: 0.0,
         span: 1.0,
         explore: derive_explore_state(&[], last),
         t_min_ci: None,
@@ -606,31 +723,15 @@ mod tests {
     }
 
     fn r(rows: &[BuildSampleRow]) -> FittedParams {
-        refit(
-            &key(),
-            rows,
-            7.0 * 86400.0,
-            None,
-            &[],
-            &HwTable::default(),
-            None,
-        )
+        refit(&key(), rows, None, &[], &HwTable::default(), None)
     }
 
     fn r_hw(rows: &[BuildSampleRow], hw: &HwTable) -> FittedParams {
-        refit(&key(), rows, 7.0 * 86400.0, None, &[], hw, None)
+        refit(&key(), rows, None, &[], hw, None)
     }
 
     fn r_prior(rows: &[BuildSampleRow], priors: &PriorSources) -> FittedParams {
-        refit(
-            &key(),
-            rows,
-            7.0 * 86400.0,
-            None,
-            &[],
-            &HwTable::default(),
-            Some(priors),
-        )
+        refit(&key(), rows, None, &[], &HwTable::default(), Some(priors))
     }
 
     /// Like `row` but with explicit peak_cpu and avg_cores so Capped-stage
@@ -1038,6 +1139,8 @@ mod tests {
             sigma_resid: 0.1,
             log_residuals: Vec::new(),
             n_eff,
+            n_distinct_c: 5,
+            sum_w: n_eff,
             span: 8.0,
             explore: ExploreState {
                 distinct_c: 3,
@@ -1063,21 +1166,9 @@ mod tests {
         // prev CI computed at t=1000, now=1020 → elapsed=20s < 30s → skip
         // even though ΔT_min=400 > width/2=50.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
-        assert!(!should_recompute_ci(
-            Some(&prev),
-            &new_fit,
-            5.0,
-            1020.0,
-            7.0 * 86400.0
-        ));
+        assert!(!should_recompute_ci(Some(&prev), &new_fit, 5.0, 1020.0));
         // Same prev, now=1040 → elapsed=40s > 30s → ΔT_min trigger fires.
-        assert!(should_recompute_ci(
-            Some(&prev),
-            &new_fit,
-            5.0,
-            1040.0,
-            7.0 * 86400.0
-        ));
+        assert!(should_recompute_ci(Some(&prev), &new_fit, 5.0, 1040.0));
     }
 
     #[test]
@@ -1088,21 +1179,9 @@ mod tests {
         };
         // ΔT_min=0, but n_eff 5→12 (>50% jump) → recompute.
         let prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
-        assert!(should_recompute_ci(
-            Some(&prev),
-            &new_fit,
-            12.0,
-            1040.0,
-            7.0 * 86400.0
-        ));
+        assert!(should_recompute_ci(Some(&prev), &new_fit, 12.0, 1040.0));
         // n_eff 5→6 (<50%) and ΔT_min=0 → keep.
-        assert!(!should_recompute_ci(
-            Some(&prev),
-            &new_fit,
-            6.0,
-            1040.0,
-            7.0 * 86400.0
-        ));
+        assert!(!should_recompute_ci(Some(&prev), &new_fit, 6.0, 1040.0));
     }
 
     // ─── Task 5.1: MAD outlier rejection ─────────────────────────────────
@@ -1224,18 +1303,12 @@ mod tests {
             s: RefSeconds(100.0),
             p: RefSeconds(0.0),
         };
-        assert!(should_recompute_ci(None, &f, 5.0, 1000.0, 7.0 * 86400.0));
+        assert!(should_recompute_ci(None, &f, 5.0, 1000.0));
         // prev exists but bootstrap has never run → recompute.
         let mut prev = prev_with_ci(100.0, 50.0, 150.0, 5.0, 1000.0);
         prev.t_min_ci = None;
         prev.ci_computed_at = None;
-        assert!(should_recompute_ci(
-            Some(&prev),
-            &f,
-            5.0,
-            1000.0,
-            7.0 * 86400.0
-        ));
+        assert!(should_recompute_ci(Some(&prev), &f, 5.0, 1000.0));
     }
 
     #[test]
@@ -1250,11 +1323,11 @@ mod tests {
         let mut prev = prev_with_ci(100.0, 50.0, 150.0, 6.0, 100.0);
         prev.t_min_ci = None;
         assert!(
-            !should_recompute_ci(Some(&prev), &f, 6.0, 101.0, 600.0),
+            !should_recompute_ci(Some(&prev), &f, 6.0, 101.0),
             "within 30s floor"
         );
         assert!(
-            should_recompute_ci(Some(&prev), &f, 6.0, 200.0, 600.0),
+            should_recompute_ci(Some(&prev), &f, 6.0, 200.0),
             "past floor"
         );
     }
@@ -1300,5 +1373,156 @@ mod tests {
             !is_outlier(280.0, 280.0, 8.0, &fit, 1.0),
             "on-curve sample survives a divergent prior"
         );
+    }
+
+    // ─── A5: anchor-slot ring buffer ─────────────────────────────────────
+
+    fn mock_sample(c: f64, vdist_tag: u32) -> (BuildSampleRow, u32) {
+        (
+            BuildSampleRow {
+                cpu_limit_cores: Some(c),
+                duration_secs: 30.0 + 2000.0 / c,
+                completed_at: now_epoch(),
+                ..Default::default()
+            },
+            vdist_tag,
+        )
+    }
+
+    // r[verify sched.sla.hw-class.anchor-slots]
+    #[test]
+    fn anchor_slots_preserve_span_after_convergence() {
+        // 3 explore samples at c={4,16,32}, then 40 converged samples at
+        // c=8. Without anchors: ring holds 32×c=8, design matrix rank-1.
+        // With anchors: c={4,16,32} survive (never displaced by recency).
+        let mut ring = AnchorRing::new(32);
+        for c in [4.0, 16.0, 32.0] {
+            let (r, vd) = mock_sample(c, 0);
+            ring.push(r, vd);
+        }
+        for _ in 0..40 {
+            let (r, vd) = mock_sample(8.0, 0);
+            ring.push(r, vd);
+        }
+        let distinct: HashSet<u32> = ring
+            .weighted_rows()
+            .map(|(r, _, _)| r.cpu_limit_cores.unwrap().round() as u32)
+            .collect();
+        assert!(distinct.contains(&4));
+        assert!(distinct.contains(&16));
+        assert!(distinct.contains(&32));
+        assert!(distinct.contains(&8));
+        assert_eq!(ring.n_distinct_c(), 4);
+        assert_eq!(ring.len(), 32, "capped at 32");
+    }
+
+    // r[verify sched.sla.hw-class.anchor-slots]
+    #[test]
+    fn anchor_weight_floor_prevents_rank_degeneration() {
+        // Anchor at c=4 has ordinal_age≈31 → recency weight 0.5^(31/20)
+        // ≈ 0.341. Floor: 0.5^0 / n_anchors = 1/3 ≈ 0.333. At age 31 the
+        // recency weight still exceeds the floor; push past 32 so the
+        // ring is full and the anchor's age is pinned at 31 (oldest
+        // retained), but at vdist=2 the unfloored weight would be
+        // 0.341 · 0.25 ≈ 0.085 — floor lifts to 0.25/3 ≈ 0.083. Use
+        // a wider gap: 200 pushes → anchors age past the recency
+        // window entirely (ordinal_age = 31 still — they're retained at
+        // the front), so test the floor against a vdist-decayed anchor.
+        let mut ring = AnchorRing::new(32);
+        let (r, _) = mock_sample(4.0, 0);
+        ring.push(r, 3); // vdist=3 → 0.5^3 = 0.125 unfloored cap
+        let (r, _) = mock_sample(32.0, 0);
+        ring.push(r, 3);
+        for _ in 0..200 {
+            let (r, vd) = mock_sample(8.0, 0);
+            ring.push(r, vd);
+        }
+        // c=4 anchor: ordinal_age = 31 (oldest retained), vdist=3.
+        // Unfloored: 0.5^(31/20) · 0.5^3 ≈ 0.341 · 0.125 ≈ 0.0427.
+        // Floor: 0.5^3 / 3 ≈ 0.0417. Recency still wins by a hair —
+        // so go further: vdist=5 → unfloored 0.341·0.03125=0.0107;
+        // floor 0.03125/3=0.0104. The floor is `0.5^vd / n_anchors`,
+        // which is by construction ≤ the vdist-only weight at age=0;
+        // its job is to bound the ORDINAL-decay arm, not vdist. Reset
+        // and test the ordinal arm directly with vdist=0 anchors and a
+        // very full ring.
+        let mut ring = AnchorRing::new(32);
+        let (r, _) = mock_sample(4.0, 0);
+        ring.push(r, 0);
+        let (r, _) = mock_sample(32.0, 0);
+        ring.push(r, 0);
+        for _ in 0..30 {
+            let (r, vd) = mock_sample(8.0, 0);
+            ring.push(r, vd);
+        }
+        // 32 retained, c=4 anchor at index 0 → age=31. Unfloored
+        // 0.5^1.55 ≈ 0.341. Floor 1/3 ≈ 0.333. Unfloored wins. Now
+        // grow the cap so age can exceed the floor crossover
+        // (age > 20·log₂(n_anchors) = 20·log₂(3) ≈ 31.7).
+        let mut ring = AnchorRing::new(64);
+        let (r, _) = mock_sample(4.0, 0);
+        ring.push(r, 0);
+        let (r, _) = mock_sample(32.0, 0);
+        ring.push(r, 0);
+        for _ in 0..62 {
+            let (r, vd) = mock_sample(8.0, 0);
+            ring.push(r, vd);
+        }
+        // c=4 anchor at age=63: unfloored 0.5^3.15 ≈ 0.113. Floor 1/3.
+        let (_, _, w4) = ring
+            .weighted_rows()
+            .find(|(r, _, _)| (r.cpu_limit_cores.unwrap() - 4.0).abs() < 0.1)
+            .unwrap();
+        assert!(
+            w4 >= 1.0 / 3.0 - 1e-6,
+            "anchor weight {w4} below floor 1/3 (unfloored ≈ 0.113)"
+        );
+    }
+
+    #[test]
+    fn anchor_ring_prefers_low_vdist_then_newest() {
+        let mut ring = AnchorRing::new(32);
+        // c=8 at vdist=2 (older), then vdist=0 (newer).
+        ring.push(mock_sample(8.0, 0).0, 2);
+        ring.push(mock_sample(8.0, 0).0, 0);
+        ring.push(mock_sample(8.0, 0).0, 1);
+        // Anchor for c=8 must be the vdist=0 row (index 1).
+        assert_eq!(ring.anchors[&8], 1, "lowest-vdist wins");
+        // Tie-break: two vdist=0 rows → newest.
+        ring.push(mock_sample(8.0, 0).0, 0);
+        assert_eq!(ring.anchors[&8], 3, "tie-break newest");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        // r[verify sched.sla.hw-class.anchor-slots]
+        #[test]
+        fn anchor_ring_n_distinct_c_le_len(
+            cs in proptest::collection::vec(1u32..16, 1..100),
+        ) {
+            let mut ring = AnchorRing::new(32);
+            for &c in &cs {
+                ring.push(mock_sample(f64::from(c), 0).0, 0);
+            }
+            proptest::prop_assert!(ring.n_distinct_c() as usize <= ring.len());
+            proptest::prop_assert!(ring.len() <= 32.max(ring.n_distinct_c() as usize));
+            // Every distinct c pushed survives as an anchor.
+            let pushed: HashSet<u32> = cs.iter().copied().collect();
+            proptest::prop_assert_eq!(ring.n_distinct_c() as usize, pushed.len());
+        }
+    }
+
+    #[test]
+    fn refit_reports_n_distinct_c_and_sum_w() {
+        let rows: Vec<_> = [4.0, 8.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .map(|c| row(c, 30.0 + 2000.0 / c))
+            .collect();
+        let f = r(&rows);
+        assert_eq!(f.n_distinct_c, 5);
+        // Σw with ordinal weights age={4,3,2,1,0}, vdist=0, anchor floor
+        // 1/5=0.2: ages 4..=0 → 0.5^{0.2,0.15,0.1,0.05,0} =
+        // {0.871,0.901,0.933,0.966,1.0}; all > 0.2 so floor inert.
+        assert!(f.sum_w > 4.5 && f.sum_w < 5.0, "Σw={}", f.sum_w);
     }
 }
