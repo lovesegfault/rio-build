@@ -525,9 +525,9 @@ const GIB: u64 = 1 << 30;
 
 /// One `(h, cap)` cell as the scheduler's `cells_to_selector_terms`
 /// would emit it: an arbitrary `[sla.hw_classes.$h].labels` conjunction
-/// + `karpenter.sh/capacity-type`. The controller no longer parses the
-/// label keys (bug_061 — `SpawnIntent.hw_class_names` carries `$h`
-/// directly), so a single-label conjunction is sufficient for the
+/// alongside `karpenter.sh/capacity-type`. The controller no longer
+/// parses label keys (bug_061 — `SpawnIntent.hw_class_names` carries
+/// `$h` directly), so a single-label conjunction suffices for the
 /// affinity-stamping path.
 fn affinity_term(band: &str, cap: &str) -> rio_proto::types::NodeSelectorTerm {
     use rio_proto::types::NodeSelectorRequirement;
