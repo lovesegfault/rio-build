@@ -3340,8 +3340,9 @@ async fn substitute_fetch_walks_closure_transitively() -> TestResult {
     seed_with_refs(&store, &d, &[]);
 
     let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
             .await;
     assert!(
         ok,
@@ -3381,8 +3382,9 @@ async fn substitute_fetch_ref_miss_sets_ok_false() -> TestResult {
     // B is NOT seeded — both BatchQPI and QPI report it absent.
 
     let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
             .await;
     assert!(
         !ok,
@@ -3415,8 +3417,9 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
     store.state.substitutable.write().unwrap().push(b.clone());
 
     let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
     let ok =
-        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &[], &shutdown)
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
             .await;
     assert!(
         ok,
@@ -3426,6 +3429,50 @@ async fn substitute_fetch_cold_seed_pushes_refs() -> TestResult {
     assert!(
         store.calls.qpi_calls.read().unwrap().contains(&b),
         "cold ref B must reach per-path QPI (batch is local-only)"
+    );
+    Ok(())
+}
+
+// r[verify sched.substitute.detached+2]
+/// merged_001: a hostile upstream returning > `MAX_SUBSTITUTE_CLOSURE`
+/// references on a SINGLE path must trip the per-path cap check
+/// immediately — not after the next BFS layer. Without the per-insert-
+/// block check, a 10k-refs/node × 10k-node layer reaches ~100M strings
+/// before the once-per-layer top-of-loop check fires. Proof of bound:
+/// only the seed layer is batch-probed (1 BatchQPI), and the 60k-ref
+/// frontier never reaches the per-path QPI loop — i.e. `visited` is
+/// capped at `MAX_SUBSTITUTE_CLOSURE + one path's references`.
+#[tokio::test]
+async fn walk_closure_hostile_refs_bounds_memory() -> TestResult {
+    use rio_common::limits::MAX_SUBSTITUTE_CLOSURE;
+    let (store, client, _task) = rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let a = test_store_path("hostile-a");
+    let n_refs = MAX_SUBSTITUTE_CLOSURE + 10_000;
+    let refs: Vec<String> = (0..n_refs)
+        .map(|i| test_store_path(&format!("hostile-ref-{i:05}")))
+        .collect();
+    let ref_strs: Vec<&str> = refs.iter().map(String::as_str).collect();
+    seed_with_refs(&store, &a, &ref_strs);
+
+    let shutdown = rio_common::signal::Token::new();
+    let auth = crate::actor::dispatch::SubstituteAuth::Jwt(Vec::new());
+    let ok =
+        crate::actor::dispatch::walk_substitute_closure(&client, vec![a.clone()], &auth, &shutdown)
+            .await;
+
+    assert!(!ok, "hostile-ref path must trip closure cap → ok=false");
+    assert_eq!(
+        store
+            .calls
+            .batch_qpi_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cap check must fire after the first layer's refs, before the \
+         60k-ref frontier reaches a second BatchQPI"
+    );
+    assert!(
+        store.calls.qpi_calls.read().unwrap().is_empty(),
+        "no per-path QPI for hostile refs — early return bounds memory"
     );
     Ok(())
 }

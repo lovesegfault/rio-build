@@ -1,6 +1,7 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rio_common::limits::MAX_SUBSTITUTE_CLOSURE;
@@ -581,7 +582,8 @@ impl DagActor {
         // result). Without this the store sees tenant_id=None and
         // substitutable_paths stays empty — the pre-fix behaviour
         // that dispatched FODs already in cache.nixos.org.
-        let probe = self.probe_tenant_meta(candidates.iter().map(|(h, _)| h));
+        let auth = self.probe_substitute_auth(candidates.iter().map(|(h, _)| h));
+        let probe = auth.mint();
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
@@ -657,20 +659,22 @@ impl DagActor {
             }
         }
         self.complete_ready_from_store_batch(&locally_present).await;
-        self.spawn_substitute_fetches(to_spawn, probe).await;
+        self.spawn_substitute_fetches(to_spawn, auth).await;
         checked
     }
 
-    /// Mint `(x-rio-service-token, x-rio-probe-tenant-id)` metadata
-    /// for the dispatch-time store calls. Empty when no
-    /// `service_signer` (dev mode) or no candidate has a known tenant
-    /// (single-tenant mode / recovered orphan).
-    fn probe_tenant_meta<'a>(
+    /// Resolve auth for dispatch-time store calls. `Jwt(vec![])`
+    /// (no-auth) when no `service_signer` (dev mode) or no candidate
+    /// has a known tenant (single-tenant mode / recovered orphan);
+    /// otherwise `Service{signer, tenant_id}` so the detached
+    /// closure-walk task can re-mint tokens past the original 60s.
+    #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
+    fn probe_substitute_auth<'a>(
         &self,
         drv_hashes: impl Iterator<Item = &'a DrvHash>,
-    ) -> Vec<(&'static str, String)> {
+    ) -> SubstituteAuth {
         let Some(signer) = &self.service_signer else {
-            return Vec::new();
+            return SubstituteAuth::Jwt(Vec::new());
         };
         let Some(tid) = drv_hashes
             .filter_map(|h| self.dag.node(h))
@@ -678,20 +682,12 @@ impl DagActor {
             .filter_map(|bid| self.builds.get(bid))
             .find_map(|b| b.tenant_id)
         else {
-            return Vec::new();
+            return SubstituteAuth::Jwt(Vec::new());
         };
-        let claims = rio_auth::hmac::ServiceClaims {
-            caller: "rio-scheduler".to_string(),
-            expiry_unix: (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0))
-                + 60,
-        };
-        vec![
-            (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),
-            (rio_proto::PROBE_TENANT_ID_HEADER, tid.to_string()),
-        ]
+        SubstituteAuth::Service {
+            signer: signer.clone(),
+            tenant_id: tid,
+        }
     }
 
     fn inject_probe_meta(md: &mut tonic::metadata::MetadataMap, meta: &[(&'static str, &str)]) {
@@ -716,13 +712,17 @@ impl DagActor {
     ///
     /// Candidates whose transition is rejected (vanished, wrong status)
     /// are skipped — they fall through to normal scheduling.
-    /// `tenant_meta` is the owned form of either the gateway-forwarded
-    /// JWT (merge-time) or the scheduler-minted service-token +
-    /// `probe-tenant-id` pair (dispatch-time).
+    /// `auth` is either the gateway-forwarded JWT (merge-time, 1h
+    /// expiry — used as-is) or the `(signer, tenant_id)` pair
+    /// (dispatch-time) so the spawned task can re-mint a fresh service
+    /// token AFTER acquiring `substitute_sem` and once per BFS layer:
+    /// a 60s token minted at spawn-time would expire while parked on
+    /// the semaphore or mid-way through a ghc-sized closure walk
+    /// (later QPIs → `NotFound` → spurious `ok=false`).
     pub(super) async fn spawn_substitute_fetches(
         &mut self,
         candidates: Vec<(DrvHash, Vec<String>)>,
-        tenant_meta: Vec<(&'static str, String)>,
+        auth: SubstituteAuth,
     ) {
         if candidates.is_empty() {
             return;
@@ -789,7 +789,7 @@ impl DagActor {
             let output_paths = paths.clone();
             let store = store.clone();
             let weak_tx = weak_tx.clone();
-            let meta = tenant_meta.clone();
+            let auth = auth.clone();
             let h = drv_hash.clone();
             let sem = self.substitute_sem.clone();
             let shutdown = self.shutdown.clone();
@@ -798,10 +798,10 @@ impl DagActor {
                 // tasks. The task is already spawned (so the actor
                 // returned), but it parks here until a slot is free —
                 // Substituting status keeps dependents gated meanwhile.
+                // `auth.mint()` is deferred to inside the walk (per
+                // layer) so time parked here doesn't eat token expiry.
                 let _permit = sem.acquire_owned().await;
-                let meta_ref: Vec<(&'static str, &str)> =
-                    meta.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                let ok = walk_substitute_closure(&store, paths, &meta_ref, &shutdown).await;
+                let ok = walk_substitute_closure(&store, paths, &auth, &shutdown).await;
                 if let Some(tx) = weak_tx.upgrade() {
                     let _ = tx
                         .send(super::ActorCommand::SubstituteComplete { drv_hash: h, ok })
@@ -1058,7 +1058,8 @@ impl DagActor {
         };
         // r[impl sched.dispatch.fod-substitute+2] — same probe-tenant
         // wiring as batch_probe_cached_ready.
-        let probe = self.probe_tenant_meta(std::iter::once(drv_hash));
+        let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
+        let probe = auth.mint();
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
         // Deliberately NOT gated on `cache_breaker`: per-drv fallback;
@@ -1080,7 +1081,7 @@ impl DagActor {
                 // awaiting eager_substitute_fetch in the actor loop.
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
                 if !substitute_tried && resp.missing_paths.iter().all(|p| sub.contains(p)) {
-                    self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], probe)
+                    self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
                         .await;
                     return true;
                 }
@@ -2227,6 +2228,66 @@ impl DagActor {
 }
 
 // r[impl sched.substitute.detached+2]
+/// Auth source for the detached substitute closure walk.
+///
+/// `Jwt` carries the gateway-forwarded tenant token (merge-time, ~1h
+/// expiry) or `vec![]` for dev/no-tenant — used as-is, never re-minted.
+/// `Service` holds `(signer, tenant_id)` and re-mints a fresh
+/// `SUBSTITUTE_FETCH_TIMEOUT`-expiry token on every `mint()` so a long
+/// closure walk or time parked on `substitute_sem` can't outlive the
+/// token (a 60s spawn-time token expired mid-walk → later QPIs
+/// `NotFound` → spurious `ok=false`).
+#[derive(Clone)]
+pub(super) enum SubstituteAuth {
+    Jwt(Vec<(&'static str, String)>),
+    Service {
+        signer: Arc<rio_auth::hmac::HmacSigner>,
+        tenant_id: Uuid,
+    },
+}
+
+impl SubstituteAuth {
+    pub(super) fn mint(&self) -> Vec<(&'static str, String)> {
+        match self {
+            SubstituteAuth::Jwt(m) => m.clone(),
+            SubstituteAuth::Service { signer, tenant_id } => {
+                let claims = rio_auth::hmac::ServiceClaims {
+                    caller: "rio-scheduler".to_string(),
+                    expiry_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        + super::SUBSTITUTE_FETCH_TIMEOUT.as_secs(),
+                };
+                vec![
+                    (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),
+                    (rio_proto::PROBE_TENANT_ID_HEADER, tenant_id.to_string()),
+                ]
+            }
+        }
+    }
+}
+
+/// `MAX_SUBSTITUTE_CLOSURE` overshoot guard for [`walk_substitute_closure`].
+/// Re-checked after every per-path `references` push so a hostile
+/// upstream can overshoot by at most one path's `MAX_REFERENCES` (10k),
+/// not `layer_width × MAX_REFERENCES` (~100M strings before the next
+/// top-of-loop check).
+fn closure_cap_exceeded(visited: usize) -> bool {
+    if visited > MAX_SUBSTITUTE_CLOSURE {
+        warn!(
+            visited,
+            cap = MAX_SUBSTITUTE_CLOSURE,
+            "substitute closure walk exceeded MAX_SUBSTITUTE_CLOSURE; \
+             demoting to cache-miss (hostile upstream reference chain?)"
+        );
+        metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+        true
+    } else {
+        false
+    }
+}
+
 /// BFS over `info.references` from `seeds`, issuing `QueryPathInfo`
 /// (which triggers store-side `try_substitute`) for every node. Returns
 /// `true` iff every node in the closure is present in the store on
@@ -2255,7 +2316,7 @@ impl DagActor {
 pub(super) async fn walk_substitute_closure(
     store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
     seeds: Vec<String>,
-    meta: &[(&'static str, &str)],
+    auth: &SubstituteAuth,
     shutdown: &rio_common::signal::Token,
 ) -> bool {
     let mut visited: HashSet<String> = seeds.iter().cloned().collect();
@@ -2265,21 +2326,28 @@ pub(super) async fn walk_substitute_closure(
         if shutdown.is_cancelled() {
             return false;
         }
-        if visited.len() > MAX_SUBSTITUTE_CLOSURE {
-            warn!(
-                visited = visited.len(),
-                cap = MAX_SUBSTITUTE_CLOSURE,
-                "substitute closure walk exceeded MAX_SUBSTITUTE_CLOSURE; \
-                 demoting to cache-miss (hostile upstream reference chain?)"
-            );
-            metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+        if closure_cap_exceeded(visited.len()) {
             return false;
         }
+        // Re-mint per layer: dispatch-time `Service` tokens are
+        // short-lived; minting once at spawn meant a ghc-sized walk or
+        // time on `substitute_sem` outlived the token. `Jwt` is a
+        // cheap clone. Only the per-path QPIs need tenant context (for
+        // store-side `try_substitute_on_miss → tenant_upstreams`).
+        let meta_owned = auth.mint();
+        let meta: Vec<(&'static str, &str)> =
+            meta_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         // Layer-batched fast-path: drain the current frontier into one
         // BatchQueryPathInfo. Present refs (warm in PG) push their
         // references; absent refs go to per-path QPI to trigger
         // substitution. Batch error → treat the whole layer as absent
         // (per-path QPI then handles each, including retry).
+        //
+        // `&[]` metadata: BatchQPI is local-only and rejects end-user
+        // tenant JWTs (`reject_end_user_tenant`); the merge-time `Jwt`
+        // path carries one, so passing `meta` here →
+        // `PermissionDenied` → debug! + per-path fallback (fast-path
+        // never fired). The call needs no tenant.
         let layer: Vec<String> = frontier.drain(..).collect();
         let mut absent: Vec<String> = Vec::new();
         let mut c = store.clone();
@@ -2287,7 +2355,7 @@ pub(super) async fn walk_substitute_closure(
             &mut c,
             layer.clone(),
             super::SUBSTITUTE_FETCH_TIMEOUT,
-            meta,
+            &[],
         )
         .await
         {
@@ -2299,6 +2367,9 @@ pub(super) async fn walk_substitute_closure(
                                 if visited.insert(r.to_string()) {
                                     frontier.push_back(r.to_string());
                                 }
+                            }
+                            if closure_cap_exceeded(visited.len()) {
+                                return false;
                             }
                         }
                         None => absent.push(path),
@@ -2325,7 +2396,7 @@ pub(super) async fn walk_substitute_closure(
                     &mut c,
                     &p,
                     super::SUBSTITUTE_FETCH_TIMEOUT,
-                    meta,
+                    &meta,
                 )
                 .await
                 {
@@ -2334,6 +2405,9 @@ pub(super) async fn walk_substitute_closure(
                             if visited.insert(r.to_string()) {
                                 frontier.push_back(r.to_string());
                             }
+                        }
+                        if closure_cap_exceeded(visited.len()) {
+                            return false;
                         }
                         continue 'paths;
                     }

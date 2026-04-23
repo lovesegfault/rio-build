@@ -14,6 +14,7 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::state::{BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash};
 
+use super::dispatch::SubstituteAuth;
 use super::{ActorError, DagActor, MergeDagRequest};
 
 /// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
@@ -527,10 +528,12 @@ impl DagActor {
             };
         }
 
-        let jwt_meta: Vec<(&'static str, String)> = jwt_token
-            .as_deref()
-            .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
-            .unwrap_or_default();
+        let jwt_auth = SubstituteAuth::Jwt(
+            jwt_token
+                .as_deref()
+                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
+                .unwrap_or_default(),
+        );
 
         // r[sched.merge.reconcile-order]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
@@ -596,7 +599,7 @@ impl DagActor {
         // first_dep_failed=Some(A), and !keep_going builds fail-fast
         // while B's fetch is mid-flight.
         if !reprobe_sub.is_empty() {
-            self.spawn_substitute_fetches(reprobe_sub, jwt_meta.clone())
+            self.spawn_substitute_fetches(reprobe_sub, jwt_auth.clone())
                 .await;
         }
         phase!("6d-spawn-substitute-reprobe");
@@ -651,7 +654,7 @@ impl DagActor {
         // completed a chain that included them) fall through to normal
         // scheduling.
         if !new_sub.is_empty() {
-            self.spawn_substitute_fetches(new_sub, jwt_meta).await;
+            self.spawn_substitute_fetches(new_sub, jwt_auth).await;
         }
         phase!("6g-spawn-substitute-new");
 
@@ -1455,10 +1458,12 @@ impl DagActor {
         }
 
         if !to_spawn.is_empty() {
-            let jwt_meta: Vec<(&'static str, String)> = jwt_token
-                .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
-                .unwrap_or_default();
-            self.spawn_substitute_fetches(to_spawn, jwt_meta).await;
+            let jwt_auth = SubstituteAuth::Jwt(
+                jwt_token
+                    .map(|t| vec![(rio_proto::TENANT_TOKEN_HEADER, t.to_string())])
+                    .unwrap_or_default(),
+            );
+            self.spawn_substitute_fetches(to_spawn, jwt_auth).await;
         }
 
         reset
