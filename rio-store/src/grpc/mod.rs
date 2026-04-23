@@ -763,7 +763,8 @@ impl StoreService for StoreServiceImpl {
             return Err(Status::invalid_argument("factor must be finite and > 0"));
         }
         sqlx::query!(
-            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) VALUES ($1, $2, $3) \
+            "INSERT INTO hw_perf_samples (hw_class, pod_id, factor) \
+             VALUES ($1, $2, jsonb_build_object('alu', $3::double precision)) \
              ON CONFLICT (hw_class, pod_id) \
              DO UPDATE SET factor = EXCLUDED.factor, measured_at = now()",
             req.hw_class,
@@ -877,7 +878,7 @@ mod tests {
         svc.append_hw_perf_sample(mk(0.9)).await.unwrap();
         svc.append_hw_perf_sample(mk(1.1)).await.unwrap();
         let (n, factor): (i64, f64) = sqlx::query_as(
-            "SELECT count(*), max(factor) FROM hw_perf_samples \
+            "SELECT count(*), max((factor->>'alu')::double precision) FROM hw_perf_samples \
              WHERE hw_class = 'aws-8-ebs-hi' AND pod_id = 'p0'",
         )
         .fetch_one(&db.pool)

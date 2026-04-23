@@ -865,6 +865,35 @@ pub const M_051: () = ();
 /// pre-053 rows: at worst the client re-receives lines it already has.
 pub const M_053: () = ();
 
+/// `migrations/054_hw_perf_jsonb.sql`
+///
+/// `hw_perf_samples.factor` f64 → jsonb K=3 vector (ADR-023 §13a). The
+/// `USING jsonb_build_object('alu', factor)` cast preserves shipped
+/// scalar rows as `{"alu": <f64>}`; key-addressed so future K-change
+/// pads rather than invalidates. View `hw_perf_factors` (043) is
+/// dropped first because PG refuses an `ALTER COLUMN ... TYPE` on a
+/// column a view depends on; the per-dimension MAD-reject the view did
+/// moves to app-side `HwTable` aggregation.
+/// +`submitting_tenant` for §Threat-model gap (b) median-of-medians.
+pub const M_054: () = ();
+
+/// `migrations/055_hw_cost_ema_state.sql`
+///
+/// `hw_cost_factors` EMA-state persist (ADR-023 §13a §Cost-model): so a
+/// scheduler lease failover resumes the smoothed price/λ rather than
+/// resetting to seed. `lambda_{num,den}_ema` are the Gamma-Poisson
+/// numerator/denominator; `node_count_ema` is the n_λ floor input.
+/// `updated_at` is NOT added here — 042 already created it.
+pub const M_055: () = ();
+
+/// `migrations/056_build_samples_enable_parallel_checking.sql`
+///
+/// `build_samples.enable_parallel_checking` (ADR-023 §13a): the
+/// `enableParallelBuilding && !enableParallelChecking` distinction
+/// matters for the §Model-staging p̄:=1 seed. Sibling
+/// `enable_parallel_building` already exists from 039.
+pub const M_056: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

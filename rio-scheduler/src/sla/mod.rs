@@ -38,8 +38,9 @@ const FLEET_MEDIAN_MIN_KEYS: usize = 50;
 /// Minimum distinct-tenant count before [`prior::fleet_median`] is
 /// trusted. A "median-of-tenant-medians" with one tenant is that
 /// tenant's median — not a fleet aggregate. Below this fall through to
-/// [`prior::PriorSource::Operator`].
-const FLEET_MEDIAN_MIN_TENANTS: usize = 2;
+/// [`prior::PriorSource::Operator`]. ADR-023 §Threat-model gap (b)
+/// raised 2→5: with 2 tenants the "fleet median" IS one of them.
+pub(super) const FLEET_MEDIAN_MIN_TENANTS: usize = 5;
 
 /// Cache of per-`ModelKey` [`FittedParams`](types::FittedParams). The
 /// dispatch path reads via [`Self::cached`] (lock-free clone of one

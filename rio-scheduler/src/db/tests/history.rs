@@ -523,8 +523,8 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    // hw_perf_factors view needs ≥3 distinct pod_ids per hw_class.
-    for (h, f) in [("ref", 1.0), ("fast", 2.0)] {
+    // HwTable::aggregate needs ≥3 distinct pod_ids per hw_class.
+    for (h, f) in [("ref", 1.0_f64), ("fast", 2.0)] {
         for p in 0..3 {
             sqlx::query(
                 "INSERT INTO hw_perf_samples (hw_class, pod_id, factor)
@@ -532,7 +532,7 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
             )
             .bind(h)
             .bind(format!("{h}-{p}"))
-            .bind(f)
+            .bind(sqlx::types::Json(serde_json::json!({ "alu": f })))
             .execute(&test_db.pool)
             .await?;
         }
@@ -597,7 +597,11 @@ async fn test_refresh_outlier_gate_normalizes_hw_class() -> anyhow::Result<()> {
     // subject; don't let a view-shape mismatch silently degrade to
     // factor=1.0 and "pass" by coincidence).
     let hw = est.hw_table();
-    assert_eq!(hw.factor("fast"), 2.0, "hw_perf_factors view → HwTable");
+    assert_eq!(
+        hw.factor("fast"),
+        2.0,
+        "hw_perf_samples → HwTable::aggregate"
+    );
     assert_eq!(hw.factor("ref"), 1.0);
 
     let excluded: Vec<f64> = sqlx::query_scalar(
