@@ -23,4 +23,5 @@ mod lifecycle_sweep;
 mod merge;
 mod misc;
 mod recovery;
+mod sla_contract;
 mod wiring;

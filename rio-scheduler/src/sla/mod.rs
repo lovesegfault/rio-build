@@ -543,6 +543,15 @@ impl SlaEstimator {
         Self::new(&c)
     }
 
+    /// Total live `FittedParams` across all per-tenant LRUs. Test-only
+    /// accessor for the `sla_contract` invariant
+    /// `solve_cache.len() ≤ live_fit_count()` (the `on_evict` hook is
+    /// what makes that bound hold).
+    #[cfg(test)]
+    pub(crate) fn live_fit_count(&self) -> usize {
+        self.cache.read().values().map(|lru| lru.len()).sum()
+    }
+
     /// Seed the hw-factor table. Test-only: bypasses the
     /// `hw_perf_factors` view so `solve_full` sees a populated
     /// `HwTable` without an ephemeral PG round-trip.

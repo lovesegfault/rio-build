@@ -68,7 +68,12 @@ impl DagActor {
     /// Refresh the SLA estimator from build_samples. Runs every ~6
     /// ticks (60s at the default 10s interval). Separated from
     /// handle_tick so the every-tick housekeeping stays readable.
-    async fn maybe_refresh_estimator(&mut self) {
+    ///
+    /// `pub(super)` for the `sla_contract` actor-boundary tests, which
+    /// drive this directly to assert the `hw_changed` →
+    /// `bump_inputs_gen` gate without going through `handle_tick`'s
+    /// leader check and orphan-cancel side-effects.
+    pub(super) async fn maybe_refresh_estimator(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         // Every 6th tick (≈60s with 10s interval). Not configurable:
