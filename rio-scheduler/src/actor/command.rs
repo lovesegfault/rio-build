@@ -488,12 +488,14 @@ pub enum AdminQuery {
         corpus: crate::sla::prior::ValidatedSeedCorpus,
         reply: oneshot::Sender<(usize, f64)>,
     },
-    /// `AdminService.HwClassSampled`: per-hw_class distinct-pod_id
-    /// count from the estimator's last `HwTable::load`. Reply is
-    /// `h → count`; absent classes map to 0 (handled RPC-side).
+    /// `AdminService.HwClassSampled`: per-hw_class **per-dimension
+    /// distinct-tenant** count from the estimator's last
+    /// `HwTable::load` (bug_013: same unit + granularity as
+    /// `cross_tenant_median`'s `min_tenants` gate). Reply is
+    /// `h → [u32; K]`; absent classes map to `[0; K]`.
     SlaHwSampled {
         hw_classes: Vec<String>,
-        reply: oneshot::Sender<std::collections::HashMap<String, u32>>,
+        reply: oneshot::Sender<std::collections::HashMap<String, [u32; crate::sla::hw::K]>>,
     },
 }
 

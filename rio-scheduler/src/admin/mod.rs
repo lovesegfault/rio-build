@@ -683,10 +683,13 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(()))
     }
 
-    /// ADR-023 §13a: per-hw_class distinct-pod_id bench count, for the
-    /// controller's `rio.build/hw-bench-needed` annotation gate.
-    /// Reflects the estimator's last `HwTable::load` (~60s stale at
-    /// worst), NOT a live PG count.
+    /// ADR-023 §13a: per-hw_class **per-dimension distinct-tenant**
+    /// bench count, for the controller's `rio.build/hw-bench-needed`
+    /// annotation gate. bug_013: same unit (tenants) + granularity
+    /// (per-dim) as `cross_tenant_median`'s `min_tenants` gate so one
+    /// tenant cannot mark a foreign hw_class fully-benched. Reflects
+    /// the estimator's last `HwTable::load` (~60s stale at worst), NOT
+    /// a live PG count.
     #[instrument(skip(self, request), fields(rpc = "HwClassSampled"))]
     async fn hw_class_sampled(
         &self,
@@ -701,13 +704,17 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let sampled_count = query_actor(&self.actor, |reply| {
+        let per_dim = query_actor(&self.actor, |reply| {
             ActorCommand::Admin(AdminQuery::SlaHwSampled {
                 hw_classes: req.hw_classes,
                 reply,
             })
         })
         .await?;
+        let sampled_count = per_dim
+            .into_iter()
+            .map(|(h, n)| (h, rio_proto::types::HwDimCounts { per_dim: n.into() }))
+            .collect();
         Ok(Response::new(HwClassSampledResponse { sampled_count }))
     }
 

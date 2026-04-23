@@ -134,7 +134,7 @@ impl DagActor {
                     hw_classes
                         .into_iter()
                         .map(|h| {
-                            let n = hw.distinct_pod_ids(&h);
+                            let n = hw.distinct_tenants_per_dim(&h);
                             (h, n)
                         })
                         .collect(),

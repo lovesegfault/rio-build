@@ -555,12 +555,21 @@ message AckSpawnedIntentsRequest {
 message HwClassSampledRequest {
   repeated string hw_classes = 1;
 }
+// Per-dimension distinct-tenant count (K=3: [alu, membw, ioseq]).
+// Wrapper because proto3 map values cannot be `repeated`.
+message HwDimCounts {
+  repeated uint32 per_dim = 1;
+}
 message HwClassSampledResponse {
-  // h → distinct pod_id count from `hw_perf_samples`. Includes
-  // hw_classes with 0 rows (count=0). Controller checks `any < 3` —
-  // the same threshold the `hw_perf_factors` view's HAVING clause uses
-  // to admit a class into the normalize table.
-  map<string, uint32> sampled_count = 1;
+  // h → distinct **tenant** count per K=3 dim that contributed a
+  // `Some(d)` row to `hw_perf_samples`. bug_013: counting pods (or
+  // tenants) per-row reopens the per-dim capture threat — one tenant
+  // spawning 3 pods writing K=3 to a foreign hw_class would mark
+  // `bench_needed=false` there and become the sole `Some(membw)`
+  // contributor. The threshold mirrors `FLEET_MEDIAN_MIN_TENANTS`'s
+  // unit (tenants) and granularity (per-dim). Controller checks
+  // `∃h ∃d: per_dim[d] < 3`.
+  map<string, HwDimCounts> sampled_count = 1;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

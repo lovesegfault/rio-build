@@ -655,10 +655,12 @@ fn pod_gets_hw_bench_needed_when_any_h_undersampled() {
             .cloned()
     };
     // hw_classes_in reads `intent.hw_class_names` directly — the
-    // operator's `$h` keys, not a derived 4-tuple string.
+    // operator's `$h` keys, not a derived 4-tuple string. bug_013:
+    // counts are per-dim distinct-tenant; `intel-8-hi` has 5 alu
+    // tenants but 1 membw/ioseq → still undersampled (∃d < 3).
     let cache = jobs::HwSampledCache::from_map(HashMap::from([
-        ("intel-8-hi".into(), 1u32),  // undersampled
-        ("intel-7-mid".into(), 5u32), // trusted
+        ("intel-8-hi".into(), [5u32, 1, 1]), // undersampled (membw/ioseq)
+        ("intel-7-mid".into(), [5u32, 5, 5]), // trusted in all K dims
     ]));
     let a_mixed = vec!["intel-7-mid".into(), "intel-8-hi".into()];
     let a_trusted = vec!["intel-7-mid".into()];

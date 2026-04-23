@@ -64,12 +64,23 @@ pub struct HwPerfSampleRow {
     pub factor: [Option<f64>; K],
 }
 
-/// Aggregated per-hw_class factor: K=3 vector + distinct-pod count.
-/// `factor` is `[1.0; K]` when `pod_ids < 3` (untrusted; pass-through).
+/// Aggregated per-hw_class factor: K=3 vector + distinct-pod count +
+/// per-dimension distinct-tenant count. `factor[d]` is `1.0` when
+/// `pod_ids < 3` OR `tenants_with_dim[d] < min_tenants` (untrusted
+/// pass-through, applied per-dim — bug_013).
 #[derive(Debug, Clone, Copy)]
 pub struct HwFactor {
     pub factor: [f64; K],
     pub pod_ids: u32,
+    /// `tenants_with_dim[d]` = distinct `submitting_tenant` buckets
+    /// that contributed ≥1 `Some(d)` row. This is the per-dim unit
+    /// `cross_tenant_median`'s `min_tenants` gate counts; the
+    /// `HwClassSampled` RPC reports it so the controller's
+    /// `bench_needed` decision mirrors the same gate at the same
+    /// granularity (bug_013: counting pods-per-row let one tenant
+    /// satisfy the bench threshold and capture a foreign class's
+    /// membw/ioseq median).
+    pub tenants_with_dim: [u32; K],
 }
 
 /// Per-hw_class aggregated K=3 microbench factor. Built app-side from
@@ -116,11 +127,23 @@ impl HwTable {
     }
 
     /// Distinct `pod_id` count for `hw_class` across the 7-day window,
-    /// regardless of the ≥3 trust floor. For the `HwClassSampled`
-    /// handler (A11): "this hw_class has N pod benches; ≥3 means
-    /// `factor()` is trusted".
+    /// regardless of the ≥3 trust floor. For SlaExplain / debug; the
+    /// `HwClassSampled` handler reads [`Self::distinct_tenants_per_dim`].
     pub fn distinct_pod_ids(&self, hw_class: &str) -> u32 {
         self.factors.get(hw_class).map(|f| f.pod_ids).unwrap_or(0)
+    }
+
+    /// Per-dimension distinct-tenant count for `hw_class`: how many
+    /// `submitting_tenant` buckets contributed ≥1 `Some(d)` row.
+    /// `[0; K]` for an unknown class. For the `HwClassSampled`
+    /// handler — the controller's `bench_needed = ∃d: count[d] < 3`
+    /// mirrors `cross_tenant_median`'s per-dim `min_tenants` gate
+    /// (bug_013: same unit, same granularity).
+    pub fn distinct_tenants_per_dim(&self, hw_class: &str) -> [u32; K] {
+        self.factors
+            .get(hw_class)
+            .map(|f| f.tenants_with_dim)
+            .unwrap_or([0; K])
     }
 
     /// Iterate `(hw_class, &[f64; K])` for trusted (≥3-pod) classes. For
@@ -212,9 +235,26 @@ impl HwTable {
             .into_iter()
             .map(|(h, tenants)| {
                 let pod_ids = pods[&h].len() as u32;
+                // Per-dim distinct-tenant count: a tenant bucket
+                // counts toward dim `d` iff ANY of its rows has
+                // `Some(d)`. This is the unit `cross_tenant_median`
+                // gates on (bug_013).
+                let tenants_with_dim: [u32; K] = std::array::from_fn(|d| {
+                    tenants
+                        .values()
+                        .filter(|rows| rows.iter().any(|r| r[d].is_some()))
+                        .count() as u32
+                });
                 let factor =
                     cross_tenant_median(&tenants, pod_ids, super::FLEET_MEDIAN_MIN_TENANTS);
-                (h, HwFactor { factor, pod_ids })
+                (
+                    h,
+                    HwFactor {
+                        factor,
+                        pod_ids,
+                        tenants_with_dim,
+                    },
+                )
             })
             .collect()
     }
@@ -280,7 +320,18 @@ impl HwTable {
         Self::from_aggregate(
             factors
                 .into_iter()
-                .map(|(h, factor)| (h, HwFactor { factor, pod_ids: 3 }))
+                .map(|(h, factor)| {
+                    (
+                        h,
+                        HwFactor {
+                            factor,
+                            pod_ids: 3,
+                            // "trusted in all K dims" — matches the
+                            // `pod_ids: 3` semantics.
+                            tenants_with_dim: [HW_MIN_PODS; K],
+                        },
+                    )
+                })
                 .collect(),
         )
     }
@@ -304,14 +355,22 @@ impl HwTable {
 /// gate trips; otherwise the per-tenant MAD-rejected median, then the
 /// per-dimension median across tenants, clamped to `[FLOOR, CEIL]`.
 ///
-/// 1. **Pod gate:** `n_pods < HW_MIN_PODS` → `[1.0; K]`. With <3
-///    distinct pods the per-tenant median is one or two samples.
-/// 2. **Tenant gate:** `by_tenant.len() < min_tenants` → `[1.0; K]`. A
-///    "median-of-tenant-medians" with one tenant IS that tenant's
-///    median; with two, the fleet median is one of them. The caller
-///    must supply `min_tenants` (no default) — see
-///    [`super::FLEET_MEDIAN_MIN_TENANTS`].
-/// 3. Per tenant: 3·MAD reject, then per-dimension median.
+/// 1. **Pod gate (per-row):** `n_pods < HW_MIN_PODS` → `[1.0; K]`.
+///    With <3 distinct pods the per-tenant median is one or two
+///    samples.
+/// 2. Per tenant: 3·MAD reject, then per-dimension median.
+/// 3. **Tenant gate (per-dim, bug_013):** for each dimension `d`, if
+///    fewer than `min_tenants` tenant-medians have `Some(d)` →
+///    `factor[d] = 1.0`. A "median-of-tenant-medians" with one tenant
+///    IS that tenant's median; with two, the fleet median is one of
+///    them. The caller must supply `min_tenants` (no default) — see
+///    [`super::FLEET_MEDIAN_MIN_TENANTS`]. This gate is applied at
+///    the same granularity as the aggregate it protects: bug_037's
+///    `[Option<f64>; K]` per-dim presence created a per-dim
+///    cardinality axis; gating only on `by_tenant.len()` (per-row)
+///    let one tenant writing K=3 capture the membw/ioseq median while
+///    `min_tenants` honest alu-only tenants satisfied the row count
+///    (`r[sched.sla.threat.hw-median-of-medians]` violated by one).
 /// 4. Across tenants: per-dimension median.
 /// 5. Clamp `[FLOOR, CEIL]` post-aggregation so MAD sees raw values.
 ///
@@ -323,23 +382,29 @@ impl HwTable {
 /// the per-tenant MAD-median and the cross-tenant median both operate
 /// per-dimension over the rows where that dim is `Some`. A tenant with
 /// zero `membw` rows contributes nothing to membw's fleet median (it
-/// is NOT a `1.0` rank). The `None → 1.0` fallback applies ONLY here
-/// at the final aggregate step, when zero tenants have that dim — at
-/// which point the fleet has no information and `1.0` (pass-through)
-/// is the bias-neutral choice. The pod/tenant gates stay per-row.
+/// is NOT a `1.0` rank). The pod gate stays per-row; the tenant gate
+/// is per-dim (bug_013) so the `< min_tenants → 1.0` fallback fires
+/// per dimension.
 pub(super) fn cross_tenant_median(
     by_tenant: &HashMap<Option<String>, Vec<[Option<f64>; K]>>,
     n_pods: u32,
     min_tenants: usize,
 ) -> [f64; K] {
-    if n_pods < HW_MIN_PODS || by_tenant.len() < min_tenants {
+    if n_pods < HW_MIN_PODS {
         return [1.0; K];
     }
     let tenant_medians: Vec<[Option<f64>; K]> =
         by_tenant.values().map(|v| mad_reject_median(v)).collect();
-    per_dim_median(&tenant_medians).map(|d| {
-        d.unwrap_or(1.0)
-            .clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
+    // Per-dim: collect Some(d) tenant-medians, gate on count, median,
+    // clamp. Inlined (not `per_dim_median(...).map(...)`) so the
+    // `min_tenants` check sees the per-dim `xs.len()` directly.
+    std::array::from_fn(|d| {
+        let mut xs: Vec<f64> = tenant_medians.iter().filter_map(|r| r[d]).collect();
+        if xs.len() < min_tenants {
+            return 1.0;
+        }
+        xs.sort_by(f64::total_cmp);
+        xs[xs.len() / 2].clamp(HW_FACTOR_SANITY_FLOOR, HW_FACTOR_SANITY_CEIL)
     })
 }
 
@@ -582,15 +647,17 @@ mod tests {
         );
     }
 
-    /// bug_037: 1 tenant with a real `membw=2.0` measurement + 4
-    /// tenants with `membw=None` (`bench_needed=false` /
-    /// O_DIRECT-EINVAL) → `factor[membw] == 2.0`, NOT 1.0. Before, the
-    /// 4 `1.0` placeholders out-ranked the one real measurement and
-    /// the fleet median converged to reference (K=3 → scalar). Now the
-    /// `None` rows contribute nothing to membw's per-dim median; the
-    /// one `Some(2.0)` tenant IS the membw fleet median. The pod/
-    /// tenant gates stay per-row (5 tenants, 5 pods → both pass).
+    /// bug_013: per-dim `min_tenants` gate. 1 tenant with a real
+    /// `membw=2.0` measurement + 4 tenants with `membw=None`
+    /// (`bench_needed=false` / O_DIRECT-EINVAL) → `factor[membw] ==
+    /// 1.0` (GATED), NOT 2.0. bug_037 removed the `1.0` placeholder
+    /// so the one `Some(2.0)` tenant became the membw fleet median —
+    /// but a 1-tenant median IS that tenant's value, so
+    /// `r[sched.sla.threat.hw-median-of-medians]` was violated by
+    /// one. The tenant gate now applies per-dimension at the same
+    /// granularity as the per-dimension aggregate it protects.
     #[test]
+    // r[verify sched.sla.threat.hw-median-of-medians]
     fn placeholder_free_membw_median() {
         let mut by_tenant: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
         by_tenant.insert(Some("t0".into()), vec![[Some(1.0), Some(2.0), Some(1.5)]]);
@@ -599,16 +666,35 @@ mod tests {
             by_tenant.insert(Some(format!("t{t}")), vec![[Some(1.0), None, None]]);
         }
         let m = cross_tenant_median(&by_tenant, 5, 5);
-        assert_eq!(m[0], 1.0, "alu: 5 tenants at 1.0");
-        assert_eq!(m[1], 2.0, "membw: 1 tenant Some(2.0), 4 None → 2.0 not 1.0");
-        assert_eq!(m[2], 1.5, "ioseq: 1 tenant Some(1.5), 4 None → 1.5");
-        // Zero tenants have a dim → 1.0 fallback at the FINAL step.
+        assert_eq!(m[0], 1.0, "alu: 5 tenants at 1.0 → median 1.0");
+        assert_eq!(
+            m[1], 1.0,
+            "membw: 1 tenant Some(2.0) < min_tenants=5 → gated 1.0 (NOT 2.0)"
+        );
+        assert_eq!(
+            m[2], 1.0,
+            "ioseq: 1 tenant Some(1.5) < min_tenants=5 → gated 1.0"
+        );
+        // ≥ min_tenants per-dim → median engages. 5 tenants alu+ioseq,
+        // 0 membw → alu/ioseq pass, membw still gated.
         let mut none_membw: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
         for t in 0..5 {
-            none_membw.insert(Some(format!("t{t}")), vec![[Some(1.3), None, Some(1.0)]]);
+            none_membw.insert(Some(format!("t{t}")), vec![[Some(1.3), None, Some(1.4)]]);
         }
         let m = cross_tenant_median(&none_membw, 5, 5);
-        assert_eq!(m, [1.3, 1.0, 1.0], "membw: zero observations → 1.0");
+        assert_eq!(m, [1.3, 1.0, 1.4], "membw: 0 < min_tenants → 1.0");
+        // 4 tenants Some(membw) — still under min_tenants=5 → gated.
+        // Two colluding tenants (and even four) cannot capture.
+        let mut four_membw: HashMap<Option<String>, Vec<[Option<f64>; K]>> = HashMap::new();
+        for t in 0..4 {
+            four_membw.insert(Some(format!("t{t}")), vec![s([1.0, 3.0, 1.0])]);
+        }
+        four_membw.insert(Some("t4".into()), vec![[Some(1.0), None, Some(1.0)]]);
+        assert_eq!(
+            cross_tenant_median(&four_membw, 5, 5)[1],
+            1.0,
+            "membw: 4 tenants < min_tenants=5 → gated"
+        );
     }
 
     /// Aggregate floor: <3 distinct pods → `factor := [1.0; K]` but the
@@ -625,6 +711,49 @@ mod tests {
         assert_eq!(t.distinct_pod_ids("new-hw"), 2);
         assert_eq!(t.len(), 0, "<3-pod classes excluded from len/iter");
         assert_eq!(t.distinct_pod_ids("absent"), 0);
+        assert_eq!(t.distinct_tenants_per_dim("absent"), [0; K]);
+    }
+
+    /// bug_013: `aggregate` tracks per-dim distinct-tenant count so the
+    /// `HwClassSampled` RPC reports the same unit `cross_tenant_median`
+    /// gates on. One tenant writing K=3 across 3 pods → `tenants_with_
+    /// dim = [1; K]` (not 3) → controller's `bench_needed` stays true.
+    #[test]
+    fn aggregate_tracks_tenants_per_dim() {
+        let row_k = |pod: &str, tenant: &str, f: [Option<f64>; K]| HwPerfSampleRow {
+            hw_class: "intel-8".into(),
+            pod_id: pod.into(),
+            submitting_tenant: Some(tenant.into()),
+            factor: f,
+        };
+        // 1 tenant, 3 pods, K=3-bench (the denial-of-calibration shape).
+        let rows = vec![
+            row_k("p0", "attacker", s([2.0, 2.0, 2.0])),
+            row_k("p1", "attacker", s([2.0, 2.0, 2.0])),
+            row_k("p2", "attacker", s([2.0, 2.0, 2.0])),
+        ];
+        let agg = HwTable::aggregate(&rows);
+        assert_eq!(agg["intel-8"].pod_ids, 3);
+        assert_eq!(
+            agg["intel-8"].tenants_with_dim, [1; K],
+            "1 tenant × 3 pods → 1 tenant per dim, not 3"
+        );
+        // 4 honest alu-only tenants + 1 K=3 attacker → alu has 5
+        // tenants, membw/ioseq have 1. The HwClassSampled response
+        // reports [5, 1, 1] so `bench_needed = ∃d: count[d] < 3` is
+        // true and honest pods K=3-bench, denying the capture.
+        let mut rows = rows;
+        for t in 0..4 {
+            rows.push(row_k(
+                &format!("h{t}"),
+                &format!("t{t}"),
+                [Some(1.0), None, None],
+            ));
+        }
+        let agg = HwTable::aggregate(&rows);
+        assert_eq!(agg["intel-8"].tenants_with_dim, [5, 1, 1]);
+        let t = HwTable::from_aggregate(agg);
+        assert_eq!(t.distinct_tenants_per_dim("intel-8"), [5, 1, 1]);
     }
 
     /// Legacy `{"alu": x}` rows / `bench_needed=false` rows yield

@@ -73,10 +73,13 @@ pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 /// (annotation absent → skip K=3, only the scalar `alu` probe runs).
 pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 
-/// `hw_perf_factors` view's `HAVING count(DISTINCT pod_id) >= 3`
-/// floor. The bench-needed gate over-benches at most until every
-/// `h ∈ A` reaches this — `HwTable::factor` ignores under-threshold
-/// rows so duplicate benches before then are harmless.
+/// `cross_tenant_median`'s per-dim `min_tenants` gate floor — the
+/// bench-needed gate over-benches at most until every `(h, d)` pair
+/// reaches this many distinct tenants. bug_013: counting pods (or
+/// tenants per-row) let one tenant writing K=3 to a foreign hw_class
+/// satisfy the threshold and capture that class's membw/ioseq median.
+/// `HwTable::factor` ignores under-threshold dims so duplicate benches
+/// before then are harmless.
 pub(crate) const HW_BENCH_SAMPLE_THRESHOLD: u32 = 3;
 
 /// Log + scratch budget. nix `build-dir` lands in the overlay emptyDir
@@ -120,19 +123,19 @@ pub(super) fn hw_classes_in(intent: &SpawnIntent) -> impl Iterator<Item = String
     intent.hw_class_names.iter().cloned()
 }
 
-/// Per-tick `HwClassSampled` snapshot: `h → distinct pod_id` from the
-/// scheduler's `HwTable` (~60s stale at worst). One RPC per
+/// Per-tick `HwClassSampled` snapshot: `h → [distinct-tenant; K]`
+/// from the scheduler's `HwTable` (~60s stale at worst). One RPC per
 /// pool-reconcile tick covers every intent — the request is the union
 /// of `hw_classes_in` over all intents this tick.
 ///
 /// RPC failure / scheduler unreachable → empty map. Unknown `h` reads
-/// as 0 in [`Self::any_under_threshold`], so an outage marks
+/// as `[0; K]` in [`Self::any_under_threshold`], so an outage marks
 /// `hw-bench-needed=true` on every affinity-carrying intent that
 /// clears the mem floor — over-benching, never under-benching. The
 /// mem-floor gate keeps STREAM's ~4.6 GiB working set off small pods
 /// regardless.
 #[derive(Default)]
-pub(crate) struct HwSampledCache(HashMap<String, u32>);
+pub(crate) struct HwSampledCache(HashMap<String, rio_proto::types::HwDimCounts>);
 
 impl HwSampledCache {
     /// One `HwClassSampled` RPC for the given (deduped) classes.
@@ -157,23 +160,35 @@ impl HwSampledCache {
         }
     }
 
-    /// `∃ h ∈ A : sampled_count[h] < HW_BENCH_SAMPLE_THRESHOLD`.
-    /// `A = ∅` (no `node_affinity`) is vacuously false — the actual
-    /// `h` is unknown until kube-scheduler bind, so the create-time
-    /// check cannot be applied; the builder still runs the scalar
-    /// `alu` probe. Unknown `h` reads as 0 (under-threshold).
+    /// `∃ h ∈ A, ∃ d ∈ K : tenants_with_dim(h, d) <
+    /// HW_BENCH_SAMPLE_THRESHOLD`. `A = ∅` (no `node_affinity`) is
+    /// vacuously false — the actual `h` is unknown until
+    /// kube-scheduler bind, so the create-time check cannot be
+    /// applied; the builder still runs the scalar `alu` probe.
+    /// Unknown `h` (or empty `per_dim` — proto default) reads as
+    /// under-threshold. bug_013: the per-dim quantifier mirrors
+    /// `cross_tenant_median`'s gate so honest pods K=3-bench until
+    /// EVERY dim has ≥3 tenants, denying single-tenant capture.
     pub(crate) fn any_under_threshold<I>(&self, a: I) -> bool
     where
         I: IntoIterator<Item = String>,
     {
-        a.into_iter()
-            .any(|h| self.0.get(&h).copied().unwrap_or(0) < HW_BENCH_SAMPLE_THRESHOLD)
+        a.into_iter().any(|h| {
+            self.0
+                .get(&h)
+                .filter(|c| !c.per_dim.is_empty())
+                .is_none_or(|c| c.per_dim.iter().any(|&n| n < HW_BENCH_SAMPLE_THRESHOLD))
+        })
     }
 
-    /// Test-only constructor.
+    /// Test-only constructor: per-hw_class K=3 distinct-tenant counts.
     #[cfg(test)]
-    pub(crate) fn from_map(m: HashMap<String, u32>) -> Self {
-        Self(m)
+    pub(crate) fn from_map(m: HashMap<String, [u32; 3]>) -> Self {
+        Self(
+            m.into_iter()
+                .map(|(h, n)| (h, rio_proto::types::HwDimCounts { per_dim: n.into() }))
+                .collect(),
+        )
     }
 }
 
