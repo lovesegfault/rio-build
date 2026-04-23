@@ -42,6 +42,12 @@
 #   queued build: that cell is dropped from nodeAffinity (read-time
 #   mask, memo unchanged). Covers sched.sla.hw-class.ice-mask.
 #
+# admissible-set — InjectBuildSample WITH hwClass across the 3
+#   fixture-configured classes (the K=3 alpha path; cost-solve covers
+#   the scalar path), queue, assert nodeAffinity ≥1 term, then assert
+#   /metrics HELP enumerates all six InfeasibleReason labels. Covers
+#   sched.sla.hw-class.admissible-set.
+#
 # CAVEAT: standalone-fixture workers read effective_cores from the host
 # cgroup, NOT from a per-dispatch SpawnIntent (no controller). The
 # convergence subtest therefore asserts the SAMPLES landed (proving the
@@ -94,6 +100,28 @@ let
     extraAttrs.pname = "synth-cost";
     script = ''
       echo synth-cost-fixture-miss-ran-real-build >&2
+      echo ok > $out
+    '';
+  };
+
+  # admissible-set subtest pname. Its build_samples carry hwClass (the
+  # K=3 alpha path), unlike synth-cost (scalar path). Body irrelevant.
+  admitDrv = drvs.mkCustom {
+    name = "synth-admit-0";
+    extraAttrs.pname = "synth-admit";
+    script = ''
+      echo synth-admit-fixture-miss-ran-real-build >&2
+      echo ok > $out
+    '';
+  };
+  # admissible-set subtest: fit with S=10000 (serial floor) → infeasible
+  # at the fixture's p90=1200 → emits rio_scheduler_sla_infeasible_total
+  # so the metric (HELP + 6 reason labels) is observable in /metrics.
+  serialDrv = drvs.mkCustom {
+    name = "synth-serial-0";
+    extraAttrs.pname = "synth-serial";
+    script = ''
+      echo synth-serial-fixture-miss-ran-real-build >&2
       echo ok > $out
     '';
   };
@@ -515,6 +543,124 @@ let
           )
     '';
 
+    admissible-set = ''
+      with subtest("admissible-set: per-hw_class samples -> nodeAffinity + 6 infeasible reasons registered"):
+          # A19: end-to-end check for the §13a per-hw_class build_samples
+          # path. cost-solve injects samples WITHOUT hwClass (scalar
+          # normalize); this injects WITH hwClass so the K=3 alpha-ALS
+          # branch fires. Chained after ice-backoff: the band-aware
+          # hw_perf_samples (intel-6/7/8) and low-lambda interrupt_
+          # samples are already seeded; worker is running.
+          #
+          # Same true T(c) curve (S=30, P=2000) on each h, scaled by
+          # that h's alu factor (1.0/1.4/2.0 from cost-solve's seed) so
+          # the samples are c↔h-correlated — exactly the deconfounding
+          # the alpha-ALS rank gate is meant to handle.
+          band_admit = [("intel-6-ebs-lo", 1.0), ("intel-7-ebs-mid", 1.4), ("intel-8-nvme-hi", 2.0)]
+          for c, t_ref in [(4, 530), (8, 280), (16, 155), (32, 92.5), (64, 61.25)]:
+              for hw, k in band_admit:
+                  grpcurl_admin("InjectBuildSample", {
+                      "pname": "synth-admit", "system": "x86_64-linux",
+                      "tenant": "", "durationSecs": t_ref / k,
+                      "peakMemoryBytes": 1073741824,
+                      "cpuLimitCores": c, "cpuSecondsTotal": (t_ref/k) * c * 0.9,
+                      "hwClass": hw,
+                  })
+          # synth-serial: constant t=10000 across c → fit S~10000, P~0 →
+          # at p90=1200 the serial floor binds → intent_for emits
+          # rio_scheduler_sla_infeasible_total{reason="serial_floor"}.
+          # span 64/4=16, n_eff=5 so the fit gate opens.
+          for c in (4, 8, 16, 32, 64):
+              grpcurl_admin("InjectBuildSample", {
+                  "pname": "synth-serial", "system": "x86_64-linux",
+                  "tenant": "", "durationSecs": 10000,
+                  "peakMemoryBytes": 1073741824,
+                  "cpuLimitCores": c, "cpuSecondsTotal": 10000.0 * c * 0.9,
+              })
+          wait_estimator_tick()
+          st = json.loads(grpcurl_admin("SlaStatus", {
+              "pname": "synth-admit", "system": "x86_64-linux", "tenant": "",
+          }))
+          assert st.get("hasFit"), f"synth-admit no fit after 15 hw-tagged samples: {st}"
+          # Stop the worker so synth-admit stays Ready and shows up in
+          # GetSpawnIntents. ice-backoff drained synth-cost; if a stray
+          # intent lingers it ALSO carries nodeAffinity (cost-solve
+          # proved that), so the all() below stays valid.
+          worker.systemctl("stop rio-builder")
+          for drv in ("${admitDrv}", "${serialDrv}"):
+              client.execute(
+                  "nohup nix-build --no-out-link "
+                  "--store 'ssh-ng://${gatewayHost}' "
+                  "--arg busybox '(builtins.storePath ${pkgs.pkgsStatic.busybox})' "
+                  f"{drv} > /tmp/synth-admit.log 2>&1 < /dev/null &"
+              )
+          intents: list = []
+          for _ in range(30):
+              resp = json.loads(grpcurl_admin("GetSpawnIntents", {}))
+              intents = resp.get("intents", [])
+              if any("synth-admit" in i.get("intentId", "") for i in intents):
+                  break
+              time.sleep(2)
+          admit = [i for i in intents if "synth-admit" in i.get("intentId", "")]
+          assert admit, (
+              "no SpawnIntent for synth-admit after 60s. "
+              f"intents={intents!r} "
+              f"nix-build={client.execute('cat /tmp/synth-admit.log')[1]!r}"
+          )
+          aff = admit[0].get("nodeAffinity", [])
+          print(f"admissible-set: synth-admit nodeAffinity={aff}")
+          assert len(aff) >= 1, (
+              "nodeAffinity has <1 term — solve_full gate not satisfied "
+              f"for hw-tagged samples. SlaStatus[synth-admit]={st!r} intent={admit[0]!r}"
+          )
+          for term in aff:
+              keys = {r["key"] for r in term.get("matchExpressions", [])}
+              assert "rio.build/hw-class" in keys, term
+              assert "karpenter.sh/capacity-type" in keys, term
+          # synth-serial's intent_for hits BestEffort → emits
+          # `_infeasible_total{reason=…}` once per snapshot. Poll until
+          # the metric surfaces, then assert the HELP line enumerates
+          # all six InfeasibleReason::ALL strings (metrics-exporter-
+          # prometheus only renders HELP for emitted metrics, so the
+          # synth-serial dispatch is what makes this observable).
+          ${gatewayHost}.wait_until_succeeds(
+              "curl -fsS localhost:9091/metrics | "
+              "grep -q '^rio_scheduler_sla_infeasible_total{'",
+              timeout=45,
+          )
+          body = ${gatewayHost}.succeed(
+              "curl -fsS localhost:9091/metrics | "
+              "grep rio_scheduler_sla_infeasible_total"
+          )
+          print(f"admissible-set: infeasible_total lines:\n{body}")
+          help_line = next(
+              (l for l in body.splitlines() if l.startswith("# HELP ")), ""
+          )
+          reasons = ("serial_floor", "mem_ceiling", "disk_ceiling",
+                     "core_ceiling", "interrupt_runaway",
+                     "capacity_exhausted")
+          for reason in reasons:
+              assert reason in help_line, (
+                  f"reason '{reason}' missing from /metrics HELP: {help_line!r}"
+              )
+          # Every emitted reason= label is one of the documented six.
+          import re as _re
+          emitted = set(_re.findall(r'reason="([^"]+)"', body))
+          assert emitted, f"no reason= series emitted: {body!r}"
+          assert emitted.issubset(set(reasons)), (
+              f"undocumented reason label(s) {emitted - set(reasons)!r} in /metrics"
+          )
+          # Cleanup: drain + restore worker for seed-corpus.
+          client.execute("pkill -f 'nix-build.*synth-' || true")
+          worker.systemctl("start rio-builder")
+          worker.wait_for_unit("rio-builder.service")
+          ${gatewayHost}.wait_until_succeeds(
+              "curl -fsS localhost:9091/metrics | "
+              "awk '/^rio_scheduler_workers_active / {exit !($2>=1)}'",
+              timeout=60,
+          )
+    '';
+
     seed-corpus = ''
       with subtest("seed-corpus: export -> reset -> import seeds prior"):
           # The convergence/outlier subtests left synth-amdahl with a
@@ -582,8 +728,13 @@ let
       }
       {
         before = "ice-backoff";
+        after = "admissible-set";
+        msg = "admissible-set reuses cost-solve's band-aware hw_perf_samples + interrupt_samples";
+      }
+      {
+        before = "admissible-set";
         after = "seed-corpus";
-        msg = "ice-backoff stops the worker; seed-corpus needs it restarted";
+        msg = "admissible-set stops the worker; seed-corpus needs it restarted";
       }
     ];
   };

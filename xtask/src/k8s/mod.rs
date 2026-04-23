@@ -17,6 +17,7 @@ mod phases;
 pub mod provider;
 pub(crate) mod qa;
 pub mod shared;
+mod sla_gates;
 pub(crate) mod status;
 mod stress;
 mod wipe;
@@ -356,6 +357,12 @@ pub enum K8sCmd {
         #[arg(long)]
         restart: bool,
     },
+    /// ADR-023 §13a empirical gates (a–d). Operator-run on EKS; NOT a
+    /// CI test. a/b assert; c/d report only.
+    SlaGates {
+        #[arg(long, value_enum)]
+        gate: sla_gates::Gate,
+    },
     /// Rotate `rio-general` Karpenter nodes onto the current AMI.
     /// EKS-only. The rio-general NodePool has `budgets:0/Drifted`, so
     /// AMI changes leave its NodeClaims at `Drifted=True` indefinitely
@@ -497,6 +504,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                 } => eks::ami::gc(older_than_days, !no_dry_run).await,
             }
         }
+        K8sCmd::SlaGates { gate } => sla_gates::run(gate).await,
         K8sCmd::RotateGeneral => {
             if !matches!(kind, ProviderKind::Eks) {
                 bail!("`rotate-general` is EKS-only (Karpenter NodeClaims); pass -p eks");

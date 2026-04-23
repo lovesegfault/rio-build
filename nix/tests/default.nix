@@ -448,6 +448,8 @@ in
           "cost-solve"
           # r[verify sched.sla.hw-class.ice-mask]
           "ice-backoff"
+          # r[verify sched.sla.hw-class.admissible-set]
+          "admissible-set"
           # r[verify sched.sla.prior-partial-pool]
           "seed-corpus"
         ];
