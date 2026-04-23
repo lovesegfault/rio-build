@@ -259,12 +259,40 @@ fn one_line(e: &anyhow::Error) -> String {
 
 // ─── PG handle ─────────────────────────────────────────────────────────
 
+const RELAY_POD: &str = "rio-qa-pg-relay";
+
+/// Drop-guard for the cluster-side `rio-qa-pg-relay` pod. Fires a
+/// fire-and-forget `kubectl delete --wait=false` so the pod doesn't
+/// outlive the [`PgHandle`]. Sync `std::process::Command::spawn` (not
+/// tokio) — Drop can't be async and the runtime may be shutting down.
+struct RelayPodGuard;
+
+impl Drop for RelayPodGuard {
+    fn drop(&mut self) {
+        tracing::debug!(pod = RELAY_POD, "deleting socat relay pod (drop)");
+        let _ = std::process::Command::new("kubectl")
+            .args([
+                "-n",
+                NS,
+                "delete",
+                "pod",
+                RELAY_POD,
+                "--wait=false",
+                "--ignore-not-found",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Process-lifetime PG connection. Built once in `scheduler::run()`;
-/// scenarios get `Arc<PgPool>` via `QaCtx`. Guard (k3s in-cluster PG
-/// only) drops with the handle.
+/// scenarios get `Arc<PgPool>` via `QaCtx`. Field drop order: pool
+/// closes → port-forward killed → relay pod deleted.
 pub struct PgHandle {
     pub pool: PgPool,
     _guard: Option<ProcessGuard>,
+    _relay_pod: Option<RelayPodGuard>,
 }
 
 impl PgHandle {
@@ -293,14 +321,16 @@ impl PgHandle {
         let (host, port) = pg_host_port(url)?;
         let in_cluster = host.ends_with(&format!(".{NS}")) || host == "rio-postgresql";
 
-        let (bound, guard) = if in_cluster {
+        let (bound, guard, relay_pod) = if in_cluster {
             // k3s: bitnami PG is a Service in rio-system.
-            shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?
+            let (b, g) = shared::port_forward(NS, "svc/rio-postgresql", 0, 5432).await?;
+            (b, g, None)
         } else {
             // EKS: RDS is VPC-private. Spawn a socat relay pod that
             // listens on 5432 and forwards to the RDS endpoint, then
             // port-forward to THAT pod.
-            spawn_socat_relay(&host, port).await?
+            let (b, g, p) = spawn_socat_relay(&host, port).await?;
+            (b, g, Some(p))
         };
 
         let url = rewrite_pg_host(url, &format!("localhost:{bound}"));
@@ -321,37 +351,41 @@ impl PgHandle {
         Ok(Self {
             pool,
             _guard: Some(guard),
+            _relay_pod: relay_pod,
         })
     }
 }
 
 /// Spawn an `alpine/socat` pod in `rio-system` that listens on 5432 and
 /// forwards to `host:port` (the RDS endpoint), wait for it to be
-/// Running, port-forward to it. Named `rio-qa-pg-relay`; pre-deletes
-/// any prior instance so re-runs are idempotent. The pod is left
-/// behind when the run ends — it's a 5MB image listening on a socket,
-/// and `up --wipe` clears it (it's in `rio-system` which wipe keeps,
-/// but the next qa run's pre-delete handles it).
-async fn spawn_socat_relay(host: &str, port: u16) -> Result<(u16, ProcessGuard)> {
-    const POD: &str = "rio-qa-pg-relay";
+/// Running, port-forward to it. Named `rio-qa-pg-relay`. Returns the
+/// port-forward guard plus a [`RelayPodGuard`] that deletes the
+/// cluster-side pod on drop. The pre-delete here is the crash-recovery
+/// backstop for the case where a prior xtask was SIGKILLed before its
+/// [`RelayPodGuard`] ran.
+async fn spawn_socat_relay(host: &str, port: u16) -> Result<(u16, ProcessGuard, RelayPodGuard)> {
     let s = sh::shell()?;
     let _ = sh::try_read(cmd!(
         s,
-        "kubectl -n {NS} delete pod {POD} --ignore-not-found --wait=true"
+        "kubectl -n {NS} delete pod {RELAY_POD} --ignore-not-found --wait=true"
     ));
     let target = format!("TCP:{host}:{port}");
     sh::try_read(cmd!(
         s,
-        "kubectl -n {NS} run {POD} --image=alpine/socat --restart=Never -- TCP-LISTEN:5432,fork,reuseaddr {target}"
+        "kubectl -n {NS} run {RELAY_POD} --image=alpine/socat --restart=Never -- TCP-LISTEN:5432,fork,reuseaddr {target}"
     ))?;
+    // Guard immediately after the pod is created so a failure in
+    // wait/port-forward below still cleans it up.
+    let pod_guard = RelayPodGuard;
     // Wait Running (alpine/socat is small; usually <10s).
     sh::try_read(cmd!(
         s,
-        "kubectl -n {NS} wait --for=condition=Ready pod/{POD} --timeout=60s"
+        "kubectl -n {NS} wait --for=condition=Ready pod/{RELAY_POD} --timeout=60s"
     ))
     .context("socat relay pod never became Ready")?;
     // Port-forward to the socat pod's 5432.
-    shared::port_forward(NS, &format!("pod/{POD}"), 0, 5432).await
+    let (bound, pf) = shared::port_forward(NS, &format!("pod/{RELAY_POD}"), 0, 5432).await?;
+    Ok((bound, pf, pod_guard))
 }
 
 /// Parse `host` and `port` from a `postgres://user:pass@host:port/db`
