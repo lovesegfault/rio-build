@@ -353,7 +353,7 @@ impl DagActor {
                 executor_token,
                 node_affinity: intent.node_affinity.clone(),
                 eta_seconds,
-                ready,
+                ready: Some(ready),
                 hw_class_names: intent.hw_class_names.clone(),
             }
         };
@@ -516,8 +516,10 @@ impl DagActor {
         // intent with overdue deps clamps to eta=0.0 but is NOT Ready
         // (bug_030).
         intents.sort_unstable_by(|(pa, ia), (pb, ib)| {
-            (ib.ready, *pb)
-                .partial_cmp(&(ia.ready, *pa))
+            // `unwrap_or(true)`: a pre-§13a sender omits field 13;
+            // pre-§13a only emitted Ready-loop intents (bug_001).
+            (ib.ready.unwrap_or(true), *pb)
+                .partial_cmp(&(ia.ready.unwrap_or(true), *pa))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 

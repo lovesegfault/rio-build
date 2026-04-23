@@ -221,6 +221,19 @@ src/
 └── validated.rs       # ValidatedPathInfo (proto → domain type validation)
 ```
 
+**Field-addition rule.** A new proto3 scalar field whose consumer
+behaviour differs between "field absent" and "field = zero-value" MUST
+be declared `optional`. The consumer MUST handle `None` as "sender
+pre-dates this field" — i.e., reproduce the pre-addition behaviour. For
+`bool` this is almost always required (default `false` is rarely
+back-compat-safe). For `repeated`/`map`, empty is usually safe. Every
+such field gets a `tests/roundtrip.rs` case in the consumer crate that
+decodes a byte-slice *without* the new tag and asserts the consumer's
+behaviour matches the old. The `.fields` snapshot tripwire
+(`rio-proto/tests/field_presence.rs`) fails CI on any
+`admin_types.proto` field-set change until the snapshot is regenerated,
+forcing this decision to be explicit.
+
 ### rio-gateway — Nix protocol frontend
 
 ```

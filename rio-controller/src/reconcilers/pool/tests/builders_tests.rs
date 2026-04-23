@@ -730,28 +730,28 @@ fn forecast_intents_filtered_in_13a() {
     let intents = [
         rio_proto::types::SpawnIntent {
             intent_id: "ready".into(),
-            ready: true,
+            ready: Some(true),
             eta_seconds: 0.0,
             hw_class_names: vec!["intel-7-mid".into()],
             ..Default::default()
         },
         rio_proto::types::SpawnIntent {
             intent_id: "forecast".into(),
-            ready: false,
+            ready: Some(false),
             eta_seconds: 42.5,
             hw_class_names: vec!["amd-9-hi".into()],
             ..Default::default()
         },
         rio_proto::types::SpawnIntent {
             intent_id: "overdue".into(),
-            ready: false,
+            ready: Some(false),
             eta_seconds: 0.0, // clamped — would pass `eta == 0.0`
             hw_class_names: vec!["amd-9-hi".into()],
             ..Default::default()
         },
     ];
     let mut filtered: Vec<_> = intents.to_vec();
-    filtered.retain(|i| i.ready);
+    filtered.retain(|i| i.ready.unwrap_or(false));
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].intent_id, "ready");
     let hs: std::collections::HashSet<_> = filtered.iter().flat_map(jobs::hw_classes_in).collect();

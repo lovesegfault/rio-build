@@ -226,7 +226,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // becomes the gate instead. Keys on the explicit `ready` bit, NOT
     // `eta_seconds == 0.0`: a forecast intent with overdue deps clamps
     // to eta=0.0 and would otherwise pass as Ready (bug_030).
-    intents.retain(|i| i.ready);
+    // TODO(bug_001): `unwrap_or(false)` preserves the pre-`optional`
+    // proto3 default; flip to `unwrap_or(true)` with the back-compat
+    // roundtrip test (batch 8) so a pre-§13a scheduler's absent field
+    // decodes as Ready, not filtered.
+    intents.retain(|i| i.ready.unwrap_or(false));
     let queued = intents.len().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
@@ -382,8 +386,12 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         if let Err(e) = admin_call(ctx.admin.clone().ack_spawned_intents(
             rio_proto::types::AckSpawnedIntentsRequest {
                 spawned: to_ack,
-                // §13b NodeClaim watcher (A18) populates this.
+                // §13b NodeClaim watcher (A18) populates both: cells
+                // with `Registered=True` edges → `registered_cells`
+                // (ICE clear); `Launched=False` / Registered timeout
+                // → `unfulfillable_cells` (ICE mark).
                 unfulfillable_cells: vec![],
+                registered_cells: vec![],
             },
         ))
         .await

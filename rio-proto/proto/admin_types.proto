@@ -436,7 +436,13 @@ message SpawnIntent {
   // intent with overdue deps clamps to eta=0.0 and would otherwise
   // pass as Ready (bug_030). `eta_seconds` is now purely the §13b
   // NodeClaim pre-provisioning horizon.
-  bool ready = 13;
+  //
+  // `optional` so absence (a pre-§13a scheduler that doesn't know
+  // field 13) decodes as `None`, not `false`. Pre-§13a only ever
+  // emitted Ready-loop intents, so the controller's filter treats
+  // `None` as `true` — `false` would drop everything during a
+  // new-controller/old-scheduler skew window (bug_001).
+  optional bool ready = 13;
   // §13a hw-class names parallel to `node_affinity` — one entry per
   // term, the operator's `[sla.hw_classes.$h]` key that produced that
   // term's label conjunction. Carries the scheduler-internal name
@@ -528,6 +534,13 @@ message AckSpawnedIntentsRequest {
   // routes around the cell. Empty until controller A18 wires the
   // NodeClaim watcher.
   repeated string unfulfillable_cells = 2;
+  // §13b: cells where a NodeClaim reached `Registered=True` this
+  // tick — the SUCCESS edge that resets ICE backoff. "h:cap" string.
+  // Scheduler `ice.clear()`s each. Distinct from `spawned` (field 1),
+  // which is "Job-created OR still-Pending" — never a capacity-success
+  // signal (bug_008). Empty until controller A18 wires the NodeClaim
+  // watcher; interim clear path is first-heartbeat.
+  repeated string registered_cells = 3;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

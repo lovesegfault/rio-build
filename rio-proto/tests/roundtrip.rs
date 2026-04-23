@@ -52,7 +52,7 @@ fn spawn_intents_proto_roundtrip() {
                     }],
                 }],
                 eta_seconds: 0.0,
-                ready: true,
+                ready: Some(true),
                 hw_class_names: vec!["intel-8".into()],
             },
             rio_proto::types::SpawnIntent {
@@ -68,7 +68,7 @@ fn spawn_intents_proto_roundtrip() {
                 executor_token: String::new(),
                 node_affinity: vec![],
                 eta_seconds: 42.5,
-                ready: false,
+                ready: Some(false),
                 hw_class_names: vec![],
             },
         ],

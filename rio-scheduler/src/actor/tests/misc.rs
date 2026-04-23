@@ -1552,10 +1552,10 @@ async fn forecast_frontier_one_layer_only() {
         !by_id.contains_key("d"),
         "d NOT forecast: dep e is Ready (not Running)"
     );
-    assert!(!b.ready, "forecast ⇒ ready=false");
+    assert_eq!(b.ready, Some(false), "forecast ⇒ ready=false");
     // e is Ready → emitted at eta=0 (the Ready loop, not forecast).
     assert_eq!(by_id["e"].eta_seconds, 0.0, "Ready ⇒ eta=0");
-    assert!(by_id["e"].ready, "Ready loop ⇒ ready=true");
+    assert_eq!(by_id["e"].ready, Some(true), "Ready loop ⇒ ready=true");
     // Ready-before-forecast in the sort: e (ready) precedes b (forecast)
     // regardless of priority (both default 0 here).
     let pos_e = snap
@@ -1641,8 +1641,16 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
     }
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
-    let n_forecast = snap.intents.iter().filter(|i| !i.ready).count();
-    let n_ready = snap.intents.iter().filter(|i| i.ready).count();
+    let n_forecast = snap
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(false))
+        .count();
+    let n_ready = snap
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(true))
+        .count();
     assert_eq!(n_ready, 3, "Ready unaffected by ceiling");
     assert_eq!(
         n_forecast, 0,
@@ -1663,7 +1671,11 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
         actor.test_set_running_eta(&dep, 50.0, 10, 4);
     }
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
-    let n_forecast = snap.intents.iter().filter(|i| !i.ready).count();
+    let n_forecast = snap
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(false))
+        .count();
     assert_eq!(
         n_forecast, 2,
         "budget 20−12=8 admits exactly 2×4-core forecast intents"
@@ -1686,7 +1698,7 @@ async fn forecast_disabled_on_empty_lead_time_seed() {
 
     let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
     assert!(
-        snap.intents.iter().all(|i| i.ready),
+        snap.intents.iter().all(|i| i.ready == Some(true)),
         "no forecast when lead_time_seed empty"
     );
     assert!(!snap.intents.iter().any(|i| i.intent_id == "b"));
@@ -1726,11 +1738,12 @@ async fn forecast_overdue_dep_is_not_ready() {
         "b.eta clamped to ~0.0 (overdue dep), got {}",
         b.eta_seconds
     );
-    assert!(
-        !b.ready,
+    assert_eq!(
+        b.ready,
+        Some(false),
         "b.ready=false despite eta=0.0 — forecast loop, dep still Running"
     );
-    assert!(by_id["r"].ready, "r genuinely Ready");
+    assert_eq!(by_id["r"].ready, Some(true), "r genuinely Ready");
 
     // Sort order: r (ready=true) precedes b (ready=false), even though
     // both have eta_seconds==0.0. Under the old `eta == 0.0` comparator

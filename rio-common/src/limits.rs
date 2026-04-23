@@ -82,6 +82,20 @@ pub const fn nar_chunk_charge(len: usize) -> u64 {
 /// longest legitimate value.
 pub const MAX_HW_CLASS_LEN: usize = 64;
 
+/// `hw_class` charset + length predicate: `[a-z0-9-]{1,MAX_HW_CLASS_LEN}`.
+///
+/// Single source of truth for the constraint enforced at every
+/// `hw_class` sink (`AppendHwPerfSample`, `AppendInterruptSample`,
+/// `SlaConfig::validate`, controller node-informer). The predicate lives
+/// next to the limit constant so a future charset change (e.g. allowing
+/// `_`) is one edit, not N inline `bytes().all(...)` copies (bug_038).
+pub fn is_hw_class_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_HW_CLASS_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Maximum number of outputs in a single PutPathBatch request.
 ///
 /// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,
@@ -153,5 +167,23 @@ mod tests {
         let n = 1000u64;
         let charged: u64 = (0..n).map(|_| nar_chunk_charge(1)).sum();
         assert_eq!(charged, n * MIN_NAR_CHUNK_CHARGE as u64);
+    }
+
+    #[test]
+    fn is_hw_class_name_charset_and_len() {
+        assert!(is_hw_class_name("aws-7-ebs-mid"));
+        assert!(is_hw_class_name("a"));
+        assert!(is_hw_class_name("0-0"));
+        assert!(is_hw_class_name(&"a".repeat(MAX_HW_CLASS_LEN)));
+        // Rejects: empty, over-length, dot, underscore, uppercase,
+        // non-ASCII. The dot case is the bug_038 trigger
+        // (`c7a.xlarge` boots cleanly under the old config-validate,
+        // every sample silently rejected at the gRPC sink).
+        assert!(!is_hw_class_name(""));
+        assert!(!is_hw_class_name(&"a".repeat(MAX_HW_CLASS_LEN + 1)));
+        assert!(!is_hw_class_name("c7a.xlarge"));
+        assert!(!is_hw_class_name("aws_7"));
+        assert!(!is_hw_class_name("AWS-7"));
+        assert!(!is_hw_class_name("aws-7-ébs"));
     }
 }

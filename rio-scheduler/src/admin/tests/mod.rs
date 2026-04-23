@@ -300,6 +300,7 @@ async fn mutating_rpcs_require_service_token() {
         svc.ack_spawned_intents(Request::new(AckSpawnedIntentsRequest {
             spawned: vec![],
             unfulfillable_cells: vec![],
+            registered_cells: vec![],
         }))
     );
     assert_gated!(
