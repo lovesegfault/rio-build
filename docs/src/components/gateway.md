@@ -821,7 +821,12 @@ retry). Under sustained admission saturation each attempt blocks
 before surfacing to the user is ~50 s — bounded, but operators should
 treat sustained `RESOURCE_EXHAUSTED` here as a scaling signal.
 Non-transient status (`NotFound`, `Internal`, `DeadlineExceeded`)
-surfaces on the first attempt.
+surfaces on the first attempt. The store maps the placeholder-race case
+(`SubstituteError::Busy{retry_after: None}` — a concurrent replica is
+still fetching the NAR) to `NotFound`, NOT `Unavailable`: the 2-attempt
+budget can't outlast a multi-second NAR fetch, so the gateway treats it
+as `valid=false` (miss) and the caller re-probes later; only the
+upstream-429 case (`Busy{Some}`) is `Unavailable` and retried here.
 
 r[gw.put.aborted-retry]
 The buffered `grpc_put_path` helper (used by `wopAddToStore`, `wopAddTextToStore`, and the `.drv`-buffered branch of `wopAddToStoreNar`/`wopAddMultipleToStore`) MUST retry on store `Code::Aborted` up to `PUT_PATH_ABORTED_MAX_ATTEMPTS` (8) with full-jitter exponential backoff (50 ms base, ×2, 2 s cap → ≤ ~6 s total budget). The store returns `Aborted` when another upload holds the placeholder row for the same path (I-068) or on PG serialization conflicts. Each retry rebuilds the request stream from the `Arc<[u8]>`-held NAR without copying. Emits `rio_gateway_putpath_aborted_retries_total{attempt}` per retry. The streaming `grpc_put_path_streaming` helper is **not** retried on `Aborted` — its reader is consumed and the bytes were forwarded as they arrived, so there is nothing to replay; in practice that path only fires for oversize non-`.drv` entries where the I-068 collision case does not apply.
